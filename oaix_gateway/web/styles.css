@@ -506,6 +506,12 @@ button {
 }
 
 .token-panel__body {
+  --table-columns:
+    minmax(0, 1.2fr)
+    minmax(120px, 0.62fr)
+    minmax(112px, 0.8fr)
+    minmax(112px, 0.8fr)
+    minmax(0, 1.1fr);
   overflow: hidden;
   border-radius: calc(var(--radius-xl) - 10px);
   border: 1px solid color-mix(in oklab, var(--line) 78%, white);
@@ -513,6 +519,13 @@ button {
 }
 
 .request-panel__body {
+  --table-columns:
+    minmax(0, 1.14fr)
+    minmax(0, 0.9fr)
+    minmax(94px, 0.56fr)
+    minmax(104px, 0.72fr)
+    minmax(88px, 0.6fr)
+    minmax(0, 1.24fr);
   overflow: hidden;
   border-radius: calc(var(--radius-xl) - 10px);
   border: 1px solid color-mix(in oklab, var(--line) 78%, white);
@@ -548,12 +561,14 @@ button {
   font-size: clamp(1.7rem, 3vw, 2.4rem);
   line-height: 0.95;
   letter-spacing: -0.04em;
+  font-variant-numeric: tabular-nums;
 }
 
 .table-head,
-.token-row {
+.token-row,
+.request-row {
   display: grid;
-  grid-template-columns: 1.2fr 0.62fr 0.8fr 0.8fr 1.1fr;
+  grid-template-columns: var(--table-columns);
   gap: 18px;
   align-items: center;
 }
@@ -566,6 +581,11 @@ button {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--ink-soft);
+}
+
+.table-head > * {
+  min-width: 0;
+  white-space: nowrap;
 }
 
 .token-list {
@@ -586,10 +606,6 @@ button {
 }
 
 .request-row {
-  display: grid;
-  grid-template-columns: 1.18fr 0.82fr 0.58fr 0.72fr 0.72fr 1.18fr;
-  gap: 18px;
-  align-items: center;
   padding: 16px 18px;
   border-bottom: 1px solid color-mix(in oklab, var(--line) 52%, white);
 }
@@ -614,6 +630,7 @@ button {
 
 .request-row__title {
   font-weight: 800;
+  font-variant-numeric: tabular-nums;
 }
 
 .token-row__meta {
@@ -632,7 +649,10 @@ button {
 }
 
 .request-row__endpoint {
+  font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.88rem;
   word-break: break-word;
+  color: var(--ink);
 }
 
 .status-pill {
@@ -683,7 +703,11 @@ button {
 }
 
 .request-row__error {
+  display: -webkit-box;
+  overflow: hidden;
   word-break: break-word;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .empty-state {

@@ -213,19 +213,21 @@ function renderRequestList(items) {
       const mode = item.is_stream ? "Stream" : "JSON";
       const attemptLabel = item.attempt_count ? `${item.attempt_count} 次` : "—";
       const endpoint = item.endpoint || "—";
+      const startedAt = item.started_at || "";
+      const errorMessage = item.error_message || "—";
       return `
         <article class="request-row">
           <div class="request-row__primary">
-            <span class="request-row__title">${escapeHtml(formatDate(item.started_at))}</span>
+            <span class="request-row__title" title="${escapeHtml(startedAt)}">${escapeHtml(formatDate(item.started_at))}</span>
             <span class="request-row__meta">${escapeHtml(`${model} · ${mode}`)}</span>
           </div>
-          <div class="request-row__endpoint" data-label="端点">${escapeHtml(endpoint)}</div>
-          <div class="request-row__status" data-label="状态码">
+          <div class="request-row__endpoint" data-label="端点" title="${escapeHtml(endpoint)}">${escapeHtml(endpoint)}</div>
+          <div class="request-row__status" data-label="状态">
             <span class="status-pill status-pill--${status.tone}">${escapeHtml(status.label)}</span>
           </div>
           <div class="request-row__time" data-label="首 Token">${escapeHtml(formatDurationMs(item.ttft_ms))}</div>
-          <div class="request-row__time" data-label="尝试次数">${escapeHtml(attemptLabel)}</div>
-          <div class="request-row__error" data-label="错误摘要">${escapeHtml(item.error_message || "—")}</div>
+          <div class="request-row__time" data-label="尝试">${escapeHtml(attemptLabel)}</div>
+          <div class="request-row__error" data-label="错误" title="${escapeHtml(errorMessage)}">${escapeHtml(errorMessage)}</div>
         </article>
       `;
     })
