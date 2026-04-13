@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 import pytest
 from fastapi import HTTPException
 from oaix_gateway.api_server import (
+    ResponseTrafficController,
     _extract_usage_limit_cooldown_seconds,
     _get_compact_codex_server_error_cooling_time,
     _is_permanent_account_disable_error,
@@ -14,6 +15,7 @@ from oaix_gateway.api_server import (
     _sanitize_codex_payload,
     _should_retry_upstream_server_error,
 )
+from oaix_gateway.database import CodexToken
 
 
 def test_extract_usage_limit_cooldown_from_resets_in_seconds() -> None:
@@ -182,3 +184,52 @@ def test_should_retry_upstream_server_error_only_for_5xx() -> None:
     assert _should_retry_upstream_server_error(503) is True
     assert _should_retry_upstream_server_error(429) is False
     assert _should_retry_upstream_server_error(400) is False
+
+
+def test_response_traffic_controller_waits_until_idle(monkeypatch) -> None:
+    monkeypatch.setenv("IMPORT_RESPONSE_IDLE_GRACE_SECONDS", "0")
+    controller = ResponseTrafficController()
+
+    async def runner() -> None:
+        lease = controller.start_response()
+        waiter = asyncio.create_task(controller.wait_for_import_turn())
+        await asyncio.sleep(0)
+        assert waiter.done() is False
+
+        await lease.release()
+        assert await asyncio.wait_for(waiter, timeout=0.2) is True
+        assert controller.active_responses == 0
+
+    asyncio.run(runner())
+
+
+def test_response_traffic_controller_keeps_waiting_until_all_responses_finish(monkeypatch) -> None:
+    monkeypatch.setenv("IMPORT_RESPONSE_IDLE_GRACE_SECONDS", "0")
+    controller = ResponseTrafficController()
+
+    async def runner() -> None:
+        lease_a = controller.start_response()
+        lease_b = controller.start_response()
+        waiter = asyncio.create_task(controller.wait_for_import_turn())
+        await asyncio.sleep(0)
+        assert waiter.done() is False
+
+        await lease_a.release()
+        await asyncio.sleep(0)
+        assert waiter.done() is False
+
+        await lease_b.release()
+        assert await asyncio.wait_for(waiter, timeout=0.2) is True
+
+    asyncio.run(runner())
+
+
+def test_response_traffic_controller_returns_immediately_without_active_responses(monkeypatch) -> None:
+    monkeypatch.setenv("IMPORT_RESPONSE_IDLE_GRACE_SECONDS", "0.25")
+    controller = ResponseTrafficController()
+
+    assert asyncio.run(controller.wait_for_import_turn()) is False
+
+
+def test_codex_token_refresh_token_index_is_declared() -> None:
+    assert "ix_codex_tokens_refresh_token" in {index.name for index in CodexToken.__table__.indexes}

@@ -1,3 +1,4 @@
+import asyncio
 import codecs
 import json
 import logging
@@ -17,6 +18,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
+from starlette.background import BackgroundTask, BackgroundTasks
 
 from .database import close_database, init_db, utcnow
 from .oauth import CodexOAuthManager
@@ -98,6 +100,61 @@ class ProxyRequestResult:
     first_token_at: datetime | None = None
 
 
+class ResponseTrafficLease:
+    def __init__(self, controller: "ResponseTrafficController") -> None:
+        self._controller = controller
+        self._released = False
+
+    async def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._controller.release_response()
+
+
+class ResponseTrafficController:
+    def __init__(self) -> None:
+        self._active_responses = 0
+        self._responses_idle = asyncio.Event()
+        self._responses_idle.set()
+
+    @property
+    def active_responses(self) -> int:
+        return self._active_responses
+
+    def start_response(self) -> ResponseTrafficLease:
+        self._active_responses += 1
+        self._responses_idle.clear()
+        return ResponseTrafficLease(self)
+
+    def release_response(self) -> None:
+        if self._active_responses <= 0:
+            self._active_responses = 0
+            self._responses_idle.set()
+            return
+        self._active_responses -= 1
+        if self._active_responses == 0:
+            self._responses_idle.set()
+
+    async def wait_for_import_turn(self) -> bool:
+        waited = False
+        while True:
+            while self._active_responses > 0:
+                waited = True
+                await self._responses_idle.wait()
+
+            if not waited:
+                return False
+
+            grace_seconds = _import_response_idle_grace_seconds()
+            if grace_seconds <= 0:
+                return True
+
+            await asyncio.sleep(grace_seconds)
+            if self._active_responses == 0:
+                return True
+
+
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     raw = str(os.getenv(name, "") or "").strip()
     try:
@@ -107,12 +164,25 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     return max(minimum, value)
 
 
+def _float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = str(os.getenv(name, "") or "").strip()
+    try:
+        value = float(raw) if raw else float(default)
+    except ValueError:
+        value = float(default)
+    return max(minimum, value)
+
+
 def _max_request_account_retries() -> int:
     return _int_env("MAX_REQUEST_ACCOUNT_RETRIES", 100, minimum=1)
 
 
 def _default_usage_limit_cooldown_seconds() -> int:
     return _int_env("DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS", 300, minimum=1)
+
+
+def _import_response_idle_grace_seconds() -> float:
+    return _float_env("IMPORT_RESPONSE_IDLE_GRACE_SECONDS", 0.25, minimum=0.0)
 
 
 def _compact_server_error_cooldown_seconds() -> int:
@@ -174,6 +244,20 @@ def _responses_endpoint_path(*, compact: bool = False) -> str:
     if compact:
         return "/v1/responses/compact"
     return "/v1/responses"
+
+
+def _append_background_task(response: Response, func, *args, **kwargs) -> None:
+    if response.background is None:
+        response.background = BackgroundTask(func, *args, **kwargs)
+        return
+    if isinstance(response.background, BackgroundTasks):
+        response.background.add_task(func, *args, **kwargs)
+        return
+
+    background_tasks = BackgroundTasks()
+    background_tasks.tasks.append(response.background)
+    background_tasks.add_task(func, *args, **kwargs)
+    response.background = background_tasks
 
 
 def _build_upstream_headers(http_request: Request, access_token: str, account_id: str | None, stream: bool) -> dict[str, str]:
@@ -465,6 +549,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="oaix Gateway", version="0.1.0", lifespan=lifespan)
+    app.state.response_traffic = ResponseTrafficController()
     app.mount("/assets", StaticFiles(directory=str(WEB_DIR)), name="assets")
 
     @app.get("/")
@@ -522,6 +607,7 @@ def create_app() -> FastAPI:
         http_request: Request,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
+        response_traffic: ResponseTrafficController = http_request.app.state.response_traffic
         try:
             body = await http_request.json()
         except json.JSONDecodeError as exc:
@@ -543,7 +629,10 @@ def create_app() -> FastAPI:
         updated: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
+        yielded_to_response_traffic = 0
         for index, payload in enumerate(payloads):
+            if await response_traffic.wait_for_import_turn():
+                yielded_to_response_traffic += 1
             if not isinstance(payload, dict):
                 failed.append({"index": index, "error": "Token payload must be a JSON object"})
                 continue
@@ -575,6 +664,7 @@ def create_app() -> FastAPI:
             "updated_count": len(updated),
             "skipped_count": len(skipped),
             "failed_count": len(failed),
+            "yielded_to_response_traffic_count": yielded_to_response_traffic,
             "created": created,
             "updated": updated,
             "skipped": skipped,
@@ -603,6 +693,9 @@ def create_app() -> FastAPI:
         *,
         compact: bool,
     ) -> Response:
+        response_traffic: ResponseTrafficController = http_request.app.state.response_traffic
+        response_lease = response_traffic.start_response()
+        release_response_traffic = True
         endpoint = _responses_endpoint_path(compact=compact)
         request_started_at = utcnow()
         request_log = await create_request_log(
@@ -664,6 +757,9 @@ def create_app() -> FastAPI:
                         first_token_at=proxy_result.first_token_at,
                         account_id=token_row.account_id,
                     )
+                    if isinstance(proxy_result.response, StreamingResponse):
+                        _append_background_task(proxy_result.response, response_lease.release)
+                        release_response_traffic = False
                     return proxy_result.response
                 except HTTPException as exc:
                     status_code = getattr(exc, "status_code", 500)
@@ -803,6 +899,9 @@ def create_app() -> FastAPI:
                 error_message=str(exc),
             )
             raise
+        finally:
+            if release_response_traffic:
+                await response_lease.release()
 
     return app
 

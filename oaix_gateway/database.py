@@ -38,7 +38,7 @@ class CodexToken(Base):
     account_id: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
     id_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     access_token: Mapped[str | None] = mapped_column(Text, nullable=True)
-    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     refresh_token_aliases: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     token_type: Mapped[str] = mapped_column("type", String(32), nullable=False, default="codex", index=True)
     last_refresh_at: Mapped[datetime | None] = mapped_column("last_refresh", DateTime(timezone=True), nullable=True, index=True)
@@ -142,6 +142,7 @@ def _run_schema_migrations(sync_conn) -> None:
     if "refresh_token_aliases" not in existing_columns:
         sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN refresh_token_aliases JSON"))
     sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_cooldown_until ON codex_tokens (cooldown_until)"))
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_refresh_token ON codex_tokens (refresh_token)"))
     _drop_single_column_uniques(sync_conn, "codex_tokens", "account_id")
     _drop_single_column_uniques(sync_conn, "codex_tokens", "email")
 
