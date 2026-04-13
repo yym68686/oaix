@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
@@ -210,8 +210,16 @@ def create_app() -> FastAPI:
     app.mount("/assets", StaticFiles(directory=str(WEB_DIR)), name="assets")
 
     @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(WEB_DIR / "index.html")
+    async def index() -> HTMLResponse:
+        html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+        css_version = int((WEB_DIR / "styles.css").stat().st_mtime)
+        js_version = int((WEB_DIR / "app.js").stat().st_mtime)
+        html = html.replace("/assets/styles.css", f"/assets/styles.css?v={css_version}")
+        html = html.replace("/assets/app.js", f"/assets/app.js?v={js_version}")
+        return HTMLResponse(
+            content=html,
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:

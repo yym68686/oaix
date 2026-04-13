@@ -427,6 +427,10 @@ button {
   min-height: 210px;
   resize: vertical;
   line-height: 1.7;
+  white-space: pre;
+  overflow-x: auto;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 
 .field input:focus,

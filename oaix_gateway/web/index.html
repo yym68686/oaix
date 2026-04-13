@@ -111,14 +111,19 @@
             <textarea
               id="token-json"
               rows="10"
-              placeholder='支持 JSON；也支持每行一个：account_id,refresh_token'
+              wrap="off"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="off"
+              autocorrect="off"
+              placeholder='支持 JSON；也支持 account_id,refresh_token。单条 key 被换行打断时会自动拼接'
             ></textarea>
           </label>
 
           <label class="upload-zone" for="token-files">
             <input id="token-files" type="file" accept=".json,.txt,.csv,application/json,text/plain" multiple />
             <span class="upload-zone__title">选择一个或多个 JSON / TXT / CSV 文件</span>
-            <span class="upload-zone__hint">支持 JSON，或每行一个 account_id,refresh_token</span>
+            <span class="upload-zone__hint">支持 JSON，或 account_id,refresh_token；单条 key 被断行时也会自动拼接</span>
           </label>
 
           <div class="field-actions field-actions--primary">

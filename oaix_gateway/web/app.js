@@ -256,25 +256,51 @@ function normalizePayload(raw) {
   throw new Error("token JSON 必须是对象、数组，或 { tokens: [...] }");
 }
 
-function parseAccountRefreshLines(text, sourceLabel) {
-  const payloads = [];
-  const lines = text.split(/\r?\n/);
+function collectLogicalKeyLines(text) {
+  const physicalLines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 
-  lines.forEach((rawLine, index) => {
-    const line = rawLine.trim();
-    if (!line) {
-      return;
+  const logicalLines = [];
+  for (const line of physicalLines) {
+    if (!logicalLines.length) {
+      logicalLines.push(line);
+      continue;
     }
 
+    const lastIndex = logicalLines.length - 1;
+    const current = logicalLines[lastIndex];
+    const currentHasComma = current.includes(",");
+    const nextHasComma = line.includes(",");
+
+    // Some paste sources hard-wrap a single key across multiple lines.
+    // Keep joining until we see a new record that clearly starts with its own comma pair.
+    if (currentHasComma && nextHasComma) {
+      logicalLines.push(line);
+      continue;
+    }
+
+    logicalLines[lastIndex] = `${current}${line}`;
+  }
+
+  return logicalLines;
+}
+
+function parseAccountRefreshLines(text, sourceLabel) {
+  const payloads = [];
+  const lines = collectLogicalKeyLines(text);
+
+  lines.forEach((line, index) => {
     const commaIndex = line.indexOf(",");
     if (commaIndex <= 0 || commaIndex === line.length - 1) {
-      throw new Error(`${sourceLabel} 第 ${index + 1} 行格式错误，应为 account_id,refresh_token`);
+      throw new Error(`${sourceLabel} 第 ${index + 1} 条记录格式错误，应为 account_id,refresh_token`);
     }
 
     const accountId = line.slice(0, commaIndex).trim();
     const refreshToken = line.slice(commaIndex + 1).trim();
     if (!accountId || !refreshToken) {
-      throw new Error(`${sourceLabel} 第 ${index + 1} 行缺少 account_id 或 refresh_token`);
+      throw new Error(`${sourceLabel} 第 ${index + 1} 条记录缺少 account_id 或 refresh_token`);
     }
 
     payloads.push({
