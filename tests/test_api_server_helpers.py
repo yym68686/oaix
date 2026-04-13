@@ -311,6 +311,108 @@ def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request(
     assert body["output"][0]["content"][0]["text"] == "hello"
 
 
+def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_upstream_stream() -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse) -> None:
+            self._response = response
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                }
+            )
+            response = DummyStreamingResponse(
+                [
+                    json.dumps(
+                        {
+                            "id": "resp_compact_123",
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "hello compact",
+                                        }
+                                    ]
+                                }
+                            ],
+                        }
+                    ).encode("utf-8")
+                ]
+            )
+            return DummyStreamContext(response)
+
+        async def post(self, *args, **kwargs):
+            raise AssertionError("compact non-stream requests should not call client.post")
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses/compact",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4",
+        input=[{"role": "user", "content": "hello compact"}],
+        stream=False,
+    )
+
+    client = DummyClient()
+    result = asyncio.run(
+        _proxy_request_with_token(
+            client,
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+            compact=True,
+        )
+    )
+
+    assert len(client.stream_calls) == 1
+    stream_call = client.stream_calls[0]
+    assert stream_call["headers"]["Accept"] == "application/json"
+    assert "stream" not in json.loads(stream_call["content"])
+    assert result.first_token_at is None
+    assert result.status_code == 200
+    body = json.loads(result.response.body)
+    assert body["id"] == "resp_compact_123"
+    assert body["status"] == "completed"
+    assert body["output"][0]["content"][0]["text"] == "hello compact"
+
+
 def test_should_retry_upstream_server_error_only_for_5xx() -> None:
     assert _should_retry_upstream_server_error(500) is True
     assert _should_retry_upstream_server_error(503) is True

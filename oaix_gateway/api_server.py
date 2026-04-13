@@ -558,6 +558,20 @@ async def _collect_responses_json_from_sse(
     ), first_token_at
 
 
+def _decode_responses_json_body(raw: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="Upstream returned invalid JSON") from exc
+
+    semantic_failure = _responses_failure_http_exception(payload)
+    if semantic_failure is not None:
+        raise semantic_failure
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Upstream returned a non-object JSON response")
+    return payload
+
+
 async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) -> tuple[list[bytes], bool]:
     """
     Buffer only initial status events so semantic stream failures can still
@@ -1098,15 +1112,18 @@ async def _proxy_request_with_token(
     compact: bool = False,
 ) -> ProxyRequestResult:
     downstream_stream = bool(request_data.stream)
+    upstream_stream = downstream_stream or not compact
     payload = _sanitize_codex_payload(request_data.model_dump(exclude_unset=True), compact=compact)
-    if not downstream_stream:
+    if compact and not downstream_stream:
+        payload.pop("stream", None)
+    elif not downstream_stream:
         payload["stream"] = True
 
     headers = _build_upstream_headers(
         http_request,
         access_token=access_token,
         account_id=account_id,
-        stream=True,
+        stream=upstream_stream,
     )
     upstream_url = _codex_responses_url(compact=compact)
     json_payload = json.dumps(payload, ensure_ascii=False)
@@ -1152,6 +1169,35 @@ async def _proxy_request_with_token(
             first_token_at=utcnow() if stream_committed else None,
         )
 
+    if upstream_stream:
+        stream_cm = client.stream(
+            "POST",
+            upstream_url,
+            headers=headers,
+            content=json_payload,
+            timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
+        )
+        upstream_response = await stream_cm.__aenter__()
+        try:
+            if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+                raw = await upstream_response.aread()
+                raise HTTPException(
+                    status_code=upstream_response.status_code,
+                    detail=_decode_error_body(raw),
+                )
+
+            data, first_token_at = await _collect_responses_json_from_sse(
+                upstream_response.aiter_raw(),
+                model=request_data.model,
+            )
+            return ProxyRequestResult(
+                response=JSONResponse(status_code=upstream_response.status_code, content=data),
+                status_code=upstream_response.status_code,
+                first_token_at=first_token_at,
+            )
+        finally:
+            await stream_cm.__aexit__(None, None, None)
+
     stream_cm = client.stream(
         "POST",
         upstream_url,
@@ -1168,14 +1214,11 @@ async def _proxy_request_with_token(
                 detail=_decode_error_body(raw),
             )
 
-        data, first_token_at = await _collect_responses_json_from_sse(
-            upstream_response.aiter_raw(),
-            model=request_data.model,
-        )
+        raw = await upstream_response.aread()
+        data = _decode_responses_json_body(raw)
         return ProxyRequestResult(
             response=JSONResponse(status_code=upstream_response.status_code, content=data),
             status_code=upstream_response.status_code,
-            first_token_at=first_token_at,
         )
     finally:
         await stream_cm.__aexit__(None, None, None)
