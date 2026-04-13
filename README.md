@@ -157,6 +157,7 @@ account_id_3,refresh_token_3
 
 - 只会选择 `is_active=true` 且 `cooldown_until` 不在未来的 key
 - `/v1/responses/compact` 会透传到上游 `/responses/compact`，并按 `uni-api` 的相关逻辑去掉 `store`
+- 下游如果把 `/v1/responses*` 当非流式调用，网关会自动把上游改成 `stream=true`，先在网关内收完整个 SSE，再拼成一个普通 JSON 响应返回
 - `/v1/responses/compact` 在上游 5xx 或传输错误时，会默认把当前 key 冷却 `60` 秒后切换下一把 key；可用 `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS=0` 关闭
 - 流式 `/v1/responses*` 会先预读开头的 SSE 状态事件；如果前缀已经是 `response.failed` / `type=error` / 不完整流 / 预读阶段网络错误，就不会先把坏流交给客户端，而是留在网关里切下一把 key
 - `/admin/tokens/import` 是低优先级导入；检测到活跃 `/v1/responses*` 流量时，会逐条暂停导入，让代理请求先占用数据库和事件循环

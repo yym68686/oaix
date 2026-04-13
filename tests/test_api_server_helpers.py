@@ -4,14 +4,18 @@ from collections.abc import AsyncIterator
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 from oaix_gateway.api_server import (
     ResponseTrafficController,
+    _collect_responses_json_from_sse,
     _extract_usage_limit_cooldown_seconds,
     _get_compact_codex_server_error_cooling_time,
     _is_permanent_account_disable_error,
     _normalize_responses_compact_upstream_url,
+    _proxy_request_with_token,
     _prime_responses_upstream_stream,
     _responses_failure_http_exception,
+    ResponsesRequest,
     _sanitize_codex_payload,
     _should_retry_upstream_server_error,
 )
@@ -177,6 +181,134 @@ def test_prime_responses_upstream_stream_raises_on_incomplete_sse_event() -> Non
         asyncio.run(_prime_responses_upstream_stream(upstream()))
 
     assert exc_info.value.status_code == 502
+
+
+def test_collect_responses_json_from_sse_merges_response_and_output_text() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","response":{"id":"resp_123","status":"in_progress","model":"gpt-5.4"}}\n\n'
+        )
+        yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+        )
+
+    response, first_token_at = asyncio.run(
+        _collect_responses_json_from_sse(upstream(), model="gpt-5.4")
+    )
+
+    assert first_token_at is not None
+    assert response["id"] == "resp_123"
+    assert response["status"] == "completed"
+    assert response["model"] == "gpt-5.4"
+    assert response["usage"]["total_tokens"] == 2
+    assert response["output"][0]["content"][0]["text"] == "hello"
+
+
+def test_collect_responses_json_from_sse_falls_back_on_done_without_response_completed() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield b'event: response.created\ndata: {"type":"response.created"}\n\n'
+        yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    response, first_token_at = asyncio.run(
+        _collect_responses_json_from_sse(upstream(), model="gpt-5.4")
+    )
+
+    assert first_token_at is not None
+    assert response["status"] == "completed"
+    assert response["model"] == "gpt-5.4"
+    assert response["output"][0]["content"][0]["text"] == "hello"
+
+
+def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request() -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse) -> None:
+            self._response = response
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                }
+            )
+            response = DummyStreamingResponse(
+                [
+                    b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_456","status":"in_progress"}}\n\n',
+                    b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+                    b'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+                ]
+            )
+            return DummyStreamContext(response)
+
+        async def post(self, *args, **kwargs):
+            raise AssertionError("non-stream downstream requests should not call client.post")
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4",
+        input=[{"role": "user", "content": "hello"}],
+        stream=False,
+    )
+
+    client = DummyClient()
+    result = asyncio.run(
+        _proxy_request_with_token(
+            client,
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+        )
+    )
+
+    assert len(client.stream_calls) == 1
+    stream_call = client.stream_calls[0]
+    assert stream_call["headers"]["Accept"] == "text/event-stream"
+    assert json.loads(stream_call["content"])["stream"] is True
+    assert result.first_token_at is not None
+    assert result.status_code == 200
+    body = json.loads(result.response.body)
+    assert body["id"] == "resp_456"
+    assert body["status"] == "completed"
+    assert body["output"][0]["content"][0]["text"] == "hello"
 
 
 def test_should_retry_upstream_server_error_only_for_5xx() -> None:

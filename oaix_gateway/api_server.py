@@ -1,5 +1,6 @@
 import asyncio
 import codecs
+import copy
 import json
 import logging
 import os
@@ -398,6 +399,163 @@ def _responses_failure_http_exception(payload: Any) -> HTTPException | None:
         status_code=_responses_error_status_code(error_obj),
         detail=json.dumps({"error": error_obj}, ensure_ascii=False),
     )
+
+
+def _merge_mapping(target: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _merge_mapping(target[key], value)
+            continue
+        target[key] = value
+    return target
+
+
+def _append_output_text_delta(
+    output_text_parts: dict[tuple[int, int], list[str]],
+    event_payload: dict[str, Any],
+) -> None:
+    delta = event_payload.get("delta")
+    if delta is None:
+        return
+
+    try:
+        output_index = int(event_payload.get("output_index", 0) or 0)
+    except (TypeError, ValueError):
+        output_index = 0
+    try:
+        content_index = int(event_payload.get("content_index", 0) or 0)
+    except (TypeError, ValueError):
+        content_index = 0
+
+    output_text_parts.setdefault((output_index, content_index), []).append(str(delta))
+
+
+def _build_responses_output_from_text_parts(
+    output_text_parts: dict[tuple[int, int], list[str]],
+) -> list[dict[str, Any]]:
+    grouped: dict[int, dict[int, str]] = {}
+    for (output_index, content_index), parts in sorted(output_text_parts.items()):
+        grouped.setdefault(output_index, {})[content_index] = "".join(parts)
+
+    output: list[dict[str, Any]] = []
+    for output_index in sorted(grouped):
+        content: list[dict[str, Any]] = []
+        for content_index in sorted(grouped[output_index]):
+            text = grouped[output_index][content_index]
+            content.append(
+                {
+                    "type": "output_text",
+                    "text": text,
+                }
+            )
+        output.append(
+            {
+                "type": "message",
+                "content": content,
+            }
+        )
+    return output
+
+
+def _finalize_collected_response(
+    response_snapshot: dict[str, Any] | None,
+    *,
+    model: str,
+    output_text_parts: dict[tuple[int, int], list[str]],
+) -> dict[str, Any]:
+    response_data = copy.deepcopy(response_snapshot or {})
+
+    if not response_data.get("id"):
+        response_data["id"] = f"resp_{uuid.uuid4().hex}"
+    if not response_data.get("object"):
+        response_data["object"] = "response"
+    if response_data.get("created_at") is None:
+        response_data["created_at"] = int(utcnow().timestamp())
+    if not response_data.get("model"):
+        response_data["model"] = model
+    response_data["status"] = "completed"
+
+    if output_text_parts and not response_data.get("output"):
+        response_data["output"] = _build_responses_output_from_text_parts(output_text_parts)
+
+    return response_data
+
+
+async def _collect_responses_json_from_sse(
+    upstream_iter: AsyncIterator[bytes],
+    *,
+    model: str,
+) -> tuple[dict[str, Any], datetime | None]:
+    response_snapshot: dict[str, Any] | None = None
+    output_text_parts: dict[tuple[int, int], list[str]] = {}
+    first_token_at: datetime | None = None
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text_buffer = ""
+
+    while True:
+        try:
+            chunk = await upstream_iter.__anext__()
+        except StopAsyncIteration:
+            if text_buffer.strip():
+                raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
+            break
+
+        text_buffer += decoder.decode(chunk)
+
+        while True:
+            match = re.search(r"\r?\n\r?\n", text_buffer)
+            if not match:
+                break
+
+            raw_event = text_buffer[:match.start()]
+            text_buffer = text_buffer[match.end():]
+            if not raw_event.strip():
+                continue
+
+            event_type, event_payload = _extract_responses_stream_event(raw_event)
+
+            if event_type == "[DONE]":
+                return _finalize_collected_response(
+                    response_snapshot,
+                    model=model,
+                    output_text_parts=output_text_parts,
+                ), first_token_at
+
+            semantic_failure = _responses_failure_http_exception(event_payload)
+            if semantic_failure is not None:
+                raise semantic_failure
+
+            if first_token_at is None and event_type and event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
+                first_token_at = utcnow()
+
+            if not isinstance(event_payload, dict):
+                continue
+
+            response_obj = event_payload.get("response")
+            if isinstance(response_obj, dict):
+                if response_snapshot is None:
+                    response_snapshot = {}
+                _merge_mapping(response_snapshot, response_obj)
+
+            if event_type == "response.output_text.delta":
+                _append_output_text_delta(output_text_parts, event_payload)
+
+            if event_type == "response.completed":
+                return _finalize_collected_response(
+                    response_snapshot,
+                    model=model,
+                    output_text_parts=output_text_parts,
+                ), first_token_at
+
+    if response_snapshot is None and not output_text_parts:
+        raise HTTPException(status_code=502, detail="Upstream closed stream without data")
+
+    return _finalize_collected_response(
+        response_snapshot,
+        model=model,
+        output_text_parts=output_text_parts,
+    ), first_token_at
 
 
 async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) -> tuple[list[bytes], bool]:
@@ -939,17 +1097,21 @@ async def _proxy_request_with_token(
     account_id: str | None,
     compact: bool = False,
 ) -> ProxyRequestResult:
+    downstream_stream = bool(request_data.stream)
     payload = _sanitize_codex_payload(request_data.model_dump(exclude_unset=True), compact=compact)
+    if not downstream_stream:
+        payload["stream"] = True
+
     headers = _build_upstream_headers(
         http_request,
         access_token=access_token,
         account_id=account_id,
-        stream=bool(request_data.stream),
+        stream=True,
     )
     upstream_url = _codex_responses_url(compact=compact)
     json_payload = json.dumps(payload, ensure_ascii=False)
 
-    if request_data.stream:
+    if downstream_stream:
         stream_cm = client.stream(
             "POST",
             upstream_url,
@@ -990,37 +1152,33 @@ async def _proxy_request_with_token(
             first_token_at=utcnow() if stream_committed else None,
         )
 
-    upstream_response = await client.post(
+    stream_cm = client.stream(
+        "POST",
         upstream_url,
         headers=headers,
         content=json_payload,
-        timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0),
+        timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
     )
-    if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
-        raw = await upstream_response.aread()
-        raise HTTPException(
-            status_code=upstream_response.status_code,
-            detail=_decode_error_body(raw),
-        )
-
+    upstream_response = await stream_cm.__aenter__()
     try:
-        data = upstream_response.json()
-    except json.JSONDecodeError:
-        return ProxyRequestResult(
-            response=Response(
-                content=upstream_response.content,
+        if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+            raw = await upstream_response.aread()
+            raise HTTPException(
                 status_code=upstream_response.status_code,
-                media_type=upstream_response.headers.get("content-type", "application/octet-stream"),
-            ),
-            status_code=upstream_response.status_code,
+                detail=_decode_error_body(raw),
+            )
+
+        data, first_token_at = await _collect_responses_json_from_sse(
+            upstream_response.aiter_raw(),
+            model=request_data.model,
         )
-    semantic_failure = _responses_failure_http_exception(data)
-    if semantic_failure is not None:
-        raise semantic_failure
-    return ProxyRequestResult(
-        response=JSONResponse(status_code=upstream_response.status_code, content=data),
-        status_code=upstream_response.status_code,
-    )
+        return ProxyRequestResult(
+            response=JSONResponse(status_code=upstream_response.status_code, content=data),
+            status_code=upstream_response.status_code,
+            first_token_at=first_token_at,
+        )
+    finally:
+        await stream_cm.__aexit__(None, None, None)
 
 
 app = create_app()
