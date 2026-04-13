@@ -57,6 +57,10 @@ def _default_usage_limit_cooldown_seconds() -> int:
     return _int_env("DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS", 300, minimum=1)
 
 
+def _compact_server_error_cooldown_seconds() -> int:
+    return _int_env("COMPACT_SERVER_ERROR_COOLDOWN_SECONDS", 60, minimum=0)
+
+
 def _get_service_api_keys() -> set[str]:
     raw = os.getenv("SERVICE_API_KEYS") or os.getenv("API_KEY") or ""
     return {item.strip() for item in raw.split(",") if item.strip()}
@@ -73,8 +77,8 @@ async def verify_service_api_key(http_request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
 
 
-def _codex_responses_url() -> str:
-    base = (os.getenv("CODEX_BASE_URL") or "").strip()
+def _normalize_responses_upstream_url(base_url: str) -> str:
+    base = (base_url or "").strip()
     if not base:
         return "https://chatgpt.com/backend-api/codex/responses"
 
@@ -82,6 +86,30 @@ def _codex_responses_url() -> str:
     if base.endswith("/v1/responses") or base.endswith("/responses"):
         return base
     return f"{base}/responses"
+
+
+def _normalize_responses_compact_upstream_url(base_url: str) -> str:
+    base = (base_url or "").strip()
+    if not base:
+        return "https://chatgpt.com/backend-api/codex/responses/compact"
+
+    base = base.rstrip("/")
+    if base.endswith("/v1/responses/compact") or base.endswith("/responses/compact"):
+        return base
+
+    base = _normalize_responses_upstream_url(base)
+    if base.endswith("/v1/responses") or base.endswith("/responses"):
+        return f"{base}/compact"
+    if base.endswith("/compact"):
+        return base
+    return f"{base}/compact"
+
+
+def _codex_responses_url(*, compact: bool = False) -> str:
+    base = os.getenv("CODEX_BASE_URL") or ""
+    if compact:
+        return _normalize_responses_compact_upstream_url(base)
+    return _normalize_responses_upstream_url(base)
 
 
 def _build_upstream_headers(http_request: Request, access_token: str, account_id: str | None, stream: bool) -> dict[str, str]:
@@ -105,11 +133,14 @@ def _build_upstream_headers(http_request: Request, access_token: str, account_id
     return headers
 
 
-def _sanitize_codex_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _sanitize_codex_payload(payload: dict[str, Any], *, compact: bool = False) -> dict[str, Any]:
     payload.pop("max_output_tokens", None)
+    payload.pop("response_format", None)
     payload.pop("previous_response_id", None)
     payload.pop("prompt_cache_retention", None)
     payload.pop("safety_identifier", None)
+    if compact:
+        payload.pop("store", None)
     payload.setdefault("instructions", "")
     return payload
 
@@ -186,6 +217,21 @@ def _is_permanent_account_disable_error(status_code: int, error_text: str) -> bo
                 return True
 
     return False
+
+
+def _get_compact_codex_server_error_cooling_time(
+    *,
+    compact: bool,
+    status_code: int,
+    error_text: str,
+) -> int:
+    if not compact:
+        return 0
+    if status_code < 500:
+        return 0
+    if _extract_usage_limit_cooldown_seconds(status_code, error_text) is not None:
+        return 0
+    return _compact_server_error_cooldown_seconds()
 
 
 @asynccontextmanager
@@ -300,6 +346,22 @@ def create_app() -> FastAPI:
         request_data: ResponsesRequest,
         _: None = Depends(verify_service_api_key),
     ) -> Response:
+        return await _responses_route_common(http_request, request_data, compact=False)
+
+    @app.post("/v1/responses/compact")
+    async def responses_compact_route(
+        http_request: Request,
+        request_data: ResponsesRequest,
+        _: None = Depends(verify_service_api_key),
+    ) -> Response:
+        return await _responses_route_common(http_request, request_data, compact=True)
+
+    async def _responses_route_common(
+        http_request: Request,
+        request_data: ResponsesRequest,
+        *,
+        compact: bool,
+    ) -> Response:
         counts = await get_token_counts()
         if counts.available <= 0:
             raise HTTPException(status_code=503, detail="No available Codex token in database")
@@ -331,6 +393,7 @@ def create_app() -> FastAPI:
                     request_data,
                     access_token=access_token,
                     account_id=token_row.account_id,
+                    compact=compact,
                 )
                 await mark_token_success(token_row.id)
                 return response
@@ -352,6 +415,29 @@ def create_app() -> FastAPI:
                         token_row.id,
                         token_row.account_id,
                         cooldown_seconds,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = exc
+                    continue
+
+                compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                    compact=compact,
+                    status_code=status_code,
+                    error_text=detail,
+                )
+                if compact_server_error_cooling_time > 0 and attempt < max_attempts:
+                    await mark_token_error(
+                        token_row.id,
+                        detail,
+                        cooldown_seconds=compact_server_error_cooling_time,
+                    )
+                    logger.warning(
+                        "Codex compact key cooled after upstream server error: token_id=%s account_id=%s status=%s cooldown_seconds=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        status_code,
+                        compact_server_error_cooling_time,
                         attempt,
                         max_attempts,
                     )
@@ -395,6 +481,28 @@ def create_app() -> FastAPI:
                 raise
             except httpx.HTTPError as exc:
                 message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                    compact=compact,
+                    status_code=500,
+                    error_text=message,
+                )
+                if compact_server_error_cooling_time > 0 and attempt < max_attempts:
+                    await mark_token_error(
+                        token_row.id,
+                        message,
+                        cooldown_seconds=compact_server_error_cooling_time,
+                    )
+                    logger.warning(
+                        "Codex compact key cooled after upstream transport error: token_id=%s account_id=%s error_type=%s cooldown_seconds=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        type(exc).__name__,
+                        compact_server_error_cooling_time,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = HTTPException(status_code=502, detail=message)
+                    continue
                 await mark_token_error(token_row.id, message)
                 raise HTTPException(status_code=502, detail=message) from exc
 
@@ -426,15 +534,16 @@ async def _proxy_request_with_token(
     *,
     access_token: str,
     account_id: str | None,
+    compact: bool = False,
 ) -> Response:
-    payload = _sanitize_codex_payload(request_data.model_dump(exclude_unset=True))
+    payload = _sanitize_codex_payload(request_data.model_dump(exclude_unset=True), compact=compact)
     headers = _build_upstream_headers(
         http_request,
         access_token=access_token,
         account_id=account_id,
         stream=bool(request_data.stream),
     )
-    upstream_url = _codex_responses_url()
+    upstream_url = _codex_responses_url(compact=compact)
     json_payload = json.dumps(payload, ensure_ascii=False)
 
     if request_data.stream:

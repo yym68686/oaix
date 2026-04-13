@@ -31,6 +31,7 @@
 - `CODEX_BASE_URL`: 上游 Codex responses 地址。默认 `https://chatgpt.com/backend-api/codex/responses`
 - `MAX_REQUEST_ACCOUNT_RETRIES`: 单次请求最多切换多少个 key，默认 `100`
 - `DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS`: 429 且没有明确重置时间时的默认冷却秒数，默认 `300`
+- `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS`: `/v1/responses/compact` 遇到上游 5xx / 传输错误时的冷却秒数，默认 `60`；设为 `0` 可关闭
 - `HOST`: 内置启动命令监听地址，默认 `0.0.0.0`
 - `PORT`: 内置启动命令端口，默认 `8000`
 
@@ -90,6 +91,7 @@ export POSTGRES_USER='oaix'
 export POSTGRES_PASSWORD='oaix_password'
 export SERVICE_API_KEYS='change-me'
 export CODEX_BASE_URL=''
+export COMPACT_SERVER_ERROR_COOLDOWN_SECONDS='60'
 ```
 
 启动后打开：
@@ -133,11 +135,14 @@ account_id_3,refresh_token_3
 - `GET /admin/tokens`: 查看 key 列表与统计
 - `POST /admin/tokens/import`: 导入单个 key、key 数组，或 `{"tokens": [...]}` 批量导入
 - `POST /v1/responses`: 代理到上游 Codex responses
+- `POST /v1/responses/compact`: 代理到上游 Codex responses compact
 - `GET /`: Web 控制台
 
 ## 网关行为
 
 - 只会选择 `is_active=true` 且 `cooldown_until` 不在未来的 key
+- `/v1/responses/compact` 会透传到上游 `/responses/compact`，并按 `uni-api` 的相关逻辑去掉 `store`
+- `/v1/responses/compact` 在上游 5xx 或传输错误时，会默认把当前 key 冷却 `60` 秒后切换下一把 key；可用 `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS=0` 关闭
 - 如果上游返回 `429` 且 `error.type=usage_limit_reached`，会按 `resets_in_seconds` 或 `resets_at` 冷却当前 key，然后自动重试下一个 key
 - 如果上游返回 `402 {"detail":{"code":"deactivated_workspace"}}` 或 `401` 且 `error.code=account_deactivated`，会永久停用该 key
 - 如果上游返回普通 `401/403`，会清空当前 access token，并尝试刷新/切换下一个 key

@@ -10,6 +10,7 @@ def test_frontend_routes_are_registered() -> None:
     assert "/admin/tokens" in paths
     assert "/admin/tokens/import" in paths
     assert "/v1/responses" in paths
+    assert "/v1/responses/compact" in paths
 
 
 def test_assets_mount_is_registered() -> None:
