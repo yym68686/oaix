@@ -12,6 +12,7 @@ class RequestLogItem:
     request_id: str
     endpoint: str
     model: str | None
+    model_name: str | None
     is_stream: bool
     status_code: int | None
     success: bool | None
@@ -47,6 +48,7 @@ async def create_request_log(
     request_id: str,
     endpoint: str,
     model: str | None,
+    model_name: str | None = None,
     is_stream: bool,
     started_at: datetime | None = None,
     client_ip: str | None = None,
@@ -59,6 +61,7 @@ async def create_request_log(
                 request_id=request_id,
                 endpoint=endpoint,
                 model=model,
+                model_name=model_name or model,
                 is_stream=is_stream,
                 started_at=started_at,
                 client_ip=client_ip,
@@ -78,6 +81,7 @@ async def finalize_request_log(
     finished_at: datetime | None = None,
     first_token_at: datetime | None = None,
     account_id: str | None = None,
+    model_name: str | None = None,
     error_message: str | None = None,
 ) -> None:
     finished_at = finished_at or utcnow()
@@ -94,6 +98,7 @@ async def finalize_request_log(
             item.ttft_ms = _ms_between(item.started_at, first_token_at)
             item.duration_ms = _ms_between(item.started_at, finished_at)
             item.account_id = account_id or item.account_id
+            item.model_name = model_name or item.model_name or item.model
             item.error_message = (error_message or "").strip()[:4000] or None
 
 
@@ -135,6 +140,7 @@ async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
                 request_id=item.request_id,
                 endpoint=item.endpoint,
                 model=item.model,
+                model_name=item.model_name,
                 is_stream=item.is_stream,
                 status_code=item.status_code,
                 success=item.success,

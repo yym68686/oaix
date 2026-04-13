@@ -272,17 +272,24 @@ function renderRequestList(items) {
   elements.requestList.innerHTML = items
     .map((item) => {
       const status = deriveRequestStatus(item);
-      const model = item.model || "未带 model";
       const mode = item.is_stream ? "Stream" : "JSON";
       const attemptLabel = item.attempt_count ? `${item.attempt_count} 次` : "—";
       const endpoint = item.endpoint || "—";
       const startedAt = item.started_at || "";
       const errorMessage = item.error_message || "—";
+      const requestedModel = item.model || "";
+      const modelName = item.model_name || requestedModel || "未带 model";
+      const requestedModelMeta =
+        requestedModel && requestedModel !== modelName ? `<span class="request-row__meta">${escapeHtml(`请求: ${requestedModel}`)}</span>` : "";
       return `
         <article class="request-row">
           <div class="request-row__primary">
             <span class="request-row__title" title="${escapeHtml(startedAt)}">${escapeHtml(formatDate(item.started_at))}</span>
-            <span class="request-row__meta">${escapeHtml(`${model} · ${mode}`)}</span>
+            <span class="request-row__meta">${escapeHtml(mode)}</span>
+          </div>
+          <div class="request-row__model" data-label="模型名" title="${escapeHtml(modelName)}">
+            <span class="request-row__model-name">${escapeHtml(modelName)}</span>
+            ${requestedModelMeta}
           </div>
           <div class="request-row__endpoint" data-label="端点" title="${escapeHtml(endpoint)}">${escapeHtml(endpoint)}</div>
           <div class="request-row__status" data-label="状态">
@@ -392,7 +399,7 @@ async function loadRequests() {
       renderRequestSummary({});
       elements.requestList.innerHTML = `
         <article class="empty-state">
-          <p>请求日志已加锁。填入 Service API Key 后可查看请求次数、端点、状态码和首字时间。</p>
+          <p>请求日志已加锁。填入 Service API Key 后可查看请求次数、模型名、端点、状态码和首字时间。</p>
         </article>
       `;
       return;

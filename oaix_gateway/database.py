@@ -61,6 +61,7 @@ class GatewayRequestLog(Base):
     request_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     endpoint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     is_stream: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     success: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
@@ -133,18 +134,27 @@ def _drop_single_column_uniques(sync_conn, table_name: str, column_name: str) ->
 
 def _run_schema_migrations(sync_conn) -> None:
     inspector = inspect(sync_conn)
-    if "codex_tokens" not in inspector.get_table_names():
-        return
+    table_names = set(inspector.get_table_names())
 
-    existing_columns = {column["name"] for column in inspector.get_columns("codex_tokens")}
-    if "cooldown_until" not in existing_columns:
-        sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN cooldown_until TIMESTAMPTZ"))
-    if "refresh_token_aliases" not in existing_columns:
-        sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN refresh_token_aliases JSON"))
-    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_cooldown_until ON codex_tokens (cooldown_until)"))
-    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_refresh_token ON codex_tokens (refresh_token)"))
-    _drop_single_column_uniques(sync_conn, "codex_tokens", "account_id")
-    _drop_single_column_uniques(sync_conn, "codex_tokens", "email")
+    if "codex_tokens" in table_names:
+        token_columns = {column["name"] for column in inspector.get_columns("codex_tokens")}
+        if "cooldown_until" not in token_columns:
+            sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN cooldown_until TIMESTAMPTZ"))
+        if "refresh_token_aliases" not in token_columns:
+            sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN refresh_token_aliases JSON"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_cooldown_until ON codex_tokens (cooldown_until)"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_refresh_token ON codex_tokens (refresh_token)"))
+        _drop_single_column_uniques(sync_conn, "codex_tokens", "account_id")
+        _drop_single_column_uniques(sync_conn, "codex_tokens", "email")
+
+    if "gateway_request_logs" in table_names:
+        request_columns = {column["name"] for column in inspector.get_columns("gateway_request_logs")}
+        if "model" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN model VARCHAR(128)"))
+        if "model_name" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN model_name VARCHAR(128)"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model ON gateway_request_logs (model)"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))
 
 
 async def _backfill_token_refresh_aliases() -> None:

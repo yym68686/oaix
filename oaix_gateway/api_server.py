@@ -98,6 +98,7 @@ class ResponsesRequest(BaseModel):
 class ProxyRequestResult:
     response: Response
     status_code: int
+    model_name: str | None = None
     first_token_at: datetime | None = None
 
 
@@ -308,6 +309,27 @@ def _mapping_get(payload: Any, *keys: str) -> Any | None:
             return None
         current = current.get(key)
     return current
+
+
+def _normalize_optional_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _extract_response_model_name(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    for candidate in (
+        payload.get("model_name"),
+        payload.get("model"),
+        _mapping_get(payload, "response", "model_name"),
+        _mapping_get(payload, "response", "model"),
+    ):
+        model_name = _normalize_optional_text(candidate)
+        if model_name:
+            return model_name
+    return None
 
 
 def _extract_responses_stream_event(raw_event: str) -> tuple[str, Any]:
@@ -586,7 +608,7 @@ def _decode_responses_json_body(raw: bytes) -> dict[str, Any]:
     return payload
 
 
-async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) -> tuple[list[bytes], bool]:
+async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) -> tuple[list[bytes], bool, str | None]:
     """
     Buffer only initial status events so semantic stream failures can still
     trigger key failover before the downstream response is committed.
@@ -594,6 +616,7 @@ async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) 
     buffered_chunks: list[bytes] = []
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    model_name: str | None = None
 
     while True:
         try:
@@ -603,7 +626,7 @@ async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) 
                 raise HTTPException(status_code=502, detail="Upstream closed stream without data") from exc
             if text_buffer.strip():
                 raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
-            return buffered_chunks, False
+            return buffered_chunks, False, model_name
 
         buffered_chunks.append(chunk)
         text_buffer += decoder.decode(chunk)
@@ -619,15 +642,18 @@ async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) 
                 continue
 
             event_type, event_payload = _extract_responses_stream_event(raw_event)
+            extracted_model_name = _extract_response_model_name(event_payload)
+            if extracted_model_name:
+                model_name = extracted_model_name
             if event_type == "[DONE]":
-                return buffered_chunks, False
+                return buffered_chunks, False, model_name
 
             semantic_failure = _responses_failure_http_exception(event_payload)
             if semantic_failure is not None:
                 raise semantic_failure
 
             if not event_type or event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
-                return buffered_chunks, True
+                return buffered_chunks, True, model_name
 
 
 def _extract_usage_limit_cooldown_seconds(status_code: int, error_text: str) -> int | None:
@@ -942,6 +968,7 @@ def create_app() -> FastAPI:
                         finished_at=utcnow(),
                         first_token_at=proxy_result.first_token_at,
                         account_id=token_row.account_id,
+                        model_name=proxy_result.model_name,
                     )
                     if isinstance(proxy_result.response, StreamingResponse):
                         _append_background_task(proxy_result.response, response_lease.release)
@@ -1161,7 +1188,7 @@ async def _proxy_request_with_token(
 
         upstream_iter = upstream_response.aiter_raw()
         try:
-            buffered_chunks, stream_committed = await _prime_responses_upstream_stream(upstream_iter)
+            buffered_chunks, stream_committed, model_name = await _prime_responses_upstream_stream(upstream_iter)
         except HTTPException:
             await stream_cm.__aexit__(None, None, None)
             raise
@@ -1180,6 +1207,7 @@ async def _proxy_request_with_token(
                 media_type="text/event-stream",
             ),
             status_code=upstream_response.status_code,
+            model_name=model_name or request_data.model,
             first_token_at=utcnow() if stream_committed else None,
         )
 
@@ -1207,6 +1235,7 @@ async def _proxy_request_with_token(
             return ProxyRequestResult(
                 response=JSONResponse(status_code=upstream_response.status_code, content=data),
                 status_code=upstream_response.status_code,
+                model_name=_extract_response_model_name(data) or request_data.model,
                 first_token_at=first_token_at,
             )
         finally:
@@ -1233,6 +1262,7 @@ async def _proxy_request_with_token(
         return ProxyRequestResult(
             response=JSONResponse(status_code=upstream_response.status_code, content=data),
             status_code=upstream_response.status_code,
+            model_name=_extract_response_model_name(data) or request_data.model,
             first_token_at=first_token_at,
         )
     finally:

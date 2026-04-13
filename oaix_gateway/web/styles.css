@@ -733,12 +733,13 @@ button {
 
 .request-panel__body {
   --table-columns:
-    minmax(0, 1.14fr)
+    minmax(120px, 0.82fr)
+    minmax(0, 1.08fr)
     minmax(0, 0.9fr)
     minmax(94px, 0.56fr)
     minmax(104px, 0.72fr)
     minmax(88px, 0.6fr)
-    minmax(0, 1.24fr);
+    minmax(0, 1.2fr);
   overflow: hidden;
   border-radius: calc(var(--radius-xl) - 10px);
   border: 1px solid var(--border-strong);
@@ -837,6 +838,12 @@ button {
   gap: 4px;
 }
 
+.request-row__model {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
 .token-row__account {
   font-weight: 800;
 }
@@ -852,6 +859,7 @@ button {
 }
 
 .request-row__meta,
+.request-row__model,
 .request-row__endpoint,
 .request-row__status,
 .request-row__time,
@@ -864,6 +872,13 @@ button {
 .request-row__endpoint {
   font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
   font-size: 0.88rem;
+  word-break: break-word;
+  color: var(--ink);
+}
+
+.request-row__model-name {
+  font-weight: 800;
+  line-height: 1.45;
   word-break: break-word;
   color: var(--ink);
 }
@@ -1053,6 +1068,7 @@ button {
 
   .token-row__time::before,
   .token-row__error::before,
+  .request-row__model::before,
   .request-row__endpoint::before,
   .request-row__status::before,
   .request-row__time::before,
@@ -1068,6 +1084,7 @@ button {
 
   .token-row__time[data-label]::before,
   .token-row__error[data-label]::before,
+  .request-row__model[data-label]::before,
   .request-row__endpoint[data-label]::before,
   .request-row__status[data-label]::before,
   .request-row__time[data-label]::before,

@@ -150,14 +150,15 @@ def test_responses_failure_http_exception_detects_response_failed_payload() -> N
 
 def test_prime_responses_upstream_stream_commits_after_first_non_prefight_event() -> None:
     async def upstream() -> AsyncIterator[bytes]:
-        yield b'event: response.created\ndata: {"type":"response.created"}\n\n'
+        yield b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.4"}}\n\n'
         yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n'
 
-    buffered_chunks, stream_committed = asyncio.run(_prime_responses_upstream_stream(upstream()))
+    buffered_chunks, stream_committed, model_name = asyncio.run(_prime_responses_upstream_stream(upstream()))
 
     assert stream_committed is True
+    assert model_name == "gpt-5.4"
     assert buffered_chunks == [
-        b'event: response.created\ndata: {"type":"response.created"}\n\n',
+        b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.4"}}\n\n',
         b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n',
     ]
 
@@ -264,7 +265,7 @@ def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request(
             )
             response = DummyStreamingResponse(
                 [
-                    b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_456","status":"in_progress"}}\n\n',
+                    b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_456","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
                     b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n',
                     b'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
                 ]
@@ -305,8 +306,10 @@ def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request(
     assert json.loads(stream_call["content"])["stream"] is True
     assert result.first_token_at is not None
     assert result.status_code == 200
+    assert result.model_name == "gpt-5.4-mini"
     body = json.loads(result.response.body)
     assert body["id"] == "resp_456"
+    assert body["model"] == "gpt-5.4-mini"
     assert body["status"] == "completed"
     assert body["output"][0]["content"][0]["text"] == "hello"
 
@@ -355,6 +358,7 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
                     json.dumps(
                         {
                             "id": "resp_compact_123",
+                            "model": "gpt-5.4-compact",
                             "status": "completed",
                             "output": [
                                 {
@@ -407,8 +411,10 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
     assert "stream" not in json.loads(stream_call["content"])
     assert result.first_token_at is not None
     assert result.status_code == 200
+    assert result.model_name == "gpt-5.4-compact"
     body = json.loads(result.response.body)
     assert body["id"] == "resp_compact_123"
+    assert body["model"] == "gpt-5.4-compact"
     assert body["status"] == "completed"
     assert body["output"][0]["content"][0]["text"] == "hello compact"
 
