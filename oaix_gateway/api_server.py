@@ -1,8 +1,10 @@
+import codecs
 import json
 import logging
 import os
+import re
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -30,6 +32,49 @@ from .token_store import (
 
 logger = logging.getLogger("oaix.gateway")
 WEB_DIR = Path(__file__).resolve().parent / "web"
+RESPONSES_STREAM_PREFLIGHT_EVENTS = frozenset(
+    {
+        "response.created",
+        "response.in_progress",
+        "response.queued",
+    }
+)
+RESPONSES_STREAM_NETWORK_ERRORS = (
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+    httpx.LocalProtocolError,
+    httpx.ReadTimeout,
+    httpx.ConnectError,
+)
+RESPONSES_FAILURE_STATUS_BY_CODE = {
+    "account_deactivated": 403,
+    "account_disabled": 403,
+    "account_suspended": 403,
+    "authentication_error": 401,
+    "billing_hard_limit_reached": 429,
+    "context_length_exceeded": 400,
+    "deactivated_workspace": 403,
+    "incorrect_api_key_provided": 401,
+    "insufficient_quota": 429,
+    "invalid_api_key": 401,
+    "invalid_request_error": 400,
+    "invalid_type": 400,
+    "model_not_found": 404,
+    "not_found_error": 404,
+    "permission_denied": 403,
+    "rate_limit_exceeded": 429,
+    "unsupported_parameter": 400,
+    "user_deactivated": 403,
+    "user_suspended": 403,
+}
+RESPONSES_FAILURE_STATUS_BY_TYPE = {
+    "authentication_error": 401,
+    "invalid_request_error": 400,
+    "not_found_error": 404,
+    "permission_error": 403,
+    "rate_limit_error": 429,
+    "tokens": 429,
+}
 
 
 class ResponsesRequest(BaseModel):
@@ -152,6 +197,150 @@ def _decode_error_body(raw: bytes) -> str:
         return repr(raw)
 
 
+def _mapping_get(payload: Any, *keys: str) -> Any | None:
+    current: Any = payload
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _extract_responses_stream_event(raw_event: str) -> tuple[str, Any]:
+    event_name = ""
+    data_lines: list[str] = []
+    for line in raw_event.splitlines():
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+
+    data_str = "\n".join(data_lines).strip()
+    if data_str == "[DONE]":
+        return "[DONE]", "[DONE]"
+
+    parsed_payload: Any = data_str
+    if data_str:
+        try:
+            parsed_payload = json.loads(data_str)
+        except Exception:
+            parsed_payload = data_str
+
+    if not event_name and isinstance(parsed_payload, dict):
+        event_name = str(parsed_payload.get("type") or "").strip()
+
+    return event_name, parsed_payload
+
+
+def _responses_error_status_code(error_obj: Any) -> int:
+    if isinstance(error_obj, dict):
+        raw_status = error_obj.get("status_code") or error_obj.get("status")
+        try:
+            status_code = int(raw_status)
+        except (TypeError, ValueError):
+            status_code = None
+        if status_code is not None and 100 <= status_code <= 599:
+            return status_code
+
+        error_code = str(error_obj.get("code") or "").strip().lower()
+        if error_code in RESPONSES_FAILURE_STATUS_BY_CODE:
+            return RESPONSES_FAILURE_STATUS_BY_CODE[error_code]
+
+        error_type = str(error_obj.get("type") or "").strip().lower()
+        if error_type in RESPONSES_FAILURE_STATUS_BY_TYPE:
+            return RESPONSES_FAILURE_STATUS_BY_TYPE[error_type]
+
+        message = str(error_obj.get("message") or "").lower()
+        if "rate limit" in message or "too many requests" in message:
+            return 429
+        if "invalid" in message or "unsupported" in message:
+            return 400
+        if "not found" in message:
+            return 404
+        if "permission" in message or "forbidden" in message:
+            return 403
+        if "auth" in message or "api key" in message or "unauthorized" in message:
+            return 401
+
+    return 500
+
+
+def _responses_failure_http_exception(payload: Any) -> HTTPException | None:
+    if not isinstance(payload, dict):
+        return None
+
+    error_obj = None
+    response_status = str(_mapping_get(payload, "response", "status") or "").strip().lower()
+    payload_status = str(payload.get("status") or "").strip().lower()
+    payload_type = str(payload.get("type") or "").strip().lower()
+
+    if payload_type == "error" and payload.get("error") is not None:
+        error_obj = payload.get("error")
+    elif payload_type == "response.failed":
+        error_obj = _mapping_get(payload, "response", "error")
+    elif payload_status == "failed":
+        error_obj = payload.get("error")
+    elif response_status == "failed":
+        error_obj = _mapping_get(payload, "response", "error")
+    elif isinstance(payload.get("error"), dict):
+        error_obj = payload.get("error")
+
+    if error_obj is None and (payload_status == "failed" or response_status == "failed"):
+        error_obj = {"message": "Responses upstream returned status=failed"}
+
+    if error_obj is None:
+        return None
+
+    return HTTPException(
+        status_code=_responses_error_status_code(error_obj),
+        detail=json.dumps({"error": error_obj}, ensure_ascii=False),
+    )
+
+
+async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) -> tuple[list[bytes], bool]:
+    """
+    Buffer only initial status events so semantic stream failures can still
+    trigger key failover before the downstream response is committed.
+    """
+    buffered_chunks: list[bytes] = []
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text_buffer = ""
+
+    while True:
+        try:
+            chunk = await upstream_iter.__anext__()
+        except StopAsyncIteration as exc:
+            if not buffered_chunks:
+                raise HTTPException(status_code=502, detail="Upstream closed stream without data") from exc
+            if text_buffer.strip():
+                raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
+            return buffered_chunks, False
+
+        buffered_chunks.append(chunk)
+        text_buffer += decoder.decode(chunk)
+
+        while True:
+            match = re.search(r"\r?\n\r?\n", text_buffer)
+            if not match:
+                break
+
+            raw_event = text_buffer[:match.start()]
+            text_buffer = text_buffer[match.end():]
+            if not raw_event.strip():
+                continue
+
+            event_type, event_payload = _extract_responses_stream_event(raw_event)
+            if event_type == "[DONE]":
+                return buffered_chunks, False
+
+            semantic_failure = _responses_failure_http_exception(event_payload)
+            if semantic_failure is not None:
+                raise semantic_failure
+
+            if not event_type or event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
+                return buffered_chunks, True
+
+
 def _extract_usage_limit_cooldown_seconds(status_code: int, error_text: str) -> int | None:
     if status_code != 429:
         return None
@@ -232,6 +421,10 @@ def _get_compact_codex_server_error_cooling_time(
     if _extract_usage_limit_cooldown_seconds(status_code, error_text) is not None:
         return 0
     return _compact_server_error_cooldown_seconds()
+
+
+def _should_retry_upstream_server_error(status_code: int) -> bool:
+    return 500 <= status_code <= 599
 
 
 @asynccontextmanager
@@ -401,8 +594,6 @@ def create_app() -> FastAPI:
                 status_code = getattr(exc, "status_code", 500)
                 detail = str(getattr(exc, "detail", "") or exc)
                 cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
-                permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
-                auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
 
                 if cooldown_seconds is not None:
                     await mark_token_error(
@@ -421,28 +612,8 @@ def create_app() -> FastAPI:
                     last_error = exc
                     continue
 
-                compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
-                    compact=compact,
-                    status_code=status_code,
-                    error_text=detail,
-                )
-                if compact_server_error_cooling_time > 0 and attempt < max_attempts:
-                    await mark_token_error(
-                        token_row.id,
-                        detail,
-                        cooldown_seconds=compact_server_error_cooling_time,
-                    )
-                    logger.warning(
-                        "Codex compact key cooled after upstream server error: token_id=%s account_id=%s status=%s cooldown_seconds=%s attempt=%s/%s",
-                        token_row.id,
-                        token_row.account_id,
-                        status_code,
-                        compact_server_error_cooling_time,
-                        attempt,
-                        max_attempts,
-                    )
-                    last_error = exc
-                    continue
+                permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
+                auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
 
                 if permanently_disabled or auth_failed_after_refresh:
                     oauth_manager.invalidate(token_row.id)
@@ -478,6 +649,29 @@ def create_app() -> FastAPI:
                     last_error = exc
                     continue
 
+                compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                    compact=compact,
+                    status_code=status_code,
+                    error_text=detail,
+                )
+                if _should_retry_upstream_server_error(status_code) and attempt < max_attempts:
+                    mark_kwargs: dict[str, Any] = {}
+                    if compact_server_error_cooling_time > 0:
+                        mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                    await mark_token_error(token_row.id, detail, **mark_kwargs)
+                    logger.warning(
+                        "Codex upstream server error before response commit: token_id=%s account_id=%s status=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        status_code,
+                        compact,
+                        compact_server_error_cooling_time,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = exc
+                    continue
+
                 raise
             except httpx.HTTPError as exc:
                 message = f"Upstream request failed: {type(exc).__name__}: {exc}"
@@ -486,17 +680,17 @@ def create_app() -> FastAPI:
                     status_code=500,
                     error_text=message,
                 )
-                if compact_server_error_cooling_time > 0 and attempt < max_attempts:
-                    await mark_token_error(
-                        token_row.id,
-                        message,
-                        cooldown_seconds=compact_server_error_cooling_time,
-                    )
+                if attempt < max_attempts:
+                    mark_kwargs: dict[str, Any] = {}
+                    if compact_server_error_cooling_time > 0:
+                        mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                    await mark_token_error(token_row.id, message, **mark_kwargs)
                     logger.warning(
-                        "Codex compact key cooled after upstream transport error: token_id=%s account_id=%s error_type=%s cooldown_seconds=%s attempt=%s/%s",
+                        "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
                         token_row.account_id,
                         type(exc).__name__,
+                        compact,
                         compact_server_error_cooling_time,
                         attempt,
                         max_attempts,
@@ -518,11 +712,24 @@ def create_app() -> FastAPI:
 
 async def _stream_upstream_response(
     stream_cm,
-    upstream_response: httpx.Response,
+    upstream_iter: AsyncIterator[bytes],
+    buffered_chunks: list[bytes],
+    *,
+    stream_committed: bool,
 ) -> AsyncGenerator[bytes, None]:
     try:
-        async for chunk in upstream_response.aiter_raw():
+        for chunk in buffered_chunks:
             yield chunk
+        async for chunk in upstream_iter:
+            yield chunk
+    except RESPONSES_STREAM_NETWORK_ERRORS as exc:
+        logger.warning(
+            "Codex upstream stream aborted after response commit: error_type=%s detail=%s",
+            type(exc).__name__,
+            str(exc) or type(exc).__name__,
+        )
+        if stream_committed:
+            yield b"data: [DONE]\n\n"
     finally:
         await stream_cm.__aexit__(None, None, None)
 
@@ -563,8 +770,23 @@ async def _proxy_request_with_token(
                 detail=_decode_error_body(raw),
             )
 
+        upstream_iter = upstream_response.aiter_raw()
+        try:
+            buffered_chunks, stream_committed = await _prime_responses_upstream_stream(upstream_iter)
+        except HTTPException:
+            await stream_cm.__aexit__(None, None, None)
+            raise
+        except RESPONSES_STREAM_NETWORK_ERRORS:
+            await stream_cm.__aexit__(None, None, None)
+            raise
+
         return StreamingResponse(
-            _stream_upstream_response(stream_cm, upstream_response),
+            _stream_upstream_response(
+                stream_cm,
+                upstream_iter,
+                buffered_chunks,
+                stream_committed=stream_committed,
+            ),
             media_type="text/event-stream",
         )
 
@@ -589,6 +811,9 @@ async def _proxy_request_with_token(
             status_code=upstream_response.status_code,
             media_type=upstream_response.headers.get("content-type", "application/octet-stream"),
         )
+    semantic_failure = _responses_failure_http_exception(data)
+    if semantic_failure is not None:
+        raise semantic_failure
     return JSONResponse(status_code=upstream_response.status_code, content=data)
 
 

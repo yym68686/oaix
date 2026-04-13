@@ -143,6 +143,7 @@ account_id_3,refresh_token_3
 - 只会选择 `is_active=true` 且 `cooldown_until` 不在未来的 key
 - `/v1/responses/compact` 会透传到上游 `/responses/compact`，并按 `uni-api` 的相关逻辑去掉 `store`
 - `/v1/responses/compact` 在上游 5xx 或传输错误时，会默认把当前 key 冷却 `60` 秒后切换下一把 key；可用 `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS=0` 关闭
+- 流式 `/v1/responses*` 会先预读开头的 SSE 状态事件；如果前缀已经是 `response.failed` / `type=error` / 不完整流 / 预读阶段网络错误，就不会先把坏流交给客户端，而是留在网关里切下一把 key
 - 如果上游返回 `429` 且 `error.type=usage_limit_reached`，会按 `resets_in_seconds` 或 `resets_at` 冷却当前 key，然后自动重试下一个 key
 - 如果上游返回 `402 {"detail":{"code":"deactivated_workspace"}}` 或 `401` 且 `error.code=account_deactivated`，会永久停用该 key
 - 如果上游返回普通 `401/403`，会清空当前 access token，并尝试刷新/切换下一个 key
