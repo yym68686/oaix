@@ -198,15 +198,18 @@ function renderCounts(counts) {
 }
 
 function deriveRequestStatus(item) {
-  const statusCode = Number(item.status_code || 0);
-  if (statusCode >= 200 && statusCode < 300 && item.success !== false) {
-    return { label: String(statusCode || 200), tone: "success" };
-  }
-  if (statusCode > 0) {
+  const statusCode = Number(item.status_code);
+  if (Number.isFinite(statusCode) && statusCode > 0) {
+    if (statusCode >= 200 && statusCode < 300 && item.success !== false) {
+      return { label: String(statusCode), tone: "success" };
+    }
     return { label: String(statusCode), tone: "failed" };
   }
   if (item.success === true) {
     return { label: "OK", tone: "success" };
+  }
+  if (!item.finished_at) {
+    return { label: "处理中", tone: "pending" };
   }
   return { label: "ERR", tone: "failed" };
 }

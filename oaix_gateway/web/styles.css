@@ -899,6 +899,11 @@ button {
   color: var(--status-available-fg);
 }
 
+.status-pill--pending {
+  background: var(--status-cooling-bg);
+  color: var(--status-cooling-fg);
+}
+
 .status-pill--failed {
   background: var(--status-disabled-bg);
   color: var(--status-disabled-fg);
