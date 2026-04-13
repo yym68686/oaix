@@ -117,6 +117,16 @@ curl -X POST http://127.0.0.1:8000/admin/tokens/import \
 python import_tokens.py token_*.json
 ```
 
+前端控制台里除了 JSON，也支持直接粘贴这种逐行格式：
+
+```text
+account_id_1,refresh_token_1
+account_id_2,refresh_token_2
+account_id_3,refresh_token_3
+```
+
+也就是每行一个 `account_id,refresh_token`，粘贴后会自动解析成导入批次。
+
 ## 接口
 
 - `GET /healthz`: 查看可用 key 数量与状态

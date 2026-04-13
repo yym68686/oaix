@@ -107,18 +107,18 @@
           </div>
 
           <label class="field">
-            <span class="field__label">粘贴 token JSON</span>
+            <span class="field__label">粘贴 Key 数据</span>
             <textarea
               id="token-json"
               rows="10"
-              placeholder='支持单个对象、对象数组，或 {"tokens":[...]}'
+              placeholder='支持 JSON；也支持每行一个：account_id,refresh_token'
             ></textarea>
           </label>
 
           <label class="upload-zone" for="token-files">
-            <input id="token-files" type="file" accept=".json,application/json" multiple />
-            <span class="upload-zone__title">选择一个或多个 JSON 文件</span>
-            <span class="upload-zone__hint">文件里的对象会自动合并到导入批次中</span>
+            <input id="token-files" type="file" accept=".json,.txt,.csv,application/json,text/plain" multiple />
+            <span class="upload-zone__title">选择一个或多个 JSON / TXT / CSV 文件</span>
+            <span class="upload-zone__hint">支持 JSON，或每行一个 account_id,refresh_token</span>
           </label>
 
           <div class="field-actions field-actions--primary">

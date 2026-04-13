@@ -256,21 +256,70 @@ function normalizePayload(raw) {
   throw new Error("token JSON 必须是对象、数组，或 { tokens: [...] }");
 }
 
+function parseAccountRefreshLines(text, sourceLabel) {
+  const payloads = [];
+  const lines = text.split(/\r?\n/);
+
+  lines.forEach((rawLine, index) => {
+    const line = rawLine.trim();
+    if (!line) {
+      return;
+    }
+
+    const commaIndex = line.indexOf(",");
+    if (commaIndex <= 0 || commaIndex === line.length - 1) {
+      throw new Error(`${sourceLabel} 第 ${index + 1} 行格式错误，应为 account_id,refresh_token`);
+    }
+
+    const accountId = line.slice(0, commaIndex).trim();
+    const refreshToken = line.slice(commaIndex + 1).trim();
+    if (!accountId || !refreshToken) {
+      throw new Error(`${sourceLabel} 第 ${index + 1} 行缺少 account_id 或 refresh_token`);
+    }
+
+    payloads.push({
+      account_id: accountId,
+      refresh_token: refreshToken,
+      type: "codex",
+    });
+  });
+
+  return payloads;
+}
+
+function parseImportText(text, sourceLabel) {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const firstChar = trimmed[0];
+  if (firstChar === "{" || firstChar === "[") {
+    try {
+      return normalizePayload(JSON.parse(trimmed));
+    } catch (error) {
+      throw new Error(`${sourceLabel} JSON 解析失败：${error.message}`);
+    }
+  }
+
+  return parseAccountRefreshLines(trimmed, sourceLabel);
+}
+
 async function collectImportPayloads() {
   const payloads = [];
   const textareaValue = elements.tokenJson.value.trim();
   if (textareaValue) {
-    payloads.push(...normalizePayload(JSON.parse(textareaValue)));
+    payloads.push(...parseImportText(textareaValue, "粘贴内容"));
   }
 
   const files = Array.from(elements.tokenFiles.files || []);
   for (const file of files) {
     const text = await file.text();
-    payloads.push(...normalizePayload(JSON.parse(text)));
+    payloads.push(...parseImportText(text, `文件 ${file.name}`));
   }
 
   if (payloads.length === 0) {
-    throw new Error("请先粘贴 JSON，或选择至少一个 JSON 文件");
+    throw new Error("请先粘贴 JSON / account_id,refresh_token 文本，或选择至少一个文件");
   }
   return payloads;
 }
