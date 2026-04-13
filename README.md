@@ -1,6 +1,6 @@
 # oaix-gateway
 
-从 `/Users/yanyuming/Downloads/GitHub/oai-x` 单独拆出的精简项目，只保留这些能力：
+从 `oai-x` 单独拆出的精简项目，只保留这些能力：
 
 - key 池持久化与状态维护
 - 请求前选择可用 key
