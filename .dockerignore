@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+tests
+oaix_gateway.egg-info

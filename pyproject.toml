@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oaix-gateway"
+version = "0.1.0"
+description = "Standalone Codex key-pool and responses gateway extracted from oai-x"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg>=0.30",
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "SQLAlchemy>=2.0",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["oaix_gateway*"]
+
+[tool.setuptools]
+py-modules = ["import_tokens"]
+
+[tool.setuptools.package-data]
+oaix_gateway = ["web/*"]

@@ -1,0 +1,110 @@
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, func, inspect, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/oaix_gateway"
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def normalize_database_url(database_url: str | None = None) -> str:
+    raw = (database_url or os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL).strip()
+    if raw.startswith("postgres://"):
+        return "postgresql+asyncpg://" + raw[len("postgres://") :]
+    if raw.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + raw[len("postgresql://") :]
+    return raw
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class CodexToken(Base):
+    __tablename__ = "codex_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str | None] = mapped_column(String(320), unique=True, index=True, nullable=True)
+    account_id: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
+    id_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    access_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
+    token_type: Mapped[str] = mapped_column("type", String(32), nullable=False, default="codex", index=True)
+    last_refresh_at: Mapped[datetime | None] = mapped_column("last_refresh", DateTime(timezone=True), nullable=True, index=True)
+    expires_at: Mapped[datetime | None] = mapped_column("expired", DateTime(timezone=True), nullable=True, index=True)
+    recovery: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    raw_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    source_file: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+_engine = None
+_session_factory = None
+
+
+def get_engine():
+    global _engine
+    if _engine is None:
+        _engine = create_async_engine(
+            normalize_database_url(),
+            pool_pre_ping=True,
+        )
+    return _engine
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    global _session_factory
+    if _session_factory is None:
+        _session_factory = async_sessionmaker(
+            get_engine(),
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+    return _session_factory
+
+
+@asynccontextmanager
+async def get_session() -> AsyncIterator[AsyncSession]:
+    session = get_session_factory()()
+    try:
+        yield session
+    finally:
+        await session.close()
+
+
+async def init_db() -> None:
+    async with get_engine().begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_run_schema_migrations)
+
+
+def _run_schema_migrations(sync_conn) -> None:
+    inspector = inspect(sync_conn)
+    if "codex_tokens" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("codex_tokens")}
+    if "cooldown_until" not in existing_columns:
+        sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN cooldown_until TIMESTAMPTZ"))
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_cooldown_until ON codex_tokens (cooldown_until)"))
+
+
+async def close_database() -> None:
+    global _engine, _session_factory
+    if _engine is not None:
+        await _engine.dispose()
+    _engine = None
+    _session_factory = None

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>oaix Key Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Manrope:wght@400;500;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="hero reveal">
+        <div class="hero__copy">
+          <p class="eyebrow">oaix key operations</p>
+          <h1>Key 池控制台</h1>
+          <p class="hero__lede">
+            用一个前端面板看清 key 的存量、冷却和停用状态，并在同一处导入新的 token JSON。
+          </p>
+        </div>
+        <div class="hero__meta">
+          <div class="meta-chip" id="protection-chip">检测服务状态中</div>
+          <div class="meta-chip meta-chip--subtle" id="sync-chip">等待首次同步</div>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="overview reveal" aria-labelledby="overview-title">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">Snapshot</p>
+              <h2 id="overview-title">池状态剖面</h2>
+            </div>
+            <button class="ghost-button" id="refresh-button" type="button">刷新</button>
+          </div>
+
+          <div class="stats-grid">
+            <article class="stat-card stat-card--available">
+              <p class="stat-card__label">有效 Key</p>
+              <p class="stat-card__value" id="available-count">0</p>
+              <p class="stat-card__hint">当前可立即请求上游的 key 数量</p>
+            </article>
+
+            <article class="stat-card stat-card--cooling">
+              <p class="stat-card__label">冷却中</p>
+              <p class="stat-card__value" id="cooling-count">0</p>
+              <p class="stat-card__hint">命中配额后暂时不可用</p>
+            </article>
+
+            <article class="stat-card stat-card--disabled">
+              <p class="stat-card__label">已禁用</p>
+              <p class="stat-card__value" id="disabled-count">0</p>
+              <p class="stat-card__hint">认证失效或永久停用</p>
+            </article>
+          </div>
+
+          <article class="distribution-panel">
+            <div class="distribution-panel__head">
+              <div>
+                <p class="section-kicker">Distribution</p>
+                <h3>状态分布</h3>
+              </div>
+              <p class="distribution-panel__total">总量 <strong id="total-count">0</strong></p>
+            </div>
+            <div class="distribution-bar" aria-hidden="true">
+              <span class="distribution-bar__segment distribution-bar__segment--available" id="bar-available"></span>
+              <span class="distribution-bar__segment distribution-bar__segment--cooling" id="bar-cooling"></span>
+              <span class="distribution-bar__segment distribution-bar__segment--disabled" id="bar-disabled"></span>
+            </div>
+            <div class="distribution-legend">
+              <div>
+                <span class="legend-dot legend-dot--available"></span>
+                <span>有效 <strong id="legend-available">0%</strong></span>
+              </div>
+              <div>
+                <span class="legend-dot legend-dot--cooling"></span>
+                <span>冷却 <strong id="legend-cooling">0%</strong></span>
+              </div>
+              <div>
+                <span class="legend-dot legend-dot--disabled"></span>
+                <span>禁用 <strong id="legend-disabled">0%</strong></span>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <aside class="import-panel reveal" aria-labelledby="import-title">
+          <div class="section-head section-head--compact">
+            <div>
+              <p class="section-kicker">Import</p>
+              <h2 id="import-title">导入 Key</h2>
+            </div>
+          </div>
+
+          <label class="field">
+            <span class="field__label">Service API Key</span>
+            <input id="service-key" type="password" placeholder="如果启用了 SERVICE_API_KEYS，请填在这里" />
+          </label>
+
+          <div class="field-actions">
+            <button class="ghost-button" id="save-key-button" type="button">保存凭证</button>
+            <button class="ghost-button" id="clear-key-button" type="button">清空</button>
+          </div>
+
+          <label class="field">
+            <span class="field__label">粘贴 token JSON</span>
+            <textarea
+              id="token-json"
+              rows="10"
+              placeholder='支持单个对象、对象数组，或 {"tokens":[...]}'
+            ></textarea>
+          </label>
+
+          <label class="upload-zone" for="token-files">
+            <input id="token-files" type="file" accept=".json,application/json" multiple />
+            <span class="upload-zone__title">选择一个或多个 JSON 文件</span>
+            <span class="upload-zone__hint">文件里的对象会自动合并到导入批次中</span>
+          </label>
+
+          <div class="field-actions field-actions--primary">
+            <button class="primary-button" id="import-button" type="button">开始导入</button>
+            <button class="ghost-button" id="reset-import-button" type="button">清空内容</button>
+          </div>
+
+          <div class="import-feedback" id="import-feedback" role="status" aria-live="polite">
+            等待导入。
+          </div>
+        </aside>
+
+        <section class="token-panel reveal" aria-labelledby="token-list-title">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">Registry</p>
+              <h2 id="token-list-title">最近 Key 状态</h2>
+            </div>
+            <p class="section-note" id="list-note">显示最近 80 条记录</p>
+          </div>
+
+          <div class="token-panel__body">
+            <div class="table-head">
+              <span>账号</span>
+              <span>状态</span>
+              <span>最近使用</span>
+              <span>冷却截止</span>
+              <span>错误摘要</span>
+            </div>
+            <div class="token-list" id="token-list">
+              <article class="empty-state">
+                <p>还没有可展示的数据。</p>
+              </article>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>
