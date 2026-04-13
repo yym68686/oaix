@@ -9,6 +9,7 @@ from typing import Any, Iterable
 from sqlalchemy import func, nullsfirst, or_, select
 
 from .database import CodexToken, close_database, get_session, init_db, utcnow
+from .token_identity import collect_refresh_token_aliases, merge_refresh_token_aliases, normalize_refresh_token
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,20 @@ class TokenStatus:
     last_error: str | None
     source_file: str | None
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class TokenUpsertResult:
+    token: CodexToken
+    action: str
+
+
+@dataclass(frozen=True)
+class TokenFileImportSummary:
+    created_count: int
+    updated_count: int
+    skipped_count: int
+    failed_count: int
 
 
 def parse_rfc3339(value: Any) -> datetime | None:
@@ -79,17 +94,52 @@ def _available_token_filters(now: datetime) -> tuple[Any, ...]:
     )
 
 
-async def _find_existing_token(session, *, account_id: str | None, email: str | None) -> CodexToken | None:
+def _pick_preferred_token(tokens: list[CodexToken], *, account_id: str | None) -> CodexToken | None:
+    if not tokens:
+        return None
     if account_id:
-        result = await session.execute(select(CodexToken).where(CodexToken.account_id == account_id))
-        token = result.scalar_one_or_none()
-        if token is not None:
-            return token
-    if email:
-        result = await session.execute(select(CodexToken).where(CodexToken.email == email))
-        token = result.scalar_one_or_none()
-        if token is not None:
-            return token
+        for token in tokens:
+            if token.account_id == account_id:
+                return token
+    return max(tokens, key=lambda item: item.id)
+
+
+def _token_aliases(token: CodexToken) -> list[str]:
+    return collect_refresh_token_aliases(token.refresh_token_aliases, token.refresh_token, token.raw_payload)
+
+
+async def _find_existing_token(
+    session,
+    *,
+    refresh_token: str,
+    account_id: str | None,
+) -> CodexToken | None:
+    exact_result = await session.execute(
+        select(CodexToken).where(CodexToken.refresh_token == refresh_token).order_by(CodexToken.id.desc())
+    )
+    exact_matches = exact_result.scalars().all()
+    token = _pick_preferred_token(exact_matches, account_id=account_id)
+    if token is not None:
+        return token
+
+    account_candidates: list[CodexToken] = []
+    if account_id:
+        account_result = await session.execute(
+            select(CodexToken).where(CodexToken.account_id == account_id).order_by(CodexToken.id.desc())
+        )
+        account_candidates = account_result.scalars().all()
+        for candidate in account_candidates:
+            if refresh_token in _token_aliases(candidate):
+                return candidate
+
+    all_result = await session.execute(select(CodexToken).order_by(CodexToken.id.desc()))
+    all_tokens = all_result.scalars().all()
+    account_candidate_ids = {item.id for item in account_candidates}
+    for candidate in all_tokens:
+        if account_candidate_ids and candidate.id in account_candidate_ids:
+            continue
+        if refresh_token in _token_aliases(candidate):
+            return candidate
     return None
 
 
@@ -97,42 +147,65 @@ async def upsert_token_payload(
     token_data_or_json: str | dict[str, Any],
     *,
     source_file: str | None = None,
-) -> CodexToken:
+) -> TokenUpsertResult:
     payload = _load_token_payload(token_data_or_json)
     email = str(payload.get("email") or "").strip() or None
     account_id = str(payload.get("account_id") or "").strip() or None
+    refresh_token = normalize_refresh_token(payload.get("refresh_token"))
+    if refresh_token is None:
+        raise ValueError("Token payload missing refresh_token")
     recovery = payload.get("recovery")
     if recovery is not None and not isinstance(recovery, dict):
         recovery = None
 
     async with get_session() as session:
         async with session.begin():
-            token = await _find_existing_token(session, account_id=account_id, email=email)
+            token = await _find_existing_token(session, refresh_token=refresh_token, account_id=account_id)
             if token is None:
                 token = CodexToken(
                     email=email,
                     account_id=account_id,
-                    refresh_token=str(payload["refresh_token"]).strip(),
+                    id_token=str(payload.get("id_token") or "").strip() or None,
+                    access_token=str(payload.get("access_token") or "").strip() or None,
+                    refresh_token=refresh_token,
+                    refresh_token_aliases=[refresh_token],
+                    token_type=str(payload.get("type") or "codex").strip() or "codex",
+                    last_refresh_at=parse_rfc3339(payload.get("last_refresh")),
+                    expires_at=parse_rfc3339(payload.get("expired")),
+                    recovery=recovery,
+                    raw_payload=payload,
+                    source_file=source_file,
+                    is_active=True,
+                    cooldown_until=None,
+                    last_error=None,
+                    updated_at=utcnow(),
                 )
                 session.add(token)
+                await session.flush()
+                return TokenUpsertResult(token=token, action="created")
 
-            token.email = email or token.email
-            token.account_id = account_id or token.account_id
-            token.id_token = str(payload.get("id_token") or "").strip() or None
-            token.access_token = str(payload.get("access_token") or "").strip() or None
-            token.refresh_token = str(payload["refresh_token"]).strip()
-            token.token_type = str(payload.get("type") or "codex").strip() or "codex"
-            token.last_refresh_at = parse_rfc3339(payload.get("last_refresh"))
-            token.expires_at = parse_rfc3339(payload.get("expired"))
-            token.recovery = recovery
-            token.raw_payload = payload
+            token.email = token.email or email
+            token.account_id = token.account_id or account_id
+            token.token_type = str(payload.get("type") or token.token_type or "codex").strip() or token.token_type or "codex"
             token.source_file = source_file or token.source_file
-            token.is_active = True
-            token.cooldown_until = None
-            token.last_error = None
+            token.refresh_token_aliases = merge_refresh_token_aliases(_token_aliases(token), refresh_token)
             token.updated_at = utcnow()
+
+            if refresh_token == normalize_refresh_token(token.refresh_token):
+                token.id_token = str(payload.get("id_token") or "").strip() or None
+                token.access_token = str(payload.get("access_token") or "").strip() or None
+                token.last_refresh_at = parse_rfc3339(payload.get("last_refresh"))
+                token.expires_at = parse_rfc3339(payload.get("expired"))
+                token.recovery = recovery
+                token.raw_payload = payload
+                token.is_active = True
+                token.cooldown_until = None
+                token.last_error = None
+                await session.flush()
+                return TokenUpsertResult(token=token, action="updated")
+
             await session.flush()
-            return token
+            return TokenUpsertResult(token=token, action="duplicate")
 
 
 async def claim_next_active_token() -> CodexToken | None:
@@ -172,9 +245,15 @@ async def update_token_refresh_state(
             token = await session.get(CodexToken, token_id, with_for_update=True)
             if token is None:
                 return
+            previous_refresh_token = token.refresh_token
             token.access_token = access_token
             if refresh_token:
                 token.refresh_token = refresh_token
+            token.refresh_token_aliases = merge_refresh_token_aliases(
+                token.refresh_token_aliases,
+                previous_refresh_token,
+                refresh_token,
+            )
             token.last_refresh_at = utcnow()
             token.expires_at = expires_at
             token.is_active = True
@@ -275,10 +354,12 @@ async def list_tokens(limit: int = 100) -> list[TokenStatus]:
         ]
 
 
-async def import_token_files(patterns: Iterable[str]) -> tuple[int, int]:
+async def import_token_files(patterns: Iterable[str]) -> TokenFileImportSummary:
     await init_db()
 
-    imported = 0
+    created = 0
+    updated = 0
+    skipped = 0
     failed = 0
     seen_paths: set[str] = set()
     for pattern in patterns:
@@ -290,16 +371,27 @@ async def import_token_files(patterns: Iterable[str]) -> tuple[int, int]:
             try:
                 with open(resolved, "r", encoding="utf-8") as f:
                     payload = json.load(f)
-                await upsert_token_payload(payload, source_file=resolved)
-                imported += 1
+                result = await upsert_token_payload(payload, source_file=resolved)
+                if result.action == "created":
+                    created += 1
+                elif result.action == "updated":
+                    updated += 1
+                else:
+                    skipped += 1
             except Exception:
                 failed += 1
-    return imported, failed
+    return TokenFileImportSummary(
+        created_count=created,
+        updated_count=updated,
+        skipped_count=skipped,
+        failed_count=failed,
+    )
 
 
 async def save_token_json(token_json: str, *, source_file: str | None = None) -> StoredTokenSummary:
     await init_db()
-    token = await upsert_token_payload(token_json, source_file=source_file)
+    result = await upsert_token_payload(token_json, source_file=source_file)
+    token = result.token
     return StoredTokenSummary(id=token.id, email=token.email, account_id=token.account_id)
 
 
@@ -313,8 +405,8 @@ def save_token_json_sync(token_json: str, *, source_file: str | None = None) -> 
     return asyncio.run(_runner())
 
 
-def import_token_files_sync(patterns: Iterable[str]) -> tuple[int, int]:
-    async def _runner() -> tuple[int, int]:
+def import_token_files_sync(patterns: Iterable[str]) -> TokenFileImportSummary:
+    async def _runner() -> TokenFileImportSummary:
         try:
             return await import_token_files(patterns)
         finally:

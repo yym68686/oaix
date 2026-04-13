@@ -539,28 +539,45 @@ def create_app() -> FastAPI:
                 detail="Body must be a token object, an array of token objects, or {'tokens': [...]}",
             )
 
-        imported: list[dict[str, Any]] = []
+        created: list[dict[str, Any]] = []
+        updated: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
         for index, payload in enumerate(payloads):
             if not isinstance(payload, dict):
                 failed.append({"index": index, "error": "Token payload must be a JSON object"})
                 continue
             try:
-                token = await upsert_token_payload(payload)
-                imported.append(
-                    {
-                        "id": token.id,
-                        "email": token.email,
-                        "account_id": token.account_id,
-                    }
-                )
+                result = await upsert_token_payload(payload)
+                item = {
+                    "id": result.token.id,
+                    "email": result.token.email,
+                    "account_id": result.token.account_id,
+                    "index": index,
+                }
+                if result.action == "created":
+                    created.append(item)
+                elif result.action == "updated":
+                    updated.append(item)
+                else:
+                    skipped.append(
+                        {
+                            **item,
+                            "reason": "duplicate_refresh_token_history",
+                        }
+                    )
             except Exception as exc:
                 failed.append({"index": index, "error": str(exc)})
 
         return {
-            "imported_count": len(imported),
+            "imported_count": len(created) + len(updated),
+            "created_count": len(created),
+            "updated_count": len(updated),
+            "skipped_count": len(skipped),
             "failed_count": len(failed),
-            "imported": imported,
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
             "failed": failed,
         }
 

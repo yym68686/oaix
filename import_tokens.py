@@ -21,9 +21,11 @@ def main() -> None:
     if args.database_url:
         os.environ["DATABASE_URL"] = args.database_url
 
-    imported, failed = import_token_files_sync(args.patterns)
-    print(f"Imported: {imported}")
-    print(f"Failed: {failed}")
+    summary = import_token_files_sync(args.patterns)
+    print(f"Created: {summary.created_count}")
+    print(f"Updated: {summary.updated_count}")
+    print(f"Skipped duplicates: {summary.skipped_count}")
+    print(f"Failed: {summary.failed_count}")
 
 
 if __name__ == "__main__":

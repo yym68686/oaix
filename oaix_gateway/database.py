@@ -3,9 +3,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, func, inspect, text
+from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from .token_identity import collect_refresh_token_aliases
 
 
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/oaix_gateway"
@@ -32,11 +34,12 @@ class CodexToken(Base):
     __tablename__ = "codex_tokens"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    email: Mapped[str | None] = mapped_column(String(320), unique=True, index=True, nullable=True)
-    account_id: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
+    email: Mapped[str | None] = mapped_column(String(320), index=True, nullable=True)
+    account_id: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
     id_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     access_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token_aliases: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     token_type: Mapped[str] = mapped_column("type", String(32), nullable=False, default="codex", index=True)
     last_refresh_at: Mapped[datetime | None] = mapped_column("last_refresh", DateTime(timezone=True), nullable=True, index=True)
     expires_at: Mapped[datetime | None] = mapped_column("expired", DateTime(timezone=True), nullable=True, index=True)
@@ -111,6 +114,21 @@ async def init_db() -> None:
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_run_schema_migrations)
+    await _backfill_token_refresh_aliases()
+
+
+def _drop_single_column_uniques(sync_conn, table_name: str, column_name: str) -> None:
+    inspector = inspect(sync_conn)
+    for constraint in inspector.get_unique_constraints(table_name):
+        if constraint.get("column_names") == [column_name] and constraint.get("name"):
+            sync_conn.execute(text(f'ALTER TABLE "{table_name}" DROP CONSTRAINT IF EXISTS "{constraint["name"]}"'))
+
+    inspector = inspect(sync_conn)
+    for index in inspector.get_indexes(table_name):
+        if index.get("unique") and index.get("column_names") == [column_name] and index.get("name"):
+            sync_conn.execute(text(f'DROP INDEX IF EXISTS "{index["name"]}"'))
+
+    sync_conn.execute(text(f'CREATE INDEX IF NOT EXISTS ix_{table_name}_{column_name} ON "{table_name}" ("{column_name}")'))
 
 
 def _run_schema_migrations(sync_conn) -> None:
@@ -121,7 +139,27 @@ def _run_schema_migrations(sync_conn) -> None:
     existing_columns = {column["name"] for column in inspector.get_columns("codex_tokens")}
     if "cooldown_until" not in existing_columns:
         sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN cooldown_until TIMESTAMPTZ"))
+    if "refresh_token_aliases" not in existing_columns:
+        sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN refresh_token_aliases JSON"))
     sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_cooldown_until ON codex_tokens (cooldown_until)"))
+    _drop_single_column_uniques(sync_conn, "codex_tokens", "account_id")
+    _drop_single_column_uniques(sync_conn, "codex_tokens", "email")
+
+
+async def _backfill_token_refresh_aliases() -> None:
+    async with get_session() as session:
+        async with session.begin():
+            result = await session.execute(select(CodexToken))
+            tokens = result.scalars().all()
+            for token in tokens:
+                aliases = collect_refresh_token_aliases(
+                    token.refresh_token_aliases,
+                    token.refresh_token,
+                    token.raw_payload,
+                )
+                if aliases != (token.refresh_token_aliases or []):
+                    token.refresh_token_aliases = aliases
+                    token.updated_at = utcnow()
 
 
 async def close_database() -> None:

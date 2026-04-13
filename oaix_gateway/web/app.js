@@ -536,8 +536,9 @@ async function importTokens() {
     });
 
     const message = [
-      `导入完成：成功 ${data.imported_count || 0} 条，失败 ${data.failed_count || 0} 条。`,
+      `导入完成：新增 ${data.created_count || 0} 条，更新 ${data.updated_count || 0} 条，跳过重复 ${data.skipped_count || 0} 条，失败 ${data.failed_count || 0} 条。`,
       data.failed_count ? `失败原因：${(data.failed || []).slice(0, 3).map((item) => item.error).join("；")}` : "",
+      data.skipped_count ? "重复判定基于当前 RT 和历史 RT 链，不会再按 account_id 合并不同账号。" : "",
     ]
       .filter(Boolean)
       .join(" ");
