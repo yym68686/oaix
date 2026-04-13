@@ -19,7 +19,7 @@
           <p class="eyebrow">oaix key operations</p>
           <h1>Key 池控制台</h1>
           <p class="hero__lede">
-            用一个前端面板看清 key 的存量、冷却和停用状态，并在同一处导入新的 token JSON。
+            用一个前端面板看清 key 的存量、冷却和停用状态，请求去了哪个端点、状态码如何、首 token 多久到，并在同一处导入新的 token JSON。
           </p>
         </div>
         <div class="hero__meta">
@@ -156,6 +156,51 @@
             <div class="token-list" id="token-list">
               <article class="empty-state">
                 <p>还没有可展示的数据。</p>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section class="request-panel reveal" aria-labelledby="request-list-title">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">Traffic</p>
+              <h2 id="request-list-title">请求观察</h2>
+            </div>
+            <p class="section-note" id="request-note">显示最近 80 条请求</p>
+          </div>
+
+          <div class="metric-strip" aria-label="请求摘要">
+            <article class="metric-pill">
+              <span class="metric-pill__label">总请求</span>
+              <strong class="metric-pill__value" id="request-total-count">0</strong>
+            </article>
+            <article class="metric-pill">
+              <span class="metric-pill__label">成功</span>
+              <strong class="metric-pill__value" id="request-success-count">0</strong>
+            </article>
+            <article class="metric-pill">
+              <span class="metric-pill__label">失败</span>
+              <strong class="metric-pill__value" id="request-failed-count">0</strong>
+            </article>
+            <article class="metric-pill">
+              <span class="metric-pill__label">平均首 Token</span>
+              <strong class="metric-pill__value" id="request-avg-ttft">—</strong>
+            </article>
+          </div>
+
+          <div class="request-panel__body">
+            <div class="table-head request-table-head">
+              <span>请求</span>
+              <span>端点</span>
+              <span>状态码</span>
+              <span>首 Token</span>
+              <span>尝试次数</span>
+              <span>错误摘要</span>
+            </div>
+            <div class="request-list" id="request-list">
+              <article class="empty-state">
+                <p>还没有请求记录。</p>
               </article>
             </div>
           </div>

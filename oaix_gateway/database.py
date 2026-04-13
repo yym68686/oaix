@@ -51,6 +51,28 @@ class CodexToken(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class GatewayRequestLog(Base):
+    __tablename__ = "gateway_request_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    endpoint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    is_stream: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    success: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    account_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    first_token_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    ttft_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 _engine = None
 _session_factory = None
 

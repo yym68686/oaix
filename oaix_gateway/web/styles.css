@@ -71,7 +71,8 @@ button {
 .hero,
 .overview,
 .import-panel,
-.token-panel {
+.token-panel,
+.request-panel {
   position: relative;
   isolation: isolate;
 }
@@ -146,12 +147,14 @@ button {
   grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.9fr);
   grid-template-areas:
     "overview import"
-    "tokens tokens";
+    "tokens tokens"
+    "requests requests";
 }
 
 .overview,
 .import-panel,
-.token-panel {
+.token-panel,
+.request-panel {
   overflow: hidden;
   border: 1px solid color-mix(in oklab, var(--line) 75%, white);
   border-radius: var(--radius-xl);
@@ -173,6 +176,11 @@ button {
 
 .token-panel {
   grid-area: tokens;
+  padding: clamp(18px, 3vw, 28px);
+}
+
+.request-panel {
+  grid-area: requests;
   padding: clamp(18px, 3vw, 28px);
 }
 
@@ -504,6 +512,44 @@ button {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(255, 255, 255, 0.52));
 }
 
+.request-panel__body {
+  overflow: hidden;
+  border-radius: calc(var(--radius-xl) - 10px);
+  border: 1px solid color-mix(in oklab, var(--line) 78%, white);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(255, 255, 255, 0.52));
+}
+
+.metric-strip {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 18px;
+}
+
+.metric-pill {
+  display: grid;
+  gap: 8px;
+  padding: 16px 18px;
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in oklab, var(--line) 76%, white);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(255, 255, 255, 0.62));
+}
+
+.metric-pill__label {
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.metric-pill__value {
+  font-family: "Fraunces", "Songti SC", serif;
+  font-size: clamp(1.7rem, 3vw, 2.4rem);
+  line-height: 0.95;
+  letter-spacing: -0.04em;
+}
+
 .table-head,
 .token-row {
   display: grid;
@@ -526,6 +572,10 @@ button {
   display: grid;
 }
 
+.request-list {
+  display: grid;
+}
+
 .token-row {
   padding: 16px 18px;
   border-bottom: 1px solid color-mix(in oklab, var(--line) 52%, white);
@@ -535,7 +585,25 @@ button {
   border-bottom: 0;
 }
 
+.request-row {
+  display: grid;
+  grid-template-columns: 1.18fr 0.82fr 0.58fr 0.72fr 0.72fr 1.18fr;
+  gap: 18px;
+  align-items: center;
+  padding: 16px 18px;
+  border-bottom: 1px solid color-mix(in oklab, var(--line) 52%, white);
+}
+
+.request-row:last-child {
+  border-bottom: 0;
+}
+
 .token-row__primary {
+  display: grid;
+  gap: 4px;
+}
+
+.request-row__primary {
   display: grid;
   gap: 4px;
 }
@@ -544,9 +612,27 @@ button {
   font-weight: 800;
 }
 
+.request-row__title {
+  font-weight: 800;
+}
+
 .token-row__meta {
   font-size: 0.88rem;
   color: var(--ink-soft);
+}
+
+.request-row__meta,
+.request-row__endpoint,
+.request-row__status,
+.request-row__time,
+.request-row__error {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+
+.request-row__endpoint {
+  word-break: break-word;
 }
 
 .status-pill {
@@ -575,6 +661,16 @@ button {
   color: color-mix(in oklab, var(--disabled) 76%, black);
 }
 
+.status-pill--success {
+  background: color-mix(in oklab, var(--available) 18%, white);
+  color: color-mix(in oklab, var(--available) 70%, black);
+}
+
+.status-pill--failed {
+  background: color-mix(in oklab, var(--disabled) 18%, white);
+  color: color-mix(in oklab, var(--disabled) 76%, black);
+}
+
 .token-row__time,
 .token-row__error {
   font-size: 0.92rem;
@@ -583,6 +679,10 @@ button {
 }
 
 .token-row__error {
+  word-break: break-word;
+}
+
+.request-row__error {
   word-break: break-word;
 }
 
@@ -614,6 +714,10 @@ button {
   animation-delay: 260ms;
 }
 
+.request-panel.reveal {
+  animation-delay: 320ms;
+}
+
 @keyframes reveal {
   to {
     opacity: 1;
@@ -642,7 +746,8 @@ button {
     grid-template-areas:
       "overview"
       "import"
-      "tokens";
+      "tokens"
+      "requests";
   }
 
   .hero {
@@ -664,6 +769,10 @@ button {
     grid-template-columns: 1fr;
   }
 
+  .metric-strip {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .stat-card--available {
     grid-row: auto;
   }
@@ -678,17 +787,23 @@ button {
     display: none;
   }
 
-  .token-row {
+  .token-row,
+  .request-row {
     grid-template-columns: 1fr;
     gap: 12px;
   }
 
-  .token-row > * {
+  .token-row > *,
+  .request-row > * {
     min-width: 0;
   }
 
   .token-row__time::before,
-  .token-row__error::before {
+  .token-row__error::before,
+  .request-row__endpoint::before,
+  .request-row__status::before,
+  .request-row__time::before,
+  .request-row__error::before {
     display: block;
     margin-bottom: 4px;
     font-size: 0.76rem;
@@ -699,7 +814,11 @@ button {
   }
 
   .token-row__time[data-label]::before,
-  .token-row__error[data-label]::before {
+  .token-row__error[data-label]::before,
+  .request-row__endpoint[data-label]::before,
+  .request-row__status[data-label]::before,
+  .request-row__time[data-label]::before,
+  .request-row__error[data-label]::before {
     content: attr(data-label);
   }
 }

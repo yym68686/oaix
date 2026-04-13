@@ -6,7 +6,7 @@ import re
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,8 +18,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
-from .database import close_database, init_db
+from .database import close_database, init_db, utcnow
 from .oauth import CodexOAuthManager
+from .request_store import (
+    create_request_log,
+    finalize_request_log,
+    get_request_log_summary,
+    list_request_logs,
+)
 from .token_store import (
     claim_next_active_token,
     get_token_counts,
@@ -83,6 +89,13 @@ class ResponsesRequest(BaseModel):
     stream: bool | None = None
 
     model_config = ConfigDict(extra="allow")
+
+
+@dataclass(frozen=True)
+class ProxyRequestResult:
+    response: Response
+    status_code: int
+    first_token_at: datetime | None = None
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
@@ -155,6 +168,12 @@ def _codex_responses_url(*, compact: bool = False) -> str:
     if compact:
         return _normalize_responses_compact_upstream_url(base)
     return _normalize_responses_upstream_url(base)
+
+
+def _responses_endpoint_path(*, compact: bool = False) -> str:
+    if compact:
+        return "/v1/responses/compact"
+    return "/v1/responses"
 
 
 def _build_upstream_headers(http_request: Request, access_token: str, account_id: str | None, stream: bool) -> dict[str, str]:
@@ -486,6 +505,18 @@ def create_app() -> FastAPI:
             "items": items,
         }
 
+    @app.get("/admin/requests")
+    async def list_requests_route(
+        limit: int = Query(100, ge=1, le=500),
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        summary = await get_request_log_summary()
+        items = [asdict(item) for item in await list_request_logs(limit=limit)]
+        return {
+            "summary": asdict(summary),
+            "items": items,
+        }
+
     @app.post("/admin/tokens/import")
     async def import_tokens_route(
         http_request: Request,
@@ -555,157 +586,206 @@ def create_app() -> FastAPI:
         *,
         compact: bool,
     ) -> Response:
-        counts = await get_token_counts()
-        if counts.available <= 0:
-            raise HTTPException(status_code=503, detail="No available Codex token in database")
+        endpoint = _responses_endpoint_path(compact=compact)
+        request_started_at = utcnow()
+        request_log = await create_request_log(
+            request_id=str(uuid.uuid4()),
+            endpoint=endpoint,
+            model=request_data.model,
+            is_stream=bool(request_data.stream),
+            started_at=request_started_at,
+            client_ip=http_request.client.host if http_request.client is not None else None,
+            user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
+        )
 
-        max_attempts = max(1, min(counts.available, _max_request_account_retries()))
-        client: httpx.AsyncClient = http_request.app.state.http_client
-        oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
-        last_error: HTTPException | None = None
+        attempt_count = 0
+        last_account_id: str | None = None
 
-        for attempt in range(1, max_attempts + 1):
-            token_row = await claim_next_active_token()
-            if token_row is None:
-                break
+        try:
+            counts = await get_token_counts()
+            if counts.available <= 0:
+                raise HTTPException(status_code=503, detail="No available Codex token in database")
 
-            try:
-                access_token, access_token_refreshed = await oauth_manager.get_access_token(token_row, client)
-            except HTTPException as exc:
-                oauth_manager.invalidate(token_row.id)
-                await mark_token_error(token_row.id, str(exc.detail), deactivate=exc.status_code in (401, 403))
-                if exc.status_code in (401, 403):
-                    last_error = exc
-                    continue
-                raise
+            max_attempts = max(1, min(counts.available, _max_request_account_retries()))
+            client: httpx.AsyncClient = http_request.app.state.http_client
+            oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
+            last_error: HTTPException | None = None
 
-            try:
-                response = await _proxy_request_with_token(
-                    client,
-                    http_request,
-                    request_data,
-                    access_token=access_token,
-                    account_id=token_row.account_id,
-                    compact=compact,
-                )
-                await mark_token_success(token_row.id)
-                return response
-            except HTTPException as exc:
-                status_code = getattr(exc, "status_code", 500)
-                detail = str(getattr(exc, "detail", "") or exc)
-                cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
+            for attempt in range(1, max_attempts + 1):
+                attempt_count = attempt
+                token_row = await claim_next_active_token()
+                if token_row is None:
+                    break
+                last_account_id = token_row.account_id
 
-                if cooldown_seconds is not None:
-                    await mark_token_error(
-                        token_row.id,
-                        detail,
-                        cooldown_seconds=cooldown_seconds,
-                    )
-                    logger.warning(
-                        "Codex account cooled down: token_id=%s account_id=%s cooldown_seconds=%s attempt=%s/%s",
-                        token_row.id,
-                        token_row.account_id,
-                        cooldown_seconds,
-                        attempt,
-                        max_attempts,
-                    )
-                    last_error = exc
-                    continue
-
-                permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
-                auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
-
-                if permanently_disabled or auth_failed_after_refresh:
+                try:
+                    access_token, access_token_refreshed = await oauth_manager.get_access_token(token_row, client)
+                except HTTPException as exc:
                     oauth_manager.invalidate(token_row.id)
-                    await mark_token_error(
-                        token_row.id,
-                        detail,
-                        deactivate=True,
-                        clear_access_token=True,
-                    )
-                    logger.warning(
-                        "Codex account disabled after upstream auth failure: token_id=%s account_id=%s status=%s refreshed=%s attempt=%s/%s",
-                        token_row.id,
-                        token_row.account_id,
-                        status_code,
-                        access_token_refreshed,
-                        attempt,
-                        max_attempts,
-                    )
-                    last_error = exc
-                    continue
+                    await mark_token_error(token_row.id, str(exc.detail), deactivate=exc.status_code in (401, 403))
+                    if exc.status_code in (401, 403):
+                        last_error = exc
+                        continue
+                    raise
 
-                if status_code in (401, 403):
-                    oauth_manager.invalidate(token_row.id)
-                    await mark_token_error(token_row.id, detail, clear_access_token=True)
-                    logger.warning(
-                        "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
-                        token_row.id,
-                        token_row.account_id,
-                        status_code,
-                        attempt,
-                        max_attempts,
+                try:
+                    proxy_result = await _proxy_request_with_token(
+                        client,
+                        http_request,
+                        request_data,
+                        access_token=access_token,
+                        account_id=token_row.account_id,
+                        compact=compact,
                     )
-                    last_error = exc
-                    continue
+                    await mark_token_success(token_row.id)
+                    await finalize_request_log(
+                        request_log.id,
+                        status_code=proxy_result.status_code,
+                        success=True,
+                        attempt_count=attempt,
+                        finished_at=utcnow(),
+                        first_token_at=proxy_result.first_token_at,
+                        account_id=token_row.account_id,
+                    )
+                    return proxy_result.response
+                except HTTPException as exc:
+                    status_code = getattr(exc, "status_code", 500)
+                    detail = str(getattr(exc, "detail", "") or exc)
+                    cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
 
-                compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
-                    compact=compact,
-                    status_code=status_code,
-                    error_text=detail,
+                    if cooldown_seconds is not None:
+                        await mark_token_error(
+                            token_row.id,
+                            detail,
+                            cooldown_seconds=cooldown_seconds,
+                        )
+                        logger.warning(
+                            "Codex account cooled down: token_id=%s account_id=%s cooldown_seconds=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            cooldown_seconds,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
+                    permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
+                    auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
+
+                    if permanently_disabled or auth_failed_after_refresh:
+                        oauth_manager.invalidate(token_row.id)
+                        await mark_token_error(
+                            token_row.id,
+                            detail,
+                            deactivate=True,
+                            clear_access_token=True,
+                        )
+                        logger.warning(
+                            "Codex account disabled after upstream auth failure: token_id=%s account_id=%s status=%s refreshed=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            status_code,
+                            access_token_refreshed,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
+                    if status_code in (401, 403):
+                        oauth_manager.invalidate(token_row.id)
+                        await mark_token_error(token_row.id, detail, clear_access_token=True)
+                        logger.warning(
+                            "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            status_code,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
+                    compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                        compact=compact,
+                        status_code=status_code,
+                        error_text=detail,
+                    )
+                    if _should_retry_upstream_server_error(status_code) and attempt < max_attempts:
+                        mark_kwargs: dict[str, Any] = {}
+                        if compact_server_error_cooling_time > 0:
+                            mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                        await mark_token_error(token_row.id, detail, **mark_kwargs)
+                        logger.warning(
+                            "Codex upstream server error before response commit: token_id=%s account_id=%s status=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            status_code,
+                            compact,
+                            compact_server_error_cooling_time,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
+                    raise
+                except httpx.HTTPError as exc:
+                    message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                    compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                        compact=compact,
+                        status_code=500,
+                        error_text=message,
+                    )
+                    if attempt < max_attempts:
+                        mark_kwargs: dict[str, Any] = {}
+                        if compact_server_error_cooling_time > 0:
+                            mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                        await mark_token_error(token_row.id, message, **mark_kwargs)
+                        logger.warning(
+                            "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            type(exc).__name__,
+                            compact,
+                            compact_server_error_cooling_time,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = HTTPException(status_code=502, detail=message)
+                        continue
+                    await mark_token_error(token_row.id, message)
+                    raise HTTPException(status_code=502, detail=message) from exc
+
+            if last_error is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
                 )
-                if _should_retry_upstream_server_error(status_code) and attempt < max_attempts:
-                    mark_kwargs: dict[str, Any] = {}
-                    if compact_server_error_cooling_time > 0:
-                        mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
-                    await mark_token_error(token_row.id, detail, **mark_kwargs)
-                    logger.warning(
-                        "Codex upstream server error before response commit: token_id=%s account_id=%s status=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
-                        token_row.id,
-                        token_row.account_id,
-                        status_code,
-                        compact,
-                        compact_server_error_cooling_time,
-                        attempt,
-                        max_attempts,
-                    )
-                    last_error = exc
-                    continue
-
-                raise
-            except httpx.HTTPError as exc:
-                message = f"Upstream request failed: {type(exc).__name__}: {exc}"
-                compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
-                    compact=compact,
-                    status_code=500,
-                    error_text=message,
-                )
-                if attempt < max_attempts:
-                    mark_kwargs: dict[str, Any] = {}
-                    if compact_server_error_cooling_time > 0:
-                        mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
-                    await mark_token_error(token_row.id, message, **mark_kwargs)
-                    logger.warning(
-                        "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
-                        token_row.id,
-                        token_row.account_id,
-                        type(exc).__name__,
-                        compact,
-                        compact_server_error_cooling_time,
-                        attempt,
-                        max_attempts,
-                    )
-                    last_error = HTTPException(status_code=502, detail=message)
-                    continue
-                await mark_token_error(token_row.id, message)
-                raise HTTPException(status_code=502, detail=message) from exc
-
-        if last_error is not None:
-            raise HTTPException(
-                status_code=503,
-                detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
+            raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
+        except HTTPException as exc:
+            await finalize_request_log(
+                request_log.id,
+                status_code=getattr(exc, "status_code", 500),
+                success=False,
+                attempt_count=attempt_count,
+                finished_at=utcnow(),
+                account_id=last_account_id,
+                error_message=str(getattr(exc, "detail", "") or exc),
             )
-        raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
+            raise
+        except Exception as exc:
+            await finalize_request_log(
+                request_log.id,
+                status_code=500,
+                success=False,
+                attempt_count=attempt_count,
+                finished_at=utcnow(),
+                account_id=last_account_id,
+                error_message=str(exc),
+            )
+            raise
 
     return app
 
@@ -742,7 +822,7 @@ async def _proxy_request_with_token(
     access_token: str,
     account_id: str | None,
     compact: bool = False,
-) -> Response:
+) -> ProxyRequestResult:
     payload = _sanitize_codex_payload(request_data.model_dump(exclude_unset=True), compact=compact)
     headers = _build_upstream_headers(
         http_request,
@@ -780,14 +860,18 @@ async def _proxy_request_with_token(
             await stream_cm.__aexit__(None, None, None)
             raise
 
-        return StreamingResponse(
-            _stream_upstream_response(
-                stream_cm,
-                upstream_iter,
-                buffered_chunks,
-                stream_committed=stream_committed,
+        return ProxyRequestResult(
+            response=StreamingResponse(
+                _stream_upstream_response(
+                    stream_cm,
+                    upstream_iter,
+                    buffered_chunks,
+                    stream_committed=stream_committed,
+                ),
+                media_type="text/event-stream",
             ),
-            media_type="text/event-stream",
+            status_code=upstream_response.status_code,
+            first_token_at=utcnow() if stream_committed else None,
         )
 
     upstream_response = await client.post(
@@ -806,15 +890,21 @@ async def _proxy_request_with_token(
     try:
         data = upstream_response.json()
     except json.JSONDecodeError:
-        return Response(
-            content=upstream_response.content,
+        return ProxyRequestResult(
+            response=Response(
+                content=upstream_response.content,
+                status_code=upstream_response.status_code,
+                media_type=upstream_response.headers.get("content-type", "application/octet-stream"),
+            ),
             status_code=upstream_response.status_code,
-            media_type=upstream_response.headers.get("content-type", "application/octet-stream"),
         )
     semantic_failure = _responses_failure_http_exception(data)
     if semantic_failure is not None:
         raise semantic_failure
-    return JSONResponse(status_code=upstream_response.status_code, content=data)
+    return ProxyRequestResult(
+        response=JSONResponse(status_code=upstream_response.status_code, content=data),
+        status_code=upstream_response.status_code,
+    )
 
 
 app = create_app()

@@ -31,6 +31,12 @@ const elements = {
   importFeedback: document.getElementById("import-feedback"),
   tokenList: document.getElementById("token-list"),
   listNote: document.getElementById("list-note"),
+  requestList: document.getElementById("request-list"),
+  requestNote: document.getElementById("request-note"),
+  requestTotalCount: document.getElementById("request-total-count"),
+  requestSuccessCount: document.getElementById("request-success-count"),
+  requestFailedCount: document.getElementById("request-failed-count"),
+  requestAvgTtft: document.getElementById("request-avg-ttft"),
 };
 
 elements.serviceKey.value = state.serviceKey;
@@ -77,6 +83,20 @@ function formatPercent(value, total) {
   return `${Math.round((value / total) * 100)}%`;
 }
 
+function formatDurationMs(value) {
+  if (value == null || Number.isNaN(Number(value))) {
+    return "—";
+  }
+  const ms = Number(value);
+  if (ms < 1000) {
+    return `${ms} ms`;
+  }
+  if (ms < 10000) {
+    return `${(ms / 1000).toFixed(1)} s`;
+  }
+  return `${Math.round(ms / 1000)} s`;
+}
+
 function clampWidth(value, total) {
   if (!total || value <= 0) {
     return "0%";
@@ -117,6 +137,32 @@ function renderCounts(counts) {
   elements.barDisabled.style.width = clampWidth(disabled, total);
 }
 
+function deriveRequestStatus(item) {
+  const statusCode = Number(item.status_code || 0);
+  if (statusCode >= 200 && statusCode < 300 && item.success !== false) {
+    return { label: String(statusCode || 200), tone: "success" };
+  }
+  if (statusCode > 0) {
+    return { label: String(statusCode), tone: "failed" };
+  }
+  if (item.success === true) {
+    return { label: "OK", tone: "success" };
+  }
+  return { label: "ERR", tone: "failed" };
+}
+
+function renderRequestSummary(summary) {
+  const total = summary?.total || 0;
+  const successful = summary?.successful || 0;
+  const failed = summary?.failed || 0;
+  const avgTtft = summary?.avg_ttft_ms;
+
+  elements.requestTotalCount.textContent = total;
+  elements.requestSuccessCount.textContent = successful;
+  elements.requestFailedCount.textContent = failed;
+  elements.requestAvgTtft.textContent = formatDurationMs(avgTtft);
+}
+
 function renderTokenList(items) {
   if (!Array.isArray(items) || items.length === 0) {
     elements.tokenList.innerHTML = `
@@ -144,6 +190,42 @@ function renderTokenList(items) {
           <div class="token-row__time" data-label="最近使用">${escapeHtml(formatDate(item.last_used_at))}</div>
           <div class="token-row__time" data-label="冷却截止">${escapeHtml(formatDate(item.cooldown_until))}</div>
           <div class="token-row__error" data-label="错误摘要">${escapeHtml(item.last_error || "—")}</div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderRequestList(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    elements.requestList.innerHTML = `
+      <article class="empty-state">
+        <p>还没有请求记录。等外部开始请求 /v1/responses 或 /v1/responses/compact，日志会出现在这里。</p>
+      </article>
+    `;
+    return;
+  }
+
+  elements.requestList.innerHTML = items
+    .map((item) => {
+      const status = deriveRequestStatus(item);
+      const model = item.model || "未带 model";
+      const mode = item.is_stream ? "Stream" : "JSON";
+      const attemptLabel = item.attempt_count ? `${item.attempt_count} 次` : "—";
+      const endpoint = item.endpoint || "—";
+      return `
+        <article class="request-row">
+          <div class="request-row__primary">
+            <span class="request-row__title">${escapeHtml(formatDate(item.started_at))}</span>
+            <span class="request-row__meta">${escapeHtml(`${model} · ${mode}`)}</span>
+          </div>
+          <div class="request-row__endpoint" data-label="端点">${escapeHtml(endpoint)}</div>
+          <div class="request-row__status" data-label="状态码">
+            <span class="status-pill status-pill--${status.tone}">${escapeHtml(status.label)}</span>
+          </div>
+          <div class="request-row__time" data-label="首 Token">${escapeHtml(formatDurationMs(item.ttft_ms))}</div>
+          <div class="request-row__time" data-label="尝试次数">${escapeHtml(attemptLabel)}</div>
+          <div class="request-row__error" data-label="错误摘要">${escapeHtml(item.error_message || "—")}</div>
         </article>
       `;
     })
@@ -231,13 +313,43 @@ async function loadTokens() {
   }
 }
 
+async function loadRequests() {
+  try {
+    const data = await fetchJson("/admin/requests?limit=80", {
+      headers: authHeaders(),
+    });
+    elements.requestNote.textContent = "显示最近 80 条请求";
+    renderRequestSummary(data.summary || {});
+    renderRequestList(data.items || []);
+  } catch (error) {
+    if (error.status === 401) {
+      elements.requestNote.textContent = "需要输入 Service API Key 才能查看请求日志";
+      renderRequestSummary({});
+      elements.requestList.innerHTML = `
+        <article class="empty-state">
+          <p>请求日志已加锁。填入 Service API Key 后可查看请求次数、端点、状态码和首 token 时间。</p>
+        </article>
+      `;
+      return;
+    }
+    elements.requestNote.textContent = `请求日志加载失败：${error.message}`;
+    renderRequestSummary({});
+    elements.requestList.innerHTML = `
+      <article class="empty-state">
+        <p>${escapeHtml(error.message)}</p>
+      </article>
+    `;
+  }
+}
+
 async function refreshDashboard() {
   elements.refreshButton.disabled = true;
   try {
     await loadHealth();
-    await loadTokens();
+    await Promise.all([loadTokens(), loadRequests()]);
   } catch (error) {
     elements.listNote.textContent = `面板同步失败：${error.message}`;
+    elements.requestNote.textContent = `面板同步失败：${error.message}`;
   } finally {
     elements.refreshButton.disabled = false;
   }
