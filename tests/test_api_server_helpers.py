@@ -405,7 +405,7 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
     stream_call = client.stream_calls[0]
     assert stream_call["headers"]["Accept"] == "application/json"
     assert "stream" not in json.loads(stream_call["content"])
-    assert result.first_token_at is None
+    assert result.first_token_at is not None
     assert result.status_code == 200
     body = json.loads(result.response.body)
     assert body["id"] == "resp_compact_123"

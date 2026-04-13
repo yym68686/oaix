@@ -288,7 +288,7 @@ function renderRequestList(items) {
           <div class="request-row__status" data-label="状态">
             <span class="status-pill status-pill--${status.tone}">${escapeHtml(status.label)}</span>
           </div>
-          <div class="request-row__time" data-label="首 Token">${escapeHtml(formatDurationMs(item.ttft_ms))}</div>
+          <div class="request-row__time" data-label="首字时间">${escapeHtml(formatDurationMs(item.ttft_ms))}</div>
           <div class="request-row__time" data-label="尝试">${escapeHtml(attemptLabel)}</div>
           <div class="request-row__error" data-label="错误" title="${escapeHtml(errorMessage)}">${escapeHtml(errorMessage)}</div>
         </article>
@@ -392,7 +392,7 @@ async function loadRequests() {
       renderRequestSummary({});
       elements.requestList.innerHTML = `
         <article class="empty-state">
-          <p>请求日志已加锁。填入 Service API Key 后可查看请求次数、端点、状态码和首 token 时间。</p>
+          <p>请求日志已加锁。填入 Service API Key 后可查看请求次数、端点、状态码和首字时间。</p>
         </article>
       `;
       return;

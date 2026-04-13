@@ -558,6 +558,20 @@ async def _collect_responses_json_from_sse(
     ), first_token_at
 
 
+async def _read_response_body_with_first_chunk_time(
+    upstream_iter: AsyncIterator[bytes],
+) -> tuple[bytes, datetime | None]:
+    chunks: list[bytes] = []
+    first_chunk_at: datetime | None = None
+
+    async for chunk in upstream_iter:
+        if chunk and first_chunk_at is None:
+            first_chunk_at = utcnow()
+        chunks.append(chunk)
+
+    return b"".join(chunks), first_chunk_at
+
+
 def _decode_responses_json_body(raw: bytes) -> dict[str, Any]:
     try:
         payload = json.loads(raw)
@@ -1214,11 +1228,12 @@ async def _proxy_request_with_token(
                 detail=_decode_error_body(raw),
             )
 
-        raw = await upstream_response.aread()
+        raw, first_token_at = await _read_response_body_with_first_chunk_time(upstream_response.aiter_raw())
         data = _decode_responses_json_body(raw)
         return ProxyRequestResult(
             response=JSONResponse(status_code=upstream_response.status_code, content=data),
             status_code=upstream_response.status_code,
+            first_token_at=first_token_at,
         )
     finally:
         await stream_cm.__aexit__(None, None, None)
