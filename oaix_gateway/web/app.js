@@ -1,13 +1,30 @@
 const STORAGE_KEY = "oaix.serviceKey";
+const THEME_STORAGE_KEY = "oaix.themePreference";
 const REFRESH_INTERVAL_MS = 15000;
+const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
+
+function normalizeThemePreference(value) {
+  return THEME_OPTIONS.has(value) ? value : "auto";
+}
+
+const initialThemePreference = normalizeThemePreference(
+  document.documentElement.dataset.themePreference || localStorage.getItem(THEME_STORAGE_KEY) || "auto",
+);
+const initialResolvedTheme = document.documentElement.dataset.colorScheme === "dark" ? "dark" : "light";
 
 const state = {
   serviceKey: localStorage.getItem(STORAGE_KEY) || "",
   protected: false,
   timer: null,
+  themePreference: initialThemePreference,
+  resolvedTheme: initialResolvedTheme,
+  themeMedia: window.matchMedia("(prefers-color-scheme: dark)"),
 };
 
 const elements = {
+  themeSummary: document.getElementById("theme-summary"),
+  themeButtons: Array.from(document.querySelectorAll("[data-theme-option]")),
+  themeColorMeta: document.querySelector('meta[name="theme-color"]'),
   availableCount: document.getElementById("available-count"),
   coolingCount: document.getElementById("cooling-count"),
   disabledCount: document.getElementById("disabled-count"),
@@ -40,6 +57,49 @@ const elements = {
 };
 
 elements.serviceKey.value = state.serviceKey;
+
+function resolveTheme(preference) {
+  if (preference === "dark" || preference === "light") {
+    return preference;
+  }
+  return state.themeMedia.matches ? "dark" : "light";
+}
+
+function updateThemeSummary() {
+  if (!elements.themeSummary) {
+    return;
+  }
+  const currentLabel = state.resolvedTheme === "dark" ? "暗色" : "亮色";
+  elements.themeSummary.textContent =
+    state.themePreference === "auto" ? `自动 · 当前${currentLabel}` : `手动 · ${currentLabel}`;
+}
+
+function updateThemeMeta() {
+  if (!elements.themeColorMeta) {
+    return;
+  }
+  elements.themeColorMeta.setAttribute("content", state.resolvedTheme === "dark" ? "#111827" : "#f5efe7");
+}
+
+function applyTheme(preference, { persist = true } = {}) {
+  state.themePreference = normalizeThemePreference(preference);
+  state.resolvedTheme = resolveTheme(state.themePreference);
+  document.documentElement.dataset.themePreference = state.themePreference;
+  document.documentElement.dataset.colorScheme = state.resolvedTheme;
+  document.documentElement.style.colorScheme = state.resolvedTheme;
+
+  elements.themeButtons.forEach((button) => {
+    const active = button.dataset.themeOption === state.themePreference;
+    button.setAttribute("aria-pressed", String(active));
+  });
+
+  updateThemeSummary();
+  updateThemeMeta();
+
+  if (persist) {
+    localStorage.setItem(THEME_STORAGE_KEY, state.themePreference);
+  }
+}
 
 function authHeaders(needsJson = false) {
   const headers = {};
@@ -515,6 +575,24 @@ function clearServiceKey() {
   localStorage.removeItem(STORAGE_KEY);
   setFeedback("Service API Key 已清空。");
   refreshDashboard();
+}
+
+function syncSystemTheme() {
+  if (state.themePreference === "auto") {
+    applyTheme("auto", { persist: false });
+  }
+}
+
+applyTheme(state.themePreference, { persist: false });
+
+elements.themeButtons.forEach((button) => {
+  button.addEventListener("click", () => applyTheme(button.dataset.themeOption));
+});
+
+if (typeof state.themeMedia.addEventListener === "function") {
+  state.themeMedia.addEventListener("change", syncSystemTheme);
+} else if (typeof state.themeMedia.addListener === "function") {
+  state.themeMedia.addListener(syncSystemTheme);
 }
 
 elements.refreshButton.addEventListener("click", refreshDashboard);

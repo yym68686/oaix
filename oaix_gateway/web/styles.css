@@ -9,12 +9,138 @@
   --cooling: oklch(0.75 0.16 58);
   --disabled: oklch(0.61 0.17 28);
   --accent: oklch(0.58 0.12 223);
+  --accent-contrast: oklch(0.985 0.006 248);
   --shadow-soft: 0 20px 55px color-mix(in oklab, var(--accent) 15%, transparent);
   --shadow-card: 0 28px 56px rgba(33, 45, 67, 0.08);
+  --focus-ring: 0 0 0 4px color-mix(in oklab, var(--accent) 12%, transparent);
+  --border-panel: color-mix(in oklab, var(--line) 75%, white);
+  --border-strong: color-mix(in oklab, var(--line) 78%, white);
+  --border-soft: color-mix(in oklab, var(--line) 76%, white);
+  --border-input: color-mix(in oklab, var(--line) 82%, white);
+  --border-table-head: color-mix(in oklab, var(--line) 84%, white);
+  --border-table-row: color-mix(in oklab, var(--line) 52%, white);
+  --border-accent-subtle: color-mix(in oklab, var(--accent) 16%, white);
+  --border-upload: color-mix(in oklab, var(--accent) 34%, white);
+  --border-feedback-error: color-mix(in oklab, var(--disabled) 45%, white);
+  --border-feedback-success: color-mix(in oklab, var(--available) 45%, white);
+  --primary-border: color-mix(in oklab, var(--accent) 55%, black);
+  --primary-bg: linear-gradient(135deg, color-mix(in oklab, var(--accent) 74%, white), var(--accent));
+  --canvas-background: linear-gradient(180deg, color-mix(in oklab, var(--paper) 88%, white), var(--paper));
+  --canvas-glow-cooling: color-mix(in oklab, var(--cooling) 18%, transparent);
+  --canvas-glow-available: color-mix(in oklab, var(--available) 22%, transparent);
+  --grid-sheen: rgba(255, 255, 255, 0.46);
+  --grid-line: color-mix(in oklab, var(--line) 48%, transparent);
+  --surface-panel:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.62)),
+    color-mix(in oklab, var(--paper-strong) 88%, white);
+  --surface-chip: color-mix(in oklab, white 82%, var(--accent) 18%);
+  --surface-chip-subtle: rgba(255, 255, 255, 0.58);
+  --surface-button: rgba(255, 255, 255, 0.7);
+  --surface-card: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(255, 255, 255, 0.52));
+  --surface-card-strong: linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(255, 255, 255, 0.62));
+  --surface-section: linear-gradient(180deg, rgba(255, 255, 255, 0.7), rgba(255, 255, 255, 0.52));
+  --surface-feedback: linear-gradient(180deg, rgba(255, 255, 255, 0.8), rgba(255, 255, 255, 0.56));
+  --surface-input: color-mix(in oklab, white 90%, var(--paper) 10%);
+  --surface-upload: linear-gradient(135deg, rgba(255, 255, 255, 0.82), color-mix(in oklab, var(--accent) 8%, white));
+  --surface-theme-rail: color-mix(in oklab, var(--accent) 6%, rgba(255, 255, 255, 0.82));
+  --surface-theme-button-active: var(--primary-bg);
+  --surface-theme-button-hover: color-mix(in oklab, var(--accent) 10%, rgba(255, 255, 255, 0.82));
+  --available-card-bg:
+    linear-gradient(145deg, color-mix(in oklab, var(--available) 18%, white), rgba(255, 255, 255, 0.84)),
+    white;
+  --available-card-glow: radial-gradient(circle, color-mix(in oklab, var(--available) 64%, white), transparent 70%);
+  --cooling-card-bg:
+    linear-gradient(145deg, color-mix(in oklab, var(--cooling) 20%, white), rgba(255, 255, 255, 0.84)),
+    white;
+  --cooling-card-glow: radial-gradient(circle, color-mix(in oklab, var(--cooling) 68%, white), transparent 72%);
+  --disabled-card-bg:
+    linear-gradient(145deg, color-mix(in oklab, var(--disabled) 18%, white), rgba(255, 255, 255, 0.84)),
+    white;
+  --disabled-card-glow: radial-gradient(circle, color-mix(in oklab, var(--disabled) 68%, white), transparent 72%);
+  --distribution-track: color-mix(in oklab, var(--line) 50%, white);
+  --status-available-bg: color-mix(in oklab, var(--available) 18%, white);
+  --status-available-fg: color-mix(in oklab, var(--available) 70%, black);
+  --status-cooling-bg: color-mix(in oklab, var(--cooling) 22%, white);
+  --status-cooling-fg: color-mix(in oklab, var(--cooling) 78%, black);
+  --status-disabled-bg: color-mix(in oklab, var(--disabled) 18%, white);
+  --status-disabled-fg: color-mix(in oklab, var(--disabled) 76%, black);
+  --feedback-error-fg: color-mix(in oklab, var(--disabled) 84%, black);
+  --feedback-success-fg: color-mix(in oklab, var(--available) 72%, black);
   --radius-xl: 32px;
   --radius-lg: 24px;
   --radius-md: 18px;
   --max-width: 1380px;
+}
+
+:root[data-color-scheme="dark"] {
+  color-scheme: dark;
+  --paper: oklch(0.17 0.018 250);
+  --paper-strong: oklch(0.215 0.022 250);
+  --ink: oklch(0.92 0.018 88);
+  --ink-soft: oklch(0.75 0.02 252);
+  --line: oklch(0.52 0.018 252 / 0.34);
+  --available: oklch(0.74 0.14 154);
+  --cooling: oklch(0.81 0.15 62);
+  --disabled: oklch(0.72 0.14 28);
+  --accent: oklch(0.71 0.09 232);
+  --accent-contrast: oklch(0.18 0.022 252);
+  --shadow-soft: 0 20px 55px rgba(6, 13, 24, 0.42);
+  --shadow-card: 0 32px 72px rgba(4, 8, 16, 0.46);
+  --focus-ring: 0 0 0 4px color-mix(in oklab, var(--accent) 18%, transparent);
+  --border-panel: rgba(128, 149, 182, 0.22);
+  --border-strong: rgba(128, 149, 182, 0.24);
+  --border-soft: rgba(128, 149, 182, 0.2);
+  --border-input: rgba(128, 149, 182, 0.24);
+  --border-table-head: rgba(128, 149, 182, 0.18);
+  --border-table-row: rgba(128, 149, 182, 0.14);
+  --border-accent-subtle: rgba(118, 157, 233, 0.32);
+  --border-upload: rgba(118, 157, 233, 0.38);
+  --border-feedback-error: rgba(214, 130, 103, 0.34);
+  --border-feedback-success: rgba(122, 208, 158, 0.34);
+  --primary-border: rgba(124, 160, 229, 0.46);
+  --primary-bg:
+    linear-gradient(135deg, color-mix(in oklab, var(--accent) 68%, white), color-mix(in oklab, var(--accent) 86%, black));
+  --canvas-background: linear-gradient(180deg, oklch(0.205 0.022 248), oklch(0.162 0.018 252));
+  --canvas-glow-cooling: color-mix(in oklab, var(--cooling) 15%, transparent);
+  --canvas-glow-available: color-mix(in oklab, var(--available) 12%, transparent);
+  --grid-sheen: rgba(255, 255, 255, 0.04);
+  --grid-line: rgba(138, 156, 188, 0.12);
+  --surface-panel:
+    linear-gradient(135deg, rgba(18, 25, 37, 0.88), rgba(10, 15, 24, 0.74)),
+    color-mix(in oklab, var(--paper-strong) 92%, black);
+  --surface-chip: linear-gradient(135deg, rgba(34, 49, 74, 0.96), rgba(23, 33, 50, 0.92));
+  --surface-chip-subtle: rgba(18, 25, 36, 0.82);
+  --surface-button: rgba(15, 22, 33, 0.84);
+  --surface-card: linear-gradient(180deg, rgba(18, 25, 37, 0.84), rgba(10, 15, 25, 0.72));
+  --surface-card-strong: linear-gradient(180deg, rgba(23, 31, 45, 0.88), rgba(11, 17, 28, 0.74));
+  --surface-section: linear-gradient(180deg, rgba(16, 22, 34, 0.78), rgba(10, 15, 25, 0.64));
+  --surface-feedback: linear-gradient(180deg, rgba(17, 24, 36, 0.84), rgba(11, 17, 28, 0.68));
+  --surface-input: rgba(11, 17, 27, 0.92);
+  --surface-upload: linear-gradient(135deg, rgba(17, 24, 36, 0.92), rgba(11, 18, 30, 0.86));
+  --surface-theme-rail: rgba(8, 13, 22, 0.82);
+  --surface-theme-button-active: var(--primary-bg);
+  --surface-theme-button-hover: rgba(30, 43, 63, 0.88);
+  --available-card-bg:
+    linear-gradient(145deg, color-mix(in oklab, var(--available) 18%, rgba(17, 24, 36, 0.96)), rgba(10, 16, 25, 0.92)),
+    rgba(7, 12, 20, 0.92);
+  --available-card-glow: radial-gradient(circle, color-mix(in oklab, var(--available) 44%, transparent), transparent 72%);
+  --cooling-card-bg:
+    linear-gradient(145deg, color-mix(in oklab, var(--cooling) 18%, rgba(17, 24, 36, 0.96)), rgba(11, 17, 28, 0.92)),
+    rgba(7, 12, 20, 0.92);
+  --cooling-card-glow: radial-gradient(circle, color-mix(in oklab, var(--cooling) 46%, transparent), transparent 72%);
+  --disabled-card-bg:
+    linear-gradient(145deg, color-mix(in oklab, var(--disabled) 18%, rgba(17, 24, 36, 0.96)), rgba(11, 17, 28, 0.92)),
+    rgba(7, 12, 20, 0.92);
+  --disabled-card-glow: radial-gradient(circle, color-mix(in oklab, var(--disabled) 44%, transparent), transparent 72%);
+  --distribution-track: rgba(138, 156, 188, 0.14);
+  --status-available-bg: color-mix(in oklab, var(--available) 20%, rgba(18, 25, 37, 0.96));
+  --status-available-fg: color-mix(in oklab, var(--available) 84%, white);
+  --status-cooling-bg: color-mix(in oklab, var(--cooling) 20%, rgba(18, 25, 37, 0.96));
+  --status-cooling-fg: color-mix(in oklab, var(--cooling) 82%, white);
+  --status-disabled-bg: color-mix(in oklab, var(--disabled) 20%, rgba(18, 25, 37, 0.96));
+  --status-disabled-fg: color-mix(in oklab, var(--disabled) 82%, white);
+  --feedback-error-fg: color-mix(in oklab, var(--disabled) 74%, white);
+  --feedback-success-fg: color-mix(in oklab, var(--available) 74%, white);
 }
 
 *,
@@ -33,9 +159,9 @@ body {
   font-family: "Manrope", "PingFang SC", "Hiragino Sans GB", sans-serif;
   color: var(--ink);
   background:
-    radial-gradient(circle at top left, color-mix(in oklab, var(--cooling) 18%, transparent), transparent 34%),
-    radial-gradient(circle at 86% 12%, color-mix(in oklab, var(--available) 22%, transparent), transparent 30%),
-    linear-gradient(180deg, color-mix(in oklab, var(--paper) 88%, white), var(--paper));
+    radial-gradient(circle at top left, var(--canvas-glow-cooling), transparent 34%),
+    radial-gradient(circle at 86% 12%, var(--canvas-glow-available), transparent 30%),
+    var(--canvas-background);
 }
 
 body::before {
@@ -44,9 +170,9 @@ body::before {
   inset: 0;
   pointer-events: none;
   background:
-    linear-gradient(115deg, rgba(255, 255, 255, 0.46), transparent 30%),
-    linear-gradient(color-mix(in oklab, var(--line) 48%, transparent) 1px, transparent 1px),
-    linear-gradient(90deg, color-mix(in oklab, var(--line) 48%, transparent) 1px, transparent 1px);
+    linear-gradient(115deg, var(--grid-sheen), transparent 30%),
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
   background-size: auto, 24px 24px, 24px 24px;
   opacity: 0.42;
 }
@@ -59,6 +185,8 @@ textarea {
 
 button {
   cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .shell {
@@ -101,6 +229,7 @@ button {
   margin: 0;
   font-family: "Fraunces", "Songti SC", serif;
   letter-spacing: -0.03em;
+  text-wrap: balance;
 }
 
 .hero h1 {
@@ -120,15 +249,17 @@ button {
 .hero__meta {
   display: grid;
   justify-items: end;
+  align-items: stretch;
   gap: 12px;
 }
 
 .meta-chip {
+  width: min(100%, 320px);
   min-width: 200px;
   padding: 12px 16px;
   border-radius: 999px;
-  border: 1px solid color-mix(in oklab, var(--accent) 16%, white);
-  background: color-mix(in oklab, white 82%, var(--accent) 18%);
+  border: 1px solid var(--border-accent-subtle);
+  background: var(--surface-chip);
   box-shadow: var(--shadow-soft);
   font-size: 0.92rem;
   font-weight: 700;
@@ -136,9 +267,82 @@ button {
 }
 
 .meta-chip--subtle {
-  background: rgba(255, 255, 255, 0.58);
-  border-color: var(--line);
+  background: var(--surface-chip-subtle);
+  border-color: var(--border-panel);
   box-shadow: none;
+}
+
+.theme-switch {
+  width: min(100%, 320px);
+  padding: 14px;
+  border-radius: calc(var(--radius-lg) - 4px);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-card);
+  box-shadow: var(--shadow-soft);
+}
+
+.theme-switch__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.theme-switch__label {
+  font-size: 0.76rem;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: color-mix(in oklab, var(--ink-soft) 86%, var(--accent));
+}
+
+.theme-switch__summary {
+  min-width: 0;
+  font-size: 0.84rem;
+  color: var(--ink-soft);
+}
+
+.theme-switch__rail {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 4px;
+  border-radius: 999px;
+  background: var(--surface-theme-rail);
+}
+
+.theme-switch__button {
+  min-height: 44px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+  font-weight: 800;
+  transition:
+    transform 180ms ease,
+    background-color 180ms ease,
+    box-shadow 180ms ease,
+    color 180ms ease;
+}
+
+.theme-switch__button:hover,
+.theme-switch__button:focus-visible {
+  background: var(--surface-theme-button-hover);
+  color: var(--ink);
+  outline: none;
+}
+
+.theme-switch__button:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+.theme-switch__button[aria-pressed="true"] {
+  background: var(--surface-theme-button-active);
+  color: var(--accent-contrast);
+  box-shadow: var(--shadow-soft);
 }
 
 .layout {
@@ -156,11 +360,9 @@ button {
 .token-panel,
 .request-panel {
   overflow: hidden;
-  border: 1px solid color-mix(in oklab, var(--line) 75%, white);
+  border: 1px solid var(--border-panel);
   border-radius: var(--radius-xl);
-  background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.62)),
-    color-mix(in oklab, var(--paper-strong) 88%, white);
+  background: var(--surface-panel);
   box-shadow: var(--shadow-card);
 }
 
@@ -217,8 +419,8 @@ button {
 }
 
 .ghost-button {
-  border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid var(--border-panel);
+  background: var(--surface-button);
   color: var(--ink);
 }
 
@@ -229,11 +431,24 @@ button {
   transform: translateY(-2px);
 }
 
+.ghost-button:focus-visible,
+.primary-button:focus-visible {
+  outline: none;
+}
+
+.ghost-button:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
 .primary-button {
-  border: 1px solid color-mix(in oklab, var(--accent) 55%, black);
-  background: linear-gradient(135deg, color-mix(in oklab, var(--accent) 74%, white), var(--accent));
-  color: white;
+  border: 1px solid var(--primary-border);
+  background: var(--primary-bg);
+  color: var(--accent-contrast);
   box-shadow: var(--shadow-soft);
+}
+
+.primary-button:focus-visible {
+  box-shadow: var(--focus-ring), var(--shadow-soft);
 }
 
 .stats-grid {
@@ -248,7 +463,7 @@ button {
   min-height: 210px;
   padding: 24px;
   border-radius: calc(var(--radius-xl) - 8px);
-  border: 1px solid color-mix(in oklab, var(--line) 78%, white);
+  border: 1px solid var(--border-strong);
   overflow: hidden;
 }
 
@@ -264,33 +479,27 @@ button {
 
 .stat-card--available {
   grid-row: span 2;
-  background:
-    linear-gradient(145deg, color-mix(in oklab, var(--available) 18%, white), rgba(255, 255, 255, 0.84)),
-    white;
+  background: var(--available-card-bg);
 }
 
 .stat-card--available::before {
-  background: radial-gradient(circle, color-mix(in oklab, var(--available) 64%, white), transparent 70%);
+  background: var(--available-card-glow);
 }
 
 .stat-card--cooling {
-  background:
-    linear-gradient(145deg, color-mix(in oklab, var(--cooling) 20%, white), rgba(255, 255, 255, 0.84)),
-    white;
+  background: var(--cooling-card-bg);
 }
 
 .stat-card--cooling::before {
-  background: radial-gradient(circle, color-mix(in oklab, var(--cooling) 68%, white), transparent 72%);
+  background: var(--cooling-card-glow);
 }
 
 .stat-card--disabled {
-  background:
-    linear-gradient(145deg, color-mix(in oklab, var(--disabled) 18%, white), rgba(255, 255, 255, 0.84)),
-    white;
+  background: var(--disabled-card-bg);
 }
 
 .stat-card--disabled::before {
-  background: radial-gradient(circle, color-mix(in oklab, var(--disabled) 68%, white), transparent 72%);
+  background: var(--disabled-card-glow);
 }
 
 .stat-card__label {
@@ -328,8 +537,8 @@ button {
   margin-top: 14px;
   padding: 24px;
   border-radius: calc(var(--radius-xl) - 8px);
-  border: 1px solid color-mix(in oklab, var(--line) 78%, white);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.7), rgba(255, 255, 255, 0.52));
+  border: 1px solid var(--border-strong);
+  background: var(--surface-section);
 }
 
 .distribution-panel__head {
@@ -355,7 +564,7 @@ button {
   min-height: 18px;
   overflow: hidden;
   border-radius: 999px;
-  background: color-mix(in oklab, var(--line) 50%, white);
+  background: var(--distribution-track);
 }
 
 .distribution-bar__segment {
@@ -423,9 +632,9 @@ button {
 .field input,
 .field textarea {
   width: 100%;
-  border: 1px solid color-mix(in oklab, var(--line) 82%, white);
+  border: 1px solid var(--border-input);
   border-radius: var(--radius-md);
-  background: color-mix(in oklab, white 90%, var(--paper) 10%);
+  background: var(--surface-input);
   padding: 14px 16px;
   color: var(--ink);
   transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
@@ -441,11 +650,16 @@ button {
   word-break: normal;
 }
 
+.field input::placeholder,
+.field textarea::placeholder {
+  color: color-mix(in oklab, var(--ink-soft) 88%, transparent);
+}
+
 .field input:focus,
 .field textarea:focus {
   outline: none;
-  border-color: color-mix(in oklab, var(--accent) 46%, white);
-  box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 12%, transparent);
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
   transform: translateY(-1px);
 }
 
@@ -465,10 +679,9 @@ button {
   gap: 8px;
   padding: 18px;
   margin-bottom: 16px;
-  border: 1px dashed color-mix(in oklab, var(--accent) 34%, white);
+  border: 1px dashed var(--border-upload);
   border-radius: var(--radius-lg);
-  background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.82), color-mix(in oklab, var(--accent) 8%, white));
+  background: var(--surface-upload);
   color: var(--ink);
 }
 
@@ -489,20 +702,20 @@ button {
   min-height: 72px;
   padding: 14px 16px;
   border-radius: var(--radius-lg);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.8), rgba(255, 255, 255, 0.56));
-  border: 1px solid var(--line);
+  background: var(--surface-feedback);
+  border: 1px solid var(--border-panel);
   line-height: 1.7;
   color: var(--ink-soft);
 }
 
 .import-feedback.is-error {
-  border-color: color-mix(in oklab, var(--disabled) 45%, white);
-  color: color-mix(in oklab, var(--disabled) 84%, black);
+  border-color: var(--border-feedback-error);
+  color: var(--feedback-error-fg);
 }
 
 .import-feedback.is-success {
-  border-color: color-mix(in oklab, var(--available) 45%, white);
-  color: color-mix(in oklab, var(--available) 72%, black);
+  border-color: var(--border-feedback-success);
+  color: var(--feedback-success-fg);
 }
 
 .token-panel__body {
@@ -514,8 +727,8 @@ button {
     minmax(0, 1.1fr);
   overflow: hidden;
   border-radius: calc(var(--radius-xl) - 10px);
-  border: 1px solid color-mix(in oklab, var(--line) 78%, white);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(255, 255, 255, 0.52));
+  border: 1px solid var(--border-strong);
+  background: var(--surface-card);
 }
 
 .request-panel__body {
@@ -528,8 +741,8 @@ button {
     minmax(0, 1.24fr);
   overflow: hidden;
   border-radius: calc(var(--radius-xl) - 10px);
-  border: 1px solid color-mix(in oklab, var(--line) 78%, white);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(255, 255, 255, 0.52));
+  border: 1px solid var(--border-strong);
+  background: var(--surface-card);
 }
 
 .metric-strip {
@@ -544,8 +757,8 @@ button {
   gap: 8px;
   padding: 16px 18px;
   border-radius: var(--radius-lg);
-  border: 1px solid color-mix(in oklab, var(--line) 76%, white);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(255, 255, 255, 0.62));
+  border: 1px solid var(--border-soft);
+  background: var(--surface-card-strong);
 }
 
 .metric-pill__label {
@@ -575,7 +788,7 @@ button {
 
 .table-head {
   padding: 14px 18px;
-  border-bottom: 1px solid color-mix(in oklab, var(--line) 84%, white);
+  border-bottom: 1px solid var(--border-table-head);
   font-size: 0.8rem;
   font-weight: 800;
   letter-spacing: 0.12em;
@@ -598,7 +811,7 @@ button {
 
 .token-row {
   padding: 16px 18px;
-  border-bottom: 1px solid color-mix(in oklab, var(--line) 52%, white);
+  border-bottom: 1px solid var(--border-table-row);
 }
 
 .token-row:last-child {
@@ -607,7 +820,7 @@ button {
 
 .request-row {
   padding: 16px 18px;
-  border-bottom: 1px solid color-mix(in oklab, var(--line) 52%, white);
+  border-bottom: 1px solid var(--border-table-row);
 }
 
 .request-row:last-child {
@@ -667,28 +880,28 @@ button {
 }
 
 .status-pill--available {
-  background: color-mix(in oklab, var(--available) 18%, white);
-  color: color-mix(in oklab, var(--available) 70%, black);
+  background: var(--status-available-bg);
+  color: var(--status-available-fg);
 }
 
 .status-pill--cooling {
-  background: color-mix(in oklab, var(--cooling) 22%, white);
-  color: color-mix(in oklab, var(--cooling) 78%, black);
+  background: var(--status-cooling-bg);
+  color: var(--status-cooling-fg);
 }
 
 .status-pill--disabled {
-  background: color-mix(in oklab, var(--disabled) 18%, white);
-  color: color-mix(in oklab, var(--disabled) 76%, black);
+  background: var(--status-disabled-bg);
+  color: var(--status-disabled-fg);
 }
 
 .status-pill--success {
-  background: color-mix(in oklab, var(--available) 18%, white);
-  color: color-mix(in oklab, var(--available) 70%, black);
+  background: var(--status-available-bg);
+  color: var(--status-available-fg);
 }
 
 .status-pill--failed {
-  background: color-mix(in oklab, var(--disabled) 18%, white);
-  color: color-mix(in oklab, var(--disabled) 76%, black);
+  background: var(--status-disabled-bg);
+  color: var(--status-disabled-fg);
 }
 
 .token-row__time,
@@ -781,6 +994,11 @@ button {
   .hero__meta {
     justify-items: start;
   }
+
+  .theme-switch,
+  .meta-chip {
+    width: min(100%, 360px);
+  }
 }
 
 @media (max-width: 760px) {
@@ -805,6 +1023,12 @@ button {
   .section-head {
     align-items: start;
     flex-direction: column;
+  }
+
+  .theme-switch,
+  .meta-chip {
+    width: 100%;
+    min-width: 0;
   }
 
   .table-head {

@@ -3,7 +3,35 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f5efe7" />
     <title>oaix Key Console</title>
+    <script>
+      (() => {
+        const storageKey = "oaix.themePreference";
+        let preference = "auto";
+        try {
+          const stored = window.localStorage.getItem(storageKey);
+          if (stored === "auto" || stored === "light" || stored === "dark") {
+            preference = stored;
+          }
+        } catch {}
+
+        const resolved =
+          preference === "auto"
+            ? window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light"
+            : preference;
+
+        document.documentElement.dataset.themePreference = preference;
+        document.documentElement.dataset.colorScheme = resolved;
+        document.documentElement.style.colorScheme = resolved;
+        const themeMeta = document.querySelector('meta[name="theme-color"]');
+        if (themeMeta) {
+          themeMeta.setAttribute("content", resolved === "dark" ? "#111827" : "#f5efe7");
+        }
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -23,6 +51,23 @@
           </p>
         </div>
         <div class="hero__meta">
+          <div class="theme-switch" aria-label="主题模式">
+            <div class="theme-switch__head">
+              <span class="theme-switch__label">主题模式</span>
+              <span class="theme-switch__summary" id="theme-summary" aria-live="polite">自动 · 跟随系统</span>
+            </div>
+            <div class="theme-switch__rail" role="group" aria-label="切换主题">
+              <button class="theme-switch__button" data-theme-option="auto" type="button" aria-pressed="true">
+                自动
+              </button>
+              <button class="theme-switch__button" data-theme-option="light" type="button" aria-pressed="false">
+                亮色
+              </button>
+              <button class="theme-switch__button" data-theme-option="dark" type="button" aria-pressed="false">
+                暗色
+              </button>
+            </div>
+          </div>
           <div class="meta-chip" id="protection-chip">检测服务状态中</div>
           <div class="meta-chip meta-chip--subtle" id="sync-chip">等待首次同步</div>
         </div>
