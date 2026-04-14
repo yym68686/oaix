@@ -187,7 +187,35 @@
               <p class="section-kicker">Registry</p>
               <h2 id="token-list-title">最近 Key 状态</h2>
             </div>
-            <p class="section-note" id="list-note">显示最近 80 条记录</p>
+            <div class="section-tools section-tools--token">
+              <p class="section-note" id="list-note">显示最近 80 条记录</p>
+              <div class="selection-switch" aria-label="Key 分发策略">
+                <div class="selection-switch__head">
+                  <span class="selection-switch__label">Key 分发</span>
+                  <span class="selection-switch__summary" id="token-selection-summary" aria-live="polite">
+                    最旧未使用优先
+                  </span>
+                </div>
+                <div class="selection-switch__rail" role="group" aria-label="切换 Key 分发策略">
+                  <button
+                    class="selection-switch__button"
+                    data-selection-strategy="least_recently_used"
+                    type="button"
+                    aria-pressed="true"
+                  >
+                    最旧未使用
+                  </button>
+                  <button
+                    class="selection-switch__button"
+                    data-selection-strategy="fill_first"
+                    type="button"
+                    aria-pressed="false"
+                  >
+                    Fill-first
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
 
           <div class="token-panel__body">
@@ -215,10 +243,18 @@
             <p class="section-note" id="request-note">显示最近 80 条请求</p>
           </div>
 
-          <div class="metric-strip" aria-label="请求摘要">
+          <div class="metric-strip metric-strip--requests" aria-label="请求摘要">
             <article class="metric-pill">
               <span class="metric-pill__label">总请求</span>
               <strong class="metric-pill__value" id="request-total-count">0</strong>
+            </article>
+            <article class="metric-pill">
+              <span class="metric-pill__label">总 Token</span>
+              <strong class="metric-pill__value" id="request-total-tokens">0</strong>
+            </article>
+            <article class="metric-pill">
+              <span class="metric-pill__label">估算金额</span>
+              <strong class="metric-pill__value" id="request-estimated-cost">$0.00</strong>
             </article>
             <article class="metric-pill">
               <span class="metric-pill__label">成功</span>
@@ -231,6 +267,44 @@
             <article class="metric-pill">
               <span class="metric-pill__label">平均首字时间</span>
               <strong class="metric-pill__value" id="request-avg-ttft">—</strong>
+            </article>
+          </div>
+
+          <div class="chart-grid" aria-label="Token 与金额图表">
+            <article class="chart-card">
+              <div class="chart-card__head">
+                <div>
+                  <p class="section-kicker">Usage</p>
+                  <h3>最近 24 小时 Token</h3>
+                </div>
+                <strong class="chart-card__value" id="request-token-chart-total">0</strong>
+              </div>
+              <div class="chart-key" aria-hidden="true">
+                <span><i class="chart-key__swatch chart-key__swatch--input"></i>输入</span>
+                <span><i class="chart-key__swatch chart-key__swatch--output"></i>输出</span>
+              </div>
+              <div class="chart-card__canvas" id="request-token-chart">
+                <article class="empty-state chart-empty">
+                  <p>还没有 token 用量数据。</p>
+                </article>
+              </div>
+              <p class="chart-card__note" id="request-token-chart-note">最近 24 小时按小时汇总输入与输出 token。</p>
+            </article>
+
+            <article class="chart-card">
+              <div class="chart-card__head">
+                <div>
+                  <p class="section-kicker">Estimate</p>
+                  <h3>模型金额分布</h3>
+                </div>
+                <strong class="chart-card__value" id="request-cost-chart-total">$0.00</strong>
+              </div>
+              <div class="chart-card__canvas" id="request-cost-chart">
+                <article class="empty-state chart-empty">
+                  <p>还没有金额统计数据。</p>
+                </article>
+              </div>
+              <p class="chart-card__note" id="request-cost-chart-note">最近 24 小时按模型汇总估算金额。</p>
             </article>
           </div>
 

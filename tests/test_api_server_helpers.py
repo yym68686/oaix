@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 from oaix_gateway.api_server import (
+    _ProxyStreamCapture,
     ResponseTrafficController,
     _collect_responses_json_from_sse,
     _extract_usage_limit_cooldown_seconds,
@@ -224,6 +225,21 @@ def test_collect_responses_json_from_sse_falls_back_on_done_without_response_com
     assert response["output"][0]["content"][0]["text"] == "hello"
 
 
+def test_proxy_stream_capture_extracts_usage_and_model() -> None:
+    capture = _ProxyStreamCapture()
+    capture.feed(
+        b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.4-mini"}}\n\n'
+    )
+    capture.feed(
+        b'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}\n\n'
+    )
+
+    assert capture.model_name == "gpt-5.4-mini"
+    assert capture.usage_metrics is not None
+    assert capture.usage_metrics.total_tokens == 15
+    assert capture.usage_metrics.output_tokens == 5
+
+
 def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request() -> None:
     class DummyStreamingResponse:
         def __init__(self, chunks: list[bytes]) -> None:
@@ -307,6 +323,8 @@ def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request(
     assert result.first_token_at is not None
     assert result.status_code == 200
     assert result.model_name == "gpt-5.4-mini"
+    assert result.usage_metrics is not None
+    assert result.usage_metrics.total_tokens == 2
     body = json.loads(result.response.body)
     assert body["id"] == "resp_456"
     assert body["model"] == "gpt-5.4-mini"
@@ -412,6 +430,7 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
     assert result.first_token_at is not None
     assert result.status_code == 200
     assert result.model_name == "gpt-5.4-compact"
+    assert result.usage_metrics is None
     body = json.loads(result.response.body)
     assert body["id"] == "resp_compact_123"
     assert body["model"] == "gpt-5.4-compact"

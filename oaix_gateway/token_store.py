@@ -8,8 +8,13 @@ from typing import Any, Iterable
 
 from sqlalchemy import func, nullsfirst, or_, select
 
-from .database import CodexToken, close_database, get_session, init_db, utcnow
+from .database import CodexToken, GatewaySetting, close_database, get_session, init_db, utcnow
 from .token_identity import collect_refresh_token_aliases, merge_refresh_token_aliases, normalize_refresh_token
+
+TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED = "least_recently_used"
+TOKEN_SELECTION_STRATEGY_FILL_FIRST = "fill_first"
+DEFAULT_TOKEN_SELECTION_STRATEGY = TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED
+TOKEN_SELECTION_SETTING_KEY = "token_selection"
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,12 @@ class TokenFileImportSummary:
     failed_count: int
 
 
+@dataclass(frozen=True)
+class TokenSelectionSettings:
+    strategy: str
+    updated_at: datetime | None = None
+
+
 def parse_rfc3339(value: Any) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:
@@ -70,6 +81,24 @@ def parse_rfc3339(value: Any) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def parse_token_selection_strategy(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"oldest_unused", "least_recently_used", "lru"}:
+        return TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED
+    if normalized in {"fill_first", "fillfirst"}:
+        return TOKEN_SELECTION_STRATEGY_FILL_FIRST
+    raise ValueError(
+        "Unsupported token selection strategy; expected one of: least_recently_used, fill_first"
+    )
+
+
+def normalize_token_selection_strategy(value: Any) -> str:
+    try:
+        return parse_token_selection_strategy(value)
+    except ValueError:
+        return DEFAULT_TOKEN_SELECTION_STRATEGY
 
 
 def _load_token_payload(token_data_or_json: str | dict[str, Any]) -> dict[str, Any]:
@@ -91,6 +120,28 @@ def _available_token_filters(now: datetime) -> tuple[Any, ...]:
         CodexToken.refresh_token.is_not(None),
         CodexToken.token_type == "codex",
         or_(CodexToken.cooldown_until.is_(None), CodexToken.cooldown_until <= now),
+    )
+
+
+def _token_selection_order_clauses(strategy: str | None) -> tuple[Any, ...]:
+    resolved = normalize_token_selection_strategy(strategy)
+    if resolved == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        return (CodexToken.id.asc(),)
+    return (
+        nullsfirst(CodexToken.last_used_at.asc()),
+        CodexToken.updated_at.asc(),
+        CodexToken.id.asc(),
+    )
+
+
+def _build_token_selection_settings(setting: GatewaySetting | None) -> TokenSelectionSettings:
+    value = setting.value if setting is not None else None
+    strategy = None
+    if isinstance(value, dict):
+        strategy = value.get("strategy")
+    return TokenSelectionSettings(
+        strategy=normalize_token_selection_strategy(strategy),
+        updated_at=setting.updated_at if setting is not None else None,
     )
 
 
@@ -208,18 +259,41 @@ async def upsert_token_payload(
             return TokenUpsertResult(token=token, action="duplicate")
 
 
-async def claim_next_active_token() -> CodexToken | None:
+async def get_token_selection_settings() -> TokenSelectionSettings:
+    async with get_session() as session:
+        setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY)
+        return _build_token_selection_settings(setting)
+
+
+async def update_token_selection_settings(*, strategy: str) -> TokenSelectionSettings:
+    resolved_strategy = parse_token_selection_strategy(strategy)
+    async with get_session() as session:
+        async with session.begin():
+            setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY, with_for_update=True)
+            if setting is None:
+                setting = GatewaySetting(
+                    key=TOKEN_SELECTION_SETTING_KEY,
+                    value={"strategy": resolved_strategy},
+                    updated_at=utcnow(),
+                )
+                session.add(setting)
+            else:
+                payload = setting.value if isinstance(setting.value, dict) else {}
+                payload["strategy"] = resolved_strategy
+                setting.value = payload
+                setting.updated_at = utcnow()
+            await session.flush()
+            return _build_token_selection_settings(setting)
+
+
+async def claim_next_active_token(*, selection_strategy: str | None = None) -> CodexToken | None:
     now = utcnow()
     async with get_session() as session:
         async with session.begin():
             stmt = (
                 select(CodexToken)
                 .where(*_available_token_filters(now))
-                .order_by(
-                    nullsfirst(CodexToken.last_used_at.asc()),
-                    CodexToken.updated_at.asc(),
-                    CodexToken.id.asc(),
-                )
+                .order_by(*_token_selection_order_clauses(selection_strategy))
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )
@@ -272,6 +346,18 @@ async def mark_token_success(token_id: int) -> None:
             token.cooldown_until = None
             token.last_error = None
             token.updated_at = utcnow()
+
+
+async def set_token_active_state(token_id: int, *, active: bool) -> CodexToken | None:
+    async with get_session() as session:
+        async with session.begin():
+            token = await session.get(CodexToken, token_id, with_for_update=True)
+            if token is None:
+                return None
+            token.is_active = bool(active)
+            token.updated_at = utcnow()
+            await session.flush()
+            return token
 
 
 async def mark_token_error(

@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, func, inspect, select, text
+from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text, func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -74,7 +74,19 @@ class GatewayRequestLog(Base):
     first_token_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     ttft_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class GatewaySetting(Base):
+    __tablename__ = "gateway_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 _engine = None
@@ -153,6 +165,14 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN model VARCHAR(128)"))
         if "model_name" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN model_name VARCHAR(128)"))
+        if "input_tokens" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN input_tokens INTEGER"))
+        if "output_tokens" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN output_tokens INTEGER"))
+        if "total_tokens" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN total_tokens INTEGER"))
+        if "estimated_cost_usd" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN estimated_cost_usd DOUBLE PRECISION"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model ON gateway_request_logs (model)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))
 

@@ -27,17 +27,25 @@ from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract
 from .request_store import (
     create_request_log,
     finalize_request_log,
+    get_request_log_analytics,
     get_request_log_summary,
     list_request_logs,
 )
 from .token_store import (
+    DEFAULT_TOKEN_SELECTION_STRATEGY,
+    TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+    TokenSelectionSettings,
     claim_next_active_token,
     get_token_counts,
+    get_token_selection_settings,
     list_token_rows,
     mark_token_error,
     mark_token_success,
+    set_token_active_state,
+    update_token_selection_settings,
     upsert_token_payload,
 )
+from .usage_cost import UsageMetrics, extract_usage_metrics
 
 
 logger = logging.getLogger("oaix.gateway")
@@ -95,12 +103,75 @@ class ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class TokenSelectionUpdateRequest(BaseModel):
+    strategy: str
+
+
+class TokenActivationUpdateRequest(BaseModel):
+    active: bool
+
+
 @dataclass(frozen=True)
 class ProxyRequestResult:
     response: Response
     status_code: int
     model_name: str | None = None
     first_token_at: datetime | None = None
+    usage_metrics: UsageMetrics | None = None
+    stream_capture: "_ProxyStreamCapture | None" = None
+
+
+class _ProxyStreamCapture:
+    def __init__(
+        self,
+        *,
+        initial_model_name: str | None = None,
+        initial_first_token_at: datetime | None = None,
+    ) -> None:
+        self.model_name = initial_model_name
+        self.first_token_at = initial_first_token_at
+        self.usage_metrics: UsageMetrics | None = None
+        self._response_snapshot: dict[str, Any] = {}
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._text_buffer = ""
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        try:
+            self._text_buffer += self._decoder.decode(chunk)
+
+            while True:
+                match = re.search(r"\r?\n\r?\n", self._text_buffer)
+                if not match:
+                    break
+
+                raw_event = self._text_buffer[:match.start()]
+                self._text_buffer = self._text_buffer[match.end():]
+                if not raw_event.strip():
+                    continue
+
+                event_type, event_payload = _extract_responses_stream_event(raw_event)
+                extracted_model_name = _extract_response_model_name(event_payload)
+                if extracted_model_name:
+                    self.model_name = extracted_model_name
+
+                if self.first_token_at is None and event_type and event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
+                    self.first_token_at = utcnow()
+
+                if not isinstance(event_payload, dict):
+                    continue
+
+                response_obj = event_payload.get("response")
+                if isinstance(response_obj, dict):
+                    _merge_mapping(self._response_snapshot, response_obj)
+
+                usage_payload = self._response_snapshot or event_payload
+                usage_metrics = extract_usage_metrics(usage_payload, model_name=self.model_name)
+                if usage_metrics is not None:
+                    self.usage_metrics = usage_metrics
+        except Exception:
+            logger.exception("Failed to observe streamed response usage")
 
 
 class ResponseTrafficLease:
@@ -751,6 +822,83 @@ def _should_retry_upstream_server_error(status_code: int) -> bool:
     return 500 <= status_code <= 599
 
 
+def _usage_finalize_kwargs(usage_metrics: UsageMetrics | None) -> dict[str, Any]:
+    if usage_metrics is None:
+        return {}
+    return {
+        "input_tokens": usage_metrics.input_tokens,
+        "output_tokens": usage_metrics.output_tokens,
+        "total_tokens": usage_metrics.total_tokens,
+        "estimated_cost_usd": usage_metrics.estimated_cost_usd,
+    }
+
+
+async def _finalize_stream_request_log(
+    *,
+    request_log_id: int,
+    status_code: int,
+    attempt_count: int,
+    account_id: str | None,
+    fallback_model_name: str | None,
+    fallback_first_token_at: datetime | None,
+    stream_capture: _ProxyStreamCapture,
+) -> None:
+    try:
+        await finalize_request_log(
+            request_log_id,
+            status_code=status_code,
+            success=True,
+            attempt_count=attempt_count,
+            finished_at=utcnow(),
+            first_token_at=stream_capture.first_token_at or fallback_first_token_at,
+            account_id=account_id,
+            model_name=stream_capture.model_name or fallback_model_name,
+            **_usage_finalize_kwargs(stream_capture.usage_metrics),
+        )
+    except Exception:
+        logger.exception("Failed to finalize streamed request log id=%s", request_log_id)
+
+
+def _selection_strategy_label(strategy: str) -> str:
+    if strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        return "Fill-first"
+    return "最旧未使用优先"
+
+
+def _selection_strategy_description(strategy: str) -> str:
+    if strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        return "持续使用第一个可用 key，直到该 key 冷却或失效再切到下一个。"
+    return "优先分配最久未使用的 key，把请求更均匀地摊在账号窗口上。"
+
+
+def _serialize_token_selection_settings(settings: TokenSelectionSettings) -> dict[str, Any]:
+    return {
+        "strategy": settings.strategy,
+        "label": _selection_strategy_label(settings.strategy),
+        "description": _selection_strategy_description(settings.strategy),
+        "updated_at": settings.updated_at,
+        "options": [
+            {
+                "id": DEFAULT_TOKEN_SELECTION_STRATEGY,
+                "label": _selection_strategy_label(DEFAULT_TOKEN_SELECTION_STRATEGY),
+                "description": _selection_strategy_description(DEFAULT_TOKEN_SELECTION_STRATEGY),
+            },
+            {
+                "id": TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+                "label": _selection_strategy_label(TOKEN_SELECTION_STRATEGY_FILL_FIRST),
+                "description": _selection_strategy_description(TOKEN_SELECTION_STRATEGY_FILL_FIRST),
+            },
+        ],
+    }
+
+
+def _current_token_selection_settings(app: FastAPI) -> TokenSelectionSettings:
+    selection = getattr(app.state, "token_selection_settings", None)
+    if isinstance(selection, TokenSelectionSettings):
+        return selection
+    return TokenSelectionSettings(strategy=DEFAULT_TOKEN_SELECTION_STRATEGY)
+
+
 def _serialize_admin_token_item(
     token_row,
     *,
@@ -836,6 +984,7 @@ async def lifespan(app: FastAPI):
         ttl_seconds=_admin_quota_cache_ttl_seconds(),
         concurrency=_admin_quota_max_concurrency(),
     )
+    app.state.token_selection_settings = await get_token_selection_settings()
     try:
         yield
     finally:
@@ -874,6 +1023,24 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.get("/admin/token-selection")
+    async def get_token_selection_route(
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        return _serialize_token_selection_settings(_current_token_selection_settings(app))
+
+    @app.post("/admin/token-selection")
+    async def update_token_selection_route(
+        payload: TokenSelectionUpdateRequest,
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        try:
+            selection = await update_token_selection_settings(strategy=payload.strategy)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        app.state.token_selection_settings = selection
+        return _serialize_token_selection_settings(selection)
+
     @app.get("/admin/tokens")
     async def list_tokens_route(
         http_request: Request,
@@ -890,7 +1057,25 @@ def create_app() -> FastAPI:
         )
         return {
             "counts": asdict(counts),
+            "selection": _serialize_token_selection_settings(_current_token_selection_settings(http_request.app)),
             "items": items,
+        }
+
+    @app.post("/admin/tokens/{token_id}/activation")
+    async def update_token_activation_route(
+        token_id: int,
+        payload: TokenActivationUpdateRequest,
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        token = await set_token_active_state(token_id, active=payload.active)
+        if token is None:
+            raise HTTPException(status_code=404, detail="Token not found")
+        counts = await get_token_counts()
+        return {
+            "id": token.id,
+            "is_active": token.is_active,
+            "cooldown_until": token.cooldown_until,
+            "counts": asdict(counts),
         }
 
     @app.get("/admin/requests")
@@ -899,9 +1084,11 @@ def create_app() -> FastAPI:
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         summary = await get_request_log_summary()
+        analytics = await get_request_log_analytics(hours=24, bucket_minutes=60, top_models=6)
         items = [asdict(item) for item in await list_request_logs(limit=limit)]
         return {
             "summary": asdict(summary),
+            "analytics": asdict(analytics),
             "items": items,
         }
 
@@ -1022,11 +1209,12 @@ def create_app() -> FastAPI:
             max_attempts = max(1, min(counts.available, _max_request_account_retries()))
             client: httpx.AsyncClient = http_request.app.state.http_client
             oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
+            selection_settings = _current_token_selection_settings(http_request.app)
             last_error: HTTPException | None = None
 
             for attempt in range(1, max_attempts + 1):
                 attempt_count = attempt
-                token_row = await claim_next_active_token()
+                token_row = await claim_next_active_token(selection_strategy=selection_settings.strategy)
                 if token_row is None:
                     break
                 last_account_id = token_row.account_id
@@ -1051,6 +1239,35 @@ def create_app() -> FastAPI:
                         compact=compact,
                     )
                     await mark_token_success(token_row.id)
+                    if isinstance(proxy_result.response, StreamingResponse):
+                        if proxy_result.stream_capture is not None:
+                            _append_background_task(
+                                proxy_result.response,
+                                _finalize_stream_request_log,
+                                request_log_id=request_log.id,
+                                status_code=proxy_result.status_code,
+                                attempt_count=attempt,
+                                account_id=token_row.account_id,
+                                fallback_model_name=proxy_result.model_name,
+                                fallback_first_token_at=proxy_result.first_token_at,
+                                stream_capture=proxy_result.stream_capture,
+                            )
+                        else:
+                            _append_background_task(
+                                proxy_result.response,
+                                finalize_request_log,
+                                request_log.id,
+                                status_code=proxy_result.status_code,
+                                success=True,
+                                attempt_count=attempt,
+                                finished_at=utcnow(),
+                                first_token_at=proxy_result.first_token_at,
+                                account_id=token_row.account_id,
+                                model_name=proxy_result.model_name,
+                            )
+                        _append_background_task(proxy_result.response, response_lease.release)
+                        release_response_traffic = False
+                        return proxy_result.response
                     await finalize_request_log(
                         request_log.id,
                         status_code=proxy_result.status_code,
@@ -1060,10 +1277,8 @@ def create_app() -> FastAPI:
                         first_token_at=proxy_result.first_token_at,
                         account_id=token_row.account_id,
                         model_name=proxy_result.model_name,
+                        **_usage_finalize_kwargs(proxy_result.usage_metrics),
                     )
-                    if isinstance(proxy_result.response, StreamingResponse):
-                        _append_background_task(proxy_result.response, response_lease.release)
-                        release_response_traffic = False
                     return proxy_result.response
                 except HTTPException as exc:
                     status_code = getattr(exc, "status_code", 500)
@@ -1216,11 +1431,16 @@ async def _stream_upstream_response(
     buffered_chunks: list[bytes],
     *,
     stream_committed: bool,
+    stream_capture: _ProxyStreamCapture | None = None,
 ) -> AsyncGenerator[bytes, None]:
     try:
         for chunk in buffered_chunks:
+            if stream_capture is not None:
+                stream_capture.feed(chunk)
             yield chunk
         async for chunk in upstream_iter:
+            if stream_capture is not None:
+                stream_capture.feed(chunk)
             yield chunk
     except RESPONSES_STREAM_NETWORK_ERRORS as exc:
         logger.warning(
@@ -1287,6 +1507,12 @@ async def _proxy_request_with_token(
             await stream_cm.__aexit__(None, None, None)
             raise
 
+        initial_first_token_at = utcnow() if stream_committed else None
+        stream_capture = _ProxyStreamCapture(
+            initial_model_name=model_name or request_data.model,
+            initial_first_token_at=initial_first_token_at,
+        )
+
         return ProxyRequestResult(
             response=StreamingResponse(
                 _stream_upstream_response(
@@ -1294,12 +1520,14 @@ async def _proxy_request_with_token(
                     upstream_iter,
                     buffered_chunks,
                     stream_committed=stream_committed,
+                    stream_capture=stream_capture,
                 ),
                 media_type="text/event-stream",
             ),
             status_code=upstream_response.status_code,
             model_name=model_name or request_data.model,
-            first_token_at=utcnow() if stream_committed else None,
+            first_token_at=initial_first_token_at,
+            stream_capture=stream_capture,
         )
 
     if upstream_stream:
@@ -1323,11 +1551,13 @@ async def _proxy_request_with_token(
                 upstream_response.aiter_raw(),
                 model=request_data.model,
             )
+            effective_model_name = _extract_response_model_name(data) or request_data.model
             return ProxyRequestResult(
                 response=JSONResponse(status_code=upstream_response.status_code, content=data),
                 status_code=upstream_response.status_code,
-                model_name=_extract_response_model_name(data) or request_data.model,
+                model_name=effective_model_name,
                 first_token_at=first_token_at,
+                usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
             )
         finally:
             await stream_cm.__aexit__(None, None, None)
@@ -1350,11 +1580,13 @@ async def _proxy_request_with_token(
 
         raw, first_token_at = await _read_response_body_with_first_chunk_time(upstream_response.aiter_raw())
         data = _decode_responses_json_body(raw)
+        effective_model_name = _extract_response_model_name(data) or request_data.model
         return ProxyRequestResult(
             response=JSONResponse(status_code=upstream_response.status_code, content=data),
             status_code=upstream_response.status_code,
-            model_name=_extract_response_model_name(data) or request_data.model,
+            model_name=effective_model_name,
             first_token_at=first_token_at,
+            usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
         )
     finally:
         await stream_cm.__aexit__(None, None, None)

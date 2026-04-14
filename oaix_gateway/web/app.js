@@ -16,6 +16,10 @@ const state = {
   serviceKey: localStorage.getItem(STORAGE_KEY) || "",
   protected: false,
   timer: null,
+  tokenActionPendingIds: new Set(),
+  tokenItems: [],
+  tokenSelectionSaving: false,
+  tokenSelectionStrategy: "least_recently_used",
   themePreference: initialThemePreference,
   resolvedTheme: initialResolvedTheme,
   themeMedia: window.matchMedia("(prefers-color-scheme: dark)"),
@@ -48,12 +52,22 @@ const elements = {
   importFeedback: document.getElementById("import-feedback"),
   tokenList: document.getElementById("token-list"),
   listNote: document.getElementById("list-note"),
+  tokenSelectionSummary: document.getElementById("token-selection-summary"),
+  tokenSelectionButtons: Array.from(document.querySelectorAll("[data-selection-strategy]")),
   requestList: document.getElementById("request-list"),
   requestNote: document.getElementById("request-note"),
   requestTotalCount: document.getElementById("request-total-count"),
+  requestTotalTokens: document.getElementById("request-total-tokens"),
+  requestEstimatedCost: document.getElementById("request-estimated-cost"),
   requestSuccessCount: document.getElementById("request-success-count"),
   requestFailedCount: document.getElementById("request-failed-count"),
   requestAvgTtft: document.getElementById("request-avg-ttft"),
+  requestTokenChart: document.getElementById("request-token-chart"),
+  requestTokenChartTotal: document.getElementById("request-token-chart-total"),
+  requestTokenChartNote: document.getElementById("request-token-chart-note"),
+  requestCostChart: document.getElementById("request-cost-chart"),
+  requestCostChartTotal: document.getElementById("request-cost-chart-total"),
+  requestCostChartNote: document.getElementById("request-cost-chart-note"),
 };
 
 elements.serviceKey.value = state.serviceKey;
@@ -155,6 +169,104 @@ function formatDurationMs(value) {
     return `${(ms / 1000).toFixed(1)} s`;
   }
   return `${Math.round(ms / 1000)} s`;
+}
+
+function formatInteger(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "0";
+  }
+  return new Intl.NumberFormat("zh-CN").format(Math.round(number));
+}
+
+function formatCompactNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "0";
+  }
+  return new Intl.NumberFormat("zh-CN", {
+    notation: "compact",
+    maximumFractionDigits: number >= 1000 ? 1 : 0,
+  }).format(number);
+}
+
+function formatUsd(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "—";
+  }
+  if (number === 0) {
+    return "$0.00";
+  }
+  if (number >= 100) {
+    return `$${number.toFixed(2)}`;
+  }
+  if (number >= 1) {
+    return `$${number.toFixed(2)}`;
+  }
+  if (number >= 0.01) {
+    return `$${number.toFixed(3)}`;
+  }
+  return `$${number.toFixed(4)}`;
+}
+
+function normalizeTokenSelectionStrategy(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("-", "_");
+  return normalized === "fill_first" ? "fill_first" : "least_recently_used";
+}
+
+function describeTokenSelectionStrategy(strategy) {
+  if (normalizeTokenSelectionStrategy(strategy) === "fill_first") {
+    return "一直用第一个可用 key，冷却后再切换";
+  }
+  return "优先分配最久未使用的 key";
+}
+
+function setTokenSelectionDisabled(disabled) {
+  elements.tokenSelectionButtons.forEach((button) => {
+    button.disabled = disabled;
+  });
+}
+
+function renderTokenSelection(selection) {
+  const strategy = normalizeTokenSelectionStrategy(selection?.strategy);
+  state.tokenSelectionStrategy = strategy;
+
+  elements.tokenSelectionButtons.forEach((button) => {
+    const active = button.dataset.selectionStrategy === strategy;
+    button.setAttribute("aria-pressed", String(active));
+  });
+
+  if (elements.tokenSelectionSummary) {
+    elements.tokenSelectionSummary.textContent = describeTokenSelectionStrategy(strategy);
+  }
+}
+
+function isTokenActionPending(tokenId) {
+  return state.tokenActionPendingIds.has(Number(tokenId));
+}
+
+function renderTokenActionButton(item) {
+  const tokenId = Number(item?.id);
+  const nextActive = !Boolean(item?.is_active);
+  const pending = isTokenActionPending(tokenId);
+  const label = pending ? "处理中…" : nextActive ? "取消禁用" : "暂时禁用";
+  const tone = nextActive ? "enable" : "disable";
+  return `
+    <button
+      class="token-action-button token-action-button--${tone}"
+      type="button"
+      data-token-toggle="true"
+      data-token-id="${tokenId}"
+      data-next-active="${nextActive ? "true" : "false"}"
+      ${pending ? "disabled" : ""}
+    >
+      ${label}
+    </button>
+  `;
 }
 
 function clampWidth(value, total) {
@@ -393,14 +505,183 @@ function deriveRequestStatus(item) {
 
 function renderRequestSummary(summary) {
   const total = summary?.total || 0;
+  const totalTokens = summary?.total_tokens || 0;
+  const estimatedCost = summary?.estimated_cost_usd || 0;
   const successful = summary?.successful || 0;
   const failed = summary?.failed || 0;
   const avgTtft = summary?.avg_ttft_ms;
 
   elements.requestTotalCount.textContent = total;
+  elements.requestTotalTokens.textContent = formatCompactNumber(totalTokens);
+  elements.requestEstimatedCost.textContent = formatUsd(estimatedCost);
   elements.requestSuccessCount.textContent = successful;
   elements.requestFailedCount.textContent = failed;
   elements.requestAvgTtft.textContent = formatDurationMs(avgTtft);
+}
+
+function renderChartEmpty(element, message) {
+  element.innerHTML = `
+    <article class="empty-state chart-empty">
+      <p>${escapeHtml(message)}</p>
+    </article>
+  `;
+}
+
+function formatBucketLabel(value) {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function truncateLabel(value, maxLength = 16) {
+  const text = String(value || "").trim();
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength - 1)}…`;
+}
+
+function renderRequestTokenChart(analytics) {
+  const buckets = Array.isArray(analytics?.buckets) ? analytics.buckets : [];
+  const periodHours = Number(analytics?.period_hours) || 24;
+  const totalTokens = buckets.reduce((sum, bucket) => sum + (Number(bucket?.total_tokens) || 0), 0);
+
+  elements.requestTokenChartTotal.textContent = formatCompactNumber(totalTokens);
+  elements.requestTokenChartNote.textContent = `最近 ${periodHours} 小时按小时汇总输入与输出 token。`;
+
+  if (!buckets.length || totalTokens <= 0) {
+    renderChartEmpty(elements.requestTokenChart, "最近 24 小时还没有 token 用量数据。");
+    return;
+  }
+
+  const width = 680;
+  const height = 224;
+  const padding = { top: 14, right: 12, bottom: 34, left: 12 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const maxTotal = Math.max(...buckets.map((bucket) => Number(bucket?.total_tokens) || 0), 1);
+  const slotWidth = plotWidth / buckets.length;
+  const barWidth = Math.max(4, slotWidth * 0.64);
+  const labelStep = Math.max(1, Math.ceil(buckets.length / 6));
+  const gridLines = 4;
+
+  const gridMarkup = Array.from({ length: gridLines }, (_, index) => {
+    const y = padding.top + (plotHeight / (gridLines - 1)) * index;
+    return `<line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" class="chart-grid-line" />`;
+  }).join("");
+
+  const barsMarkup = buckets
+    .map((bucket, index) => {
+      const inputTokens = Math.max(0, Number(bucket?.input_tokens) || 0);
+      const outputTokens = Math.max(0, Number(bucket?.output_tokens) || 0);
+      const total = Math.max(0, Number(bucket?.total_tokens) || 0);
+      const x = padding.left + index * slotWidth + (slotWidth - barWidth) / 2;
+      const totalHeight = total > 0 ? (total / maxTotal) * plotHeight : 0;
+      const inputHeight = total > 0 ? (inputTokens / maxTotal) * plotHeight : 0;
+      const outputHeight = totalHeight - inputHeight;
+      const baseY = padding.top + plotHeight;
+      const outputY = baseY - outputHeight;
+      const inputY = outputY - inputHeight;
+      const label = formatBucketLabel(bucket?.bucket_start);
+
+      return `
+        <g class="chart-bar-group">
+          <title>${escapeHtml(`${label} · 输入 ${formatInteger(inputTokens)} · 输出 ${formatInteger(outputTokens)} · 总计 ${formatInteger(total)}`)}</title>
+          ${
+            inputHeight > 0
+              ? `<rect x="${x}" y="${inputY}" width="${barWidth}" height="${inputHeight}" rx="5" class="chart-bar chart-bar--input" />`
+              : ""
+          }
+          ${
+            outputHeight > 0
+              ? `<rect x="${x}" y="${outputY}" width="${barWidth}" height="${outputHeight}" rx="5" class="chart-bar chart-bar--output" />`
+              : ""
+          }
+          ${
+            index % labelStep === 0
+              ? `<text x="${x + barWidth / 2}" y="${height - 10}" text-anchor="middle" class="chart-axis-label">${escapeHtml(label)}</text>`
+              : ""
+          }
+        </g>
+      `;
+    })
+    .join("");
+
+  elements.requestTokenChart.innerHTML = `
+    <svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="最近 24 小时 token 趋势图">
+      ${gridMarkup}
+      ${barsMarkup}
+    </svg>
+  `;
+}
+
+function renderRequestCostChart(analytics) {
+  const models = Array.isArray(analytics?.models) ? analytics.models : [];
+  const periodHours = Number(analytics?.period_hours) || 24;
+  const totalCost = models.reduce((sum, item) => sum + (Number(item?.estimated_cost_usd) || 0), 0);
+  const maxCost = Math.max(...models.map((item) => Number(item?.estimated_cost_usd) || 0), 0);
+
+  elements.requestCostChartTotal.textContent = formatUsd(totalCost);
+  elements.requestCostChartNote.textContent =
+    maxCost > 0
+      ? `最近 ${periodHours} 小时按模型汇总估算金额。`
+      : `最近 ${periodHours} 小时暂无可估算金额，可能模型未命中单价表。`;
+
+  if (!models.length) {
+    renderChartEmpty(elements.requestCostChart, "最近 24 小时还没有模型金额分布数据。");
+    return;
+  }
+
+  const width = 680;
+  const rowHeight = 38;
+  const height = Math.max(220, 44 + models.length * rowHeight);
+  const padding = { top: 16, right: 12, bottom: 18, left: 196 };
+  const plotWidth = width - padding.left - padding.right;
+  const resolvedMaxCost = Math.max(maxCost, 0.0001);
+
+  const rowsMarkup = models
+    .map((item, index) => {
+      const modelName = item?.model_name || "未识别模型";
+      const visibleLabel = truncateLabel(modelName, 18);
+      const cost = Math.max(0, Number(item?.estimated_cost_usd) || 0);
+      const totalTokens = Math.max(0, Number(item?.total_tokens) || 0);
+      const y = padding.top + index * rowHeight;
+      const barY = y + 12;
+      const barHeight = 10;
+      const barWidth = (cost / resolvedMaxCost) * plotWidth;
+      const textY = y + 8;
+
+      return `
+        <g class="chart-model-row">
+          <title>${escapeHtml(`${modelName} · ${formatUsd(cost)} · ${formatInteger(totalTokens)} tokens`)}</title>
+          <text x="${padding.left - 12}" y="${textY}" text-anchor="end" class="chart-model-label">${escapeHtml(visibleLabel)}</text>
+          <rect x="${padding.left}" y="${barY}" width="${plotWidth}" height="${barHeight}" rx="999" class="chart-track" />
+          ${barWidth > 0 ? `<rect x="${padding.left}" y="${barY}" width="${barWidth}" height="${barHeight}" rx="999" class="chart-bar chart-bar--cost" />` : ""}
+          <text x="${width - padding.right}" y="${textY}" text-anchor="end" class="chart-model-value">${escapeHtml(formatUsd(cost))}</text>
+          <text x="${padding.left - 12}" y="${y + 26}" text-anchor="end" class="chart-model-meta">${escapeHtml(`${formatCompactNumber(totalTokens)} tokens`)}</text>
+        </g>
+      `;
+    })
+    .join("");
+
+  elements.requestCostChart.innerHTML = `
+    <svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="最近 24 小时模型金额分布图">
+      ${rowsMarkup}
+    </svg>
+  `;
+}
+
+function renderRequestAnalytics(analytics) {
+  renderRequestTokenChart(analytics);
+  renderRequestCostChart(analytics);
 }
 
 function renderTokenList(items) {
@@ -437,6 +718,9 @@ function renderTokenList(items) {
               <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
             </div>
             ${renderTokenMetaBlock("订阅到期", formatSubscriptionUntil(item.subscription_active_until), { subtle: true })}
+            <div class="token-row__status-actions">
+              ${renderTokenActionButton(item)}
+            </div>
           </div>
           <div class="token-row__lifecycle" data-label="冷却到期 / 最近使用">
             <span class="token-lifecycle-value token-lifecycle-value--${cooldownTone}">${escapeHtml(cooldownValue)}</span>
@@ -552,14 +836,22 @@ async function loadTokens() {
     const data = await fetchJson("/admin/tokens?limit=80&include_quota=1", {
       headers: authHeaders(),
     });
+    state.tokenItems = Array.isArray(data.items) ? data.items : [];
     elements.listNote.textContent = "显示最近 80 条记录 · 含计划、订阅与 5h/7d 配额";
-    renderTokenList(data.items || []);
+    renderTokenSelection(data.selection || {});
+    setTokenSelectionDisabled(state.tokenSelectionSaving);
+    renderTokenList(state.tokenItems);
     if (data.counts) {
       renderCounts(data.counts);
     }
   } catch (error) {
+    state.tokenItems = [];
     if (error.status === 401) {
       elements.listNote.textContent = "需要输入 Service API Key 才能查看明细和导入";
+      if (elements.tokenSelectionSummary) {
+        elements.tokenSelectionSummary.textContent = "需要 Service API Key";
+      }
+      setTokenSelectionDisabled(true);
       elements.tokenList.innerHTML = `
         <article class="empty-state">
           <p>管理接口已加锁。填入 Service API Key 后可查看明细和导入 key。</p>
@@ -568,6 +860,10 @@ async function loadTokens() {
       return;
     }
     elements.listNote.textContent = `列表加载失败：${error.message}`;
+    if (elements.tokenSelectionSummary) {
+      elements.tokenSelectionSummary.textContent = "切换器同步失败";
+    }
+    setTokenSelectionDisabled(true);
     elements.tokenList.innerHTML = `
       <article class="empty-state">
         <p>${escapeHtml(error.message)}</p>
@@ -576,27 +872,97 @@ async function loadTokens() {
   }
 }
 
+async function saveTokenSelection(strategy) {
+  const nextStrategy = normalizeTokenSelectionStrategy(strategy);
+  if (state.tokenSelectionSaving || nextStrategy === state.tokenSelectionStrategy) {
+    return;
+  }
+
+  const previousStrategy = state.tokenSelectionStrategy;
+  let disableAfterSave = false;
+  state.tokenSelectionSaving = true;
+  renderTokenSelection({ strategy: nextStrategy });
+  if (elements.tokenSelectionSummary) {
+    elements.tokenSelectionSummary.textContent = `正在切换到${nextStrategy === "fill_first" ? " Fill-first" : "最旧未使用优先"}`;
+  }
+  setTokenSelectionDisabled(true);
+
+  try {
+    const data = await fetchJson("/admin/token-selection", {
+      method: "POST",
+      headers: authHeaders(true),
+      body: JSON.stringify({ strategy: nextStrategy }),
+    });
+    renderTokenSelection(data);
+    elements.listNote.textContent = "显示最近 80 条记录 · 含计划、订阅与 5h/7d 配额";
+  } catch (error) {
+    renderTokenSelection({ strategy: previousStrategy });
+    if (elements.tokenSelectionSummary) {
+      elements.tokenSelectionSummary.textContent =
+        error.status === 401 ? "需要 Service API Key" : "切换失败，请重试";
+    }
+    disableAfterSave = error.status === 401;
+    throw error;
+  } finally {
+    state.tokenSelectionSaving = false;
+    setTokenSelectionDisabled(disableAfterSave);
+  }
+}
+
+async function toggleTokenActivation(tokenId, nextActive) {
+  const resolvedTokenId = Number(tokenId);
+  if (!Number.isFinite(resolvedTokenId) || isTokenActionPending(resolvedTokenId)) {
+    return;
+  }
+
+  state.tokenActionPendingIds.add(resolvedTokenId);
+  renderTokenList(state.tokenItems);
+
+  try {
+    await fetchJson(`/admin/tokens/${resolvedTokenId}/activation`, {
+      method: "POST",
+      headers: authHeaders(true),
+      body: JSON.stringify({ active: Boolean(nextActive) }),
+    });
+    await loadHealth();
+    await loadTokens();
+  } catch (error) {
+    elements.listNote.textContent =
+      error.status === 401 ? "需要输入 Service API Key 才能变更 key 状态" : `状态更新失败：${error.message}`;
+    if (error.status === 401) {
+      await loadTokens();
+    }
+    throw error;
+  } finally {
+    state.tokenActionPendingIds.delete(resolvedTokenId);
+    renderTokenList(state.tokenItems);
+  }
+}
+
 async function loadRequests() {
   try {
     const data = await fetchJson("/admin/requests?limit=80", {
       headers: authHeaders(),
     });
-    elements.requestNote.textContent = "显示最近 80 条请求";
+    elements.requestNote.textContent = "显示最近 80 条请求 · 图表为最近 24 小时 token 与估算金额";
     renderRequestSummary(data.summary || {});
+    renderRequestAnalytics(data.analytics || {});
     renderRequestList(data.items || []);
   } catch (error) {
     if (error.status === 401) {
       elements.requestNote.textContent = "需要输入 Service API Key 才能查看请求日志";
       renderRequestSummary({});
+      renderRequestAnalytics({});
       elements.requestList.innerHTML = `
         <article class="empty-state">
-          <p>请求日志已加锁。填入 Service API Key 后可查看请求次数、模型名、端点、状态码和首字时间。</p>
+          <p>请求日志已加锁。填入 Service API Key 后可查看请求次数、token 用量、估算金额、模型名、端点、状态码和首字时间。</p>
         </article>
       `;
       return;
     }
     elements.requestNote.textContent = `请求日志加载失败：${error.message}`;
     renderRequestSummary({});
+    renderRequestAnalytics({});
     elements.requestList.innerHTML = `
       <article class="empty-state">
         <p>${escapeHtml(error.message)}</p>
@@ -786,9 +1152,31 @@ function syncSystemTheme() {
 }
 
 applyTheme(state.themePreference, { persist: false });
+renderTokenSelection({ strategy: state.tokenSelectionStrategy });
 
 elements.themeButtons.forEach((button) => {
   button.addEventListener("click", () => applyTheme(button.dataset.themeOption));
+});
+
+elements.tokenSelectionButtons.forEach((button) => {
+  button.addEventListener("click", async () => {
+    try {
+      await saveTokenSelection(button.dataset.selectionStrategy);
+    } catch {}
+  });
+});
+
+elements.tokenList.addEventListener("click", async (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const button = event.target.closest("[data-token-toggle]");
+  if (!(button instanceof HTMLElement)) {
+    return;
+  }
+  try {
+    await toggleTokenActivation(button.dataset.tokenId, button.dataset.nextActive === "true");
+  } catch {}
 });
 
 if (typeof state.themeMedia.addEventListener === "function") {
