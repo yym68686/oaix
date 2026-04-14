@@ -580,6 +580,69 @@ function renderTokenErrorSection(item) {
   `;
 }
 
+function renderTokenCard(item) {
+  const status = deriveStatus(item);
+  const accountId = item.chatgpt_account_id || item.account_id || "";
+  const account = item.email || accountId || "未命名账号";
+  const meta = accountId && accountId !== account ? accountId : item.source_file || "无来源记录";
+  const planLabel = formatPlanType(item.plan_type);
+  const planTone = derivePlanTone(item.plan_type);
+  const subscriptionValue = formatSubscriptionUntil(item.subscription_active_until);
+  const subscriptionTone = subscriptionValue.startsWith("已过期")
+    ? "disabled"
+    : subscriptionValue === "—"
+      ? "muted"
+      : "default";
+  const cooldownValue = formatCooldownUntil(item.cooldown_until);
+  const lastUsedValue = formatDate(item.last_used_at);
+  const observedCostValue = item.observed_cost_usd == null ? "—" : formatUsd(item.observed_cost_usd);
+  const cooldownTone = cooldownValue === "—" ? "muted" : "cooling";
+  const lastUsedTone = lastUsedValue === "—" ? "muted" : "default";
+  const observedCostTone = item.observed_cost_usd == null ? "muted" : "money";
+  const errorSection = renderTokenErrorSection(item);
+  return `
+    <article class="token-card token-card--${status.tone}">
+      <div class="token-card__top">
+        <div class="token-card__identity">
+          <span class="token-card__account">${escapeHtml(account)}</span>
+          <span class="token-card__meta">${escapeHtml(meta)}</span>
+        </div>
+        <div class="token-card__overview">
+          <div class="token-card__chips">
+            <span class="status-pill status-pill--${status.tone}">${status.label}</span>
+            <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
+          </div>
+          <div class="token-card__facts">
+            ${renderTokenFact("订阅", subscriptionValue, subscriptionTone)}
+            ${renderTokenFact("冷却到", cooldownValue, cooldownTone)}
+            ${renderTokenFact("最近使用", lastUsedValue, lastUsedTone)}
+            ${renderTokenFact("已用金额", observedCostValue, observedCostTone)}
+          </div>
+        </div>
+        <div class="token-card__action">
+          ${renderTokenActionButton(item)}
+        </div>
+      </div>
+      <div class="token-card__bottom${errorSection ? " token-card__bottom--with-error" : ""}">
+        ${renderQuotaSection(item)}
+        ${errorSection}
+      </div>
+    </article>
+  `;
+}
+
+function renderTokenGroupHeader(title, meta, count) {
+  return `
+    <div class="token-group__head">
+      <div class="token-group__copy">
+        <span class="token-group__title">${escapeHtml(title)}</span>
+        <span class="token-group__meta">${escapeHtml(meta)}</span>
+      </div>
+      <span class="token-group__count">${escapeHtml(formatInteger(count))}</span>
+    </div>
+  `;
+}
+
 function renderCounts(counts) {
   const total = counts.total || 0;
   const available = counts.available || 0;
@@ -808,58 +871,61 @@ function renderTokenList(items) {
     return;
   }
 
-  elements.tokenList.innerHTML = items
-    .map((item) => {
-      const status = deriveStatus(item);
-      const accountId = item.chatgpt_account_id || item.account_id || "";
-      const account = item.email || accountId || "未命名账号";
-      const meta = accountId && accountId !== account ? accountId : item.source_file || "无来源记录";
-      const planLabel = formatPlanType(item.plan_type);
-      const planTone = derivePlanTone(item.plan_type);
-      const subscriptionValue = formatSubscriptionUntil(item.subscription_active_until);
-      const subscriptionTone = subscriptionValue.startsWith("已过期")
-        ? "disabled"
-        : subscriptionValue === "—"
-          ? "muted"
-          : "default";
-      const cooldownValue = formatCooldownUntil(item.cooldown_until);
-      const lastUsedValue = formatDate(item.last_used_at);
-      const observedCostValue = item.observed_cost_usd == null ? "—" : formatUsd(item.observed_cost_usd);
-      const cooldownTone = cooldownValue === "—" ? "muted" : "cooling";
-      const lastUsedTone = lastUsedValue === "—" ? "muted" : "default";
-      const observedCostTone = item.observed_cost_usd == null ? "muted" : "money";
-      const errorSection = renderTokenErrorSection(item);
-      return `
-        <article class="token-card token-card--${status.tone}">
-          <div class="token-card__top">
-            <div class="token-card__identity">
-              <span class="token-card__account">${escapeHtml(account)}</span>
-              <span class="token-card__meta">${escapeHtml(meta)}</span>
+  const primaryItems = [];
+  const disabledItems = [];
+  let availableCount = 0;
+  let coolingCount = 0;
+
+  items.forEach((item) => {
+    const status = deriveStatus(item);
+    if (status.tone === "disabled") {
+      disabledItems.push(item);
+      return;
+    }
+    primaryItems.push(item);
+    if (status.tone === "cooling") {
+      coolingCount += 1;
+    } else {
+      availableCount += 1;
+    }
+  });
+
+  const primaryMeta =
+    primaryItems.length > 0 ? `${formatInteger(availableCount)} 可用 · ${formatInteger(coolingCount)} 冷却` : "当前没有可调度 key";
+  const primaryEmptyMessage =
+    disabledItems.length > 0 ? "当前没有可用或冷却中的 key，下面可以展开查看已禁用项。" : "当前没有可展示的 key。";
+  const disabledOpen = primaryItems.length === 0;
+
+  elements.tokenList.innerHTML = `
+    <section class="token-group">
+      ${renderTokenGroupHeader("可用与冷却", primaryMeta, primaryItems.length)}
+      <div class="token-group__body">
+        ${
+          primaryItems.length > 0
+            ? primaryItems.map((item) => renderTokenCard(item)).join("")
+            : `<article class="empty-state"><p>${escapeHtml(primaryEmptyMessage)}</p></article>`
+        }
+      </div>
+    </section>
+    ${
+      disabledItems.length > 0
+        ? `
+          <details class="token-group token-group--archived"${disabledOpen ? " open" : ""}>
+            <summary class="token-group__summary">
+              <span class="token-group__copy">
+                <span class="token-group__title">已禁用</span>
+                <span class="token-group__meta">已移出调度池</span>
+              </span>
+              <span class="token-group__count">${escapeHtml(formatInteger(disabledItems.length))}</span>
+            </summary>
+            <div class="token-group__body">
+              ${disabledItems.map((item) => renderTokenCard(item)).join("")}
             </div>
-            <div class="token-card__overview">
-              <div class="token-card__chips">
-                <span class="status-pill status-pill--${status.tone}">${status.label}</span>
-                <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
-              </div>
-              <div class="token-card__facts">
-                ${renderTokenFact("订阅", subscriptionValue, subscriptionTone)}
-                ${renderTokenFact("冷却到", cooldownValue, cooldownTone)}
-                ${renderTokenFact("最近使用", lastUsedValue, lastUsedTone)}
-                ${renderTokenFact("已用金额", observedCostValue, observedCostTone)}
-              </div>
-            </div>
-            <div class="token-card__action">
-              ${renderTokenActionButton(item)}
-            </div>
-          </div>
-          <div class="token-card__bottom${errorSection ? " token-card__bottom--with-error" : ""}">
-            ${renderQuotaSection(item)}
-            ${errorSection}
-          </div>
-        </article>
-      `;
-    })
-    .join("");
+          </details>
+        `
+        : ""
+    }
+  `;
 }
 
 function renderRequestList(items) {
@@ -965,7 +1031,7 @@ async function loadTokens() {
       headers: authHeaders(),
     });
     state.tokenItems = Array.isArray(data.items) ? data.items : [];
-    elements.listNote.textContent = "显示最近 80 条记录 · 含计划、订阅、配额与已用金额（美元估算）";
+    elements.listNote.textContent = "显示最近 80 条记录 · 运行池与已禁用分组";
     renderTokenSelection(data.selection || {});
     setTokenSelectionDisabled(state.tokenSelectionSaving);
     renderTokenList(state.tokenItems);
@@ -1022,7 +1088,7 @@ async function saveTokenSelection(strategy) {
       body: JSON.stringify({ strategy: nextStrategy }),
     });
     renderTokenSelection(data);
-    elements.listNote.textContent = "显示最近 80 条记录 · 含计划、订阅、配额与已用金额（美元估算）";
+    elements.listNote.textContent = "显示最近 80 条记录 · 运行池与已禁用分组";
   } catch (error) {
     renderTokenSelection({ strategy: previousStrategy });
     if (elements.tokenSelectionSummary) {
