@@ -106,6 +106,37 @@ def _floor_bucket_start(value: datetime, *, bucket_minutes: int) -> datetime:
     return value.replace(minute=minute)
 
 
+def _request_model_label_expr():
+    return func.coalesce(GatewayRequestLog.model_name, GatewayRequestLog.model, "未识别模型")
+
+
+def _build_request_model_analytics_stmt(*, since: datetime, top_models: int):
+    model_source = (
+        select(
+            _request_model_label_expr().label("model_name"),
+            GatewayRequestLog.total_tokens.label("total_tokens"),
+            GatewayRequestLog.estimated_cost_usd.label("estimated_cost_usd"),
+        )
+        .where(GatewayRequestLog.started_at >= since)
+        .subquery()
+    )
+    return (
+        select(
+            model_source.c.model_name,
+            func.count(),
+            func.sum(model_source.c.total_tokens),
+            func.sum(model_source.c.estimated_cost_usd),
+        )
+        .group_by(model_source.c.model_name)
+        .order_by(
+            func.sum(model_source.c.estimated_cost_usd).desc().nullslast(),
+            func.sum(model_source.c.total_tokens).desc().nullslast(),
+            func.count().desc(),
+        )
+        .limit(top_models)
+    )
+
+
 async def create_request_log(
     *,
     request_id: str,
@@ -271,22 +302,7 @@ async def get_request_log_analytics(*, hours: int = 24, bucket_minutes: int = 60
         )
         bucket_rows = (await session.execute(bucket_stmt)).all()
 
-        model_stmt = (
-            select(
-                func.coalesce(GatewayRequestLog.model_name, GatewayRequestLog.model, "未识别模型"),
-                func.count(),
-                func.sum(GatewayRequestLog.total_tokens),
-                func.sum(GatewayRequestLog.estimated_cost_usd),
-            )
-            .where(GatewayRequestLog.started_at >= since)
-            .group_by(func.coalesce(GatewayRequestLog.model_name, GatewayRequestLog.model, "未识别模型"))
-            .order_by(
-                func.sum(GatewayRequestLog.estimated_cost_usd).desc().nullslast(),
-                func.sum(GatewayRequestLog.total_tokens).desc().nullslast(),
-                func.count().desc(),
-            )
-            .limit(effective_top_models)
-        )
+        model_stmt = _build_request_model_analytics_stmt(since=since, top_models=effective_top_models)
         model_rows = (await session.execute(model_stmt)).all()
 
     bucket_map: dict[datetime, dict[str, float | int | datetime]] = {}
