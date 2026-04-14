@@ -303,56 +303,53 @@ function renderQuotaWindow(window, fallbackLabel) {
 
   if (!window) {
     return `
-      <div class="quota-window quota-window--pending">
-        <div class="quota-window__head">
-          <span class="quota-window__label">${escapeHtml(label)}</span>
-          <span class="quota-window__value">—</span>
+      <div class="quota-meter quota-meter--pending">
+        <div class="quota-meter__row">
+          <span class="quota-meter__label">${escapeHtml(label)}</span>
+          <span class="quota-meter__reset">未返回窗口</span>
+          <span class="quota-meter__value">—</span>
         </div>
-        <div class="quota-window__bar"><span class="quota-window__fill" style="width: 0%"></span></div>
-        <div class="quota-window__meta">未返回窗口</div>
+        <div class="quota-meter__track"><span class="quota-meter__fill" style="width: 0%"></span></div>
       </div>
     `;
   }
 
-  const metaParts = [`剩余 ${remainingLabel}`];
+  let metaText = "等待窗口";
   if (resetLabel !== "—") {
-    metaParts.push(`重置 ${resetLabel}`);
-  }
-  if (window.exhausted) {
-    metaParts.push("已耗尽");
+    metaText = `重置 ${resetLabel}`;
+  } else if (window.exhausted) {
+    metaText = "已耗尽";
   }
 
   return `
-    <div class="quota-window quota-window--${tone}">
-      <div class="quota-window__head">
-        <span class="quota-window__label">${escapeHtml(label)}</span>
-        <span class="quota-window__value">${escapeHtml(remainingLabel)}</span>
+    <div class="quota-meter quota-meter--${tone}">
+      <div class="quota-meter__row">
+        <span class="quota-meter__label">${escapeHtml(label)}</span>
+        <span class="quota-meter__reset">${escapeHtml(metaText)}</span>
+        <span class="quota-meter__value">${escapeHtml(remainingLabel)}</span>
       </div>
-      <div class="quota-window__bar"><span class="quota-window__fill" style="width: ${fillWidth}%"></span></div>
-      <div class="quota-window__meta">${escapeHtml(metaParts.join(" · "))}</div>
+      <div class="quota-meter__track"><span class="quota-meter__fill" style="width: ${fillWidth}%"></span></div>
     </div>
   `;
 }
 
 function renderQuotaSection(item) {
   const quota = item.quota;
-  const fetchedAt = quota?.fetched_at ? `更新 ${formatDate(quota.fetched_at)}` : "";
   if (quota?.error) {
     return `
       <div class="token-row__quota" data-label="5h / 7d 配额">
         <p class="quota-error">${escapeHtml(quota.error)}</p>
-        ${fetchedAt ? `<p class="quota-meta">${escapeHtml(fetchedAt)}</p>` : ""}
+        ${quota?.fetched_at ? `<p class="quota-meta">${escapeHtml(`最近尝试 ${formatDate(quota.fetched_at)}`)}</p>` : ""}
       </div>
     `;
   }
 
   return `
     <div class="token-row__quota" data-label="5h / 7d 配额">
-      <div class="quota-window-list">
+      <div class="quota-meter-list">
         ${renderQuotaWindow(getQuotaWindow(item, "code-5h"), "5h")}
         ${renderQuotaWindow(getQuotaWindow(item, "code-7d"), "7d")}
       </div>
-      ${fetchedAt ? `<p class="quota-meta">${escapeHtml(fetchedAt)}</p>` : ""}
     </div>
   `;
 }

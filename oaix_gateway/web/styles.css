@@ -811,7 +811,7 @@ button {
 }
 
 .token-row {
-  padding: 16px 18px;
+  padding: 14px 18px;
   border-bottom: 1px solid var(--border-table-row);
 }
 
@@ -842,7 +842,7 @@ button {
 .token-row__status {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 8px;
 }
 
 .request-row__primary {
@@ -872,30 +872,30 @@ button {
 
 .token-row__lifecycle {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .token-detail {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
 }
 
 .token-detail__label {
   flex: 0 0 auto;
-  font-size: 0.76rem;
+  font-size: 0.74rem;
   font-weight: 800;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-soft);
 }
 
 .token-detail__value {
   min-width: 0;
-  font-size: 0.92rem;
-  line-height: 1.5;
+  font-size: 0.9rem;
+  line-height: 1.4;
   text-align: right;
   word-break: break-word;
   color: var(--ink);
@@ -976,69 +976,73 @@ button {
 
 .token-row__quota {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
-.quota-window-list {
-  display: grid;
-  gap: 10px;
-}
-
-.quota-window {
+.quota-meter-list {
   display: grid;
   gap: 8px;
-  padding: 12px 14px;
-  border-radius: 16px;
-  border: 1px solid var(--border-soft);
-  background: var(--surface-card-strong);
 }
 
-.quota-window__head {
+.quota-meter {
+  display: grid;
+  gap: 6px;
+}
+
+.quota-meter__row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
+  min-width: 0;
 }
 
-.quota-window__label {
-  font-size: 0.84rem;
+.quota-meter__label {
+  flex: 0 0 auto;
+  font-size: 0.76rem;
   font-weight: 800;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-soft);
 }
 
-.quota-window__value {
-  font-size: 0.92rem;
+.quota-meter__reset {
+  min-width: 0;
+  flex: 1 1 auto;
+  font-size: 0.84rem;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ink-soft);
+}
+
+.quota-meter__value {
+  flex: 0 0 auto;
+  font-size: 0.9rem;
   font-weight: 800;
   color: var(--ink);
 }
 
-.quota-window__bar {
+.quota-meter__track {
   position: relative;
   overflow: hidden;
-  height: 8px;
+  height: 7px;
   border-radius: 999px;
   background: var(--distribution-track);
 }
 
-.quota-window__fill {
+.quota-meter__fill {
   display: block;
   height: 100%;
   border-radius: inherit;
   transition: width 200ms ease;
 }
 
-.quota-window__meta,
 .quota-meta,
 .quota-error {
   font-size: 0.84rem;
   line-height: 1.5;
   color: var(--ink-soft);
-}
-
-.quota-window__meta {
-  word-break: break-word;
 }
 
 .quota-meta,
@@ -1051,19 +1055,19 @@ button {
   word-break: break-word;
 }
 
-.quota-window--available .quota-window__fill {
+.quota-meter--available .quota-meter__fill {
   background: linear-gradient(90deg, color-mix(in oklab, var(--available) 74%, white), var(--available));
 }
 
-.quota-window--cooling .quota-window__fill {
+.quota-meter--cooling .quota-meter__fill {
   background: linear-gradient(90deg, color-mix(in oklab, var(--cooling) 70%, white), var(--cooling));
 }
 
-.quota-window--disabled .quota-window__fill {
+.quota-meter--disabled .quota-meter__fill {
   background: linear-gradient(90deg, color-mix(in oklab, var(--disabled) 66%, white), var(--disabled));
 }
 
-.quota-window--pending .quota-window__fill {
+.quota-meter--pending .quota-meter__fill {
   background: linear-gradient(90deg, color-mix(in oklab, var(--accent) 38%, white), color-mix(in oklab, var(--line) 82%, white));
 }
 
