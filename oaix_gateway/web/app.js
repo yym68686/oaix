@@ -248,14 +248,14 @@ function formatSubscriptionUntil(value) {
 
 function formatCooldownUntil(value) {
   if (!value) {
-    return "未冷却";
+    return "—";
   }
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
     return value;
   }
   if (date.getTime() <= Date.now()) {
-    return "已解除";
+    return "—";
   }
   return formatDate(value);
 }
@@ -421,6 +421,10 @@ function renderTokenList(items) {
       const meta = accountId && accountId !== account ? accountId : item.source_file || "无来源记录";
       const planLabel = formatPlanType(item.plan_type);
       const planTone = derivePlanTone(item.plan_type);
+      const cooldownValue = formatCooldownUntil(item.cooldown_until);
+      const lastUsedValue = formatDate(item.last_used_at);
+      const cooldownTone = cooldownValue === "—" ? "muted" : "cooling";
+      const lastUsedTone = lastUsedValue === "—" ? "muted" : "default";
       return `
         <article class="token-row">
           <div class="token-row__primary">
@@ -434,9 +438,9 @@ function renderTokenList(items) {
             </div>
             ${renderTokenMetaBlock("订阅到期", formatSubscriptionUntil(item.subscription_active_until), { subtle: true })}
           </div>
-          <div class="token-row__lifecycle" data-label="冷却 / 最近使用">
-            ${renderTokenMetaBlock("当前冷却", formatCooldownUntil(item.cooldown_until))}
-            ${renderTokenMetaBlock("最近使用", formatDate(item.last_used_at))}
+          <div class="token-row__lifecycle" data-label="冷却到期 / 最近使用">
+            <span class="token-lifecycle-value token-lifecycle-value--${cooldownTone}">${escapeHtml(cooldownValue)}</span>
+            <span class="token-lifecycle-value token-lifecycle-value--${lastUsedTone}">${escapeHtml(lastUsedValue)}</span>
           </div>
           ${renderQuotaSection(item)}
           <div class="token-row__error" data-label="错误摘要">${escapeHtml(item.last_error || "—")}</div>

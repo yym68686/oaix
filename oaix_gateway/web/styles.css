@@ -887,6 +887,7 @@ button {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px 14px;
   align-content: start;
+  align-items: start;
 }
 
 .token-meta-block {
@@ -918,6 +919,26 @@ button {
 .token-meta-block--subtle .token-meta-block__value {
   font-size: 0.88rem;
   color: var(--ink-soft);
+}
+
+.token-lifecycle-value {
+  min-width: 0;
+  font-size: 0.94rem;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.token-lifecycle-value--default {
+  color: var(--ink);
+}
+
+.token-lifecycle-value--muted {
+  color: var(--ink-soft);
+}
+
+.token-lifecycle-value--cooling {
+  color: var(--status-cooling-fg);
 }
 
 .request-row__meta,
