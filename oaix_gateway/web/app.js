@@ -285,11 +285,11 @@ function deriveQuotaTone(window) {
   return "available";
 }
 
-function renderTokenDetail(label, value) {
+function renderTokenMetaBlock(label, value, { subtle = false } = {}) {
   return `
-    <div class="token-detail">
-      <span class="token-detail__label">${escapeHtml(label)}</span>
-      <span class="token-detail__value">${escapeHtml(value)}</span>
+    <div class="token-meta-block${subtle ? " token-meta-block--subtle" : ""}">
+      <span class="token-meta-block__label">${escapeHtml(label)}</span>
+      <span class="token-meta-block__value">${escapeHtml(value)}</span>
     </div>
   `;
 }
@@ -304,12 +304,12 @@ function renderQuotaWindow(window, fallbackLabel) {
   if (!window) {
     return `
       <div class="quota-meter quota-meter--pending">
-        <div class="quota-meter__row">
+        <div class="quota-meter__head">
           <span class="quota-meter__label">${escapeHtml(label)}</span>
-          <span class="quota-meter__reset">未返回窗口</span>
           <span class="quota-meter__value">—</span>
         </div>
         <div class="quota-meter__track"><span class="quota-meter__fill" style="width: 0%"></span></div>
+        <span class="quota-meter__meta">未返回窗口</span>
       </div>
     `;
   }
@@ -323,12 +323,12 @@ function renderQuotaWindow(window, fallbackLabel) {
 
   return `
     <div class="quota-meter quota-meter--${tone}">
-      <div class="quota-meter__row">
+      <div class="quota-meter__head">
         <span class="quota-meter__label">${escapeHtml(label)}</span>
-        <span class="quota-meter__reset">${escapeHtml(metaText)}</span>
         <span class="quota-meter__value">${escapeHtml(remainingLabel)}</span>
       </div>
       <div class="quota-meter__track"><span class="quota-meter__fill" style="width: ${fillWidth}%"></span></div>
+      <span class="quota-meter__meta">${escapeHtml(metaText)}</span>
     </div>
   `;
 }
@@ -427,14 +427,16 @@ function renderTokenList(items) {
             <span class="token-row__account">${escapeHtml(account)}</span>
             <span class="token-row__meta">${escapeHtml(meta)}</span>
           </div>
-          <div class="token-row__status" data-label="状态与计划">
-            <span class="status-pill status-pill--${status.tone}">${status.label}</span>
-            <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
+          <div class="token-row__status" data-label="状态 / 计划 / 订阅">
+            <div class="token-row__status-pills">
+              <span class="status-pill status-pill--${status.tone}">${status.label}</span>
+              <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
+            </div>
+            ${renderTokenMetaBlock("订阅到期", formatSubscriptionUntil(item.subscription_active_until), { subtle: true })}
           </div>
-          <div class="token-row__lifecycle" data-label="订阅 / 冷却 / 使用">
-            ${renderTokenDetail("订阅到期", formatSubscriptionUntil(item.subscription_active_until))}
-            ${renderTokenDetail("当前冷却", formatCooldownUntil(item.cooldown_until))}
-            ${renderTokenDetail("最近使用", formatDate(item.last_used_at))}
+          <div class="token-row__lifecycle" data-label="冷却 / 最近使用">
+            ${renderTokenMetaBlock("当前冷却", formatCooldownUntil(item.cooldown_until))}
+            ${renderTokenMetaBlock("最近使用", formatDate(item.last_used_at))}
           </div>
           ${renderQuotaSection(item)}
           <div class="token-row__error" data-label="错误摘要">${escapeHtml(item.last_error || "—")}</div>
