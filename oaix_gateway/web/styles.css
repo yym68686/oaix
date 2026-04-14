@@ -414,24 +414,25 @@ button {
   gap: 10px;
 }
 
+.section-tools--token {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
 .section-tools--token .section-note {
   text-align: right;
 }
 
 .selection-switch {
-  width: min(100%, 388px);
-  padding: 12px;
-  border-radius: calc(var(--radius-lg) - 6px);
-  border: 1px solid var(--border-strong);
-  background: var(--surface-card);
-}
-
-.selection-switch__head {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  max-width: 100%;
 }
 
 .selection-switch__label {
@@ -444,15 +445,14 @@ button {
 
 .selection-switch__summary {
   min-width: 0;
-  font-size: 0.84rem;
+  font-size: 0.82rem;
   line-height: 1.4;
-  text-align: right;
   color: var(--ink-soft);
 }
 
 .selection-switch__rail {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(116px, 1fr));
   gap: 6px;
   padding: 4px;
   border-radius: 999px;
@@ -812,9 +812,9 @@ button {
 .token-panel__body {
   --table-columns:
     minmax(0, 1.08fr)
-    minmax(188px, 0.94fr)
-    minmax(176px, 0.82fr)
-    minmax(264px, 1.28fr)
+    minmax(228px, 1.04fr)
+    minmax(158px, 0.76fr)
+    minmax(272px, 1.22fr)
     minmax(0, 0.92fr);
   overflow: hidden;
   border-radius: calc(var(--radius-xl) - 10px);
@@ -1041,8 +1041,8 @@ button {
 }
 
 .token-row {
-  padding: 16px 18px;
-  gap: 20px;
+  padding: 14px 18px;
+  gap: 18px;
   align-items: start;
   border-bottom: 1px solid var(--border-table-row);
 }
@@ -1073,20 +1073,23 @@ button {
 
 .token-row__status {
   display: grid;
-  gap: 10px;
+  gap: 8px;
   align-content: start;
+}
+
+.token-row__status-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
 }
 
 .token-row__status-pills {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-}
-
-.token-row__status-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .request-row__primary {
@@ -1115,24 +1118,22 @@ button {
 }
 
 .token-row__lifecycle {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px 14px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
   align-content: start;
-  align-items: start;
 }
 
-.token-meta-block {
-  display: grid;
-  gap: 3px;
+.token-inline-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
   min-width: 0;
 }
 
-.token-meta-block--subtle {
-  padding-top: 2px;
-}
-
-.token-meta-block__label {
+.token-inline-meta__label {
   font-size: 0.72rem;
   font-weight: 800;
   letter-spacing: 0.08em;
@@ -1140,16 +1141,20 @@ button {
   color: var(--ink-soft);
 }
 
-.token-meta-block__value {
+.token-inline-meta__value {
   min-width: 0;
-  font-size: 0.94rem;
+  font-size: 0.88rem;
   line-height: 1.35;
+  font-variant-numeric: tabular-nums;
   word-break: break-word;
-  color: var(--ink);
+  color: var(--ink-soft);
 }
 
-.token-meta-block--subtle .token-meta-block__value {
-  font-size: 0.88rem;
+.token-inline-meta__value--default {
+  color: var(--ink-soft);
+}
+
+.token-inline-meta__value--muted {
   color: var(--ink-soft);
 }
 
@@ -1163,6 +1168,10 @@ button {
 
 .token-lifecycle-value--default {
   color: var(--ink);
+}
+
+.token-lifecycle-separator {
+  color: var(--ink-soft);
 }
 
 .token-lifecycle-value--muted {
@@ -1240,16 +1249,16 @@ button {
 }
 
 .token-action-button {
-  min-height: 34px;
+  min-height: 32px;
   padding: 0 12px;
   border: 1px solid var(--border-panel);
   border-radius: 999px;
-  background: var(--surface-button);
+  background: transparent;
   color: var(--ink);
   font-size: 0.82rem;
   font-weight: 800;
+  margin-inline-start: auto;
   transition:
-    transform 180ms ease,
     background-color 180ms ease,
     border-color 180ms ease,
     color 180ms ease,
@@ -1258,7 +1267,6 @@ button {
 
 .token-action-button:hover,
 .token-action-button:focus-visible {
-  transform: translateY(-1px);
   outline: none;
 }
 
@@ -1301,18 +1309,18 @@ button {
 
 .token-row__quota {
   display: grid;
-  gap: 10px;
+  gap: 8px;
   align-content: start;
 }
 
 .quota-meter-list {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .quota-meter {
   display: grid;
-  gap: 5px;
+  gap: 6px;
 }
 
 .quota-meter__head {
@@ -1320,6 +1328,13 @@ button {
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
+}
+
+.quota-meter__title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
   min-width: 0;
 }
 
@@ -1363,8 +1378,9 @@ button {
 }
 
 .quota-meter__meta {
-  white-space: nowrap;
+  min-width: 0;
   overflow: hidden;
+  white-space: nowrap;
   text-overflow: ellipsis;
 }
 
@@ -1517,13 +1533,17 @@ button {
     justify-items: start;
   }
 
-  .section-tools--token .section-note,
-  .selection-switch__summary {
+  .section-tools--token {
+    justify-content: flex-start;
+  }
+
+  .section-tools--token .section-note {
     text-align: left;
   }
 
   .selection-switch {
     width: 100%;
+    justify-content: flex-start;
   }
 
   .theme-switch,
@@ -1548,7 +1568,7 @@ button {
   }
 
   .token-row__lifecycle {
-    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 6px;
   }
 
   .quota-meter__meta {

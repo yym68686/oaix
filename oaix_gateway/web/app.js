@@ -220,9 +220,9 @@ function normalizeTokenSelectionStrategy(value) {
 
 function describeTokenSelectionStrategy(strategy) {
   if (normalizeTokenSelectionStrategy(strategy) === "fill_first") {
-    return "一直用第一个可用 key，冷却后再切换";
+    return "优先首个可用 key";
   }
-  return "优先分配最久未使用的 key";
+  return "最旧未使用优先";
 }
 
 function setTokenSelectionDisabled(disabled) {
@@ -397,11 +397,11 @@ function deriveQuotaTone(window) {
   return "available";
 }
 
-function renderTokenMetaBlock(label, value, { subtle = false } = {}) {
+function renderTokenInlineMeta(label, value, tone = "default") {
   return `
-    <div class="token-meta-block${subtle ? " token-meta-block--subtle" : ""}">
-      <span class="token-meta-block__label">${escapeHtml(label)}</span>
-      <span class="token-meta-block__value">${escapeHtml(value)}</span>
+    <div class="token-inline-meta">
+      <span class="token-inline-meta__label">${escapeHtml(label)}</span>
+      <span class="token-inline-meta__value token-inline-meta__value--${tone}">${escapeHtml(value)}</span>
     </div>
   `;
 }
@@ -417,11 +417,13 @@ function renderQuotaWindow(window, fallbackLabel) {
     return `
       <div class="quota-meter quota-meter--pending">
         <div class="quota-meter__head">
-          <span class="quota-meter__label">${escapeHtml(label)}</span>
+          <div class="quota-meter__title">
+            <span class="quota-meter__label">${escapeHtml(label)}</span>
+            <span class="quota-meter__meta">未返回窗口</span>
+          </div>
           <span class="quota-meter__value">—</span>
         </div>
         <div class="quota-meter__track"><span class="quota-meter__fill" style="width: 0%"></span></div>
-        <span class="quota-meter__meta">未返回窗口</span>
       </div>
     `;
   }
@@ -436,11 +438,13 @@ function renderQuotaWindow(window, fallbackLabel) {
   return `
     <div class="quota-meter quota-meter--${tone}">
       <div class="quota-meter__head">
-        <span class="quota-meter__label">${escapeHtml(label)}</span>
+        <div class="quota-meter__title">
+          <span class="quota-meter__label">${escapeHtml(label)}</span>
+          <span class="quota-meter__meta">${escapeHtml(metaText)}</span>
+        </div>
         <span class="quota-meter__value">${escapeHtml(remainingLabel)}</span>
       </div>
       <div class="quota-meter__track"><span class="quota-meter__fill" style="width: ${fillWidth}%"></span></div>
-      <span class="quota-meter__meta">${escapeHtml(metaText)}</span>
     </div>
   `;
 }
@@ -702,6 +706,8 @@ function renderTokenList(items) {
       const meta = accountId && accountId !== account ? accountId : item.source_file || "无来源记录";
       const planLabel = formatPlanType(item.plan_type);
       const planTone = derivePlanTone(item.plan_type);
+      const subscriptionValue = formatSubscriptionUntil(item.subscription_active_until);
+      const subscriptionTone = subscriptionValue === "—" ? "muted" : "default";
       const cooldownValue = formatCooldownUntil(item.cooldown_until);
       const lastUsedValue = formatDate(item.last_used_at);
       const cooldownTone = cooldownValue === "—" ? "muted" : "cooling";
@@ -713,17 +719,18 @@ function renderTokenList(items) {
             <span class="token-row__meta">${escapeHtml(meta)}</span>
           </div>
           <div class="token-row__status" data-label="状态 / 计划 / 订阅">
-            <div class="token-row__status-pills">
-              <span class="status-pill status-pill--${status.tone}">${status.label}</span>
-              <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
-            </div>
-            ${renderTokenMetaBlock("订阅到期", formatSubscriptionUntil(item.subscription_active_until), { subtle: true })}
-            <div class="token-row__status-actions">
+            <div class="token-row__status-top">
+              <div class="token-row__status-pills">
+                <span class="status-pill status-pill--${status.tone}">${status.label}</span>
+                <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
+              </div>
               ${renderTokenActionButton(item)}
             </div>
+            ${renderTokenInlineMeta("订阅", subscriptionValue, subscriptionTone)}
           </div>
           <div class="token-row__lifecycle" data-label="冷却到期 / 最近使用">
             <span class="token-lifecycle-value token-lifecycle-value--${cooldownTone}">${escapeHtml(cooldownValue)}</span>
+            <span class="token-lifecycle-separator" aria-hidden="true">/</span>
             <span class="token-lifecycle-value token-lifecycle-value--${lastUsedTone}">${escapeHtml(lastUsedValue)}</span>
           </div>
           ${renderQuotaSection(item)}
