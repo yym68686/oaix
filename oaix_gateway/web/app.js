@@ -220,9 +220,9 @@ function normalizeTokenSelectionStrategy(value) {
 
 function describeTokenSelectionStrategy(strategy) {
   if (normalizeTokenSelectionStrategy(strategy) === "fill_first") {
-    return "优先首个可用 key";
+    return "首个可用优先";
   }
-  return "最旧未使用优先";
+  return "最久未用优先";
 }
 
 function setTokenSelectionDisabled(disabled) {
@@ -253,7 +253,7 @@ function renderTokenActionButton(item) {
   const tokenId = Number(item?.id);
   const nextActive = !Boolean(item?.is_active);
   const pending = isTokenActionPending(tokenId);
-  const label = pending ? "处理中…" : nextActive ? "取消禁用" : "暂时禁用";
+  const label = pending ? "处理中" : nextActive ? "启用" : "停用";
   const tone = nextActive ? "enable" : "disable";
   return `
     <button
@@ -326,6 +326,9 @@ function formatPlanType(value) {
     enterprise: "Enterprise",
     edu: "Edu",
   };
+  if (normalized === "unknown" || normalized === "unrecognized") {
+    return "未识别计划";
+  }
   return labels[normalized] || normalized.toUpperCase();
 }
 
@@ -397,12 +400,97 @@ function deriveQuotaTone(window) {
   return "available";
 }
 
-function renderTokenInlineMeta(label, value, tone = "default") {
+function normalizeWhitespace(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function truncateText(value, maxLength = 160) {
+  const text = normalizeWhitespace(value);
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function extractErrorPayload(value) {
+  const raw = normalizeWhitespace(value);
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed?.error && typeof parsed.error === "object") {
+      return { raw, data: parsed.error };
+    }
+    if (parsed?.detail && typeof parsed.detail === "object") {
+      return { raw, data: parsed.detail };
+    }
+    return { raw, data: parsed };
+  } catch {
+    return { raw, data: null };
+  }
+}
+
+function humanizeErrorType(value) {
+  const type = normalizeWhitespace(value).toLowerCase();
+  const labels = {
+    usage_limit_reached: "额度限制",
+    invalid_request_error: "请求无效",
+    rate_limit_exceeded: "速率限制",
+    account_deactivated: "账号停用",
+    deactivated_workspace: "工作区停用",
+    auth_error: "鉴权失败",
+  };
+  return labels[type] || "";
+}
+
+function summarizeTokenError(value) {
+  const payload = extractErrorPayload(value);
+  if (!payload) {
+    return "";
+  }
+
+  const raw = payload.raw;
+  const source = payload.data && typeof payload.data === "object" ? payload.data : {};
+  const type = normalizeWhitespace(source.type || source.code || "");
+  const message = normalizeWhitespace(source.message || source.detail || raw);
+  const haystack = `${type} ${message}`.toLowerCase();
+
+  if (type === "usage_limit_reached" || haystack.includes("usage limit")) {
+    return "额度已用尽，等待窗口重置";
+  }
+  if (haystack.includes("refresh token") && (haystack.includes("signing in again") || haystack.includes("invalid"))) {
+    return "Refresh token 已失效，需要重新登录";
+  }
+  if (haystack.includes("already been used to generate a new access token")) {
+    return "Refresh token 已失效，需要重新登录";
+  }
+  if (haystack.includes("account_deactivated") || haystack.includes("deactivated_workspace")) {
+    return "账号已停用，不能继续请求";
+  }
+  if (haystack.includes("401") && haystack.includes("codex token refresh failed")) {
+    return "Codex 刷新失败，请重新登录账号";
+  }
+
+  const typeLabel = humanizeErrorType(type);
+  if (typeLabel && message && !message.toLowerCase().includes(type.toLowerCase())) {
+    return truncateText(`${typeLabel} · ${message}`, 148);
+  }
+  if (message && message !== raw) {
+    return truncateText(message, 148);
+  }
+  if (typeLabel) {
+    return typeLabel;
+  }
+  return truncateText(raw, 148);
+}
+
+function renderTokenFact(label, value, tone = "default") {
   return `
-    <div class="token-inline-meta">
-      <span class="token-inline-meta__label">${escapeHtml(label)}</span>
-      <span class="token-inline-meta__value token-inline-meta__value--${tone}">${escapeHtml(value)}</span>
-    </div>
+    <span class="token-fact">
+      <span class="token-fact__label">${escapeHtml(label)}</span>
+      <span class="token-fact__value token-fact__value--${tone}">${escapeHtml(value)}</span>
+    </span>
   `;
 }
 
@@ -415,15 +503,15 @@ function renderQuotaWindow(window, fallbackLabel) {
 
   if (!window) {
     return `
-      <div class="quota-meter quota-meter--pending">
-        <div class="quota-meter__head">
-          <div class="quota-meter__title">
-            <span class="quota-meter__label">${escapeHtml(label)}</span>
-            <span class="quota-meter__meta">未返回窗口</span>
+      <div class="quota-band quota-band--pending">
+        <div class="quota-band__head">
+          <div class="quota-band__title">
+            <span class="quota-band__label">${escapeHtml(label)}</span>
+            <span class="quota-band__meta">未返回窗口</span>
           </div>
-          <span class="quota-meter__value">—</span>
+          <span class="quota-band__value">—</span>
         </div>
-        <div class="quota-meter__track"><span class="quota-meter__fill" style="width: 0%"></span></div>
+        <div class="quota-band__track"><span class="quota-band__fill" style="width: 0%"></span></div>
       </div>
     `;
   }
@@ -436,36 +524,58 @@ function renderQuotaWindow(window, fallbackLabel) {
   }
 
   return `
-    <div class="quota-meter quota-meter--${tone}">
-      <div class="quota-meter__head">
-        <div class="quota-meter__title">
-          <span class="quota-meter__label">${escapeHtml(label)}</span>
-          <span class="quota-meter__meta">${escapeHtml(metaText)}</span>
+    <div class="quota-band quota-band--${tone}">
+      <div class="quota-band__head">
+        <div class="quota-band__title">
+          <span class="quota-band__label">${escapeHtml(label)}</span>
+          <span class="quota-band__meta">${escapeHtml(metaText)}</span>
         </div>
-        <span class="quota-meter__value">${escapeHtml(remainingLabel)}</span>
+        <span class="quota-band__value">${escapeHtml(remainingLabel)}</span>
       </div>
-      <div class="quota-meter__track"><span class="quota-meter__fill" style="width: ${fillWidth}%"></span></div>
+      <div class="quota-band__track"><span class="quota-band__fill" style="width: ${fillWidth}%"></span></div>
     </div>
   `;
 }
 
 function renderQuotaSection(item) {
   const quota = item.quota;
-  if (quota?.error) {
-    return `
-      <div class="token-row__quota" data-label="5h / 7d 配额">
-        <p class="quota-error">${escapeHtml(quota.error)}</p>
-        ${quota?.fetched_at ? `<p class="quota-meta">${escapeHtml(`最近尝试 ${formatDate(quota.fetched_at)}`)}</p>` : ""}
-      </div>
-    `;
-  }
-
   return `
-    <div class="token-row__quota" data-label="5h / 7d 配额">
-      <div class="quota-meter-list">
+    <div class="token-card__quota">
+      <div class="token-card__quota-grid">
         ${renderQuotaWindow(getQuotaWindow(item, "code-5h"), "5h")}
         ${renderQuotaWindow(getQuotaWindow(item, "code-7d"), "7d")}
       </div>
+      ${
+        quota?.error
+          ? `<p class="token-card__quota-note">${escapeHtml(`配额读取失败 · ${summarizeTokenError(quota.error) || "请稍后再试"}`)}${
+              quota?.fetched_at ? ` · ${escapeHtml(`最近尝试 ${formatDate(quota.fetched_at)}`)}` : ""
+            }</p>`
+          : ""
+      }
+    </div>
+  `;
+}
+
+function renderTokenErrorSection(item) {
+  const primaryRaw = normalizeWhitespace(item?.last_error);
+  const quotaRaw = normalizeWhitespace(item?.quota?.error);
+  if (!primaryRaw && !quotaRaw) {
+    return "";
+  }
+
+  const primarySummary = primaryRaw ? summarizeTokenError(primaryRaw) : "";
+  const quotaSummary = quotaRaw ? summarizeTokenError(quotaRaw) : "";
+  const label = primaryRaw ? "最近错误" : "配额读取";
+  const message = primarySummary || quotaSummary;
+  const secondary =
+    primaryRaw && quotaSummary && quotaSummary !== primarySummary ? `配额读取 · ${quotaSummary}` : "";
+  const rawTitle = primaryRaw || quotaRaw;
+
+  return `
+    <div class="token-card__error" title="${escapeHtml(rawTitle)}">
+      <span class="token-card__error-label">${label}</span>
+      <p class="token-card__error-message">${escapeHtml(message || "请求失败，请稍后再试")}</p>
+      ${secondary ? `<p class="token-card__error-meta">${escapeHtml(secondary)}</p>` : ""}
     </div>
   `;
 }
@@ -707,34 +817,45 @@ function renderTokenList(items) {
       const planLabel = formatPlanType(item.plan_type);
       const planTone = derivePlanTone(item.plan_type);
       const subscriptionValue = formatSubscriptionUntil(item.subscription_active_until);
-      const subscriptionTone = subscriptionValue === "—" ? "muted" : "default";
+      const subscriptionTone = subscriptionValue.startsWith("已过期")
+        ? "disabled"
+        : subscriptionValue === "—"
+          ? "muted"
+          : "default";
       const cooldownValue = formatCooldownUntil(item.cooldown_until);
       const lastUsedValue = formatDate(item.last_used_at);
+      const observedCostValue = item.observed_cost_usd == null ? "—" : formatUsd(item.observed_cost_usd);
       const cooldownTone = cooldownValue === "—" ? "muted" : "cooling";
       const lastUsedTone = lastUsedValue === "—" ? "muted" : "default";
+      const observedCostTone = item.observed_cost_usd == null ? "muted" : "money";
+      const errorSection = renderTokenErrorSection(item);
       return `
-        <article class="token-row">
-          <div class="token-row__primary">
-            <span class="token-row__account">${escapeHtml(account)}</span>
-            <span class="token-row__meta">${escapeHtml(meta)}</span>
-          </div>
-          <div class="token-row__status" data-label="状态 / 计划 / 订阅">
-            <div class="token-row__status-top">
-              <div class="token-row__status-pills">
+        <article class="token-card token-card--${status.tone}">
+          <div class="token-card__top">
+            <div class="token-card__identity">
+              <span class="token-card__account">${escapeHtml(account)}</span>
+              <span class="token-card__meta">${escapeHtml(meta)}</span>
+            </div>
+            <div class="token-card__overview">
+              <div class="token-card__chips">
                 <span class="status-pill status-pill--${status.tone}">${status.label}</span>
                 <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
               </div>
+              <div class="token-card__facts">
+                ${renderTokenFact("订阅", subscriptionValue, subscriptionTone)}
+                ${renderTokenFact("冷却到", cooldownValue, cooldownTone)}
+                ${renderTokenFact("最近使用", lastUsedValue, lastUsedTone)}
+                ${renderTokenFact("已用金额", observedCostValue, observedCostTone)}
+              </div>
+            </div>
+            <div class="token-card__action">
               ${renderTokenActionButton(item)}
             </div>
-            ${renderTokenInlineMeta("订阅", subscriptionValue, subscriptionTone)}
           </div>
-          <div class="token-row__lifecycle" data-label="冷却到期 / 最近使用">
-            <span class="token-lifecycle-value token-lifecycle-value--${cooldownTone}">${escapeHtml(cooldownValue)}</span>
-            <span class="token-lifecycle-separator" aria-hidden="true">/</span>
-            <span class="token-lifecycle-value token-lifecycle-value--${lastUsedTone}">${escapeHtml(lastUsedValue)}</span>
+          <div class="token-card__bottom${errorSection ? " token-card__bottom--with-error" : ""}">
+            ${renderQuotaSection(item)}
+            ${errorSection}
           </div>
-          ${renderQuotaSection(item)}
-          <div class="token-row__error" data-label="错误摘要">${escapeHtml(item.last_error || "—")}</div>
         </article>
       `;
     })
@@ -844,7 +965,7 @@ async function loadTokens() {
       headers: authHeaders(),
     });
     state.tokenItems = Array.isArray(data.items) ? data.items : [];
-    elements.listNote.textContent = "显示最近 80 条记录 · 含计划、订阅与 5h/7d 配额";
+    elements.listNote.textContent = "显示最近 80 条记录 · 含计划、订阅、配额与已用金额（美元估算）";
     renderTokenSelection(data.selection || {});
     setTokenSelectionDisabled(state.tokenSelectionSaving);
     renderTokenList(state.tokenItems);
@@ -901,7 +1022,7 @@ async function saveTokenSelection(strategy) {
       body: JSON.stringify({ strategy: nextStrategy }),
     });
     renderTokenSelection(data);
-    elements.listNote.textContent = "显示最近 80 条记录 · 含计划、订阅与 5h/7d 配额";
+    elements.listNote.textContent = "显示最近 80 条记录 · 含计划、订阅、配额与已用金额（美元估算）";
   } catch (error) {
     renderTokenSelection({ strategy: previousStrategy });
     if (elements.tokenSelectionSummary) {

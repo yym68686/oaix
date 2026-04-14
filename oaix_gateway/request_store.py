@@ -77,6 +77,21 @@ class RequestLogAnalytics:
     models: list[RequestAnalyticsModel]
 
 
+def _normalize_request_account_ids(account_ids: list[str] | set[str] | tuple[str, ...]) -> list[str]:
+    return sorted({str(value or "").strip() for value in account_ids if str(value or "").strip()})
+
+
+def _build_request_account_costs_stmt(*, account_ids: list[str]):
+    return (
+        select(
+            GatewayRequestLog.account_id,
+            func.sum(GatewayRequestLog.estimated_cost_usd),
+        )
+        .where(GatewayRequestLog.account_id.in_(account_ids))
+        .group_by(GatewayRequestLog.account_id)
+    )
+
+
 def _int_or_zero(value) -> int:
     if value is None:
         return 0
@@ -277,6 +292,21 @@ async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
             )
             for item in items
         ]
+
+
+async def get_request_costs_by_account(account_ids: list[str] | set[str] | tuple[str, ...]) -> dict[str, float]:
+    resolved_account_ids = _normalize_request_account_ids(account_ids)
+    if not resolved_account_ids:
+        return {}
+
+    async with get_session() as session:
+        result = await session.execute(_build_request_account_costs_stmt(account_ids=resolved_account_ids))
+        rows = result.all()
+    return {
+        str(account_id): _round_cost(_float_or_zero(estimated_cost_usd))
+        for account_id, estimated_cost_usd in rows
+        if str(account_id or "").strip()
+    }
 
 
 async def get_request_log_analytics(*, hours: int = 24, bucket_minutes: int = 60, top_models: int = 6) -> RequestLogAnalytics:

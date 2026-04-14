@@ -28,6 +28,7 @@ from .request_store import (
     create_request_log,
     finalize_request_log,
     get_request_log_analytics,
+    get_request_costs_by_account,
     get_request_log_summary,
     list_request_logs,
 )
@@ -904,6 +905,7 @@ def _serialize_admin_token_item(
     *,
     plan_info: CodexPlanInfo,
     quota_snapshot: CodexQuotaSnapshot | None,
+    observed_cost_usd: float | None,
 ) -> dict[str, Any]:
     item = {
         "id": token_row.id,
@@ -921,9 +923,33 @@ def _serialize_admin_token_item(
         "plan_type": quota_snapshot.plan_type if quota_snapshot and quota_snapshot.plan_type else plan_info.plan_type,
         "subscription_active_start": plan_info.subscription_active_start,
         "subscription_active_until": plan_info.subscription_active_until,
+        "observed_cost_usd": observed_cost_usd,
         "quota": asdict(quota_snapshot) if quota_snapshot is not None else None,
     }
     return item
+
+
+def _token_observed_account_ids(token_row, *, plan_info: CodexPlanInfo) -> set[str]:
+    return {
+        account_id
+        for account_id in {
+            token_row.account_id,
+            plan_info.chatgpt_account_id,
+        }
+        if str(account_id or "").strip()
+    }
+
+
+def _resolve_token_observed_cost_usd(
+    observed_costs_by_account: dict[str, float],
+    *,
+    token_row,
+    plan_info: CodexPlanInfo,
+) -> float | None:
+    candidate_ids = _token_observed_account_ids(token_row, plan_info=plan_info)
+    if not candidate_ids:
+        return None
+    return round(sum(observed_costs_by_account.get(account_id, 0.0) for account_id in candidate_ids), 6)
 
 
 async def _build_admin_token_items(
@@ -942,6 +968,17 @@ async def _build_admin_token_items(
     }
 
     quota_by_id: dict[int, CodexQuotaSnapshot] = {}
+    observed_costs_by_account: dict[str, float] = {}
+    observed_account_ids = {
+        account_id
+        for token_row in token_rows
+        for account_id in _token_observed_account_ids(token_row, plan_info=plan_info_by_id[token_row.id])
+    }
+    if observed_account_ids:
+        try:
+            observed_costs_by_account = await get_request_costs_by_account(observed_account_ids)
+        except Exception:
+            logger.exception("Failed to collect admin token observed costs")
     if include_quota and token_rows:
         quota_service: CodexQuotaService = app.state.quota_service
         client: httpx.AsyncClient = app.state.http_client
@@ -965,6 +1002,11 @@ async def _build_admin_token_items(
             token_row,
             plan_info=plan_info_by_id[token_row.id],
             quota_snapshot=quota_by_id.get(token_row.id),
+            observed_cost_usd=_resolve_token_observed_cost_usd(
+                observed_costs_by_account,
+                token_row=token_row,
+                plan_info=plan_info_by_id[token_row.id],
+            ),
         )
         for token_row in token_rows
     ]
