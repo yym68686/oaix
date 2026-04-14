@@ -177,6 +177,186 @@ function deriveStatus(item) {
   return { label: "可用", tone: "available" };
 }
 
+function formatPercentValue(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "—";
+  }
+  if (number <= 0 || number >= 100) {
+    return `${Math.round(number)}%`;
+  }
+  if (number >= 10) {
+    return `${Math.round(number)}%`;
+  }
+  return `${number.toFixed(1)}%`;
+}
+
+function clampPercentNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, number));
+}
+
+function formatPlanType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return "未识别计划";
+  }
+
+  const labels = {
+    free: "Free",
+    plus: "Plus",
+    team: "Team",
+    pro: "Pro",
+    business: "Business",
+    enterprise: "Enterprise",
+    edu: "Edu",
+  };
+  return labels[normalized] || normalized.toUpperCase();
+}
+
+function derivePlanTone(value) {
+  switch (String(value || "").trim().toLowerCase()) {
+    case "plus":
+    case "pro":
+    case "team":
+    case "business":
+    case "enterprise":
+      return "available";
+    case "free":
+      return "cooling";
+    default:
+      return "pending";
+  }
+}
+
+function formatSubscriptionUntil(value) {
+  if (!value) {
+    return "—";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  if (date.getTime() <= Date.now()) {
+    return `已过期 ${formatDate(value)}`;
+  }
+  return formatDate(value);
+}
+
+function formatCooldownUntil(value) {
+  if (!value) {
+    return "未冷却";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  if (date.getTime() <= Date.now()) {
+    return "已解除";
+  }
+  return formatDate(value);
+}
+
+function getQuotaWindow(item, windowId) {
+  const windows = item?.quota?.windows;
+  if (!Array.isArray(windows)) {
+    return null;
+  }
+  return windows.find((window) => window?.id === windowId) || null;
+}
+
+function deriveQuotaTone(window) {
+  const remaining = Number(window?.remaining_percent);
+  if (!Number.isFinite(remaining)) {
+    return "pending";
+  }
+  if (window?.exhausted || remaining <= 0) {
+    return "disabled";
+  }
+  if (remaining <= 30) {
+    return "disabled";
+  }
+  if (remaining <= 70) {
+    return "cooling";
+  }
+  return "available";
+}
+
+function renderTokenDetail(label, value) {
+  return `
+    <div class="token-detail">
+      <span class="token-detail__label">${escapeHtml(label)}</span>
+      <span class="token-detail__value">${escapeHtml(value)}</span>
+    </div>
+  `;
+}
+
+function renderQuotaWindow(window, fallbackLabel) {
+  const label = window?.label || fallbackLabel;
+  const remainingLabel = formatPercentValue(window?.remaining_percent);
+  const resetLabel = formatDate(window?.reset_at);
+  const tone = deriveQuotaTone(window);
+  const fillWidth = clampPercentNumber(window?.remaining_percent);
+
+  if (!window) {
+    return `
+      <div class="quota-window quota-window--pending">
+        <div class="quota-window__head">
+          <span class="quota-window__label">${escapeHtml(label)}</span>
+          <span class="quota-window__value">—</span>
+        </div>
+        <div class="quota-window__bar"><span class="quota-window__fill" style="width: 0%"></span></div>
+        <div class="quota-window__meta">未返回窗口</div>
+      </div>
+    `;
+  }
+
+  const metaParts = [`剩余 ${remainingLabel}`];
+  if (resetLabel !== "—") {
+    metaParts.push(`重置 ${resetLabel}`);
+  }
+  if (window.exhausted) {
+    metaParts.push("已耗尽");
+  }
+
+  return `
+    <div class="quota-window quota-window--${tone}">
+      <div class="quota-window__head">
+        <span class="quota-window__label">${escapeHtml(label)}</span>
+        <span class="quota-window__value">${escapeHtml(remainingLabel)}</span>
+      </div>
+      <div class="quota-window__bar"><span class="quota-window__fill" style="width: ${fillWidth}%"></span></div>
+      <div class="quota-window__meta">${escapeHtml(metaParts.join(" · "))}</div>
+    </div>
+  `;
+}
+
+function renderQuotaSection(item) {
+  const quota = item.quota;
+  const fetchedAt = quota?.fetched_at ? `更新 ${formatDate(quota.fetched_at)}` : "";
+  if (quota?.error) {
+    return `
+      <div class="token-row__quota" data-label="5h / 7d 配额">
+        <p class="quota-error">${escapeHtml(quota.error)}</p>
+        ${fetchedAt ? `<p class="quota-meta">${escapeHtml(fetchedAt)}</p>` : ""}
+      </div>
+    `;
+  }
+
+  return `
+    <div class="token-row__quota" data-label="5h / 7d 配额">
+      <div class="quota-window-list">
+        ${renderQuotaWindow(getQuotaWindow(item, "code-5h"), "5h")}
+        ${renderQuotaWindow(getQuotaWindow(item, "code-7d"), "7d")}
+      </div>
+      ${fetchedAt ? `<p class="quota-meta">${escapeHtml(fetchedAt)}</p>` : ""}
+    </div>
+  `;
+}
+
 function renderCounts(counts) {
   const total = counts.total || 0;
   const available = counts.available || 0;
@@ -239,19 +419,27 @@ function renderTokenList(items) {
   elements.tokenList.innerHTML = items
     .map((item) => {
       const status = deriveStatus(item);
-      const account = item.email || item.account_id || "未命名账号";
-      const meta = item.account_id && item.email ? item.account_id : item.source_file || "无来源记录";
+      const accountId = item.chatgpt_account_id || item.account_id || "";
+      const account = item.email || accountId || "未命名账号";
+      const meta = accountId && accountId !== account ? accountId : item.source_file || "无来源记录";
+      const planLabel = formatPlanType(item.plan_type);
+      const planTone = derivePlanTone(item.plan_type);
       return `
         <article class="token-row">
           <div class="token-row__primary">
             <span class="token-row__account">${escapeHtml(account)}</span>
             <span class="token-row__meta">${escapeHtml(meta)}</span>
           </div>
-          <div>
+          <div class="token-row__status" data-label="状态与计划">
             <span class="status-pill status-pill--${status.tone}">${status.label}</span>
+            <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
           </div>
-          <div class="token-row__time" data-label="最近使用">${escapeHtml(formatDate(item.last_used_at))}</div>
-          <div class="token-row__time" data-label="冷却截止">${escapeHtml(formatDate(item.cooldown_until))}</div>
+          <div class="token-row__lifecycle" data-label="订阅 / 冷却 / 使用">
+            ${renderTokenDetail("订阅到期", formatSubscriptionUntil(item.subscription_active_until))}
+            ${renderTokenDetail("当前冷却", formatCooldownUntil(item.cooldown_until))}
+            ${renderTokenDetail("最近使用", formatDate(item.last_used_at))}
+          </div>
+          ${renderQuotaSection(item)}
           <div class="token-row__error" data-label="错误摘要">${escapeHtml(item.last_error || "—")}</div>
         </article>
       `;
@@ -358,10 +546,10 @@ async function loadHealth() {
 
 async function loadTokens() {
   try {
-    const data = await fetchJson("/admin/tokens?limit=80", {
+    const data = await fetchJson("/admin/tokens?limit=80&include_quota=1", {
       headers: authHeaders(),
     });
-    elements.listNote.textContent = "显示最近 80 条记录";
+    elements.listNote.textContent = "显示最近 80 条记录 · 含计划、订阅与 5h/7d 配额";
     renderTokenList(data.items || []);
     if (data.counts) {
       renderCounts(data.counts);

@@ -23,6 +23,7 @@ from starlette.background import BackgroundTask, BackgroundTasks
 
 from .database import close_database, init_db, utcnow
 from .oauth import CodexOAuthManager
+from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
 from .request_store import (
     create_request_log,
     finalize_request_log,
@@ -32,7 +33,7 @@ from .request_store import (
 from .token_store import (
     claim_next_active_token,
     get_token_counts,
-    list_tokens,
+    list_token_rows,
     mark_token_error,
     mark_token_success,
     upsert_token_payload,
@@ -189,6 +190,14 @@ def _import_response_idle_grace_seconds() -> float:
 
 def _compact_server_error_cooldown_seconds() -> int:
     return _int_env("COMPACT_SERVER_ERROR_COOLDOWN_SECONDS", 60, minimum=0)
+
+
+def _admin_quota_cache_ttl_seconds() -> int:
+    return _int_env("ADMIN_QUOTA_CACHE_TTL_SECONDS", 60, minimum=5)
+
+
+def _admin_quota_max_concurrency() -> int:
+    return _int_env("ADMIN_QUOTA_MAX_CONCURRENCY", 4, minimum=1)
 
 
 def _get_service_api_keys() -> set[str]:
@@ -742,6 +751,77 @@ def _should_retry_upstream_server_error(status_code: int) -> bool:
     return 500 <= status_code <= 599
 
 
+def _serialize_admin_token_item(
+    token_row,
+    *,
+    plan_info: CodexPlanInfo,
+    quota_snapshot: CodexQuotaSnapshot | None,
+) -> dict[str, Any]:
+    item = {
+        "id": token_row.id,
+        "email": token_row.email,
+        "account_id": token_row.account_id,
+        "chatgpt_account_id": plan_info.chatgpt_account_id or token_row.account_id,
+        "is_active": token_row.is_active,
+        "cooldown_until": token_row.cooldown_until,
+        "last_refresh_at": token_row.last_refresh_at,
+        "expires_at": token_row.expires_at,
+        "last_used_at": token_row.last_used_at,
+        "last_error": token_row.last_error,
+        "source_file": token_row.source_file,
+        "updated_at": token_row.updated_at,
+        "plan_type": quota_snapshot.plan_type if quota_snapshot and quota_snapshot.plan_type else plan_info.plan_type,
+        "subscription_active_start": plan_info.subscription_active_start,
+        "subscription_active_until": plan_info.subscription_active_until,
+        "quota": asdict(quota_snapshot) if quota_snapshot is not None else None,
+    }
+    return item
+
+
+async def _build_admin_token_items(
+    app: FastAPI,
+    *,
+    token_rows: list[Any],
+    include_quota: bool,
+) -> list[dict[str, Any]]:
+    plan_info_by_id = {
+        token_row.id: extract_codex_plan_info(
+            token_row.id_token,
+            account_id=token_row.account_id,
+            raw_payload=token_row.raw_payload,
+        )
+        for token_row in token_rows
+    }
+
+    quota_by_id: dict[int, CodexQuotaSnapshot] = {}
+    if include_quota and token_rows:
+        quota_service: CodexQuotaService = app.state.quota_service
+        client: httpx.AsyncClient = app.state.http_client
+        oauth_manager: CodexOAuthManager = app.state.oauth_manager
+        effective_account_ids = {
+            token_row.id: plan_info_by_id[token_row.id].chatgpt_account_id or token_row.account_id
+            for token_row in token_rows
+        }
+        try:
+            quota_by_id = await quota_service.get_many(
+                token_rows,
+                client=client,
+                oauth_manager=oauth_manager,
+                account_ids=effective_account_ids,
+            )
+        except Exception:
+            logger.exception("Failed to collect admin token quota snapshots")
+
+    return [
+        _serialize_admin_token_item(
+            token_row,
+            plan_info=plan_info_by_id[token_row.id],
+            quota_snapshot=quota_by_id.get(token_row.id),
+        )
+        for token_row in token_rows
+    ]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
@@ -752,6 +832,10 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
     )
     app.state.oauth_manager = CodexOAuthManager()
+    app.state.quota_service = CodexQuotaService(
+        ttl_seconds=_admin_quota_cache_ttl_seconds(),
+        concurrency=_admin_quota_max_concurrency(),
+    )
     try:
         yield
     finally:
@@ -792,11 +876,18 @@ def create_app() -> FastAPI:
 
     @app.get("/admin/tokens")
     async def list_tokens_route(
+        http_request: Request,
         limit: int = Query(100, ge=1, le=500),
+        include_quota: bool = Query(False),
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         counts = await get_token_counts()
-        items = [asdict(token) for token in await list_tokens(limit=limit)]
+        token_rows = await list_token_rows(limit=limit)
+        items = await _build_admin_token_items(
+            http_request.app,
+            token_rows=token_rows,
+            include_quota=include_quota,
+        )
         return {
             "counts": asdict(counts),
             "items": items,

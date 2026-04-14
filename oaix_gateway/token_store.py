@@ -331,27 +331,31 @@ async def get_token_counts() -> TokenCounts:
         )
 
 
-async def list_tokens(limit: int = 100) -> list[TokenStatus]:
+async def list_token_rows(limit: int = 100) -> list[CodexToken]:
     async with get_session() as session:
         stmt = select(CodexToken).order_by(CodexToken.id.desc()).limit(max(1, min(limit, 500)))
         result = await session.execute(stmt)
-        tokens = result.scalars().all()
-        return [
-            TokenStatus(
-                id=token.id,
-                email=token.email,
-                account_id=token.account_id,
-                is_active=token.is_active,
-                cooldown_until=token.cooldown_until,
-                last_refresh_at=token.last_refresh_at,
-                expires_at=token.expires_at,
-                last_used_at=token.last_used_at,
-                last_error=token.last_error,
-                source_file=token.source_file,
-                updated_at=token.updated_at,
-            )
-            for token in tokens
-        ]
+        return result.scalars().all()
+
+
+async def list_tokens(limit: int = 100) -> list[TokenStatus]:
+    tokens = await list_token_rows(limit=limit)
+    return [
+        TokenStatus(
+            id=token.id,
+            email=token.email,
+            account_id=token.account_id,
+            is_active=token.is_active,
+            cooldown_until=token.cooldown_until,
+            last_refresh_at=token.last_refresh_at,
+            expires_at=token.expires_at,
+            last_used_at=token.last_used_at,
+            last_error=token.last_error,
+            source_file=token.source_file,
+            updated_at=token.updated_at,
+        )
+        for token in tokens
+    ]
 
 
 async def import_token_files(patterns: Iterable[str]) -> TokenFileImportSummary:
