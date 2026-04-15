@@ -489,6 +489,84 @@ function normalizeWhitespace(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function resolveWorkspaceAccountId(item) {
+  return normalizeWhitespace(item?.chatgpt_account_id || item?.account_id || "");
+}
+
+function buildWorkspaceTokenCounts(items) {
+  const counts = Object.create(null);
+  if (!Array.isArray(items)) {
+    return counts;
+  }
+  items.forEach((item) => {
+    const workspaceAccountId = resolveWorkspaceAccountId(item);
+    if (!workspaceAccountId) {
+      return;
+    }
+    counts[workspaceAccountId] = (counts[workspaceAccountId] || 0) + 1;
+  });
+  return counts;
+}
+
+function countDistinctWorkspaces(items, workspaceTokenCounts = null) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return 0;
+  }
+  if (workspaceTokenCounts && typeof workspaceTokenCounts === "object") {
+    return Object.keys(workspaceTokenCounts).length;
+  }
+  return Object.keys(buildWorkspaceTokenCounts(items)).length;
+}
+
+function describeTokenGroupMeta(items, presentText, emptyText, workspaceTokenCounts = null) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return emptyText;
+  }
+  const distinctWorkspaceCount = countDistinctWorkspaces(items, workspaceTokenCounts);
+  if (!distinctWorkspaceCount || distinctWorkspaceCount === items.length) {
+    return presentText;
+  }
+  return `${presentText} · ${formatInteger(distinctWorkspaceCount)} 个工作区共享这 ${formatInteger(items.length)} 把 token`;
+}
+
+function buildTokenPresentation(item, workspaceTokenCounts) {
+  const workspaceAccountId = resolveWorkspaceAccountId(item);
+  const email = normalizeWhitespace(item?.email || "");
+  const sourceFile = normalizeWhitespace(item?.source_file || "");
+  const sharedWorkspaceCount = workspaceAccountId ? workspaceTokenCounts?.[workspaceAccountId] || 0 : 0;
+  const hasSharedWorkspace = sharedWorkspaceCount > 1;
+  const titleIncludesTokenId = (!email && hasSharedWorkspace && workspaceAccountId) || (!email && !workspaceAccountId);
+
+  let account = email || workspaceAccountId || `Token #${item?.id ?? "—"}`;
+  if (!email && hasSharedWorkspace && workspaceAccountId) {
+    account = `${workspaceAccountId} · Token #${item.id}`;
+  }
+
+  const metaParts = [];
+  if (email && workspaceAccountId) {
+    metaParts.push(workspaceAccountId);
+  }
+  if (!titleIncludesTokenId) {
+    metaParts.push(`Token #${item?.id ?? "—"}`);
+  }
+  if (hasSharedWorkspace) {
+    metaParts.push(`同工作区共 ${sharedWorkspaceCount} 把`);
+  }
+  if (sourceFile) {
+    metaParts.push(sourceFile);
+  } else {
+    metaParts.push("无来源记录");
+  }
+
+  return {
+    account,
+    meta: metaParts.join(" · "),
+    workspaceAccountId,
+    sharedWorkspaceCount,
+    hasSharedWorkspace,
+  };
+}
+
 function truncateText(value, maxLength = 160) {
   const text = normalizeWhitespace(value);
   if (!text || text.length <= maxLength) {
@@ -622,21 +700,28 @@ function renderQuotaWindow(window, fallbackLabel) {
   `;
 }
 
-function renderQuotaSection(item) {
+function renderQuotaSection(item, presentation) {
   const quota = item.quota;
+  const notes = [];
+  if (presentation?.hasSharedWorkspace) {
+    notes.push(
+      `同工作区共 ${presentation.sharedWorkspaceCount} 把 token；已用金额和 5H / 7D 配额窗口按工作区共享，所以这几张卡会显示相同额度。`,
+    );
+  }
+  if (quota?.error) {
+    notes.push(
+      `配额读取失败 · ${summarizeTokenError(quota.error) || "请稍后再试"}${
+        quota?.fetched_at ? ` · 最近尝试 ${formatDate(quota.fetched_at)}` : ""
+      }`,
+    );
+  }
   return `
     <div class="token-card__quota">
       <div class="token-card__quota-grid">
         ${renderQuotaWindow(getQuotaWindow(item, "code-5h"), "5h")}
         ${renderQuotaWindow(getQuotaWindow(item, "code-7d"), "7d")}
       </div>
-      ${
-        quota?.error
-          ? `<p class="token-card__quota-note">${escapeHtml(`配额读取失败 · ${summarizeTokenError(quota.error) || "请稍后再试"}`)}${
-              quota?.fetched_at ? ` · ${escapeHtml(`最近尝试 ${formatDate(quota.fetched_at)}`)}` : ""
-            }</p>`
-          : ""
-      }
+      ${notes.map((note) => `<p class="token-card__quota-note">${escapeHtml(note)}</p>`).join("")}
     </div>
   `;
 }
@@ -665,11 +750,9 @@ function renderTokenErrorSection(item) {
   `;
 }
 
-function renderTokenCard(item) {
+function renderTokenCard(item, workspaceTokenCounts) {
   const status = deriveStatus(item);
-  const accountId = item.chatgpt_account_id || item.account_id || "";
-  const account = item.email || accountId || "未命名账号";
-  const meta = accountId && accountId !== account ? accountId : item.source_file || "无来源记录";
+  const presentation = buildTokenPresentation(item, workspaceTokenCounts);
   const planLabel = formatPlanType(item.plan_type);
   const planTone = derivePlanTone(item.plan_type);
   const subscriptionValue = formatSubscriptionUntil(item.subscription_active_until);
@@ -685,12 +768,13 @@ function renderTokenCard(item) {
   const lastUsedTone = lastUsedValue === "—" ? "muted" : "default";
   const observedCostTone = item.observed_cost_usd == null ? "muted" : "money";
   const errorSection = renderTokenErrorSection(item);
+  const observedCostLabel = presentation.hasSharedWorkspace ? "工作区已用金额" : "已用金额";
   return `
     <article class="token-card token-card--${status.tone}">
       <div class="token-card__top">
         <div class="token-card__identity">
-          <span class="token-card__account">${escapeHtml(account)}</span>
-          <span class="token-card__meta">${escapeHtml(meta)}</span>
+          <span class="token-card__account">${escapeHtml(presentation.account)}</span>
+          <span class="token-card__meta">${escapeHtml(presentation.meta)}</span>
         </div>
         <div class="token-card__overview">
           <div class="token-card__chips">
@@ -701,7 +785,7 @@ function renderTokenCard(item) {
             ${renderTokenFact("订阅", subscriptionValue, subscriptionTone)}
             ${renderTokenFact("冷却到", cooldownValue, cooldownTone)}
             ${renderTokenFact("最近使用", lastUsedValue, lastUsedTone)}
-            ${renderTokenFact("已用金额", observedCostValue, observedCostTone)}
+            ${renderTokenFact(observedCostLabel, observedCostValue, observedCostTone)}
           </div>
         </div>
         <div class="token-card__action">
@@ -709,14 +793,14 @@ function renderTokenCard(item) {
         </div>
       </div>
       <div class="token-card__bottom${errorSection ? " token-card__bottom--with-error" : ""}">
-        ${renderQuotaSection(item)}
+        ${renderQuotaSection(item, presentation)}
         ${errorSection}
       </div>
     </article>
   `;
 }
 
-function renderTokenGroup({ id, title, meta, tone, items, open = false, emptyMessage }) {
+function renderTokenGroup({ id, title, meta, tone, items, open = false, emptyMessage, itemRenderer = renderTokenCard }) {
   const list = Array.isArray(items) ? items : [];
   return `
     <details class="token-group token-group--${escapeHtml(tone)}" data-token-group="${escapeHtml(id)}"${open ? " open" : ""}>
@@ -737,7 +821,7 @@ function renderTokenGroup({ id, title, meta, tone, items, open = false, emptyMes
       <div class="token-group__body token-group__body--fold">
         ${
           list.length > 0
-            ? list.map((item) => renderTokenCard(item)).join("")
+            ? list.map((item) => itemRenderer(item)).join("")
             : `<article class="empty-state empty-state--inline"><p>${escapeHtml(emptyMessage)}</p></article>`
         }
       </div>
@@ -976,6 +1060,7 @@ function renderTokenList(items) {
   const availableItems = [];
   const coolingItems = [];
   const disabledItems = [];
+  const workspaceTokenCounts = buildWorkspaceTokenCounts(items);
 
   items.forEach((item) => {
     const status = deriveStatus(item);
@@ -1001,27 +1086,45 @@ function renderTokenList(items) {
     ${renderTokenGroup({
       id: "available",
       title: "可用",
-      meta: availableItems.length > 0 ? "可立即调度" : "当前没有可立即调度的 key",
+      meta: describeTokenGroupMeta(
+        availableItems,
+        "可立即调度",
+        "当前没有可立即调度的 key",
+        buildWorkspaceTokenCounts(availableItems),
+      ),
       tone: "available",
       items: availableItems,
+      itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
       open: availableOpen,
       emptyMessage: "当前没有可立即调度的 key。",
     })}
     ${renderTokenGroup({
       id: "cooling",
       title: "冷却",
-      meta: coolingItems.length > 0 ? "等待冷却窗口结束" : "当前没有冷却中的 key",
+      meta: describeTokenGroupMeta(
+        coolingItems,
+        "等待冷却窗口结束",
+        "当前没有冷却中的 key",
+        buildWorkspaceTokenCounts(coolingItems),
+      ),
       tone: "cooling",
       items: coolingItems,
+      itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
       open: coolingOpen,
       emptyMessage: "当前没有处于冷却窗口的 key。",
     })}
     ${renderTokenGroup({
       id: "disabled",
       title: "已禁用",
-      meta: disabledItems.length > 0 ? "已移出调度池" : "当前没有已禁用 key",
+      meta: describeTokenGroupMeta(
+        disabledItems,
+        "已移出调度池",
+        "当前没有已禁用 key",
+        buildWorkspaceTokenCounts(disabledItems),
+      ),
       tone: "disabled",
       items: disabledItems,
+      itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
       open: disabledOpen,
       emptyMessage: "当前没有已禁用的 key。",
     })}
