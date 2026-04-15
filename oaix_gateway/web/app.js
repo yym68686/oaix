@@ -471,9 +471,9 @@ function getQuotaWindow(item, windowId) {
 function deriveQuotaTone(window) {
   const remaining = Number(window?.remaining_percent);
   if (!Number.isFinite(remaining)) {
-    return "pending";
+    return window?.exhausted ? "disabled" : "pending";
   }
-  if (window?.exhausted || remaining <= 0) {
+  if (remaining <= 0) {
     return "disabled";
   }
   if (remaining <= 30) {

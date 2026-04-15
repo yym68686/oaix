@@ -101,6 +101,36 @@ def test_parse_codex_quota_payload_marks_limit_reached_windows_exhausted() -> No
     assert windows["code-7d"].exhausted is True
 
 
+def test_parse_codex_quota_payload_prefers_window_percent_over_global_limit_flags() -> None:
+    now = datetime(2026, 4, 14, 10, 0, tzinfo=timezone.utc)
+    payload = {
+        "rate_limit": {
+            "allowed": False,
+            "limit_reached": True,
+            "primary_window": {
+                "limit_window_seconds": 5 * 60 * 60,
+                "used_percent": 100,
+                "reset_after_seconds": 600,
+            },
+            "secondary_window": {
+                "limit_window_seconds": 7 * 24 * 60 * 60,
+                "used_percent": 25,
+                "reset_after_seconds": 3600,
+            },
+        }
+    }
+
+    parsed = parse_codex_quota_payload(payload, now=now)
+    windows = {window.id: window for window in parsed.windows}
+
+    assert windows["code-5h"].used_percent == 100
+    assert windows["code-5h"].remaining_percent == 0
+    assert windows["code-5h"].exhausted is True
+    assert windows["code-7d"].used_percent == 25
+    assert windows["code-7d"].remaining_percent == 75
+    assert windows["code-7d"].exhausted is False
+
+
 def test_quota_service_deactivates_permanently_invalid_refresh_tokens(monkeypatch) -> None:
     recorded: dict[str, object] = {}
 

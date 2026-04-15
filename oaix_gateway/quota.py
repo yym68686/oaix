@@ -336,12 +336,12 @@ def _build_codex_window(
         return None
 
     reset_at = _extract_reset_at(window, now)
+    exhausted_hint = _coerce_bool(limit_reached) is True or _coerce_bool(allowed) is False
     used_percent = _deduce_used_percent(window, limit_reached=limit_reached, allowed=allowed, reset_at=reset_at)
     remaining_percent = None if used_percent is None else _clamp_percent(100.0 - used_percent)
     exhausted = bool(
         (used_percent is not None and used_percent >= 100.0)
-        or (_coerce_bool(limit_reached) is True and reset_at is not None)
-        or _coerce_bool(allowed) is False
+        or (used_percent is None and exhausted_hint and (reset_at is not None or _coerce_bool(allowed) is False))
     )
     return CodexQuotaWindow(
         id=window_id,
