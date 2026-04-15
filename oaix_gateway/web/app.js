@@ -1,7 +1,16 @@
 const STORAGE_KEY = "oaix.serviceKey";
 const THEME_STORAGE_KEY = "oaix.themePreference";
+const IMPORT_JOB_STORAGE_KEY = "oaix.importJobId";
 const REFRESH_INTERVAL_MS = 15000;
+const IMPORT_JOB_POLL_INTERVAL_MS = 1500;
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
+const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
+
+function readStoredImportJobId() {
+  const raw = localStorage.getItem(IMPORT_JOB_STORAGE_KEY) || "";
+  const value = Number.parseInt(raw, 10);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
 
 function normalizeThemePreference(value) {
   return THEME_OPTIONS.has(value) ? value : "auto";
@@ -14,6 +23,9 @@ const initialResolvedTheme = document.documentElement.dataset.colorScheme === "d
 
 const state = {
   serviceKey: localStorage.getItem(STORAGE_KEY) || "",
+  importJobId: readStoredImportJobId(),
+  importJobPollTimer: null,
+  importJobPolling: false,
   protected: false,
   timer: null,
   tokenActionPendingKinds: new Map(),
@@ -86,6 +98,7 @@ const elements = {
 elements.serviceKey.value = state.serviceKey;
 const supportsTokenDeleteDialog =
   typeof HTMLDialogElement !== "undefined" && elements.tokenDeleteDialog instanceof HTMLDialogElement;
+const DEFAULT_IMPORT_BUTTON_LABEL = elements.importButton.textContent.trim() || "导入";
 
 function resolveTheme(preference) {
   if (preference === "dark" || preference === "light") {
@@ -147,6 +160,158 @@ function setFeedback(message, tone = "") {
   if (tone) {
     elements.importFeedback.classList.add(tone);
   }
+}
+
+function setImportButtonBusy(disabled, label = DEFAULT_IMPORT_BUTTON_LABEL) {
+  elements.importButton.disabled = disabled;
+  elements.importButton.textContent = label;
+}
+
+function persistImportJobId(jobId) {
+  const normalized = Number.parseInt(String(jobId), 10);
+  if (!Number.isInteger(normalized) || normalized <= 0) {
+    state.importJobId = null;
+    localStorage.removeItem(IMPORT_JOB_STORAGE_KEY);
+    return;
+  }
+  state.importJobId = normalized;
+  localStorage.setItem(IMPORT_JOB_STORAGE_KEY, String(normalized));
+}
+
+function stopImportJobPolling() {
+  if (state.importJobPollTimer) {
+    window.clearTimeout(state.importJobPollTimer);
+    state.importJobPollTimer = null;
+  }
+}
+
+function clearImportJobTracking() {
+  stopImportJobPolling();
+  state.importJobId = null;
+  localStorage.removeItem(IMPORT_JOB_STORAGE_KEY);
+}
+
+function queueImportJobPoll(jobId, refreshOnFinish) {
+  stopImportJobPolling();
+  state.importJobPollTimer = window.setTimeout(() => {
+    void pollImportJob(jobId, { refreshOnFinish });
+  }, IMPORT_JOB_POLL_INTERVAL_MS);
+}
+
+function buildImportJobProgressMessage(job) {
+  const totalCount = Number(job?.total_count || 0);
+  const processedCount = Number(job?.processed_count || 0);
+  const createdCount = Number(job?.created_count || 0);
+  const updatedCount = Number(job?.updated_count || 0);
+  const skippedCount = Number(job?.skipped_count || 0);
+  const failedCount = Number(job?.failed_count || 0);
+  const queueLabel =
+    job?.status === "queued"
+      ? `导入任务 #${job?.id} 已入队，等待后台 worker 领取。`
+      : `后台导入中：已处理 ${processedCount}/${totalCount} 条。`;
+  const trafficNote = Number(job?.yielded_to_response_traffic_count || 0)
+    ? `期间主动给 /v1/responses 流量让路 ${job.yielded_to_response_traffic_count} 次。`
+    : "";
+  const timeoutNote = Number(job?.response_traffic_timeout_count || 0)
+    ? `有 ${job.response_traffic_timeout_count} 条在响应流量持续繁忙时改为继续执行。`
+    : "";
+  return [
+    queueLabel,
+    `当前结果：新增 ${createdCount} 条，更新 ${updatedCount} 条，跳过 ${skippedCount} 条，失败 ${failedCount} 条。`,
+    trafficNote,
+    timeoutNote,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function buildImportJobCompletedMessage(job) {
+  const failedMessages = Array.isArray(job?.failed)
+    ? job.failed
+        .slice(0, 3)
+        .map((item) => item?.error)
+        .filter(Boolean)
+    : [];
+  return [
+    `导入完成：新增 ${job?.created_count || 0} 条，更新 ${job?.updated_count || 0} 条，跳过重复 ${job?.skipped_count || 0} 条，失败 ${job?.failed_count || 0} 条。`,
+    job?.response_traffic_timeout_count
+      ? `导入期间有 ${job.response_traffic_timeout_count} 条记录在 /v1/responses 持续繁忙时改为继续执行，没有再因等待排空而整批失败。`
+      : "",
+    failedMessages.length ? `失败原因：${failedMessages.join("；")}` : "",
+    job?.skipped_count ? "重复判定基于当前 RT 和历史 RT 链，不会再按 account_id 合并不同账号。" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function buildImportJobFailureMessage(job) {
+  return `导入任务 #${job?.id || "?"} 失败：${job?.last_error || "后台 worker 执行失败"}`;
+}
+
+async function pollImportJob(jobId, { refreshOnFinish = true } = {}) {
+  if (state.importJobPolling && Number.parseInt(String(jobId), 10) === state.importJobId) {
+    return;
+  }
+  state.importJobPolling = true;
+  persistImportJobId(jobId);
+  setImportButtonBusy(true, "后台导入中…");
+  try {
+    const data = await fetchJson(`/admin/tokens/import-jobs/${encodeURIComponent(jobId)}`, {
+      headers: authHeaders(),
+    });
+    const job = data?.job;
+    if (!job) {
+      throw new Error("导入任务状态缺失");
+    }
+
+    if (IMPORT_JOB_ACTIVE_STATUSES.has(String(job.status || ""))) {
+      setFeedback(buildImportJobProgressMessage(job));
+      queueImportJobPoll(job.id, refreshOnFinish);
+      return;
+    }
+
+    clearImportJobTracking();
+    setImportButtonBusy(false);
+
+    if (job.status === "completed") {
+      setFeedback(buildImportJobCompletedMessage(job), "is-success");
+      if (refreshOnFinish) {
+        await refreshDashboard();
+      }
+      return;
+    }
+
+    setFeedback(buildImportJobFailureMessage(job), "is-error");
+    if (refreshOnFinish) {
+      await refreshDashboard();
+    }
+  } catch (error) {
+    const status = Number(error?.status || 0);
+    if (status === 404) {
+      clearImportJobTracking();
+      setImportButtonBusy(false);
+      setFeedback("后台导入任务不存在，可能已被清理或迁移。", "is-error");
+      return;
+    }
+    if (status === 401 || status === 403) {
+      stopImportJobPolling();
+      setImportButtonBusy(true, "等待鉴权…");
+      setFeedback("后台导入任务仍在执行，但当前缺少有效 Service API Key，恢复鉴权后会继续显示进度。", "is-error");
+      return;
+    }
+
+    setFeedback(`后台导入任务状态同步失败：${error.message}`, "is-error");
+    queueImportJobPoll(jobId, refreshOnFinish);
+  } finally {
+    state.importJobPolling = false;
+  }
+}
+
+function resumeTrackedImportJob() {
+  if (!state.importJobId || state.importJobPollTimer || state.importJobPolling) {
+    return;
+  }
+  void pollImportJob(state.importJobId, { refreshOnFinish: false });
 }
 
 function formatDate(value) {
@@ -1587,6 +1752,9 @@ async function refreshDashboard() {
     elements.requestNote.textContent = `面板同步失败：${error.message}`;
   } finally {
     elements.refreshButton.disabled = false;
+    if (state.importJobId && !state.importJobPollTimer) {
+      resumeTrackedImportJob();
+    }
   }
 }
 
@@ -1698,7 +1866,7 @@ async function collectImportPayloads() {
 }
 
 async function importTokens() {
-  elements.importButton.disabled = true;
+  setImportButtonBusy(true, "提交中…");
   setFeedback("正在整理并提交导入批次…");
   try {
     const payloads = await collectImportPayloads();
@@ -1707,30 +1875,31 @@ async function importTokens() {
       headers: authHeaders(true),
       body: JSON.stringify(payloads),
     });
-
-    const message = [
-      `导入完成：新增 ${data.created_count || 0} 条，更新 ${data.updated_count || 0} 条，跳过重复 ${data.skipped_count || 0} 条，失败 ${data.failed_count || 0} 条。`,
-      data.response_traffic_timeout_count
-        ? `导入期间有 ${data.response_traffic_timeout_count} 条记录在 /v1/responses 持续繁忙时改为继续执行，没有再因等待排空而整批失败。`
-        : "",
-      data.failed_count ? `失败原因：${(data.failed || []).slice(0, 3).map((item) => item.error).join("；")}` : "",
-      data.skipped_count ? "重复判定基于当前 RT 和历史 RT 链，不会再按 account_id 合并不同账号。" : "",
-    ]
-      .filter(Boolean)
-      .join(" ");
-
-    setFeedback(message, "is-success");
+    const job = data?.job;
+    if (!job?.id) {
+      throw new Error("导入任务创建失败，服务端未返回 job_id");
+    }
+    persistImportJobId(job.id);
+    setFeedback(
+      `导入任务 #${job.id} 已创建，共 ${job.total_count || payloads.length} 条，后台会继续处理。`,
+      "is-success",
+    );
     await refreshDashboard();
+    await pollImportJob(job.id, { refreshOnFinish: false });
   } catch (error) {
     setFeedback(`导入失败：${error.message}`, "is-error");
-  } finally {
-    elements.importButton.disabled = false;
+    if (!state.importJobId) {
+      setImportButtonBusy(false);
+    }
   }
 }
 
 function resetImportForm() {
   elements.tokenJson.value = "";
   elements.tokenFiles.value = "";
+  if (state.importJobId) {
+    return;
+  }
   setFeedback("等待导入。");
 }
 
@@ -1744,6 +1913,9 @@ function saveServiceKey() {
     setFeedback("Service API Key 已清空。");
   }
   refreshDashboard();
+  if (state.importJobId) {
+    resumeTrackedImportJob();
+  }
 }
 
 function clearServiceKey() {
@@ -1751,6 +1923,10 @@ function clearServiceKey() {
   state.serviceKey = "";
   localStorage.removeItem(STORAGE_KEY);
   setFeedback("Service API Key 已清空。");
+  if (state.importJobId) {
+    stopImportJobPolling();
+    setImportButtonBusy(true, "等待鉴权…");
+  }
   refreshDashboard();
 }
 
@@ -1763,6 +1939,10 @@ function syncSystemTheme() {
 applyTheme(state.themePreference, { persist: false });
 renderTokenSelection({ strategy: state.tokenSelectionStrategy });
 renderInitialLoadingStates();
+if (state.importJobId) {
+  setImportButtonBusy(true, "后台导入中…");
+  setFeedback(`检测到后台导入任务 #${state.importJobId}，正在恢复状态…`);
+}
 
 elements.themeButtons.forEach((button) => {
   button.addEventListener("click", () => applyTheme(button.dataset.themeOption));
@@ -1860,3 +2040,4 @@ elements.resetImportButton.addEventListener("click", resetImportForm);
 
 refreshDashboard();
 state.timer = window.setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
+resumeTrackedImportJob();

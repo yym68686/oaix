@@ -1,7 +1,30 @@
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from oaix_gateway.database import CodexToken
-from oaix_gateway.token_store import _merge_duplicate_token_rows
+from oaix_gateway.token_store import (
+    TokenHistoryRepairSummary,
+    _merge_duplicate_token_rows,
+    repair_duplicate_token_histories,
+    update_token_refresh_state,
+)
+
+
+class _FakeTransaction:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _FakeSession:
+    def begin(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
+    async def close(self) -> None:
+        return None
 
 
 def test_merge_duplicate_token_rows_marks_shadow_and_preserves_canonical_history() -> None:
@@ -97,3 +120,88 @@ def test_merge_duplicate_token_rows_prefers_latest_state_even_if_it_is_inactive(
     assert canonical.cooldown_until is None
     assert canonical.last_error == "refresh_token_reused"
     assert [shadow.id for shadow in shadows] == [10]
+
+
+def test_update_token_refresh_state_acquires_history_lock_before_row_locks(monkeypatch) -> None:
+    token = CodexToken(
+        id=7,
+        refresh_token="rt_old",
+        refresh_token_aliases=["rt_old"],
+        token_type="codex",
+        is_active=True,
+    )
+    fake_session = _FakeSession()
+    calls: list[str] = []
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield fake_session
+
+    async def fake_acquire_history_lock(session) -> None:
+        assert session is fake_session
+        calls.append("lock")
+
+    async def fake_resolve(session, token_id: int) -> CodexToken:
+        assert session is fake_session
+        assert calls == ["lock"]
+        calls.append(f"resolve:{token_id}")
+        return token
+
+    async def fake_repair(session) -> TokenHistoryRepairSummary:
+        assert session is fake_session
+        assert calls == ["lock", "resolve:7"]
+        calls.append("repair")
+        return TokenHistoryRepairSummary(duplicate_group_count=0, merged_row_count=0)
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
+    monkeypatch.setattr("oaix_gateway.token_store._acquire_token_history_repair_lock", fake_acquire_history_lock)
+    monkeypatch.setattr("oaix_gateway.token_store._resolve_canonical_token_for_update", fake_resolve)
+    monkeypatch.setattr("oaix_gateway.token_store._repair_duplicate_token_histories_in_session", fake_repair)
+
+    asyncio.run(
+        update_token_refresh_state(
+            7,
+            access_token="access_new",
+            refresh_token="rt_new",
+            expires_at=None,
+        )
+    )
+
+    assert calls == ["lock", "resolve:7", "repair"]
+    assert token.access_token == "access_new"
+    assert token.refresh_token == "rt_new"
+    assert token.refresh_token_aliases == ["rt_old", "rt_new"]
+
+
+def test_repair_duplicate_token_histories_acquires_history_lock(monkeypatch) -> None:
+    fake_session = _FakeSession()
+    calls: list[str] = []
+    expected = TokenHistoryRepairSummary(
+        duplicate_group_count=1,
+        merged_row_count=2,
+        canonical_ids=(11,),
+        shadow_ids=(9, 10),
+    )
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield fake_session
+
+    async def fake_acquire_history_lock(session) -> None:
+        assert session is fake_session
+        calls.append("lock")
+
+    async def fake_repair(session) -> TokenHistoryRepairSummary:
+        assert session is fake_session
+        assert calls == ["lock"]
+        calls.append("repair")
+        return expected
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
+    monkeypatch.setattr("oaix_gateway.token_store._acquire_token_history_repair_lock", fake_acquire_history_lock)
+    monkeypatch.setattr("oaix_gateway.token_store._repair_duplicate_token_histories_in_session", fake_repair)
+
+    summary = asyncio.run(repair_duplicate_token_histories())
+
+    assert calls == ["lock", "repair"]
+    assert summary == expected

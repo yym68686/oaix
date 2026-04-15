@@ -13,6 +13,7 @@ def test_frontend_routes_are_registered() -> None:
     assert "/admin/tokens/{token_id}" in paths
     assert "/admin/requests" in paths
     assert "/admin/tokens/import" in paths
+    assert "/admin/tokens/import-jobs/{job_id}" in paths
     assert "/v1/responses" in paths
     assert "/v1/responses/compact" in paths
 

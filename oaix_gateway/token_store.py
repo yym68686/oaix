@@ -22,6 +22,7 @@ DEFAULT_TOKEN_SELECTION_STRATEGY = TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED
 TOKEN_SELECTION_SETTING_KEY = "token_selection"
 MERGED_DUPLICATE_TOKEN_ERROR_PREFIX = "Merged into token #"
 TOKEN_IDENTITY_LOCK_NAMESPACE = "codex-token-identity"
+TOKEN_HISTORY_REPAIR_LOCK_KEY = "codex-token-history:repair"
 
 
 @dataclass(frozen=True)
@@ -316,17 +317,25 @@ async def _acquire_token_identity_locks(
     refresh_token: str,
     account_id: str | None,
 ) -> None:
-    bind = session.get_bind()
-    if bind is None or bind.dialect.name != "postgresql":
-        return
-
     lock_keys = [f"{TOKEN_IDENTITY_LOCK_NAMESPACE}:refresh:{refresh_token}"]
     normalized_account_id = str(account_id or "").strip()
     if normalized_account_id:
         lock_keys.append(f"{TOKEN_IDENTITY_LOCK_NAMESPACE}:account:{normalized_account_id}")
 
     for lock_key in sorted(set(lock_keys)):
-        await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key)::bigint)"), {"key": lock_key})
+        await _acquire_postgres_transaction_lock(session, lock_key=lock_key)
+
+
+async def _acquire_postgres_transaction_lock(session, *, lock_key: str) -> None:
+    bind = session.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+
+    await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key)::bigint)"), {"key": lock_key})
+
+
+async def _acquire_token_history_repair_lock(session) -> None:
+    await _acquire_postgres_transaction_lock(session, lock_key=TOKEN_HISTORY_REPAIR_LOCK_KEY)
 
 
 async def _resolve_canonical_token_for_update(session, token_id: int) -> CodexToken | None:
@@ -511,6 +520,7 @@ async def update_token_selection_settings(*, strategy: str) -> TokenSelectionSet
 async def repair_duplicate_token_histories() -> TokenHistoryRepairSummary:
     async with get_session() as session:
         async with session.begin():
+            await _acquire_token_history_repair_lock(session)
             return await _repair_duplicate_token_histories_in_session(session)
 
 
@@ -544,6 +554,10 @@ async def update_token_refresh_state(
 ) -> None:
     async with get_session() as session:
         async with session.begin():
+            # Refresh writes may already hold a token row lock; serialize the
+            # duplicate-history repair scan first so concurrent refreshes do not
+            # deadlock while escalating to a full canonical-token FOR UPDATE pass.
+            await _acquire_token_history_repair_lock(session)
             token = await _resolve_canonical_token_for_update(session, token_id)
             if token is None:
                 return

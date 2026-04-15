@@ -90,6 +90,31 @@ class GatewaySetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class TokenImportJob(Base):
+    __tablename__ = "token_import_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
+    payloads: Mapped[list[dict] | None] = mapped_column(JSON, nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    processed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    yielded_to_response_traffic_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    response_traffic_timeout_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_items: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
+    updated_items: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
+    skipped_items: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
+    failed_items: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+
 _engine = None
 _session_factory = None
 
@@ -181,6 +206,28 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN estimated_cost_usd DOUBLE PRECISION"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model ON gateway_request_logs (model)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))
+
+    if "token_import_jobs" in table_names:
+        job_columns = {column["name"] for column in inspector.get_columns("token_import_jobs")}
+        if "heartbeat_at" not in job_columns:
+            sync_conn.execute(text("ALTER TABLE token_import_jobs ADD COLUMN heartbeat_at TIMESTAMPTZ"))
+        if "response_traffic_timeout_count" not in job_columns:
+            sync_conn.execute(text("ALTER TABLE token_import_jobs ADD COLUMN response_traffic_timeout_count INTEGER NOT NULL DEFAULT 0"))
+        if "yielded_to_response_traffic_count" not in job_columns:
+            sync_conn.execute(
+                text("ALTER TABLE token_import_jobs ADD COLUMN yielded_to_response_traffic_count INTEGER NOT NULL DEFAULT 0")
+            )
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_token_import_jobs_status ON token_import_jobs (status)"))
+        sync_conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_token_import_jobs_submitted_at ON token_import_jobs (submitted_at)")
+        )
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_token_import_jobs_started_at ON token_import_jobs (started_at)"))
+        sync_conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_token_import_jobs_finished_at ON token_import_jobs (finished_at)")
+        )
+        sync_conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_token_import_jobs_heartbeat_at ON token_import_jobs (heartbeat_at)")
+        )
 
 
 async def _backfill_token_refresh_aliases() -> None:

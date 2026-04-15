@@ -30,6 +30,11 @@ from .request_store import (
     get_request_log_summary,
     list_request_logs,
 )
+from .token_import_jobs import (
+    TokenImportBackgroundWorker,
+    create_token_import_job,
+    get_token_import_job,
+)
 from .token_store import (
     DEFAULT_TOKEN_SELECTION_STRATEGY,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
@@ -44,7 +49,6 @@ from .token_store import (
     repair_duplicate_token_histories,
     set_token_active_state,
     update_token_selection_settings,
-    upsert_token_payload,
 )
 from .usage_cost import UsageMetrics, extract_usage_metrics
 
@@ -1073,9 +1077,12 @@ async def lifespan(app: FastAPI):
         concurrency=_admin_quota_max_concurrency(),
     )
     app.state.token_selection_settings = await get_token_selection_settings()
+    app.state.token_import_worker = TokenImportBackgroundWorker(response_traffic=app.state.response_traffic)
+    await app.state.token_import_worker.start()
     try:
         yield
     finally:
+        await app.state.token_import_worker.stop()
         await app.state.http_client.aclose()
         await close_database()
 
@@ -1083,6 +1090,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="oaix Gateway", version="0.1.0", lifespan=lifespan)
     app.state.response_traffic = ResponseTrafficController()
+    app.state.token_import_worker = None
     app.mount("/assets", StaticFiles(directory=str(WEB_DIR)), name="assets")
 
     @app.get("/")
@@ -1195,12 +1203,11 @@ def create_app() -> FastAPI:
             "items": items,
         }
 
-    @app.post("/admin/tokens/import")
+    @app.post("/admin/tokens/import", status_code=202)
     async def import_tokens_route(
         http_request: Request,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
-        response_traffic: ResponseTrafficController = http_request.app.state.response_traffic
         try:
             body = await http_request.json()
         except json.JSONDecodeError as exc:
@@ -1217,65 +1224,21 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail="Body must be a token object, an array of token objects, or {'tokens': [...]}",
             )
+        job = await create_token_import_job(payloads)
+        worker = getattr(http_request.app.state, "token_import_worker", None)
+        if worker is not None:
+            worker.notify()
+        return {"job": asdict(job)}
 
-        created: list[dict[str, Any]] = []
-        updated: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = []
-        failed: list[dict[str, Any]] = []
-        yielded_to_response_traffic = 0
-        response_traffic_timeout_count = 0
-        for index, payload in enumerate(payloads):
-            try:
-                if await response_traffic.wait_for_import_turn():
-                    yielded_to_response_traffic += 1
-            except TimeoutError as exc:
-                response_traffic_timeout_count += 1
-                logger.warning(
-                    "Token import wait timed out while /v1/responses traffic remained active; continuing import: index=%s total_payloads=%s active_responses=%s timeout_seconds=%s",
-                    index,
-                    len(payloads),
-                    response_traffic.active_responses,
-                    _import_wait_timeout_seconds(),
-                )
-                await asyncio.sleep(0)
-            if not isinstance(payload, dict):
-                failed.append({"index": index, "error": "Token payload must be a JSON object"})
-                continue
-            try:
-                result = await upsert_token_payload(payload)
-                item = {
-                    "id": result.token.id,
-                    "email": result.token.email,
-                    "account_id": result.token.account_id,
-                    "index": index,
-                }
-                if result.action == "created":
-                    created.append(item)
-                elif result.action == "updated":
-                    updated.append(item)
-                else:
-                    skipped.append(
-                        {
-                            **item,
-                            "reason": "duplicate_refresh_token_history",
-                        }
-                    )
-            except Exception as exc:
-                failed.append({"index": index, "error": str(exc)})
-
-        return {
-            "imported_count": len(created) + len(updated),
-            "created_count": len(created),
-            "updated_count": len(updated),
-            "skipped_count": len(skipped),
-            "failed_count": len(failed),
-            "yielded_to_response_traffic_count": yielded_to_response_traffic,
-            "response_traffic_timeout_count": response_traffic_timeout_count,
-            "created": created,
-            "updated": updated,
-            "skipped": skipped,
-            "failed": failed,
-        }
+    @app.get("/admin/tokens/import-jobs/{job_id}")
+    async def get_import_job_route(
+        job_id: int,
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        job = await get_token_import_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Import job not found")
+        return {"job": asdict(job)}
 
     @app.post("/v1/responses")
     async def responses_route(
