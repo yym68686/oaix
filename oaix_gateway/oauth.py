@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -12,6 +13,104 @@ from .token_store import update_token_refresh_state
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 30
+PERMANENT_REFRESH_TOKEN_ERROR_CODES = frozenset(
+    {
+        "invalid_grant",
+        "invalid_refresh_token",
+        "refresh_token_expired",
+        "refresh_token_not_found",
+        "refresh_token_reused",
+        "refresh_token_revoked",
+        "token_expired",
+        "token_revoked",
+    }
+)
+PERMANENT_REFRESH_TOKEN_MESSAGE_MARKERS = (
+    "already been used to generate a new access token",
+    "invalid refresh token",
+    "please try signing in again",
+    "refresh token expired",
+    "refresh token is invalid",
+    "refresh token not found",
+    "refresh token revoked",
+)
+
+
+def _normalize_optional_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _parse_json_mapping(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+
+    raw = _normalize_optional_text(value)
+    if raw is None:
+        return None
+
+    candidates = [raw]
+    json_start = raw.find("{")
+    if json_start >= 0:
+        candidates.append(raw[json_start:])
+
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _extract_oauth_error_source(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("error", "detail"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return payload
+
+
+def is_permanently_invalid_refresh_token_error(error: Any) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if status_code not in (None, 400, 401, 403):
+        return False
+
+    detail = getattr(error, "detail", error)
+    payload = _parse_json_mapping(detail)
+
+    source: dict[str, Any] | None = None
+    if payload is not None:
+        source = _extract_oauth_error_source(payload)
+        error_code = _normalize_optional_text(
+            source.get("code") or source.get("error") or source.get("type") or payload.get("error")
+        )
+        if error_code and error_code.lower() in PERMANENT_REFRESH_TOKEN_ERROR_CODES:
+            return True
+
+    haystack_parts: list[str] = []
+    raw_detail = _normalize_optional_text(detail)
+    if raw_detail is not None:
+        haystack_parts.append(raw_detail)
+    if source is not None:
+        for value in (
+            source.get("code"),
+            source.get("type"),
+            source.get("message"),
+            source.get("detail"),
+            payload.get("error_description") if payload is not None else None,
+        ):
+            text = _normalize_optional_text(value)
+            if text is not None:
+                haystack_parts.append(text)
+
+    haystack = " ".join(haystack_parts).lower()
+    if not haystack:
+        return False
+    if "refresh token" not in haystack and "invalid_grant" not in haystack:
+        return False
+    return any(marker in haystack for marker in PERMANENT_REFRESH_TOKEN_MESSAGE_MARKERS)
 
 
 class CodexOAuthManager:
@@ -52,7 +151,7 @@ class CodexOAuthManager:
         response = await client.post(CODEX_OAUTH_TOKEN_URL, data=data, headers=headers, timeout=30.0)
         if response.status_code != 200:
             raise HTTPException(
-                status_code=401,
+                status_code=response.status_code,
                 detail=f"Codex token refresh failed: status {response.status_code}: {response.text}",
             )
 

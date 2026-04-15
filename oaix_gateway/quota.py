@@ -10,7 +10,8 @@ from typing import Any
 import httpx
 
 from .database import CodexToken, utcnow
-from .oauth import CodexOAuthManager
+from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
+from .token_store import mark_token_error
 
 
 logger = logging.getLogger("oaix.gateway")
@@ -526,6 +527,15 @@ class CodexQuotaService:
                 account_id=effective_account_id,
             )
         except Exception as exc:
+            if is_permanently_invalid_refresh_token_error(exc):
+                oauth_manager.invalidate(token_row.id)
+                detail = getattr(exc, "detail", exc)
+                await mark_token_error(
+                    token_row.id,
+                    json.dumps(detail, ensure_ascii=True) if isinstance(detail, dict) else str(detail),
+                    deactivate=True,
+                    clear_access_token=True,
+                )
             logger.warning("Failed to query wham quota for token_id=%s: %s", token_row.id, exc)
             return CodexQuotaSnapshot(
                 fetched_at=fetched_at,

@@ -1,8 +1,12 @@
+import asyncio
 import base64
 import json
 from datetime import datetime, timedelta, timezone
 
-from oaix_gateway.quota import extract_codex_plan_info, parse_codex_quota_payload
+from fastapi import HTTPException
+
+from oaix_gateway.database import CodexToken
+from oaix_gateway.quota import CodexQuotaService, extract_codex_plan_info, parse_codex_quota_payload
 
 
 def _jwt_like(payload: dict) -> str:
@@ -95,3 +99,78 @@ def test_parse_codex_quota_payload_marks_limit_reached_windows_exhausted() -> No
     assert windows["code-7d"].used_percent == 100
     assert windows["code-7d"].remaining_percent == 0
     assert windows["code-7d"].exhausted is True
+
+
+def test_quota_service_deactivates_permanently_invalid_refresh_tokens(monkeypatch) -> None:
+    recorded: dict[str, object] = {}
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        recorded.update(
+            {
+                "token_id": token_id,
+                "message": message,
+                "deactivate": deactivate,
+                "cooldown_seconds": cooldown_seconds,
+                "clear_access_token": clear_access_token,
+            }
+        )
+
+    monkeypatch.setattr("oaix_gateway.quota.mark_token_error", fake_mark_token_error)
+
+    class DummyOAuthManager:
+        def __init__(self) -> None:
+            self.invalidated: list[int] = []
+
+        def invalidate(self, token_id: int) -> None:
+            self.invalidated.append(token_id)
+
+        async def get_access_token(self, token_row: CodexToken, client) -> tuple[str, bool]:
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    'Codex token refresh failed: status 401: {"error":{"code":"refresh_token_reused",'
+                    '"message":"This refresh token has already been used to generate a new access token. '
+                    'Please try signing in again."}}'
+                ),
+            )
+
+    token_row = CodexToken(
+        id=7,
+        account_id="acct_123",
+        refresh_token="rt_123",
+        token_type="codex",
+        is_active=True,
+    )
+    service = CodexQuotaService(ttl_seconds=60)
+    oauth_manager = DummyOAuthManager()
+
+    async def runner():
+        return await service.get_snapshot(
+            token_row,
+            client=object(),
+            oauth_manager=oauth_manager,
+            account_id="acct_123",
+        )
+
+    snapshot = asyncio.run(runner())
+
+    assert snapshot.error is not None
+    assert oauth_manager.invalidated == [7]
+    assert recorded == {
+        "token_id": 7,
+        "message": (
+            'Codex token refresh failed: status 401: {"error":{"code":"refresh_token_reused",'
+            '"message":"This refresh token has already been used to generate a new access token. '
+            'Please try signing in again."}}'
+        ),
+        "deactivate": True,
+        "cooldown_seconds": None,
+        "clear_access_token": True,
+    }

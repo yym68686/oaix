@@ -19,6 +19,7 @@ from oaix_gateway.api_server import (
     ResponsesRequest,
     _sanitize_codex_payload,
     _should_retry_upstream_server_error,
+    _wrap_streaming_body_iterator,
 )
 from oaix_gateway.database import CodexToken
 
@@ -488,6 +489,45 @@ def test_response_traffic_controller_returns_immediately_without_active_response
     controller = ResponseTrafficController()
 
     assert asyncio.run(controller.wait_for_import_turn()) is False
+
+
+def test_response_traffic_controller_times_out_when_active_responses_do_not_drain(monkeypatch) -> None:
+    monkeypatch.setenv("IMPORT_RESPONSE_IDLE_GRACE_SECONDS", "0")
+    monkeypatch.setenv("IMPORT_WAIT_TIMEOUT_SECONDS", "0.01")
+    controller = ResponseTrafficController()
+
+    async def runner() -> None:
+        lease = controller.start_response()
+        try:
+            with pytest.raises(TimeoutError, match="Timed out waiting for active /v1/responses traffic to drain"):
+                await controller.wait_for_import_turn()
+        finally:
+            await lease.release()
+
+    asyncio.run(runner())
+
+
+def test_wrap_streaming_body_iterator_runs_cleanup_on_close() -> None:
+    events: list[str] = []
+
+    async def upstream() -> AsyncIterator[bytes]:
+        try:
+            yield b"chunk-1"
+            await asyncio.sleep(60)
+        finally:
+            events.append("upstream_closed")
+
+    async def on_close() -> None:
+        events.append("cleanup_ran")
+
+    async def runner() -> None:
+        wrapped = _wrap_streaming_body_iterator(upstream(), on_close=on_close)
+        assert await wrapped.__anext__() == b"chunk-1"
+        await wrapped.aclose()
+
+    asyncio.run(runner())
+
+    assert events == ["upstream_closed", "cleanup_ran"]
 
 
 def test_codex_token_refresh_token_index_is_declared() -> None:

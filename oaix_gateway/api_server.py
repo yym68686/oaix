@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 import uvicorn
@@ -19,10 +19,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
-from starlette.background import BackgroundTask, BackgroundTasks
-
 from .database import close_database, init_db, utcnow
-from .oauth import CodexOAuthManager
+from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
 from .request_store import (
     create_request_log,
@@ -211,12 +209,31 @@ class ResponseTrafficController:
         if self._active_responses == 0:
             self._responses_idle.set()
 
-    async def wait_for_import_turn(self) -> bool:
+    async def wait_for_import_turn(self, *, timeout_seconds: float | None = None) -> bool:
         waited = False
+        resolved_timeout = _import_wait_timeout_seconds() if timeout_seconds is None else float(timeout_seconds)
+        deadline: float | None = None
+        loop = asyncio.get_running_loop()
+        if resolved_timeout > 0:
+            deadline = loop.time() + resolved_timeout
+
         while True:
             while self._active_responses > 0:
                 waited = True
-                await self._responses_idle.wait()
+                if deadline is None:
+                    await self._responses_idle.wait()
+                    continue
+
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out waiting for active /v1/responses traffic to drain before import")
+
+                try:
+                    await asyncio.wait_for(self._responses_idle.wait(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(
+                        "Timed out waiting for active /v1/responses traffic to drain before import"
+                    ) from exc
 
             if not waited:
                 return False
@@ -224,6 +241,11 @@ class ResponseTrafficController:
             grace_seconds = _import_response_idle_grace_seconds()
             if grace_seconds <= 0:
                 return True
+
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0 or remaining < grace_seconds:
+                    raise TimeoutError("Timed out waiting for active /v1/responses traffic to drain before import")
 
             await asyncio.sleep(grace_seconds)
             if self._active_responses == 0:
@@ -258,6 +280,10 @@ def _default_usage_limit_cooldown_seconds() -> int:
 
 def _import_response_idle_grace_seconds() -> float:
     return _float_env("IMPORT_RESPONSE_IDLE_GRACE_SECONDS", 0.25, minimum=0.0)
+
+
+def _import_wait_timeout_seconds() -> float:
+    return _float_env("IMPORT_WAIT_TIMEOUT_SECONDS", 30.0, minimum=0.0)
 
 
 def _compact_server_error_cooldown_seconds() -> int:
@@ -327,20 +353,6 @@ def _responses_endpoint_path(*, compact: bool = False) -> str:
     if compact:
         return "/v1/responses/compact"
     return "/v1/responses"
-
-
-def _append_background_task(response: Response, func, *args, **kwargs) -> None:
-    if response.background is None:
-        response.background = BackgroundTask(func, *args, **kwargs)
-        return
-    if isinstance(response.background, BackgroundTasks):
-        response.background.add_task(func, *args, **kwargs)
-        return
-
-    background_tasks = BackgroundTasks()
-    background_tasks.tasks.append(response.background)
-    background_tasks.add_task(func, *args, **kwargs)
-    response.background = background_tasks
 
 
 def _build_upstream_headers(http_request: Request, access_token: str, account_id: str | None, stream: bool) -> dict[str, str]:
@@ -860,6 +872,28 @@ async def _finalize_stream_request_log(
         logger.exception("Failed to finalize streamed request log id=%s", request_log_id)
 
 
+async def _wrap_streaming_body_iterator(
+    body_iterator: AsyncIterator[bytes],
+    *,
+    on_close: Callable[[], Awaitable[None]],
+) -> AsyncGenerator[bytes, None]:
+    try:
+        async for chunk in body_iterator:
+            yield chunk
+    finally:
+        close_iterator = getattr(body_iterator, "aclose", None)
+        if callable(close_iterator):
+            try:
+                await close_iterator()
+            except Exception:
+                logger.exception("Failed to close streamed response body iterator")
+
+        try:
+            await on_close()
+        except Exception:
+            logger.exception("Failed to run streamed response cleanup")
+
+
 def _selection_strategy_label(strategy: str) -> str:
     if strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
         return "Fill-first"
@@ -1163,8 +1197,18 @@ def create_app() -> FastAPI:
         failed: list[dict[str, Any]] = []
         yielded_to_response_traffic = 0
         for index, payload in enumerate(payloads):
-            if await response_traffic.wait_for_import_turn():
-                yielded_to_response_traffic += 1
+            try:
+                if await response_traffic.wait_for_import_turn():
+                    yielded_to_response_traffic += 1
+            except TimeoutError as exc:
+                error_message = str(exc)
+                if not created and not updated and not skipped and not failed:
+                    raise HTTPException(status_code=503, detail=error_message) from exc
+                failed.extend(
+                    {"index": remaining_index, "error": error_message}
+                    for remaining_index in range(index, len(payloads))
+                )
+                break
             if not isinstance(payload, dict):
                 failed.append({"index": index, "error": "Token payload must be a JSON object"})
                 continue
@@ -1265,7 +1309,13 @@ def create_app() -> FastAPI:
                     access_token, access_token_refreshed = await oauth_manager.get_access_token(token_row, client)
                 except HTTPException as exc:
                     oauth_manager.invalidate(token_row.id)
-                    await mark_token_error(token_row.id, str(exc.detail), deactivate=exc.status_code in (401, 403))
+                    permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
+                    await mark_token_error(
+                        token_row.id,
+                        str(exc.detail),
+                        deactivate=permanent_refresh_failure,
+                        clear_access_token=True,
+                    )
                     if exc.status_code in (401, 403):
                         last_error = exc
                         continue
@@ -1282,32 +1332,36 @@ def create_app() -> FastAPI:
                     )
                     await mark_token_success(token_row.id)
                     if isinstance(proxy_result.response, StreamingResponse):
-                        if proxy_result.stream_capture is not None:
-                            _append_background_task(
-                                proxy_result.response,
-                                _finalize_stream_request_log,
-                                request_log_id=request_log.id,
-                                status_code=proxy_result.status_code,
-                                attempt_count=attempt,
-                                account_id=token_row.account_id,
-                                fallback_model_name=proxy_result.model_name,
-                                fallback_first_token_at=proxy_result.first_token_at,
-                                stream_capture=proxy_result.stream_capture,
-                            )
-                        else:
-                            _append_background_task(
-                                proxy_result.response,
-                                finalize_request_log,
-                                request_log.id,
-                                status_code=proxy_result.status_code,
-                                success=True,
-                                attempt_count=attempt,
-                                finished_at=utcnow(),
-                                first_token_at=proxy_result.first_token_at,
-                                account_id=token_row.account_id,
-                                model_name=proxy_result.model_name,
-                            )
-                        _append_background_task(proxy_result.response, response_lease.release)
+                        async def on_stream_close() -> None:
+                            try:
+                                if proxy_result.stream_capture is not None:
+                                    await _finalize_stream_request_log(
+                                        request_log_id=request_log.id,
+                                        status_code=proxy_result.status_code,
+                                        attempt_count=attempt,
+                                        account_id=token_row.account_id,
+                                        fallback_model_name=proxy_result.model_name,
+                                        fallback_first_token_at=proxy_result.first_token_at,
+                                        stream_capture=proxy_result.stream_capture,
+                                    )
+                                else:
+                                    await finalize_request_log(
+                                        request_log.id,
+                                        status_code=proxy_result.status_code,
+                                        success=True,
+                                        attempt_count=attempt,
+                                        finished_at=utcnow(),
+                                        first_token_at=proxy_result.first_token_at,
+                                        account_id=token_row.account_id,
+                                        model_name=proxy_result.model_name,
+                                    )
+                            finally:
+                                await response_lease.release()
+
+                        proxy_result.response.body_iterator = _wrap_streaming_body_iterator(
+                            proxy_result.response.body_iterator,
+                            on_close=on_stream_close,
+                        )
                         release_response_traffic = False
                         return proxy_result.response
                     await finalize_request_log(
