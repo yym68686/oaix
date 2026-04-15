@@ -954,6 +954,7 @@ def _serialize_admin_token_item(
         "last_used_at": token_row.last_used_at,
         "last_error": token_row.last_error,
         "source_file": token_row.source_file,
+        "created_at": token_row.created_at,
         "updated_at": token_row.updated_at,
         "plan_type": quota_snapshot.plan_type if quota_snapshot and quota_snapshot.plan_type else plan_info.plan_type,
         "subscription_active_start": plan_info.subscription_active_start,

@@ -762,9 +762,11 @@ function renderTokenCard(item, workspaceTokenCounts) {
       ? "muted"
       : "default";
   const cooldownValue = formatCooldownUntil(item.cooldown_until);
+  const createdAtValue = formatDate(item.created_at);
   const lastUsedValue = formatDate(item.last_used_at);
   const observedCostValue = item.observed_cost_usd == null ? "—" : formatUsd(item.observed_cost_usd);
   const cooldownTone = cooldownValue === "—" ? "muted" : "cooling";
+  const createdAtTone = createdAtValue === "—" ? "muted" : "default";
   const lastUsedTone = lastUsedValue === "—" ? "muted" : "default";
   const observedCostTone = item.observed_cost_usd == null ? "muted" : "money";
   const errorSection = renderTokenErrorSection(item);
@@ -784,6 +786,7 @@ function renderTokenCard(item, workspaceTokenCounts) {
           <div class="token-card__facts">
             ${renderTokenFact("订阅", subscriptionValue, subscriptionTone)}
             ${renderTokenFact("冷却到", cooldownValue, cooldownTone)}
+            ${renderTokenFact("入库时间", createdAtValue, createdAtTone)}
             ${renderTokenFact("最近使用", lastUsedValue, lastUsedTone)}
             ${renderTokenFact(observedCostLabel, observedCostValue, observedCostTone)}
           </div>

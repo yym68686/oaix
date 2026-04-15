@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -17,11 +18,13 @@ from oaix_gateway.api_server import (
     _prime_responses_upstream_stream,
     _responses_failure_http_exception,
     ResponsesRequest,
+    _serialize_admin_token_item,
     _sanitize_codex_payload,
     _should_retry_upstream_server_error,
     _wrap_streaming_body_iterator,
 )
 from oaix_gateway.database import CodexToken
+from oaix_gateway.quota import CodexPlanInfo
 
 
 def test_extract_usage_limit_cooldown_from_resets_in_seconds() -> None:
@@ -224,6 +227,32 @@ def test_collect_responses_json_from_sse_falls_back_on_done_without_response_com
     assert response["status"] == "completed"
     assert response["model"] == "gpt-5.4"
     assert response["output"][0]["content"][0]["text"] == "hello"
+
+
+def test_serialize_admin_token_item_includes_created_at() -> None:
+    created_at = datetime(2026, 4, 15, 9, 30, tzinfo=timezone.utc)
+    token = CodexToken(
+        id=7,
+        email="user@example.com",
+        account_id="acct_123",
+        refresh_token="refresh_token",
+        is_active=True,
+    )
+    token.created_at = created_at
+
+    item = _serialize_admin_token_item(
+        token,
+        plan_info=CodexPlanInfo(
+            chatgpt_account_id=None,
+            plan_type="plus",
+            subscription_active_start=None,
+            subscription_active_until=None,
+        ),
+        quota_snapshot=None,
+        observed_cost_usd=None,
+    )
+
+    assert item["created_at"] == created_at
 
 
 def test_proxy_stream_capture_extracts_usage_and_model() -> None:
