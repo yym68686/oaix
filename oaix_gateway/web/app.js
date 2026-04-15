@@ -912,13 +912,17 @@ function renderTokenList(items) {
         ? `
           <details class="token-group token-group--archived"${disabledOpen ? " open" : ""}>
             <summary class="token-group__summary">
-              <span class="token-group__copy">
+              <span class="token-group__summary-main">
                 <span class="token-group__title">已禁用</span>
-                <span class="token-group__meta">已移出调度池</span>
+                <span class="token-group__meta">${escapeHtml(`${formatInteger(disabledItems.length)} 个 key · 已移出调度池`)}</span>
               </span>
-              <span class="token-group__count">${escapeHtml(formatInteger(disabledItems.length))}</span>
+              <span class="token-group__summary-action">
+                <span class="token-group__toggle-label token-group__toggle-label--closed">查看列表</span>
+                <span class="token-group__toggle-label token-group__toggle-label--open">收起列表</span>
+                <span class="token-group__toggle-icon" aria-hidden="true"></span>
+              </span>
             </summary>
-            <div class="token-group__body">
+            <div class="token-group__body token-group__body--archived">
               ${disabledItems.map((item) => renderTokenCard(item)).join("")}
             </div>
           </details>

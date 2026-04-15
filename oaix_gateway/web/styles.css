@@ -1083,47 +1083,99 @@ button {
   gap: 14px;
 }
 
-.token-group--archived > .token-group__summary {
+.token-group--archived {
   position: relative;
-  padding: 14px 18px;
-  border: 1px solid var(--border-soft);
-  border-radius: calc(var(--radius-lg) - 4px);
-  background: color-mix(in oklab, var(--surface-card) 92%, transparent);
+  gap: 16px;
+  padding-top: 18px;
+}
+
+.token-group--archived::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklab, var(--border-table-row) 78%, transparent),
+    color-mix(in oklab, var(--ink-soft) 18%, transparent),
+    color-mix(in oklab, var(--border-table-row) 78%, transparent)
+  );
+}
+
+.token-group--archived > .token-group__summary {
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: none;
   list-style: none;
   cursor: pointer;
-  transition:
-    border-color 160ms ease,
-    background 160ms ease,
-    transform 160ms ease;
+  transition: color 160ms ease;
 }
 
 .token-group--archived > .token-group__summary::-webkit-details-marker {
   display: none;
 }
 
-.token-group--archived > .token-group__summary:hover {
-  border-color: color-mix(in oklab, var(--accent) 24%, var(--border-soft));
-  background: color-mix(in oklab, var(--surface-card) 86%, transparent);
+.token-group__summary-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
 }
 
-.token-group--archived > .token-group__summary::after {
-  content: "";
+.token-group__summary-action {
   flex: 0 0 auto;
-  width: 10px;
-  height: 10px;
-  margin-left: 2px;
-  border-right: 2px solid color-mix(in oklab, var(--ink-soft) 82%, var(--accent));
-  border-bottom: 2px solid color-mix(in oklab, var(--ink-soft) 82%, var(--accent));
-  transform: rotate(45deg) translateY(-1px);
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px 8px 16px;
+  border: 1px solid color-mix(in oklab, var(--border-soft) 92%, transparent);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--surface-card) 88%, transparent);
+  font-size: 0.84rem;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    transform 160ms ease;
+}
+
+.token-group--archived > .token-group__summary:hover .token-group__summary-action {
+  border-color: color-mix(in oklab, var(--accent) 22%, var(--border-soft));
+  background: color-mix(in oklab, var(--surface-card) 82%, transparent);
+}
+
+.token-group__toggle-label--open {
+  display: none;
+}
+
+.token-group--archived[open] .token-group__toggle-label--closed {
+  display: none;
+}
+
+.token-group--archived[open] .token-group__toggle-label--open {
+  display: inline;
+}
+
+.token-group__toggle-icon {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid color-mix(in oklab, var(--ink-soft) 78%, var(--accent));
+  border-bottom: 2px solid color-mix(in oklab, var(--ink-soft) 78%, var(--accent));
+  transform: rotate(45deg);
   transform-origin: center;
   transition: transform 160ms ease;
 }
 
-.token-group--archived[open] > .token-group__summary::after {
-  transform: rotate(-135deg) translateY(-1px);
+.token-group--archived[open] .token-group__toggle-icon {
+  transform: rotate(-135deg);
 }
 
-.token-group--archived[open] > .token-group__body {
+.token-group__body--archived {
   padding-top: 2px;
 }
 
@@ -1962,6 +2014,10 @@ button {
     align-items: start;
   }
 
+  .token-group--archived > .token-group__summary {
+    flex-wrap: wrap;
+  }
+
   .request-row {
     grid-template-columns: 1fr;
   }
@@ -1976,8 +2032,8 @@ button {
     padding: 16px;
   }
 
-  .token-group__summary {
-    padding: 14px 16px;
+  .token-group__summary-action {
+    padding: 8px 13px 8px 15px;
   }
 
   .token-card__top {
