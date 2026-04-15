@@ -35,6 +35,7 @@ from .token_store import (
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenSelectionSettings,
     claim_next_active_token,
+    delete_token,
     get_token_counts,
     get_token_selection_settings,
     list_token_rows,
@@ -1165,6 +1166,21 @@ def create_app() -> FastAPI:
             "counts": asdict(counts),
         }
 
+    @app.delete("/admin/tokens/{token_id}")
+    async def delete_token_route(
+        token_id: int,
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        deleted = await delete_token(token_id)
+        if deleted is None:
+            raise HTTPException(status_code=404, detail="Token not found")
+        counts = await get_token_counts()
+        return {
+            "id": deleted.canonical_id,
+            "deleted_ids": list(deleted.deleted_ids),
+            "counts": asdict(counts),
+        }
+
     @app.get("/admin/requests")
     async def list_requests_route(
         limit: int = Query(100, ge=1, le=500),
@@ -1207,19 +1223,21 @@ def create_app() -> FastAPI:
         skipped: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
         yielded_to_response_traffic = 0
+        response_traffic_timeout_count = 0
         for index, payload in enumerate(payloads):
             try:
                 if await response_traffic.wait_for_import_turn():
                     yielded_to_response_traffic += 1
             except TimeoutError as exc:
-                error_message = str(exc)
-                if not created and not updated and not skipped and not failed:
-                    raise HTTPException(status_code=503, detail=error_message) from exc
-                failed.extend(
-                    {"index": remaining_index, "error": error_message}
-                    for remaining_index in range(index, len(payloads))
+                response_traffic_timeout_count += 1
+                logger.warning(
+                    "Token import wait timed out while /v1/responses traffic remained active; continuing import: index=%s total_payloads=%s active_responses=%s timeout_seconds=%s",
+                    index,
+                    len(payloads),
+                    response_traffic.active_responses,
+                    _import_wait_timeout_seconds(),
                 )
-                break
+                await asyncio.sleep(0)
             if not isinstance(payload, dict):
                 failed.append({"index": index, "error": "Token payload must be a JSON object"})
                 continue
@@ -1252,6 +1270,7 @@ def create_app() -> FastAPI:
             "skipped_count": len(skipped),
             "failed_count": len(failed),
             "yielded_to_response_traffic_count": yielded_to_response_traffic,
+            "response_traffic_timeout_count": response_traffic_timeout_count,
             "created": created,
             "updated": updated,
             "skipped": skipped,

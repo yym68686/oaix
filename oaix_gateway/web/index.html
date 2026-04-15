@@ -321,6 +321,33 @@
       </main>
     </div>
 
+    <dialog class="confirm-dialog" id="token-delete-dialog" aria-labelledby="token-delete-title" aria-describedby="token-delete-description">
+      <div class="confirm-dialog__surface">
+        <div class="confirm-dialog__header">
+          <p class="confirm-dialog__eyebrow">Danger Zone</p>
+          <button class="confirm-dialog__close" id="token-delete-close" type="button" aria-label="关闭删除确认">
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+        <div class="confirm-dialog__copy">
+          <h2 id="token-delete-title">删除这把 Key？</h2>
+          <p class="confirm-dialog__body" id="token-delete-description">
+            删除后会从调度池和最近列表移除。此操作不可撤销。
+          </p>
+        </div>
+        <div class="confirm-dialog__target">
+          <span class="confirm-dialog__target-label">将删除</span>
+          <strong class="confirm-dialog__target-value" id="token-delete-target">—</strong>
+          <p class="confirm-dialog__target-meta" id="token-delete-meta">—</p>
+        </div>
+        <p class="confirm-dialog__feedback" id="token-delete-feedback" role="status" aria-live="polite"></p>
+        <div class="confirm-dialog__actions">
+          <button class="ghost-button" id="token-delete-cancel" type="button">取消</button>
+          <button class="danger-button" id="token-delete-confirm" type="button">删除 Key</button>
+        </div>
+      </div>
+    </dialog>
+
     <script src="/assets/app.js" defer></script>
   </body>
 </html>

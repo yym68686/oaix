@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import func, nullsfirst, or_, select, text
+from sqlalchemy import delete, func, nullsfirst, or_, select, text
 
 from .database import CodexToken, GatewaySetting, close_database, get_session, init_db, utcnow
 from .token_identity import (
@@ -81,6 +81,12 @@ class TokenFileImportSummary:
 class TokenSelectionSettings:
     strategy: str
     updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class TokenDeleteResult:
+    canonical_id: int
+    deleted_ids: tuple[int, ...]
 
 
 def _canonical_token_filters() -> tuple[Any, ...]:
@@ -581,6 +587,34 @@ async def set_token_active_state(token_id: int, *, active: bool) -> CodexToken |
             token.updated_at = utcnow()
             await session.flush()
             return token
+
+
+async def delete_token(token_id: int) -> TokenDeleteResult | None:
+    async with get_session() as session:
+        async with session.begin():
+            token = await _resolve_canonical_token_for_update(session, token_id)
+            if token is None:
+                return None
+
+            canonical_id = token.id
+            result = await session.execute(
+                select(CodexToken.id)
+                .where(
+                    or_(
+                        CodexToken.id == canonical_id,
+                        CodexToken.merged_into_token_id == canonical_id,
+                    )
+                )
+                .order_by(CodexToken.id.asc())
+                .with_for_update()
+            )
+            deleted_ids = tuple(int(row_id) for row_id in result.scalars().all())
+            if not deleted_ids:
+                return None
+
+            await session.execute(delete(CodexToken).where(CodexToken.id.in_(deleted_ids)))
+            await session.flush()
+            return TokenDeleteResult(canonical_id=canonical_id, deleted_ids=deleted_ids)
 
 
 async def mark_token_error(

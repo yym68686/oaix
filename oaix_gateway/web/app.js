@@ -16,7 +16,8 @@ const state = {
   serviceKey: localStorage.getItem(STORAGE_KEY) || "",
   protected: false,
   timer: null,
-  tokenActionPendingIds: new Set(),
+  tokenActionPendingKinds: new Map(),
+  tokenDeleteTargetId: null,
   tokenGroupOpenStates: Object.create(null),
   tokenItems: [],
   healthLoaded: false,
@@ -72,9 +73,19 @@ const elements = {
   requestCostChart: document.getElementById("request-cost-chart"),
   requestCostChartTotal: document.getElementById("request-cost-chart-total"),
   requestCostChartNote: document.getElementById("request-cost-chart-note"),
+  tokenDeleteDialog: document.getElementById("token-delete-dialog"),
+  tokenDeleteDescription: document.getElementById("token-delete-description"),
+  tokenDeleteTarget: document.getElementById("token-delete-target"),
+  tokenDeleteMeta: document.getElementById("token-delete-meta"),
+  tokenDeleteFeedback: document.getElementById("token-delete-feedback"),
+  tokenDeleteCancel: document.getElementById("token-delete-cancel"),
+  tokenDeleteClose: document.getElementById("token-delete-close"),
+  tokenDeleteConfirm: document.getElementById("token-delete-confirm"),
 };
 
 elements.serviceKey.value = state.serviceKey;
+const supportsTokenDeleteDialog =
+  typeof HTMLDialogElement !== "undefined" && elements.tokenDeleteDialog instanceof HTMLDialogElement;
 
 function resolveTheme(preference) {
   if (preference === "dark" || preference === "light") {
@@ -330,27 +341,44 @@ function resolveTokenGroupOpenState(groupId, fallbackOpen) {
     : Boolean(fallbackOpen);
 }
 
-function isTokenActionPending(tokenId) {
-  return state.tokenActionPendingIds.has(Number(tokenId));
+function getTokenActionPendingKind(tokenId) {
+  return state.tokenActionPendingKinds.get(Number(tokenId)) || "";
 }
 
-function renderTokenActionButton(item) {
+function isTokenActionPending(tokenId) {
+  return state.tokenActionPendingKinds.has(Number(tokenId));
+}
+
+function renderTokenActionButtons(item) {
   const tokenId = Number(item?.id);
   const nextActive = !Boolean(item?.is_active);
-  const pending = isTokenActionPending(tokenId);
-  const label = pending ? "处理中" : nextActive ? "启用" : "停用";
+  const pendingKind = getTokenActionPendingKind(tokenId);
+  const pending = Boolean(pendingKind);
+  const toggleLabel = pendingKind === "toggle" ? "处理中" : nextActive ? "启用" : "停用";
+  const deleteLabel = pendingKind === "delete" ? "删除中" : "删除";
   const tone = nextActive ? "enable" : "disable";
   return `
-    <button
-      class="token-action-button token-action-button--${tone}"
-      type="button"
-      data-token-toggle="true"
-      data-token-id="${tokenId}"
-      data-next-active="${nextActive ? "true" : "false"}"
-      ${pending ? "disabled" : ""}
-    >
-      ${label}
-    </button>
+    <div class="token-card__actions">
+      <button
+        class="token-action-button token-action-button--${tone}"
+        type="button"
+        data-token-toggle="true"
+        data-token-id="${tokenId}"
+        data-next-active="${nextActive ? "true" : "false"}"
+        ${pending ? "disabled" : ""}
+      >
+        ${toggleLabel}
+      </button>
+      <button
+        class="token-action-button token-action-button--delete"
+        type="button"
+        data-token-delete="true"
+        data-token-id="${tokenId}"
+        ${pending ? "disabled" : ""}
+      >
+        ${deleteLabel}
+      </button>
+    </div>
   `;
 }
 
@@ -792,7 +820,7 @@ function renderTokenCard(item, workspaceTokenCounts) {
           </div>
         </div>
         <div class="token-card__action">
-          ${renderTokenActionButton(item)}
+          ${renderTokenActionButtons(item)}
         </div>
       </div>
       <div class="token-card__bottom${errorSection ? " token-card__bottom--with-error" : ""}">
@@ -1134,6 +1162,124 @@ function renderTokenList(items) {
   `;
 }
 
+function getTokenItemById(tokenId) {
+  const resolvedTokenId = Number(tokenId);
+  if (!Number.isFinite(resolvedTokenId)) {
+    return null;
+  }
+  return state.tokenItems.find((item) => Number(item?.id) === resolvedTokenId) || null;
+}
+
+function buildTokenDeleteContext(item) {
+  const workspaceTokenCounts = buildWorkspaceTokenCounts(state.tokenItems);
+  const presentation = buildTokenPresentation(item, workspaceTokenCounts);
+  const status = deriveStatus(item);
+  const tokenLabel = `Token #${item.id}`;
+  const noteParts = [
+    "删除后会从调度池和最近列表移除",
+    "如果这把 key 合并过历史 refresh token，关联历史记录也会一起删除",
+    presentation.hasSharedWorkspace ? "同工作区的其它 token 不会受影响" : "",
+    "此操作不可撤销",
+  ].filter(Boolean);
+  const metaParts = [status.label];
+  if (!presentation.meta || !presentation.meta.includes(tokenLabel)) {
+    metaParts.unshift(tokenLabel);
+  }
+  if (presentation.meta) {
+    metaParts.push(presentation.meta);
+  }
+
+  return {
+    title: presentation.account,
+    description: noteParts.join(" · "),
+    meta: metaParts.filter(Boolean).join(" · "),
+  };
+}
+
+function clearTokenDeleteFeedback() {
+  if (!elements.tokenDeleteFeedback) {
+    return;
+  }
+  elements.tokenDeleteFeedback.textContent = "";
+  elements.tokenDeleteFeedback.classList.remove("is-error");
+}
+
+function setTokenDeleteFeedback(message, tone = "") {
+  if (!elements.tokenDeleteFeedback) {
+    return;
+  }
+  elements.tokenDeleteFeedback.textContent = message;
+  elements.tokenDeleteFeedback.classList.toggle("is-error", tone === "error");
+}
+
+function setTokenDeleteDialogBusy(busy) {
+  const disabled = Boolean(busy);
+  if (elements.tokenDeleteCancel) {
+    elements.tokenDeleteCancel.disabled = disabled;
+  }
+  if (elements.tokenDeleteClose) {
+    elements.tokenDeleteClose.disabled = disabled;
+  }
+  if (elements.tokenDeleteConfirm) {
+    elements.tokenDeleteConfirm.disabled = disabled || !Number.isFinite(Number(state.tokenDeleteTargetId));
+    elements.tokenDeleteConfirm.textContent = disabled ? "删除中…" : "删除 Key";
+  }
+}
+
+function closeTokenDeleteDialog({ force = false } = {}) {
+  const dialog = elements.tokenDeleteDialog;
+  if (!supportsTokenDeleteDialog) {
+    state.tokenDeleteTargetId = null;
+    return;
+  }
+  if (!force && state.tokenDeleteTargetId != null && getTokenActionPendingKind(state.tokenDeleteTargetId) === "delete") {
+    return;
+  }
+  if (dialog.open) {
+    dialog.close();
+    return;
+  }
+  state.tokenDeleteTargetId = null;
+  setTokenDeleteDialogBusy(false);
+  clearTokenDeleteFeedback();
+}
+
+function openTokenDeleteDialog(tokenId) {
+  const item = getTokenItemById(tokenId);
+  if (!item) {
+    return;
+  }
+
+  const context = buildTokenDeleteContext(item);
+  state.tokenDeleteTargetId = Number(item.id);
+
+  if (elements.tokenDeleteTarget) {
+    elements.tokenDeleteTarget.textContent = context.title;
+  }
+  if (elements.tokenDeleteDescription) {
+    elements.tokenDeleteDescription.textContent = context.description;
+  }
+  if (elements.tokenDeleteMeta) {
+    elements.tokenDeleteMeta.textContent = context.meta;
+  }
+  clearTokenDeleteFeedback();
+  setTokenDeleteDialogBusy(false);
+
+  const dialog = elements.tokenDeleteDialog;
+  if (!supportsTokenDeleteDialog || typeof dialog.showModal !== "function") {
+    if (window.confirm(`删除 ${context.title}？\n${context.description}`)) {
+      void deleteToken(item.id);
+      return;
+    }
+    state.tokenDeleteTargetId = null;
+    return;
+  }
+
+  if (!dialog.open) {
+    dialog.showModal();
+  }
+}
+
 function renderRequestList(items) {
   if (!Array.isArray(items) || items.length === 0) {
     elements.requestList.innerHTML = `
@@ -1318,7 +1464,7 @@ async function toggleTokenActivation(tokenId, nextActive) {
     return;
   }
 
-  state.tokenActionPendingIds.add(resolvedTokenId);
+  state.tokenActionPendingKinds.set(resolvedTokenId, "toggle");
   renderTokenList(state.tokenItems);
 
   try {
@@ -1337,7 +1483,55 @@ async function toggleTokenActivation(tokenId, nextActive) {
     }
     throw error;
   } finally {
-    state.tokenActionPendingIds.delete(resolvedTokenId);
+    state.tokenActionPendingKinds.delete(resolvedTokenId);
+    renderTokenList(state.tokenItems);
+  }
+}
+
+async function deleteToken(tokenId) {
+  const resolvedTokenId = Number(tokenId);
+  if (!Number.isFinite(resolvedTokenId) || isTokenActionPending(resolvedTokenId)) {
+    return;
+  }
+
+  const item = getTokenItemById(resolvedTokenId);
+  const context = item ? buildTokenDeleteContext(item) : { title: `Token #${resolvedTokenId}` };
+
+  state.tokenActionPendingKinds.set(resolvedTokenId, "delete");
+  if (state.tokenDeleteTargetId === resolvedTokenId) {
+    clearTokenDeleteFeedback();
+    setTokenDeleteDialogBusy(true);
+  }
+  renderTokenList(state.tokenItems);
+
+  try {
+    await fetchJson(`/admin/tokens/${resolvedTokenId}`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    });
+    closeTokenDeleteDialog({ force: true });
+    await loadHealth();
+    await loadTokens();
+    elements.listNote.textContent = `已删除 ${context.title}`;
+  } catch (error) {
+    const summary =
+      error.status === 401 ? "需要输入 Service API Key 才能删除 key" : `删除失败：${error.message}`;
+    elements.listNote.textContent = summary;
+    if (state.tokenDeleteTargetId === resolvedTokenId) {
+      setTokenDeleteFeedback(
+        error.status === 401 ? "需要先填写 Service API Key，才能删除这把 key。" : `删除失败：${error.message}`,
+        "error",
+      );
+    }
+    if (error.status === 401) {
+      await loadTokens();
+    }
+    throw error;
+  } finally {
+    state.tokenActionPendingKinds.delete(resolvedTokenId);
+    if (state.tokenDeleteTargetId === resolvedTokenId) {
+      setTokenDeleteDialogBusy(false);
+    }
     renderTokenList(state.tokenItems);
   }
 }
@@ -1516,6 +1710,9 @@ async function importTokens() {
 
     const message = [
       `导入完成：新增 ${data.created_count || 0} 条，更新 ${data.updated_count || 0} 条，跳过重复 ${data.skipped_count || 0} 条，失败 ${data.failed_count || 0} 条。`,
+      data.response_traffic_timeout_count
+        ? `导入期间有 ${data.response_traffic_timeout_count} 条记录在 /v1/responses 持续繁忙时改为继续执行，没有再因等待排空而整批失败。`
+        : "",
       data.failed_count ? `失败原因：${(data.failed || []).slice(0, 3).map((item) => item.error).join("；")}` : "",
       data.skipped_count ? "重复判定基于当前 RT 和历史 RT 链，不会再按 account_id 合并不同账号。" : "",
     ]
@@ -1583,13 +1780,17 @@ elements.tokenList.addEventListener("click", async (event) => {
   if (!(event.target instanceof Element)) {
     return;
   }
-  const button = event.target.closest("[data-token-toggle]");
-  if (!(button instanceof HTMLElement)) {
+  const toggleButton = event.target.closest("[data-token-toggle]");
+  if (toggleButton instanceof HTMLElement) {
+    try {
+      await toggleTokenActivation(toggleButton.dataset.tokenId, toggleButton.dataset.nextActive === "true");
+    } catch {}
     return;
   }
-  try {
-    await toggleTokenActivation(button.dataset.tokenId, button.dataset.nextActive === "true");
-  } catch {}
+  const deleteButton = event.target.closest("[data-token-delete]");
+  if (deleteButton instanceof HTMLElement) {
+    openTokenDeleteDialog(deleteButton.dataset.tokenId);
+  }
 });
 
 elements.tokenList.addEventListener(
@@ -1612,6 +1813,43 @@ if (typeof state.themeMedia.addEventListener === "function") {
   state.themeMedia.addEventListener("change", syncSystemTheme);
 } else if (typeof state.themeMedia.addListener === "function") {
   state.themeMedia.addListener(syncSystemTheme);
+}
+
+if (elements.tokenDeleteCancel) {
+  elements.tokenDeleteCancel.addEventListener("click", () => closeTokenDeleteDialog());
+}
+
+if (elements.tokenDeleteClose) {
+  elements.tokenDeleteClose.addEventListener("click", () => closeTokenDeleteDialog());
+}
+
+if (elements.tokenDeleteConfirm) {
+  elements.tokenDeleteConfirm.addEventListener("click", async () => {
+    if (state.tokenDeleteTargetId == null) {
+      return;
+    }
+    try {
+      await deleteToken(state.tokenDeleteTargetId);
+    } catch {}
+  });
+}
+
+if (supportsTokenDeleteDialog) {
+  elements.tokenDeleteDialog.addEventListener("click", (event) => {
+    if (event.target === elements.tokenDeleteDialog) {
+      closeTokenDeleteDialog();
+    }
+  });
+  elements.tokenDeleteDialog.addEventListener("cancel", (event) => {
+    if (state.tokenDeleteTargetId != null && getTokenActionPendingKind(state.tokenDeleteTargetId) === "delete") {
+      event.preventDefault();
+    }
+  });
+  elements.tokenDeleteDialog.addEventListener("close", () => {
+    state.tokenDeleteTargetId = null;
+    setTokenDeleteDialogBusy(false);
+    clearTokenDeleteFeedback();
+  });
 }
 
 elements.refreshButton.addEventListener("click", refreshDashboard);

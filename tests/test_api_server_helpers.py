@@ -22,9 +22,11 @@ from oaix_gateway.api_server import (
     _sanitize_codex_payload,
     _should_retry_upstream_server_error,
     _wrap_streaming_body_iterator,
+    create_app,
 )
 from oaix_gateway.database import CodexToken
 from oaix_gateway.quota import CodexPlanInfo
+from oaix_gateway.token_store import TokenUpsertResult
 
 
 def test_extract_usage_limit_cooldown_from_resets_in_seconds() -> None:
@@ -534,6 +536,59 @@ def test_response_traffic_controller_times_out_when_active_responses_do_not_drai
             await lease.release()
 
     asyncio.run(runner())
+
+
+def test_import_route_continues_after_response_traffic_wait_timeout(monkeypatch) -> None:
+    app = create_app()
+
+    class BusyResponseTraffic:
+        active_responses = 3
+
+        async def wait_for_import_turn(self) -> bool:
+            raise TimeoutError("Timed out waiting for active /v1/responses traffic to drain before import")
+
+    async def fake_upsert_token_payload(payload: dict) -> TokenUpsertResult:
+        token = CodexToken(
+            id=99,
+            email=None,
+            account_id="acct_123",
+            refresh_token=payload["refresh_token"],
+            is_active=True,
+        )
+        return TokenUpsertResult(token=token, action="created")
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": b'[{"refresh_token":"rt-123"}]',
+            "more_body": False,
+        }
+
+    monkeypatch.setattr("oaix_gateway.api_server.upsert_token_payload", fake_upsert_token_payload)
+    app.state.response_traffic = BusyResponseTraffic()
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/admin/tokens/import",
+            "headers": [(b"content-type", b"application/json")],
+            "app": app,
+        },
+        receive=receive,
+    )
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/admin/tokens/import" and "POST" in getattr(route, "methods", set())
+    )
+
+    result = asyncio.run(route.endpoint(request, None))
+
+    assert result["created_count"] == 1
+    assert result["failed_count"] == 0
+    assert result["yielded_to_response_traffic_count"] == 0
+    assert result["response_traffic_timeout_count"] == 1
 
 
 def test_wrap_streaming_body_iterator_runs_cleanup_on_close() -> None:
