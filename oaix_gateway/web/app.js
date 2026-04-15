@@ -631,15 +631,32 @@ function renderTokenCard(item) {
   `;
 }
 
-function renderTokenGroupHeader(title, meta, count) {
+function renderTokenGroup({ title, meta, tone, items, open = false, emptyMessage }) {
+  const list = Array.isArray(items) ? items : [];
   return `
-    <div class="token-group__head">
-      <div class="token-group__copy">
-        <span class="token-group__title">${escapeHtml(title)}</span>
-        <span class="token-group__meta">${escapeHtml(meta)}</span>
+    <details class="token-group token-group--${escapeHtml(tone)}"${open ? " open" : ""}>
+      <summary class="token-group__summary">
+        <span class="token-group__summary-main">
+          <span class="token-group__title-row">
+            <span class="token-group__title">${escapeHtml(title)}</span>
+            <span class="token-group__count">${escapeHtml(formatInteger(list.length))}</span>
+          </span>
+          <span class="token-group__meta">${escapeHtml(meta)}</span>
+        </span>
+        <span class="token-group__summary-action">
+          <span class="token-group__toggle-label token-group__toggle-label--closed">展开</span>
+          <span class="token-group__toggle-label token-group__toggle-label--open">收起</span>
+          <span class="token-group__toggle-icon" aria-hidden="true"></span>
+        </span>
+      </summary>
+      <div class="token-group__body token-group__body--fold">
+        ${
+          list.length > 0
+            ? list.map((item) => renderTokenCard(item)).join("")
+            : `<article class="empty-state empty-state--inline"><p>${escapeHtml(emptyMessage)}</p></article>`
+        }
       </div>
-      <span class="token-group__count">${escapeHtml(formatInteger(count))}</span>
-    </div>
+    </details>
   `;
 }
 
@@ -871,10 +888,9 @@ function renderTokenList(items) {
     return;
   }
 
-  const primaryItems = [];
+  const availableItems = [];
+  const coolingItems = [];
   const disabledItems = [];
-  let availableCount = 0;
-  let coolingCount = 0;
 
   items.forEach((item) => {
     const status = deriveStatus(item);
@@ -882,53 +898,42 @@ function renderTokenList(items) {
       disabledItems.push(item);
       return;
     }
-    primaryItems.push(item);
     if (status.tone === "cooling") {
-      coolingCount += 1;
-    } else {
-      availableCount += 1;
+      coolingItems.push(item);
+      return;
     }
+    availableItems.push(item);
   });
 
-  const primaryMeta =
-    primaryItems.length > 0 ? `${formatInteger(availableCount)} 可用 · ${formatInteger(coolingCount)} 冷却` : "当前没有可调度 key";
-  const primaryEmptyMessage =
-    disabledItems.length > 0 ? "当前没有可用或冷却中的 key，下面可以展开查看已禁用项。" : "当前没有可展示的 key。";
-  const disabledOpen = primaryItems.length === 0;
+  const availableOpen = true;
+  const coolingOpen = availableItems.length === 0 && coolingItems.length > 0;
+  const disabledOpen = availableItems.length === 0 && coolingItems.length === 0 && disabledItems.length > 0;
 
   elements.tokenList.innerHTML = `
-    <section class="token-group">
-      ${renderTokenGroupHeader("可用与冷却", primaryMeta, primaryItems.length)}
-      <div class="token-group__body">
-        ${
-          primaryItems.length > 0
-            ? primaryItems.map((item) => renderTokenCard(item)).join("")
-            : `<article class="empty-state"><p>${escapeHtml(primaryEmptyMessage)}</p></article>`
-        }
-      </div>
-    </section>
-    ${
-      disabledItems.length > 0
-        ? `
-          <details class="token-group token-group--archived"${disabledOpen ? " open" : ""}>
-            <summary class="token-group__summary">
-              <span class="token-group__summary-main">
-                <span class="token-group__title">已禁用</span>
-                <span class="token-group__meta">${escapeHtml(`${formatInteger(disabledItems.length)} 个 key · 已移出调度池`)}</span>
-              </span>
-              <span class="token-group__summary-action">
-                <span class="token-group__toggle-label token-group__toggle-label--closed">查看列表</span>
-                <span class="token-group__toggle-label token-group__toggle-label--open">收起列表</span>
-                <span class="token-group__toggle-icon" aria-hidden="true"></span>
-              </span>
-            </summary>
-            <div class="token-group__body token-group__body--archived">
-              ${disabledItems.map((item) => renderTokenCard(item)).join("")}
-            </div>
-          </details>
-        `
-        : ""
-    }
+    ${renderTokenGroup({
+      title: "可用",
+      meta: availableItems.length > 0 ? "可立即调度" : "当前没有可立即调度的 key",
+      tone: "available",
+      items: availableItems,
+      open: availableOpen,
+      emptyMessage: "当前没有可立即调度的 key。",
+    })}
+    ${renderTokenGroup({
+      title: "冷却",
+      meta: coolingItems.length > 0 ? "等待冷却窗口结束" : "当前没有冷却中的 key",
+      tone: "cooling",
+      items: coolingItems,
+      open: coolingOpen,
+      emptyMessage: "当前没有处于冷却窗口的 key。",
+    })}
+    ${renderTokenGroup({
+      title: "已禁用",
+      meta: disabledItems.length > 0 ? "已移出调度池" : "当前没有已禁用 key",
+      tone: "disabled",
+      items: disabledItems,
+      open: disabledOpen,
+      emptyMessage: "当前没有已禁用的 key。",
+    })}
   `;
 }
 
@@ -1035,7 +1040,7 @@ async function loadTokens() {
       headers: authHeaders(),
     });
     state.tokenItems = Array.isArray(data.items) ? data.items : [];
-    elements.listNote.textContent = "显示最近 80 条记录 · 运行池与已禁用分组";
+    elements.listNote.textContent = "显示最近 80 条记录 · 可用 / 冷却 / 已禁用分组";
     renderTokenSelection(data.selection || {});
     setTokenSelectionDisabled(state.tokenSelectionSaving);
     renderTokenList(state.tokenItems);
@@ -1092,7 +1097,7 @@ async function saveTokenSelection(strategy) {
       body: JSON.stringify({ strategy: nextStrategy }),
     });
     renderTokenSelection(data);
-    elements.listNote.textContent = "显示最近 80 条记录 · 运行池与已禁用分组";
+    elements.listNote.textContent = "显示最近 80 条记录 · 可用 / 冷却 / 已禁用分组";
   } catch (error) {
     renderTokenSelection({ strategy: previousStrategy });
     if (elements.tokenSelectionSummary) {
