@@ -40,6 +40,7 @@ from .token_store import (
     list_token_rows,
     mark_token_error,
     mark_token_success,
+    repair_duplicate_token_histories,
     set_token_active_state,
     update_token_selection_settings,
     upsert_token_payload,
@@ -1050,6 +1051,15 @@ async def _build_admin_token_items(
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
     await init_db()
+    repair_summary = await repair_duplicate_token_histories()
+    if repair_summary.merged_row_count:
+        logger.info(
+            "Merged duplicate token histories on startup: groups=%s merged_rows=%s canonical_ids=%s shadow_ids=%s",
+            repair_summary.duplicate_group_count,
+            repair_summary.merged_row_count,
+            list(repair_summary.canonical_ids),
+            list(repair_summary.shadow_ids),
+        )
     app.state.http_client = httpx.AsyncClient(
         follow_redirects=True,
         http2=False,

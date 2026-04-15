@@ -6,15 +6,22 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import func, nullsfirst, or_, select
+from sqlalchemy import func, nullsfirst, or_, select, text
 
 from .database import CodexToken, GatewaySetting, close_database, get_session, init_db, utcnow
-from .token_identity import collect_refresh_token_aliases, merge_refresh_token_aliases, normalize_refresh_token
+from .token_identity import (
+    collect_refresh_token_aliases,
+    group_rows_by_refresh_token_history,
+    merge_refresh_token_aliases,
+    normalize_refresh_token,
+)
 
 TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED = "least_recently_used"
 TOKEN_SELECTION_STRATEGY_FILL_FIRST = "fill_first"
 DEFAULT_TOKEN_SELECTION_STRATEGY = TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED
 TOKEN_SELECTION_SETTING_KEY = "token_selection"
+MERGED_DUPLICATE_TOKEN_ERROR_PREFIX = "Merged into token #"
+TOKEN_IDENTITY_LOCK_NAMESPACE = "codex-token-identity"
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,14 @@ class TokenUpsertResult:
 
 
 @dataclass(frozen=True)
+class TokenHistoryRepairSummary:
+    duplicate_group_count: int
+    merged_row_count: int
+    canonical_ids: tuple[int, ...] = ()
+    shadow_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class TokenFileImportSummary:
     created_count: int
     updated_count: int
@@ -66,6 +81,135 @@ class TokenFileImportSummary:
 class TokenSelectionSettings:
     strategy: str
     updated_at: datetime | None = None
+
+
+def _canonical_token_filters() -> tuple[Any, ...]:
+    return (CodexToken.merged_into_token_id.is_(None),)
+
+
+def _datetime_sort_value(value: datetime | None) -> float:
+    if value is None:
+        return float("-inf")
+    return value.timestamp()
+
+
+def _non_empty_value(value: Any) -> Any | None:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return value if value is not None else None
+
+
+def _is_merged_duplicate_error(message: str | None) -> bool:
+    return str(message or "").startswith(MERGED_DUPLICATE_TOKEN_ERROR_PREFIX)
+
+
+def _token_history_rank(token: CodexToken) -> tuple[float, ...]:
+    return (
+        _datetime_sort_value(token.last_refresh_at),
+        _datetime_sort_value(token.updated_at),
+        _datetime_sort_value(token.last_used_at),
+        _datetime_sort_value(token.cooldown_until),
+        1.0 if token.access_token else 0.0,
+        _datetime_sort_value(token.expires_at),
+        1.0 if token.is_active else 0.0,
+        float(token.id),
+    )
+
+
+def _pick_canonical_token(tokens: list[CodexToken]) -> CodexToken:
+    return max(tokens, key=_token_history_rank)
+
+
+def _pick_latest_value(tokens: list[CodexToken], attribute: str) -> Any | None:
+    for token in sorted(tokens, key=_token_history_rank, reverse=True):
+        value = _non_empty_value(getattr(token, attribute, None))
+        if value is not None:
+            return value
+    return None
+
+
+def _pick_latest_non_merge_error(tokens: list[CodexToken]) -> str | None:
+    best_error = None
+    best_rank: tuple[float, float] | None = None
+    for token in tokens:
+        message = str(token.last_error or "").strip()
+        if not message or _is_merged_duplicate_error(message):
+            continue
+        rank = (_datetime_sort_value(token.updated_at), float(token.id))
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_error = message
+    return best_error
+
+
+def _merge_shadow_error(canonical_id: int) -> str:
+    return f"{MERGED_DUPLICATE_TOKEN_ERROR_PREFIX}{canonical_id} due to duplicate refresh token history"
+
+
+def _merge_duplicate_token_rows(
+    tokens: list[CodexToken],
+    *,
+    now: datetime | None = None,
+) -> tuple[CodexToken, list[CodexToken]]:
+    if not tokens:
+        raise ValueError("Expected at least one token row to merge")
+
+    merged_at = now or utcnow()
+    canonical = _pick_canonical_token(tokens)
+    shadows = [token for token in tokens if token.id != canonical.id]
+    merged_aliases: list[str] = []
+    for token in tokens:
+        merged_aliases = merge_refresh_token_aliases(merged_aliases, *_token_aliases(token))
+
+    canonical.refresh_token_aliases = merged_aliases
+    canonical.merged_into_token_id = None
+    canonical.email = canonical.email or _pick_latest_value(tokens, "email")
+    canonical.account_id = canonical.account_id or _pick_latest_value(tokens, "account_id")
+    canonical.id_token = canonical.id_token or _pick_latest_value(tokens, "id_token")
+    canonical.source_file = canonical.source_file or _pick_latest_value(tokens, "source_file")
+    canonical.recovery = canonical.recovery or _pick_latest_value(tokens, "recovery")
+    canonical.raw_payload = canonical.raw_payload or _pick_latest_value(tokens, "raw_payload")
+    canonical.token_type = canonical.token_type or _pick_latest_value(tokens, "token_type") or "codex"
+
+    canonical.last_refresh_at = max(
+        (token.last_refresh_at for token in tokens if token.last_refresh_at is not None),
+        default=canonical.last_refresh_at,
+    )
+    canonical.last_used_at = max(
+        (token.last_used_at for token in tokens if token.last_used_at is not None),
+        default=canonical.last_used_at,
+    )
+    canonical.cooldown_until = (
+        max((token.cooldown_until for token in tokens if token.cooldown_until is not None), default=None)
+        if canonical.is_active
+        else None
+    )
+    if canonical.access_token:
+        canonical.expires_at = canonical.expires_at or max(
+            (token.expires_at for token in tokens if token.expires_at is not None),
+            default=canonical.expires_at,
+        )
+    else:
+        canonical.expires_at = max(
+            (token.expires_at for token in tokens if token.expires_at is not None),
+            default=canonical.expires_at,
+        )
+    latest_error = _pick_latest_non_merge_error(tokens)
+    if latest_error is not None or _is_merged_duplicate_error(canonical.last_error):
+        canonical.last_error = latest_error
+    canonical.updated_at = merged_at
+
+    for shadow in shadows:
+        shadow.merged_into_token_id = canonical.id
+        shadow.is_active = False
+        shadow.access_token = None
+        shadow.expires_at = None
+        shadow.cooldown_until = None
+        shadow.last_error = _merge_shadow_error(canonical.id)
+        shadow.updated_at = merged_at
+
+    return canonical, shadows
 
 
 def parse_rfc3339(value: Any) -> datetime | None:
@@ -116,6 +260,7 @@ def _load_token_payload(token_data_or_json: str | dict[str, Any]) -> dict[str, A
 
 def _available_token_filters(now: datetime) -> tuple[Any, ...]:
     return (
+        *_canonical_token_filters(),
         CodexToken.is_active.is_(True),
         CodexToken.refresh_token.is_not(None),
         CodexToken.token_type == "codex",
@@ -159,6 +304,72 @@ def _token_aliases(token: CodexToken) -> list[str]:
     return collect_refresh_token_aliases(token.refresh_token_aliases, token.refresh_token, token.raw_payload)
 
 
+async def _acquire_token_identity_locks(
+    session,
+    *,
+    refresh_token: str,
+    account_id: str | None,
+) -> None:
+    bind = session.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+
+    lock_keys = [f"{TOKEN_IDENTITY_LOCK_NAMESPACE}:refresh:{refresh_token}"]
+    normalized_account_id = str(account_id or "").strip()
+    if normalized_account_id:
+        lock_keys.append(f"{TOKEN_IDENTITY_LOCK_NAMESPACE}:account:{normalized_account_id}")
+
+    for lock_key in sorted(set(lock_keys)):
+        await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key)::bigint)"), {"key": lock_key})
+
+
+async def _resolve_canonical_token_for_update(session, token_id: int) -> CodexToken | None:
+    current_id: int | None = token_id
+    visited: set[int] = set()
+    while current_id is not None and current_id not in visited:
+        visited.add(current_id)
+        token = await session.get(CodexToken, current_id, with_for_update=True)
+        if token is None:
+            return None
+        if token.merged_into_token_id is None:
+            return token
+        current_id = token.merged_into_token_id
+    return None
+
+
+async def _repair_duplicate_token_histories_in_session(session) -> TokenHistoryRepairSummary:
+    await session.flush()
+    result = await session.execute(
+        select(CodexToken)
+        .where(*_canonical_token_filters())
+        .order_by(CodexToken.id.asc())
+        .with_for_update()
+    )
+    tokens = result.scalars().all()
+    duplicate_groups = [
+        group
+        for group in group_rows_by_refresh_token_history(tokens, alias_getter=_token_aliases)
+        if len(group) > 1
+    ]
+    if not duplicate_groups:
+        return TokenHistoryRepairSummary(duplicate_group_count=0, merged_row_count=0)
+
+    canonical_ids: list[int] = []
+    shadow_ids: list[int] = []
+    merged_at = utcnow()
+    for group in duplicate_groups:
+        canonical, shadows = _merge_duplicate_token_rows(group, now=merged_at)
+        canonical_ids.append(canonical.id)
+        shadow_ids.extend(shadow.id for shadow in shadows)
+    await session.flush()
+    return TokenHistoryRepairSummary(
+        duplicate_group_count=len(duplicate_groups),
+        merged_row_count=len(shadow_ids),
+        canonical_ids=tuple(canonical_ids),
+        shadow_ids=tuple(sorted(shadow_ids)),
+    )
+
+
 async def _find_existing_token(
     session,
     *,
@@ -166,32 +377,35 @@ async def _find_existing_token(
     account_id: str | None,
 ) -> CodexToken | None:
     exact_result = await session.execute(
-        select(CodexToken).where(CodexToken.refresh_token == refresh_token).order_by(CodexToken.id.desc())
+        select(CodexToken)
+        .where(*_canonical_token_filters(), CodexToken.refresh_token == refresh_token)
+        .order_by(CodexToken.id.desc())
     )
     exact_matches = exact_result.scalars().all()
     token = _pick_preferred_token(exact_matches, account_id=account_id)
     if token is not None:
         return token
 
-    account_candidates: list[CodexToken] = []
-    if account_id:
-        account_result = await session.execute(
-            select(CodexToken).where(CodexToken.account_id == account_id).order_by(CodexToken.id.desc())
-        )
-        account_candidates = account_result.scalars().all()
-        for candidate in account_candidates:
-            if refresh_token in _token_aliases(candidate):
-                return candidate
+    canonical_result = await session.execute(
+        select(CodexToken).where(*_canonical_token_filters()).order_by(CodexToken.id.desc())
+    )
+    canonical_tokens = canonical_result.scalars().all()
+    matching_groups = [
+        group
+        for group in group_rows_by_refresh_token_history(canonical_tokens, alias_getter=_token_aliases)
+        if refresh_token in {alias for token_row in group for alias in _token_aliases(token_row)}
+    ]
+    if not matching_groups:
+        return None
 
-    all_result = await session.execute(select(CodexToken).order_by(CodexToken.id.desc()))
-    all_tokens = all_result.scalars().all()
-    account_candidate_ids = {item.id for item in account_candidates}
-    for candidate in all_tokens:
-        if account_candidate_ids and candidate.id in account_candidate_ids:
-            continue
-        if refresh_token in _token_aliases(candidate):
-            return candidate
-    return None
+    preferred_matches = [
+        _pick_canonical_token(group)
+        for group in matching_groups
+        if account_id and any(token_row.account_id == account_id for token_row in group)
+    ]
+    if preferred_matches:
+        return max(preferred_matches, key=lambda item: item.id)
+    return max((_pick_canonical_token(group) for group in matching_groups), key=lambda item: item.id)
 
 
 async def upsert_token_payload(
@@ -211,6 +425,7 @@ async def upsert_token_payload(
 
     async with get_session() as session:
         async with session.begin():
+            await _acquire_token_identity_locks(session, refresh_token=refresh_token, account_id=account_id)
             token = await _find_existing_token(session, refresh_token=refresh_token, account_id=account_id)
             if token is None:
                 token = CodexToken(
@@ -220,6 +435,7 @@ async def upsert_token_payload(
                     access_token=str(payload.get("access_token") or "").strip() or None,
                     refresh_token=refresh_token,
                     refresh_token_aliases=[refresh_token],
+                    merged_into_token_id=None,
                     token_type=str(payload.get("type") or "codex").strip() or "codex",
                     last_refresh_at=parse_rfc3339(payload.get("last_refresh")),
                     expires_at=parse_rfc3339(payload.get("expired")),
@@ -286,6 +502,12 @@ async def update_token_selection_settings(*, strategy: str) -> TokenSelectionSet
             return _build_token_selection_settings(setting)
 
 
+async def repair_duplicate_token_histories() -> TokenHistoryRepairSummary:
+    async with get_session() as session:
+        async with session.begin():
+            return await _repair_duplicate_token_histories_in_session(session)
+
+
 async def claim_next_active_token(*, selection_strategy: str | None = None) -> CodexToken | None:
     now = utcnow()
     async with get_session() as session:
@@ -316,7 +538,7 @@ async def update_token_refresh_state(
 ) -> None:
     async with get_session() as session:
         async with session.begin():
-            token = await session.get(CodexToken, token_id, with_for_update=True)
+            token = await _resolve_canonical_token_for_update(session, token_id)
             if token is None:
                 return
             previous_refresh_token = token.refresh_token
@@ -334,12 +556,13 @@ async def update_token_refresh_state(
             token.cooldown_until = None
             token.last_error = None
             token.updated_at = utcnow()
+            await _repair_duplicate_token_histories_in_session(session)
 
 
 async def mark_token_success(token_id: int) -> None:
     async with get_session() as session:
         async with session.begin():
-            token = await session.get(CodexToken, token_id, with_for_update=True)
+            token = await _resolve_canonical_token_for_update(session, token_id)
             if token is None:
                 return
             token.is_active = True
@@ -351,7 +574,7 @@ async def mark_token_success(token_id: int) -> None:
 async def set_token_active_state(token_id: int, *, active: bool) -> CodexToken | None:
     async with get_session() as session:
         async with session.begin():
-            token = await session.get(CodexToken, token_id, with_for_update=True)
+            token = await _resolve_canonical_token_for_update(session, token_id)
             if token is None:
                 return None
             token.is_active = bool(active)
@@ -370,7 +593,7 @@ async def mark_token_error(
 ) -> None:
     async with get_session() as session:
         async with session.begin():
-            token = await session.get(CodexToken, token_id, with_for_update=True)
+            token = await _resolve_canonical_token_for_update(session, token_id)
             if token is None:
                 return
             token.last_error = message[:4000]
@@ -389,15 +612,20 @@ async def mark_token_error(
 async def get_token_counts() -> TokenCounts:
     now = utcnow()
     async with get_session() as session:
-        total_result = await session.execute(select(func.count()).select_from(CodexToken))
+        total_result = await session.execute(
+            select(func.count()).select_from(CodexToken).where(*_canonical_token_filters())
+        )
         active_result = await session.execute(
-            select(func.count()).select_from(CodexToken).where(CodexToken.is_active.is_(True))
+            select(func.count())
+            .select_from(CodexToken)
+            .where(*_canonical_token_filters(), CodexToken.is_active.is_(True))
         )
         available_result = await session.execute(
             select(func.count()).select_from(CodexToken).where(*_available_token_filters(now))
         )
         cooling_result = await session.execute(
             select(func.count()).select_from(CodexToken).where(
+                *_canonical_token_filters(),
                 CodexToken.is_active.is_(True),
                 CodexToken.refresh_token.is_not(None),
                 CodexToken.token_type == "codex",
@@ -406,7 +634,9 @@ async def get_token_counts() -> TokenCounts:
             )
         )
         disabled_result = await session.execute(
-            select(func.count()).select_from(CodexToken).where(CodexToken.is_active.is_(False))
+            select(func.count())
+            .select_from(CodexToken)
+            .where(*_canonical_token_filters(), CodexToken.is_active.is_(False))
         )
         return TokenCounts(
             total=int(total_result.scalar_one() or 0),
@@ -419,7 +649,12 @@ async def get_token_counts() -> TokenCounts:
 
 async def list_token_rows(limit: int = 100) -> list[CodexToken]:
     async with get_session() as session:
-        stmt = select(CodexToken).order_by(CodexToken.id.desc()).limit(max(1, min(limit, 500)))
+        stmt = (
+            select(CodexToken)
+            .where(*_canonical_token_filters())
+            .order_by(CodexToken.id.desc())
+            .limit(max(1, min(limit, 500)))
+        )
         result = await session.execute(stmt)
         return result.scalars().all()
 
