@@ -17,6 +17,7 @@ const state = {
   protected: false,
   timer: null,
   tokenActionPendingIds: new Set(),
+  tokenGroupOpenStates: Object.create(null),
   tokenItems: [],
   healthLoaded: false,
   tokensLoaded: false,
@@ -321,6 +322,12 @@ function renderTokenSelection(selection) {
   if (elements.tokenSelectionSummary) {
     elements.tokenSelectionSummary.textContent = describeTokenSelectionStrategy(strategy);
   }
+}
+
+function resolveTokenGroupOpenState(groupId, fallbackOpen) {
+  return Object.prototype.hasOwnProperty.call(state.tokenGroupOpenStates, groupId)
+    ? Boolean(state.tokenGroupOpenStates[groupId])
+    : Boolean(fallbackOpen);
 }
 
 function isTokenActionPending(tokenId) {
@@ -709,10 +716,10 @@ function renderTokenCard(item) {
   `;
 }
 
-function renderTokenGroup({ title, meta, tone, items, open = false, emptyMessage }) {
+function renderTokenGroup({ id, title, meta, tone, items, open = false, emptyMessage }) {
   const list = Array.isArray(items) ? items : [];
   return `
-    <details class="token-group token-group--${escapeHtml(tone)}"${open ? " open" : ""}>
+    <details class="token-group token-group--${escapeHtml(tone)}" data-token-group="${escapeHtml(id)}"${open ? " open" : ""}>
       <summary class="token-group__summary">
         <span class="token-group__summary-main">
           <span class="token-group__title-row">
@@ -983,12 +990,16 @@ function renderTokenList(items) {
     availableItems.push(item);
   });
 
-  const availableOpen = true;
-  const coolingOpen = availableItems.length === 0 && coolingItems.length > 0;
-  const disabledOpen = availableItems.length === 0 && coolingItems.length === 0 && disabledItems.length > 0;
+  const availableOpen = resolveTokenGroupOpenState("available", true);
+  const coolingOpen = resolveTokenGroupOpenState("cooling", availableItems.length === 0 && coolingItems.length > 0);
+  const disabledOpen = resolveTokenGroupOpenState(
+    "disabled",
+    availableItems.length === 0 && coolingItems.length === 0 && disabledItems.length > 0,
+  );
 
   elements.tokenList.innerHTML = `
     ${renderTokenGroup({
+      id: "available",
       title: "可用",
       meta: availableItems.length > 0 ? "可立即调度" : "当前没有可立即调度的 key",
       tone: "available",
@@ -997,6 +1008,7 @@ function renderTokenList(items) {
       emptyMessage: "当前没有可立即调度的 key。",
     })}
     ${renderTokenGroup({
+      id: "cooling",
       title: "冷却",
       meta: coolingItems.length > 0 ? "等待冷却窗口结束" : "当前没有冷却中的 key",
       tone: "cooling",
@@ -1005,6 +1017,7 @@ function renderTokenList(items) {
       emptyMessage: "当前没有处于冷却窗口的 key。",
     })}
     ${renderTokenGroup({
+      id: "disabled",
       title: "已禁用",
       meta: disabledItems.length > 0 ? "已移出调度池" : "当前没有已禁用 key",
       tone: "disabled",
@@ -1472,6 +1485,22 @@ elements.tokenList.addEventListener("click", async (event) => {
     await toggleTokenActivation(button.dataset.tokenId, button.dataset.nextActive === "true");
   } catch {}
 });
+
+elements.tokenList.addEventListener(
+  "toggle",
+  (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLDetailsElement)) {
+      return;
+    }
+    const groupId = target.dataset.tokenGroup;
+    if (!groupId) {
+      return;
+    }
+    state.tokenGroupOpenStates[groupId] = target.open;
+  },
+  true,
+);
 
 if (typeof state.themeMedia.addEventListener === "function") {
   state.themeMedia.addEventListener("change", syncSystemTheme);
