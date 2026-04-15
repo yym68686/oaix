@@ -1875,10 +1875,40 @@ button {
   -webkit-line-clamp: 2;
 }
 
+.loading-state,
 .empty-state {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
   padding: 42px 24px;
   text-align: center;
   color: var(--ink-soft);
+}
+
+.loading-state__spinner {
+  width: 26px;
+  height: 26px;
+  border: 2px solid color-mix(in oklab, var(--border-soft) 88%, transparent);
+  border-top-color: color-mix(in oklab, var(--accent) 58%, white);
+  border-radius: 999px;
+  animation: spin 780ms linear infinite;
+}
+
+.loading-state__label {
+  margin: 0;
+  font-size: 0.94rem;
+  line-height: 1.5;
+}
+
+.loading-state--chart {
+  min-height: 220px;
+  align-content: center;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .reveal {

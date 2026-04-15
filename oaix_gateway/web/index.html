@@ -68,8 +68,8 @@
               </button>
             </div>
           </div>
-          <div class="meta-chip" id="protection-chip">检测服务状态中</div>
-          <div class="meta-chip meta-chip--subtle" id="sync-chip">等待首次同步</div>
+          <div class="meta-chip" id="protection-chip">正在检测服务状态</div>
+          <div class="meta-chip meta-chip--subtle" id="sync-chip">正在首次同步</div>
         </div>
       </header>
 
@@ -86,19 +86,19 @@
           <div class="stats-grid">
             <article class="stat-card stat-card--available">
               <p class="stat-card__label">有效 Key</p>
-              <p class="stat-card__value" id="available-count">0</p>
+              <p class="stat-card__value" id="available-count">—</p>
               <p class="stat-card__hint">当前可立即请求上游的 key 数量</p>
             </article>
 
             <article class="stat-card stat-card--cooling">
               <p class="stat-card__label">冷却中</p>
-              <p class="stat-card__value" id="cooling-count">0</p>
+              <p class="stat-card__value" id="cooling-count">—</p>
               <p class="stat-card__hint">命中配额后暂时不可用</p>
             </article>
 
             <article class="stat-card stat-card--disabled">
               <p class="stat-card__label">已禁用</p>
-              <p class="stat-card__value" id="disabled-count">0</p>
+              <p class="stat-card__value" id="disabled-count">—</p>
               <p class="stat-card__hint">认证失效或永久停用</p>
             </article>
           </div>
@@ -109,7 +109,7 @@
                 <p class="section-kicker">Distribution</p>
                 <h3>状态分布</h3>
               </div>
-              <p class="distribution-panel__total">总量 <strong id="total-count">0</strong></p>
+              <p class="distribution-panel__total">总量 <strong id="total-count">—</strong></p>
             </div>
             <div class="distribution-bar" aria-hidden="true">
               <span class="distribution-bar__segment distribution-bar__segment--available" id="bar-available"></span>
@@ -119,15 +119,15 @@
             <div class="distribution-legend">
               <div>
                 <span class="legend-dot legend-dot--available"></span>
-                <span>有效 <strong id="legend-available">0%</strong></span>
+                <span>有效 <strong id="legend-available">—</strong></span>
               </div>
               <div>
                 <span class="legend-dot legend-dot--cooling"></span>
-                <span>冷却 <strong id="legend-cooling">0%</strong></span>
+                <span>冷却 <strong id="legend-cooling">—</strong></span>
               </div>
               <div>
                 <span class="legend-dot legend-dot--disabled"></span>
-                <span>禁用 <strong id="legend-disabled">0%</strong></span>
+                <span>禁用 <strong id="legend-disabled">—</strong></span>
               </div>
             </div>
           </article>
@@ -188,7 +188,7 @@
               <h2 id="token-list-title">最近 Key 状态</h2>
             </div>
             <div class="section-tools section-tools--token">
-              <p class="section-note" id="list-note">显示最近 80 条记录</p>
+              <p class="section-note" id="list-note">正在载入最近 80 条 key…</p>
               <div class="selection-switch" aria-label="Key 分发策略">
                 <span class="selection-switch__label">Key 分发</span>
                 <div class="selection-switch__rail" role="group" aria-label="切换 Key 分发策略">
@@ -209,17 +209,16 @@
                     Fill-first
                   </button>
                 </div>
-                <span class="selection-switch__summary" id="token-selection-summary" aria-live="polite">
-                  最旧未使用优先
-                </span>
+                <span class="selection-switch__summary" id="token-selection-summary" aria-live="polite">正在同步策略</span>
               </div>
             </div>
           </div>
 
           <div class="token-panel__body">
             <div class="token-list" id="token-list">
-              <article class="empty-state">
-                <p>还没有可展示的数据。</p>
+              <article class="loading-state" role="status" aria-live="polite">
+                <span class="loading-state__spinner" aria-hidden="true"></span>
+                <p class="loading-state__label">正在加载 key 池…</p>
               </article>
             </div>
           </div>
@@ -231,29 +230,29 @@
               <p class="section-kicker">Traffic</p>
               <h2 id="request-list-title">请求观察</h2>
             </div>
-            <p class="section-note" id="request-note">显示最近 80 条请求</p>
+            <p class="section-note" id="request-note">正在载入最近 80 条请求…</p>
           </div>
 
           <div class="metric-strip metric-strip--requests" aria-label="请求摘要">
             <article class="metric-pill">
               <span class="metric-pill__label">总请求</span>
-              <strong class="metric-pill__value" id="request-total-count">0</strong>
+              <strong class="metric-pill__value" id="request-total-count">—</strong>
             </article>
             <article class="metric-pill">
               <span class="metric-pill__label">总 Token</span>
-              <strong class="metric-pill__value" id="request-total-tokens">0</strong>
+              <strong class="metric-pill__value" id="request-total-tokens">—</strong>
             </article>
             <article class="metric-pill">
               <span class="metric-pill__label">估算金额</span>
-              <strong class="metric-pill__value" id="request-estimated-cost">$0.00</strong>
+              <strong class="metric-pill__value" id="request-estimated-cost">—</strong>
             </article>
             <article class="metric-pill">
               <span class="metric-pill__label">成功</span>
-              <strong class="metric-pill__value" id="request-success-count">0</strong>
+              <strong class="metric-pill__value" id="request-success-count">—</strong>
             </article>
             <article class="metric-pill">
               <span class="metric-pill__label">失败</span>
-              <strong class="metric-pill__value" id="request-failed-count">0</strong>
+              <strong class="metric-pill__value" id="request-failed-count">—</strong>
             </article>
             <article class="metric-pill">
               <span class="metric-pill__label">平均首字时间</span>
@@ -268,18 +267,19 @@
                   <p class="section-kicker">Usage</p>
                   <h3>最近 24 小时 Token</h3>
                 </div>
-                <strong class="chart-card__value" id="request-token-chart-total">0</strong>
+                <strong class="chart-card__value" id="request-token-chart-total">—</strong>
               </div>
               <div class="chart-key" aria-hidden="true">
                 <span><i class="chart-key__swatch chart-key__swatch--input"></i>输入</span>
                 <span><i class="chart-key__swatch chart-key__swatch--output"></i>输出</span>
               </div>
               <div class="chart-card__canvas" id="request-token-chart">
-                <article class="empty-state chart-empty">
-                  <p>还没有 token 用量数据。</p>
+                <article class="loading-state loading-state--chart" role="status" aria-live="polite">
+                  <span class="loading-state__spinner" aria-hidden="true"></span>
+                  <p class="loading-state__label">正在汇总 token 用量…</p>
                 </article>
               </div>
-              <p class="chart-card__note" id="request-token-chart-note">最近 24 小时按小时汇总输入与输出 token。</p>
+              <p class="chart-card__note" id="request-token-chart-note">正在汇总最近 24 小时 token 用量…</p>
             </article>
 
             <article class="chart-card">
@@ -288,14 +288,15 @@
                   <p class="section-kicker">Estimate</p>
                   <h3>模型金额分布</h3>
                 </div>
-                <strong class="chart-card__value" id="request-cost-chart-total">$0.00</strong>
+                <strong class="chart-card__value" id="request-cost-chart-total">—</strong>
               </div>
               <div class="chart-card__canvas" id="request-cost-chart">
-                <article class="empty-state chart-empty">
-                  <p>还没有金额统计数据。</p>
+                <article class="loading-state loading-state--chart" role="status" aria-live="polite">
+                  <span class="loading-state__spinner" aria-hidden="true"></span>
+                  <p class="loading-state__label">正在汇总模型金额…</p>
                 </article>
               </div>
-              <p class="chart-card__note" id="request-cost-chart-note">最近 24 小时按模型汇总估算金额。</p>
+              <p class="chart-card__note" id="request-cost-chart-note">正在汇总最近 24 小时模型金额…</p>
             </article>
           </div>
 
@@ -310,8 +311,9 @@
               <span>错误</span>
             </div>
             <div class="request-list" id="request-list">
-              <article class="empty-state">
-                <p>还没有请求记录。</p>
+              <article class="loading-state" role="status" aria-live="polite">
+                <span class="loading-state__spinner" aria-hidden="true"></span>
+                <p class="loading-state__label">正在加载请求日志…</p>
               </article>
             </div>
           </div>

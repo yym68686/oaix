@@ -18,6 +18,9 @@ const state = {
   timer: null,
   tokenActionPendingIds: new Set(),
   tokenItems: [],
+  healthLoaded: false,
+  tokensLoaded: false,
+  requestsLoaded: false,
   tokenSelectionSaving: false,
   tokenSelectionStrategy: "least_recently_used",
   themePreference: initialThemePreference,
@@ -229,6 +232,81 @@ function setTokenSelectionDisabled(disabled) {
   elements.tokenSelectionButtons.forEach((button) => {
     button.disabled = disabled;
   });
+}
+
+function renderLoadingState(message, className = "") {
+  const classes = ["loading-state", className].filter(Boolean).join(" ");
+  return `
+    <article class="${classes}" role="status" aria-live="polite">
+      <span class="loading-state__spinner" aria-hidden="true"></span>
+      <p class="loading-state__label">${escapeHtml(message)}</p>
+    </article>
+  `;
+}
+
+function renderCountsLoading() {
+  elements.availableCount.textContent = "—";
+  elements.coolingCount.textContent = "—";
+  elements.disabledCount.textContent = "—";
+  elements.totalCount.textContent = "—";
+  elements.legendAvailable.textContent = "—";
+  elements.legendCooling.textContent = "—";
+  elements.legendDisabled.textContent = "—";
+  elements.barAvailable.style.width = "0%";
+  elements.barCooling.style.width = "0%";
+  elements.barDisabled.style.width = "0%";
+}
+
+function renderRequestSummaryUnavailable() {
+  elements.requestTotalCount.textContent = "—";
+  elements.requestTotalTokens.textContent = "—";
+  elements.requestEstimatedCost.textContent = "—";
+  elements.requestSuccessCount.textContent = "—";
+  elements.requestFailedCount.textContent = "—";
+  elements.requestAvgTtft.textContent = "—";
+  elements.requestTokenChartTotal.textContent = "—";
+  elements.requestCostChartTotal.textContent = "—";
+}
+
+function renderTokenListLoading() {
+  elements.tokenList.innerHTML = renderLoadingState("正在加载 key 池…");
+}
+
+function renderRequestListLoading() {
+  elements.requestList.innerHTML = renderLoadingState("正在加载请求日志…");
+}
+
+function renderChartLoading(element, message) {
+  element.innerHTML = renderLoadingState(message, "loading-state--chart");
+}
+
+function renderRequestAnalyticsLoading() {
+  elements.requestTokenChartNote.textContent = "正在汇总最近 24 小时 token 用量…";
+  elements.requestCostChartNote.textContent = "正在汇总最近 24 小时模型金额…";
+  renderChartLoading(elements.requestTokenChart, "正在汇总 token 用量…");
+  renderChartLoading(elements.requestCostChart, "正在汇总模型金额…");
+}
+
+function renderInitialLoadingStates() {
+  if (!state.healthLoaded) {
+    renderCountsLoading();
+    elements.protectionChip.textContent = "正在检测服务状态";
+    elements.syncChip.textContent = "正在首次同步";
+  }
+  if (!state.tokensLoaded) {
+    elements.listNote.textContent = "正在载入最近 80 条 key…";
+    if (elements.tokenSelectionSummary) {
+      elements.tokenSelectionSummary.textContent = "正在同步策略";
+    }
+    setTokenSelectionDisabled(true);
+    renderTokenListLoading();
+  }
+  if (!state.requestsLoaded) {
+    elements.requestNote.textContent = "正在载入最近 80 条请求…";
+    renderRequestSummaryUnavailable();
+    renderRequestAnalyticsLoading();
+    renderRequestListLoading();
+  }
 }
 
 function renderTokenSelection(selection) {
@@ -1017,6 +1095,7 @@ async function fetchJson(url, options = {}) {
 async function loadHealth() {
   const response = await fetch("/healthz");
   const health = await response.json();
+  state.healthLoaded = true;
   renderCounts(health.counts || {});
   state.protected = Boolean(health.service_key_protected);
   if (response.ok) {
@@ -1039,6 +1118,7 @@ async function loadTokens() {
     const data = await fetchJson("/admin/tokens?limit=80&include_quota=1", {
       headers: authHeaders(),
     });
+    state.tokensLoaded = true;
     state.tokenItems = Array.isArray(data.items) ? data.items : [];
     elements.listNote.textContent = "显示最近 80 条记录 · 可用 / 冷却 / 已禁用分组";
     renderTokenSelection(data.selection || {});
@@ -1048,6 +1128,7 @@ async function loadTokens() {
       renderCounts(data.counts);
     }
   } catch (error) {
+    state.tokensLoaded = true;
     state.tokenItems = [];
     if (error.status === 401) {
       elements.listNote.textContent = "需要输入 Service API Key 才能查看明细和导入";
@@ -1147,15 +1228,20 @@ async function loadRequests() {
     const data = await fetchJson("/admin/requests?limit=80", {
       headers: authHeaders(),
     });
+    state.requestsLoaded = true;
     elements.requestNote.textContent = "显示最近 80 条请求 · 图表为最近 24 小时 token 与估算金额";
     renderRequestSummary(data.summary || {});
     renderRequestAnalytics(data.analytics || {});
     renderRequestList(data.items || []);
   } catch (error) {
+    state.requestsLoaded = true;
     if (error.status === 401) {
       elements.requestNote.textContent = "需要输入 Service API Key 才能查看请求日志";
-      renderRequestSummary({});
-      renderRequestAnalytics({});
+      renderRequestSummaryUnavailable();
+      elements.requestTokenChartNote.textContent = "填入 Service API Key 后显示最近 24 小时 token 趋势。";
+      elements.requestCostChartNote.textContent = "填入 Service API Key 后显示最近 24 小时模型金额分布。";
+      renderChartEmpty(elements.requestTokenChart, "需要 Service API Key");
+      renderChartEmpty(elements.requestCostChart, "需要 Service API Key");
       elements.requestList.innerHTML = `
         <article class="empty-state">
           <p>请求日志已加锁。填入 Service API Key 后可查看请求次数、token 用量、估算金额、模型名、端点、状态码和首字时间。</p>
@@ -1164,8 +1250,11 @@ async function loadRequests() {
       return;
     }
     elements.requestNote.textContent = `请求日志加载失败：${error.message}`;
-    renderRequestSummary({});
-    renderRequestAnalytics({});
+    renderRequestSummaryUnavailable();
+    elements.requestTokenChartNote.textContent = "请求恢复后会显示最近 24 小时 token 趋势。";
+    elements.requestCostChartNote.textContent = "请求恢复后会显示最近 24 小时模型金额分布。";
+    renderChartEmpty(elements.requestTokenChart, "请求日志加载失败");
+    renderChartEmpty(elements.requestCostChart, "模型金额暂时不可用");
     elements.requestList.innerHTML = `
       <article class="empty-state">
         <p>${escapeHtml(error.message)}</p>
@@ -1176,6 +1265,7 @@ async function loadRequests() {
 
 async function refreshDashboard() {
   elements.refreshButton.disabled = true;
+  renderInitialLoadingStates();
   try {
     await loadHealth();
     await Promise.all([loadTokens(), loadRequests()]);
@@ -1356,6 +1446,7 @@ function syncSystemTheme() {
 
 applyTheme(state.themePreference, { persist: false });
 renderTokenSelection({ strategy: state.tokenSelectionStrategy });
+renderInitialLoadingStates();
 
 elements.themeButtons.forEach((button) => {
   button.addEventListener("click", () => applyTheme(button.dataset.themeOption));
