@@ -34,6 +34,7 @@ from .token_import_jobs import (
     TokenImportBackgroundWorker,
     create_token_import_job,
     get_token_import_job,
+    job_state_from_lease,
 )
 from .token_store import (
     DEFAULT_TOKEN_SELECTION_STRATEGY,
@@ -1224,11 +1225,11 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail="Body must be a token object, an array of token objects, or {'tokens': [...]}",
             )
-        job = await create_token_import_job(payloads)
         worker = getattr(http_request.app.state, "token_import_worker", None)
+        job = await create_token_import_job(payloads, start_immediately=worker is not None)
         if worker is not None:
-            worker.notify()
-        return {"job": asdict(job)}
+            worker.submit(job)
+        return {"job": asdict(job_state_from_lease(job))}
 
     @app.get("/admin/tokens/import-jobs/{job_id}")
     async def get_import_job_route(

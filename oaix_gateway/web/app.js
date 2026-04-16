@@ -208,7 +208,7 @@ function buildImportJobProgressMessage(job) {
   const queueLabel =
     job?.status === "queued"
       ? `导入任务 #${job?.id} 已入队，等待后台 worker 领取。`
-      : `后台导入中：已处理 ${processedCount}/${totalCount} 条。`;
+      : `后台并行导入中：已处理 ${processedCount}/${totalCount} 条。`;
   const trafficNote = Number(job?.yielded_to_response_traffic_count || 0)
     ? `期间主动给 /v1/responses 流量让路 ${job.yielded_to_response_traffic_count} 次。`
     : "";

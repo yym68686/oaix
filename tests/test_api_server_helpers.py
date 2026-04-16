@@ -552,16 +552,21 @@ def test_import_route_enqueues_background_job(monkeypatch) -> None:
 
     class FakeWorker:
         def __init__(self) -> None:
-            self.notified = False
+            self.submitted_jobs: list[TokenImportJobLease] = []
 
-        def notify(self) -> None:
-            self.notified = True
+        def submit(self, job: TokenImportJobLease) -> None:
+            self.submitted_jobs.append(job)
 
-    async def fake_create_token_import_job(payloads: list[dict[str, object]]) -> TokenImportJobState:
+    async def fake_create_token_import_job(
+        payloads: list[dict[str, object]],
+        *,
+        start_immediately: bool = False,
+    ) -> TokenImportJobLease:
         captured["payloads"] = payloads
-        return TokenImportJobState(
+        captured["start_immediately"] = start_immediately
+        return TokenImportJobLease(
             id=42,
-            status=IMPORT_JOB_STATUS_QUEUED,
+            status=IMPORT_JOB_STATUS_RUNNING if start_immediately else IMPORT_JOB_STATUS_QUEUED,
             total_count=len(payloads),
             processed_count=0,
             created_count=0,
@@ -579,6 +584,7 @@ def test_import_route_enqueues_background_job(monkeypatch) -> None:
             heartbeat_at=None,
             finished_at=None,
             last_error=None,
+            payloads=list(payloads),
         )
 
     async def receive():
@@ -612,16 +618,18 @@ def test_import_route_enqueues_background_job(monkeypatch) -> None:
     result = asyncio.run(route.endpoint(request, None))
 
     assert captured["payloads"] == [{"refresh_token": "rt-123"}]
-    assert app.state.token_import_worker.notified is True
+    assert captured["start_immediately"] is True
+    assert [job.id for job in app.state.token_import_worker.submitted_jobs] == [42]
     assert result["job"]["id"] == 42
-    assert result["job"]["status"] == IMPORT_JOB_STATUS_QUEUED
+    assert result["job"]["status"] == IMPORT_JOB_STATUS_RUNNING
     assert result["job"]["total_count"] == 1
+    assert "payloads" not in result["job"]
 
 
-def test_process_token_import_job_updates_progress_and_completes(monkeypatch) -> None:
+def test_process_token_import_job_runs_payloads_in_parallel_without_response_traffic_wait(monkeypatch) -> None:
     progress_calls: list[dict[str, object]] = []
-    touched: list[int] = []
     completed: dict[str, object] = {}
+    concurrency = {"active": 0, "max_active": 0}
 
     class BusyResponseTraffic:
         active_responses = 2
@@ -631,23 +639,23 @@ def test_process_token_import_job_updates_progress_and_completes(monkeypatch) ->
 
         async def wait_for_import_turn(self, *, timeout_seconds=None) -> bool:
             self.calls += 1
-            if self.calls == 1:
-                raise TimeoutError("Timed out waiting for active /v1/responses traffic to drain before import")
-            return False
+            raise AssertionError("wait_for_import_turn should not run when IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC is disabled")
+
+    response_traffic = BusyResponseTraffic()
 
     async def fake_upsert_token_payload(payload: dict) -> TokenUpsertResult:
+        concurrency["active"] += 1
+        concurrency["max_active"] = max(concurrency["max_active"], concurrency["active"])
+        await asyncio.sleep(0.02)
+        concurrency["active"] -= 1
         token = CodexToken(
-            id=99,
+            id=int(str(payload["refresh_token"]).split("-")[-1]),
             email="user@example.com",
             account_id="acct_123",
             refresh_token=payload["refresh_token"],
             is_active=True,
         )
         return TokenUpsertResult(token=token, action="created")
-
-    async def fake_touch_token_import_job(job_id: int) -> None:
-        touched.append(job_id)
-        return None
 
     async def fake_update_token_import_job_progress(
         job_id: int,
@@ -719,8 +727,11 @@ def test_process_token_import_job_updates_progress_and_completes(monkeypatch) ->
             last_error=None,
         )
 
+    monkeypatch.setenv("IMPORT_JOB_MAX_CONCURRENCY", "4")
+    monkeypatch.setenv("IMPORT_JOB_PROGRESS_FLUSH_EVERY", "1")
+    monkeypatch.setenv("IMPORT_JOB_PROGRESS_FLUSH_INTERVAL_SECONDS", "0")
+    monkeypatch.delenv("IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC", raising=False)
     monkeypatch.setattr("oaix_gateway.token_import_jobs.upsert_token_payload", fake_upsert_token_payload)
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.touch_token_import_job", fake_touch_token_import_job)
     monkeypatch.setattr(
         "oaix_gateway.token_import_jobs.update_token_import_job_progress",
         fake_update_token_import_job_progress,
@@ -747,28 +758,148 @@ def test_process_token_import_job_updates_progress_and_completes(monkeypatch) ->
         heartbeat_at=None,
         finished_at=None,
         last_error=None,
-        payloads=[{"refresh_token": "rt-123"}, "bad-payload"],
+        payloads=[
+            {"refresh_token": "rt-1"},
+            {"refresh_token": "rt-2"},
+            {"refresh_token": "rt-3"},
+            "bad-payload",
+        ],
     )
 
     result = asyncio.run(
         process_token_import_job(
             job,
-            response_traffic=BusyResponseTraffic(),
+            response_traffic=response_traffic,
         )
     )
 
-    assert touched == [7, 7]
-    assert [call["processed_count"] for call in progress_calls] == [1, 2]
-    assert progress_calls[0]["response_traffic_timeout_count"] == 1
-    assert progress_calls[1]["failed"] == [{"index": 1, "error": "Token payload must be a JSON object"}]
-    assert completed["processed_count"] == 2
-    assert completed["response_traffic_timeout_count"] == 1
-    assert len(completed["created"]) == 1
-    assert completed["failed"] == [{"index": 1, "error": "Token payload must be a JSON object"}]
+    assert response_traffic.calls == 0
+    assert concurrency["max_active"] > 1
+    assert [call["processed_count"] for call in progress_calls] == [1, 2, 3]
+    assert progress_calls[-1]["response_traffic_timeout_count"] == 0
+    assert completed["processed_count"] == 4
+    assert completed["response_traffic_timeout_count"] == 0
+    assert [item["index"] for item in completed["created"]] == [0, 1, 2]
+    assert completed["failed"] == [{"index": 3, "error": "Token payload must be a JSON object"}]
     assert result is not None
     assert result.status == IMPORT_JOB_STATUS_COMPLETED
-    assert result.created_count == 1
+    assert result.created_count == 3
     assert result.failed_count == 1
+
+
+def test_process_token_import_job_batches_progress_updates_for_small_fast_jobs(monkeypatch) -> None:
+    progress_calls: list[int] = []
+
+    class IdleResponseTraffic:
+        active_responses = 0
+
+        async def wait_for_import_turn(self, *, timeout_seconds=None) -> bool:
+            raise AssertionError("wait_for_import_turn should stay disabled by default")
+
+    async def fake_upsert_token_payload(payload: dict) -> TokenUpsertResult:
+        token = CodexToken(
+            id=int(str(payload["refresh_token"]).split("-")[-1]),
+            email="user@example.com",
+            account_id="acct_123",
+            refresh_token=payload["refresh_token"],
+            is_active=True,
+        )
+        return TokenUpsertResult(token=token, action="created")
+
+    async def fake_update_token_import_job_progress(
+        job_id: int,
+        *,
+        processed_count: int,
+        created: list[dict[str, object]],
+        updated: list[dict[str, object]],
+        skipped: list[dict[str, object]],
+        failed: list[dict[str, object]],
+        yielded_to_response_traffic_count: int,
+        response_traffic_timeout_count: int,
+    ) -> None:
+        progress_calls.append(processed_count)
+        return None
+
+    async def fake_complete_token_import_job(
+        job_id: int,
+        *,
+        processed_count: int,
+        created: list[dict[str, object]],
+        updated: list[dict[str, object]],
+        skipped: list[dict[str, object]],
+        failed: list[dict[str, object]],
+        yielded_to_response_traffic_count: int,
+        response_traffic_timeout_count: int,
+    ) -> TokenImportJobState:
+        return TokenImportJobState(
+            id=job_id,
+            status=IMPORT_JOB_STATUS_COMPLETED,
+            total_count=17,
+            processed_count=processed_count,
+            created_count=len(created),
+            updated_count=len(updated),
+            skipped_count=len(skipped),
+            failed_count=len(failed),
+            yielded_to_response_traffic_count=yielded_to_response_traffic_count,
+            response_traffic_timeout_count=response_traffic_timeout_count,
+            created=list(created),
+            updated=list(updated),
+            skipped=list(skipped),
+            failed=list(failed),
+            submitted_at=None,
+            started_at=None,
+            heartbeat_at=None,
+            finished_at=None,
+            last_error=None,
+        )
+
+    monkeypatch.setenv("IMPORT_JOB_MAX_CONCURRENCY", "16")
+    monkeypatch.setenv("IMPORT_JOB_PROGRESS_FLUSH_EVERY", "64")
+    monkeypatch.setenv("IMPORT_JOB_PROGRESS_FLUSH_INTERVAL_SECONDS", "3600")
+    monkeypatch.delenv("IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC", raising=False)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.upsert_token_payload", fake_upsert_token_payload)
+    monkeypatch.setattr(
+        "oaix_gateway.token_import_jobs.update_token_import_job_progress",
+        fake_update_token_import_job_progress,
+    )
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.complete_token_import_job", fake_complete_token_import_job)
+
+    job = TokenImportJobLease(
+        id=8,
+        status=IMPORT_JOB_STATUS_RUNNING,
+        total_count=17,
+        processed_count=0,
+        created_count=0,
+        updated_count=0,
+        skipped_count=0,
+        failed_count=0,
+        yielded_to_response_traffic_count=0,
+        response_traffic_timeout_count=0,
+        created=[],
+        updated=[],
+        skipped=[],
+        failed=[],
+        submitted_at=None,
+        started_at=None,
+        heartbeat_at=None,
+        finished_at=None,
+        last_error=None,
+        payloads=[{"refresh_token": f"rt-{index + 1}"} for index in range(17)],
+    )
+
+    result = asyncio.run(
+        process_token_import_job(
+            job,
+            response_traffic=IdleResponseTraffic(),
+        )
+    )
+
+    assert progress_calls == []
+    assert result is not None
+    assert result.status == IMPORT_JOB_STATUS_COMPLETED
+    assert result.processed_count == 17
+    assert result.created_count == 17
+    assert [item["index"] for item in result.created] == list(range(17))
 
 
 def test_wrap_streaming_body_iterator_runs_cleanup_on_close() -> None:
