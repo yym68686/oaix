@@ -185,9 +185,8 @@ async def create_token_import_job(payloads: list[Any], *, start_immediately: boo
     normalized_payloads = list(payloads)
     async with get_session() as session:
         async with session.begin():
-            now = utcnow()
             job = TokenImportJob(
-                status=IMPORT_JOB_STATUS_RUNNING if start_immediately else IMPORT_JOB_STATUS_QUEUED,
+                status=IMPORT_JOB_STATUS_QUEUED,
                 payloads=normalized_payloads,
                 total_count=len(normalized_payloads),
                 processed_count=0,
@@ -202,8 +201,8 @@ async def create_token_import_job(payloads: list[Any], *, start_immediately: boo
                 skipped_items=[],
                 failed_items=[],
                 last_error=None,
-                started_at=now if start_immediately else None,
-                heartbeat_at=now if start_immediately else None,
+                started_at=None,
+                heartbeat_at=None,
                 finished_at=None,
             )
             session.add(job)
@@ -213,7 +212,10 @@ async def create_token_import_job(payloads: list[Any], *, start_immediately: boo
 
 async def get_token_import_job(job_id: int) -> TokenImportJobState | None:
     async with get_read_session() as session:
-        job = await session.get(TokenImportJob, int(job_id))
+        # AsyncSession.get() tries to autobegin even inside this read helper.
+        # Keep read-only routes on explicit SELECT statements while autobegin is disabled.
+        result = await session.execute(select(TokenImportJob).where(TokenImportJob.id == int(job_id)).limit(1))
+        job = result.scalars().first()
         if job is None:
             return None
         return _serialize_job_state(job)
@@ -268,6 +270,29 @@ async def requeue_stale_token_import_jobs(*, stale_after_seconds: float | None =
             return len(jobs)
 
 
+def _claim_job_lease(job: TokenImportJob) -> TokenImportJobLease:
+    now = utcnow()
+    job.status = IMPORT_JOB_STATUS_RUNNING
+    if job.started_at is None:
+        job.started_at = now
+    job.heartbeat_at = now
+    job.finished_at = None
+    job.last_error = None
+    return _serialize_job_lease(job)
+
+
+async def claim_token_import_job(job_id: int) -> TokenImportJobLease | None:
+    async with get_session() as session:
+        async with session.begin():
+            job = await _get_token_import_job_for_update(session, job_id)
+            if job is None or str(job.status or "") != IMPORT_JOB_STATUS_QUEUED:
+                return None
+
+            claimed = _claim_job_lease(job)
+            await session.flush()
+            return claimed
+
+
 async def claim_next_token_import_job(*, stale_after_seconds: float | None = None) -> TokenImportJobLease | None:
     await requeue_stale_token_import_jobs(stale_after_seconds=stale_after_seconds)
     async with get_session() as session:
@@ -283,15 +308,9 @@ async def claim_next_token_import_job(*, stale_after_seconds: float | None = Non
             if job is None:
                 return None
 
-            now = utcnow()
-            job.status = IMPORT_JOB_STATUS_RUNNING
-            if job.started_at is None:
-                job.started_at = now
-            job.heartbeat_at = now
-            job.finished_at = None
-            job.last_error = None
+            claimed = _claim_job_lease(job)
             await session.flush()
-            return _serialize_job_lease(job)
+            return claimed
 
 
 async def update_token_import_job_progress(
@@ -629,7 +648,7 @@ class TokenImportBackgroundWorker:
         self._stale_after_seconds = (
             _import_job_stale_after_seconds() if stale_after_seconds is None else max(30.0, float(stale_after_seconds))
         )
-        self._submitted_jobs: asyncio.Queue[TokenImportJobLease] = asyncio.Queue()
+        self._submitted_jobs: asyncio.Queue[int] = asyncio.Queue()
         self._wake_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
@@ -642,6 +661,7 @@ class TokenImportBackgroundWorker:
         if requeued:
             logger.warning("Requeued stale token import jobs on startup: count=%s", requeued)
         self._task = asyncio.create_task(self._run(), name="oaix-token-import-worker")
+        self._task.add_done_callback(self._handle_task_done)
 
     async def stop(self) -> None:
         self._stopping = True
@@ -659,37 +679,60 @@ class TokenImportBackgroundWorker:
             except asyncio.CancelledError:
                 pass
 
-    def submit(self, job: TokenImportJobLease) -> None:
-        self._submitted_jobs.put_nowait(job)
+    def submit(self, job: TokenImportJobLease | int) -> None:
+        job_id = int(job.id) if isinstance(job, TokenImportJobLease) else int(job)
+        self._submitted_jobs.put_nowait(job_id)
         self._wake_event.set()
+
+    def _handle_task_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        if self._stopping:
+            task.exception()
+            return
+        exc = task.exception()
+        if exc is None:
+            logger.warning("Token import worker exited unexpectedly without an exception")
+            return
+        logger.exception("Token import worker task crashed", exc_info=exc)
 
     async def _run(self) -> None:
         while not self._stopping:
-            job: TokenImportJobLease | None = None
             try:
-                job = self._submitted_jobs.get_nowait()
-            except asyncio.QueueEmpty:
-                job = None
-
-            if job is None:
-                job = await claim_next_token_import_job(stale_after_seconds=self._stale_after_seconds)
-            if job is None:
-                self._wake_event.clear()
-                if not self._submitted_jobs.empty():
-                    self._wake_event.set()
-                    continue
                 try:
-                    await asyncio.wait_for(self._wake_event.wait(), timeout=self._poll_interval_seconds)
-                except asyncio.TimeoutError:
-                    pass
-                continue
+                    submitted_job_id = self._submitted_jobs.get_nowait()
+                except asyncio.QueueEmpty:
+                    submitted_job_id = None
 
-            logger.info(
-                "Processing token import job: job_id=%s processed=%s total=%s concurrency=%s respect_response_traffic=%s",
-                job.id,
-                job.processed_count,
-                job.total_count,
-                max(1, min(_import_job_max_concurrency(), job.total_count - job.processed_count or 1)),
-                _import_job_respect_response_traffic(),
-            )
-            await process_token_import_job(job, response_traffic=self._response_traffic)
+                job: TokenImportJobLease | None = None
+                if submitted_job_id is not None:
+                    job = await claim_token_import_job(submitted_job_id)
+                if job is None:
+                    job = await claim_next_token_import_job(stale_after_seconds=self._stale_after_seconds)
+                if job is None:
+                    self._wake_event.clear()
+                    if not self._submitted_jobs.empty():
+                        self._wake_event.set()
+                        continue
+                    try:
+                        await asyncio.wait_for(self._wake_event.wait(), timeout=self._poll_interval_seconds)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+
+                logger.info(
+                    "Processing token import job: job_id=%s processed=%s total=%s concurrency=%s respect_response_traffic=%s",
+                    job.id,
+                    job.processed_count,
+                    job.total_count,
+                    max(1, min(_import_job_max_concurrency(), job.total_count - job.processed_count or 1)),
+                    _import_job_respect_response_traffic(),
+                )
+                await process_token_import_job(job, response_traffic=self._response_traffic)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Token import worker loop failed; retrying after backoff")
+                if self._stopping:
+                    break
+                await asyncio.sleep(min(self._poll_interval_seconds, 1.0))

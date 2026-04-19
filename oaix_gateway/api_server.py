@@ -1226,7 +1226,9 @@ def create_app() -> FastAPI:
                 detail="Body must be a token object, an array of token objects, or {'tokens': [...]}",
             )
         worker = getattr(http_request.app.state, "token_import_worker", None)
-        job = await create_token_import_job(payloads, start_immediately=worker is not None)
+        if worker is not None:
+            await worker.start()
+        job = await create_token_import_job(payloads)
         if worker is not None:
             worker.submit(job)
         return {"job": asdict(job_state_from_lease(job))}
@@ -1236,6 +1238,9 @@ def create_app() -> FastAPI:
         job_id: int,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
+        worker = getattr(app.state, "token_import_worker", None)
+        if worker is not None:
+            await worker.start()
         job = await get_token_import_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Import job not found")

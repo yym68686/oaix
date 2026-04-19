@@ -492,7 +492,11 @@ async def upsert_token_payload(
 
 async def get_token_selection_settings() -> TokenSelectionSettings:
     async with get_read_session() as session:
-        setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY)
+        # Match the import-job read path and avoid AsyncSession.get() with autobegin disabled.
+        result = await session.execute(
+            select(GatewaySetting).where(GatewaySetting.key == TOKEN_SELECTION_SETTING_KEY).limit(1)
+        )
+        setting = result.scalars().first()
         return _build_token_selection_settings(setting)
 
 
