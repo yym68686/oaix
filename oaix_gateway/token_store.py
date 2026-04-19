@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 from sqlalchemy import delete, func, nullsfirst, or_, select, text
 
-from .database import CodexToken, GatewaySetting, close_database, get_session, init_db, utcnow
+from .database import CodexToken, GatewaySetting, close_database, get_read_session, get_session, init_db, utcnow
 from .token_identity import (
     collect_refresh_token_aliases,
     group_rows_by_refresh_token_history,
@@ -491,7 +491,7 @@ async def upsert_token_payload(
 
 
 async def get_token_selection_settings() -> TokenSelectionSettings:
-    async with get_session() as session:
+    async with get_read_session() as session:
         setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY)
         return _build_token_selection_settings(setting)
 
@@ -659,7 +659,7 @@ async def mark_token_error(
 
 async def get_token_counts() -> TokenCounts:
     now = utcnow()
-    async with get_session() as session:
+    async with get_read_session() as session:
         total_result = await session.execute(
             select(func.count()).select_from(CodexToken).where(*_canonical_token_filters())
         )
@@ -696,7 +696,7 @@ async def get_token_counts() -> TokenCounts:
 
 
 async def list_token_rows(limit: int = 100) -> list[CodexToken]:
-    async with get_session() as session:
+    async with get_read_session() as session:
         stmt = (
             select(CodexToken)
             .where(*_canonical_token_filters())

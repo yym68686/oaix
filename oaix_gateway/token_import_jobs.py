@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 from sqlalchemy import and_, or_, select
 
-from .database import TokenImportJob, get_session, utcnow
+from .database import TokenImportJob, get_read_session, get_session, utcnow
 from .token_store import upsert_token_payload
 
 
@@ -212,7 +212,7 @@ async def create_token_import_job(payloads: list[Any], *, start_immediately: boo
 
 
 async def get_token_import_job(job_id: int) -> TokenImportJobState | None:
-    async with get_session() as session:
+    async with get_read_session() as session:
         job = await session.get(TokenImportJob, int(job_id))
         if job is None:
             return None

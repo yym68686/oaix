@@ -1,3 +1,4 @@
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -125,6 +126,7 @@ def get_engine():
         _engine = create_async_engine(
             normalize_database_url(),
             pool_pre_ping=True,
+            pool_reset_on_return="rollback",
         )
     return _engine
 
@@ -135,9 +137,19 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
         _session_factory = async_sessionmaker(
             get_engine(),
             class_=AsyncSession,
+            autobegin=False,
             expire_on_commit=False,
         )
     return _session_factory
+
+
+async def _close_session(session: AsyncSession) -> None:
+    close_task = asyncio.create_task(session.close(), name="oaix-db-session-close")
+    try:
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        await close_task
+        raise
 
 
 @asynccontextmanager
@@ -146,7 +158,14 @@ async def get_session() -> AsyncIterator[AsyncSession]:
     try:
         yield session
     finally:
-        await session.close()
+        await _close_session(session)
+
+
+@asynccontextmanager
+async def get_read_session() -> AsyncIterator[AsyncSession]:
+    async with get_session() as session:
+        async with session.begin():
+            yield session
 
 
 async def init_db() -> None:

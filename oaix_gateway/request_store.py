@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
 
-from .database import GatewayRequestLog, get_session, utcnow
+from .database import GatewayRequestLog, get_read_session, get_session, utcnow
 
 
 @dataclass(frozen=True)
@@ -222,7 +222,7 @@ async def finalize_request_log(
 
 
 async def get_request_log_summary() -> RequestLogSummary:
-    async with get_session() as session:
+    async with get_read_session() as session:
         total_result = await session.execute(select(func.count()).select_from(GatewayRequestLog))
         success_result = await session.execute(
             select(func.count()).select_from(GatewayRequestLog).where(GatewayRequestLog.success.is_(True))
@@ -255,7 +255,7 @@ async def get_request_log_summary() -> RequestLogSummary:
 
 
 async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
-    async with get_session() as session:
+    async with get_read_session() as session:
         stmt = (
             select(GatewayRequestLog)
             .order_by(GatewayRequestLog.started_at.desc(), GatewayRequestLog.id.desc())
@@ -299,7 +299,7 @@ async def get_request_costs_by_account(account_ids: list[str] | set[str] | tuple
     if not resolved_account_ids:
         return {}
 
-    async with get_session() as session:
+    async with get_read_session() as session:
         result = await session.execute(_build_request_account_costs_stmt(account_ids=resolved_account_ids))
         rows = result.all()
     return {
@@ -318,7 +318,7 @@ async def get_request_log_analytics(*, hours: int = 24, bucket_minutes: int = 60
     first_bucket = _floor_bucket_start(since, bucket_minutes=effective_bucket_minutes)
     last_bucket = _floor_bucket_start(now, bucket_minutes=effective_bucket_minutes)
 
-    async with get_session() as session:
+    async with get_read_session() as session:
         bucket_stmt = (
             select(
                 GatewayRequestLog.started_at,
