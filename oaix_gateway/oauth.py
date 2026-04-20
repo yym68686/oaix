@@ -176,14 +176,21 @@ class CodexOAuthManager:
             "expires_at": expires_at,
         }
 
-    async def get_access_token(self, token_row: CodexToken, client: httpx.AsyncClient) -> tuple[str, bool]:
+    async def get_access_token(
+        self,
+        token_row: CodexToken,
+        client: httpx.AsyncClient,
+        *,
+        force_refresh: bool = False,
+        reactivate_on_refresh: bool = True,
+    ) -> tuple[str, bool]:
         lock = self._lock_for(token_row.id)
         async with lock:
             cache_entry = self._cache.get(token_row.id) or {}
-            if self._access_token_is_valid(cache_entry.get("access_token"), cache_entry.get("expires_at")):
+            if not force_refresh and self._access_token_is_valid(cache_entry.get("access_token"), cache_entry.get("expires_at")):
                 return str(cache_entry["access_token"]), False
 
-            if self._access_token_is_valid(token_row.access_token, token_row.expires_at):
+            if not force_refresh and self._access_token_is_valid(token_row.access_token, token_row.expires_at):
                 self._cache[token_row.id] = {
                     "access_token": token_row.access_token,
                     "refresh_token": token_row.refresh_token,
@@ -198,6 +205,7 @@ class CodexOAuthManager:
                 access_token=refreshed["access_token"],
                 refresh_token=next_refresh_token,
                 expires_at=refreshed.get("expires_at"),
+                reactivate=reactivate_on_refresh,
             )
             self._cache[token_row.id] = {
                 "access_token": refreshed["access_token"],

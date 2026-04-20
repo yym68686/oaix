@@ -555,6 +555,7 @@ async def update_token_refresh_state(
     access_token: str,
     refresh_token: str | None,
     expires_at: datetime | None,
+    reactivate: bool = True,
 ) -> None:
     async with get_session() as session:
         async with session.begin():
@@ -576,9 +577,10 @@ async def update_token_refresh_state(
             )
             token.last_refresh_at = utcnow()
             token.expires_at = expires_at
-            token.is_active = True
-            token.cooldown_until = None
-            token.last_error = None
+            if reactivate:
+                token.is_active = True
+                token.cooldown_until = None
+                token.last_error = None
             token.updated_at = utcnow()
             await _repair_duplicate_token_histories_in_session(session)
 
@@ -709,6 +711,21 @@ async def list_token_rows(limit: int = 100) -> list[CodexToken]:
         )
         result = await session.execute(stmt)
         return result.scalars().all()
+
+
+async def get_token_row(token_id: int) -> CodexToken | None:
+    async with get_read_session() as session:
+        current_id: int | None = int(token_id)
+        visited: set[int] = set()
+        while current_id is not None and current_id not in visited:
+            visited.add(current_id)
+            token = await session.get(CodexToken, current_id)
+            if token is None:
+                return None
+            if token.merged_into_token_id is None:
+                return token
+            current_id = token.merged_into_token_id
+    return None
 
 
 async def list_tokens(limit: int = 100) -> list[TokenStatus]:

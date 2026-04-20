@@ -42,6 +42,7 @@ from .token_store import (
     TokenSelectionSettings,
     claim_next_active_token,
     delete_token,
+    get_token_row,
     get_token_counts,
     get_token_selection_settings,
     list_token_rows,
@@ -56,6 +57,7 @@ from .usage_cost import UsageMetrics, extract_usage_metrics
 
 logger = logging.getLogger("oaix.gateway")
 WEB_DIR = Path(__file__).resolve().parent / "web"
+ADMIN_TOKEN_PROBE_INPUT = "say test"
 RESPONSES_STREAM_PREFLIGHT_EVENTS = frozenset(
     {
         "response.created",
@@ -393,6 +395,10 @@ def _sanitize_codex_payload(payload: dict[str, Any], *, compact: bool = False) -
         payload.pop("store", None)
     payload.setdefault("instructions", "")
     return payload
+
+
+def _admin_token_probe_model() -> str:
+    return _normalize_optional_text(os.getenv("ADMIN_TOKEN_PROBE_MODEL")) or "gpt-5.4-mini"
 
 
 def _decode_error_body(raw: bytes) -> str:
@@ -853,6 +859,161 @@ def _usage_finalize_kwargs(usage_metrics: UsageMetrics | None) -> dict[str, Any]
     }
 
 
+async def _probe_token_with_latest_access_token(
+    app: FastAPI,
+    *,
+    http_request: Request,
+    token_row: Any,
+) -> dict[str, Any]:
+    client: httpx.AsyncClient = app.state.http_client
+    oauth_manager: CodexOAuthManager = app.state.oauth_manager
+    probe_request = ResponsesRequest(
+        model=_admin_token_probe_model(),
+        input=ADMIN_TOKEN_PROBE_INPUT,
+        stream=False,
+    )
+
+    try:
+        access_token, _ = await oauth_manager.get_access_token(
+            token_row,
+            client,
+            force_refresh=True,
+            reactivate_on_refresh=False,
+        )
+    except HTTPException as exc:
+        oauth_manager.invalidate(token_row.id)
+        detail = str(getattr(exc, "detail", "") or exc)
+        if is_permanently_invalid_refresh_token_error(exc):
+            await mark_token_error(
+                token_row.id,
+                detail,
+                deactivate=True,
+                clear_access_token=True,
+            )
+            return {
+                "id": token_row.id,
+                "outcome": "disabled",
+                "status_code": getattr(exc, "status_code", 500),
+                "message": "测试失败：refresh token 已失效，仍判定为真实封禁。",
+                "detail": detail,
+                "probe_model": probe_request.model,
+                "probe_input": ADMIN_TOKEN_PROBE_INPUT,
+            }
+        if getattr(exc, "status_code", None) in (401, 403):
+            await mark_token_error(
+                token_row.id,
+                detail,
+                clear_access_token=True,
+            )
+            return {
+                "id": token_row.id,
+                "outcome": "inconclusive",
+                "status_code": getattr(exc, "status_code", 500),
+                "message": f"测试未得出结论：刷新最新 access token 失败（{getattr(exc, 'status_code', 500)}），状态未恢复。",
+                "detail": detail,
+                "probe_model": probe_request.model,
+                "probe_input": ADMIN_TOKEN_PROBE_INPUT,
+            }
+        return {
+            "id": token_row.id,
+            "outcome": "inconclusive",
+            "status_code": getattr(exc, "status_code", 500),
+            "message": f"测试未得出结论：刷新最新 access token 时返回 {getattr(exc, 'status_code', 500)}，状态未恢复。",
+            "detail": detail,
+            "probe_model": probe_request.model,
+            "probe_input": ADMIN_TOKEN_PROBE_INPUT,
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "id": token_row.id,
+            "outcome": "inconclusive",
+            "status_code": 502,
+            "message": f"测试未得出结论：刷新最新 access token 时发生 {type(exc).__name__}，状态未恢复。",
+            "detail": str(exc) or type(exc).__name__,
+            "probe_model": probe_request.model,
+            "probe_input": ADMIN_TOKEN_PROBE_INPUT,
+        }
+
+    try:
+        proxy_result = await _proxy_request_with_token(
+            client,
+            http_request,
+            probe_request,
+            access_token=access_token,
+            account_id=token_row.account_id,
+            compact=True,
+        )
+        await mark_token_success(token_row.id)
+        return {
+            "id": token_row.id,
+            "outcome": "reactivated",
+            "status_code": proxy_result.status_code,
+            "message": "测试成功：使用最新 access token 请求上游成功，这把 key 不是永久封禁，已恢复可用。",
+            "detail": None,
+            "probe_model": probe_request.model,
+            "probe_input": ADMIN_TOKEN_PROBE_INPUT,
+            "response_model": proxy_result.model_name,
+        }
+    except HTTPException as exc:
+        status_code = getattr(exc, "status_code", 500)
+        detail = str(getattr(exc, "detail", "") or exc)
+        cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
+        if cooldown_seconds is not None:
+            await mark_token_error(
+                token_row.id,
+                detail,
+                cooldown_seconds=cooldown_seconds,
+            )
+            return {
+                "id": token_row.id,
+                "outcome": "cooling",
+                "status_code": status_code,
+                "message": f"测试结果：上游返回额度限制，这把 key 不是永久封禁，已转为冷却 {cooldown_seconds} 秒。",
+                "detail": detail,
+                "cooldown_seconds": cooldown_seconds,
+                "probe_model": probe_request.model,
+                "probe_input": ADMIN_TOKEN_PROBE_INPUT,
+            }
+
+        if _is_permanent_account_disable_error(status_code, detail) or status_code in (401, 403):
+            oauth_manager.invalidate(token_row.id)
+            await mark_token_error(
+                token_row.id,
+                detail,
+                deactivate=True,
+                clear_access_token=True,
+            )
+            return {
+                "id": token_row.id,
+                "outcome": "disabled",
+                "status_code": status_code,
+                "message": f"测试失败：使用最新 access token 请求上游后仍返回鉴权/停用错误（{status_code}），仍判定为真实封禁。",
+                "detail": detail,
+                "probe_model": probe_request.model,
+                "probe_input": ADMIN_TOKEN_PROBE_INPUT,
+            }
+
+        return {
+            "id": token_row.id,
+            "outcome": "inconclusive",
+            "status_code": status_code,
+            "message": f"测试未得出结论：上游返回 {status_code}，状态未恢复。",
+            "detail": detail,
+            "probe_model": probe_request.model,
+            "probe_input": ADMIN_TOKEN_PROBE_INPUT,
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "id": token_row.id,
+            "outcome": "inconclusive",
+            "status_code": 502,
+            "message": f"测试未得出结论：上游请求发生 {type(exc).__name__}，状态未恢复。",
+            "detail": str(exc) or type(exc).__name__,
+            "probe_model": probe_request.model,
+            "probe_input": ADMIN_TOKEN_PROBE_INPUT,
+        }
+
+
 async def _finalize_stream_request_log(
     *,
     request_log_id: int,
@@ -1174,6 +1335,21 @@ def create_app() -> FastAPI:
             "cooldown_until": token.cooldown_until,
             "counts": asdict(counts),
         }
+
+    @app.post("/admin/tokens/{token_id}/probe")
+    async def probe_token_route(
+        http_request: Request,
+        token_id: int,
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        token_row = await get_token_row(token_id)
+        if token_row is None:
+            raise HTTPException(status_code=404, detail="Token not found")
+        return await _probe_token_with_latest_access_token(
+            http_request.app,
+            http_request=http_request,
+            token_row=token_row,
+        )
 
     @app.delete("/admin/tokens/{token_id}")
     async def delete_token_route(

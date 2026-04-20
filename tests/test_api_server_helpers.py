@@ -18,6 +18,7 @@ from oaix_gateway.api_server import (
     _normalize_responses_compact_upstream_url,
     _proxy_request_with_token,
     _prime_responses_upstream_stream,
+    _probe_token_with_latest_access_token,
     _responses_failure_http_exception,
     ResponsesRequest,
     _serialize_admin_token_item,
@@ -1113,6 +1114,218 @@ def test_wrap_streaming_body_iterator_runs_cleanup_on_close() -> None:
     asyncio.run(runner())
 
     assert events == ["upstream_closed", "cleanup_ran"]
+
+
+def test_probe_token_with_latest_access_token_reactivates_on_success(monkeypatch) -> None:
+    app = SimpleNamespace(state=SimpleNamespace(http_client=object(), oauth_manager=None))
+    token_row = CodexToken(
+        id=7,
+        account_id="acct_123",
+        refresh_token="refresh-token",
+        is_active=False,
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/admin/tokens/7/probe",
+            "headers": [],
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    calls: dict[str, object] = {}
+
+    class DummyOAuthManager:
+        def __init__(self) -> None:
+            self.invalidated: list[int] = []
+
+        async def get_access_token(
+            self,
+            token,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            calls["oauth"] = {
+                "token_id": token.id,
+                "force_refresh": force_refresh,
+                "reactivate_on_refresh": reactivate_on_refresh,
+            }
+            return "fresh-access-token", True
+
+        def invalidate(self, token_id: int) -> None:
+            self.invalidated.append(token_id)
+
+    app.state.oauth_manager = DummyOAuthManager()
+
+    async def fake_proxy_request_with_token(
+        client,
+        http_request,
+        request_data,
+        *,
+        access_token: str,
+        account_id: str | None,
+        compact: bool = False,
+    ):
+        calls["proxy"] = {
+            "access_token": access_token,
+            "account_id": account_id,
+            "compact": compact,
+            "model": request_data.model,
+            "input": request_data.input,
+        }
+        return SimpleNamespace(
+            status_code=200,
+            model_name="gpt-5.4-mini",
+        )
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        calls["success_token_id"] = token_id
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        raise AssertionError("mark_token_error should not run on a successful probe")
+
+    monkeypatch.setattr("oaix_gateway.api_server._proxy_request_with_token", fake_proxy_request_with_token)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    result = asyncio.run(
+        _probe_token_with_latest_access_token(
+            app,
+            http_request=request,
+            token_row=token_row,
+        )
+    )
+
+    assert calls["oauth"] == {
+        "token_id": 7,
+        "force_refresh": True,
+        "reactivate_on_refresh": False,
+    }
+    assert calls["proxy"] == {
+        "access_token": "fresh-access-token",
+        "account_id": "acct_123",
+        "compact": True,
+        "model": "gpt-5.4-mini",
+        "input": "say test",
+    }
+    assert calls["success_token_id"] == 7
+    assert result["outcome"] == "reactivated"
+    assert result["status_code"] == 200
+    assert "已恢复可用" in result["message"]
+
+
+def test_probe_token_with_latest_access_token_keeps_disabled_on_auth_failure(monkeypatch) -> None:
+    app = SimpleNamespace(state=SimpleNamespace(http_client=object(), oauth_manager=None))
+    token_row = CodexToken(
+        id=8,
+        account_id="acct_456",
+        refresh_token="refresh-token",
+        is_active=False,
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/admin/tokens/8/probe",
+            "headers": [],
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    calls: dict[str, object] = {}
+
+    class DummyOAuthManager:
+        def __init__(self) -> None:
+            self.invalidated: list[int] = []
+
+        async def get_access_token(
+            self,
+            token,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            calls["oauth"] = {
+                "token_id": token.id,
+                "force_refresh": force_refresh,
+                "reactivate_on_refresh": reactivate_on_refresh,
+            }
+            return "fresh-access-token", True
+
+        def invalidate(self, token_id: int) -> None:
+            self.invalidated.append(token_id)
+
+    app.state.oauth_manager = DummyOAuthManager()
+
+    async def fake_proxy_request_with_token(
+        client,
+        http_request,
+        request_data,
+        *,
+        access_token: str,
+        account_id: str | None,
+        compact: bool = False,
+    ):
+        raise HTTPException(status_code=403, detail='{"error":{"code":"account_deactivated"}}')
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        raise AssertionError("mark_token_success should not run when the probe still auth-fails")
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        calls["error"] = {
+            "token_id": token_id,
+            "message": message,
+            "deactivate": deactivate,
+            "cooldown_seconds": cooldown_seconds,
+            "clear_access_token": clear_access_token,
+        }
+
+    monkeypatch.setattr("oaix_gateway.api_server._proxy_request_with_token", fake_proxy_request_with_token)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    result = asyncio.run(
+        _probe_token_with_latest_access_token(
+            app,
+            http_request=request,
+            token_row=token_row,
+        )
+    )
+
+    assert calls["oauth"] == {
+        "token_id": 8,
+        "force_refresh": True,
+        "reactivate_on_refresh": False,
+    }
+    assert app.state.oauth_manager.invalidated == [8]
+    assert calls["error"] == {
+        "token_id": 8,
+        "message": '{"error":{"code":"account_deactivated"}}',
+        "deactivate": True,
+        "cooldown_seconds": None,
+        "clear_access_token": True,
+    }
+    assert result["outcome"] == "disabled"
+    assert result["status_code"] == 403
+    assert "真实封禁" in result["message"]
 
 
 def test_codex_token_refresh_token_index_is_declared() -> None:

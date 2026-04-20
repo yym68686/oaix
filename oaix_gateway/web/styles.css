@@ -1716,6 +1716,16 @@ button {
   background: color-mix(in oklab, var(--available) 12%, transparent);
 }
 
+.token-action-button--probe {
+  border-color: color-mix(in oklab, var(--available) 38%, var(--border-panel));
+  color: color-mix(in oklab, var(--available) 62%, var(--ink));
+}
+
+.token-action-button--probe:hover,
+.token-action-button--probe:focus-visible {
+  background: color-mix(in oklab, var(--available) 10%, transparent);
+}
+
 .token-action-button--delete {
   border-color: var(--border-feedback-error);
   color: var(--feedback-error-fg);

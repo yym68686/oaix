@@ -519,11 +519,26 @@ function renderTokenActionButtons(item) {
   const nextActive = !Boolean(item?.is_active);
   const pendingKind = getTokenActionPendingKind(tokenId);
   const pending = Boolean(pendingKind);
+  const probeLabel = pendingKind === "probe" ? "测试中" : "测试";
   const toggleLabel = pendingKind === "toggle" ? "处理中" : nextActive ? "启用" : "停用";
   const deleteLabel = pendingKind === "delete" ? "删除中" : "删除";
   const tone = nextActive ? "enable" : "disable";
+  const probeButton = !Boolean(item?.is_active)
+    ? `
+      <button
+        class="token-action-button token-action-button--probe"
+        type="button"
+        data-token-probe="true"
+        data-token-id="${tokenId}"
+        ${pending ? "disabled" : ""}
+      >
+        ${probeLabel}
+      </button>
+    `
+    : "";
   return `
     <div class="token-card__actions">
+      ${probeButton}
       <button
         class="token-action-button token-action-button--${tone}"
         type="button"
@@ -1653,6 +1668,36 @@ async function toggleTokenActivation(tokenId, nextActive) {
   }
 }
 
+async function probeToken(tokenId) {
+  const resolvedTokenId = Number(tokenId);
+  if (!Number.isFinite(resolvedTokenId) || isTokenActionPending(resolvedTokenId)) {
+    return;
+  }
+
+  state.tokenActionPendingKinds.set(resolvedTokenId, "probe");
+  renderTokenList(state.tokenItems);
+
+  try {
+    const data = await fetchJson(`/admin/tokens/${resolvedTokenId}/probe`, {
+      method: "POST",
+      headers: authHeaders(),
+    });
+    await loadHealth();
+    await loadTokens();
+    elements.listNote.textContent = data?.message || "测试完成";
+  } catch (error) {
+    elements.listNote.textContent =
+      error.status === 401 ? "需要输入 Service API Key 才能测试禁用 key" : `测试失败：${error.message}`;
+    if (error.status === 401) {
+      await loadTokens();
+    }
+    throw error;
+  } finally {
+    state.tokenActionPendingKinds.delete(resolvedTokenId);
+    renderTokenList(state.tokenItems);
+  }
+}
+
 async function deleteToken(tokenId) {
   const resolvedTokenId = Number(tokenId);
   if (!Number.isFinite(resolvedTokenId) || isTokenActionPending(resolvedTokenId)) {
@@ -1958,6 +2003,13 @@ elements.tokenSelectionButtons.forEach((button) => {
 
 elements.tokenList.addEventListener("click", async (event) => {
   if (!(event.target instanceof Element)) {
+    return;
+  }
+  const probeButton = event.target.closest("[data-token-probe]");
+  if (probeButton instanceof HTMLElement) {
+    try {
+      await probeToken(probeButton.dataset.tokenId);
+    } catch {}
     return;
   }
   const toggleButton = event.target.closest("[data-token-toggle]");
