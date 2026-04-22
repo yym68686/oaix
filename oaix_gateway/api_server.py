@@ -65,6 +65,45 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 ADMIN_TOKEN_PROBE_INPUT = "say test"
 DEFAULT_IMAGES_MAIN_MODEL = "gpt-5.4-mini"
 DEFAULT_IMAGES_TOOL_MODEL = "gpt-image-2"
+RESPONSES_IMAGE_COMPAT_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL})
+RESPONSES_IMAGE_TOOL_TEXT_FIELDS = (
+    "size",
+    "quality",
+    "background",
+    "output_format",
+    "input_fidelity",
+    "moderation",
+)
+RESPONSES_IMAGE_TOOL_INT_FIELDS = (
+    "output_compression",
+    "partial_images",
+)
+CHAT_COMPLETIONS_RESPONSES_PASSTHROUGH_FIELDS = frozenset(
+    {
+        "model",
+        "stream",
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "parallel_tool_calls",
+        "reasoning",
+        "tools",
+        "tool_choice",
+        "store",
+        "metadata",
+        "previous_response_id",
+        "size",
+        "quality",
+        "background",
+        "output_format",
+        "input_fidelity",
+        "moderation",
+        "output_compression",
+        "partial_images",
+    }
+)
+CHAT_COMPLETIONS_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 RESPONSES_STREAM_PREFLIGHT_EVENTS = frozenset(
     {
         "response.created",
@@ -113,6 +152,14 @@ RESPONSES_FAILURE_STATUS_BY_TYPE = {
 class ResponsesRequest(BaseModel):
     model: str
     input: Any
+    stream: bool | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ChatCompletionsRequest(BaseModel):
+    model: str
+    messages: list[Any]
     stream: bool | None = None
 
     model_config = ConfigDict(extra="allow")
@@ -440,10 +487,16 @@ def _build_upstream_headers(http_request: Request, access_token: str, account_id
     return headers
 
 
-def _sanitize_codex_payload(payload: dict[str, Any], *, compact: bool = False) -> dict[str, Any]:
+def _sanitize_codex_payload(
+    payload: dict[str, Any],
+    *,
+    compact: bool = False,
+    preserve_previous_response_id: bool = False,
+) -> dict[str, Any]:
     payload.pop("max_output_tokens", None)
     payload.pop("response_format", None)
-    payload.pop("previous_response_id", None)
+    if not preserve_previous_response_id:
+        payload.pop("previous_response_id", None)
     payload.pop("prompt_cache_retention", None)
     payload.pop("safety_identifier", None)
     if compact:
@@ -517,6 +570,295 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _normalize_chat_message_role(value: Any) -> str | None:
+    role = _normalize_optional_text(value)
+    if role is None:
+        return None
+    normalized = role.lower()
+    if normalized in {"system", "developer", "user", "assistant", "tool"}:
+        return normalized
+    return None
+
+
+def _chat_text_part_type_for_role(role: str) -> str:
+    return "output_text" if role == "assistant" else "input_text"
+
+
+def _extract_chat_image_url(item: Any) -> str | None:
+    if isinstance(item, str):
+        return _normalize_optional_text(item)
+    if not isinstance(item, dict):
+        return None
+
+    image_url = item.get("image_url")
+    if isinstance(image_url, dict):
+        candidate = _normalize_optional_text(image_url.get("url"))
+        if candidate is not None:
+            return candidate
+    candidate = _normalize_optional_text(image_url)
+    if candidate is not None:
+        return candidate
+    return _normalize_optional_text(item.get("url"))
+
+
+def _append_chat_text_and_markdown_images(
+    content_parts: list[dict[str, Any]],
+    text: str,
+    *,
+    text_part_type: str,
+) -> None:
+    cursor = 0
+    matched_any = False
+
+    for match in CHAT_COMPLETIONS_MARKDOWN_IMAGE_RE.finditer(text):
+        image_url = _normalize_optional_text(match.group(1))
+        if image_url is None:
+            continue
+
+        matched_any = True
+        if match.start() > cursor:
+            prefix = text[cursor:match.start()]
+            if prefix:
+                content_parts.append({"type": text_part_type, "text": prefix})
+        content_parts.append({"type": "input_image", "image_url": image_url})
+        cursor = match.end()
+
+    if cursor < len(text):
+        suffix = text[cursor:]
+        if suffix:
+            content_parts.append({"type": text_part_type, "text": suffix})
+    elif not matched_any and text:
+        content_parts.append({"type": text_part_type, "text": text})
+
+
+def _append_chat_content_parts(
+    content_parts: list[dict[str, Any]],
+    content_value: Any,
+    *,
+    role: str,
+) -> None:
+    text_part_type = _chat_text_part_type_for_role(role)
+
+    if isinstance(content_value, str):
+        _append_chat_text_and_markdown_images(content_parts, content_value, text_part_type=text_part_type)
+        return
+
+    if not isinstance(content_value, list):
+        return
+
+    for item in content_value:
+        if isinstance(item, str):
+            _append_chat_text_and_markdown_images(content_parts, item, text_part_type=text_part_type)
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        item_type = _normalize_optional_text(item.get("type"))
+        if item_type in {"text", "input_text", "output_text"}:
+            text_value = str(item.get("text") or "")
+            if text_value:
+                _append_chat_text_and_markdown_images(content_parts, text_value, text_part_type=text_part_type)
+            continue
+
+        if item_type in {"image_url", "input_image"}:
+            image_url = _extract_chat_image_url(item)
+            if image_url is not None:
+                content_parts.append({"type": "input_image", "image_url": image_url})
+            continue
+
+        if item_type == "input_audio" and role == "user":
+            content_parts.append(copy.deepcopy(item))
+
+
+def _stringify_chat_tool_output(content_value: Any) -> str:
+    if isinstance(content_value, str):
+        return content_value
+
+    if isinstance(content_value, list):
+        text_parts: list[str] = []
+        for item in content_value:
+            if isinstance(item, str):
+                text_parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = _normalize_optional_text(item.get("type"))
+            if item_type in {"text", "input_text", "output_text"} and item.get("text") is not None:
+                text_parts.append(str(item.get("text")))
+        if text_parts:
+            return "\n".join(text_parts)
+
+    try:
+        return json.dumps(content_value, ensure_ascii=False)
+    except Exception:
+        return str(content_value or "")
+
+
+def _chat_messages_to_responses_input(messages: list[Any]) -> list[dict[str, Any]]:
+    input_items: list[dict[str, Any]] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = _normalize_chat_message_role(message.get("role"))
+        if role is None:
+            continue
+
+        if role == "tool":
+            tool_call_id = _normalize_optional_text(message.get("tool_call_id"))
+            if tool_call_id is None:
+                continue
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": tool_call_id,
+                    "output": _stringify_chat_tool_output(message.get("content")),
+                }
+            )
+            continue
+
+        responses_role = "developer" if role == "system" else role
+        content_parts: list[dict[str, Any]] = []
+        _append_chat_content_parts(content_parts, message.get("content"), role=role)
+        input_items.append(
+            {
+                "type": "message",
+                "role": responses_role,
+                "content": content_parts,
+            }
+        )
+
+        if role != "assistant":
+            continue
+
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            if _normalize_optional_text(tool_call.get("type")) != "function":
+                continue
+            function_obj = tool_call.get("function")
+            if not isinstance(function_obj, dict):
+                continue
+            name = _normalize_optional_text(function_obj.get("name"))
+            if name is None:
+                continue
+            input_items.append(
+                {
+                    "type": "function_call",
+                    "call_id": _normalize_optional_text(tool_call.get("id")) or f"call_{uuid.uuid4().hex}",
+                    "name": name,
+                    "arguments": function_obj.get("arguments") or "",
+                }
+            )
+
+    return input_items
+
+
+def _chat_completions_request_to_responses_request(request_data: ChatCompletionsRequest) -> ResponsesRequest:
+    raw_payload = request_data.model_dump(exclude_unset=True)
+    messages = raw_payload.pop("messages", [])
+    payload = {
+        key: copy.deepcopy(value)
+        for key, value in raw_payload.items()
+        if key in CHAT_COMPLETIONS_RESPONSES_PASSTHROUGH_FIELDS
+    }
+    payload["model"] = request_data.model
+    payload["input"] = _chat_messages_to_responses_input(messages if isinstance(messages, list) else [])
+    if request_data.stream is not None:
+        payload["stream"] = bool(request_data.stream)
+    return ResponsesRequest.model_validate(payload)
+
+
+def _is_responses_image_compat_model(model_name: Any) -> bool:
+    normalized = _normalize_optional_text(model_name)
+    if normalized is None:
+        return False
+    return normalized in RESPONSES_IMAGE_COMPAT_MODELS
+
+
+def _ensure_responses_image_generation_tool(payload: dict[str, Any]) -> dict[str, Any]:
+    tools_payload = payload.get("tools")
+    tools: list[Any] = []
+    image_tool: dict[str, Any] | None = None
+
+    if isinstance(tools_payload, list):
+        for item in tools_payload:
+            if isinstance(item, dict):
+                copied_item = copy.deepcopy(item)
+                if image_tool is None and _normalize_optional_text(copied_item.get("type")) == "image_generation":
+                    image_tool = copied_item
+                tools.append(copied_item)
+            else:
+                tools.append(copy.deepcopy(item))
+
+    if image_tool is None:
+        image_tool = {"type": "image_generation"}
+        tools.append(image_tool)
+
+    payload["tools"] = tools
+    return image_tool
+
+
+def _translate_responses_image_compat_payload(
+    payload: dict[str, Any],
+    *,
+    compact: bool,
+) -> tuple[dict[str, Any], str | None]:
+    requested_model = _normalize_optional_text(payload.get("model"))
+    if requested_model is None or not _is_responses_image_compat_model(requested_model):
+        return payload, None
+
+    if compact:
+        raise HTTPException(status_code=400, detail="gpt-image-2 is only supported on /v1/responses")
+
+    translated = copy.deepcopy(payload)
+    translated["model"] = DEFAULT_IMAGES_MAIN_MODEL
+
+    image_tool = _ensure_responses_image_generation_tool(translated)
+    image_tool["type"] = "image_generation"
+    image_tool["model"] = requested_model
+    image_tool.setdefault("action", "auto")
+
+    for field in RESPONSES_IMAGE_TOOL_TEXT_FIELDS:
+        value = _normalize_optional_text(translated.pop(field, None))
+        if value is not None:
+            image_tool[field] = value
+
+    for field in RESPONSES_IMAGE_TOOL_INT_FIELDS:
+        raw_value = translated.pop(field, None)
+        coerced = _coerce_int(raw_value)
+        if raw_value is not None and coerced is not None:
+            image_tool[field] = coerced
+
+    translated["tool_choice"] = {"type": "image_generation"}
+    return translated, requested_model
+
+
+def _apply_response_model_alias(payload: Any, model_alias: str | None) -> Any:
+    normalized_alias = _normalize_optional_text(model_alias)
+    if normalized_alias is None or not isinstance(payload, dict):
+        return payload
+
+    patched = copy.deepcopy(payload)
+    if "model" in patched or "model_name" in patched:
+        patched["model"] = normalized_alias
+        if "model_name" in patched:
+            patched["model_name"] = normalized_alias
+
+    response_payload = patched.get("response")
+    if isinstance(response_payload, dict):
+        response_payload["model"] = normalized_alias
+        if "model_name" in response_payload:
+            response_payload["model_name"] = normalized_alias
+
+    return patched
 
 
 async def _upload_file_to_data_url(upload: UploadFile) -> str:
@@ -1025,6 +1367,8 @@ async def _collect_responses_json_from_sse(
 ) -> tuple[dict[str, Any], datetime | None]:
     response_snapshot: dict[str, Any] | None = None
     output_text_parts: dict[tuple[int, int], list[str]] = {}
+    output_items_by_index: dict[int, dict[str, Any]] = {}
+    output_items_fallback: list[dict[str, Any]] = []
     first_token_at: datetime | None = None
 
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -1069,8 +1413,23 @@ async def _collect_responses_json_from_sse(
             if not isinstance(event_payload, dict):
                 continue
 
+            if event_type == "response.output_item.done":
+                _collect_responses_output_item_done(
+                    event_payload,
+                    output_items_by_index=output_items_by_index,
+                    output_items_fallback=output_items_fallback,
+                )
+                continue
+
             response_obj = event_payload.get("response")
             if isinstance(response_obj, dict):
+                if event_type == "response.completed":
+                    event_payload = _patch_completed_output_from_output_items(
+                        event_payload,
+                        output_items_by_index=output_items_by_index,
+                        output_items_fallback=output_items_fallback,
+                    )
+                    response_obj = event_payload.get("response")
                 if response_snapshot is None:
                     response_snapshot = {}
                 _merge_mapping(response_snapshot, response_obj)
@@ -1087,6 +1446,16 @@ async def _collect_responses_json_from_sse(
 
     if response_snapshot is None and not output_text_parts:
         raise HTTPException(status_code=502, detail="Upstream closed stream without data")
+
+    if response_snapshot is not None:
+        response_snapshot = _patch_completed_output_from_output_items(
+            {
+                "type": "response.completed",
+                "response": response_snapshot,
+            },
+            output_items_by_index=output_items_by_index,
+            output_items_fallback=output_items_fallback,
+        )["response"]
 
     return _finalize_collected_response(
         response_snapshot,
@@ -1249,6 +1618,298 @@ def _build_images_api_response(
     if usage_payload is not None:
         response["usage"] = copy.deepcopy(usage_payload)
     return response
+
+
+def _chat_completion_created_at(payload: Any) -> int:
+    created_at = _coerce_int(
+        _mapping_get(payload, "created")
+        or _mapping_get(payload, "created_at")
+        or _mapping_get(payload, "response", "created_at")
+        or _mapping_get(payload, "response", "created")
+    )
+    if created_at is None or created_at <= 0:
+        return int(utcnow().timestamp())
+    return created_at
+
+
+def _chat_completion_response_id(payload: Any) -> str:
+    for candidate in (
+        _mapping_get(payload, "id"),
+        _mapping_get(payload, "response", "id"),
+    ):
+        normalized = _normalize_optional_text(candidate)
+        if normalized is not None:
+            return normalized
+    return f"chatcmpl_{uuid.uuid4().hex}"
+
+
+def _chat_completion_tool_calls_from_output(output_items: Any) -> list[dict[str, Any]]:
+    if not isinstance(output_items, list):
+        return []
+
+    tool_calls: list[dict[str, Any]] = []
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        if _normalize_optional_text(item.get("type")) != "function_call":
+            continue
+
+        name = _normalize_optional_text(item.get("name"))
+        if name is None:
+            continue
+        tool_calls.append(
+            {
+                "id": _normalize_optional_text(item.get("call_id")) or f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": str(item.get("arguments") or ""),
+                },
+            }
+        )
+    return tool_calls
+
+
+def _chat_completion_message_from_response_payload(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    output_items = payload.get("output")
+    message_parts: list[str] = []
+
+    if isinstance(output_items, list):
+        for item in output_items:
+            if not isinstance(item, dict):
+                continue
+
+            item_type = _normalize_optional_text(item.get("type"))
+            if item_type == "message":
+                content_items = item.get("content")
+                if not isinstance(content_items, list):
+                    continue
+                text_parts: list[str] = []
+                for content_item in content_items:
+                    if not isinstance(content_item, dict):
+                        continue
+                    content_type = _normalize_optional_text(content_item.get("type"))
+                    if content_type in {"output_text", "input_text", "text"} and content_item.get("text") is not None:
+                        text_parts.append(str(content_item.get("text")))
+                if text_parts:
+                    message_parts.append("".join(text_parts))
+                continue
+
+            if item_type == "image_generation_call":
+                result_b64 = _normalize_optional_text(item.get("result"))
+                if result_b64 is None:
+                    continue
+                mime_type = _mime_type_from_output_format(_normalize_optional_text(item.get("output_format")))
+                message_parts.append(f"![image](data:{mime_type};base64,{result_b64})")
+
+    content = "\n\n".join(part for part in message_parts if part)
+    tool_calls = _chat_completion_tool_calls_from_output(output_items)
+
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content or None,
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        if not content:
+            message["content"] = None
+        return message, "tool_calls"
+    return message, "stop"
+
+
+def _chat_completion_usage_payload(payload: dict[str, Any], *, model_name: str | None) -> dict[str, Any] | None:
+    usage_metrics = extract_usage_metrics(payload, model_name=model_name)
+    if usage_metrics is None:
+        return None
+    return {
+        "prompt_tokens": usage_metrics.input_tokens,
+        "completion_tokens": usage_metrics.output_tokens,
+        "total_tokens": usage_metrics.total_tokens,
+    }
+
+
+def _build_chat_completions_response(
+    payload: dict[str, Any],
+    *,
+    request_model: str,
+) -> dict[str, Any]:
+    model_name = _extract_response_model_name(payload) or request_model
+    message, finish_reason = _chat_completion_message_from_response_payload(payload)
+    response = {
+        "id": _chat_completion_response_id(payload),
+        "object": "chat.completion",
+        "created": _chat_completion_created_at(payload),
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    usage_payload = _chat_completion_usage_payload(payload, model_name=model_name)
+    if usage_payload is not None:
+        response["usage"] = usage_payload
+    return response
+
+
+def _build_chat_completion_chunk_bytes(
+    *,
+    response_id: str,
+    created_at: int,
+    model_name: str,
+    delta: dict[str, Any],
+    finish_reason: str | None = None,
+) -> bytes:
+    payload = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created_at,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return b"data: " + json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n\n"
+
+
+async def _stream_responses_to_chat_completions(
+    body_iterator: AsyncIterator[bytes],
+    *,
+    request_model: str,
+) -> AsyncGenerator[bytes, None]:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text_buffer = ""
+    emitted_content = ""
+    role_sent = False
+    response_id = f"chatcmpl_{uuid.uuid4().hex}"
+    created_at = int(utcnow().timestamp())
+    model_name = request_model
+    output_items_by_index: dict[int, dict[str, Any]] = {}
+    output_items_fallback: list[dict[str, Any]] = []
+
+    async def emit_content_delta(content: str) -> AsyncGenerator[bytes, None]:
+        nonlocal role_sent, emitted_content
+        if not content:
+            return
+        delta: dict[str, Any] = {"content": content}
+        if not role_sent:
+            delta["role"] = "assistant"
+            role_sent = True
+        emitted_content += content
+        yield _build_chat_completion_chunk_bytes(
+            response_id=response_id,
+            created_at=created_at,
+            model_name=model_name,
+            delta=delta,
+        )
+
+    try:
+        async for chunk in body_iterator:
+            text_buffer += decoder.decode(chunk)
+            while True:
+                match = re.search(r"\r?\n\r?\n", text_buffer)
+                if not match:
+                    break
+
+                raw_event = text_buffer[:match.start()]
+                text_buffer = text_buffer[match.end():]
+                if not raw_event.strip():
+                    continue
+
+                event_type, event_payload = _extract_responses_stream_event(raw_event)
+                if event_type == "[DONE]":
+                    yield b"data: [DONE]\n\n"
+                    return
+
+                if isinstance(event_payload, dict):
+                    response_id = _chat_completion_response_id(event_payload)
+                    created_at = _chat_completion_created_at(event_payload)
+                    model_name = _extract_response_model_name(event_payload) or model_name
+
+                if event_type == "response.output_item.done":
+                    _collect_responses_output_item_done(
+                        event_payload,
+                        output_items_by_index=output_items_by_index,
+                        output_items_fallback=output_items_fallback,
+                    )
+                    continue
+
+                if event_type == "response.output_text.delta" and isinstance(event_payload, dict):
+                    delta_text = str(event_payload.get("delta") or "")
+                    async for content_chunk in emit_content_delta(delta_text):
+                        yield content_chunk
+                    continue
+
+                if event_type != "response.completed" or not isinstance(event_payload, dict):
+                    continue
+
+                patched_payload = _patch_completed_output_from_output_items(
+                    event_payload,
+                    output_items_by_index=output_items_by_index,
+                    output_items_fallback=output_items_fallback,
+                )
+                completed_response = patched_payload.get("response")
+                if not isinstance(completed_response, dict):
+                    completed_response = {}
+                message, finish_reason = _chat_completion_message_from_response_payload(completed_response)
+                final_content = str(message.get("content") or "")
+
+                if final_content:
+                    suffix = final_content
+                    if emitted_content and final_content.startswith(emitted_content):
+                        suffix = final_content[len(emitted_content):]
+                    async for content_chunk in emit_content_delta(suffix):
+                        yield content_chunk
+
+                if message.get("tool_calls"):
+                    tool_call_deltas = []
+                    for index, tool_call in enumerate(message["tool_calls"]):
+                        tool_call_delta = copy.deepcopy(tool_call)
+                        tool_call_delta["index"] = index
+                        tool_call_deltas.append(tool_call_delta)
+                    delta: dict[str, Any] = {"tool_calls": tool_call_deltas}
+                    if not role_sent:
+                        delta["role"] = "assistant"
+                        role_sent = True
+                    yield _build_chat_completion_chunk_bytes(
+                        response_id=response_id,
+                        created_at=created_at,
+                        model_name=model_name,
+                        delta=delta,
+                    )
+
+                if not role_sent:
+                    yield _build_chat_completion_chunk_bytes(
+                        response_id=response_id,
+                        created_at=created_at,
+                        model_name=model_name,
+                        delta={"role": "assistant"},
+                    )
+                    role_sent = True
+
+                yield _build_chat_completion_chunk_bytes(
+                    response_id=response_id,
+                    created_at=created_at,
+                    model_name=model_name,
+                    delta={},
+                    finish_reason=finish_reason,
+                )
+                yield b"data: [DONE]\n\n"
+                return
+        yield b"data: [DONE]\n\n"
+    finally:
+        close_iterator = getattr(body_iterator, "aclose", None)
+        if callable(close_iterator):
+            with suppress(Exception):
+                await close_iterator()
 
 
 async def _await_image_non_stream_chunk(
@@ -2642,6 +3303,33 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Import job not found")
         return {"job": asdict(job)}
 
+    @app.post("/v1/chat/completions")
+    async def chat_completions_route(
+        http_request: Request,
+        request_data: ChatCompletionsRequest,
+        _: None = Depends(verify_service_api_key),
+    ) -> Response:
+        async def proxy_call(
+            client: httpx.AsyncClient,
+            access_token: str,
+            account_id: str | None,
+        ) -> ProxyRequestResult:
+            return await _proxy_chat_completions_with_token(
+                client,
+                http_request,
+                request_data,
+                access_token=access_token,
+                account_id=account_id,
+            )
+
+        return await _execute_proxy_request_with_failover(
+            http_request,
+            endpoint="/v1/chat/completions",
+            request_model=request_data.model,
+            is_stream=bool(request_data.stream),
+            proxy_call=proxy_call,
+        )
+
     @app.post("/v1/responses")
     async def responses_route(
         http_request: Request,
@@ -2754,16 +3442,93 @@ async def _stream_upstream_response(
     *,
     stream_committed: bool,
     stream_capture: _ProxyStreamCapture | None = None,
+    response_model_alias: str | None = None,
 ) -> AsyncGenerator[bytes, None]:
+    if response_model_alias is None:
+        try:
+            for chunk in buffered_chunks:
+                if stream_capture is not None:
+                    stream_capture.feed(chunk)
+                yield chunk
+            async for chunk in upstream_iter:
+                if stream_capture is not None:
+                    stream_capture.feed(chunk)
+                yield chunk
+        except RESPONSES_STREAM_NETWORK_ERRORS as exc:
+            logger.warning(
+                "Codex upstream stream aborted after response commit: error_type=%s detail=%s",
+                type(exc).__name__,
+                str(exc) or type(exc).__name__,
+            )
+            if stream_committed:
+                yield b"data: [DONE]\n\n"
+        finally:
+            await stream_cm.__aexit__(None, None, None)
+        return
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text_buffer = ""
+
+    def drain_buffer(*, final: bool = False) -> tuple[list[bytes], bool]:
+        nonlocal text_buffer
+        events: list[bytes] = []
+
+        while True:
+            match = re.search(r"\r?\n\r?\n", text_buffer)
+            if not match:
+                break
+
+            raw_event = text_buffer[:match.start()]
+            text_buffer = text_buffer[match.end():]
+            if not raw_event.strip():
+                continue
+
+            event_type, event_payload = _extract_responses_stream_event(raw_event)
+            if event_type == "[DONE]":
+                events.append(b"data: [DONE]\n\n")
+                return events, True
+
+            if isinstance(event_payload, dict):
+                patched_payload = _apply_response_model_alias(event_payload, response_model_alias)
+                encoded_event = _encode_sse_event(event_type, patched_payload)
+            else:
+                encoded_event = raw_event.encode("utf-8") + b"\n\n"
+
+            events.append(encoded_event)
+
+        if final and text_buffer.strip():
+            events.append(text_buffer.encode("utf-8"))
+            text_buffer = ""
+            return events, True
+
+        return events, False
+
     try:
         for chunk in buffered_chunks:
-            if stream_capture is not None:
-                stream_capture.feed(chunk)
-            yield chunk
+            text_buffer += decoder.decode(chunk)
+            events, done = drain_buffer()
+            for event in events:
+                if stream_capture is not None:
+                    stream_capture.feed(event)
+                yield event
+            if done:
+                return
+
         async for chunk in upstream_iter:
+            text_buffer += decoder.decode(chunk)
+            events, done = drain_buffer()
+            for event in events:
+                if stream_capture is not None:
+                    stream_capture.feed(event)
+                yield event
+            if done:
+                return
+
+        events, _ = drain_buffer(final=True)
+        for event in events:
             if stream_capture is not None:
-                stream_capture.feed(chunk)
-            yield chunk
+                stream_capture.feed(event)
+            yield event
     except RESPONSES_STREAM_NETWORK_ERRORS as exc:
         logger.warning(
             "Codex upstream stream aborted after response commit: error_type=%s detail=%s",
@@ -2787,7 +3552,17 @@ async def _proxy_request_with_token(
 ) -> ProxyRequestResult:
     downstream_stream = bool(request_data.stream)
     upstream_stream = downstream_stream or not compact
-    payload = _sanitize_codex_payload(request_data.model_dump(exclude_unset=True), compact=compact)
+    raw_payload = request_data.model_dump(exclude_unset=True)
+    payload, response_model_alias = _translate_responses_image_compat_payload(
+        raw_payload,
+        compact=compact,
+    )
+    effective_requested_model = response_model_alias or request_data.model
+    payload = _sanitize_codex_payload(
+        payload,
+        compact=compact,
+        preserve_previous_response_id=response_model_alias is not None,
+    )
     if compact and not downstream_stream:
         payload.pop("stream", None)
     elif not downstream_stream:
@@ -2831,7 +3606,7 @@ async def _proxy_request_with_token(
 
         initial_first_token_at = utcnow() if stream_committed else None
         stream_capture = _ProxyStreamCapture(
-            initial_model_name=model_name or request_data.model,
+            initial_model_name=effective_requested_model if response_model_alias is not None else (model_name or request_data.model),
             initial_first_token_at=initial_first_token_at,
         )
 
@@ -2843,11 +3618,12 @@ async def _proxy_request_with_token(
                     buffered_chunks,
                     stream_committed=stream_committed,
                     stream_capture=stream_capture,
+                    response_model_alias=response_model_alias,
                 ),
                 media_type="text/event-stream",
             ),
             status_code=upstream_response.status_code,
-            model_name=model_name or request_data.model,
+            model_name=effective_requested_model if response_model_alias is not None else (model_name or request_data.model),
             first_token_at=initial_first_token_at,
             stream_capture=stream_capture,
         )
@@ -2871,9 +3647,13 @@ async def _proxy_request_with_token(
 
             data, first_token_at = await _collect_responses_json_from_sse(
                 upstream_response.aiter_raw(),
-                model=request_data.model,
+                model=effective_requested_model,
             )
-            effective_model_name = _extract_response_model_name(data) or request_data.model
+            if response_model_alias is not None:
+                data = _apply_response_model_alias(data, response_model_alias)
+                effective_model_name = response_model_alias
+            else:
+                effective_model_name = _extract_response_model_name(data) or request_data.model
             return ProxyRequestResult(
                 response=JSONResponse(status_code=upstream_response.status_code, content=data),
                 status_code=upstream_response.status_code,
@@ -2902,7 +3682,11 @@ async def _proxy_request_with_token(
 
         raw, first_token_at = await _read_response_body_with_first_chunk_time(upstream_response.aiter_raw())
         data = _decode_responses_json_body(raw)
-        effective_model_name = _extract_response_model_name(data) or request_data.model
+        if response_model_alias is not None:
+            data = _apply_response_model_alias(data, response_model_alias)
+            effective_model_name = response_model_alias
+        else:
+            effective_model_name = _extract_response_model_name(data) or request_data.model
         return ProxyRequestResult(
             response=JSONResponse(status_code=upstream_response.status_code, content=data),
             status_code=upstream_response.status_code,
@@ -2912,6 +3696,62 @@ async def _proxy_request_with_token(
         )
     finally:
         await stream_cm.__aexit__(None, None, None)
+
+
+async def _proxy_chat_completions_with_token(
+    client: httpx.AsyncClient,
+    http_request: Request,
+    request_data: ChatCompletionsRequest,
+    *,
+    access_token: str,
+    account_id: str | None,
+) -> ProxyRequestResult:
+    responses_request = _chat_completions_request_to_responses_request(request_data)
+    proxy_result = await _proxy_request_with_token(
+        client,
+        http_request,
+        responses_request,
+        access_token=access_token,
+        account_id=account_id,
+        compact=False,
+    )
+
+    if isinstance(proxy_result.response, StreamingResponse):
+        return ProxyRequestResult(
+            response=StreamingResponse(
+                _stream_responses_to_chat_completions(
+                    proxy_result.response.body_iterator,
+                    request_model=request_data.model,
+                ),
+                media_type="text/event-stream",
+            ),
+            status_code=proxy_result.status_code,
+            model_name=request_data.model,
+            first_token_at=proxy_result.first_token_at,
+            usage_metrics=proxy_result.usage_metrics,
+            stream_capture=proxy_result.stream_capture,
+        )
+
+    body = getattr(proxy_result.response, "body", b"{}")
+    try:
+        responses_payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="Responses proxy returned invalid JSON") from exc
+
+    if not isinstance(responses_payload, dict):
+        raise HTTPException(status_code=502, detail="Responses proxy returned a non-object JSON response")
+
+    chat_payload = _build_chat_completions_response(
+        responses_payload,
+        request_model=request_data.model,
+    )
+    return ProxyRequestResult(
+        response=JSONResponse(status_code=proxy_result.status_code, content=chat_payload),
+        status_code=proxy_result.status_code,
+        model_name=request_data.model,
+        first_token_at=proxy_result.first_token_at,
+        usage_metrics=proxy_result.usage_metrics,
+    )
 
 
 app = create_app()

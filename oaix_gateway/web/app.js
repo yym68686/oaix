@@ -3,6 +3,8 @@ const THEME_STORAGE_KEY = "oaix.themePreference";
 const IMPORT_JOB_STORAGE_KEY = "oaix.importJobId";
 const REFRESH_INTERVAL_MS = 15000;
 const IMPORT_JOB_POLL_INTERVAL_MS = 1500;
+const TOAST_DURATION_MS = 5200;
+const TOAST_EXIT_DURATION_MS = 220;
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 
@@ -26,6 +28,8 @@ const state = {
   importJobId: readStoredImportJobId(),
   importJobPollTimer: null,
   importJobPolling: false,
+  toastHideTimer: null,
+  toastCleanupTimer: null,
   protected: false,
   timer: null,
   tokenActionPendingKinds: new Map(),
@@ -85,6 +89,7 @@ const elements = {
   requestCostChart: document.getElementById("request-cost-chart"),
   requestCostChartTotal: document.getElementById("request-cost-chart-total"),
   requestCostChartNote: document.getElementById("request-cost-chart-note"),
+  toastStack: document.getElementById("toast-stack"),
   tokenDeleteDialog: document.getElementById("token-delete-dialog"),
   tokenDeleteDescription: document.getElementById("token-delete-description"),
   tokenDeleteTarget: document.getElementById("token-delete-target"),
@@ -159,6 +164,88 @@ function setFeedback(message, tone = "") {
   elements.importFeedback.classList.remove("is-error", "is-success");
   if (tone) {
     elements.importFeedback.classList.add(tone);
+  }
+}
+
+function clearToastTimers() {
+  if (state.toastHideTimer) {
+    window.clearTimeout(state.toastHideTimer);
+    state.toastHideTimer = null;
+  }
+  if (state.toastCleanupTimer) {
+    window.clearTimeout(state.toastCleanupTimer);
+    state.toastCleanupTimer = null;
+  }
+}
+
+function dismissToast() {
+  if (!elements.toastStack) {
+    return;
+  }
+  clearToastTimers();
+  const toast = elements.toastStack.querySelector(".toast");
+  if (!(toast instanceof HTMLElement)) {
+    return;
+  }
+  toast.classList.remove("is-visible");
+  state.toastCleanupTimer = window.setTimeout(() => {
+    if (elements.toastStack.contains(toast)) {
+      elements.toastStack.replaceChildren();
+    }
+    state.toastCleanupTimer = null;
+  }, TOAST_EXIT_DURATION_MS);
+}
+
+function showToast(message, tone = "default", title = "Key 测试") {
+  if (!elements.toastStack) {
+    return;
+  }
+  clearToastTimers();
+  elements.toastStack.replaceChildren();
+
+  const toast = document.createElement("article");
+  toast.className = `toast toast--${tone}`;
+  toast.setAttribute("role", tone === "error" ? "alert" : "status");
+  toast.setAttribute("aria-live", tone === "error" ? "assertive" : "polite");
+
+  const body = document.createElement("div");
+  body.className = "toast__body";
+
+  const titleElement = document.createElement("strong");
+  titleElement.className = "toast__title";
+  titleElement.textContent = title;
+
+  const messageElement = document.createElement("p");
+  messageElement.className = "toast__message";
+  messageElement.textContent = String(message || "").trim() || "操作已完成。";
+
+  const closeButton = document.createElement("button");
+  closeButton.className = "toast__close";
+  closeButton.type = "button";
+  closeButton.dataset.toastDismiss = "true";
+  closeButton.setAttribute("aria-label", "关闭提示");
+  closeButton.textContent = "×";
+
+  body.append(titleElement, messageElement);
+  toast.append(body, closeButton);
+  elements.toastStack.appendChild(toast);
+
+  window.requestAnimationFrame(() => {
+    toast.classList.add("is-visible");
+  });
+  state.toastHideTimer = window.setTimeout(dismissToast, TOAST_DURATION_MS);
+}
+
+function resolveProbeToastTone(result) {
+  switch (String(result?.outcome || "").trim()) {
+    case "reactivated":
+      return "success";
+    case "cooling":
+      return "warning";
+    case "disabled":
+      return "error";
+    default:
+      return "default";
   }
 }
 
@@ -1680,12 +1767,18 @@ async function probeToken(tokenId) {
       method: "POST",
       headers: authHeaders(),
     });
-    await loadHealth();
-    await loadTokens();
-    elements.listNote.textContent = data?.message || "测试完成";
+    showToast(data?.message || "测试完成", resolveProbeToastTone(data));
+    try {
+      await loadHealth();
+      await loadTokens();
+    } catch (refreshError) {
+      elements.listNote.textContent = `测试结果已返回，列表稍后刷新：${refreshError.message}`;
+    }
   } catch (error) {
-    elements.listNote.textContent =
-      error.status === 401 ? "需要输入 Service API Key 才能测试 key" : `测试失败：${error.message}`;
+    showToast(
+      error.status === 401 ? "需要输入 Service API Key 才能测试 key。" : `测试失败：${error.message}`,
+      "error",
+    );
     if (error.status === 401) {
       await loadTokens();
     }
@@ -2022,6 +2115,18 @@ elements.tokenList.addEventListener("click", async (event) => {
     openTokenDeleteDialog(deleteButton.dataset.tokenId);
   }
 });
+
+if (elements.toastStack) {
+  elements.toastStack.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const dismissButton = event.target.closest("[data-toast-dismiss]");
+    if (dismissButton instanceof HTMLElement) {
+      dismissToast();
+    }
+  });
+}
 
 elements.tokenList.addEventListener(
   "toggle",

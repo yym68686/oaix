@@ -852,6 +852,114 @@ button {
   color: var(--feedback-success-fg);
 }
 
+.toast-stack {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 80;
+  display: grid;
+  gap: 12px;
+  pointer-events: none;
+}
+
+.toast {
+  width: min(420px, calc(100vw - 28px));
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: start;
+  padding: 16px 16px 15px;
+  border-radius: calc(var(--radius-lg) + 2px);
+  border: 1px solid var(--border-panel);
+  background: var(--surface-feedback);
+  box-shadow: var(--shadow-card);
+  backdrop-filter: blur(18px);
+  opacity: 0;
+  transform: translateY(10px) scale(0.98);
+  transition:
+    opacity 180ms ease,
+    transform 180ms ease,
+    border-color 180ms ease;
+  pointer-events: auto;
+}
+
+.toast.is-visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+.toast--success {
+  border-color: var(--border-feedback-success);
+}
+
+.toast--warning {
+  border-color: color-mix(in oklab, var(--cooling) 42%, var(--border-panel));
+}
+
+.toast--error {
+  border-color: var(--border-feedback-error);
+}
+
+.toast__body {
+  display: grid;
+  gap: 6px;
+}
+
+.toast__title {
+  font-size: 0.76rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.toast__message {
+  margin: 0;
+  line-height: 1.6;
+  color: var(--ink);
+}
+
+.toast--success .toast__message {
+  color: var(--feedback-success-fg);
+}
+
+.toast--warning .toast__message {
+  color: var(--status-cooling-fg);
+}
+
+.toast--error .toast__message {
+  color: var(--feedback-error-fg);
+}
+
+.toast__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--surface-panel) 62%, transparent);
+  color: var(--ink-soft);
+  font-size: 1.1rem;
+  transition:
+    background-color 180ms ease,
+    color 180ms ease,
+    transform 180ms ease;
+}
+
+.toast__close:hover,
+.toast__close:focus-visible {
+  background: color-mix(in oklab, var(--surface-panel) 78%, transparent);
+  color: var(--ink);
+  transform: translateY(-1px);
+  outline: none;
+}
+
+.toast__close:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
 .token-panel__body {
   display: grid;
 }

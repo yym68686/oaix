@@ -9,13 +9,16 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 from oaix_gateway.api_server import (
+    ChatCompletionsRequest,
     ImageProxyRequest,
     _ProxyStreamCapture,
+    _chat_completions_request_to_responses_request,
     _collect_images_api_response_from_sse,
     _execute_proxy_request_with_failover,
     ResponseTrafficController,
     _parse_images_edits_request,
     _parse_images_generations_request,
+    _proxy_chat_completions_with_token,
     _proxy_image_request_with_token,
     _collect_responses_json_from_sse,
     _extract_usage_limit_cooldown_seconds,
@@ -31,6 +34,7 @@ from oaix_gateway.api_server import (
     _serialize_admin_token_item,
     _sanitize_codex_payload,
     _should_retry_upstream_server_error,
+    _translate_responses_image_compat_payload,
     _wrap_streaming_body_iterator,
     create_app,
 )
@@ -127,6 +131,104 @@ def test_sanitize_codex_payload_compact_strips_store() -> None:
         "input": "hi",
         "instructions": "",
     }
+
+
+def test_sanitize_codex_payload_can_preserve_previous_response_id() -> None:
+    payload = {
+        "model": "gpt-image-2",
+        "input": "hi",
+        "previous_response_id": "resp_prev_123",
+    }
+    sanitized = _sanitize_codex_payload(payload, preserve_previous_response_id=True)
+    assert sanitized == {
+        "model": "gpt-image-2",
+        "input": "hi",
+        "previous_response_id": "resp_prev_123",
+        "instructions": "",
+    }
+
+
+def test_translate_responses_image_compat_payload_injects_image_tool() -> None:
+    translated, response_model_alias = _translate_responses_image_compat_payload(
+        {
+            "model": "gpt-image-2",
+            "input": [{"role": "user", "content": "Draw a mug"}],
+            "previous_response_id": "resp_prev_123",
+            "size": "1024x1024",
+            "output_format": "png",
+        },
+        compact=False,
+    )
+
+    assert response_model_alias == "gpt-image-2"
+    assert translated["model"] == "gpt-5.4-mini"
+    assert translated["previous_response_id"] == "resp_prev_123"
+    assert translated["tool_choice"] == {"type": "image_generation"}
+    assert translated["tools"] == [
+        {
+            "type": "image_generation",
+            "model": "gpt-image-2",
+            "action": "auto",
+            "size": "1024x1024",
+            "output_format": "png",
+        }
+    ]
+    assert "size" not in translated
+    assert "output_format" not in translated
+
+
+def test_translate_responses_image_compat_payload_rejects_compact() -> None:
+    with pytest.raises(HTTPException, match="gpt-image-2 is only supported on /v1/responses"):
+        _translate_responses_image_compat_payload(
+            {
+                "model": "gpt-image-2",
+                "input": "Draw a mug",
+            },
+            compact=True,
+        )
+
+
+def test_chat_completions_request_to_responses_request_parses_markdown_image_history() -> None:
+    request_data = ChatCompletionsRequest(
+        model="gpt-image-2",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "Here is the previous render.\n\n![image](data:image/png;base64,prev-image)",
+            },
+            {
+                "role": "user",
+                "content": "Make the mug blue",
+            },
+        ],
+        stream=False,
+        size="1024x1024",
+        output_format="png",
+    )
+
+    responses_request = _chat_completions_request_to_responses_request(request_data)
+    payload = responses_request.model_dump(exclude_unset=True)
+
+    assert payload["model"] == "gpt-image-2"
+    assert payload["size"] == "1024x1024"
+    assert payload["output_format"] == "png"
+    assert payload["input"] == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "Here is the previous render.\n\n"},
+                {"type": "input_image", "image_url": "data:image/png;base64,prev-image"},
+            ],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Make the mug blue"},
+            ],
+        },
+    ]
 
 
 def test_parse_images_generations_request_builds_image_tool_payload() -> None:
@@ -338,6 +440,32 @@ def test_collect_responses_json_from_sse_falls_back_on_done_without_response_com
     assert response["status"] == "completed"
     assert response["model"] == "gpt-5.4"
     assert response["output"][0]["content"][0]["text"] == "hello"
+
+
+def test_collect_responses_json_from_sse_patches_output_item_done() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","response":{"id":"resp_img_compat","status":"in_progress","model":"gpt-image-2"}}\n\n'
+        )
+        yield (
+            b'event: response.output_item.done\n'
+            b'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"patched-b64","output_format":"png"}}\n\n'
+        )
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"id":"resp_img_compat","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}\n\n'
+        )
+
+    response, first_token_at = asyncio.run(
+        _collect_responses_json_from_sse(upstream(), model="gpt-image-2")
+    )
+
+    assert first_token_at is not None
+    assert response["id"] == "resp_img_compat"
+    assert response["model"] == "gpt-image-2"
+    assert response["output"][0]["type"] == "image_generation_call"
+    assert response["output"][0]["result"] == "patched-b64"
 
 
 def test_collect_images_api_response_from_sse_returns_openai_images_shape() -> None:
@@ -629,6 +757,112 @@ def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request(
     assert body["output"][0]["content"][0]["text"] == "hello"
 
 
+def test_proxy_request_with_token_auto_translates_gpt_image_responses_request() -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse) -> None:
+            self._response = response
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                }
+            )
+            response = DummyStreamingResponse(
+                [
+                    b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_img_123","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
+                    b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_img_123","status":"completed","model":"gpt-5.4-mini","output":[{"type":"image_generation_call","result":"img-b64","output_format":"png","revised_prompt":"drawn mug"}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}\n\n',
+                ]
+            )
+            return DummyStreamContext(response)
+
+        async def post(self, *args, **kwargs):
+            raise AssertionError("non-stream downstream requests should not call client.post")
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    request_data = ResponsesRequest(
+        model="gpt-image-2",
+        input=[{"role": "user", "content": [{"type": "input_text", "text": "Draw a mug"}]}],
+        stream=False,
+        previous_response_id="resp_prev_123",
+        size="1024x1024",
+        output_format="png",
+    )
+
+    client = DummyClient()
+    result = asyncio.run(
+        _proxy_request_with_token(
+            client,
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+        )
+    )
+
+    assert len(client.stream_calls) == 1
+    stream_call = client.stream_calls[0]
+    upstream_payload = json.loads(stream_call["content"])
+    assert upstream_payload["model"] == "gpt-5.4-mini"
+    assert upstream_payload["stream"] is True
+    assert upstream_payload["previous_response_id"] == "resp_prev_123"
+    assert upstream_payload["tool_choice"] == {"type": "image_generation"}
+    assert upstream_payload["tools"] == [
+        {
+            "type": "image_generation",
+            "model": "gpt-image-2",
+            "action": "auto",
+            "size": "1024x1024",
+            "output_format": "png",
+        }
+    ]
+    assert result.status_code == 200
+    assert result.model_name == "gpt-image-2"
+    assert result.first_token_at is not None
+    assert result.usage_metrics is not None
+    assert result.usage_metrics.total_tokens == 5
+    body = json.loads(result.response.body)
+    assert body["id"] == "resp_img_123"
+    assert body["model"] == "gpt-image-2"
+    assert body["output"][0]["type"] == "image_generation_call"
+    assert body["output"][0]["result"] == "img-b64"
+
+
 def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_upstream_stream() -> None:
     class DummyStreamingResponse:
         def __init__(self, chunks: list[bytes]) -> None:
@@ -733,6 +967,301 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
     assert body["model"] == "gpt-5.4-compact"
     assert body["status"] == "completed"
     assert body["output"][0]["content"][0]["text"] == "hello compact"
+
+
+def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias() -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse) -> None:
+            self._response = response
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                }
+            )
+            response = DummyStreamingResponse(
+                [
+                    b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_stream_img","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
+                    b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_stream_img","status":"completed","model":"gpt-5.4-mini","output":[{"type":"image_generation_call","result":"img-stream","output_format":"png"}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n',
+                    b'data: [DONE]\n\n',
+                ]
+            )
+            return DummyStreamContext(response)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    request_data = ResponsesRequest(
+        model="gpt-image-2",
+        input=[{"role": "user", "content": [{"type": "input_text", "text": "Draw a mug"}]}],
+        stream=True,
+    )
+
+    async def run_stream() -> tuple[object, str, list[dict[str, object]]]:
+        client = DummyClient()
+        result = await _proxy_request_with_token(
+            client,
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+        )
+        chunks: list[bytes] = []
+        async for chunk in result.response.body_iterator:
+            chunks.append(chunk)
+        return result, b"".join(chunks).decode("utf-8"), client.stream_calls
+
+    result, body, stream_calls = asyncio.run(run_stream())
+
+    upstream_payload = json.loads(stream_calls[0]["content"])
+    assert upstream_payload["model"] == "gpt-5.4-mini"
+    assert upstream_payload["tool_choice"] == {"type": "image_generation"}
+    assert upstream_payload["tools"][0]["model"] == "gpt-image-2"
+    assert result.status_code == 200
+    assert result.model_name == "gpt-image-2"
+    assert result.stream_capture is not None
+    assert result.stream_capture.model_name == "gpt-image-2"
+    assert result.stream_capture.usage_metrics is not None
+    assert result.stream_capture.usage_metrics.total_tokens == 3
+    assert '"model": "gpt-image-2"' in body
+    assert "gpt-5.4-mini" not in body
+
+
+def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_response() -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse) -> None:
+            self._response = response
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                }
+            )
+            response = DummyStreamingResponse(
+                [
+                    b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_chat_img","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
+                    b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"chat-image","output_format":"png"}}\n\n',
+                    b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_chat_img","status":"completed","model":"gpt-5.4-mini","output":[],"usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}}}\n\n',
+                ]
+            )
+            return DummyStreamContext(response)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    request_data = ChatCompletionsRequest(
+        model="gpt-image-2",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "![image](data:image/png;base64,prev-image)",
+            },
+            {
+                "role": "user",
+                "content": "Make it blue",
+            },
+        ],
+        stream=False,
+        size="1024x1024",
+        output_format="png",
+    )
+
+    client = DummyClient()
+    result = asyncio.run(
+        _proxy_chat_completions_with_token(
+            client,
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+        )
+    )
+
+    upstream_payload = json.loads(client.stream_calls[0]["content"])
+    assert upstream_payload["model"] == "gpt-5.4-mini"
+    assert upstream_payload["tool_choice"] == {"type": "image_generation"}
+    assert upstream_payload["tools"] == [
+        {
+            "type": "image_generation",
+            "model": "gpt-image-2",
+            "action": "auto",
+            "size": "1024x1024",
+            "output_format": "png",
+        }
+    ]
+    assert upstream_payload["input"][0]["role"] == "assistant"
+    assert upstream_payload["input"][0]["content"] == [
+        {"type": "input_image", "image_url": "data:image/png;base64,prev-image"}
+    ]
+    assert upstream_payload["input"][1]["content"] == [
+        {"type": "input_text", "text": "Make it blue"}
+    ]
+    assert result.status_code == 200
+    assert result.model_name == "gpt-image-2"
+    body = json.loads(result.response.body)
+    assert body["object"] == "chat.completion"
+    assert body["model"] == "gpt-image-2"
+    assert body["choices"][0]["message"]["role"] == "assistant"
+    assert body["choices"][0]["message"]["content"] == "![image](data:image/png;base64,chat-image)"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"]["total_tokens"] == 10
+
+
+def test_proxy_chat_completions_with_token_stream_returns_markdown_image_chunks() -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse) -> None:
+            self._response = response
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                }
+            )
+            response = DummyStreamingResponse(
+                [
+                    b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_chat_stream","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
+                    b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"stream-image","output_format":"png"}}\n\n',
+                    b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_chat_stream","status":"completed","model":"gpt-5.4-mini","output":[],"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}\n\n',
+                    b'data: [DONE]\n\n',
+                ]
+            )
+            return DummyStreamContext(response)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    request_data = ChatCompletionsRequest(
+        model="gpt-image-2",
+        messages=[{"role": "user", "content": "Draw a mug"}],
+        stream=True,
+    )
+
+    async def run_stream() -> tuple[object, str]:
+        result = await _proxy_chat_completions_with_token(
+            DummyClient(),
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+        )
+        chunks: list[bytes] = []
+        async for chunk in result.response.body_iterator:
+            chunks.append(chunk)
+        return result, b"".join(chunks).decode("utf-8")
+
+    result, body = asyncio.run(run_stream())
+
+    assert result.status_code == 200
+    assert result.model_name == "gpt-image-2"
+    assert result.stream_capture is not None
+    assert result.stream_capture.model_name == "gpt-image-2"
+    assert "chat.completion.chunk" in body
+    assert '"model": "gpt-image-2"' in body
+    assert '"content": "![image](data:image/png;base64,stream-image)"' in body
+    assert '"finish_reason": "stop"' in body
+    assert "data: [DONE]" in body
 
 
 def test_proxy_image_request_with_token_non_stream_collects_openai_images_response() -> None:
