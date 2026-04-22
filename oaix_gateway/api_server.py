@@ -2478,6 +2478,7 @@ async def _probe_token_with_latest_access_token(
         model=_admin_token_probe_model(),
         input=ADMIN_TOKEN_PROBE_INPUT,
         stream=False,
+        store=False,
     )
 
     try:
@@ -2548,7 +2549,7 @@ async def _probe_token_with_latest_access_token(
             probe_request,
             access_token=access_token,
             account_id=token_row.account_id,
-            compact=True,
+            compact=False,
         )
         await mark_token_success(token_row.id)
         return {
