@@ -806,6 +806,23 @@ def _ensure_responses_image_generation_tool(payload: dict[str, Any]) -> dict[str
     return image_tool
 
 
+def _apply_images_responses_defaults(payload: dict[str, Any]) -> None:
+    payload.setdefault("instructions", "")
+    payload.setdefault("parallel_tool_calls", True)
+    if not isinstance(payload.get("reasoning"), dict):
+        payload["reasoning"] = {"effort": "medium", "summary": "auto"}
+
+    include_payload = payload.get("include")
+    if isinstance(include_payload, (list, tuple)):
+        include_items = [copy.deepcopy(item) for item in include_payload]
+    else:
+        include_items = []
+    if "reasoning.encrypted_content" not in include_items:
+        include_items.append("reasoning.encrypted_content")
+    payload["include"] = include_items
+    payload["store"] = False
+
+
 def _translate_responses_image_compat_payload(
     payload: dict[str, Any],
     *,
@@ -837,6 +854,7 @@ def _translate_responses_image_compat_payload(
         if raw_value is not None and coerced is not None:
             image_tool[field] = coerced
 
+    _apply_images_responses_defaults(translated)
     translated["tool_choice"] = {"type": "image_generation"}
     return translated, requested_model
 
@@ -925,18 +943,15 @@ def _build_images_responses_payload(prompt: str, images: list[str], tool: dict[s
             }
         )
 
-    return {
-        "instructions": "",
+    payload = {
         "stream": True,
-        "reasoning": {"effort": "medium", "summary": "auto"},
-        "parallel_tool_calls": True,
-        "include": ["reasoning.encrypted_content"],
         "model": DEFAULT_IMAGES_MAIN_MODEL,
-        "store": False,
         "tool_choice": {"type": "image_generation"},
         "input": [{"type": "message", "role": "user", "content": content}],
         "tools": [tool],
     }
+    _apply_images_responses_defaults(payload)
+    return payload
 
 
 async def _parse_images_generations_request(http_request: Request) -> ImageProxyRequest:
