@@ -9,7 +9,7 @@ import os
 import re
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -208,6 +208,20 @@ class _ProxyStreamCapture:
             logger.exception("Failed to observe streamed response usage")
 
 
+class _GatewayProxyHTTPException(HTTPException):
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        detail: str,
+        retryable: bool | None = None,
+        record_token_error: bool = False,
+    ) -> None:
+        super().__init__(status_code=status_code, detail=detail)
+        self.retryable = retryable
+        self.record_token_error = record_token_error
+
+
 class ResponseTrafficLease:
     def __init__(self, controller: "ResponseTrafficController") -> None:
         self._controller = controller
@@ -323,6 +337,21 @@ def _import_wait_timeout_seconds() -> float:
 
 def _compact_server_error_cooldown_seconds() -> int:
     return _int_env("COMPACT_SERVER_ERROR_COOLDOWN_SECONDS", 60, minimum=0)
+
+
+def _image_non_stream_total_timeout_seconds() -> float:
+    return _float_env("IMAGE_NON_STREAM_TOTAL_TIMEOUT_SECONDS", 110.0, minimum=1.0)
+
+
+def _image_non_stream_read_timeout_seconds() -> float:
+    return min(
+        _image_non_stream_total_timeout_seconds(),
+        _float_env("IMAGE_NON_STREAM_READ_TIMEOUT_SECONDS", 60.0, minimum=1.0),
+    )
+
+
+def _image_non_stream_disconnect_poll_seconds() -> float:
+    return _float_env("IMAGE_NON_STREAM_DISCONNECT_POLL_SECONDS", 1.0, minimum=0.1)
 
 
 def _admin_quota_cache_ttl_seconds() -> int:
@@ -920,6 +949,75 @@ def _finalize_collected_response(
     return response_data
 
 
+def _collect_responses_output_item_done(
+    event_payload: Any,
+    *,
+    output_items_by_index: dict[int, dict[str, Any]],
+    output_items_fallback: list[dict[str, Any]],
+) -> None:
+    if not isinstance(event_payload, dict):
+        return
+
+    item = event_payload.get("item")
+    if not isinstance(item, dict):
+        return
+
+    output_index = _coerce_int(event_payload.get("output_index"))
+    item_copy = copy.deepcopy(item)
+    if output_index is None:
+        output_items_fallback.append(item_copy)
+        return
+    output_items_by_index[output_index] = item_copy
+
+
+def _patch_completed_output_from_output_items(
+    payload: Any,
+    *,
+    output_items_by_index: dict[int, dict[str, Any]],
+    output_items_fallback: list[dict[str, Any]],
+) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    response_payload = payload.get("response")
+    if not isinstance(response_payload, dict):
+        return payload
+
+    output_items = response_payload.get("output")
+    should_patch_output = (
+        (not isinstance(output_items, list) or not output_items)
+        and (output_items_by_index or output_items_fallback)
+    )
+    if not should_patch_output:
+        return payload
+
+    patched_payload = copy.deepcopy(payload)
+    patched_response = patched_payload.get("response")
+    if not isinstance(patched_response, dict):
+        return patched_payload
+
+    patched_output: list[dict[str, Any]] = [
+        copy.deepcopy(output_items_by_index[index]) for index in sorted(output_items_by_index)
+    ]
+    patched_output.extend(copy.deepcopy(item) for item in output_items_fallback)
+    patched_response["output"] = patched_output
+    return patched_payload
+
+
+def _non_retryable_gateway_http_exception(
+    *,
+    status_code: int,
+    detail: str,
+    record_token_error: bool = True,
+) -> _GatewayProxyHTTPException:
+    return _GatewayProxyHTTPException(
+        status_code=status_code,
+        detail=detail,
+        retryable=False,
+        record_token_error=record_token_error,
+    )
+
+
 async def _collect_responses_json_from_sse(
     upstream_iter: AsyncIterator[bytes],
     *,
@@ -1153,21 +1251,97 @@ def _build_images_api_response(
     return response
 
 
+async def _await_image_non_stream_chunk(
+    upstream_iter: AsyncIterator[bytes],
+    *,
+    http_request: Request | None,
+    started_at_monotonic: float,
+    total_timeout_seconds: float | None,
+    read_timeout_seconds: float | None,
+    disconnect_poll_seconds: float,
+) -> bytes:
+    loop = asyncio.get_running_loop()
+    read_started_at = loop.time()
+    next_chunk_task = asyncio.create_task(upstream_iter.__anext__())
+
+    try:
+        while True:
+            now = loop.time()
+            timeouts: list[float] = [disconnect_poll_seconds]
+
+            if total_timeout_seconds is not None:
+                remaining_total = total_timeout_seconds - (now - started_at_monotonic)
+                if remaining_total <= 0:
+                    raise _non_retryable_gateway_http_exception(
+                        status_code=504,
+                        detail=(
+                            "Upstream image request exceeded total timeout "
+                            f"of {int(total_timeout_seconds)} seconds"
+                        ),
+                    )
+                timeouts.append(remaining_total)
+
+            if read_timeout_seconds is not None:
+                remaining_read = read_timeout_seconds - (now - read_started_at)
+                if remaining_read <= 0:
+                    raise _non_retryable_gateway_http_exception(
+                        status_code=504,
+                        detail=(
+                            "Upstream image stream exceeded read timeout "
+                            f"of {int(read_timeout_seconds)} seconds"
+                        ),
+                    )
+                timeouts.append(remaining_read)
+
+            done, _ = await asyncio.wait({next_chunk_task}, timeout=max(0.01, min(timeouts)))
+            if next_chunk_task in done:
+                return next_chunk_task.result()
+
+            if http_request is not None and await http_request.is_disconnected():
+                raise _non_retryable_gateway_http_exception(
+                    status_code=499,
+                    detail="Client disconnected during image generation",
+                    record_token_error=False,
+                )
+    finally:
+        if not next_chunk_task.done():
+            next_chunk_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await next_chunk_task
+
+
 async def _collect_images_api_response_from_sse(
     upstream_iter: AsyncIterator[bytes],
     *,
     response_format: str,
+    http_request: Request | None = None,
+    total_timeout_seconds: float | None = None,
+    read_timeout_seconds: float | None = None,
+    disconnect_poll_seconds: float = 1.0,
 ) -> tuple[dict[str, Any], datetime | None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
     first_token_at: datetime | None = None
+    output_items_by_index: dict[int, dict[str, Any]] = {}
+    output_items_fallback: list[dict[str, Any]] = []
+    started_at_monotonic = asyncio.get_running_loop().time()
 
     while True:
         try:
-            chunk = await upstream_iter.__anext__()
+            chunk = await _await_image_non_stream_chunk(
+                upstream_iter,
+                http_request=http_request,
+                started_at_monotonic=started_at_monotonic,
+                total_timeout_seconds=total_timeout_seconds,
+                read_timeout_seconds=read_timeout_seconds,
+                disconnect_poll_seconds=disconnect_poll_seconds,
+            )
         except StopAsyncIteration:
             if text_buffer.strip():
-                raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
+                raise _non_retryable_gateway_http_exception(
+                    status_code=502,
+                    detail="Upstream closed stream with an incomplete SSE event",
+                )
             break
 
         text_buffer += decoder.decode(chunk)
@@ -1183,7 +1357,10 @@ async def _collect_images_api_response_from_sse(
 
             event_type, event_payload = _extract_responses_stream_event(raw_event)
             if event_type == "[DONE]":
-                raise HTTPException(status_code=502, detail="Upstream closed image stream before completion")
+                raise _non_retryable_gateway_http_exception(
+                    status_code=502,
+                    detail="Upstream closed image stream before completion",
+                )
 
             semantic_failure = _responses_failure_http_exception(event_payload)
             if semantic_failure is not None:
@@ -1192,13 +1369,29 @@ async def _collect_images_api_response_from_sse(
             if first_token_at is None and event_type and event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
                 first_token_at = utcnow()
 
+            if event_type == "response.output_item.done":
+                _collect_responses_output_item_done(
+                    event_payload,
+                    output_items_by_index=output_items_by_index,
+                    output_items_fallback=output_items_fallback,
+                )
+                continue
+
             if event_type != "response.completed":
                 continue
 
+            patched_event_payload = _patch_completed_output_from_output_items(
+                event_payload,
+                output_items_by_index=output_items_by_index,
+                output_items_fallback=output_items_fallback,
+            )
             try:
-                results, created_at, usage_payload = _extract_images_from_completed_response(event_payload)
+                results, created_at, usage_payload = _extract_images_from_completed_response(patched_event_payload)
             except ValueError as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
+                raise _non_retryable_gateway_http_exception(
+                    status_code=502,
+                    detail=str(exc),
+                ) from exc
 
             return _build_images_api_response(
                 results,
@@ -1207,7 +1400,10 @@ async def _collect_images_api_response_from_sse(
                 response_format=response_format,
             ), first_token_at
 
-    raise HTTPException(status_code=502, detail="Upstream closed image stream before completion")
+    raise _non_retryable_gateway_http_exception(
+        status_code=502,
+        detail="Upstream closed image stream before completion",
+    )
 
 
 def _encode_sse_event(event_name: str, payload: dict[str, Any]) -> bytes:
@@ -1291,6 +1487,8 @@ async def _stream_upstream_image_response(
 ) -> AsyncGenerator[bytes, None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    output_items_by_index: dict[int, dict[str, Any]] = {}
+    output_items_fallback: list[dict[str, Any]] = []
 
     def drain_buffer(*, final: bool = False) -> tuple[list[bytes], bool]:
         nonlocal text_buffer
@@ -1314,6 +1512,21 @@ async def _stream_upstream_image_response(
                 detail = str(getattr(semantic_failure, "detail", "") or semantic_failure)
                 events.append(_build_stream_error_event(semantic_failure.status_code, detail))
                 return events, True
+
+            if event_type == "response.output_item.done":
+                _collect_responses_output_item_done(
+                    event_payload,
+                    output_items_by_index=output_items_by_index,
+                    output_items_fallback=output_items_fallback,
+                )
+                continue
+
+            if event_type == "response.completed":
+                event_payload = _patch_completed_output_from_output_items(
+                    event_payload,
+                    output_items_by_index=output_items_by_index,
+                    output_items_fallback=output_items_fallback,
+                )
 
             try:
                 transformed_events, done = _transform_image_stream_event(
@@ -1386,6 +1599,9 @@ async def _proxy_image_request_with_token(
     upstream_url = _codex_responses_url(compact=False)
     json_payload = json.dumps(image_request.responses_payload, ensure_ascii=False)
     timeout = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+    non_stream_total_timeout_seconds = _image_non_stream_total_timeout_seconds()
+    non_stream_read_timeout_seconds = _image_non_stream_read_timeout_seconds()
+    non_stream_disconnect_poll_seconds = _image_non_stream_disconnect_poll_seconds()
 
     if image_request.stream:
         stream_cm = client.stream(
@@ -1451,6 +1667,10 @@ async def _proxy_image_request_with_token(
         response_body, first_token_at = await _collect_images_api_response_from_sse(
             upstream_response.aiter_raw(),
             response_format=image_request.response_format,
+            http_request=http_request,
+            total_timeout_seconds=non_stream_total_timeout_seconds,
+            read_timeout_seconds=non_stream_read_timeout_seconds,
+            disconnect_poll_seconds=non_stream_disconnect_poll_seconds,
         )
         return ProxyRequestResult(
             response=JSONResponse(status_code=upstream_response.status_code, content=response_body),
@@ -1546,6 +1766,17 @@ def _get_compact_codex_server_error_cooling_time(
 
 def _should_retry_upstream_server_error(status_code: int) -> bool:
     return 500 <= status_code <= 599
+
+
+def _should_retry_http_exception(exc: HTTPException) -> bool:
+    retryable = getattr(exc, "retryable", None)
+    if retryable is not None:
+        return bool(retryable)
+    return _should_retry_upstream_server_error(getattr(exc, "status_code", 500))
+
+
+def _should_record_http_exception_token_error(exc: HTTPException) -> bool:
+    return bool(getattr(exc, "record_token_error", False))
 
 
 def _usage_finalize_kwargs(usage_metrics: UsageMetrics | None) -> dict[str, Any]:
@@ -1885,6 +2116,9 @@ async def _execute_proxy_request_with_failover(
                     last_error = exc
                     continue
 
+                if _should_record_http_exception_token_error(exc):
+                    await mark_token_error(token_row.id, detail)
+
                 permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
                 auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
 
@@ -1927,7 +2161,7 @@ async def _execute_proxy_request_with_failover(
                     status_code=status_code,
                     error_text=detail,
                 )
-                if _should_retry_upstream_server_error(status_code) and attempt < max_attempts:
+                if _should_retry_http_exception(exc) and attempt < max_attempts:
                     mark_kwargs: dict[str, Any] = {}
                     if compact_server_error_cooling_time > 0:
                         mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time

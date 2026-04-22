@@ -12,6 +12,7 @@ from oaix_gateway.api_server import (
     ImageProxyRequest,
     _ProxyStreamCapture,
     _collect_images_api_response_from_sse,
+    _execute_proxy_request_with_failover,
     ResponseTrafficController,
     _parse_images_edits_request,
     _parse_images_generations_request,
@@ -364,6 +365,88 @@ def test_collect_images_api_response_from_sse_returns_openai_images_shape() -> N
         "size": "1024x1024",
         "usage": {"images": 1},
     }
+
+
+def test_collect_images_api_response_from_sse_patches_output_item_done() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield (
+            b'event: response.output_item.done\n'
+            b'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"patched-img","output_format":"png","revised_prompt":"patched prompt","size":"1024x1024"}}\n\n'
+        )
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"created_at":1710000005,"status":"completed","output":[],"tool_usage":{"image_gen":{"images":1}}}}\n\n'
+        )
+
+    response, first_token_at = asyncio.run(
+        _collect_images_api_response_from_sse(upstream(), response_format="b64_json")
+    )
+
+    assert first_token_at is not None
+    assert response == {
+        "created": 1710000005,
+        "data": [{"b64_json": "patched-img", "revised_prompt": "patched prompt"}],
+        "output_format": "png",
+        "size": "1024x1024",
+        "usage": {"images": 1},
+    }
+
+
+def test_collect_images_api_response_from_sse_enforces_read_timeout() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.05)
+        if False:
+            yield b""
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            _collect_images_api_response_from_sse(
+                upstream(),
+                response_format="b64_json",
+                total_timeout_seconds=1.0,
+                read_timeout_seconds=0.01,
+                disconnect_poll_seconds=0.005,
+            )
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 504
+    assert getattr(exc, "retryable", True) is False
+    assert getattr(exc, "record_token_error", False) is True
+    assert "read timeout" in str(exc.detail)
+
+
+def test_collect_images_api_response_from_sse_aborts_on_client_disconnect() -> None:
+    class DisconnectingRequest:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def is_disconnected(self) -> bool:
+            self.calls += 1
+            return self.calls >= 1
+
+    async def upstream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.05)
+        if False:
+            yield b""
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            _collect_images_api_response_from_sse(
+                upstream(),
+                response_format="b64_json",
+                http_request=DisconnectingRequest(),
+                total_timeout_seconds=1.0,
+                read_timeout_seconds=1.0,
+                disconnect_poll_seconds=0.005,
+            )
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 499
+    assert getattr(exc, "retryable", True) is False
+    assert getattr(exc, "record_token_error", True) is False
+    assert "Client disconnected" in str(exc.detail)
 
 
 def test_serialize_admin_token_item_includes_created_at() -> None:
@@ -830,11 +913,221 @@ def test_proxy_image_request_with_token_stream_translates_image_events() -> None
     assert '"usage": {"images": 1}' in body
 
 
+def test_proxy_image_request_with_token_stream_patches_output_item_done() -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse) -> None:
+            self._response = response
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyClient:
+        def stream(self, method, url, headers, content, timeout):
+            response = DummyStreamingResponse(
+                [
+                    b'event: response.created\ndata: {"type":"response.created","response":{"status":"in_progress"}}\n\n',
+                    b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"patched-final","output_format":"png","revised_prompt":"patched done"}}\n\n',
+                    b'event: response.completed\ndata: {"type":"response.completed","response":{"created_at":1710000003,"status":"completed","output":[],"tool_usage":{"image_gen":{"images":1}}}}\n\n',
+                ]
+            )
+            return DummyStreamContext(response)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/images/generations",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    image_request = ImageProxyRequest(
+        model_name="gpt-image-2",
+        response_format="b64_json",
+        stream=True,
+        stream_prefix="image_generation",
+        responses_payload={
+            "model": "gpt-5.4-mini",
+            "stream": True,
+            "tools": [{"type": "image_generation", "action": "generate", "model": "gpt-image-2"}],
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "draw"}]}],
+        },
+    )
+
+    async def run_stream() -> tuple[object, str]:
+        result = await _proxy_image_request_with_token(
+            DummyClient(),
+            request,
+            image_request,
+            access_token="access-token",
+            account_id="account-1",
+        )
+        chunks: list[bytes] = []
+        async for chunk in result.response.body_iterator:
+            chunks.append(chunk)
+        return result, b"".join(chunks).decode("utf-8")
+
+    result, body = asyncio.run(run_stream())
+
+    assert result.status_code == 200
+    assert result.model_name == "gpt-image-2"
+    assert "event: image_generation.completed" in body
+    assert '"b64_json": "patched-final"' in body
+    assert '"revised_prompt": "patched done"' in body
+    assert '"usage": {"images": 1}' in body
+
+
 def test_should_retry_upstream_server_error_only_for_5xx() -> None:
     assert _should_retry_upstream_server_error(500) is True
     assert _should_retry_upstream_server_error(503) is True
     assert _should_retry_upstream_server_error(429) is False
     assert _should_retry_upstream_server_error(400) is False
+
+
+def test_execute_proxy_request_with_failover_does_not_retry_nonretryable_http_exception(
+    monkeypatch,
+) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run for non-retryable gateway errors")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/images/generations",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    token_row = CodexToken(
+        id=11,
+        account_id="acct_11",
+        refresh_token="refresh-token",
+        is_active=True,
+    )
+
+    claim_calls: list[int] = []
+    mark_token_error_calls: list[dict[str, object]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=5)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str):
+        claim_calls.append(1)
+        return token_row if len(claim_calls) == 1 else None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=77)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        mark_token_error_calls.append(
+            {
+                "token_id": token_id,
+                "message": message,
+                "deactivate": deactivate,
+                "cooldown_seconds": cooldown_seconds,
+                "clear_access_token": clear_access_token,
+            }
+        )
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        raise AssertionError("mark_token_success should not run when proxy_call fails")
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        exc = HTTPException(status_code=502, detail="Upstream did not return image output")
+        exc.retryable = False
+        exc.record_token_error = True
+        raise exc
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            _execute_proxy_request_with_failover(
+                request,
+                endpoint="/v1/images/generations",
+                request_model="gpt-image-2",
+                is_stream=False,
+                proxy_call=fake_proxy_call,
+            )
+        )
+
+    assert exc_info.value.status_code == 502
+    assert str(exc_info.value.detail) == "Upstream did not return image output"
+    assert claim_calls == [1]
+    assert mark_token_error_calls == [
+        {
+            "token_id": 11,
+            "message": "Upstream did not return image output",
+            "deactivate": False,
+            "cooldown_seconds": None,
+            "clear_access_token": False,
+        }
+    ]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 77
+    assert finalized[0]["status_code"] == 502
+    assert finalized[0]["success"] is False
+    assert finalized[0]["attempt_count"] == 1
+    assert finalized[0]["finished_at"] is not None
+    assert finalized[0]["token_id"] == 11
+    assert finalized[0]["account_id"] == "acct_11"
+    assert finalized[0]["error_message"] == "Upstream did not return image output"
 
 
 def test_response_traffic_controller_waits_until_idle(monkeypatch) -> None:
