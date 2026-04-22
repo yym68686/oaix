@@ -17,6 +17,8 @@ def test_frontend_routes_are_registered() -> None:
     assert "/admin/tokens/import-jobs/{job_id}" in paths
     assert "/v1/responses" in paths
     assert "/v1/responses/compact" in paths
+    assert "/v1/images/generations" in paths
+    assert "/v1/images/edits" in paths
 
 
 def test_assets_mount_is_registered() -> None:

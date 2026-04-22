@@ -1,8 +1,10 @@
 import asyncio
+import base64
 import codecs
 import copy
 import json
 import logging
+import mimetypes
 import os
 import re
 import uuid
@@ -19,6 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
+from starlette.datastructures import UploadFile
 from .database import close_database, init_db, utcnow
 from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
@@ -60,6 +63,8 @@ from .usage_cost import UsageMetrics, extract_usage_metrics
 logger = logging.getLogger("oaix.gateway")
 WEB_DIR = Path(__file__).resolve().parent / "web"
 ADMIN_TOKEN_PROBE_INPUT = "say test"
+DEFAULT_IMAGES_MAIN_MODEL = "gpt-5.4-mini"
+DEFAULT_IMAGES_TOOL_MODEL = "gpt-image-2"
 RESPONSES_STREAM_PREFLIGHT_EVENTS = frozenset(
     {
         "response.created",
@@ -129,6 +134,25 @@ class ProxyRequestResult:
     first_token_at: datetime | None = None
     usage_metrics: UsageMetrics | None = None
     stream_capture: "_ProxyStreamCapture | None" = None
+
+
+@dataclass(frozen=True)
+class ImageProxyRequest:
+    model_name: str
+    response_format: str
+    stream: bool
+    stream_prefix: str
+    responses_payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ImageCallResult:
+    result_b64: str
+    revised_prompt: str | None = None
+    output_format: str | None = None
+    size: str | None = None
+    background: str | None = None
+    quality: str | None = None
 
 
 class _ProxyStreamCapture:
@@ -422,6 +446,291 @@ def _mapping_get(payload: Any, *keys: str) -> Any | None:
 def _normalize_optional_text(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _normalize_image_response_format(value: Any) -> str:
+    return (_normalize_optional_text(value) or "b64_json").lower()
+
+
+def _mime_type_from_output_format(output_format: str | None) -> str:
+    normalized = _normalize_optional_text(output_format)
+    if normalized is None:
+        return "image/png"
+    if "/" in normalized:
+        return normalized
+    return {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+    }.get(normalized.lower(), "image/png")
+
+
+def _coerce_int(value: Any, default: int | None = None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+async def _upload_file_to_data_url(upload: UploadFile) -> str:
+    try:
+        payload = await upload.read()
+    finally:
+        try:
+            await upload.close()
+        except Exception:
+            logger.exception("Failed to close uploaded image file")
+
+    media_type = _normalize_optional_text(getattr(upload, "content_type", None))
+    if media_type is None:
+        media_type = mimetypes.guess_type(getattr(upload, "filename", "") or "")[0] or "application/octet-stream"
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:{media_type};base64,{encoded}"
+
+
+def _extract_image_url_candidate(value: Any) -> str | None:
+    if isinstance(value, str):
+        return _normalize_optional_text(value)
+    if isinstance(value, dict):
+        return _normalize_optional_text(value.get("url"))
+    return None
+
+
+def _extract_json_image_reference(item: Any) -> str | None:
+    if isinstance(item, str):
+        return _normalize_optional_text(item)
+    if not isinstance(item, dict):
+        return None
+
+    image_url = _extract_image_url_candidate(item.get("image_url"))
+    if image_url is not None:
+        return image_url
+    return _extract_image_url_candidate(item.get("url"))
+
+
+def _extract_json_mask_reference(item: Any) -> str | None:
+    if isinstance(item, str):
+        return _normalize_optional_text(item)
+    if not isinstance(item, dict):
+        return None
+
+    if _normalize_optional_text(item.get("file_id")) is not None:
+        raise HTTPException(status_code=400, detail="mask.file_id is not supported (use mask.image_url instead)")
+
+    image_url = _extract_image_url_candidate(item.get("image_url"))
+    if image_url is not None:
+        return image_url
+    return _extract_image_url_candidate(item.get("url"))
+
+
+def _build_images_responses_payload(prompt: str, images: list[str], tool: dict[str, Any]) -> dict[str, Any]:
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    for image_url in images:
+        normalized = _normalize_optional_text(image_url)
+        if normalized is None:
+            continue
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": normalized,
+            }
+        )
+
+    return {
+        "instructions": "",
+        "stream": True,
+        "reasoning": {"effort": "medium", "summary": "auto"},
+        "parallel_tool_calls": True,
+        "include": ["reasoning.encrypted_content"],
+        "model": DEFAULT_IMAGES_MAIN_MODEL,
+        "store": False,
+        "tool_choice": {"type": "image_generation"},
+        "input": [{"type": "message", "role": "user", "content": content}],
+        "tools": [tool],
+    }
+
+
+async def _parse_images_generations_request(http_request: Request) -> ImageProxyRequest:
+    try:
+        body = await http_request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    prompt = _normalize_optional_text(body.get("prompt"))
+    if prompt is None:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    image_model = _normalize_optional_text(body.get("model")) or DEFAULT_IMAGES_TOOL_MODEL
+    response_format = _normalize_image_response_format(body.get("response_format"))
+    stream = _coerce_bool(body.get("stream"), False)
+
+    tool: dict[str, Any] = {
+        "type": "image_generation",
+        "action": "generate",
+        "model": image_model,
+    }
+    for field in ("size", "quality", "background", "output_format", "moderation"):
+        value = _normalize_optional_text(body.get(field))
+        if value is not None:
+            tool[field] = value
+    for field in ("output_compression", "partial_images"):
+        raw_value = body.get(field)
+        coerced = _coerce_int(raw_value)
+        if raw_value is not None and coerced is not None:
+            tool[field] = coerced
+
+    return ImageProxyRequest(
+        model_name=image_model,
+        response_format=response_format,
+        stream=stream,
+        stream_prefix="image_generation",
+        responses_payload=_build_images_responses_payload(prompt, [], tool),
+    )
+
+
+async def _parse_images_edits_json_request(http_request: Request) -> ImageProxyRequest:
+    try:
+        body = await http_request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    prompt = _normalize_optional_text(body.get("prompt"))
+    if prompt is None:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    images: list[str] = []
+    if isinstance(body.get("images"), list):
+        for item in body["images"]:
+            image_url = _extract_json_image_reference(item)
+            if image_url is not None:
+                images.append(image_url)
+    if not images:
+        raise HTTPException(status_code=400, detail="images[].image_url is required (file_id is not supported)")
+
+    mask_image_url = _extract_json_mask_reference(body.get("mask"))
+    image_model = _normalize_optional_text(body.get("model")) or DEFAULT_IMAGES_TOOL_MODEL
+    response_format = _normalize_image_response_format(body.get("response_format"))
+    stream = _coerce_bool(body.get("stream"), False)
+
+    tool: dict[str, Any] = {
+        "type": "image_generation",
+        "action": "edit",
+        "model": image_model,
+    }
+    for field in ("size", "quality", "background", "output_format", "input_fidelity", "moderation"):
+        value = _normalize_optional_text(body.get(field))
+        if value is not None:
+            tool[field] = value
+    for field in ("output_compression", "partial_images"):
+        raw_value = body.get(field)
+        coerced = _coerce_int(raw_value)
+        if raw_value is not None and coerced is not None:
+            tool[field] = coerced
+
+    if mask_image_url is not None:
+        tool["input_image_mask"] = {"image_url": mask_image_url}
+
+    return ImageProxyRequest(
+        model_name=image_model,
+        response_format=response_format,
+        stream=stream,
+        stream_prefix="image_edit",
+        responses_payload=_build_images_responses_payload(prompt, images, tool),
+    )
+
+
+async def _parse_images_edits_multipart_request(http_request: Request) -> ImageProxyRequest:
+    try:
+        form = await http_request.form()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid multipart form: {exc}") from exc
+
+    prompt = _normalize_optional_text(form.get("prompt"))
+    if prompt is None:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    image_entries = form.getlist("image[]") or form.getlist("image")
+    images: list[str] = []
+    for entry in image_entries:
+        if isinstance(entry, UploadFile):
+            images.append(await _upload_file_to_data_url(entry))
+            continue
+        image_url = _normalize_optional_text(entry)
+        if image_url is not None:
+            images.append(image_url)
+
+    if not images:
+        raise HTTPException(status_code=400, detail="image is required")
+
+    mask_image_url: str | None = None
+    mask_value = form.get("mask")
+    if isinstance(mask_value, UploadFile):
+        mask_image_url = await _upload_file_to_data_url(mask_value)
+    else:
+        mask_image_url = _normalize_optional_text(mask_value)
+
+    image_model = _normalize_optional_text(form.get("model")) or DEFAULT_IMAGES_TOOL_MODEL
+    response_format = _normalize_image_response_format(form.get("response_format"))
+    stream = _coerce_bool(form.get("stream"), False)
+
+    tool: dict[str, Any] = {
+        "type": "image_generation",
+        "action": "edit",
+        "model": image_model,
+    }
+    for field in ("size", "quality", "background", "output_format", "input_fidelity", "moderation"):
+        value = _normalize_optional_text(form.get(field))
+        if value is not None:
+            tool[field] = value
+    for field in ("output_compression", "partial_images"):
+        raw_value = form.get(field)
+        coerced = _coerce_int(raw_value)
+        if raw_value not in (None, "") and coerced is not None:
+            tool[field] = coerced
+
+    if mask_image_url is not None:
+        tool["input_image_mask"] = {"image_url": mask_image_url}
+
+    return ImageProxyRequest(
+        model_name=image_model,
+        response_format=response_format,
+        stream=stream,
+        stream_prefix="image_edit",
+        responses_payload=_build_images_responses_payload(prompt, images, tool),
+    )
+
+
+async def _parse_images_edits_request(http_request: Request) -> ImageProxyRequest:
+    content_type = (http_request.headers.get("content-type") or "").strip().lower()
+    if content_type.startswith("application/json"):
+        return await _parse_images_edits_json_request(http_request)
+    if not content_type or content_type.startswith("multipart/form-data"):
+        return await _parse_images_edits_multipart_request(http_request)
+    raise HTTPException(status_code=400, detail=f"Unsupported Content-Type {content_type!r}")
 
 
 def _extract_response_model_name(payload: Any) -> str | None:
@@ -764,6 +1073,395 @@ async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) 
                 return buffered_chunks, True, model_name
 
 
+def _extract_images_from_completed_response(
+    payload: Any,
+) -> tuple[list[ImageCallResult], int, dict[str, Any] | None]:
+    if not isinstance(payload, dict) or str(payload.get("type") or "").strip() != "response.completed":
+        raise ValueError("Unexpected image response event type")
+
+    response_payload = payload.get("response")
+    if not isinstance(response_payload, dict):
+        raise ValueError("Image response.completed event is missing response payload")
+
+    created_at = _coerce_int(response_payload.get("created_at"))
+    if created_at is None or created_at <= 0:
+        created_at = int(utcnow().timestamp())
+
+    results: list[ImageCallResult] = []
+    output_items = response_payload.get("output")
+    if isinstance(output_items, list):
+        for item in output_items:
+            if not isinstance(item, dict) or str(item.get("type") or "").strip() != "image_generation_call":
+                continue
+            result_b64 = _normalize_optional_text(item.get("result"))
+            if result_b64 is None:
+                continue
+            results.append(
+                ImageCallResult(
+                    result_b64=result_b64,
+                    revised_prompt=_normalize_optional_text(item.get("revised_prompt")),
+                    output_format=_normalize_optional_text(item.get("output_format")),
+                    size=_normalize_optional_text(item.get("size")),
+                    background=_normalize_optional_text(item.get("background")),
+                    quality=_normalize_optional_text(item.get("quality")),
+                )
+            )
+
+    if not results:
+        raise ValueError("Upstream did not return image output")
+
+    usage_payload = _mapping_get(payload, "response", "tool_usage", "image_gen")
+    usage = copy.deepcopy(usage_payload) if isinstance(usage_payload, dict) else None
+    return results, created_at, usage
+
+
+def _build_images_api_response(
+    results: list[ImageCallResult],
+    *,
+    created_at: int,
+    usage_payload: dict[str, Any] | None,
+    response_format: str,
+) -> dict[str, Any]:
+    normalized_response_format = _normalize_image_response_format(response_format)
+    data: list[dict[str, Any]] = []
+    for item in results:
+        result_item: dict[str, Any] = {}
+        if normalized_response_format == "url":
+            mime_type = _mime_type_from_output_format(item.output_format)
+            result_item["url"] = f"data:{mime_type};base64,{item.result_b64}"
+        else:
+            result_item["b64_json"] = item.result_b64
+        if item.revised_prompt is not None:
+            result_item["revised_prompt"] = item.revised_prompt
+        data.append(result_item)
+
+    response: dict[str, Any] = {
+        "created": created_at,
+        "data": data,
+    }
+    first_item = results[0]
+    if first_item.background is not None:
+        response["background"] = first_item.background
+    if first_item.output_format is not None:
+        response["output_format"] = first_item.output_format
+    if first_item.quality is not None:
+        response["quality"] = first_item.quality
+    if first_item.size is not None:
+        response["size"] = first_item.size
+    if usage_payload is not None:
+        response["usage"] = copy.deepcopy(usage_payload)
+    return response
+
+
+async def _collect_images_api_response_from_sse(
+    upstream_iter: AsyncIterator[bytes],
+    *,
+    response_format: str,
+) -> tuple[dict[str, Any], datetime | None]:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text_buffer = ""
+    first_token_at: datetime | None = None
+
+    while True:
+        try:
+            chunk = await upstream_iter.__anext__()
+        except StopAsyncIteration:
+            if text_buffer.strip():
+                raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
+            break
+
+        text_buffer += decoder.decode(chunk)
+        while True:
+            match = re.search(r"\r?\n\r?\n", text_buffer)
+            if not match:
+                break
+
+            raw_event = text_buffer[:match.start()]
+            text_buffer = text_buffer[match.end():]
+            if not raw_event.strip():
+                continue
+
+            event_type, event_payload = _extract_responses_stream_event(raw_event)
+            if event_type == "[DONE]":
+                raise HTTPException(status_code=502, detail="Upstream closed image stream before completion")
+
+            semantic_failure = _responses_failure_http_exception(event_payload)
+            if semantic_failure is not None:
+                raise semantic_failure
+
+            if first_token_at is None and event_type and event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
+                first_token_at = utcnow()
+
+            if event_type != "response.completed":
+                continue
+
+            try:
+                results, created_at, usage_payload = _extract_images_from_completed_response(event_payload)
+            except ValueError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+            return _build_images_api_response(
+                results,
+                created_at=created_at,
+                usage_payload=usage_payload,
+                response_format=response_format,
+            ), first_token_at
+
+    raise HTTPException(status_code=502, detail="Upstream closed image stream before completion")
+
+
+def _encode_sse_event(event_name: str, payload: dict[str, Any]) -> bytes:
+    prefix = f"event: {event_name}\n".encode("utf-8") if event_name else b""
+    return prefix + b"data: " + json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n\n"
+
+
+def _build_stream_error_event(status_code: int, message: str) -> bytes:
+    error_type = "invalid_request_error" if 400 <= status_code < 500 else "server_error"
+    return _encode_sse_event(
+        "error",
+        {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "status_code": status_code,
+            }
+        },
+    )
+
+
+def _transform_image_stream_event(
+    event_type: str,
+    event_payload: Any,
+    *,
+    response_format: str,
+    stream_prefix: str,
+) -> tuple[list[bytes], bool]:
+    if not isinstance(event_payload, dict):
+        return [], False
+
+    normalized_response_format = _normalize_image_response_format(response_format)
+    if event_type == "response.image_generation_call.partial_image":
+        partial_b64 = _normalize_optional_text(event_payload.get("partial_image_b64"))
+        if partial_b64 is None:
+            return [], False
+
+        partial_index = _coerce_int(event_payload.get("partial_image_index"), 0) or 0
+        output_format = _normalize_optional_text(event_payload.get("output_format"))
+        event_name = f"{stream_prefix}.partial_image"
+        response_payload: dict[str, Any] = {
+            "type": event_name,
+            "partial_image_index": partial_index,
+        }
+        if normalized_response_format == "url":
+            mime_type = _mime_type_from_output_format(output_format)
+            response_payload["url"] = f"data:{mime_type};base64,{partial_b64}"
+        else:
+            response_payload["b64_json"] = partial_b64
+        return [_encode_sse_event(event_name, response_payload)], False
+
+    if event_type != "response.completed":
+        return [], False
+
+    results, _, usage_payload = _extract_images_from_completed_response(event_payload)
+    event_name = f"{stream_prefix}.completed"
+    events: list[bytes] = []
+    for item in results:
+        response_payload = {"type": event_name}
+        if normalized_response_format == "url":
+            mime_type = _mime_type_from_output_format(item.output_format)
+            response_payload["url"] = f"data:{mime_type};base64,{item.result_b64}"
+        else:
+            response_payload["b64_json"] = item.result_b64
+        if item.revised_prompt is not None:
+            response_payload["revised_prompt"] = item.revised_prompt
+        if usage_payload is not None:
+            response_payload["usage"] = copy.deepcopy(usage_payload)
+        events.append(_encode_sse_event(event_name, response_payload))
+    return events, True
+
+
+async def _stream_upstream_image_response(
+    stream_cm,
+    upstream_iter: AsyncIterator[bytes],
+    buffered_chunks: list[bytes],
+    *,
+    stream_committed: bool,
+    response_format: str,
+    stream_prefix: str,
+) -> AsyncGenerator[bytes, None]:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text_buffer = ""
+
+    def drain_buffer(*, final: bool = False) -> tuple[list[bytes], bool]:
+        nonlocal text_buffer
+        events: list[bytes] = []
+        while True:
+            match = re.search(r"\r?\n\r?\n", text_buffer)
+            if not match:
+                break
+
+            raw_event = text_buffer[:match.start()]
+            text_buffer = text_buffer[match.end():]
+            if not raw_event.strip():
+                continue
+
+            event_type, event_payload = _extract_responses_stream_event(raw_event)
+            if event_type == "[DONE]":
+                return events, True
+
+            semantic_failure = _responses_failure_http_exception(event_payload)
+            if semantic_failure is not None:
+                detail = str(getattr(semantic_failure, "detail", "") or semantic_failure)
+                events.append(_build_stream_error_event(semantic_failure.status_code, detail))
+                return events, True
+
+            try:
+                transformed_events, done = _transform_image_stream_event(
+                    event_type,
+                    event_payload,
+                    response_format=response_format,
+                    stream_prefix=stream_prefix,
+                )
+            except ValueError as exc:
+                events.append(_build_stream_error_event(502, str(exc)))
+                return events, True
+
+            events.extend(transformed_events)
+            if done:
+                return events, True
+
+        if final and text_buffer.strip():
+            events.append(_build_stream_error_event(502, "Upstream closed stream with an incomplete SSE event"))
+            text_buffer = ""
+            return events, True
+
+        return events, False
+
+    try:
+        for chunk in buffered_chunks:
+            text_buffer += decoder.decode(chunk)
+            events, done = drain_buffer()
+            for event in events:
+                yield event
+            if done:
+                return
+
+        async for chunk in upstream_iter:
+            text_buffer += decoder.decode(chunk)
+            events, done = drain_buffer()
+            for event in events:
+                yield event
+            if done:
+                return
+
+        events, _ = drain_buffer(final=True)
+        for event in events:
+            yield event
+    except RESPONSES_STREAM_NETWORK_ERRORS as exc:
+        logger.warning(
+            "Codex upstream image stream aborted after response commit: error_type=%s detail=%s",
+            type(exc).__name__,
+            str(exc) or type(exc).__name__,
+        )
+        if stream_committed:
+            yield b"data: [DONE]\n\n"
+    finally:
+        await stream_cm.__aexit__(None, None, None)
+
+
+async def _proxy_image_request_with_token(
+    client: httpx.AsyncClient,
+    http_request: Request,
+    image_request: ImageProxyRequest,
+    *,
+    access_token: str,
+    account_id: str | None,
+) -> ProxyRequestResult:
+    headers = _build_upstream_headers(
+        http_request,
+        access_token=access_token,
+        account_id=account_id,
+        stream=True,
+    )
+    upstream_url = _codex_responses_url(compact=False)
+    json_payload = json.dumps(image_request.responses_payload, ensure_ascii=False)
+    timeout = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+
+    if image_request.stream:
+        stream_cm = client.stream(
+            "POST",
+            upstream_url,
+            headers=headers,
+            content=json_payload,
+            timeout=timeout,
+        )
+        upstream_response = await stream_cm.__aenter__()
+        if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+            raw = await upstream_response.aread()
+            await stream_cm.__aexit__(None, None, None)
+            raise HTTPException(
+                status_code=upstream_response.status_code,
+                detail=_decode_error_body(raw),
+            )
+
+        upstream_iter = upstream_response.aiter_raw()
+        try:
+            buffered_chunks, stream_committed, _ = await _prime_responses_upstream_stream(upstream_iter)
+        except HTTPException:
+            await stream_cm.__aexit__(None, None, None)
+            raise
+        except RESPONSES_STREAM_NETWORK_ERRORS:
+            await stream_cm.__aexit__(None, None, None)
+            raise
+
+        initial_first_token_at = utcnow() if stream_committed else None
+        return ProxyRequestResult(
+            response=StreamingResponse(
+                _stream_upstream_image_response(
+                    stream_cm,
+                    upstream_iter,
+                    buffered_chunks,
+                    stream_committed=stream_committed,
+                    response_format=image_request.response_format,
+                    stream_prefix=image_request.stream_prefix,
+                ),
+                media_type="text/event-stream",
+            ),
+            status_code=upstream_response.status_code,
+            model_name=image_request.model_name,
+            first_token_at=initial_first_token_at,
+        )
+
+    stream_cm = client.stream(
+        "POST",
+        upstream_url,
+        headers=headers,
+        content=json_payload,
+        timeout=timeout,
+    )
+    upstream_response = await stream_cm.__aenter__()
+    try:
+        if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+            raw = await upstream_response.aread()
+            raise HTTPException(
+                status_code=upstream_response.status_code,
+                detail=_decode_error_body(raw),
+            )
+
+        response_body, first_token_at = await _collect_images_api_response_from_sse(
+            upstream_response.aiter_raw(),
+            response_format=image_request.response_format,
+        )
+        return ProxyRequestResult(
+            response=JSONResponse(status_code=upstream_response.status_code, content=response_body),
+            status_code=upstream_response.status_code,
+            model_name=image_request.model_name,
+            first_token_at=first_token_at,
+        )
+    finally:
+        await stream_cm.__aexit__(None, None, None)
+
+
 def _extract_usage_limit_cooldown_seconds(status_code: int, error_text: str) -> int | None:
     if status_code != 429:
         return None
@@ -1042,6 +1740,272 @@ async def _finalize_stream_request_log(
         )
     except Exception:
         logger.exception("Failed to finalize streamed request log id=%s", request_log_id)
+
+
+async def _execute_proxy_request_with_failover(
+    http_request: Request,
+    *,
+    endpoint: str,
+    request_model: str | None,
+    is_stream: bool,
+    proxy_call: Callable[[httpx.AsyncClient, str, str | None], Awaitable[ProxyRequestResult]],
+    compact: bool = False,
+) -> Response:
+    response_traffic: ResponseTrafficController = http_request.app.state.response_traffic
+    response_lease = response_traffic.start_response()
+    release_response_traffic = True
+    request_started_at = utcnow()
+    request_log = await create_request_log(
+        request_id=str(uuid.uuid4()),
+        endpoint=endpoint,
+        model=request_model,
+        is_stream=is_stream,
+        started_at=request_started_at,
+        client_ip=http_request.client.host if http_request.client is not None else None,
+        user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
+    )
+
+    attempt_count = 0
+    last_token_id: int | None = None
+    last_account_id: str | None = None
+
+    try:
+        counts = await get_token_counts()
+        if counts.available <= 0:
+            raise HTTPException(status_code=503, detail="No available Codex token in database")
+
+        max_attempts = max(1, min(counts.available, _max_request_account_retries()))
+        client: httpx.AsyncClient = http_request.app.state.http_client
+        oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
+        selection_settings = _current_token_selection_settings(http_request.app)
+        last_error: HTTPException | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            attempt_count = attempt
+            token_row = await claim_next_active_token(selection_strategy=selection_settings.strategy)
+            if token_row is None:
+                break
+            last_token_id = token_row.id
+            last_account_id = token_row.account_id
+
+            try:
+                access_token, access_token_refreshed = await oauth_manager.get_access_token(token_row, client)
+            except HTTPException as exc:
+                oauth_manager.invalidate(token_row.id)
+                permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
+                await mark_token_error(
+                    token_row.id,
+                    str(exc.detail),
+                    deactivate=permanent_refresh_failure,
+                    clear_access_token=True,
+                )
+                if exc.status_code in (401, 403):
+                    last_error = exc
+                    continue
+                raise
+
+            try:
+                proxy_result = await proxy_call(client, access_token, token_row.account_id)
+                await mark_token_success(token_row.id)
+                if isinstance(proxy_result.response, StreamingResponse):
+
+                    async def on_stream_close(
+                        *,
+                        attempt_index: int = attempt,
+                        token_id: int = token_row.id,
+                        proxied_account_id: str | None = token_row.account_id,
+                        proxied_result: ProxyRequestResult = proxy_result,
+                    ) -> None:
+                        try:
+                            if proxied_result.stream_capture is not None:
+                                await _finalize_stream_request_log(
+                                    request_log_id=request_log.id,
+                                    status_code=proxied_result.status_code,
+                                    attempt_count=attempt_index,
+                                    token_id=token_id,
+                                    account_id=proxied_account_id,
+                                    fallback_model_name=proxied_result.model_name,
+                                    fallback_first_token_at=proxied_result.first_token_at,
+                                    stream_capture=proxied_result.stream_capture,
+                                )
+                            else:
+                                await finalize_request_log(
+                                    request_log.id,
+                                    status_code=proxied_result.status_code,
+                                    success=True,
+                                    attempt_count=attempt_index,
+                                    finished_at=utcnow(),
+                                    first_token_at=proxied_result.first_token_at,
+                                    token_id=token_id,
+                                    account_id=proxied_account_id,
+                                    model_name=proxied_result.model_name,
+                                )
+                        finally:
+                            await response_lease.release()
+
+                    proxy_result.response.body_iterator = _wrap_streaming_body_iterator(
+                        proxy_result.response.body_iterator,
+                        on_close=on_stream_close,
+                    )
+                    release_response_traffic = False
+                    return proxy_result.response
+
+                await finalize_request_log(
+                    request_log.id,
+                    status_code=proxy_result.status_code,
+                    success=True,
+                    attempt_count=attempt,
+                    finished_at=utcnow(),
+                    first_token_at=proxy_result.first_token_at,
+                    token_id=token_row.id,
+                    account_id=token_row.account_id,
+                    model_name=proxy_result.model_name,
+                    **_usage_finalize_kwargs(proxy_result.usage_metrics),
+                )
+                return proxy_result.response
+            except HTTPException as exc:
+                status_code = getattr(exc, "status_code", 500)
+                detail = str(getattr(exc, "detail", "") or exc)
+                cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
+
+                if cooldown_seconds is not None:
+                    await mark_token_error(
+                        token_row.id,
+                        detail,
+                        cooldown_seconds=cooldown_seconds,
+                    )
+                    logger.warning(
+                        "Codex account cooled down: token_id=%s account_id=%s cooldown_seconds=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        cooldown_seconds,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = exc
+                    continue
+
+                permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
+                auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
+
+                if permanently_disabled or auth_failed_after_refresh:
+                    oauth_manager.invalidate(token_row.id)
+                    await mark_token_error(
+                        token_row.id,
+                        detail,
+                        deactivate=True,
+                        clear_access_token=True,
+                    )
+                    logger.warning(
+                        "Codex account disabled after upstream auth failure: token_id=%s account_id=%s status=%s refreshed=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        status_code,
+                        access_token_refreshed,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = exc
+                    continue
+
+                if status_code in (401, 403):
+                    oauth_manager.invalidate(token_row.id)
+                    await mark_token_error(token_row.id, detail, clear_access_token=True)
+                    logger.warning(
+                        "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        status_code,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = exc
+                    continue
+
+                compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                    compact=compact,
+                    status_code=status_code,
+                    error_text=detail,
+                )
+                if _should_retry_upstream_server_error(status_code) and attempt < max_attempts:
+                    mark_kwargs: dict[str, Any] = {}
+                    if compact_server_error_cooling_time > 0:
+                        mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                    await mark_token_error(token_row.id, detail, **mark_kwargs)
+                    logger.warning(
+                        "Codex upstream server error before response commit: token_id=%s account_id=%s status=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        status_code,
+                        compact,
+                        compact_server_error_cooling_time,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = exc
+                    continue
+
+                raise
+            except httpx.HTTPError as exc:
+                message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                    compact=compact,
+                    status_code=500,
+                    error_text=message,
+                )
+                if attempt < max_attempts:
+                    mark_kwargs: dict[str, Any] = {}
+                    if compact_server_error_cooling_time > 0:
+                        mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                    await mark_token_error(token_row.id, message, **mark_kwargs)
+                    logger.warning(
+                        "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        type(exc).__name__,
+                        compact,
+                        compact_server_error_cooling_time,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = HTTPException(status_code=502, detail=message)
+                    continue
+                await mark_token_error(token_row.id, message)
+                raise HTTPException(status_code=502, detail=message) from exc
+
+        if last_error is not None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
+            )
+        raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
+    except HTTPException as exc:
+        await finalize_request_log(
+            request_log.id,
+            status_code=getattr(exc, "status_code", 500),
+            success=False,
+            attempt_count=attempt_count,
+            finished_at=utcnow(),
+            token_id=last_token_id,
+            account_id=last_account_id,
+            error_message=str(getattr(exc, "detail", "") or exc),
+        )
+        raise
+    except Exception as exc:
+        await finalize_request_log(
+            request_log.id,
+            status_code=500,
+            success=False,
+            attempt_count=attempt_count,
+            finished_at=utcnow(),
+            token_id=last_token_id,
+            account_id=last_account_id,
+            error_message=str(exc),
+        )
+        raise
+    finally:
+        if release_response_traffic:
+            await response_lease.release()
 
 
 async def _wrap_streaming_body_iterator(
@@ -1466,261 +2430,85 @@ def create_app() -> FastAPI:
         *,
         compact: bool,
     ) -> Response:
-        response_traffic: ResponseTrafficController = http_request.app.state.response_traffic
-        response_lease = response_traffic.start_response()
-        release_response_traffic = True
         endpoint = _responses_endpoint_path(compact=compact)
-        request_started_at = utcnow()
-        request_log = await create_request_log(
-            request_id=str(uuid.uuid4()),
+        async def proxy_call(
+            client: httpx.AsyncClient,
+            access_token: str,
+            account_id: str | None,
+        ) -> ProxyRequestResult:
+            return await _proxy_request_with_token(
+                client,
+                http_request,
+                request_data,
+                access_token=access_token,
+                account_id=account_id,
+                compact=compact,
+            )
+
+        return await _execute_proxy_request_with_failover(
+            http_request,
             endpoint=endpoint,
-            model=request_data.model,
+            request_model=request_data.model,
             is_stream=bool(request_data.stream),
-            started_at=request_started_at,
-            client_ip=http_request.client.host if http_request.client is not None else None,
-            user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
+            proxy_call=proxy_call,
+            compact=compact,
         )
 
-        attempt_count = 0
-        last_token_id: int | None = None
-        last_account_id: str | None = None
+    @app.post("/v1/images/generations")
+    async def images_generations_route(
+        http_request: Request,
+        _: None = Depends(verify_service_api_key),
+    ) -> Response:
+        image_request = await _parse_images_generations_request(http_request)
 
-        try:
-            counts = await get_token_counts()
-            if counts.available <= 0:
-                raise HTTPException(status_code=503, detail="No available Codex token in database")
-
-            max_attempts = max(1, min(counts.available, _max_request_account_retries()))
-            client: httpx.AsyncClient = http_request.app.state.http_client
-            oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
-            selection_settings = _current_token_selection_settings(http_request.app)
-            last_error: HTTPException | None = None
-
-            for attempt in range(1, max_attempts + 1):
-                attempt_count = attempt
-                token_row = await claim_next_active_token(selection_strategy=selection_settings.strategy)
-                if token_row is None:
-                    break
-                last_token_id = token_row.id
-                last_account_id = token_row.account_id
-
-                try:
-                    access_token, access_token_refreshed = await oauth_manager.get_access_token(token_row, client)
-                except HTTPException as exc:
-                    oauth_manager.invalidate(token_row.id)
-                    permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
-                    await mark_token_error(
-                        token_row.id,
-                        str(exc.detail),
-                        deactivate=permanent_refresh_failure,
-                        clear_access_token=True,
-                    )
-                    if exc.status_code in (401, 403):
-                        last_error = exc
-                        continue
-                    raise
-
-                try:
-                    proxy_result = await _proxy_request_with_token(
-                        client,
-                        http_request,
-                        request_data,
-                        access_token=access_token,
-                        account_id=token_row.account_id,
-                        compact=compact,
-                    )
-                    await mark_token_success(token_row.id)
-                    if isinstance(proxy_result.response, StreamingResponse):
-                        async def on_stream_close() -> None:
-                            try:
-                                if proxy_result.stream_capture is not None:
-                                    await _finalize_stream_request_log(
-                                        request_log_id=request_log.id,
-                                        status_code=proxy_result.status_code,
-                                        attempt_count=attempt,
-                                        token_id=token_row.id,
-                                        account_id=token_row.account_id,
-                                        fallback_model_name=proxy_result.model_name,
-                                        fallback_first_token_at=proxy_result.first_token_at,
-                                        stream_capture=proxy_result.stream_capture,
-                                    )
-                                else:
-                                    await finalize_request_log(
-                                        request_log.id,
-                                        status_code=proxy_result.status_code,
-                                        success=True,
-                                        attempt_count=attempt,
-                                        finished_at=utcnow(),
-                                        first_token_at=proxy_result.first_token_at,
-                                        token_id=token_row.id,
-                                        account_id=token_row.account_id,
-                                        model_name=proxy_result.model_name,
-                                    )
-                            finally:
-                                await response_lease.release()
-
-                        proxy_result.response.body_iterator = _wrap_streaming_body_iterator(
-                            proxy_result.response.body_iterator,
-                            on_close=on_stream_close,
-                        )
-                        release_response_traffic = False
-                        return proxy_result.response
-                    await finalize_request_log(
-                        request_log.id,
-                        status_code=proxy_result.status_code,
-                        success=True,
-                        attempt_count=attempt,
-                        finished_at=utcnow(),
-                        first_token_at=proxy_result.first_token_at,
-                        token_id=token_row.id,
-                        account_id=token_row.account_id,
-                        model_name=proxy_result.model_name,
-                        **_usage_finalize_kwargs(proxy_result.usage_metrics),
-                    )
-                    return proxy_result.response
-                except HTTPException as exc:
-                    status_code = getattr(exc, "status_code", 500)
-                    detail = str(getattr(exc, "detail", "") or exc)
-                    cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
-
-                    if cooldown_seconds is not None:
-                        await mark_token_error(
-                            token_row.id,
-                            detail,
-                            cooldown_seconds=cooldown_seconds,
-                        )
-                        logger.warning(
-                            "Codex account cooled down: token_id=%s account_id=%s cooldown_seconds=%s attempt=%s/%s",
-                            token_row.id,
-                            token_row.account_id,
-                            cooldown_seconds,
-                            attempt,
-                            max_attempts,
-                        )
-                        last_error = exc
-                        continue
-
-                    permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
-                    auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
-
-                    if permanently_disabled or auth_failed_after_refresh:
-                        oauth_manager.invalidate(token_row.id)
-                        await mark_token_error(
-                            token_row.id,
-                            detail,
-                            deactivate=True,
-                            clear_access_token=True,
-                        )
-                        logger.warning(
-                            "Codex account disabled after upstream auth failure: token_id=%s account_id=%s status=%s refreshed=%s attempt=%s/%s",
-                            token_row.id,
-                            token_row.account_id,
-                            status_code,
-                            access_token_refreshed,
-                            attempt,
-                            max_attempts,
-                        )
-                        last_error = exc
-                        continue
-
-                    if status_code in (401, 403):
-                        oauth_manager.invalidate(token_row.id)
-                        await mark_token_error(token_row.id, detail, clear_access_token=True)
-                        logger.warning(
-                            "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
-                            token_row.id,
-                            token_row.account_id,
-                            status_code,
-                            attempt,
-                            max_attempts,
-                        )
-                        last_error = exc
-                        continue
-
-                    compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
-                        compact=compact,
-                        status_code=status_code,
-                        error_text=detail,
-                    )
-                    if _should_retry_upstream_server_error(status_code) and attempt < max_attempts:
-                        mark_kwargs: dict[str, Any] = {}
-                        if compact_server_error_cooling_time > 0:
-                            mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
-                        await mark_token_error(token_row.id, detail, **mark_kwargs)
-                        logger.warning(
-                            "Codex upstream server error before response commit: token_id=%s account_id=%s status=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
-                            token_row.id,
-                            token_row.account_id,
-                            status_code,
-                            compact,
-                            compact_server_error_cooling_time,
-                            attempt,
-                            max_attempts,
-                        )
-                        last_error = exc
-                        continue
-
-                    raise
-                except httpx.HTTPError as exc:
-                    message = f"Upstream request failed: {type(exc).__name__}: {exc}"
-                    compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
-                        compact=compact,
-                        status_code=500,
-                        error_text=message,
-                    )
-                    if attempt < max_attempts:
-                        mark_kwargs: dict[str, Any] = {}
-                        if compact_server_error_cooling_time > 0:
-                            mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
-                        await mark_token_error(token_row.id, message, **mark_kwargs)
-                        logger.warning(
-                            "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
-                            token_row.id,
-                            token_row.account_id,
-                            type(exc).__name__,
-                            compact,
-                            compact_server_error_cooling_time,
-                            attempt,
-                            max_attempts,
-                        )
-                        last_error = HTTPException(status_code=502, detail=message)
-                        continue
-                    await mark_token_error(token_row.id, message)
-                    raise HTTPException(status_code=502, detail=message) from exc
-
-            if last_error is not None:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
-                )
-            raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
-        except HTTPException as exc:
-            await finalize_request_log(
-                request_log.id,
-                status_code=getattr(exc, "status_code", 500),
-                success=False,
-                attempt_count=attempt_count,
-                finished_at=utcnow(),
-                token_id=last_token_id,
-                account_id=last_account_id,
-                error_message=str(getattr(exc, "detail", "") or exc),
+        async def proxy_call(
+            client: httpx.AsyncClient,
+            access_token: str,
+            account_id: str | None,
+        ) -> ProxyRequestResult:
+            return await _proxy_image_request_with_token(
+                client,
+                http_request,
+                image_request,
+                access_token=access_token,
+                account_id=account_id,
             )
-            raise
-        except Exception as exc:
-            await finalize_request_log(
-                request_log.id,
-                status_code=500,
-                success=False,
-                attempt_count=attempt_count,
-                finished_at=utcnow(),
-                token_id=last_token_id,
-                account_id=last_account_id,
-                error_message=str(exc),
+
+        return await _execute_proxy_request_with_failover(
+            http_request,
+            endpoint="/v1/images/generations",
+            request_model=image_request.model_name,
+            is_stream=image_request.stream,
+            proxy_call=proxy_call,
+        )
+
+    @app.post("/v1/images/edits")
+    async def images_edits_route(
+        http_request: Request,
+        _: None = Depends(verify_service_api_key),
+    ) -> Response:
+        image_request = await _parse_images_edits_request(http_request)
+
+        async def proxy_call(
+            client: httpx.AsyncClient,
+            access_token: str,
+            account_id: str | None,
+        ) -> ProxyRequestResult:
+            return await _proxy_image_request_with_token(
+                client,
+                http_request,
+                image_request,
+                access_token=access_token,
+                account_id=account_id,
             )
-            raise
-        finally:
-            if release_response_traffic:
-                await response_lease.release()
+
+        return await _execute_proxy_request_with_failover(
+            http_request,
+            endpoint="/v1/images/edits",
+            request_model=image_request.model_name,
+            is_stream=image_request.stream,
+            proxy_call=proxy_call,
+        )
 
     return app
 
