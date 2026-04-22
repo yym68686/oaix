@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
@@ -366,6 +367,11 @@ def _float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
     return max(minimum, value)
 
 
+def _csv_env(name: str) -> list[str]:
+    raw = str(os.getenv(name, "") or "").strip()
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _max_request_account_retries() -> int:
     return _int_env("MAX_REQUEST_ACCOUNT_RETRIES", 100, minimum=1)
 
@@ -412,6 +418,19 @@ def _admin_quota_max_concurrency() -> int:
 def _get_service_api_keys() -> set[str]:
     raw = os.getenv("SERVICE_API_KEYS") or os.getenv("API_KEY") or ""
     return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _cors_allow_origins() -> list[str]:
+    origins = _csv_env("CORS_ALLOW_ORIGINS")
+    return origins or ["*"]
+
+
+def _cors_allow_origin_regex() -> str | None:
+    return _normalize_optional_text(os.getenv("CORS_ALLOW_ORIGIN_REGEX"))
+
+
+def _cors_allow_credentials() -> bool:
+    return _coerce_bool(os.getenv("CORS_ALLOW_CREDENTIALS"), False)
 
 
 async def verify_service_api_key(http_request: Request) -> None:
@@ -2476,7 +2495,18 @@ async def _probe_token_with_latest_access_token(
     oauth_manager: CodexOAuthManager = app.state.oauth_manager
     probe_request = ResponsesRequest(
         model=_admin_token_probe_model(),
-        input=ADMIN_TOKEN_PROBE_INPUT,
+        input=[
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": ADMIN_TOKEN_PROBE_INPUT,
+                    }
+                ],
+            }
+        ],
         stream=False,
         store=False,
     )
@@ -3150,6 +3180,14 @@ def create_app() -> FastAPI:
     app = FastAPI(title="oaix Gateway", version="0.1.0", lifespan=lifespan)
     app.state.response_traffic = ResponseTrafficController()
     app.state.token_import_worker = None
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_allow_origins(),
+        allow_origin_regex=_cors_allow_origin_regex(),
+        allow_credentials=_cors_allow_credentials(),
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.mount("/assets", StaticFiles(directory=str(WEB_DIR)), name="assets")
 
     @app.get("/")

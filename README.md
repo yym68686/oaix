@@ -30,6 +30,9 @@
 
 - `DATABASE_URL`: PostgreSQL DSN，默认 `postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/oaix_gateway`
 - `SERVICE_API_KEYS`: 服务端鉴权 key，多个用逗号分隔；未设置时不鉴权
+- `CORS_ALLOW_ORIGINS`: 浏览器跨域允许的 Origin 列表，逗号分隔；默认 `*`
+- `CORS_ALLOW_ORIGIN_REGEX`: 浏览器跨域允许的 Origin 正则；默认不设置
+- `CORS_ALLOW_CREDENTIALS`: 是否允许浏览器跨域携带 credentials；默认 `false`
 - `CODEX_BASE_URL`: 上游 Codex responses 地址。默认 `https://chatgpt.com/backend-api/codex/responses`
 - `MAX_REQUEST_ACCOUNT_RETRIES`: 单次请求最多切换多少个 key，默认 `100`
 - `DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS`: 429 且没有明确重置时间时的默认冷却秒数，默认 `300`
@@ -96,6 +99,7 @@ export POSTGRES_DB='oaix_gateway'
 export POSTGRES_USER='oaix'
 export POSTGRES_PASSWORD='oaix_password'
 export SERVICE_API_KEYS='change-me'
+export CORS_ALLOW_ORIGINS='https://your-app.example'
 export CODEX_BASE_URL=''
 export IMPORT_RESPONSE_IDLE_GRACE_SECONDS='0.25'
 export IMPORT_WAIT_TIMEOUT_SECONDS='30'

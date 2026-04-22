@@ -2415,10 +2415,32 @@ def test_probe_token_with_latest_access_token_reactivates_on_success(monkeypatch
         "account_id": "acct_123",
         "compact": False,
         "model": "gpt-5.4-mini",
-        "input": "say test",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "say test",
+                    }
+                ],
+            }
+        ],
         "payload": {
             "model": "gpt-5.4-mini",
-            "input": "say test",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "say test",
+                        }
+                    ],
+                }
+            ],
             "stream": False,
             "store": False,
         },
