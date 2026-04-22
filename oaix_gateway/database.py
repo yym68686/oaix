@@ -68,6 +68,7 @@ class GatewayRequestLog(Base):
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     success: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    token_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     account_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -215,6 +216,8 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN model VARCHAR(128)"))
         if "model_name" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN model_name VARCHAR(128)"))
+        if "token_id" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN token_id INTEGER"))
         if "input_tokens" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN input_tokens INTEGER"))
         if "output_tokens" not in request_columns:
@@ -223,6 +226,7 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN total_tokens INTEGER"))
         if "estimated_cost_usd" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN estimated_cost_usd DOUBLE PRECISION"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_token_id ON gateway_request_logs (token_id)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model ON gateway_request_logs (model)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))
 

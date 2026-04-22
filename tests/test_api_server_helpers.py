@@ -19,6 +19,7 @@ from oaix_gateway.api_server import (
     _proxy_request_with_token,
     _prime_responses_upstream_stream,
     _probe_token_with_latest_access_token,
+    _resolve_token_observed_cost_usd,
     _responses_failure_http_exception,
     ResponsesRequest,
     _serialize_admin_token_item,
@@ -27,7 +28,7 @@ from oaix_gateway.api_server import (
     _wrap_streaming_body_iterator,
     create_app,
 )
-from oaix_gateway.database import CodexToken
+from oaix_gateway.database import CodexToken, GatewayRequestLog
 from oaix_gateway.quota import CodexPlanInfo
 from oaix_gateway.token_import_jobs import (
     IMPORT_JOB_STATUS_COMPLETED,
@@ -268,6 +269,53 @@ def test_serialize_admin_token_item_includes_created_at() -> None:
     )
 
     assert item["created_at"] == created_at
+
+
+def test_resolve_token_observed_cost_usd_prefers_direct_token_cost() -> None:
+    token = CodexToken(
+        id=7,
+        account_id="acct_123",
+        refresh_token="refresh_token",
+        is_active=True,
+    )
+
+    observed_cost = _resolve_token_observed_cost_usd(
+        {7: 12.5},
+        {"acct_123": 99.0},
+        {"acct_123": 1},
+        token_row=token,
+    )
+
+    assert observed_cost == 12.5
+
+
+def test_resolve_token_observed_cost_usd_falls_back_only_for_unique_account() -> None:
+    token = CodexToken(
+        id=8,
+        account_id="acct_456",
+        refresh_token="refresh_token",
+        is_active=True,
+    )
+
+    assert (
+        _resolve_token_observed_cost_usd(
+            {},
+            {"acct_456": 4.25},
+            {"acct_456": 1},
+            token_row=token,
+        )
+        == 4.25
+    )
+
+    assert (
+        _resolve_token_observed_cost_usd(
+            {},
+            {"acct_456": 4.25},
+            {"acct_456": 2},
+            token_row=token,
+        )
+        is None
+    )
 
 
 def test_proxy_stream_capture_extracts_usage_and_model() -> None:
@@ -1330,3 +1378,7 @@ def test_probe_token_with_latest_access_token_keeps_disabled_on_auth_failure(mon
 
 def test_codex_token_refresh_token_index_is_declared() -> None:
     assert "ix_codex_tokens_refresh_token" in {index.name for index in CodexToken.__table__.indexes}
+
+
+def test_gateway_request_log_token_index_is_declared() -> None:
+    assert "ix_gateway_request_logs_token_id" in {index.name for index in GatewayRequestLog.__table__.indexes}

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
 
-from .database import GatewayRequestLog, get_read_session, get_session, utcnow
+from .database import CodexToken, GatewayRequestLog, get_read_session, get_session, utcnow
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,7 @@ class RequestLogItem:
     status_code: int | None
     success: bool | None
     attempt_count: int
+    token_id: int | None
     account_id: str | None
     client_ip: str | None
     user_agent: str | None
@@ -81,6 +82,18 @@ def _normalize_request_account_ids(account_ids: list[str] | set[str] | tuple[str
     return sorted({str(value or "").strip() for value in account_ids if str(value or "").strip()})
 
 
+def _normalize_request_token_ids(token_ids: list[int] | set[int] | tuple[int, ...]) -> list[int]:
+    normalized: set[int] = set()
+    for value in token_ids:
+        try:
+            token_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if token_id > 0:
+            normalized.add(token_id)
+    return sorted(normalized)
+
+
 def _build_request_account_costs_stmt(*, account_ids: list[str]):
     return (
         select(
@@ -89,6 +102,20 @@ def _build_request_account_costs_stmt(*, account_ids: list[str]):
         )
         .where(GatewayRequestLog.account_id.in_(account_ids))
         .group_by(GatewayRequestLog.account_id)
+    )
+
+
+def _build_request_token_costs_stmt(*, token_ids: list[int]):
+    canonical_token_id = func.coalesce(CodexToken.merged_into_token_id, CodexToken.id)
+    return (
+        select(
+            canonical_token_id,
+            func.sum(GatewayRequestLog.estimated_cost_usd),
+        )
+        .select_from(GatewayRequestLog)
+        .join(CodexToken, GatewayRequestLog.token_id == CodexToken.id)
+        .where(canonical_token_id.in_(token_ids))
+        .group_by(canonical_token_id)
     )
 
 
@@ -189,6 +216,7 @@ async def finalize_request_log(
     attempt_count: int,
     finished_at: datetime | None = None,
     first_token_at: datetime | None = None,
+    token_id: int | None = None,
     account_id: str | None = None,
     model_name: str | None = None,
     input_tokens: int | None = None,
@@ -210,6 +238,11 @@ async def finalize_request_log(
             item.first_token_at = first_token_at
             item.ttft_ms = _ms_between(item.started_at, first_token_at)
             item.duration_ms = _ms_between(item.started_at, finished_at)
+            if token_id is not None:
+                try:
+                    item.token_id = max(1, int(token_id))
+                except (TypeError, ValueError):
+                    pass
             item.account_id = account_id or item.account_id
             item.model_name = model_name or item.model_name or item.model
             item.input_tokens = _int_or_zero(input_tokens) if input_tokens is not None else item.input_tokens
@@ -274,6 +307,7 @@ async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
                 status_code=item.status_code,
                 success=item.success,
                 attempt_count=item.attempt_count,
+                token_id=item.token_id,
                 account_id=item.account_id,
                 client_ip=item.client_ip,
                 user_agent=item.user_agent,
@@ -306,6 +340,21 @@ async def get_request_costs_by_account(account_ids: list[str] | set[str] | tuple
         str(account_id): _round_cost(_float_or_zero(estimated_cost_usd))
         for account_id, estimated_cost_usd in rows
         if str(account_id or "").strip()
+    }
+
+
+async def get_request_costs_by_token(token_ids: list[int] | set[int] | tuple[int, ...]) -> dict[int, float]:
+    resolved_token_ids = _normalize_request_token_ids(token_ids)
+    if not resolved_token_ids:
+        return {}
+
+    async with get_read_session() as session:
+        result = await session.execute(_build_request_token_costs_stmt(token_ids=resolved_token_ids))
+        rows = result.all()
+    return {
+        int(token_id): _round_cost(_float_or_zero(estimated_cost_usd))
+        for token_id, estimated_cost_usd in rows
+        if token_id is not None
     }
 
 

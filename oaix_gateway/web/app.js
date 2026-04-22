@@ -913,7 +913,7 @@ function renderQuotaSection(item, presentation) {
   const notes = [];
   if (presentation?.hasSharedWorkspace) {
     notes.push(
-      `同工作区共 ${presentation.sharedWorkspaceCount} 把 token；已用金额和 5H / 7D 配额窗口按工作区共享，所以这几张卡会显示相同额度。`,
+      `同工作区共 ${presentation.sharedWorkspaceCount} 把 token；这里只表示它们共享工作区标识，5H / 7D 配额窗口仍按每把 token 实时读取，可能不同。`,
     );
   }
   if (quota?.error) {
@@ -978,7 +978,7 @@ function renderTokenCard(item, workspaceTokenCounts) {
   const lastUsedTone = lastUsedValue === "—" ? "muted" : "default";
   const observedCostTone = item.observed_cost_usd == null ? "muted" : "money";
   const errorSection = renderTokenErrorSection(item);
-  const observedCostLabel = presentation.hasSharedWorkspace ? "工作区已用金额" : "已用金额";
+  const observedCostLabel = "已用金额";
   return `
     <article class="token-card token-card--${status.tone}">
       <div class="token-card__top">

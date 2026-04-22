@@ -26,6 +26,7 @@ from .request_store import (
     create_request_log,
     finalize_request_log,
     get_request_log_analytics,
+    get_request_costs_by_token,
     get_request_costs_by_account,
     get_request_log_summary,
     list_request_logs,
@@ -44,6 +45,7 @@ from .token_store import (
     delete_token,
     get_token_row,
     get_token_counts,
+    get_token_counts_by_account_ids,
     get_token_selection_settings,
     list_token_rows,
     mark_token_error,
@@ -1019,6 +1021,7 @@ async def _finalize_stream_request_log(
     request_log_id: int,
     status_code: int,
     attempt_count: int,
+    token_id: int | None,
     account_id: str | None,
     fallback_model_name: str | None,
     fallback_first_token_at: datetime | None,
@@ -1032,6 +1035,7 @@ async def _finalize_stream_request_log(
             attempt_count=attempt_count,
             finished_at=utcnow(),
             first_token_at=stream_capture.first_token_at or fallback_first_token_at,
+            token_id=token_id,
             account_id=account_id,
             model_name=stream_capture.model_name or fallback_model_name,
             **_usage_finalize_kwargs(stream_capture.usage_metrics),
@@ -1132,27 +1136,30 @@ def _serialize_admin_token_item(
     return item
 
 
-def _token_observed_account_ids(token_row, *, plan_info: CodexPlanInfo) -> set[str]:
-    return {
-        account_id
-        for account_id in {
-            token_row.account_id,
-            plan_info.chatgpt_account_id,
-        }
-        if str(account_id or "").strip()
-    }
+def _observed_cost_fallback_account_id(token_row) -> str | None:
+    account_id = str(token_row.account_id or "").strip()
+    return account_id or None
 
 
 def _resolve_token_observed_cost_usd(
+    observed_costs_by_token: dict[int, float],
     observed_costs_by_account: dict[str, float],
+    token_counts_by_account: dict[str, int],
     *,
     token_row,
-    plan_info: CodexPlanInfo,
 ) -> float | None:
-    candidate_ids = _token_observed_account_ids(token_row, plan_info=plan_info)
-    if not candidate_ids:
+    direct_cost = observed_costs_by_token.get(token_row.id)
+    if direct_cost is not None:
+        return round(float(direct_cost), 6)
+
+    account_id = _observed_cost_fallback_account_id(token_row)
+    if not account_id or token_counts_by_account.get(account_id) != 1:
         return None
-    return round(sum(observed_costs_by_account.get(account_id, 0.0) for account_id in candidate_ids), 6)
+
+    fallback_cost = observed_costs_by_account.get(account_id)
+    if fallback_cost is None:
+        return None
+    return round(float(fallback_cost), 6)
 
 
 async def _build_admin_token_items(
@@ -1171,17 +1178,31 @@ async def _build_admin_token_items(
     }
 
     quota_by_id: dict[int, CodexQuotaSnapshot] = {}
+    observed_costs_by_token: dict[int, float] = {}
     observed_costs_by_account: dict[str, float] = {}
-    observed_account_ids = {
+    token_counts_by_account: dict[str, int] = {}
+    observed_token_ids = {token_row.id for token_row in token_rows}
+    if observed_token_ids:
+        try:
+            observed_costs_by_token = await get_request_costs_by_token(observed_token_ids)
+        except Exception:
+            logger.exception("Failed to collect admin token observed costs by token")
+
+    fallback_account_ids = {
         account_id
         for token_row in token_rows
-        for account_id in _token_observed_account_ids(token_row, plan_info=plan_info_by_id[token_row.id])
+        if token_row.id not in observed_costs_by_token
+        for account_id in [_observed_cost_fallback_account_id(token_row)]
+        if account_id is not None
     }
-    if observed_account_ids:
+    if fallback_account_ids:
         try:
-            observed_costs_by_account = await get_request_costs_by_account(observed_account_ids)
+            observed_costs_by_account, token_counts_by_account = await asyncio.gather(
+                get_request_costs_by_account(fallback_account_ids),
+                get_token_counts_by_account_ids(fallback_account_ids),
+            )
         except Exception:
-            logger.exception("Failed to collect admin token observed costs")
+            logger.exception("Failed to collect admin token observed cost fallbacks")
     if include_quota and token_rows:
         quota_service: CodexQuotaService = app.state.quota_service
         client: httpx.AsyncClient = app.state.http_client
@@ -1206,9 +1227,10 @@ async def _build_admin_token_items(
             plan_info=plan_info_by_id[token_row.id],
             quota_snapshot=quota_by_id.get(token_row.id),
             observed_cost_usd=_resolve_token_observed_cost_usd(
+                observed_costs_by_token,
                 observed_costs_by_account,
+                token_counts_by_account,
                 token_row=token_row,
-                plan_info=plan_info_by_id[token_row.id],
             ),
         )
         for token_row in token_rows
@@ -1460,6 +1482,7 @@ def create_app() -> FastAPI:
         )
 
         attempt_count = 0
+        last_token_id: int | None = None
         last_account_id: str | None = None
 
         try:
@@ -1478,6 +1501,7 @@ def create_app() -> FastAPI:
                 token_row = await claim_next_active_token(selection_strategy=selection_settings.strategy)
                 if token_row is None:
                     break
+                last_token_id = token_row.id
                 last_account_id = token_row.account_id
 
                 try:
@@ -1514,6 +1538,7 @@ def create_app() -> FastAPI:
                                         request_log_id=request_log.id,
                                         status_code=proxy_result.status_code,
                                         attempt_count=attempt,
+                                        token_id=token_row.id,
                                         account_id=token_row.account_id,
                                         fallback_model_name=proxy_result.model_name,
                                         fallback_first_token_at=proxy_result.first_token_at,
@@ -1527,6 +1552,7 @@ def create_app() -> FastAPI:
                                         attempt_count=attempt,
                                         finished_at=utcnow(),
                                         first_token_at=proxy_result.first_token_at,
+                                        token_id=token_row.id,
                                         account_id=token_row.account_id,
                                         model_name=proxy_result.model_name,
                                     )
@@ -1546,6 +1572,7 @@ def create_app() -> FastAPI:
                         attempt_count=attempt,
                         finished_at=utcnow(),
                         first_token_at=proxy_result.first_token_at,
+                        token_id=token_row.id,
                         account_id=token_row.account_id,
                         model_name=proxy_result.model_name,
                         **_usage_finalize_kwargs(proxy_result.usage_metrics),
@@ -1674,6 +1701,7 @@ def create_app() -> FastAPI:
                 success=False,
                 attempt_count=attempt_count,
                 finished_at=utcnow(),
+                token_id=last_token_id,
                 account_id=last_account_id,
                 error_message=str(getattr(exc, "detail", "") or exc),
             )
@@ -1685,6 +1713,7 @@ def create_app() -> FastAPI:
                 success=False,
                 attempt_count=attempt_count,
                 finished_at=utcnow(),
+                token_id=last_token_id,
                 account_id=last_account_id,
                 error_message=str(exc),
             )

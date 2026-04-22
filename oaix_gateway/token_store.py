@@ -311,6 +311,10 @@ def _token_aliases(token: CodexToken) -> list[str]:
     return collect_refresh_token_aliases(token.refresh_token_aliases, token.refresh_token, token.raw_payload)
 
 
+def _normalize_token_account_ids(account_ids: list[str] | set[str] | tuple[str, ...]) -> list[str]:
+    return sorted({str(value or "").strip() for value in account_ids if str(value or "").strip()})
+
+
 async def _acquire_token_identity_locks(
     session,
     *,
@@ -699,6 +703,28 @@ async def get_token_counts() -> TokenCounts:
             cooling=int(cooling_result.scalar_one() or 0),
             disabled=int(disabled_result.scalar_one() or 0),
         )
+
+
+async def get_token_counts_by_account_ids(account_ids: list[str] | set[str] | tuple[str, ...]) -> dict[str, int]:
+    resolved_account_ids = _normalize_token_account_ids(account_ids)
+    if not resolved_account_ids:
+        return {}
+
+    async with get_read_session() as session:
+        result = await session.execute(
+            select(CodexToken.account_id, func.count())
+            .where(
+                *_canonical_token_filters(),
+                CodexToken.account_id.in_(resolved_account_ids),
+            )
+            .group_by(CodexToken.account_id)
+        )
+        rows = result.all()
+    return {
+        str(account_id): int(count or 0)
+        for account_id, count in rows
+        if str(account_id or "").strip()
+    }
 
 
 async def list_token_rows(limit: int = 100) -> list[CodexToken]:
