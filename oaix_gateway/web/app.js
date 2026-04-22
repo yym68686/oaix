@@ -523,8 +523,7 @@ function renderTokenActionButtons(item) {
   const toggleLabel = pendingKind === "toggle" ? "处理中" : nextActive ? "启用" : "停用";
   const deleteLabel = pendingKind === "delete" ? "删除中" : "删除";
   const tone = nextActive ? "enable" : "disable";
-  const probeButton = !Boolean(item?.is_active)
-    ? `
+  const probeButton = `
       <button
         class="token-action-button token-action-button--probe"
         type="button"
@@ -534,8 +533,7 @@ function renderTokenActionButtons(item) {
       >
         ${probeLabel}
       </button>
-    `
-    : "";
+    `;
   return `
     <div class="token-card__actions">
       ${probeButton}
@@ -1687,7 +1685,7 @@ async function probeToken(tokenId) {
     elements.listNote.textContent = data?.message || "测试完成";
   } catch (error) {
     elements.listNote.textContent =
-      error.status === 401 ? "需要输入 Service API Key 才能测试禁用 key" : `测试失败：${error.message}`;
+      error.status === 401 ? "需要输入 Service API Key 才能测试 key" : `测试失败：${error.message}`;
     if (error.status === 401) {
       await loadTokens();
     }

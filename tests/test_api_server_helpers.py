@@ -1568,7 +1568,7 @@ def test_probe_token_with_latest_access_token_reactivates_on_success(monkeypatch
     assert calls["success_token_id"] == 7
     assert result["outcome"] == "reactivated"
     assert result["status_code"] == 200
-    assert "已恢复可用" in result["message"]
+    assert "已标记为可用" in result["message"]
 
 
 def test_probe_token_with_latest_access_token_keeps_disabled_on_auth_failure(monkeypatch) -> None:
@@ -1672,7 +1672,7 @@ def test_probe_token_with_latest_access_token_keeps_disabled_on_auth_failure(mon
     }
     assert result["outcome"] == "disabled"
     assert result["status_code"] == 403
-    assert "真实封禁" in result["message"]
+    assert "已标记为禁用" in result["message"]
 
 
 def test_codex_token_refresh_token_index_is_declared() -> None:
