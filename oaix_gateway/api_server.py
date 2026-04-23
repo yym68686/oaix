@@ -1095,6 +1095,22 @@ def _is_responses_image_compat_model(model_name: Any) -> bool:
     return normalized in RESPONSES_IMAGE_COMPAT_MODELS
 
 
+def _request_requires_non_free_codex_token(request_model: str | None) -> bool:
+    return _is_responses_image_compat_model(request_model)
+
+
+def _token_plan_type(token_row: Any) -> str | None:
+    return extract_codex_plan_info(
+        getattr(token_row, "id_token", None),
+        account_id=getattr(token_row, "account_id", None),
+        raw_payload=getattr(token_row, "raw_payload", None),
+    ).plan_type
+
+
+def _is_free_plan_token(token_row: Any) -> bool:
+    return _token_plan_type(token_row) == "free"
+
+
 def _ensure_responses_image_generation_tool(payload: dict[str, Any]) -> dict[str, Any]:
     tools_payload = payload.get("tools")
     tools: list[Any] = []
@@ -3073,12 +3089,29 @@ async def _execute_proxy_request_with_failover(
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
         last_error: HTTPException | None = None
+        require_non_free_token = _request_requires_non_free_codex_token(request_model)
+        excluded_token_ids: set[int] = set()
+        skipped_free_token_ids: set[int] = set()
 
-        for attempt in range(1, max_attempts + 1):
-            attempt_count = attempt
-            token_row = await claim_next_active_token(selection_strategy=selection_settings.strategy)
+        while attempt_count < max_attempts:
+            token_row = await claim_next_active_token(
+                selection_strategy=selection_settings.strategy,
+                exclude_token_ids=excluded_token_ids,
+            )
             if token_row is None:
                 break
+            if require_non_free_token and _is_free_plan_token(token_row):
+                excluded_token_ids.add(token_row.id)
+                skipped_free_token_ids.add(token_row.id)
+                logger.info(
+                    "Skipping free-plan Codex token for gpt-image-2 request: token_id=%s account_id=%s",
+                    token_row.id,
+                    token_row.account_id,
+                )
+                continue
+
+            attempt_count += 1
+            attempt = attempt_count
             last_token_id = token_row.id
             last_account_id = token_row.account_id
 
@@ -3277,6 +3310,8 @@ async def _execute_proxy_request_with_failover(
                 status_code=503,
                 detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
             )
+        if require_non_free_token and skipped_free_token_ids:
+            raise HTTPException(status_code=503, detail="No non-free Codex token available for gpt-image-2 requests")
         raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
     except HTTPException as exc:
         await finalize_request_log(

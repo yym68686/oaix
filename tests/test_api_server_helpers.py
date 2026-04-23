@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 from starlette.requests import Request
 from oaix_gateway.api_server import (
     ChatCompletionsRequest,
@@ -1822,7 +1823,7 @@ def test_execute_proxy_request_with_failover_does_not_retry_nonretryable_http_ex
     async def fake_get_token_counts():
         return SimpleNamespace(available=5)
 
-    async def fake_claim_next_active_token(*, selection_strategy: str):
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
         claim_calls.append(1)
         return token_row if len(claim_calls) == 1 else None
 
@@ -1898,6 +1899,334 @@ def test_execute_proxy_request_with_failover_does_not_retry_nonretryable_http_ex
     assert finalized[0]["token_id"] == 11
     assert finalized[0]["account_id"] == "acct_11"
     assert finalized[0]["error_message"] == "Upstream did not return image output"
+
+
+def test_execute_proxy_request_with_failover_skips_free_tokens_for_gpt_image_2(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run in successful failover test")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    free_token = CodexToken(
+        id=11,
+        account_id="acct_free",
+        refresh_token="refresh-free",
+        is_active=True,
+        raw_payload={"plan_type": "free"},
+    )
+    paid_token = CodexToken(
+        id=12,
+        account_id="acct_paid",
+        refresh_token="refresh-paid",
+        is_active=True,
+        raw_payload={"plan_type": "plus"},
+    )
+
+    claim_calls: list[tuple[int, ...]] = []
+    mark_success_calls: list[int] = []
+    proxy_calls: list[tuple[str, str | None]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if 11 not in excluded:
+            return free_token
+        return paid_token
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=88)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("mark_token_error should not run on successful request")
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        proxy_calls.append((access_token, account_id))
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-image-2",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/chat/completions",
+            request_model="gpt-image-2",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    assert response.status_code == 200
+    assert claim_calls == [(), (11,)]
+    assert proxy_calls == [("access-token-12", "acct_paid")]
+    assert mark_success_calls == [12]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 88
+    assert finalized[0]["status_code"] == 200
+    assert finalized[0]["success"] is True
+    assert finalized[0]["attempt_count"] == 1
+    assert finalized[0]["finished_at"] is not None
+    assert finalized[0]["first_token_at"] is None
+    assert finalized[0]["token_id"] == 12
+    assert finalized[0]["account_id"] == "acct_paid"
+    assert finalized[0]["model_name"] == "gpt-image-2"
+
+
+def test_execute_proxy_request_with_failover_allows_free_tokens_for_other_models(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run in successful request test")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    free_token = CodexToken(
+        id=21,
+        account_id="acct_free",
+        refresh_token="refresh-free",
+        is_active=True,
+        raw_payload={"plan_type": "free"},
+    )
+
+    claim_calls: list[tuple[int, ...]] = []
+    mark_success_calls: list[int] = []
+    proxy_calls: list[tuple[str, str | None]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        return free_token if len(claim_calls) == 1 else None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=89)
+
+    async def fake_finalize_request_log(*args, **kwargs) -> None:
+        return None
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("mark_token_error should not run on successful request")
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        proxy_calls.append((access_token, account_id))
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-5.4-mini",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.4-mini",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    assert response.status_code == 200
+    assert claim_calls == [()]
+    assert proxy_calls == [("access-token-21", "acct_free")]
+    assert mark_success_calls == [21]
+
+
+def test_execute_proxy_request_with_failover_returns_clear_503_when_only_free_tokens_exist_for_gpt_image_2(
+    monkeypatch,
+) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            raise AssertionError("free tokens should be skipped before fetching access tokens")
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should never run when no request is attempted")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/images/generations",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    free_token = CodexToken(
+        id=31,
+        account_id="acct_free",
+        refresh_token="refresh-free",
+        is_active=True,
+        raw_payload={"plan_type": "free"},
+    )
+
+    claim_calls: list[tuple[int, ...]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if 31 in excluded:
+            return None
+        return free_token
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=90)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        raise AssertionError("mark_token_success should not run when no request is attempted")
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("mark_token_error should not run when free tokens are skipped")
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        raise AssertionError("proxy_call should not run when only free tokens are available")
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            _execute_proxy_request_with_failover(
+                request,
+                endpoint="/v1/images/generations",
+                request_model="gpt-image-2",
+                is_stream=False,
+                proxy_call=fake_proxy_call,
+            )
+        )
+
+    assert exc_info.value.status_code == 503
+    assert str(exc_info.value.detail) == "No non-free Codex token available for gpt-image-2 requests"
+    assert claim_calls == [(), (31,)]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 90
+    assert finalized[0]["status_code"] == 503
+    assert finalized[0]["success"] is False
+    assert finalized[0]["attempt_count"] == 0
+    assert finalized[0]["token_id"] is None
+    assert finalized[0]["account_id"] is None
+    assert finalized[0]["error_message"] == "No non-free Codex token available for gpt-image-2 requests"
 
 
 def test_response_traffic_controller_waits_until_idle(monkeypatch) -> None:

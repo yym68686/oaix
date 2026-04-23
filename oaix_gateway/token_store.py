@@ -532,8 +532,13 @@ async def repair_duplicate_token_histories() -> TokenHistoryRepairSummary:
             return await _repair_duplicate_token_histories_in_session(session)
 
 
-async def claim_next_active_token(*, selection_strategy: str | None = None) -> CodexToken | None:
+async def claim_next_active_token(
+    *,
+    selection_strategy: str | None = None,
+    exclude_token_ids: Iterable[int] | None = None,
+) -> CodexToken | None:
     now = utcnow()
+    excluded_ids = tuple(sorted({int(token_id) for token_id in (exclude_token_ids or ())}))
     async with get_session() as session:
         async with session.begin():
             stmt = (
@@ -543,6 +548,8 @@ async def claim_next_active_token(*, selection_strategy: str | None = None) -> C
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )
+            if excluded_ids:
+                stmt = stmt.where(CodexToken.id.notin_(excluded_ids))
             result = await session.execute(stmt)
             token = result.scalars().first()
             if token is None:
