@@ -953,6 +953,22 @@ def _append_assistant_tool_calls(
         )
 
 
+def _resolved_chat_image_to_responses_input_item(resolved_image: Any) -> dict[str, Any] | None:
+    # Replaying the full upstream output item back into `input` is invalid.
+    # Follow-up edits should reference the prior image generation call by id only.
+    image_call_id = _normalize_optional_text(getattr(resolved_image, "image_call_id", None))
+    output_item = getattr(resolved_image, "output_item", None)
+    if image_call_id is None and isinstance(output_item, dict):
+        if _normalize_optional_text(output_item.get("type")) == "image_generation_call":
+            image_call_id = _normalize_optional_text(output_item.get("id"))
+    if image_call_id is None:
+        return None
+    return {
+        "type": "image_generation_call",
+        "id": image_call_id,
+    }
+
+
 async def _chat_messages_to_responses_input_with_image_checkpoints(
     messages: list[Any],
     *,
@@ -1044,7 +1060,11 @@ async def _chat_messages_to_responses_input_with_image_checkpoints(
             if resolved_image is None:
                 unresolved_image_urls.append(token.image_url)
                 continue
-            input_items.append(copy.deepcopy(resolved_image.output_item))
+            input_item = _resolved_chat_image_to_responses_input_item(resolved_image)
+            if input_item is None:
+                unresolved_image_urls.append(token.image_url)
+                continue
+            input_items.append(input_item)
 
         flush_assistant_parts()
         _append_assistant_tool_calls(input_items, message)

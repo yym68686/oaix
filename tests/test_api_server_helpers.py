@@ -217,9 +217,15 @@ def test_chat_completions_request_to_responses_request_parses_markdown_image_his
         assert image_urls == ["data:image/png;base64,prev-image"]
         return [
             SimpleNamespace(
+                image_call_id="ig_prev",
                 output_item={
                     "type": "image_generation_call",
                     "id": "ig_prev",
+                    "status": "generating",
+                    "action": "generate",
+                    "background": "opaque",
+                    "quality": "medium",
+                    "size": "1024x1024",
                     "result": "prev-image",
                     "output_format": "png",
                 }
@@ -265,8 +271,6 @@ def test_chat_completions_request_to_responses_request_parses_markdown_image_his
         {
             "type": "image_generation_call",
             "id": "ig_prev",
-            "result": "prev-image",
-            "output_format": "png",
         },
         {
             "type": "message",
@@ -315,9 +319,14 @@ def test_chat_completions_request_to_responses_request_resolves_assistant_image_
         assert image_urls == ["data:image/png;base64,prev-image"]
         return [
             SimpleNamespace(
+                image_call_id="ig_prev_url",
                 output_item={
                     "type": "image_generation_call",
                     "id": "ig_prev_url",
+                    "status": "completed",
+                    "action": "generate",
+                    "background": "opaque",
+                    "quality": "medium",
                     "result": "prev-image",
                     "output_format": "png",
                 }
@@ -356,8 +365,6 @@ def test_chat_completions_request_to_responses_request_resolves_assistant_image_
         {
             "type": "image_generation_call",
             "id": "ig_prev_url",
-            "result": "prev-image",
-            "output_format": "png",
         },
         {
             "type": "message",
@@ -1213,9 +1220,15 @@ def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_res
         assert image_urls == ["data:image/png;base64,prev-image"]
         return [
             SimpleNamespace(
+                image_call_id="ig_prev",
                 output_item={
                     "type": "image_generation_call",
                     "id": "ig_prev",
+                    "status": "completed",
+                    "action": "generate",
+                    "background": "opaque",
+                    "quality": "medium",
+                    "size": "1024x1024",
                     "result": "prev-image",
                     "output_format": "png",
                 }
@@ -1350,8 +1363,6 @@ def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_res
     assert upstream_payload["input"][0] == {
         "type": "image_generation_call",
         "id": "ig_prev",
-        "result": "prev-image",
-        "output_format": "png",
     }
     assert upstream_payload["input"][1]["content"] == [
         {"type": "input_text", "text": "Make it blue"}
