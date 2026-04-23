@@ -172,6 +172,7 @@ class TokenSelectionUpdateRequest(BaseModel):
 
 class TokenActivationUpdateRequest(BaseModel):
     active: bool
+    clear_cooldown: bool = False
 
 
 @dataclass(frozen=True)
@@ -520,6 +521,8 @@ def _sanitize_codex_payload(
     payload.pop("safety_identifier", None)
     if compact:
         payload.pop("store", None)
+    else:
+        payload["store"] = False
     payload.setdefault("instructions", "")
     return payload
 
@@ -874,7 +877,7 @@ def _translate_responses_image_compat_payload(
             image_tool[field] = coerced
 
     _apply_images_responses_defaults(translated)
-    translated["tool_choice"] = {"type": "image_generation"}
+    translated.pop("tool_choice", None)
     return translated, requested_model
 
 
@@ -965,7 +968,6 @@ def _build_images_responses_payload(prompt: str, images: list[str], tool: dict[s
     payload = {
         "stream": True,
         "model": DEFAULT_IMAGES_MAIN_MODEL,
-        "tool_choice": {"type": "image_generation"},
         "input": [{"type": "message", "role": "user", "content": content}],
         "tools": [tool],
     }
@@ -3260,7 +3262,11 @@ def create_app() -> FastAPI:
         payload: TokenActivationUpdateRequest,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
-        token = await set_token_active_state(token_id, active=payload.active)
+        token = await set_token_active_state(
+            token_id,
+            active=payload.active,
+            clear_cooldown=payload.clear_cooldown,
+        )
         if token is None:
             raise HTTPException(status_code=404, detail="Token not found")
         counts = await get_token_counts()

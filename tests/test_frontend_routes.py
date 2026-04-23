@@ -4,6 +4,8 @@ import httpx
 from fastapi.responses import JSONResponse
 
 from oaix_gateway.api_server import create_app
+from oaix_gateway.database import CodexToken
+from oaix_gateway.token_store import TokenCounts
 
 
 async def _request(
@@ -104,3 +106,60 @@ def test_chat_completions_post_includes_cors_headers(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_token_activation_route_forwards_clear_cooldown(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+    captured: dict[str, object] = {}
+
+    async def fake_set_token_active_state(
+        token_id: int,
+        *,
+        active: bool,
+        clear_cooldown: bool = False,
+    ) -> CodexToken | None:
+        captured["token_id"] = token_id
+        captured["active"] = active
+        captured["clear_cooldown"] = clear_cooldown
+        return CodexToken(
+            id=token_id,
+            token_type="codex",
+            is_active=active,
+            cooldown_until=None,
+        )
+
+    async def fake_get_token_counts() -> TokenCounts:
+        return TokenCounts(total=3, active=2, available=2, cooling=0, disabled=1)
+
+    monkeypatch.setattr("oaix_gateway.api_server.set_token_active_state", fake_set_token_active_state)
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/admin/tokens/9/activation",
+            json={"active": True, "clear_cooldown": True},
+        )
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "token_id": 9,
+        "active": True,
+        "clear_cooldown": True,
+    }
+    assert response.json() == {
+        "id": 9,
+        "is_active": True,
+        "cooldown_until": None,
+        "counts": {
+            "total": 3,
+            "active": 2,
+            "available": 2,
+            "cooling": 0,
+            "disabled": 1,
+        },
+    }

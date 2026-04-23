@@ -601,13 +601,20 @@ async def mark_token_success(token_id: int) -> None:
             token.updated_at = utcnow()
 
 
-async def set_token_active_state(token_id: int, *, active: bool) -> CodexToken | None:
+async def set_token_active_state(
+    token_id: int,
+    *,
+    active: bool,
+    clear_cooldown: bool = False,
+) -> CodexToken | None:
     async with get_session() as session:
         async with session.begin():
             token = await _resolve_canonical_token_for_update(session, token_id)
             if token is None:
                 return None
             token.is_active = bool(active)
+            if not active or clear_cooldown:
+                token.cooldown_until = None
             token.updated_at = utcnow()
             await session.flush()
             return token

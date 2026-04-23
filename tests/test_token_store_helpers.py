@@ -7,6 +7,7 @@ from oaix_gateway.token_store import (
     TokenHistoryRepairSummary,
     _merge_duplicate_token_rows,
     repair_duplicate_token_histories,
+    set_token_active_state,
     update_token_refresh_state,
 )
 
@@ -22,6 +23,9 @@ class _FakeTransaction:
 class _FakeSession:
     def begin(self) -> _FakeTransaction:
         return _FakeTransaction()
+
+    async def flush(self) -> None:
+        return None
 
     async def close(self) -> None:
         return None
@@ -205,3 +209,59 @@ def test_repair_duplicate_token_histories_acquires_history_lock(monkeypatch) -> 
 
     assert calls == ["lock", "repair"]
     assert summary == expected
+
+
+def test_set_token_active_state_can_clear_cooldown_when_reactivating(monkeypatch) -> None:
+    token = CodexToken(
+        id=7,
+        token_type="codex",
+        is_active=True,
+        cooldown_until=datetime(2026, 4, 15, 15, 0, tzinfo=timezone.utc),
+    )
+    fake_session = _FakeSession()
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield fake_session
+
+    async def fake_resolve(session, token_id: int) -> CodexToken:
+        assert session is fake_session
+        assert token_id == 7
+        return token
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
+    monkeypatch.setattr("oaix_gateway.token_store._resolve_canonical_token_for_update", fake_resolve)
+
+    result = asyncio.run(set_token_active_state(7, active=True, clear_cooldown=True))
+
+    assert result is token
+    assert token.is_active is True
+    assert token.cooldown_until is None
+
+
+def test_set_token_active_state_clears_cooldown_when_deactivating(monkeypatch) -> None:
+    token = CodexToken(
+        id=8,
+        token_type="codex",
+        is_active=True,
+        cooldown_until=datetime(2026, 4, 15, 15, 30, tzinfo=timezone.utc),
+    )
+    fake_session = _FakeSession()
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield fake_session
+
+    async def fake_resolve(session, token_id: int) -> CodexToken:
+        assert session is fake_session
+        assert token_id == 8
+        return token
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
+    monkeypatch.setattr("oaix_gateway.token_store._resolve_canonical_token_for_update", fake_resolve)
+
+    result = asyncio.run(set_token_active_state(8, active=False))
+
+    assert result is token
+    assert token.is_active is False
+    assert token.cooldown_until is None

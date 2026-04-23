@@ -601,16 +601,29 @@ function isTokenActionPending(tokenId) {
   return state.tokenActionPendingKinds.has(Number(tokenId));
 }
 
+function clearTokenActionPending(tokenId) {
+  const resolvedTokenId = Number(tokenId);
+  if (!Number.isFinite(resolvedTokenId)) {
+    return;
+  }
+  if (!state.tokenActionPendingKinds.delete(resolvedTokenId)) {
+    return;
+  }
+  renderTokenList(state.tokenItems);
+}
+
 function renderTokenActionButtons(item) {
   const tokenId = Number(item?.id);
-  const nextActive = !Boolean(item?.is_active);
+  const status = deriveStatus(item);
   const pendingKind = getTokenActionPendingKind(tokenId);
   const pending = Boolean(pendingKind);
   const probeLabel = pendingKind === "probe" ? "测试中" : "测试";
-  const toggleLabel = pendingKind === "toggle" ? "处理中" : nextActive ? "启用" : "停用";
+  const enableLabel = pendingKind === "enable" ? "处理中" : "启用";
+  const makeAvailableLabel = pendingKind === "make-available" ? "处理中" : "转为可用";
+  const disableLabel = pendingKind === "disable" ? "处理中" : "停用";
   const deleteLabel = pendingKind === "delete" ? "删除中" : "删除";
-  const tone = nextActive ? "enable" : "disable";
-  const probeButton = `
+  const actionButtons = [
+    `
       <button
         class="token-action-button token-action-button--probe"
         type="button"
@@ -620,20 +633,59 @@ function renderTokenActionButtons(item) {
       >
         ${probeLabel}
       </button>
-    `;
-  return `
-    <div class="token-card__actions">
-      ${probeButton}
+    `,
+  ];
+
+  if (status.tone === "cooling") {
+    actionButtons.push(`
+      <button
+        class="token-action-button token-action-button--enable"
+        type="button"
+        data-token-toggle="true"
+        data-token-id="${tokenId}"
+        data-next-active="true"
+        data-clear-cooldown="true"
+        data-pending-kind="make-available"
+        ${pending ? "disabled" : ""}
+      >
+        ${makeAvailableLabel}
+      </button>
+    `);
+    actionButtons.push(`
+      <button
+        class="token-action-button token-action-button--disable"
+        type="button"
+        data-token-toggle="true"
+        data-token-id="${tokenId}"
+        data-next-active="false"
+        data-clear-cooldown="false"
+        data-pending-kind="disable"
+        ${pending ? "disabled" : ""}
+      >
+        ${disableLabel}
+      </button>
+    `);
+  } else {
+    const nextActive = !Boolean(item?.is_active);
+    const tone = nextActive ? "enable" : "disable";
+    const toggleLabel = nextActive ? enableLabel : disableLabel;
+    actionButtons.push(`
       <button
         class="token-action-button token-action-button--${tone}"
         type="button"
         data-token-toggle="true"
         data-token-id="${tokenId}"
         data-next-active="${nextActive ? "true" : "false"}"
+        data-clear-cooldown="${nextActive ? "true" : "false"}"
+        data-pending-kind="${nextActive ? "enable" : "disable"}"
         ${pending ? "disabled" : ""}
       >
         ${toggleLabel}
       </button>
+    `);
+  }
+
+  actionButtons.push(`
       <button
         class="token-action-button token-action-button--delete"
         type="button"
@@ -643,6 +695,11 @@ function renderTokenActionButtons(item) {
       >
         ${deleteLabel}
       </button>
+    `);
+
+  return `
+    <div class="token-card__actions">
+      ${actionButtons.join("")}
     </div>
   `;
 }
@@ -1723,20 +1780,26 @@ async function saveTokenSelection(strategy) {
   }
 }
 
-async function toggleTokenActivation(tokenId, nextActive) {
+async function toggleTokenActivation(
+  tokenId,
+  { nextActive, clearCooldown = false, pendingKind = nextActive ? "enable" : "disable" } = {},
+) {
   const resolvedTokenId = Number(tokenId);
   if (!Number.isFinite(resolvedTokenId) || isTokenActionPending(resolvedTokenId)) {
     return;
   }
 
-  state.tokenActionPendingKinds.set(resolvedTokenId, "toggle");
+  state.tokenActionPendingKinds.set(resolvedTokenId, pendingKind);
   renderTokenList(state.tokenItems);
 
   try {
     await fetchJson(`/admin/tokens/${resolvedTokenId}/activation`, {
       method: "POST",
       headers: authHeaders(true),
-      body: JSON.stringify({ active: Boolean(nextActive) }),
+      body: JSON.stringify({
+        active: Boolean(nextActive),
+        clear_cooldown: Boolean(clearCooldown),
+      }),
     });
     await loadHealth();
     await loadTokens();
@@ -1767,6 +1830,7 @@ async function probeToken(tokenId) {
       method: "POST",
       headers: authHeaders(),
     });
+    clearTokenActionPending(resolvedTokenId);
     showToast(data?.message || "测试完成", resolveProbeToastTone(data));
     try {
       await loadHealth();
@@ -1775,6 +1839,7 @@ async function probeToken(tokenId) {
       elements.listNote.textContent = `测试结果已返回，列表稍后刷新：${refreshError.message}`;
     }
   } catch (error) {
+    clearTokenActionPending(resolvedTokenId);
     showToast(
       error.status === 401 ? "需要输入 Service API Key 才能测试 key。" : `测试失败：${error.message}`,
       "error",
@@ -1784,8 +1849,7 @@ async function probeToken(tokenId) {
     }
     throw error;
   } finally {
-    state.tokenActionPendingKinds.delete(resolvedTokenId);
-    renderTokenList(state.tokenItems);
+    clearTokenActionPending(resolvedTokenId);
   }
 }
 
@@ -2106,7 +2170,11 @@ elements.tokenList.addEventListener("click", async (event) => {
   const toggleButton = event.target.closest("[data-token-toggle]");
   if (toggleButton instanceof HTMLElement) {
     try {
-      await toggleTokenActivation(toggleButton.dataset.tokenId, toggleButton.dataset.nextActive === "true");
+      await toggleTokenActivation(toggleButton.dataset.tokenId, {
+        nextActive: toggleButton.dataset.nextActive === "true",
+        clearCooldown: toggleButton.dataset.clearCooldown === "true",
+        pendingKind: toggleButton.dataset.pendingKind,
+      });
     } catch {}
     return;
   }

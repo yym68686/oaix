@@ -114,6 +114,7 @@ def test_sanitize_codex_payload_removes_unsupported_fields() -> None:
     assert sanitized == {
         "model": "gpt-4.1",
         "input": "hi",
+        "store": False,
         "instructions": "",
     }
 
@@ -133,6 +134,21 @@ def test_sanitize_codex_payload_compact_strips_store() -> None:
     }
 
 
+def test_sanitize_codex_payload_forces_store_false_for_non_compact() -> None:
+    payload = {
+        "model": "gpt-4.1",
+        "input": "hi",
+        "store": True,
+    }
+    sanitized = _sanitize_codex_payload(payload)
+    assert sanitized == {
+        "model": "gpt-4.1",
+        "input": "hi",
+        "store": False,
+        "instructions": "",
+    }
+
+
 def test_sanitize_codex_payload_can_preserve_previous_response_id() -> None:
     payload = {
         "model": "gpt-image-2",
@@ -144,6 +160,7 @@ def test_sanitize_codex_payload_can_preserve_previous_response_id() -> None:
         "model": "gpt-image-2",
         "input": "hi",
         "previous_response_id": "resp_prev_123",
+        "store": False,
         "instructions": "",
     }
 
@@ -168,7 +185,7 @@ def test_translate_responses_image_compat_payload_injects_image_tool() -> None:
     assert translated["parallel_tool_calls"] is True
     assert translated["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert translated["include"] == ["custom.include", "reasoning.encrypted_content"]
-    assert translated["tool_choice"] == {"type": "image_generation"}
+    assert "tool_choice" not in translated
     assert translated["tools"] == [
         {
             "type": "image_generation",
@@ -256,7 +273,7 @@ def test_parse_images_generations_request_builds_image_tool_payload() -> None:
     assert image_request.stream_prefix == "image_generation"
     assert image_request.responses_payload["model"] == "gpt-5.4-mini"
     assert image_request.responses_payload["stream"] is True
-    assert image_request.responses_payload["tool_choice"] == {"type": "image_generation"}
+    assert "tool_choice" not in image_request.responses_payload
     assert image_request.responses_payload["tools"][0] == {
         "type": "image_generation",
         "action": "generate",
@@ -749,7 +766,9 @@ def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request(
     assert len(client.stream_calls) == 1
     stream_call = client.stream_calls[0]
     assert stream_call["headers"]["Accept"] == "text/event-stream"
-    assert json.loads(stream_call["content"])["stream"] is True
+    upstream_payload = json.loads(stream_call["content"])
+    assert upstream_payload["stream"] is True
+    assert upstream_payload["store"] is False
     assert result.first_token_at is not None
     assert result.status_code == 200
     assert result.model_name == "gpt-5.4-mini"
@@ -850,7 +869,7 @@ def test_proxy_request_with_token_auto_translates_gpt_image_responses_request() 
     assert upstream_payload["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert upstream_payload["include"] == ["reasoning.encrypted_content"]
     assert upstream_payload["previous_response_id"] == "resp_prev_123"
-    assert upstream_payload["tool_choice"] == {"type": "image_generation"}
+    assert "tool_choice" not in upstream_payload
     assert upstream_payload["tools"] == [
         {
             "type": "image_generation",
@@ -1058,7 +1077,11 @@ def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias() -> Non
 
     upstream_payload = json.loads(stream_calls[0]["content"])
     assert upstream_payload["model"] == "gpt-5.4-mini"
-    assert upstream_payload["tool_choice"] == {"type": "image_generation"}
+    assert upstream_payload["store"] is False
+    assert upstream_payload["parallel_tool_calls"] is True
+    assert upstream_payload["reasoning"] == {"effort": "medium", "summary": "auto"}
+    assert upstream_payload["include"] == ["reasoning.encrypted_content"]
+    assert "tool_choice" not in upstream_payload
     assert upstream_payload["tools"][0]["model"] == "gpt-image-2"
     assert result.status_code == 200
     assert result.model_name == "gpt-image-2"
@@ -1160,7 +1183,7 @@ def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_res
     assert upstream_payload["parallel_tool_calls"] is True
     assert upstream_payload["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert upstream_payload["include"] == ["reasoning.encrypted_content"]
-    assert upstream_payload["tool_choice"] == {"type": "image_generation"}
+    assert "tool_choice" not in upstream_payload
     assert upstream_payload["tools"] == [
         {
             "type": "image_generation",
@@ -1274,7 +1297,7 @@ def test_proxy_chat_completions_with_token_stream_returns_markdown_image_chunks(
     assert upstream_payload["parallel_tool_calls"] is True
     assert upstream_payload["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert upstream_payload["include"] == ["reasoning.encrypted_content"]
-    assert upstream_payload["tool_choice"] == {"type": "image_generation"}
+    assert "tool_choice" not in upstream_payload
     assert upstream_payload["tools"] == [
         {
             "type": "image_generation",
