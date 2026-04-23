@@ -5,6 +5,7 @@ const REFRESH_INTERVAL_MS = 15000;
 const IMPORT_JOB_POLL_INTERVAL_MS = 1500;
 const TOAST_DURATION_MS = 5200;
 const TOAST_EXIT_DURATION_MS = 220;
+const TOKEN_LIST_BASE_NOTE = "显示最近 80 条记录 · 可用 / 冷却 / 已禁用分组";
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 
@@ -35,6 +36,7 @@ const state = {
   tokenActionPendingKinds: new Map(),
   tokenDeleteTargetId: null,
   tokenGroupOpenStates: Object.create(null),
+  tokenSearchTerm: "",
   tokenItems: [],
   healthLoaded: false,
   tokensLoaded: false,
@@ -73,6 +75,8 @@ const elements = {
   importFeedback: document.getElementById("import-feedback"),
   tokenList: document.getElementById("token-list"),
   listNote: document.getElementById("list-note"),
+  tokenSearchInput: document.getElementById("token-search-input"),
+  tokenSearchSummary: document.getElementById("token-search-summary"),
   tokenSelectionSummary: document.getElementById("token-selection-summary"),
   tokenSelectionButtons: Array.from(document.querySelectorAll("[data-selection-strategy]")),
   requestList: document.getElementById("request-list"),
@@ -498,6 +502,13 @@ function setTokenSelectionDisabled(disabled) {
   });
 }
 
+function setTokenSearchDisabled(disabled) {
+  if (!elements.tokenSearchInput) {
+    return;
+  }
+  elements.tokenSearchInput.disabled = disabled;
+}
+
 function renderLoadingState(message, className = "") {
   const classes = ["loading-state", className].filter(Boolean).join(" ");
   return `
@@ -533,6 +544,7 @@ function renderRequestSummaryUnavailable() {
 }
 
 function renderTokenListLoading() {
+  renderTokenSearchSummary(0, 0, "等待载入");
   elements.tokenList.innerHTML = renderLoadingState("正在加载 key 池…");
 }
 
@@ -563,6 +575,7 @@ function renderInitialLoadingStates() {
       elements.tokenSelectionSummary.textContent = "正在同步策略";
     }
     setTokenSelectionDisabled(true);
+    setTokenSearchDisabled(true);
     renderTokenListLoading();
   }
   if (!state.requestsLoaded) {
@@ -585,6 +598,68 @@ function renderTokenSelection(selection) {
   if (elements.tokenSelectionSummary) {
     elements.tokenSelectionSummary.textContent = describeTokenSelectionStrategy(strategy);
   }
+}
+
+function normalizeTokenSearchQuery(value) {
+  return normalizeWhitespace(value).toLowerCase();
+}
+
+function getTokenSearchTerms() {
+  return normalizeTokenSearchQuery(state.tokenSearchTerm)
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function buildTokenSearchIndex(item) {
+  const status = deriveStatus(item);
+  const workspaceAccountId = resolveWorkspaceAccountId(item);
+  const primaryError = normalizeWhitespace(item?.last_error || "");
+  const quotaError = normalizeWhitespace(item?.quota?.error || "");
+  const fields = [
+    item?.id == null ? "" : `token ${item.id}`,
+    item?.id == null ? "" : `token #${item.id}`,
+    normalizeWhitespace(item?.email || ""),
+    workspaceAccountId,
+    normalizeWhitespace(item?.source_file || ""),
+    normalizeWhitespace(item?.plan_type || ""),
+    formatPlanType(item?.plan_type),
+    status.label,
+    summarizeTokenError(primaryError),
+    summarizeTokenError(quotaError),
+    primaryError,
+    quotaError,
+  ];
+  return fields
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+}
+
+function filterTokenItems(items) {
+  const list = Array.isArray(items) ? items : [];
+  const searchTerms = getTokenSearchTerms();
+  if (!searchTerms.length) {
+    return list;
+  }
+  return list.filter((item) => {
+    const haystack = buildTokenSearchIndex(item);
+    return searchTerms.every((term) => haystack.includes(term));
+  });
+}
+
+function renderTokenSearchSummary(totalCount, visibleCount, customMessage = "") {
+  if (!elements.tokenSearchSummary) {
+    return;
+  }
+  if (customMessage) {
+    elements.tokenSearchSummary.textContent = customMessage;
+    return;
+  }
+  if (!getTokenSearchTerms().length) {
+    elements.tokenSearchSummary.textContent = totalCount > 0 ? `显示 ${formatInteger(totalCount)} 条` : "等待导入或刷新";
+    return;
+  }
+  elements.tokenSearchSummary.textContent = `匹配 ${formatInteger(visibleCount)} / ${formatInteger(totalCount)} 条`;
 }
 
 function resolveTokenGroupOpenState(groupId, fallbackOpen) {
@@ -1401,7 +1476,11 @@ function renderRequestAnalytics(analytics) {
 }
 
 function renderTokenList(items) {
-  if (!Array.isArray(items) || items.length === 0) {
+  const list = Array.isArray(items) ? items : [];
+  const filteredItems = filterTokenItems(list);
+  renderTokenSearchSummary(list.length, filteredItems.length);
+
+  if (list.length === 0) {
     elements.tokenList.innerHTML = `
       <article class="empty-state">
         <p>没有最近记录。先导入一批 key，列表会在这里展开。</p>
@@ -1410,12 +1489,22 @@ function renderTokenList(items) {
     return;
   }
 
+  if (filteredItems.length === 0) {
+    const query = normalizeWhitespace(state.tokenSearchTerm);
+    elements.tokenList.innerHTML = `
+      <article class="empty-state">
+        <p>最近 80 条记录里没有匹配“${escapeHtml(query)}”的 key。</p>
+      </article>
+    `;
+    return;
+  }
+
   const availableItems = [];
   const coolingItems = [];
   const disabledItems = [];
-  const workspaceTokenCounts = buildWorkspaceTokenCounts(items);
+  const workspaceTokenCounts = buildWorkspaceTokenCounts(filteredItems);
 
-  items.forEach((item) => {
+  filteredItems.forEach((item) => {
     const status = deriveStatus(item);
     if (status.tone === "disabled") {
       disabledItems.push(item);
@@ -1707,9 +1796,10 @@ async function loadTokens() {
     });
     state.tokensLoaded = true;
     state.tokenItems = Array.isArray(data.items) ? data.items : [];
-    elements.listNote.textContent = "显示最近 80 条记录 · 可用 / 冷却 / 已禁用分组";
+    elements.listNote.textContent = TOKEN_LIST_BASE_NOTE;
     renderTokenSelection(data.selection || {});
     setTokenSelectionDisabled(state.tokenSelectionSaving);
+    setTokenSearchDisabled(false);
     renderTokenList(state.tokenItems);
     if (data.counts) {
       renderCounts(data.counts);
@@ -1719,10 +1809,12 @@ async function loadTokens() {
     state.tokenItems = [];
     if (error.status === 401) {
       elements.listNote.textContent = "需要输入 Service API Key 才能查看明细和导入";
+      renderTokenSearchSummary(0, 0, "需要 Service API Key");
       if (elements.tokenSelectionSummary) {
         elements.tokenSelectionSummary.textContent = "需要 Service API Key";
       }
       setTokenSelectionDisabled(true);
+      setTokenSearchDisabled(true);
       elements.tokenList.innerHTML = `
         <article class="empty-state">
           <p>管理接口已加锁。填入 Service API Key 后可查看明细和导入 key。</p>
@@ -1731,10 +1823,12 @@ async function loadTokens() {
       return;
     }
     elements.listNote.textContent = `列表加载失败：${error.message}`;
+    renderTokenSearchSummary(0, 0, "列表加载失败");
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "切换器同步失败";
     }
     setTokenSelectionDisabled(true);
+    setTokenSearchDisabled(true);
     elements.tokenList.innerHTML = `
       <article class="empty-state">
         <p>${escapeHtml(error.message)}</p>
@@ -1765,7 +1859,7 @@ async function saveTokenSelection(strategy) {
       body: JSON.stringify({ strategy: nextStrategy }),
     });
     renderTokenSelection(data);
-    elements.listNote.textContent = "显示最近 80 条记录 · 可用 / 冷却 / 已禁用分组";
+    elements.listNote.textContent = TOKEN_LIST_BASE_NOTE;
   } catch (error) {
     renderTokenSelection({ strategy: previousStrategy });
     if (elements.tokenSelectionSummary) {
@@ -2155,6 +2249,16 @@ elements.tokenSelectionButtons.forEach((button) => {
     } catch {}
   });
 });
+
+if (elements.tokenSearchInput) {
+  elements.tokenSearchInput.addEventListener("input", (event) => {
+    if (!(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+    state.tokenSearchTerm = event.target.value;
+    renderTokenList(state.tokenItems);
+  });
+}
 
 elements.tokenList.addEventListener("click", async (event) => {
   if (!(event.target instanceof Element)) {

@@ -432,6 +432,51 @@ button {
   text-align: right;
 }
 
+.token-search {
+  flex: 1 1 320px;
+  display: grid;
+  gap: 6px;
+  max-width: 360px;
+  min-width: min(100%, 260px);
+}
+
+.token-search__label {
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: color-mix(in oklab, var(--ink-soft) 84%, var(--accent));
+}
+
+.token-search__input {
+  width: 100%;
+  min-height: 42px;
+  padding: 11px 15px;
+  border: 1px solid var(--border-input);
+  border-radius: 999px;
+  background: var(--surface-input);
+  color: var(--ink);
+  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.token-search__input::placeholder {
+  color: color-mix(in oklab, var(--ink-soft) 88%, transparent);
+}
+
+.token-search__input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+  transform: translateY(-1px);
+}
+
+.token-search__summary {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--ink-soft);
+}
+
 .selection-switch {
   display: flex;
   align-items: center;
@@ -2366,6 +2411,11 @@ button {
 
   .section-tools--token .section-note {
     text-align: left;
+  }
+
+  .token-search {
+    width: 100%;
+    max-width: none;
   }
 
   .selection-switch {

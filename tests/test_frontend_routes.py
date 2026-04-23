@@ -47,6 +47,16 @@ def test_assets_mount_is_registered() -> None:
     assert any(getattr(route, "path", None) == "/assets" for route in app.routes)
 
 
+def test_frontend_index_includes_token_search_input() -> None:
+    app = create_app()
+
+    response = asyncio.run(_request(app, "GET", "/"))
+
+    assert response.status_code == 200
+    assert 'id="token-search-input"' in response.text
+    assert 'id="token-search-summary"' in response.text
+
+
 def test_chat_completions_preflight_is_handled_by_cors(monkeypatch) -> None:
     monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
     monkeypatch.delenv("API_KEY", raising=False)

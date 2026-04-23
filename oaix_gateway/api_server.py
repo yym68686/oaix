@@ -121,8 +121,9 @@ RESPONSES_STREAM_NETWORK_ERRORS = (
     httpx.ReadTimeout,
     httpx.ConnectError,
 )
-DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS = 100.0
-STREAM_KEEPALIVE_COMMENT = b": keepalive\n\n"
+DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS = 30.0
+STREAM_KEEPALIVE_PADDING_BYTES = 2048
+STREAM_KEEPALIVE_COMMENT = b": keepalive" + (b" " * STREAM_KEEPALIVE_PADDING_BYTES) + b"\n\n"
 RESPONSES_FAILURE_STATUS_BY_CODE = {
     "account_deactivated": 403,
     "account_disabled": 403,
@@ -188,6 +189,16 @@ class ProxyRequestResult:
     usage_metrics: UsageMetrics | None = None
     on_success: Callable[[int], Awaitable[None]] | None = None
     stream_capture: "_ProxyStreamCapture | None" = None
+
+
+@dataclass(frozen=True)
+class _PrimedResponsesStream:
+    buffered_chunks: list[bytes]
+    stream_committed: bool
+    model_name: str | None
+    first_token_observed: bool
+    emit_initial_keepalive: bool = False
+    pending_chunk_task: asyncio.Task[bytes] | None = None
 
 
 @dataclass(frozen=True)
@@ -315,6 +326,64 @@ class _GatewayProxyHTTPException(HTTPException):
         super().__init__(status_code=status_code, detail=detail)
         self.retryable = retryable
         self.record_token_error = record_token_error
+
+
+class _SSEProxyStreamingResponse(Response):
+    def __init__(
+        self,
+        content: AsyncIterator[bytes],
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        super().__init__(content=None, status_code=status_code, headers=headers, media_type=media_type)
+        self.body_iterator = content
+        if "content-length" in self.headers:
+            del self.headers["content-length"]
+
+    async def __call__(self, scope, receive, send) -> None:
+        response_started = False
+        try:
+            async for chunk in self.body_iterator:
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                if not response_started:
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": self.status_code,
+                            "headers": self.raw_headers,
+                        }
+                    )
+                    response_started = True
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": chunk,
+                        "more_body": True,
+                    }
+                )
+        finally:
+            if not response_started:
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": self.status_code,
+                        "headers": self.raw_headers,
+                    }
+                )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b"",
+                    "more_body": False,
+                }
+            )
+            close_iterator = getattr(self.body_iterator, "aclose", None)
+            if callable(close_iterator):
+                with suppress(Exception):
+                    await close_iterator()
 
 
 class ResponseTrafficLease:
@@ -1138,31 +1207,21 @@ def _declared_token_plan_info(token_row: Any) -> CodexPlanInfo:
 
 
 async def _effective_token_plan_type(http_request: Request, token_row: Any) -> str | None:
+    stored_plan_type = _normalize_optional_text(getattr(token_row, "plan_type", None))
+    if stored_plan_type is not None:
+        return stored_plan_type.lower()
+
     declared_plan_info = _declared_token_plan_info(token_row)
+    if declared_plan_info.plan_type is not None:
+        return declared_plan_info.plan_type
+
     quota_service: CodexQuotaService | None = getattr(http_request.app.state, "quota_service", None)
-    client: httpx.AsyncClient | None = getattr(http_request.app.state, "http_client", None)
-    oauth_manager: CodexOAuthManager | None = getattr(http_request.app.state, "oauth_manager", None)
-    effective_account_id = declared_plan_info.chatgpt_account_id or getattr(token_row, "account_id", None)
+    if quota_service is not None:
+        cached_snapshot = quota_service.get_cached_snapshot(getattr(token_row, "id", 0))
+        if cached_snapshot is not None and cached_snapshot.plan_type:
+            return cached_snapshot.plan_type
 
-    if quota_service is not None and client is not None and oauth_manager is not None:
-        try:
-            quota_snapshot = await quota_service.get_snapshot(
-                token_row,
-                client=client,
-                oauth_manager=oauth_manager,
-                account_id=effective_account_id,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to resolve quota snapshot while selecting gpt-image-2 token: token_id=%s account_id=%s",
-                getattr(token_row, "id", None),
-                getattr(token_row, "account_id", None),
-            )
-        else:
-            if quota_snapshot.plan_type:
-                return quota_snapshot.plan_type
-
-    return declared_plan_info.plan_type
+    return None
 
 
 async def _is_free_plan_token(http_request: Request, token_row: Any) -> bool:
@@ -1555,6 +1614,13 @@ def _stream_keepalive_interval_seconds() -> float:
     return max(1.0, value)
 
 
+def _sse_response_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+    }
+
+
 def _is_sse_comment_frame(raw_event: str) -> bool:
     has_line = False
     for line in raw_event.splitlines():
@@ -1572,13 +1638,30 @@ async def _iterate_with_sse_keepalive(
     *,
     heartbeat_interval_seconds: float | None,
     heartbeat_bytes: bytes = STREAM_KEEPALIVE_COMMENT,
+    pending_chunk_task: asyncio.Task[bytes] | None = None,
 ) -> AsyncGenerator[bytes, None]:
     if heartbeat_interval_seconds is None or heartbeat_interval_seconds <= 0:
-        async for chunk in source_iter:
-            yield chunk
+        next_chunk_task = pending_chunk_task
+        if next_chunk_task is None:
+            async for chunk in source_iter:
+                yield chunk
+            return
+        try:
+            while True:
+                try:
+                    chunk = await next_chunk_task
+                except StopAsyncIteration:
+                    return
+                yield chunk
+                next_chunk_task = asyncio.create_task(source_iter.__anext__())
+        finally:
+            if next_chunk_task is not None and not next_chunk_task.done():
+                next_chunk_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await next_chunk_task
         return
 
-    next_chunk_task = asyncio.create_task(source_iter.__anext__())
+    next_chunk_task = pending_chunk_task or asyncio.create_task(source_iter.__anext__())
     try:
         while True:
             done, _ = await asyncio.wait({next_chunk_task}, timeout=heartbeat_interval_seconds)
@@ -1597,6 +1680,60 @@ async def _iterate_with_sse_keepalive(
             next_chunk_task.cancel()
             with suppress(asyncio.CancelledError):
                 await next_chunk_task
+
+
+async def _wrap_sse_stream_with_initial_keepalive(
+    source_iter: AsyncIterator[bytes],
+    *,
+    heartbeat_interval_seconds: float | None,
+    heartbeat_bytes: bytes = STREAM_KEEPALIVE_COMMENT,
+) -> AsyncGenerator[bytes, None]:
+    if heartbeat_interval_seconds is None or heartbeat_interval_seconds <= 0:
+        async for chunk in source_iter:
+            yield chunk
+        return
+
+    first_chunk_task = asyncio.create_task(source_iter.__anext__())
+    handoff_to_keepalive = False
+    try:
+        try:
+            done, _ = await asyncio.wait({first_chunk_task}, timeout=heartbeat_interval_seconds)
+            if first_chunk_task in done:
+                try:
+                    first_chunk = first_chunk_task.result()
+                except StopAsyncIteration:
+                    return
+                yield first_chunk
+                async for chunk in _iterate_with_sse_keepalive(
+                    source_iter,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    heartbeat_bytes=heartbeat_bytes,
+                ):
+                    yield chunk
+                return
+
+            handoff_to_keepalive = True
+            yield heartbeat_bytes
+            async for chunk in _iterate_with_sse_keepalive(
+                source_iter,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                heartbeat_bytes=heartbeat_bytes,
+                pending_chunk_task=first_chunk_task,
+            ):
+                yield chunk
+        except StopAsyncIteration:
+            return
+        except HTTPException as exc:
+            yield _build_stream_error_event(exc.status_code, str(getattr(exc, "detail", "") or exc))
+            yield b"data: [DONE]\n\n"
+        except Exception as exc:
+            yield _build_stream_error_event(502, str(exc) or type(exc).__name__)
+            yield b"data: [DONE]\n\n"
+    finally:
+        if not handoff_to_keepalive and not first_chunk_task.done():
+            first_chunk_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await first_chunk_task
 
 
 def _responses_error_status_code(error_obj: Any) -> int:
@@ -1945,7 +2082,11 @@ def _decode_responses_json_body(raw: bytes) -> dict[str, Any]:
     return payload
 
 
-async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) -> tuple[list[bytes], bool, str | None]:
+async def _prime_responses_upstream_stream(
+    upstream_iter: AsyncIterator[bytes],
+    *,
+    heartbeat_interval_seconds: float | None = None,
+) -> _PrimedResponsesStream:
     """
     Buffer only initial status events so semantic stream failures can still
     trigger key failover before the downstream response is committed.
@@ -1954,43 +2095,102 @@ async def _prime_responses_upstream_stream(upstream_iter: AsyncIterator[bytes]) 
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
     model_name: str | None = None
+    keepalive_deadline: float | None = None
+    pending_chunk_task: asyncio.Task[bytes] | None = None
 
-    while True:
-        try:
-            chunk = await upstream_iter.__anext__()
-        except StopAsyncIteration as exc:
-            if not buffered_chunks:
-                raise HTTPException(status_code=502, detail="Upstream closed stream without data") from exc
-            if text_buffer.strip():
-                raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
-            return buffered_chunks, False, model_name
+    if heartbeat_interval_seconds is not None and heartbeat_interval_seconds > 0:
+        keepalive_deadline = asyncio.get_running_loop().time() + heartbeat_interval_seconds
 
-        buffered_chunks.append(chunk)
-        text_buffer += decoder.decode(chunk)
+    pending_chunk_task = asyncio.create_task(upstream_iter.__anext__())
 
+    try:
         while True:
-            match = re.search(r"\r?\n\r?\n", text_buffer)
-            if not match:
-                break
+            timeout: float | None = None
+            if keepalive_deadline is not None:
+                timeout = max(0.0, keepalive_deadline - asyncio.get_running_loop().time())
+                if timeout == 0.0:
+                    task_to_return = pending_chunk_task
+                    pending_chunk_task = None
+                    return _PrimedResponsesStream(
+                        buffered_chunks=buffered_chunks,
+                        stream_committed=True,
+                        model_name=model_name,
+                        first_token_observed=False,
+                        emit_initial_keepalive=True,
+                        pending_chunk_task=task_to_return,
+                    )
 
-            raw_event = text_buffer[:match.start()]
-            text_buffer = text_buffer[match.end():]
-            if not raw_event.strip():
-                continue
+            done, _ = await asyncio.wait({pending_chunk_task}, timeout=timeout)
+            if pending_chunk_task not in done:
+                task_to_return = pending_chunk_task
+                pending_chunk_task = None
+                return _PrimedResponsesStream(
+                    buffered_chunks=buffered_chunks,
+                    stream_committed=True,
+                    model_name=model_name,
+                    first_token_observed=False,
+                    emit_initial_keepalive=True,
+                    pending_chunk_task=task_to_return,
+                )
 
-            event_type, event_payload = _extract_responses_stream_event(raw_event)
-            extracted_model_name = _extract_response_model_name(event_payload)
-            if extracted_model_name:
-                model_name = extracted_model_name
-            if event_type == "[DONE]":
-                return buffered_chunks, False, model_name
+            try:
+                chunk = pending_chunk_task.result()
+            except StopAsyncIteration as exc:
+                if not buffered_chunks:
+                    raise HTTPException(status_code=502, detail="Upstream closed stream without data") from exc
+                if text_buffer.strip():
+                    raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
+                return _PrimedResponsesStream(
+                    buffered_chunks=buffered_chunks,
+                    stream_committed=False,
+                    model_name=model_name,
+                    first_token_observed=False,
+                )
 
-            semantic_failure = _responses_failure_http_exception(event_payload)
-            if semantic_failure is not None:
-                raise semantic_failure
+            pending_chunk_task = None
+            buffered_chunks.append(chunk)
+            text_buffer += decoder.decode(chunk)
 
-            if not event_type or event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
-                return buffered_chunks, True, model_name
+            while True:
+                match = re.search(r"\r?\n\r?\n", text_buffer)
+                if not match:
+                    break
+
+                raw_event = text_buffer[:match.start()]
+                text_buffer = text_buffer[match.end():]
+                if not raw_event.strip():
+                    continue
+
+                event_type, event_payload = _extract_responses_stream_event(raw_event)
+                extracted_model_name = _extract_response_model_name(event_payload)
+                if extracted_model_name:
+                    model_name = extracted_model_name
+                if event_type == "[DONE]":
+                    return _PrimedResponsesStream(
+                        buffered_chunks=buffered_chunks,
+                        stream_committed=False,
+                        model_name=model_name,
+                        first_token_observed=False,
+                    )
+
+                semantic_failure = _responses_failure_http_exception(event_payload)
+                if semantic_failure is not None:
+                    raise semantic_failure
+
+                if not event_type or event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
+                    return _PrimedResponsesStream(
+                        buffered_chunks=buffered_chunks,
+                        stream_committed=True,
+                        model_name=model_name,
+                        first_token_observed=True,
+                    )
+
+            pending_chunk_task = asyncio.create_task(upstream_iter.__anext__())
+    finally:
+        if pending_chunk_task is not None and not pending_chunk_task.done():
+            pending_chunk_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_chunk_task
 
 
 def _extract_images_from_completed_response(
@@ -2658,6 +2858,9 @@ async def _stream_upstream_image_response(
     response_format: str,
     stream_prefix: str,
     heartbeat_interval_seconds: float | None = None,
+    emit_initial_keepalive: bool = False,
+    pending_chunk_task: asyncio.Task[bytes] | None = None,
+    stream_capture: _ProxyStreamCapture | None = None,
 ) -> AsyncGenerator[bytes, None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
@@ -2729,7 +2932,11 @@ async def _stream_upstream_image_response(
         return events, False
 
     try:
+        if emit_initial_keepalive:
+            yield STREAM_KEEPALIVE_COMMENT
         for chunk in buffered_chunks:
+            if stream_capture is not None:
+                stream_capture.feed(chunk)
             text_buffer += decoder.decode(chunk)
             events, done = drain_buffer()
             for event in events:
@@ -2740,7 +2947,10 @@ async def _stream_upstream_image_response(
         async for chunk in _iterate_with_sse_keepalive(
             upstream_iter,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
+            pending_chunk_task=pending_chunk_task,
         ):
+            if stream_capture is not None and chunk != STREAM_KEEPALIVE_COMMENT:
+                stream_capture.feed(chunk)
             text_buffer += decoder.decode(chunk)
             events, done = drain_buffer()
             for event in events:
@@ -2788,49 +2998,62 @@ async def _proxy_image_request_with_token(
     )
 
     if image_request.stream:
-        stream_cm = client.stream(
-            "POST",
-            upstream_url,
-            headers=headers,
-            content=json_payload,
-            timeout=timeout,
+        stream_capture = _ProxyStreamCapture(
+            initial_model_name=image_request.model_name,
+            initial_first_token_at=None,
         )
-        upstream_response = await stream_cm.__aenter__()
-        if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
-            raw = await upstream_response.aread()
-            await stream_cm.__aexit__(None, None, None)
-            raise HTTPException(
-                status_code=upstream_response.status_code,
-                detail=_decode_error_body(raw),
+
+        async def body_iterator() -> AsyncGenerator[bytes, None]:
+            stream_cm = client.stream(
+                "POST",
+                upstream_url,
+                headers=headers,
+                content=json_payload,
+                timeout=timeout,
             )
+            upstream_response = await stream_cm.__aenter__()
+            if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+                try:
+                    raw = await upstream_response.aread()
+                finally:
+                    await stream_cm.__aexit__(None, None, None)
+                raise HTTPException(
+                    status_code=upstream_response.status_code,
+                    detail=_decode_error_body(raw),
+                )
 
-        upstream_iter = upstream_response.aiter_raw()
-        try:
-            buffered_chunks, stream_committed, _ = await _prime_responses_upstream_stream(upstream_iter)
-        except HTTPException:
-            await stream_cm.__aexit__(None, None, None)
-            raise
-        except RESPONSES_STREAM_NETWORK_ERRORS:
-            await stream_cm.__aexit__(None, None, None)
-            raise
+            upstream_iter = upstream_response.aiter_raw()
+            try:
+                primed_stream = await _prime_responses_upstream_stream(upstream_iter)
+            except Exception:
+                await stream_cm.__aexit__(None, None, None)
+                raise
 
-        initial_first_token_at = utcnow() if stream_committed else None
+            async for chunk in _stream_upstream_image_response(
+                stream_cm,
+                upstream_iter,
+                primed_stream.buffered_chunks,
+                stream_committed=primed_stream.stream_committed,
+                response_format=image_request.response_format,
+                stream_prefix=image_request.stream_prefix,
+                heartbeat_interval_seconds=stream_keepalive_interval_seconds,
+                stream_capture=stream_capture,
+            ):
+                yield chunk
+
         return ProxyRequestResult(
             response=StreamingResponse(
-                _stream_upstream_image_response(
-                    stream_cm,
-                    upstream_iter,
-                    buffered_chunks,
-                    stream_committed=stream_committed,
-                    response_format=image_request.response_format,
-                    stream_prefix=image_request.stream_prefix,
+                _wrap_sse_stream_with_initial_keepalive(
+                    body_iterator(),
                     heartbeat_interval_seconds=stream_keepalive_interval_seconds,
                 ),
                 media_type="text/event-stream",
+                headers=_sse_response_headers(),
             ),
-            status_code=upstream_response.status_code,
+            status_code=200,
             model_name=image_request.model_name,
-            first_token_at=initial_first_token_at,
+            first_token_at=None,
+            stream_capture=stream_capture,
         )
 
     stream_cm = client.stream(
@@ -3179,6 +3402,379 @@ async def _run_proxy_result_success_hook(proxy_result: ProxyRequestResult, *, re
         logger.exception("Failed to persist proxy success side effects for request log id=%s", request_log_id)
 
 
+async def _await_with_keepalive_queue(
+    awaitable: Awaitable[Any],
+    *,
+    output_queue: asyncio.Queue[bytes | object],
+    heartbeat_interval_seconds: float | None,
+) -> Any:
+    task = asyncio.create_task(awaitable)
+    try:
+        if heartbeat_interval_seconds is None or heartbeat_interval_seconds <= 0:
+            return await task
+
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=heartbeat_interval_seconds)
+            if task in done:
+                return task.result()
+            await output_queue.put(STREAM_KEEPALIVE_COMMENT)
+    finally:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+def _gpt_image_stream_keepalive_response(
+    http_request: Request,
+    *,
+    endpoint: str,
+    request_model: str | None,
+    compact: bool,
+    proxy_call: Callable[[httpx.AsyncClient, str, str | None], Awaitable[ProxyRequestResult]],
+    request_log_id: int,
+    response_lease: Any,
+) -> StreamingResponse:
+    output_queue: asyncio.Queue[bytes | object] = asyncio.Queue()
+    queue_done_sentinel = object()
+    heartbeat_interval_seconds = _stream_keepalive_interval_seconds()
+
+    async def worker() -> None:
+        client: httpx.AsyncClient = http_request.app.state.http_client
+        oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
+        selection_settings = _current_token_selection_settings(http_request.app)
+
+        attempt_count = 0
+        last_token_id: int | None = None
+        last_account_id: str | None = None
+        stream_finalized = False
+        require_non_free_token = _request_requires_non_free_codex_token(request_model)
+        skipped_free_token_ids: set[int] = set()
+        excluded_token_ids: set[int] = set()
+        postponed_unknown_plan_tokens: list[Any] = []
+
+        try:
+            counts = await _await_with_keepalive_queue(
+                get_token_counts(),
+                output_queue=output_queue,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+            )
+            if counts.available <= 0:
+                raise HTTPException(status_code=503, detail="No available Codex token in database")
+
+            max_attempts = max(1, min(counts.available, _max_request_account_retries()))
+            last_error: HTTPException | None = None
+
+            while attempt_count < max_attempts:
+                token_row = await _await_with_keepalive_queue(
+                    claim_next_active_token(
+                        selection_strategy=selection_settings.strategy,
+                        exclude_token_ids=excluded_token_ids,
+                    ),
+                    output_queue=output_queue,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
+                using_postponed_unknown_plan = False
+                if token_row is None:
+                    if require_non_free_token and postponed_unknown_plan_tokens:
+                        token_row = postponed_unknown_plan_tokens.pop(0)
+                        using_postponed_unknown_plan = True
+                    else:
+                        break
+
+                if require_non_free_token:
+                    effective_plan_type = await _effective_token_plan_type(http_request, token_row)
+                    if effective_plan_type == "free":
+                        excluded_token_ids.add(token_row.id)
+                        skipped_free_token_ids.add(token_row.id)
+                        logger.info(
+                            "Skipping free-plan Codex token for gpt-image-2 request: token_id=%s account_id=%s",
+                            token_row.id,
+                            token_row.account_id,
+                        )
+                        continue
+                    if effective_plan_type is None and not using_postponed_unknown_plan:
+                        excluded_token_ids.add(token_row.id)
+                        postponed_unknown_plan_tokens.append(token_row)
+                        logger.info(
+                            "Postponing unknown-plan Codex token while searching for a known non-free gpt-image-2 token: "
+                            "token_id=%s account_id=%s",
+                            token_row.id,
+                            token_row.account_id,
+                        )
+                        continue
+
+                attempt_count += 1
+                attempt = attempt_count
+                last_token_id = token_row.id
+                last_account_id = token_row.account_id
+
+                try:
+                    access_token, access_token_refreshed = await _await_with_keepalive_queue(
+                        oauth_manager.get_access_token(token_row, client),
+                        output_queue=output_queue,
+                        heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    )
+                except HTTPException as exc:
+                    oauth_manager.invalidate(token_row.id)
+                    permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
+                    await mark_token_error(
+                        token_row.id,
+                        str(exc.detail),
+                        deactivate=permanent_refresh_failure,
+                        clear_access_token=True,
+                    )
+                    if exc.status_code in (401, 403):
+                        last_error = exc
+                        continue
+                    raise
+
+                try:
+                    proxy_result = await _await_with_keepalive_queue(
+                        proxy_call(client, access_token, token_row.account_id),
+                        output_queue=output_queue,
+                        heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    )
+                    await mark_token_success(token_row.id)
+
+                    if not isinstance(proxy_result.response, StreamingResponse):
+                        raise HTTPException(
+                            status_code=502,
+                            detail="Proxy call returned a non-streaming response for a streaming request",
+                        )
+
+                    body_iterator = proxy_result.response.body_iterator
+                    body_iterator = _wrap_sse_stream_with_initial_keepalive(
+                        body_iterator,
+                        heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    )
+                    try:
+                        async for chunk in body_iterator:
+                            await output_queue.put(chunk)
+                    finally:
+                        close_iterator = getattr(body_iterator, "aclose", None)
+                        if callable(close_iterator):
+                            with suppress(Exception):
+                                await close_iterator()
+
+                    if proxy_result.stream_capture is not None:
+                        await _finalize_stream_request_log(
+                            request_log_id=request_log_id,
+                            status_code=proxy_result.status_code,
+                            attempt_count=attempt,
+                            token_id=token_row.id,
+                            account_id=token_row.account_id,
+                            fallback_model_name=proxy_result.model_name,
+                            fallback_first_token_at=proxy_result.first_token_at,
+                            stream_capture=proxy_result.stream_capture,
+                        )
+                    else:
+                        await finalize_request_log(
+                            request_log_id,
+                            status_code=proxy_result.status_code,
+                            success=True,
+                            attempt_count=attempt,
+                            finished_at=utcnow(),
+                            first_token_at=proxy_result.first_token_at,
+                            token_id=token_row.id,
+                            account_id=token_row.account_id,
+                            model_name=proxy_result.model_name,
+                        )
+                    stream_finalized = True
+                    await _run_proxy_result_success_hook(proxy_result, request_log_id=request_log_id)
+                    return
+                except HTTPException as exc:
+                    status_code = getattr(exc, "status_code", 500)
+                    detail = str(getattr(exc, "detail", "") or exc)
+                    cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
+
+                    if cooldown_seconds is not None:
+                        await mark_token_error(
+                            token_row.id,
+                            detail,
+                            cooldown_seconds=cooldown_seconds,
+                        )
+                        logger.warning(
+                            "Codex account cooled down: token_id=%s account_id=%s cooldown_seconds=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            cooldown_seconds,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
+                    if _should_record_http_exception_token_error(exc):
+                        await mark_token_error(token_row.id, detail)
+
+                    permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
+                    auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
+
+                    if permanently_disabled or auth_failed_after_refresh:
+                        oauth_manager.invalidate(token_row.id)
+                        await mark_token_error(
+                            token_row.id,
+                            detail,
+                            deactivate=True,
+                            clear_access_token=True,
+                        )
+                        logger.warning(
+                            "Codex account disabled after upstream auth failure: token_id=%s account_id=%s status=%s refreshed=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            status_code,
+                            access_token_refreshed,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
+                    if status_code in (401, 403):
+                        oauth_manager.invalidate(token_row.id)
+                        await mark_token_error(token_row.id, detail, clear_access_token=True)
+                        logger.warning(
+                            "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            status_code,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
+                    compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                        compact=compact,
+                        status_code=status_code,
+                        error_text=detail,
+                    )
+                    if _should_retry_http_exception(exc) and attempt < max_attempts:
+                        mark_kwargs: dict[str, Any] = {}
+                        if compact_server_error_cooling_time > 0:
+                            mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                        await mark_token_error(token_row.id, detail, **mark_kwargs)
+                        logger.warning(
+                            "Codex upstream server error before response commit: token_id=%s account_id=%s status=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            status_code,
+                            compact,
+                            compact_server_error_cooling_time,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
+                    raise
+                except httpx.HTTPError as exc:
+                    message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                    compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                        compact=compact,
+                        status_code=500,
+                        error_text=message,
+                    )
+                    if attempt < max_attempts:
+                        mark_kwargs: dict[str, Any] = {}
+                        if compact_server_error_cooling_time > 0:
+                            mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                        await mark_token_error(token_row.id, message, **mark_kwargs)
+                        logger.warning(
+                            "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            type(exc).__name__,
+                            compact,
+                            compact_server_error_cooling_time,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = HTTPException(status_code=502, detail=message)
+                        continue
+                    await mark_token_error(token_row.id, message)
+                    raise HTTPException(status_code=502, detail=message) from exc
+
+            if last_error is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
+                )
+            if require_non_free_token and skipped_free_token_ids:
+                raise HTTPException(status_code=503, detail="No non-free Codex token available for gpt-image-2 requests")
+            raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
+        except asyncio.CancelledError:
+            if not stream_finalized:
+                with suppress(Exception):
+                    await finalize_request_log(
+                        request_log_id,
+                        status_code=499,
+                        success=False,
+                        attempt_count=attempt_count,
+                        finished_at=utcnow(),
+                        token_id=last_token_id,
+                        account_id=last_account_id,
+                        error_message="Client disconnected",
+                    )
+            raise
+        except HTTPException as exc:
+            if not stream_finalized:
+                await finalize_request_log(
+                    request_log_id,
+                    status_code=getattr(exc, "status_code", 500),
+                    success=False,
+                    attempt_count=attempt_count,
+                    finished_at=utcnow(),
+                    token_id=last_token_id,
+                    account_id=last_account_id,
+                    error_message=str(getattr(exc, "detail", "") or exc),
+                )
+            await output_queue.put(_build_stream_error_event(getattr(exc, "status_code", 500), str(getattr(exc, "detail", "") or exc)))
+            await output_queue.put(b"data: [DONE]\n\n")
+        except Exception as exc:
+            if not stream_finalized:
+                await finalize_request_log(
+                    request_log_id,
+                    status_code=500,
+                    success=False,
+                    attempt_count=attempt_count,
+                    finished_at=utcnow(),
+                    token_id=last_token_id,
+                    account_id=last_account_id,
+                    error_message=str(exc),
+                )
+            await output_queue.put(_build_stream_error_event(500, str(exc) or type(exc).__name__))
+            await output_queue.put(b"data: [DONE]\n\n")
+        finally:
+            await output_queue.put(queue_done_sentinel)
+            await response_lease.release()
+
+    async def response_body() -> AsyncGenerator[bytes, None]:
+        worker_task = asyncio.create_task(worker())
+        try:
+            # Commit an initial SSE comment immediately so downstream proxies/CDNs
+            # don't wait for the first upstream model event before forwarding body bytes.
+            yield STREAM_KEEPALIVE_COMMENT
+            while True:
+                item = await output_queue.get()
+                if item is queue_done_sentinel:
+                    break
+                if isinstance(item, bytes):
+                    yield item
+        finally:
+            if not worker_task.done():
+                worker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker_task
+
+    return StreamingResponse(
+        response_body(),
+        media_type="text/event-stream",
+        headers=_sse_response_headers(),
+    )
+
+
 async def _execute_proxy_request_with_failover(
     http_request: Request,
     *,
@@ -3202,6 +3798,18 @@ async def _execute_proxy_request_with_failover(
         user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
     )
 
+    if is_stream and _is_responses_image_compat_model(request_model):
+        release_response_traffic = False
+        return _gpt_image_stream_keepalive_response(
+            http_request,
+            endpoint=endpoint,
+            request_model=request_model,
+            compact=compact,
+            proxy_call=proxy_call,
+            request_log_id=request_log.id,
+            response_lease=response_lease,
+        )
+
     attempt_count = 0
     last_token_id: int | None = None
     last_account_id: str | None = None
@@ -3219,23 +3827,42 @@ async def _execute_proxy_request_with_failover(
         require_non_free_token = _request_requires_non_free_codex_token(request_model)
         excluded_token_ids: set[int] = set()
         skipped_free_token_ids: set[int] = set()
+        postponed_unknown_plan_tokens: list[Any] = []
 
         while attempt_count < max_attempts:
             token_row = await claim_next_active_token(
                 selection_strategy=selection_settings.strategy,
                 exclude_token_ids=excluded_token_ids,
             )
+            using_postponed_unknown_plan = False
             if token_row is None:
-                break
-            if require_non_free_token and await _is_free_plan_token(http_request, token_row):
-                excluded_token_ids.add(token_row.id)
-                skipped_free_token_ids.add(token_row.id)
-                logger.info(
-                    "Skipping free-plan Codex token for gpt-image-2 request: token_id=%s account_id=%s",
-                    token_row.id,
-                    token_row.account_id,
-                )
-                continue
+                if require_non_free_token and postponed_unknown_plan_tokens:
+                    token_row = postponed_unknown_plan_tokens.pop(0)
+                    using_postponed_unknown_plan = True
+                else:
+                    break
+
+            if require_non_free_token:
+                effective_plan_type = await _effective_token_plan_type(http_request, token_row)
+                if effective_plan_type == "free":
+                    excluded_token_ids.add(token_row.id)
+                    skipped_free_token_ids.add(token_row.id)
+                    logger.info(
+                        "Skipping free-plan Codex token for gpt-image-2 request: token_id=%s account_id=%s",
+                        token_row.id,
+                        token_row.account_id,
+                    )
+                    continue
+                if effective_plan_type is None and not using_postponed_unknown_plan:
+                    excluded_token_ids.add(token_row.id)
+                    postponed_unknown_plan_tokens.append(token_row)
+                    logger.info(
+                        "Postponing unknown-plan Codex token while searching for a known non-free gpt-image-2 token: "
+                        "token_id=%s account_id=%s",
+                        token_row.id,
+                        token_row.account_id,
+                    )
+                    continue
 
             attempt_count += 1
             attempt = attempt_count
@@ -3298,10 +3925,17 @@ async def _execute_proxy_request_with_failover(
                         finally:
                             await response_lease.release()
 
-                    proxy_result.response.body_iterator = _wrap_streaming_body_iterator(
-                        proxy_result.response.body_iterator,
+                    body_iterator = proxy_result.response.body_iterator
+                    if _is_responses_image_compat_model(request_model):
+                        body_iterator = _wrap_sse_stream_with_initial_keepalive(
+                            body_iterator,
+                            heartbeat_interval_seconds=_stream_keepalive_interval_seconds(),
+                        )
+                    body_iterator = _wrap_streaming_body_iterator(
+                        body_iterator,
                         on_close=on_stream_close,
                     )
+                    proxy_result.response.body_iterator = body_iterator
                     release_response_traffic = False
                     return proxy_result.response
 
@@ -3552,7 +4186,11 @@ def _serialize_admin_token_item(
         "source_file": token_row.source_file,
         "created_at": token_row.created_at,
         "updated_at": token_row.updated_at,
-        "plan_type": quota_snapshot.plan_type if quota_snapshot and quota_snapshot.plan_type else plan_info.plan_type,
+        "plan_type": (
+            quota_snapshot.plan_type
+            if quota_snapshot and quota_snapshot.plan_type
+            else _normalize_optional_text(getattr(token_row, "plan_type", None)) or plan_info.plan_type
+        ),
         "subscription_active_start": plan_info.subscription_active_start,
         "subscription_active_until": plan_info.subscription_active_until,
         "observed_cost_usd": observed_cost_usd,
@@ -4021,9 +4659,13 @@ async def _stream_upstream_response(
     stream_committed: bool,
     stream_capture: _ProxyStreamCapture | None = None,
     response_model_alias: str | None = None,
+    emit_initial_keepalive: bool = False,
+    pending_chunk_task: asyncio.Task[bytes] | None = None,
 ) -> AsyncGenerator[bytes, None]:
     if response_model_alias is None:
         try:
+            if emit_initial_keepalive:
+                yield STREAM_KEEPALIVE_COMMENT
             for chunk in buffered_chunks:
                 if stream_capture is not None:
                     stream_capture.feed(chunk)
@@ -4085,6 +4727,8 @@ async def _stream_upstream_response(
         return events, False
 
     try:
+        if emit_initial_keepalive:
+            yield STREAM_KEEPALIVE_COMMENT
         for chunk in buffered_chunks:
             text_buffer += decoder.decode(chunk)
             events, done = drain_buffer()
@@ -4098,6 +4742,7 @@ async def _stream_upstream_response(
         async for chunk in _iterate_with_sse_keepalive(
             upstream_iter,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
+            pending_chunk_task=pending_chunk_task,
         ):
             text_buffer += decoder.decode(chunk)
             events, done = drain_buffer()
@@ -4161,6 +4806,64 @@ async def _proxy_request_with_token(
     upstream_url = _codex_responses_url(compact=compact)
     json_payload = json.dumps(payload, ensure_ascii=False)
 
+    if downstream_stream and response_model_alias is not None:
+        heartbeat_interval_seconds = _stream_keepalive_interval_seconds()
+        stream_capture = _ProxyStreamCapture(
+            initial_model_name=effective_requested_model,
+            initial_first_token_at=None,
+        )
+
+        async def body_iterator() -> AsyncGenerator[bytes, None]:
+            stream_cm = client.stream(
+                "POST",
+                upstream_url,
+                headers=headers,
+                content=json_payload,
+                timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
+            )
+            upstream_response = await stream_cm.__aenter__()
+            if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+                try:
+                    raw = await upstream_response.aread()
+                finally:
+                    await stream_cm.__aexit__(None, None, None)
+                raise HTTPException(
+                    status_code=upstream_response.status_code,
+                    detail=_decode_error_body(raw),
+                )
+
+            upstream_iter = upstream_response.aiter_raw()
+            try:
+                primed_stream = await _prime_responses_upstream_stream(upstream_iter)
+            except Exception:
+                await stream_cm.__aexit__(None, None, None)
+                raise
+
+            async for chunk in _stream_upstream_response(
+                stream_cm,
+                upstream_iter,
+                primed_stream.buffered_chunks,
+                stream_committed=primed_stream.stream_committed,
+                stream_capture=stream_capture,
+                response_model_alias=response_model_alias,
+            ):
+                yield chunk
+
+        return ProxyRequestResult(
+            response=StreamingResponse(
+                _wrap_sse_stream_with_initial_keepalive(
+                    body_iterator(),
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                ),
+                media_type="text/event-stream",
+                headers=_sse_response_headers(),
+            ),
+            status_code=200,
+            model_name=effective_requested_model,
+            first_token_at=None,
+            stream_capture=stream_capture,
+        )
+
     if downstream_stream:
         stream_cm = client.stream(
             "POST",
@@ -4180,7 +4883,7 @@ async def _proxy_request_with_token(
 
         upstream_iter = upstream_response.aiter_raw()
         try:
-            buffered_chunks, stream_committed, model_name = await _prime_responses_upstream_stream(upstream_iter)
+            primed_stream = await _prime_responses_upstream_stream(upstream_iter)
         except HTTPException:
             await stream_cm.__aexit__(None, None, None)
             raise
@@ -4188,9 +4891,10 @@ async def _proxy_request_with_token(
             await stream_cm.__aexit__(None, None, None)
             raise
 
-        initial_first_token_at = utcnow() if stream_committed else None
+        effective_model_name = primed_stream.model_name or request_data.model
+        initial_first_token_at = utcnow() if primed_stream.first_token_observed else None
         stream_capture = _ProxyStreamCapture(
-            initial_model_name=effective_requested_model if response_model_alias is not None else (model_name or request_data.model),
+            initial_model_name=effective_model_name,
             initial_first_token_at=initial_first_token_at,
         )
 
@@ -4199,15 +4903,15 @@ async def _proxy_request_with_token(
                 _stream_upstream_response(
                     stream_cm,
                     upstream_iter,
-                    buffered_chunks,
-                    stream_committed=stream_committed,
+                    primed_stream.buffered_chunks,
+                    stream_committed=primed_stream.stream_committed,
                     stream_capture=stream_capture,
-                    response_model_alias=response_model_alias,
                 ),
                 media_type="text/event-stream",
+                headers=_sse_response_headers(),
             ),
             status_code=upstream_response.status_code,
-            model_name=effective_requested_model if response_model_alias is not None else (model_name or request_data.model),
+            model_name=effective_model_name,
             first_token_at=initial_first_token_at,
             stream_capture=stream_capture,
         )
@@ -4323,6 +5027,7 @@ async def _proxy_chat_completions_with_token(
                     request_model=request_data.model,
                 ),
                 media_type="text/event-stream",
+                headers=_sse_response_headers(),
             ),
             status_code=proxy_result.status_code,
             model_name=request_data.model,

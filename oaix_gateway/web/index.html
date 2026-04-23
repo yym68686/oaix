@@ -189,6 +189,19 @@
             </div>
             <div class="section-tools section-tools--token">
               <p class="section-note" id="list-note">正在载入最近 80 条 key…</p>
+              <div class="token-search" role="search" aria-label="搜索最近 Key 状态">
+                <label class="token-search__label" for="token-search-input">搜索 Key</label>
+                <input
+                  class="token-search__input"
+                  id="token-search-input"
+                  type="search"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder="邮箱 / 工作区 / Token ID / 来源"
+                  aria-describedby="token-search-summary"
+                />
+                <p class="token-search__summary" id="token-search-summary" aria-live="polite">等待载入</p>
+              </div>
               <div class="selection-switch" aria-label="Key 分发策略">
                 <span class="selection-switch__label">Key 分发</span>
                 <div class="selection-switch__rail" role="group" aria-label="切换 Key 分发策略">

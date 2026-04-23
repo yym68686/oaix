@@ -47,6 +47,7 @@ class CodexToken(Base):
     expires_at: Mapped[datetime | None] = mapped_column("expired", DateTime(timezone=True), nullable=True, index=True)
     recovery: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     raw_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    plan_type: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     source_file: Mapped[str | None] = mapped_column(String(512), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -235,11 +236,14 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN refresh_token_aliases JSON"))
         if "merged_into_token_id" not in token_columns:
             sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN merged_into_token_id INTEGER"))
+        if "plan_type" not in token_columns:
+            sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN plan_type VARCHAR(32)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_cooldown_until ON codex_tokens (cooldown_until)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_refresh_token ON codex_tokens (refresh_token)"))
         sync_conn.execute(
             text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_merged_into_token_id ON codex_tokens (merged_into_token_id)")
         )
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_plan_type ON codex_tokens (plan_type)"))
         _drop_single_column_uniques(sync_conn, "codex_tokens", "account_id")
         _drop_single_column_uniques(sync_conn, "codex_tokens", "email")
 
@@ -300,6 +304,20 @@ async def _backfill_token_refresh_aliases() -> None:
                 if aliases != (token.refresh_token_aliases or []):
                     token.refresh_token_aliases = aliases
                     token.updated_at = utcnow()
+                if token.plan_type is None:
+                    raw_payload = token.raw_payload if isinstance(token.raw_payload, dict) else {}
+                    auth_payload = raw_payload.get("https://api.openai.com/auth")
+                    candidate = None
+                    if isinstance(auth_payload, dict):
+                        candidate = auth_payload.get("chatgpt_plan_type") or auth_payload.get("plan_type")
+                    if candidate is None:
+                        candidate = raw_payload.get("chatgpt_plan_type") or raw_payload.get("plan_type")
+                    normalized = str(candidate or "").strip().lower()
+                    if normalized.startswith("chatgpt_"):
+                        normalized = normalized[len("chatgpt_") :]
+                    if normalized:
+                        token.plan_type = normalized
+                        token.updated_at = utcnow()
 
 
 async def close_database() -> None:

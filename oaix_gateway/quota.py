@@ -11,7 +11,7 @@ import httpx
 
 from .database import CodexToken, utcnow
 from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
-from .token_store import mark_token_error
+from .token_store import mark_token_error, update_token_plan_type
 
 
 logger = logging.getLogger("oaix.gateway")
@@ -451,6 +451,9 @@ class CodexQuotaService:
             return None
         return cached.snapshot
 
+    def get_cached_snapshot(self, token_id: int) -> CodexQuotaSnapshot | None:
+        return self._fresh_cached_snapshot(token_id)
+
     async def get_snapshot(
         self,
         token_row: CodexToken,
@@ -479,6 +482,8 @@ class CodexQuotaService:
                 snapshot=snapshot,
                 expires_at=snapshot.fetched_at + timedelta(seconds=self._ttl_seconds),
             )
+            if snapshot.plan_type:
+                await update_token_plan_type(token_row.id, plan_type=snapshot.plan_type)
             return snapshot
 
     async def get_many(

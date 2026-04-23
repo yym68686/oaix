@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
 from oaix_gateway.api_server import (
     ChatCompletionsRequest,
@@ -33,6 +33,8 @@ from oaix_gateway.api_server import (
     _resolved_chat_image_to_responses_input_item,
     _responses_failure_http_exception,
     _iterate_with_sse_keepalive,
+    _stream_keepalive_interval_seconds,
+    _wrap_sse_stream_with_initial_keepalive,
     _stream_responses_to_chat_completions,
     _stream_upstream_image_response,
     _stream_upstream_response,
@@ -547,11 +549,13 @@ def test_prime_responses_upstream_stream_commits_after_first_non_prefight_event(
         yield b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.4"}}\n\n'
         yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n'
 
-    buffered_chunks, stream_committed, model_name = asyncio.run(_prime_responses_upstream_stream(upstream()))
+    primed_stream = asyncio.run(_prime_responses_upstream_stream(upstream()))
 
-    assert stream_committed is True
-    assert model_name == "gpt-5.4"
-    assert buffered_chunks == [
+    assert primed_stream.stream_committed is True
+    assert primed_stream.first_token_observed is True
+    assert primed_stream.emit_initial_keepalive is False
+    assert primed_stream.model_name == "gpt-5.4"
+    assert primed_stream.buffered_chunks == [
         b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.4"}}\n\n',
         b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n',
     ]
@@ -578,6 +582,35 @@ def test_prime_responses_upstream_stream_raises_on_incomplete_sse_event() -> Non
     assert exc_info.value.status_code == 502
 
 
+def test_prime_responses_upstream_stream_times_out_into_initial_keepalive() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.4-mini"}}\n\n'
+        await asyncio.sleep(0.02)
+        yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+
+    primed_stream = asyncio.run(
+        _prime_responses_upstream_stream(
+            upstream(),
+            heartbeat_interval_seconds=0.001,
+        )
+    )
+
+    assert primed_stream.stream_committed is True
+    assert primed_stream.first_token_observed is False
+    assert primed_stream.emit_initial_keepalive is True
+    assert primed_stream.model_name == "gpt-5.4-mini"
+    assert primed_stream.buffered_chunks == [
+        b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.4-mini"}}\n\n'
+    ]
+    assert primed_stream.pending_chunk_task is not None
+
+
+def test_stream_keepalive_interval_defaults_to_30_seconds(monkeypatch) -> None:
+    monkeypatch.delenv("STREAM_KEEPALIVE_INTERVAL_SECONDS", raising=False)
+
+    assert _stream_keepalive_interval_seconds() == 30.0
+
+
 def test_iterate_with_sse_keepalive_emits_comment_before_delayed_chunk() -> None:
     async def upstream() -> AsyncIterator[bytes]:
         await asyncio.sleep(0.01)
@@ -594,8 +627,51 @@ def test_iterate_with_sse_keepalive_emits_comment_before_delayed_chunk() -> None
 
     chunks = asyncio.run(collect())
 
-    assert chunks[0] == b": keepalive\n\n"
+    assert chunks[0].startswith(b": keepalive")
     assert chunks[-1] == b"data: payload\n\n"
+
+
+def test_wrap_sse_stream_with_initial_keepalive_emits_comment_before_first_item() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.01)
+        yield b"data: payload\n\n"
+
+    async def collect() -> list[bytes]:
+        chunks: list[bytes] = []
+        async for chunk in _wrap_sse_stream_with_initial_keepalive(
+            upstream(),
+            heartbeat_interval_seconds=0.001,
+        ):
+            chunks.append(chunk)
+            if chunk == b"data: payload\n\n":
+                break
+        return chunks
+
+    chunks = asyncio.run(collect())
+
+    assert chunks[0].startswith(b": keepalive")
+    assert chunks[-1] == b"data: payload\n\n"
+
+
+def test_wrap_sse_stream_with_initial_keepalive_emits_error_event_on_http_exception() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        raise HTTPException(status_code=429, detail="Too many requests")
+        yield b""
+
+    async def collect() -> bytes:
+        chunks: list[bytes] = []
+        async for chunk in _wrap_sse_stream_with_initial_keepalive(
+            upstream(),
+            heartbeat_interval_seconds=0.001,
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    body = asyncio.run(collect()).decode("utf-8")
+
+    assert '"status_code":429' in body.replace(" ", "")
+    assert "Too many requests" in body
+    assert "data: [DONE]" in body
 
 
 def test_stream_responses_to_chat_completions_forwards_keepalive_comment() -> None:
@@ -615,7 +691,7 @@ def test_stream_responses_to_chat_completions_forwards_keepalive_comment() -> No
 
     body = asyncio.run(collect())
 
-    assert ": keepalive\n\n" in body
+    assert ": keepalive" in body
     assert '"content": "hello"' in body
     assert "data: [DONE]" in body
 
@@ -648,7 +724,47 @@ def test_stream_upstream_response_image_compat_emits_keepalive_comment(monkeypat
     monkeypatch.setattr("oaix_gateway.api_server._stream_keepalive_interval_seconds", lambda: 0.001)
     body = asyncio.run(collect())
 
-    assert ": keepalive\n\n" in body
+    assert ": keepalive" in body
+    assert '"model": "gpt-image-2"' in body
+    assert "data: [DONE]" in body
+
+
+def test_stream_upstream_response_image_compat_emits_initial_keepalive_after_prime_timeout() -> None:
+    class DummyStreamContext:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def upstream() -> AsyncIterator[bytes]:
+        yield b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.4-mini"}}\n\n'
+        await asyncio.sleep(0.02)
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"id":"resp_prime_keepalive","status":"completed","model":"gpt-5.4-mini","output":[]}}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> str:
+        upstream_iter = upstream()
+        primed_stream = await _prime_responses_upstream_stream(
+            upstream_iter,
+            heartbeat_interval_seconds=0.001,
+        )
+        chunks: list[bytes] = []
+        async for chunk in _stream_upstream_response(
+            DummyStreamContext(),
+            upstream_iter=upstream_iter,
+            buffered_chunks=primed_stream.buffered_chunks,
+            stream_committed=primed_stream.stream_committed,
+            response_model_alias="gpt-image-2",
+            emit_initial_keepalive=primed_stream.emit_initial_keepalive,
+            pending_chunk_task=primed_stream.pending_chunk_task,
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert body.startswith(": keepalive")
     assert '"model": "gpt-image-2"' in body
     assert "data: [DONE]" in body
 
@@ -800,7 +916,49 @@ def test_stream_upstream_image_response_emits_keepalive_comment() -> None:
 
     body = asyncio.run(collect())
 
-    assert ": keepalive\n\n" in body
+    assert ": keepalive" in body
+    assert "event: image_generation.completed" in body
+    assert '"b64_json": "img-b64"' in body
+
+
+def test_stream_upstream_image_response_emits_initial_keepalive_after_prime_timeout() -> None:
+    class DummyStreamContext:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def upstream() -> AsyncIterator[bytes]:
+        yield b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.4-mini"}}\n\n'
+        await asyncio.sleep(0.02)
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"id":"resp_img_prime_keepalive","status":"completed","output":[{"type":"image_generation_call","result":"img-b64","output_format":"png"}]}}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> str:
+        upstream_iter = upstream()
+        primed_stream = await _prime_responses_upstream_stream(
+            upstream_iter,
+            heartbeat_interval_seconds=0.001,
+        )
+        chunks: list[bytes] = []
+        async for chunk in _stream_upstream_image_response(
+            DummyStreamContext(),
+            upstream_iter=upstream_iter,
+            buffered_chunks=primed_stream.buffered_chunks,
+            stream_committed=primed_stream.stream_committed,
+            response_format="b64_json",
+            stream_prefix="image_generation",
+            heartbeat_interval_seconds=0.001,
+            emit_initial_keepalive=primed_stream.emit_initial_keepalive,
+            pending_chunk_task=primed_stream.pending_chunk_task,
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert body.startswith(": keepalive")
     assert "event: image_generation.completed" in body
     assert '"b64_json": "img-b64"' in body
 
@@ -1831,7 +1989,9 @@ def test_proxy_image_request_with_token_stream_translates_image_events() -> None
 
     assert result.status_code == 200
     assert result.model_name == "gpt-image-2"
-    assert result.first_token_at is not None
+    assert result.first_token_at is None
+    assert result.stream_capture is not None
+    assert result.stream_capture.first_token_at is not None
     assert "event: image_generation.partial_image" in body
     assert '"b64_json": "partial-1"' in body
     assert "event: image_generation.completed" in body
@@ -1969,6 +2129,7 @@ def test_execute_proxy_request_with_failover_does_not_retry_nonretryable_http_ex
         account_id="acct_11",
         refresh_token="refresh-token",
         is_active=True,
+        plan_type="team",
     )
 
     claim_calls: list[int] = []
@@ -2058,14 +2219,17 @@ def test_execute_proxy_request_with_failover_does_not_retry_nonretryable_http_ex
 
 def test_execute_proxy_request_with_failover_skips_free_tokens_for_gpt_image_2(monkeypatch) -> None:
     class DummyQuotaService:
-        async def get_snapshot(self, token_row, *, client, oauth_manager, account_id=None):
-            plan_type = "free" if token_row.id == 11 else "plus"
+        def get_cached_snapshot(self, token_id: int):
+            plan_type = "free" if token_id == 11 else "plus"
             return CodexQuotaSnapshot(
                 fetched_at=datetime.now(timezone.utc),
                 error=None,
                 plan_type=plan_type,
                 windows=[],
             )
+
+        async def get_snapshot(self, *args, **kwargs):
+            raise AssertionError("gpt-image-2 token selection should not fetch quota snapshots on the hot path")
 
     app = SimpleNamespace(
         state=SimpleNamespace(
@@ -2189,6 +2353,423 @@ def test_execute_proxy_request_with_failover_skips_free_tokens_for_gpt_image_2(m
     assert finalized[0]["model_name"] == "gpt-image-2"
 
 
+def test_execute_proxy_request_with_failover_wraps_gpt_image_2_stream_with_outer_keepalive(
+    monkeypatch,
+) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run in successful stream test")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    token_row = CodexToken(
+        id=13,
+        account_id="acct_paid",
+        refresh_token="refresh-token",
+        is_active=True,
+        raw_payload={},
+    )
+
+    claim_calls = 0
+    mark_success_calls: list[int] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        nonlocal claim_calls
+        claim_calls += 1
+        return token_row if claim_calls == 1 else None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=92)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("mark_token_error should not run on successful stream")
+
+    async def delayed_stream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.05)
+        yield b"data: delayed\n\n"
+        yield b"data: [DONE]\n\n"
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        return SimpleNamespace(
+            response=StreamingResponse(delayed_stream(), media_type="text/event-stream"),
+            status_code=200,
+            model_name="gpt-image-2",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server._stream_keepalive_interval_seconds", lambda: 0.01)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/chat/completions",
+            request_model="gpt-image-2",
+            is_stream=True,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    async def collect_chunks() -> list[bytes]:
+        chunks: list[bytes] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(collect_chunks())
+
+    assert isinstance(response, StreamingResponse)
+    assert response.status_code == 200
+    assert chunks[0].startswith(b": keepalive")
+    assert b"data: delayed\n\n" in chunks
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    assert mark_success_calls == [13]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 92
+    assert finalized[0]["status_code"] == 200
+    assert finalized[0]["success"] is True
+    assert finalized[0]["attempt_count"] == 1
+    assert finalized[0]["token_id"] == 13
+    assert finalized[0]["account_id"] == "acct_paid"
+    assert finalized[0]["model_name"] == "gpt-image-2"
+
+
+def test_execute_proxy_request_with_failover_returns_immediately_for_gpt_image_2_stream_while_auth_is_pending(
+    monkeypatch,
+) -> None:
+    auth_gate = asyncio.Event()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            await auth_gate.wait()
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run in successful stream test")
+
+    app.state.oauth_manager = DummyOAuthManager()
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=receive,
+    )
+    token_row = CodexToken(
+        id=31,
+        account_id="acct_paid",
+        refresh_token="refresh-token",
+        is_active=True,
+        raw_payload={},
+        plan_type="team",
+    )
+
+    claim_calls = 0
+    mark_success_calls: list[int] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        nonlocal claim_calls
+        claim_calls += 1
+        return token_row if claim_calls == 1 else None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=101)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("mark_token_error should not run on successful stream")
+
+    async def delayed_stream() -> AsyncIterator[bytes]:
+        yield b"data: delayed\n\n"
+        yield b"data: [DONE]\n\n"
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        return SimpleNamespace(
+            response=StreamingResponse(delayed_stream(), media_type="text/event-stream"),
+            status_code=200,
+            model_name="gpt-image-2",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server._stream_keepalive_interval_seconds", lambda: 0.01)
+
+    async def run() -> tuple[StreamingResponse, list[bytes]]:
+        response = await asyncio.wait_for(
+            _execute_proxy_request_with_failover(
+                request,
+                endpoint="/v1/chat/completions",
+                request_model="gpt-image-2",
+                is_stream=True,
+                proxy_call=fake_proxy_call,
+            ),
+            timeout=0.02,
+        )
+        iterator = response.body_iterator.__aiter__()
+        first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.03)
+        auth_gate.set()
+        chunks = [first_chunk]
+        async for chunk in iterator:
+            chunks.append(chunk)
+        return response, chunks
+
+    response, chunks = asyncio.run(run())
+
+    assert isinstance(response, StreamingResponse)
+    assert response.status_code == 200
+    assert chunks[0].startswith(b": keepalive")
+    assert b"data: delayed\n\n" in chunks
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    assert mark_success_calls == [31]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 101
+    assert finalized[0]["status_code"] == 200
+    assert finalized[0]["success"] is True
+    assert finalized[0]["attempt_count"] == 1
+    assert finalized[0]["token_id"] == 31
+    assert finalized[0]["account_id"] == "acct_paid"
+
+
+def test_execute_proxy_request_with_failover_keeps_retrying_gpt_image_2_stream_after_keepalive(
+    monkeypatch,
+) -> None:
+    first_attempt_gate = asyncio.Event()
+    second_attempt_gate = asyncio.Event()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run in retry stream test")
+
+    app.state.oauth_manager = DummyOAuthManager()
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=receive,
+    )
+    first_token = CodexToken(
+        id=41,
+        account_id="acct-first",
+        refresh_token="refresh-first",
+        is_active=True,
+        raw_payload={},
+        plan_type="team",
+    )
+    second_token = CodexToken(
+        id=42,
+        account_id="acct-second",
+        refresh_token="refresh-second",
+        is_active=True,
+        raw_payload={},
+        plan_type="team",
+    )
+
+    claim_calls = 0
+    mark_success_calls: list[int] = []
+    mark_error_calls: list[tuple[int, str]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls == 1:
+            return first_token
+        if claim_calls == 2:
+            return second_token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=202)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_mark_token_error(token_id: int, detail: str, **kwargs) -> None:
+        mark_error_calls.append((token_id, detail))
+
+    async def success_stream() -> AsyncIterator[bytes]:
+        yield b"data: success\n\n"
+        yield b"data: [DONE]\n\n"
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        if account_id == "acct-first":
+            await first_attempt_gate.wait()
+            raise HTTPException(status_code=502, detail="first attempt failed")
+        await second_attempt_gate.wait()
+        return SimpleNamespace(
+            response=StreamingResponse(success_stream(), media_type="text/event-stream"),
+            status_code=200,
+            model_name="gpt-image-2",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server._stream_keepalive_interval_seconds", lambda: 0.01)
+
+    async def run() -> list[bytes]:
+        response = await asyncio.wait_for(
+            _execute_proxy_request_with_failover(
+                request,
+                endpoint="/v1/chat/completions",
+                request_model="gpt-image-2",
+                is_stream=True,
+                proxy_call=fake_proxy_call,
+            ),
+            timeout=0.02,
+        )
+        iterator = response.body_iterator.__aiter__()
+        first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.03)
+        first_attempt_gate.set()
+        second_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.03)
+        second_attempt_gate.set()
+        chunks = [first_chunk, second_chunk]
+        async for chunk in iterator:
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(run())
+    body = b"".join(chunks)
+
+    assert chunks[0].startswith(b": keepalive")
+    assert chunks[1].startswith(b": keepalive")
+    assert b"data: success\n\n" in body
+    assert b"first attempt failed" not in body
+    assert mark_error_calls == [(41, "first attempt failed")]
+    assert mark_success_calls == [42]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 202
+    assert finalized[0]["status_code"] == 200
+    assert finalized[0]["success"] is True
+    assert finalized[0]["attempt_count"] == 2
+    assert finalized[0]["token_id"] == 42
+    assert finalized[0]["account_id"] == "acct-second"
+
+
 def test_execute_proxy_request_with_failover_allows_free_tokens_for_other_models(monkeypatch) -> None:
     app = SimpleNamespace(
         state=SimpleNamespace(
@@ -2295,13 +2876,16 @@ def test_execute_proxy_request_with_failover_returns_clear_503_when_only_free_to
     monkeypatch,
 ) -> None:
     class DummyQuotaService:
-        async def get_snapshot(self, token_row, *, client, oauth_manager, account_id=None):
+        def get_cached_snapshot(self, token_id: int):
             return CodexQuotaSnapshot(
                 fetched_at=datetime.now(timezone.utc),
                 error=None,
                 plan_type="free",
                 windows=[],
             )
+
+        async def get_snapshot(self, *args, **kwargs):
+            raise AssertionError("gpt-image-2 token selection should not fetch quota snapshots on the hot path")
 
     app = SimpleNamespace(
         state=SimpleNamespace(
@@ -2499,6 +3083,129 @@ def test_execute_proxy_request_with_failover_falls_back_to_declared_plan_type_wh
     assert exc_info.value.status_code == 503
     assert str(exc_info.value.detail) == "No non-free Codex token available for gpt-image-2 requests"
     assert claim_calls == [(), (41,)]
+
+
+def test_execute_proxy_request_with_failover_postpones_unknown_plan_tokens_until_known_non_free_found(
+    monkeypatch,
+) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+            quota_service=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run in successful unknown-plan fallback test")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    unknown_token = CodexToken(
+        id=51,
+        account_id="acct_unknown",
+        refresh_token="refresh-unknown",
+        is_active=True,
+        raw_payload={},
+    )
+    paid_token = CodexToken(
+        id=52,
+        account_id="acct_paid",
+        refresh_token="refresh-paid",
+        is_active=True,
+        raw_payload={},
+        plan_type="team",
+    )
+
+    claim_calls: list[tuple[int, ...]] = []
+    proxy_calls: list[tuple[str, str | None]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if 51 not in excluded:
+            return unknown_token
+        if 52 not in excluded:
+            return paid_token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=92)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        return None
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("mark_token_error should not run in successful unknown-plan fallback test")
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        proxy_calls.append((access_token, account_id))
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-image-2",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/chat/completions",
+            request_model="gpt-image-2",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    assert response.status_code == 200
+    assert claim_calls == [(), (51,)]
+    assert proxy_calls == [("access-token-52", "acct_paid")]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 92
+    assert finalized[0]["status_code"] == 200
+    assert finalized[0]["success"] is True
+    assert finalized[0]["attempt_count"] == 1
+    assert finalized[0]["token_id"] == 52
+    assert finalized[0]["account_id"] == "acct_paid"
 
 
 def test_response_traffic_controller_waits_until_idle(monkeypatch) -> None:

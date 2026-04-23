@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import glob
 import json
 from dataclasses import dataclass
@@ -105,6 +106,79 @@ def _non_empty_value(value: Any) -> Any | None:
         normalized = value.strip()
         return normalized or None
     return value if value is not None else None
+
+
+def _normalize_plan_type(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized.startswith("chatgpt_"):
+        normalized = normalized[len("chatgpt_") :]
+    return normalized or None
+
+
+def _decode_base64_url(segment: str) -> bytes:
+    value = segment.strip()
+    padding = len(value) % 4
+    if padding == 2:
+        value += "=="
+    elif padding == 3:
+        value += "="
+    elif padding == 1:
+        value += "==="
+    return base64.urlsafe_b64decode(value.encode("utf-8"))
+
+
+def _parse_mapping_or_jwt(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+
+    parts = raw.split(".")
+    if len(parts) < 2:
+        return None
+
+    try:
+        decoded = _decode_base64_url(parts[1])
+        payload = json.loads(decoded)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _extract_plan_type_from_payload(payload: dict[str, Any]) -> str | None:
+    auth_payload = payload.get("https://api.openai.com/auth")
+    if isinstance(auth_payload, dict):
+        normalized = _normalize_plan_type(auth_payload.get("chatgpt_plan_type") or auth_payload.get("plan_type"))
+        if normalized is not None:
+            return normalized
+
+    normalized = _normalize_plan_type(payload.get("chatgpt_plan_type") or payload.get("plan_type"))
+    if normalized is not None:
+        return normalized
+
+    id_token_payload = _parse_mapping_or_jwt(payload.get("id_token"))
+    if isinstance(id_token_payload, dict):
+        auth_mapping = id_token_payload.get("https://api.openai.com/auth")
+        if isinstance(auth_mapping, dict):
+            normalized = _normalize_plan_type(
+                auth_mapping.get("chatgpt_plan_type") or auth_mapping.get("plan_type")
+            )
+            if normalized is not None:
+                return normalized
+        return _normalize_plan_type(
+            id_token_payload.get("chatgpt_plan_type") or id_token_payload.get("plan_type")
+        )
+
+    return None
 
 
 def _is_merged_duplicate_error(message: str | None) -> bool:
@@ -460,6 +534,7 @@ async def upsert_token_payload(
                     expires_at=parse_rfc3339(payload.get("expired")),
                     recovery=recovery,
                     raw_payload=payload,
+                    plan_type=_extract_plan_type_from_payload(payload),
                     source_file=source_file,
                     is_active=True,
                     cooldown_until=None,
@@ -484,6 +559,7 @@ async def upsert_token_payload(
                 token.expires_at = parse_rfc3339(payload.get("expired"))
                 token.recovery = recovery
                 token.raw_payload = payload
+                token.plan_type = _extract_plan_type_from_payload(payload) or token.plan_type
                 token.is_active = True
                 token.cooldown_until = None
                 token.last_error = None
@@ -594,6 +670,22 @@ async def update_token_refresh_state(
                 token.last_error = None
             token.updated_at = utcnow()
             await _repair_duplicate_token_histories_in_session(session)
+
+
+async def update_token_plan_type(token_id: int, *, plan_type: str | None) -> None:
+    normalized_plan_type = _normalize_plan_type(plan_type)
+    if normalized_plan_type is None:
+        return
+
+    async with get_session() as session:
+        async with session.begin():
+            token = await _resolve_canonical_token_for_update(session, token_id)
+            if token is None:
+                return
+            if token.plan_type == normalized_plan_type:
+                return
+            token.plan_type = normalized_plan_type
+            token.updated_at = utcnow()
 
 
 async def mark_token_success(token_id: int) -> None:
