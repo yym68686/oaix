@@ -38,7 +38,7 @@ from oaix_gateway.api_server import (
     _wrap_streaming_body_iterator,
     create_app,
 )
-from oaix_gateway.database import CodexToken, GatewayRequestLog
+from oaix_gateway.database import ChatImageCheckpoint, ChatImageCheckpointImage, CodexToken, GatewayRequestLog
 from oaix_gateway.quota import CodexPlanInfo
 from oaix_gateway.token_import_jobs import (
     IMPORT_JOB_STATUS_COMPLETED,
@@ -210,7 +210,26 @@ def test_translate_responses_image_compat_payload_rejects_compact() -> None:
         )
 
 
-def test_chat_completions_request_to_responses_request_parses_markdown_image_history() -> None:
+def test_chat_completions_request_to_responses_request_parses_markdown_image_history(monkeypatch) -> None:
+    async def fake_resolve_chat_image_output_items(*, scope_hash: str, client_model: str, image_urls: list[str]):
+        assert client_model == "gpt-image-2"
+        assert image_urls == ["data:image/png;base64,prev-image"]
+        return [
+            SimpleNamespace(
+                output_item={
+                    "type": "image_generation_call",
+                    "id": "ig_prev",
+                    "result": "prev-image",
+                    "output_format": "png",
+                }
+            )
+        ]
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.resolve_chat_image_output_items",
+        fake_resolve_chat_image_output_items,
+    )
+
     request_data = ChatCompletionsRequest(
         model="gpt-image-2",
         messages=[
@@ -228,7 +247,7 @@ def test_chat_completions_request_to_responses_request_parses_markdown_image_his
         output_format="png",
     )
 
-    responses_request = _chat_completions_request_to_responses_request(request_data)
+    responses_request = asyncio.run(_chat_completions_request_to_responses_request(request_data))
     payload = responses_request.model_dump(exclude_unset=True)
 
     assert payload["model"] == "gpt-image-2"
@@ -240,8 +259,13 @@ def test_chat_completions_request_to_responses_request_parses_markdown_image_his
             "role": "assistant",
             "content": [
                 {"type": "output_text", "text": "Here is the previous render.\n\n"},
-                {"type": "input_image", "image_url": "data:image/png;base64,prev-image"},
             ],
+        },
+        {
+            "type": "image_generation_call",
+            "id": "ig_prev",
+            "result": "prev-image",
+            "output_format": "png",
         },
         {
             "type": "message",
@@ -249,6 +273,95 @@ def test_chat_completions_request_to_responses_request_parses_markdown_image_his
             "content": [
                 {"type": "input_text", "text": "Make the mug blue"},
             ],
+        },
+    ]
+
+
+def test_chat_completions_request_to_responses_request_rejects_unresolved_assistant_image_history(
+    monkeypatch,
+) -> None:
+    async def fake_resolve_chat_image_output_items(*, scope_hash: str, client_model: str, image_urls: list[str]):
+        return [None]
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.resolve_chat_image_output_items",
+        fake_resolve_chat_image_output_items,
+    )
+
+    request_data = ChatCompletionsRequest(
+        model="gpt-image-2",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "![image](data:image/png;base64,prev-image)",
+            },
+            {
+                "role": "user",
+                "content": "Make the mug blue",
+            },
+        ],
+        stream=False,
+    )
+
+    with pytest.raises(HTTPException, match="Assistant image history could not be resolved"):
+        asyncio.run(_chat_completions_request_to_responses_request(request_data))
+
+
+def test_chat_completions_request_to_responses_request_resolves_assistant_image_url_history(
+    monkeypatch,
+) -> None:
+    async def fake_resolve_chat_image_output_items(*, scope_hash: str, client_model: str, image_urls: list[str]):
+        assert image_urls == ["data:image/png;base64,prev-image"]
+        return [
+            SimpleNamespace(
+                output_item={
+                    "type": "image_generation_call",
+                    "id": "ig_prev_url",
+                    "result": "prev-image",
+                    "output_format": "png",
+                }
+            )
+        ]
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.resolve_chat_image_output_items",
+        fake_resolve_chat_image_output_items,
+    )
+
+    request_data = ChatCompletionsRequest(
+        model="gpt-image-2",
+        messages=[
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,prev-image"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": "杯子变成红色",
+            },
+        ],
+        stream=False,
+    )
+
+    responses_request = asyncio.run(_chat_completions_request_to_responses_request(request_data))
+    payload = responses_request.model_dump(exclude_unset=True)
+
+    assert payload["input"] == [
+        {
+            "type": "image_generation_call",
+            "id": "ig_prev_url",
+            "result": "prev-image",
+            "output_format": "png",
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "杯子变成红色"}],
         },
     ]
 
@@ -1093,7 +1206,47 @@ def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias() -> Non
     assert "gpt-5.4-mini" not in body
 
 
-def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_response() -> None:
+def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_response(monkeypatch) -> None:
+    async def fake_resolve_chat_image_output_items(*, scope_hash: str, client_model: str, image_urls: list[str]):
+        assert client_model == "gpt-image-2"
+        assert image_urls == ["data:image/png;base64,prev-image"]
+        return [
+            SimpleNamespace(
+                output_item={
+                    "type": "image_generation_call",
+                    "id": "ig_prev",
+                    "result": "prev-image",
+                    "output_format": "png",
+                }
+            )
+        ]
+
+    persisted: dict[str, object] = {}
+
+    async def fake_create_chat_image_checkpoint(
+        *,
+        scope_hash: str,
+        client_model: str,
+        responses_payload: dict[str, object],
+        assistant_content: str | None,
+        request_log_id: int | None = None,
+    ) -> int | None:
+        persisted["scope_hash"] = scope_hash
+        persisted["client_model"] = client_model
+        persisted["responses_payload"] = responses_payload
+        persisted["assistant_content"] = assistant_content
+        persisted["request_log_id"] = request_log_id
+        return 7
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.resolve_chat_image_output_items",
+        fake_resolve_chat_image_output_items,
+    )
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.create_chat_image_checkpoint",
+        fake_create_chat_image_checkpoint,
+    )
+
     class DummyStreamingResponse:
         def __init__(self, chunks: list[bytes]) -> None:
             self.status_code = 200
@@ -1135,7 +1288,7 @@ def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_res
             response = DummyStreamingResponse(
                 [
                     b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_chat_img","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
-                    b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"chat-image","output_format":"png"}}\n\n',
+                    b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","id":"ig_chat","result":"chat-image","output_format":"png"}}\n\n',
                     b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_chat_img","status":"completed","model":"gpt-5.4-mini","output":[],"usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}}}\n\n',
                 ]
             )
@@ -1193,10 +1346,12 @@ def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_res
             "output_format": "png",
         }
     ]
-    assert upstream_payload["input"][0]["role"] == "assistant"
-    assert upstream_payload["input"][0]["content"] == [
-        {"type": "input_image", "image_url": "data:image/png;base64,prev-image"}
-    ]
+    assert upstream_payload["input"][0] == {
+        "type": "image_generation_call",
+        "id": "ig_prev",
+        "result": "prev-image",
+        "output_format": "png",
+    }
     assert upstream_payload["input"][1]["content"] == [
         {"type": "input_text", "text": "Make it blue"}
     ]
@@ -1209,9 +1364,37 @@ def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_res
     assert body["choices"][0]["message"]["content"] == "![image](data:image/png;base64,chat-image)"
     assert body["choices"][0]["finish_reason"] == "stop"
     assert body["usage"]["total_tokens"] == 10
+    assert result.on_success is not None
+    asyncio.run(result.on_success(101))
+    assert persisted["client_model"] == "gpt-image-2"
+    assert persisted["assistant_content"] == "![image](data:image/png;base64,chat-image)"
+    assert persisted["request_log_id"] == 101
+    assert persisted["responses_payload"]["id"] == "resp_chat_img"
 
 
-def test_proxy_chat_completions_with_token_stream_returns_markdown_image_chunks() -> None:
+def test_proxy_chat_completions_with_token_stream_returns_markdown_image_chunks(monkeypatch) -> None:
+    persisted: dict[str, object] = {}
+
+    async def fake_create_chat_image_checkpoint(
+        *,
+        scope_hash: str,
+        client_model: str,
+        responses_payload: dict[str, object],
+        assistant_content: str | None,
+        request_log_id: int | None = None,
+    ) -> int | None:
+        persisted["scope_hash"] = scope_hash
+        persisted["client_model"] = client_model
+        persisted["responses_payload"] = responses_payload
+        persisted["assistant_content"] = assistant_content
+        persisted["request_log_id"] = request_log_id
+        return 9
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.create_chat_image_checkpoint",
+        fake_create_chat_image_checkpoint,
+    )
+
     class DummyStreamingResponse:
         def __init__(self, chunks: list[bytes]) -> None:
             self.status_code = 200
@@ -1253,7 +1436,7 @@ def test_proxy_chat_completions_with_token_stream_returns_markdown_image_chunks(
             response = DummyStreamingResponse(
                 [
                     b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_chat_stream","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
-                    b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"stream-image","output_format":"png"}}\n\n',
+                    b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","id":"ig_stream","result":"stream-image","output_format":"png"}}\n\n',
                     b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_chat_stream","status":"completed","model":"gpt-5.4-mini","output":[],"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}\n\n',
                     b'data: [DONE]\n\n',
                 ]
@@ -1314,6 +1497,12 @@ def test_proxy_chat_completions_with_token_stream_returns_markdown_image_chunks(
     assert '"content": "![image](data:image/png;base64,stream-image)"' in body
     assert '"finish_reason": "stop"' in body
     assert "data: [DONE]" in body
+    assert result.on_success is not None
+    asyncio.run(result.on_success(202))
+    assert persisted["client_model"] == "gpt-image-2"
+    assert persisted["assistant_content"] == "![image](data:image/png;base64,stream-image)"
+    assert persisted["request_log_id"] == 202
+    assert persisted["responses_payload"]["output"][0]["id"] == "ig_stream"
 
 
 def test_proxy_image_request_with_token_non_stream_collects_openai_images_response() -> None:
@@ -2584,3 +2773,13 @@ def test_codex_token_refresh_token_index_is_declared() -> None:
 
 def test_gateway_request_log_token_index_is_declared() -> None:
     assert "ix_gateway_request_logs_token_id" in {index.name for index in GatewayRequestLog.__table__.indexes}
+
+
+def test_chat_image_checkpoint_indexes_are_declared() -> None:
+    checkpoint_indexes = {index.name for index in ChatImageCheckpoint.__table__.indexes}
+    image_indexes = {index.name for index in ChatImageCheckpointImage.__table__.indexes}
+
+    assert "ix_chat_image_checkpoints_scope_hash" in checkpoint_indexes
+    assert "ix_chat_image_checkpoints_client_model" in checkpoint_indexes
+    assert "ix_chat_image_checkpoint_images_image_sha256" in image_indexes
+    assert "ix_chat_image_checkpoint_images_image_call_id" in image_indexes

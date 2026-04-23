@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text, func, inspect, select, text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -90,6 +90,39 @@ class GatewaySetting(Base):
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ChatImageCheckpoint(Base):
+    __tablename__ = "chat_image_checkpoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    client_model: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    upstream_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    request_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    assistant_content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    image_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+
+class ChatImageCheckpointImage(Base):
+    __tablename__ = "chat_image_checkpoint_images"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    checkpoint_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("chat_image_checkpoints.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    image_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    image_call_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    image_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    output_item: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
 
 
 class TokenImportJob(Base):

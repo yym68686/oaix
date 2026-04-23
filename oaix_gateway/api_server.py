@@ -2,6 +2,7 @@ import asyncio
 import base64
 import codecs
 import copy
+import hashlib
 import json
 import logging
 import mimetypes
@@ -23,6 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 from starlette.datastructures import UploadFile
+from .chat_image_store import create_chat_image_checkpoint, resolve_chat_image_output_items
 from .database import close_database, init_db, utcnow
 from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
@@ -182,6 +184,7 @@ class ProxyRequestResult:
     model_name: str | None = None
     first_token_at: datetime | None = None
     usage_metrics: UsageMetrics | None = None
+    on_success: Callable[[int], Awaitable[None]] | None = None
     stream_capture: "_ProxyStreamCapture | None" = None
 
 
@@ -204,6 +207,14 @@ class ImageCallResult:
     quality: str | None = None
 
 
+@dataclass(frozen=True)
+class _ChatContentToken:
+    kind: str
+    text: str | None = None
+    image_url: str | None = None
+    raw_item: dict[str, Any] | None = None
+
+
 class _ProxyStreamCapture:
     def __init__(
         self,
@@ -215,8 +226,26 @@ class _ProxyStreamCapture:
         self.first_token_at = initial_first_token_at
         self.usage_metrics: UsageMetrics | None = None
         self._response_snapshot: dict[str, Any] = {}
+        self._output_items_by_index: dict[int, dict[str, Any]] = {}
+        self._output_items_fallback: list[dict[str, Any]] = []
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._text_buffer = ""
+
+    @property
+    def response_payload(self) -> dict[str, Any] | None:
+        if not self._response_snapshot:
+            return None
+
+        patched = _patch_completed_output_from_output_items(
+            {
+                "type": "response.completed",
+                "response": copy.deepcopy(self._response_snapshot),
+            },
+            output_items_by_index=self._output_items_by_index,
+            output_items_fallback=self._output_items_fallback,
+        )
+        response_payload = patched.get("response")
+        return response_payload if isinstance(response_payload, dict) else None
 
     def feed(self, chunk: bytes) -> None:
         if not chunk:
@@ -245,11 +274,26 @@ class _ProxyStreamCapture:
                 if not isinstance(event_payload, dict):
                     continue
 
+                if event_type == "response.output_item.done":
+                    _collect_responses_output_item_done(
+                        event_payload,
+                        output_items_by_index=self._output_items_by_index,
+                        output_items_fallback=self._output_items_fallback,
+                    )
+                    continue
+
                 response_obj = event_payload.get("response")
                 if isinstance(response_obj, dict):
+                    if event_type == "response.completed":
+                        event_payload = _patch_completed_output_from_output_items(
+                            event_payload,
+                            output_items_by_index=self._output_items_by_index,
+                            output_items_fallback=self._output_items_fallback,
+                        )
+                        response_obj = event_payload.get("response")
                     _merge_mapping(self._response_snapshot, response_obj)
 
-                usage_payload = self._response_snapshot or event_payload
+                usage_payload = self.response_payload or event_payload
                 usage_metrics = extract_usage_metrics(usage_payload, model_name=self.model_name)
                 if usage_metrics is not None:
                     self.usage_metrics = usage_metrics
@@ -625,6 +669,84 @@ def _extract_chat_image_url(item: Any) -> str | None:
     return _normalize_optional_text(item.get("url"))
 
 
+def _append_chat_content_tokens_from_text(tokens: list[_ChatContentToken], text: str) -> None:
+    cursor = 0
+    matched_any = False
+
+    for match in CHAT_COMPLETIONS_MARKDOWN_IMAGE_RE.finditer(text):
+        image_url = _normalize_optional_text(match.group(1))
+        if image_url is None:
+            continue
+
+        matched_any = True
+        if match.start() > cursor:
+            prefix = text[cursor:match.start()]
+            if prefix:
+                tokens.append(_ChatContentToken(kind="text", text=prefix))
+        tokens.append(_ChatContentToken(kind="image", image_url=image_url))
+        cursor = match.end()
+
+    if cursor < len(text):
+        suffix = text[cursor:]
+        if suffix:
+            tokens.append(_ChatContentToken(kind="text", text=suffix))
+    elif not matched_any and text:
+        tokens.append(_ChatContentToken(kind="text", text=text))
+
+
+def _extract_chat_content_tokens(content_value: Any, *, role: str) -> list[_ChatContentToken]:
+    tokens: list[_ChatContentToken] = []
+
+    if isinstance(content_value, str):
+        _append_chat_content_tokens_from_text(tokens, content_value)
+        return tokens
+
+    if not isinstance(content_value, list):
+        return tokens
+
+    for item in content_value:
+        if isinstance(item, str):
+            _append_chat_content_tokens_from_text(tokens, item)
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        item_type = _normalize_optional_text(item.get("type"))
+        if item_type in {"text", "input_text", "output_text"}:
+            text_value = str(item.get("text") or "")
+            if text_value:
+                _append_chat_content_tokens_from_text(tokens, text_value)
+            continue
+
+        if item_type in {"image_url", "input_image"}:
+            image_url = _extract_chat_image_url(item)
+            if image_url is not None:
+                tokens.append(_ChatContentToken(kind="image", image_url=image_url))
+            continue
+
+        if item_type == "input_audio" and role == "user":
+            tokens.append(_ChatContentToken(kind="audio", raw_item=copy.deepcopy(item)))
+
+    return tokens
+
+
+def _chat_content_tokens_to_parts(tokens: list[_ChatContentToken], *, role: str) -> list[dict[str, Any]]:
+    text_part_type = _chat_text_part_type_for_role(role)
+    content_parts: list[dict[str, Any]] = []
+
+    for token in tokens:
+        if token.kind == "text" and token.text:
+            content_parts.append({"type": text_part_type, "text": token.text})
+            continue
+        if token.kind == "image" and token.image_url:
+            content_parts.append({"type": "input_image", "image_url": token.image_url})
+            continue
+        if token.kind == "audio" and role == "user" and isinstance(token.raw_item, dict):
+            content_parts.append(copy.deepcopy(token.raw_item))
+
+    return content_parts
+
+
 def _append_chat_text_and_markdown_images(
     content_parts: list[dict[str, Any]],
     text: str,
@@ -783,7 +905,167 @@ def _chat_messages_to_responses_input(messages: list[Any]) -> list[dict[str, Any
     return input_items
 
 
-def _chat_completions_request_to_responses_request(request_data: ChatCompletionsRequest) -> ResponsesRequest:
+def _chat_image_checkpoint_scope_hash(http_request: Request | None) -> str:
+    if http_request is None:
+        return hashlib.sha256(b"oaix-chat-image-scope:anonymous").hexdigest()
+
+    authorization = _normalize_optional_text(http_request.headers.get("authorization"))
+    bearer_token: str | None = None
+    if authorization is not None and authorization.lower().startswith("bearer "):
+        bearer_token = _normalize_optional_text(authorization[7:])
+
+    scope_payload = {
+        "authorization": bearer_token or "",
+        "origin": _normalize_optional_text(http_request.headers.get("origin")) or "",
+        "client_ip": "" if bearer_token is not None else (http_request.client.host if http_request.client is not None else ""),
+        "user_agent": "" if bearer_token is not None else (_normalize_optional_text(http_request.headers.get("user-agent")) or ""),
+    }
+    encoded = json.dumps(scope_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _append_assistant_tool_calls(
+    input_items: list[dict[str, Any]],
+    message: dict[str, Any],
+) -> None:
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return
+
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        if _normalize_optional_text(tool_call.get("type")) != "function":
+            continue
+        function_obj = tool_call.get("function")
+        if not isinstance(function_obj, dict):
+            continue
+        name = _normalize_optional_text(function_obj.get("name"))
+        if name is None:
+            continue
+        input_items.append(
+            {
+                "type": "function_call",
+                "call_id": _normalize_optional_text(tool_call.get("id")) or f"call_{uuid.uuid4().hex}",
+                "name": name,
+                "arguments": function_obj.get("arguments") or "",
+            }
+        )
+
+
+async def _chat_messages_to_responses_input_with_image_checkpoints(
+    messages: list[Any],
+    *,
+    scope_hash: str,
+    client_model: str,
+) -> list[dict[str, Any]]:
+    parsed_messages: list[tuple[dict[str, Any], str, str, list[_ChatContentToken]]] = []
+    assistant_image_urls: list[str] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = _normalize_chat_message_role(message.get("role"))
+        if role is None:
+            continue
+
+        if role == "tool":
+            parsed_messages.append((message, role, role, []))
+            continue
+
+        tokens = _extract_chat_content_tokens(message.get("content"), role=role)
+        parsed_messages.append((message, role, "developer" if role == "system" else role, tokens))
+        if role == "assistant":
+            assistant_image_urls.extend(
+                token.image_url
+                for token in tokens
+                if token.kind == "image" and token.image_url is not None
+            )
+
+    resolved_images = await resolve_chat_image_output_items(
+        scope_hash=scope_hash,
+        client_model=client_model,
+        image_urls=assistant_image_urls,
+    )
+    resolved_image_iter = iter(resolved_images)
+    unresolved_image_urls: list[str] = []
+    input_items: list[dict[str, Any]] = []
+
+    for message, role, responses_role, tokens in parsed_messages:
+        if role == "tool":
+            tool_call_id = _normalize_optional_text(message.get("tool_call_id"))
+            if tool_call_id is None:
+                continue
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": tool_call_id,
+                    "output": _stringify_chat_tool_output(message.get("content")),
+                }
+            )
+            continue
+
+        if role != "assistant":
+            input_items.append(
+                {
+                    "type": "message",
+                    "role": responses_role,
+                    "content": _chat_content_tokens_to_parts(tokens, role=role),
+                }
+            )
+            continue
+
+        buffered_parts: list[dict[str, Any]] = []
+
+        def flush_assistant_parts() -> None:
+            nonlocal buffered_parts
+            if not buffered_parts:
+                return
+            input_items.append(
+                {
+                    "type": "message",
+                    "role": responses_role,
+                    "content": buffered_parts,
+                }
+            )
+            buffered_parts = []
+
+        for token in tokens:
+            if token.kind == "text" and token.text:
+                buffered_parts.append({"type": "output_text", "text": token.text})
+                continue
+
+            if token.kind != "image" or token.image_url is None:
+                continue
+
+            flush_assistant_parts()
+            resolved_image = next(resolved_image_iter, None)
+            if resolved_image is None:
+                unresolved_image_urls.append(token.image_url)
+                continue
+            input_items.append(copy.deepcopy(resolved_image.output_item))
+
+        flush_assistant_parts()
+        _append_assistant_tool_calls(input_items, message)
+
+    if unresolved_image_urls:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Assistant image history could not be resolved. "
+                "The image was not generated by oaix or its checkpoint expired."
+            ),
+        )
+
+    return input_items
+
+
+async def _chat_completions_request_to_responses_request(
+    request_data: ChatCompletionsRequest,
+    *,
+    http_request: Request | None = None,
+) -> ResponsesRequest:
     raw_payload = request_data.model_dump(exclude_unset=True)
     messages = raw_payload.pop("messages", [])
     payload = {
@@ -792,7 +1074,15 @@ def _chat_completions_request_to_responses_request(request_data: ChatCompletions
         if key in CHAT_COMPLETIONS_RESPONSES_PASSTHROUGH_FIELDS
     }
     payload["model"] = request_data.model
-    payload["input"] = _chat_messages_to_responses_input(messages if isinstance(messages, list) else [])
+    message_list = messages if isinstance(messages, list) else []
+    if _is_responses_image_compat_model(request_data.model):
+        payload["input"] = await _chat_messages_to_responses_input_with_image_checkpoints(
+            message_list,
+            scope_hash=_chat_image_checkpoint_scope_hash(http_request),
+            client_model=request_data.model,
+        )
+    else:
+        payload["input"] = _chat_messages_to_responses_input(message_list)
     if request_data.stream is not None:
         payload["stream"] = bool(request_data.stream)
     return ResponsesRequest.model_validate(payload)
@@ -1792,6 +2082,61 @@ def _build_chat_completions_response(
     return response
 
 
+def _chat_completion_assistant_message(chat_payload: dict[str, Any]) -> dict[str, Any] | None:
+    choices = chat_payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return None
+    message = choice.get("message")
+    return message if isinstance(message, dict) else None
+
+
+def _chat_completion_assistant_content_from_response_payload(
+    responses_payload: dict[str, Any] | None,
+    *,
+    request_model: str,
+) -> str | None:
+    if not isinstance(responses_payload, dict):
+        return None
+    message = _chat_completion_assistant_message(
+        _build_chat_completions_response(
+            responses_payload,
+            request_model=request_model,
+        )
+    )
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    return str(content) if content is not None else None
+
+
+def _build_chat_image_checkpoint_callback(
+    *,
+    request_model: str,
+    scope_hash: str,
+    responses_payload_getter: Callable[[], dict[str, Any] | None],
+    assistant_content_getter: Callable[[], str | None],
+) -> Callable[[int], Awaitable[None]] | None:
+    if not _is_responses_image_compat_model(request_model):
+        return None
+
+    async def on_success(request_log_id: int) -> None:
+        responses_payload = responses_payload_getter()
+        if not isinstance(responses_payload, dict):
+            return
+        await create_chat_image_checkpoint(
+            scope_hash=scope_hash,
+            client_model=request_model,
+            responses_payload=responses_payload,
+            assistant_content=assistant_content_getter(),
+            request_log_id=request_log_id,
+        )
+
+    return on_success
+
+
 def _build_chat_completion_chunk_bytes(
     *,
     response_id: str,
@@ -2682,6 +3027,15 @@ async def _finalize_stream_request_log(
         logger.exception("Failed to finalize streamed request log id=%s", request_log_id)
 
 
+async def _run_proxy_result_success_hook(proxy_result: ProxyRequestResult, *, request_log_id: int) -> None:
+    if proxy_result.on_success is None:
+        return
+    try:
+        await proxy_result.on_success(request_log_id)
+    except Exception:
+        logger.exception("Failed to persist proxy success side effects for request log id=%s", request_log_id)
+
+
 async def _execute_proxy_request_with_failover(
     http_request: Request,
     *,
@@ -2780,6 +3134,7 @@ async def _execute_proxy_request_with_failover(
                                     account_id=proxied_account_id,
                                     model_name=proxied_result.model_name,
                                 )
+                            await _run_proxy_result_success_hook(proxied_result, request_log_id=request_log.id)
                         finally:
                             await response_lease.release()
 
@@ -2802,6 +3157,7 @@ async def _execute_proxy_request_with_failover(
                     model_name=proxy_result.model_name,
                     **_usage_finalize_kwargs(proxy_result.usage_metrics),
                 )
+                await _run_proxy_result_success_hook(proxy_result, request_log_id=request_log.id)
                 return proxy_result.response
             except HTTPException as exc:
                 status_code = getattr(exc, "status_code", 500)
@@ -3766,7 +4122,11 @@ async def _proxy_chat_completions_with_token(
     access_token: str,
     account_id: str | None,
 ) -> ProxyRequestResult:
-    responses_request = _chat_completions_request_to_responses_request(request_data)
+    responses_request = await _chat_completions_request_to_responses_request(
+        request_data,
+        http_request=http_request,
+    )
+    scope_hash = _chat_image_checkpoint_scope_hash(http_request)
     proxy_result = await _proxy_request_with_token(
         client,
         http_request,
@@ -3777,6 +4137,17 @@ async def _proxy_chat_completions_with_token(
     )
 
     if isinstance(proxy_result.response, StreamingResponse):
+        checkpoint_callback = _build_chat_image_checkpoint_callback(
+            request_model=request_data.model,
+            scope_hash=scope_hash,
+            responses_payload_getter=lambda: proxy_result.stream_capture.response_payload
+            if proxy_result.stream_capture is not None
+            else None,
+            assistant_content_getter=lambda: _chat_completion_assistant_content_from_response_payload(
+                proxy_result.stream_capture.response_payload if proxy_result.stream_capture is not None else None,
+                request_model=request_data.model,
+            ),
+        )
         return ProxyRequestResult(
             response=StreamingResponse(
                 _stream_responses_to_chat_completions(
@@ -3789,6 +4160,7 @@ async def _proxy_chat_completions_with_token(
             model_name=request_data.model,
             first_token_at=proxy_result.first_token_at,
             usage_metrics=proxy_result.usage_metrics,
+            on_success=checkpoint_callback,
             stream_capture=proxy_result.stream_capture,
         )
 
@@ -3805,12 +4177,22 @@ async def _proxy_chat_completions_with_token(
         responses_payload,
         request_model=request_data.model,
     )
+    assistant_message = _chat_completion_assistant_message(chat_payload)
+    checkpoint_callback = _build_chat_image_checkpoint_callback(
+        request_model=request_data.model,
+        scope_hash=scope_hash,
+        responses_payload_getter=lambda payload=copy.deepcopy(responses_payload): payload,
+        assistant_content_getter=lambda message=copy.deepcopy(assistant_message): (
+            str(message.get("content") or "") if isinstance(message, dict) else None
+        ),
+    )
     return ProxyRequestResult(
         response=JSONResponse(status_code=proxy_result.status_code, content=chat_payload),
         status_code=proxy_result.status_code,
         model_name=request_data.model,
         first_token_at=proxy_result.first_token_at,
         usage_metrics=proxy_result.usage_metrics,
+        on_success=checkpoint_callback,
     )
 
 
