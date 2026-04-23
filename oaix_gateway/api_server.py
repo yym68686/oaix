@@ -955,17 +955,25 @@ def _append_assistant_tool_calls(
 
 def _resolved_chat_image_to_responses_input_item(resolved_image: Any) -> dict[str, Any] | None:
     # Replaying the full upstream output item back into `input` is invalid.
-    # Follow-up edits should reference the prior image generation call by id only.
+    # Stateless follow-up edits need the schema-legal image generation call
+    # payload, not the full tool output object.
     image_call_id = _normalize_optional_text(getattr(resolved_image, "image_call_id", None))
     output_item = getattr(resolved_image, "output_item", None)
     if image_call_id is None and isinstance(output_item, dict):
         if _normalize_optional_text(output_item.get("type")) == "image_generation_call":
             image_call_id = _normalize_optional_text(output_item.get("id"))
-    if image_call_id is None:
+    result_b64 = None
+    status = None
+    if isinstance(output_item, dict):
+        result_b64 = _normalize_optional_text(output_item.get("result"))
+        status = _normalize_optional_text(output_item.get("status"))
+    if image_call_id is None or result_b64 is None:
         return None
     return {
         "type": "image_generation_call",
         "id": image_call_id,
+        "result": result_b64,
+        "status": status or "completed",
     }
 
 

@@ -30,6 +30,7 @@ from oaix_gateway.api_server import (
     _prime_responses_upstream_stream,
     _probe_token_with_latest_access_token,
     _resolve_token_observed_cost_usd,
+    _resolved_chat_image_to_responses_input_item,
     _responses_failure_http_exception,
     ResponsesRequest,
     _serialize_admin_token_item,
@@ -221,7 +222,7 @@ def test_chat_completions_request_to_responses_request_parses_markdown_image_his
                 output_item={
                     "type": "image_generation_call",
                     "id": "ig_prev",
-                    "status": "generating",
+                    "status": "completed",
                     "action": "generate",
                     "background": "opaque",
                     "quality": "medium",
@@ -271,6 +272,8 @@ def test_chat_completions_request_to_responses_request_parses_markdown_image_his
         {
             "type": "image_generation_call",
             "id": "ig_prev",
+            "result": "prev-image",
+            "status": "completed",
         },
         {
             "type": "message",
@@ -280,6 +283,30 @@ def test_chat_completions_request_to_responses_request_parses_markdown_image_his
             ],
         },
     ]
+
+
+def test_resolved_chat_image_to_responses_input_item_uses_schema_legal_subset() -> None:
+    translated = _resolved_chat_image_to_responses_input_item(
+        SimpleNamespace(
+            image_call_id="ig_prev_subset",
+            output_item={
+                "type": "image_generation_call",
+                "id": "ig_prev_subset",
+                "action": "generate",
+                "background": "opaque",
+                "quality": "medium",
+                "result": "prev-image",
+                "output_format": "png",
+            },
+        )
+    )
+
+    assert translated == {
+        "type": "image_generation_call",
+        "id": "ig_prev_subset",
+        "result": "prev-image",
+        "status": "completed",
+    }
 
 
 def test_chat_completions_request_to_responses_request_rejects_unresolved_assistant_image_history(
@@ -365,6 +392,8 @@ def test_chat_completions_request_to_responses_request_resolves_assistant_image_
         {
             "type": "image_generation_call",
             "id": "ig_prev_url",
+            "result": "prev-image",
+            "status": "completed",
         },
         {
             "type": "message",
@@ -1363,6 +1392,8 @@ def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_res
     assert upstream_payload["input"][0] == {
         "type": "image_generation_call",
         "id": "ig_prev",
+        "result": "prev-image",
+        "status": "completed",
     }
     assert upstream_payload["input"][1]["content"] == [
         {"type": "input_text", "text": "Make it blue"}
