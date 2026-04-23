@@ -40,7 +40,7 @@ from oaix_gateway.api_server import (
     create_app,
 )
 from oaix_gateway.database import ChatImageCheckpoint, ChatImageCheckpointImage, CodexToken, GatewayRequestLog
-from oaix_gateway.quota import CodexPlanInfo
+from oaix_gateway.quota import CodexPlanInfo, CodexQuotaSnapshot
 from oaix_gateway.token_import_jobs import (
     IMPORT_JOB_STATUS_COMPLETED,
     IMPORT_JOB_STATUS_QUEUED,
@@ -1902,11 +1902,22 @@ def test_execute_proxy_request_with_failover_does_not_retry_nonretryable_http_ex
 
 
 def test_execute_proxy_request_with_failover_skips_free_tokens_for_gpt_image_2(monkeypatch) -> None:
+    class DummyQuotaService:
+        async def get_snapshot(self, token_row, *, client, oauth_manager, account_id=None):
+            plan_type = "free" if token_row.id == 11 else "plus"
+            return CodexQuotaSnapshot(
+                fetched_at=datetime.now(timezone.utc),
+                error=None,
+                plan_type=plan_type,
+                windows=[],
+            )
+
     app = SimpleNamespace(
         state=SimpleNamespace(
             response_traffic=ResponseTrafficController(),
             http_client=object(),
             oauth_manager=None,
+            quota_service=DummyQuotaService(),
         )
     )
 
@@ -1941,14 +1952,14 @@ def test_execute_proxy_request_with_failover_skips_free_tokens_for_gpt_image_2(m
         account_id="acct_free",
         refresh_token="refresh-free",
         is_active=True,
-        raw_payload={"plan_type": "free"},
+        raw_payload={},
     )
     paid_token = CodexToken(
         id=12,
         account_id="acct_paid",
         refresh_token="refresh-paid",
         is_active=True,
-        raw_payload={"plan_type": "plus"},
+        raw_payload={},
     )
 
     claim_calls: list[tuple[int, ...]] = []
@@ -2128,11 +2139,21 @@ def test_execute_proxy_request_with_failover_allows_free_tokens_for_other_models
 def test_execute_proxy_request_with_failover_returns_clear_503_when_only_free_tokens_exist_for_gpt_image_2(
     monkeypatch,
 ) -> None:
+    class DummyQuotaService:
+        async def get_snapshot(self, token_row, *, client, oauth_manager, account_id=None):
+            return CodexQuotaSnapshot(
+                fetched_at=datetime.now(timezone.utc),
+                error=None,
+                plan_type="free",
+                windows=[],
+            )
+
     app = SimpleNamespace(
         state=SimpleNamespace(
             response_traffic=ResponseTrafficController(),
             http_client=object(),
             oauth_manager=None,
+            quota_service=DummyQuotaService(),
         )
     )
 
@@ -2167,7 +2188,7 @@ def test_execute_proxy_request_with_failover_returns_clear_503_when_only_free_to
         account_id="acct_free",
         refresh_token="refresh-free",
         is_active=True,
-        raw_payload={"plan_type": "free"},
+        raw_payload={},
     )
 
     claim_calls: list[tuple[int, ...]] = []
@@ -2227,6 +2248,102 @@ def test_execute_proxy_request_with_failover_returns_clear_503_when_only_free_to
     assert finalized[0]["token_id"] is None
     assert finalized[0]["account_id"] is None
     assert finalized[0]["error_message"] == "No non-free Codex token available for gpt-image-2 requests"
+
+
+def test_execute_proxy_request_with_failover_falls_back_to_declared_plan_type_when_quota_missing(
+    monkeypatch,
+) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+            quota_service=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            raise AssertionError("free tokens should still be skipped using declared plan info")
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should never run when no request is attempted")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/images/generations",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    free_token = CodexToken(
+        id=41,
+        account_id="acct_free",
+        refresh_token="refresh-free",
+        is_active=True,
+        raw_payload={"plan_type": "free"},
+    )
+
+    claim_calls: list[tuple[int, ...]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if 41 in excluded:
+            return None
+        return free_token
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=91)
+
+    async def fake_finalize_request_log(*args, **kwargs) -> None:
+        return None
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        raise AssertionError("mark_token_success should not run when free token is skipped")
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("mark_token_error should not run when free token is skipped")
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        raise AssertionError("proxy_call should not run when free token is skipped")
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            _execute_proxy_request_with_failover(
+                request,
+                endpoint="/v1/images/generations",
+                request_model="gpt-image-2",
+                is_stream=False,
+                proxy_call=fake_proxy_call,
+            )
+        )
+
+    assert exc_info.value.status_code == 503
+    assert str(exc_info.value.detail) == "No non-free Codex token available for gpt-image-2 requests"
+    assert claim_calls == [(), (41,)]
 
 
 def test_response_traffic_controller_waits_until_idle(monkeypatch) -> None:

@@ -1099,16 +1099,44 @@ def _request_requires_non_free_codex_token(request_model: str | None) -> bool:
     return _is_responses_image_compat_model(request_model)
 
 
-def _token_plan_type(token_row: Any) -> str | None:
+def _declared_token_plan_info(token_row: Any) -> CodexPlanInfo:
     return extract_codex_plan_info(
         getattr(token_row, "id_token", None),
         account_id=getattr(token_row, "account_id", None),
         raw_payload=getattr(token_row, "raw_payload", None),
-    ).plan_type
+    )
 
 
-def _is_free_plan_token(token_row: Any) -> bool:
-    return _token_plan_type(token_row) == "free"
+async def _effective_token_plan_type(http_request: Request, token_row: Any) -> str | None:
+    declared_plan_info = _declared_token_plan_info(token_row)
+    quota_service: CodexQuotaService | None = getattr(http_request.app.state, "quota_service", None)
+    client: httpx.AsyncClient | None = getattr(http_request.app.state, "http_client", None)
+    oauth_manager: CodexOAuthManager | None = getattr(http_request.app.state, "oauth_manager", None)
+    effective_account_id = declared_plan_info.chatgpt_account_id or getattr(token_row, "account_id", None)
+
+    if quota_service is not None and client is not None and oauth_manager is not None:
+        try:
+            quota_snapshot = await quota_service.get_snapshot(
+                token_row,
+                client=client,
+                oauth_manager=oauth_manager,
+                account_id=effective_account_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to resolve quota snapshot while selecting gpt-image-2 token: token_id=%s account_id=%s",
+                getattr(token_row, "id", None),
+                getattr(token_row, "account_id", None),
+            )
+        else:
+            if quota_snapshot.plan_type:
+                return quota_snapshot.plan_type
+
+    return declared_plan_info.plan_type
+
+
+async def _is_free_plan_token(http_request: Request, token_row: Any) -> bool:
+    return await _effective_token_plan_type(http_request, token_row) == "free"
 
 
 def _ensure_responses_image_generation_tool(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3100,7 +3128,7 @@ async def _execute_proxy_request_with_failover(
             )
             if token_row is None:
                 break
-            if require_non_free_token and _is_free_plan_token(token_row):
+            if require_non_free_token and await _is_free_plan_token(http_request, token_row):
                 excluded_token_ids.add(token_row.id)
                 skipped_free_token_ids.add(token_row.id)
                 logger.info(
