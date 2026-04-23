@@ -32,6 +32,10 @@ from oaix_gateway.api_server import (
     _resolve_token_observed_cost_usd,
     _resolved_chat_image_to_responses_input_item,
     _responses_failure_http_exception,
+    _iterate_with_sse_keepalive,
+    _stream_responses_to_chat_completions,
+    _stream_upstream_image_response,
+    _stream_upstream_response,
     ResponsesRequest,
     _serialize_admin_token_item,
     _sanitize_codex_payload,
@@ -574,6 +578,81 @@ def test_prime_responses_upstream_stream_raises_on_incomplete_sse_event() -> Non
     assert exc_info.value.status_code == 502
 
 
+def test_iterate_with_sse_keepalive_emits_comment_before_delayed_chunk() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.01)
+        yield b"data: payload\n\n"
+
+    async def collect() -> list[bytes]:
+        chunks: list[bytes] = []
+        async for chunk in _iterate_with_sse_keepalive(
+            upstream(),
+            heartbeat_interval_seconds=0.001,
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(collect())
+
+    assert chunks[0] == b": keepalive\n\n"
+    assert chunks[-1] == b"data: payload\n\n"
+
+
+def test_stream_responses_to_chat_completions_forwards_keepalive_comment() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield b": keepalive\n\n"
+        yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_responses_to_chat_completions(
+            upstream(),
+            request_model="gpt-image-2",
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert ": keepalive\n\n" in body
+    assert '"content": "hello"' in body
+    assert "data: [DONE]" in body
+
+
+def test_stream_upstream_response_image_compat_emits_keepalive_comment(monkeypatch) -> None:
+    class DummyStreamContext:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def upstream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.01)
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"id":"resp_keepalive","status":"completed","model":"gpt-5.4-mini","output":[]}}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_upstream_response(
+            DummyStreamContext(),
+            upstream(),
+            [],
+            stream_committed=True,
+            response_model_alias="gpt-image-2",
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    monkeypatch.setattr("oaix_gateway.api_server._stream_keepalive_interval_seconds", lambda: 0.001)
+    body = asyncio.run(collect())
+
+    assert ": keepalive\n\n" in body
+    assert '"model": "gpt-image-2"' in body
+    assert "data: [DONE]" in body
+
+
 def test_collect_responses_json_from_sse_merges_response_and_output_text() -> None:
     async def upstream() -> AsyncIterator[bytes]:
         yield (
@@ -690,6 +769,40 @@ def test_collect_images_api_response_from_sse_patches_output_item_done() -> None
         "size": "1024x1024",
         "usage": {"images": 1},
     }
+
+
+def test_stream_upstream_image_response_emits_keepalive_comment() -> None:
+    class DummyStreamContext:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def upstream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.01)
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"id":"resp_img_keepalive","status":"completed","output":[{"type":"image_generation_call","result":"img-b64","output_format":"png"}]}}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_upstream_image_response(
+            DummyStreamContext(),
+            upstream(),
+            [],
+            stream_committed=True,
+            response_format="b64_json",
+            stream_prefix="image_generation",
+            heartbeat_interval_seconds=0.001,
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert ": keepalive\n\n" in body
+    assert "event: image_generation.completed" in body
+    assert '"b64_json": "img-b64"' in body
 
 
 def test_collect_images_api_response_from_sse_enforces_read_timeout() -> None:

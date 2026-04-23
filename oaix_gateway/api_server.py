@@ -121,6 +121,8 @@ RESPONSES_STREAM_NETWORK_ERRORS = (
     httpx.ReadTimeout,
     httpx.ConnectError,
 )
+DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS = 100.0
+STREAM_KEEPALIVE_COMMENT = b": keepalive\n\n"
 RESPONSES_FAILURE_STATUS_BY_CODE = {
     "account_deactivated": 403,
     "account_disabled": 403,
@@ -1544,6 +1546,59 @@ def _extract_responses_stream_event(raw_event: str) -> tuple[str, Any]:
     return event_name, parsed_payload
 
 
+def _stream_keepalive_interval_seconds() -> float:
+    raw = str(os.getenv("STREAM_KEEPALIVE_INTERVAL_SECONDS", "") or "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS
+    except ValueError:
+        value = DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS
+    return max(1.0, value)
+
+
+def _is_sse_comment_frame(raw_event: str) -> bool:
+    has_line = False
+    for line in raw_event.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        has_line = True
+        if not stripped.startswith(":"):
+            return False
+    return has_line
+
+
+async def _iterate_with_sse_keepalive(
+    source_iter: AsyncIterator[bytes],
+    *,
+    heartbeat_interval_seconds: float | None,
+    heartbeat_bytes: bytes = STREAM_KEEPALIVE_COMMENT,
+) -> AsyncGenerator[bytes, None]:
+    if heartbeat_interval_seconds is None or heartbeat_interval_seconds <= 0:
+        async for chunk in source_iter:
+            yield chunk
+        return
+
+    next_chunk_task = asyncio.create_task(source_iter.__anext__())
+    try:
+        while True:
+            done, _ = await asyncio.wait({next_chunk_task}, timeout=heartbeat_interval_seconds)
+            if next_chunk_task in done:
+                try:
+                    chunk = next_chunk_task.result()
+                except StopAsyncIteration:
+                    return
+                yield chunk
+                next_chunk_task = asyncio.create_task(source_iter.__anext__())
+                continue
+
+            yield heartbeat_bytes
+    finally:
+        if not next_chunk_task.done():
+            next_chunk_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await next_chunk_task
+
+
 def _responses_error_status_code(error_obj: Any) -> int:
     if isinstance(error_obj, dict):
         raw_status = error_obj.get("status_code") or error_obj.get("status")
@@ -2277,6 +2332,10 @@ async def _stream_responses_to_chat_completions(
                 if not raw_event.strip():
                     continue
 
+                if _is_sse_comment_frame(raw_event):
+                    yield raw_event.encode("utf-8") + b"\n\n"
+                    continue
+
                 event_type, event_payload = _extract_responses_stream_event(raw_event)
                 if event_type == "[DONE]":
                     yield b"data: [DONE]\n\n"
@@ -2598,6 +2657,7 @@ async def _stream_upstream_image_response(
     stream_committed: bool,
     response_format: str,
     stream_prefix: str,
+    heartbeat_interval_seconds: float | None = None,
 ) -> AsyncGenerator[bytes, None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
@@ -2615,6 +2675,10 @@ async def _stream_upstream_image_response(
             raw_event = text_buffer[:match.start()]
             text_buffer = text_buffer[match.end():]
             if not raw_event.strip():
+                continue
+
+            if _is_sse_comment_frame(raw_event):
+                events.append(raw_event.encode("utf-8") + b"\n\n")
                 continue
 
             event_type, event_payload = _extract_responses_stream_event(raw_event)
@@ -2673,7 +2737,10 @@ async def _stream_upstream_image_response(
             if done:
                 return
 
-        async for chunk in upstream_iter:
+        async for chunk in _iterate_with_sse_keepalive(
+            upstream_iter,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        ):
             text_buffer += decoder.decode(chunk)
             events, done = drain_buffer()
             for event in events:
@@ -2716,6 +2783,9 @@ async def _proxy_image_request_with_token(
     non_stream_total_timeout_seconds = _image_non_stream_total_timeout_seconds()
     non_stream_read_timeout_seconds = _image_non_stream_read_timeout_seconds()
     non_stream_disconnect_poll_seconds = _image_non_stream_disconnect_poll_seconds()
+    stream_keepalive_interval_seconds = (
+        _stream_keepalive_interval_seconds() if _is_responses_image_compat_model(image_request.model_name) else None
+    )
 
     if image_request.stream:
         stream_cm = client.stream(
@@ -2754,6 +2824,7 @@ async def _proxy_image_request_with_token(
                     stream_committed=stream_committed,
                     response_format=image_request.response_format,
                     stream_prefix=image_request.stream_prefix,
+                    heartbeat_interval_seconds=stream_keepalive_interval_seconds,
                 ),
                 media_type="text/event-stream",
             ),
@@ -3975,6 +4046,9 @@ async def _stream_upstream_response(
 
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    heartbeat_interval_seconds = (
+        _stream_keepalive_interval_seconds() if _is_responses_image_compat_model(response_model_alias) else None
+    )
 
     def drain_buffer(*, final: bool = False) -> tuple[list[bytes], bool]:
         nonlocal text_buffer
@@ -4015,17 +4089,20 @@ async def _stream_upstream_response(
             text_buffer += decoder.decode(chunk)
             events, done = drain_buffer()
             for event in events:
-                if stream_capture is not None:
+                if stream_capture is not None and event != STREAM_KEEPALIVE_COMMENT:
                     stream_capture.feed(event)
                 yield event
             if done:
                 return
 
-        async for chunk in upstream_iter:
+        async for chunk in _iterate_with_sse_keepalive(
+            upstream_iter,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        ):
             text_buffer += decoder.decode(chunk)
             events, done = drain_buffer()
             for event in events:
-                if stream_capture is not None:
+                if stream_capture is not None and event != STREAM_KEEPALIVE_COMMENT:
                     stream_capture.feed(event)
                 yield event
             if done:
@@ -4033,7 +4110,7 @@ async def _stream_upstream_response(
 
         events, _ = drain_buffer(final=True)
         for event in events:
-            if stream_capture is not None:
+            if stream_capture is not None and event != STREAM_KEEPALIVE_COMMENT:
                 stream_capture.feed(event)
             yield event
     except RESPONSES_STREAM_NETWORK_ERRORS as exc:
