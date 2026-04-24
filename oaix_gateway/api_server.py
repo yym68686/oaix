@@ -68,6 +68,7 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 ADMIN_TOKEN_PROBE_INPUT = "say test"
 DEFAULT_IMAGES_MAIN_MODEL = "gpt-5.4-mini"
 DEFAULT_IMAGES_TOOL_MODEL = "gpt-image-2"
+NON_FREE_ONLY_CODEX_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL, "gpt-5.5"})
 RESPONSES_IMAGE_COMPAT_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL})
 RESPONSES_IMAGE_TOOL_TEXT_FIELDS = (
     "size",
@@ -1211,8 +1212,19 @@ def _is_responses_image_compat_model(model_name: Any) -> bool:
     return normalized in RESPONSES_IMAGE_COMPAT_MODELS
 
 
+def _non_free_only_codex_model_name(request_model: str | None) -> str | None:
+    normalized = _normalize_optional_text(request_model)
+    if normalized is None:
+        return None
+    return normalized if normalized in NON_FREE_ONLY_CODEX_MODELS else None
+
+
 def _request_requires_non_free_codex_token(request_model: str | None) -> bool:
-    return _is_responses_image_compat_model(request_model)
+    return _non_free_only_codex_model_name(request_model) is not None
+
+
+def _non_free_codex_token_unavailable_detail(model_name: str) -> str:
+    return f"No non-free Codex token available for {model_name} requests"
 
 
 def _declared_token_plan_info(token_row: Any) -> CodexPlanInfo:
@@ -3672,7 +3684,9 @@ def _gpt_image_stream_keepalive_response(
         last_token_id: int | None = None
         last_account_id: str | None = None
         stream_finalized = False
-        require_non_free_token = _request_requires_non_free_codex_token(request_model)
+        restricted_model_name = _non_free_only_codex_model_name(request_model)
+        require_non_free_token = restricted_model_name is not None
+        restricted_model_label = restricted_model_name or "requested"
         skipped_free_token_ids: set[int] = set()
         excluded_token_ids: set[int] = set()
         postponed_unknown_plan_tokens: list[Any] = []
@@ -3712,7 +3726,8 @@ def _gpt_image_stream_keepalive_response(
                         excluded_token_ids.add(token_row.id)
                         skipped_free_token_ids.add(token_row.id)
                         logger.info(
-                            "Skipping free-plan Codex token for gpt-image-2 request: token_id=%s account_id=%s",
+                            "Skipping free-plan Codex token for %s request: token_id=%s account_id=%s",
+                            restricted_model_label,
                             token_row.id,
                             token_row.account_id,
                         )
@@ -3721,8 +3736,9 @@ def _gpt_image_stream_keepalive_response(
                         excluded_token_ids.add(token_row.id)
                         postponed_unknown_plan_tokens.append(token_row)
                         logger.info(
-                            "Postponing unknown-plan Codex token while searching for a known non-free gpt-image-2 token: "
+                            "Postponing unknown-plan Codex token while searching for a known non-free %s token: "
                             "token_id=%s account_id=%s",
+                            restricted_model_label,
                             token_row.id,
                             token_row.account_id,
                         )
@@ -3983,7 +3999,10 @@ def _gpt_image_stream_keepalive_response(
                     detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
                 )
             if require_non_free_token and skipped_free_token_ids:
-                raise HTTPException(status_code=503, detail="No non-free Codex token available for gpt-image-2 requests")
+                raise HTTPException(
+                    status_code=503,
+                    detail=_non_free_codex_token_unavailable_detail(restricted_model_label),
+                )
             raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
         except asyncio.CancelledError:
             if not stream_finalized:
@@ -4105,7 +4124,9 @@ async def _execute_proxy_request_with_failover(
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
         last_error: HTTPException | None = None
-        require_non_free_token = _request_requires_non_free_codex_token(request_model)
+        restricted_model_name = _non_free_only_codex_model_name(request_model)
+        require_non_free_token = restricted_model_name is not None
+        restricted_model_label = restricted_model_name or "requested"
         excluded_token_ids: set[int] = set()
         skipped_free_token_ids: set[int] = set()
         postponed_unknown_plan_tokens: list[Any] = []
@@ -4129,7 +4150,8 @@ async def _execute_proxy_request_with_failover(
                     excluded_token_ids.add(token_row.id)
                     skipped_free_token_ids.add(token_row.id)
                     logger.info(
-                        "Skipping free-plan Codex token for gpt-image-2 request: token_id=%s account_id=%s",
+                        "Skipping free-plan Codex token for %s request: token_id=%s account_id=%s",
+                        restricted_model_label,
                         token_row.id,
                         token_row.account_id,
                     )
@@ -4138,8 +4160,9 @@ async def _execute_proxy_request_with_failover(
                     excluded_token_ids.add(token_row.id)
                     postponed_unknown_plan_tokens.append(token_row)
                     logger.info(
-                        "Postponing unknown-plan Codex token while searching for a known non-free gpt-image-2 token: "
+                        "Postponing unknown-plan Codex token while searching for a known non-free %s token: "
                         "token_id=%s account_id=%s",
+                        restricted_model_label,
                         token_row.id,
                         token_row.account_id,
                     )
@@ -4353,7 +4376,10 @@ async def _execute_proxy_request_with_failover(
                 detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
             )
         if require_non_free_token and skipped_free_token_ids:
-            raise HTTPException(status_code=503, detail="No non-free Codex token available for gpt-image-2 requests")
+            raise HTTPException(
+                status_code=503,
+                detail=_non_free_codex_token_unavailable_detail(restricted_model_label),
+            )
         raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
     except HTTPException as exc:
         await finalize_request_log(

@@ -32,6 +32,7 @@ from oaix_gateway.api_server import (
     _probe_token_with_latest_access_token,
     _resolve_token_observed_cost_usd,
     _resolved_chat_image_to_responses_input_item,
+    _request_requires_non_free_codex_token,
     _responses_failure_http_exception,
     _iterate_with_sse_keepalive,
     _stream_keepalive_interval_seconds,
@@ -108,6 +109,12 @@ def test_detects_permanent_disable_errors() -> None:
     payload_401 = json.dumps({"error": {"code": "account_deactivated"}})
     assert _is_permanent_account_disable_error(402, payload_402) is True
     assert _is_permanent_account_disable_error(401, payload_401) is True
+
+
+def test_request_requires_non_free_codex_token_for_restricted_models() -> None:
+    assert _request_requires_non_free_codex_token("gpt-image-2") is True
+    assert _request_requires_non_free_codex_token("gpt-5.5") is True
+    assert _request_requires_non_free_codex_token("gpt-5.4-mini") is False
 
 
 def test_sanitize_codex_payload_removes_unsupported_fields() -> None:
@@ -3682,6 +3689,123 @@ def test_execute_proxy_request_with_failover_returns_clear_503_when_only_free_to
     assert finalized[0]["token_id"] is None
     assert finalized[0]["account_id"] is None
     assert finalized[0]["error_message"] == "No non-free Codex token available for gpt-image-2 requests"
+
+
+def test_execute_proxy_request_with_failover_returns_clear_503_when_only_free_tokens_exist_for_gpt_5_5(
+    monkeypatch,
+) -> None:
+    class DummyQuotaService:
+        def get_cached_snapshot(self, token_id: int):
+            return CodexQuotaSnapshot(
+                fetched_at=datetime.now(timezone.utc),
+                error=None,
+                plan_type="free",
+                windows=[],
+            )
+
+        async def get_snapshot(self, *args, **kwargs):
+            raise AssertionError("gpt-5.5 token selection should not fetch quota snapshots on the hot path")
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+            quota_service=DummyQuotaService(),
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            raise AssertionError("free tokens should be skipped before fetching access tokens")
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should never run when no request is attempted")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    free_token = CodexToken(
+        id=32,
+        account_id="acct_free",
+        refresh_token="refresh-free",
+        is_active=True,
+        raw_payload={},
+    )
+
+    claim_calls: list[tuple[int, ...]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if 32 in excluded:
+            return None
+        return free_token
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=93)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        raise AssertionError("mark_token_success should not run when no request is attempted")
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("mark_token_error should not run when free tokens are skipped")
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        raise AssertionError("proxy_call should not run when only free tokens are available")
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            _execute_proxy_request_with_failover(
+                request,
+                endpoint="/v1/chat/completions",
+                request_model="gpt-5.5",
+                is_stream=False,
+                proxy_call=fake_proxy_call,
+            )
+        )
+
+    assert exc_info.value.status_code == 503
+    assert str(exc_info.value.detail) == "No non-free Codex token available for gpt-5.5 requests"
+    assert claim_calls == [(), (32,)]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 93
+    assert finalized[0]["status_code"] == 503
+    assert finalized[0]["success"] is False
+    assert finalized[0]["attempt_count"] == 0
+    assert finalized[0]["token_id"] is None
+    assert finalized[0]["account_id"] is None
+    assert finalized[0]["error_message"] == "No non-free Codex token available for gpt-5.5 requests"
 
 
 def test_execute_proxy_request_with_failover_falls_back_to_declared_plan_type_when_quota_missing(
