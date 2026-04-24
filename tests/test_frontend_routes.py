@@ -1,9 +1,10 @@
 import asyncio
+import hashlib
 
 import httpx
 from fastapi.responses import JSONResponse
 
-from oaix_gateway.api_server import create_app
+from oaix_gateway.api_server import WEB_DIR, create_app
 from oaix_gateway.database import CodexToken
 from oaix_gateway.token_store import TokenCounts
 
@@ -55,6 +56,20 @@ def test_frontend_index_includes_token_search_input() -> None:
     assert response.status_code == 200
     assert 'id="token-search-input"' in response.text
     assert 'id="token-search-summary"' in response.text
+
+
+def test_frontend_index_busts_asset_cache_with_content_hash() -> None:
+    app = create_app()
+
+    response = asyncio.run(_request(app, "GET", "/"))
+
+    css_version = hashlib.sha256((WEB_DIR / "styles.css").read_bytes()).hexdigest()[:12]
+    js_version = hashlib.sha256((WEB_DIR / "app.js").read_bytes()).hexdigest()[:12]
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert f'/assets/styles.css?v={css_version}' in response.text
+    assert f'/assets/app.js?v={js_version}' in response.text
 
 
 def test_chat_completions_preflight_is_handled_by_cors(monkeypatch) -> None:

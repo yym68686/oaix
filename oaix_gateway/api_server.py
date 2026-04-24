@@ -146,6 +146,15 @@ RESPONSES_FAILURE_STATUS_BY_CODE = {
     "user_deactivated": 403,
     "user_suspended": 403,
 }
+
+
+def _web_asset_version(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "dev"
+
+
 RESPONSES_FAILURE_STATUS_BY_TYPE = {
     "authentication_error": 401,
     "invalid_request_error": 400,
@@ -4658,8 +4667,8 @@ def create_app() -> FastAPI:
     @app.get("/")
     async def index() -> HTMLResponse:
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-        css_version = int((WEB_DIR / "styles.css").stat().st_mtime)
-        js_version = int((WEB_DIR / "app.js").stat().st_mtime)
+        css_version = _web_asset_version(WEB_DIR / "styles.css")
+        js_version = _web_asset_version(WEB_DIR / "app.js")
         html = html.replace("/assets/styles.css", f"/assets/styles.css?v={css_version}")
         html = html.replace("/assets/app.js", f"/assets/app.js?v={js_version}")
         return HTMLResponse(
