@@ -640,7 +640,7 @@ def _build_upstream_headers(http_request: Request, access_token: str, account_id
         "Version": (http_request.headers.get("Version") or "0.21.0").strip(),
         "Session_id": session_id,
         "Conversation_id": conversation_id,
-        "User-Agent": (http_request.headers.get("User-Agent") or "codex_cli_rs/0.50.0").strip(),
+        "User-Agent": (http_request.headers.get("User-Agent") or "codex_cli_rs/0.125.0").strip(),
         "Connection": "Keep-Alive",
         "Accept": "text/event-stream" if stream else "application/json",
     }

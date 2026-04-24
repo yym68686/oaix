@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 
 from oaix_gateway.database import CodexToken
-from oaix_gateway.quota import CodexQuotaService, extract_codex_plan_info, parse_codex_quota_payload
+from oaix_gateway.quota import CodexQuotaService, WHAM_USER_AGENT, extract_codex_plan_info, parse_codex_quota_payload
 
 
 def _jwt_like(payload: dict) -> str:
@@ -37,6 +37,10 @@ def test_extract_codex_plan_info_reads_openai_auth_claims() -> None:
     assert info.plan_type == "plus"
     assert info.subscription_active_start == datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
     assert info.subscription_active_until == datetime(2026, 4, 30, 12, 34, 56, tzinfo=timezone.utc)
+
+
+def test_wham_user_agent_uses_current_codex_version() -> None:
+    assert WHAM_USER_AGENT.startswith("codex_cli_rs/0.125.0 ")
 
 
 def test_parse_codex_quota_payload_reads_5h_and_7d_windows() -> None:

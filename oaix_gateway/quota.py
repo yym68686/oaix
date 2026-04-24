@@ -17,7 +17,7 @@ from .token_store import mark_token_error, update_token_plan_type
 logger = logging.getLogger("oaix.gateway")
 
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
-WHAM_USER_AGENT = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+WHAM_USER_AGENT = "codex_cli_rs/0.125.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 WINDOW_5H_SECONDS = 5 * 60 * 60
 WINDOW_7D_SECONDS = 7 * 24 * 60 * 60
 

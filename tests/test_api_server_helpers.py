@@ -38,6 +38,7 @@ from oaix_gateway.api_server import (
     _stream_keepalive_interval_seconds,
     _wrap_sse_stream_with_initial_keepalive,
     _build_stream_error_event,
+    _build_upstream_headers,
     _stream_responses_to_chat_completions,
     _stream_upstream_image_response,
     _stream_upstream_response,
@@ -180,6 +181,23 @@ def test_sanitize_codex_payload_can_preserve_previous_response_id() -> None:
         "store": False,
         "instructions": "",
     }
+
+
+def test_build_upstream_headers_uses_current_codex_user_agent_default() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [],
+        }
+    )
+
+    headers = _build_upstream_headers(request, access_token="access-token", account_id="account-1", stream=False)
+
+    assert headers["Authorization"] == "Bearer access-token"
+    assert headers["Accept"] == "application/json"
+    assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
 
 
 def test_translate_responses_image_compat_payload_injects_image_tool() -> None:
