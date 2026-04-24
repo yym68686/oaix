@@ -7,6 +7,8 @@ const TOAST_DURATION_MS = 5200;
 const TOAST_EXIT_DURATION_MS = 220;
 const TOKEN_LIST_BASE_NOTE = "显示最近 80 条记录 · 可用 / 冷却 / 已禁用分组";
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
+const PROBE_MODEL_OPTIONS = ["gpt-5.4-mini", "gpt-5.5"];
+const DEFAULT_PROBE_MODEL = PROBE_MODEL_OPTIONS[0];
 const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 
 function readStoredImportJobId() {
@@ -17,6 +19,10 @@ function readStoredImportJobId() {
 
 function normalizeThemePreference(value) {
   return THEME_OPTIONS.has(value) ? value : "auto";
+}
+
+function normalizeProbeModel(value) {
+  return PROBE_MODEL_OPTIONS.includes(value) ? value : DEFAULT_PROBE_MODEL;
 }
 
 const initialThemePreference = normalizeThemePreference(
@@ -43,6 +49,7 @@ const state = {
   requestsLoaded: false,
   tokenSelectionSaving: false,
   tokenSelectionStrategy: "least_recently_used",
+  probeModel: DEFAULT_PROBE_MODEL,
   themePreference: initialThemePreference,
   resolvedTheme: initialResolvedTheme,
   themeMedia: window.matchMedia("(prefers-color-scheme: dark)"),
@@ -693,6 +700,25 @@ function renderTokenActionButtons(item) {
   const pendingKind = getTokenActionPendingKind(tokenId);
   const pending = Boolean(pendingKind);
   const probeLabel = pendingKind === "probe" ? "测试中" : "测试";
+  const probeModel = normalizeProbeModel(state.probeModel);
+  const probeModelOptions = PROBE_MODEL_OPTIONS.map(
+    (model) =>
+      `<option value="${escapeHtml(model)}"${model === probeModel ? " selected" : ""}>${escapeHtml(model)}</option>`,
+  ).join("");
+  const probeModelSelect = `
+    <label class="token-probe-model">
+      <span class="token-probe-model__label">测试模型</span>
+      <select
+        class="token-probe-model__select"
+        data-token-probe-model="true"
+        data-token-id="${tokenId}"
+        aria-label="测试模型"
+        ${pending ? "disabled" : ""}
+      >
+        ${probeModelOptions}
+      </select>
+    </label>
+  `;
   const enableLabel = pendingKind === "enable" ? "处理中" : "启用";
   const makeAvailableLabel = pendingKind === "make-available" ? "处理中" : "转为可用";
   const disableLabel = pendingKind === "disable" ? "处理中" : "停用";
@@ -773,6 +799,7 @@ function renderTokenActionButtons(item) {
 
   return `
     <div class="token-card__actions">
+      ${probeModelSelect}
       ${probeButton}
       ${actionButtons.join("")}
     </div>
@@ -1910,19 +1937,22 @@ async function toggleTokenActivation(
   }
 }
 
-async function probeToken(tokenId) {
+async function probeToken(tokenId, model = state.probeModel) {
   const resolvedTokenId = Number(tokenId);
   if (!Number.isFinite(resolvedTokenId) || isTokenActionPending(resolvedTokenId)) {
     return;
   }
 
+  const selectedModel = normalizeProbeModel(model);
+  state.probeModel = selectedModel;
   state.tokenActionPendingKinds.set(resolvedTokenId, "probe");
   renderTokenList(state.tokenItems);
 
   try {
     const data = await fetchJson(`/admin/tokens/${resolvedTokenId}/probe`, {
       method: "POST",
-      headers: authHeaders(),
+      headers: authHeaders(true),
+      body: JSON.stringify({ model: selectedModel }),
     });
     clearTokenActionPending(resolvedTokenId);
     showToast(data?.message || "测试完成", resolveProbeToastTone(data));
@@ -2266,8 +2296,11 @@ elements.tokenList.addEventListener("click", async (event) => {
   }
   const probeButton = event.target.closest("[data-token-probe]");
   if (probeButton instanceof HTMLElement) {
+    const actions = probeButton.closest(".token-card__actions");
+    const modelSelect = actions?.querySelector("[data-token-probe-model]");
+    const selectedModel = modelSelect instanceof HTMLSelectElement ? modelSelect.value : state.probeModel;
     try {
-      await probeToken(probeButton.dataset.tokenId);
+      await probeToken(probeButton.dataset.tokenId, selectedModel);
     } catch {}
     return;
   }
@@ -2286,6 +2319,14 @@ elements.tokenList.addEventListener("click", async (event) => {
   if (deleteButton instanceof HTMLElement) {
     openTokenDeleteDialog(deleteButton.dataset.tokenId);
   }
+});
+
+elements.tokenList.addEventListener("change", (event) => {
+  if (!(event.target instanceof HTMLSelectElement) || !event.target.matches("[data-token-probe-model]")) {
+    return;
+  }
+  state.probeModel = normalizeProbeModel(event.target.value);
+  event.target.value = state.probeModel;
 });
 
 if (elements.toastStack) {

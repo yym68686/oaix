@@ -4813,6 +4813,7 @@ def test_probe_token_with_latest_access_token_reactivates_on_success(monkeypatch
             app,
             http_request=request,
             token_row=token_row,
+            probe_model="gpt-5.5",
         )
     )
 
@@ -4825,7 +4826,7 @@ def test_probe_token_with_latest_access_token_reactivates_on_success(monkeypatch
         "access_token": "fresh-access-token",
         "account_id": "acct_123",
         "compact": False,
-        "model": "gpt-5.4-mini",
+        "model": "gpt-5.5",
         "input": [
             {
                 "type": "message",
@@ -4839,7 +4840,7 @@ def test_probe_token_with_latest_access_token_reactivates_on_success(monkeypatch
             }
         ],
         "payload": {
-            "model": "gpt-5.4-mini",
+            "model": "gpt-5.5",
             "input": [
                 {
                     "type": "message",
@@ -4859,6 +4860,7 @@ def test_probe_token_with_latest_access_token_reactivates_on_success(monkeypatch
     assert calls["success_token_id"] == 7
     assert result["outcome"] == "reactivated"
     assert result["status_code"] == 200
+    assert result["probe_model"] == "gpt-5.5"
     assert "已标记为可用" in result["message"]
 
 

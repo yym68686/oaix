@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from types import SimpleNamespace
 
 import httpx
 from fastapi.responses import JSONResponse
@@ -76,10 +77,68 @@ def test_frontend_token_cards_always_render_probe_button() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     action_renderer = app_js.split("function renderTokenActionButtons", 1)[1].split("function clampWidth", 1)[0]
 
+    assert 'const PROBE_MODEL_OPTIONS = ["gpt-5.4-mini", "gpt-5.5"]' in app_js
+    assert 'data-token-probe-model="true"' in action_renderer
     assert 'const probeButton = `' in action_renderer
     assert 'data-token-probe="true"' in action_renderer
     assert "${probeButton}" in action_renderer
     assert action_renderer.index("${probeButton}") < action_renderer.index('${actionButtons.join("")}')
+
+
+def test_frontend_probe_request_sends_selected_model() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+    probe_function = app_js.split("async function probeToken", 1)[1].split("async function deleteToken", 1)[0]
+
+    assert "const selectedModel = normalizeProbeModel(model)" in probe_function
+    assert "headers: authHeaders(true)" in probe_function
+    assert "body: JSON.stringify({ model: selectedModel })" in probe_function
+
+
+def test_admin_token_probe_route_accepts_model_payload(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+    calls: dict[str, object] = {}
+
+    async def fake_get_token_row(token_id: int):
+        return SimpleNamespace(id=token_id)
+
+    async def fake_probe_token_with_latest_access_token(app_arg, *, http_request, token_row, probe_model=None):
+        calls["probe"] = {
+            "app": app_arg,
+            "path": http_request.url.path,
+            "token_id": token_row.id,
+            "probe_model": probe_model,
+        }
+        return {"id": token_row.id, "probe_model": probe_model}
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_row", fake_get_token_row)
+    monkeypatch.setattr(
+        "oaix_gateway.api_server._probe_token_with_latest_access_token",
+        fake_probe_token_with_latest_access_token,
+    )
+
+    response = asyncio.run(_request(app, "POST", "/admin/tokens/12/probe", json={"model": "gpt-5.5"}))
+
+    assert response.status_code == 200
+    assert response.json() == {"id": 12, "probe_model": "gpt-5.5"}
+    assert calls["probe"] == {
+        "app": app,
+        "path": "/admin/tokens/12/probe",
+        "token_id": 12,
+        "probe_model": "gpt-5.5",
+    }
+
+    response = asyncio.run(_request(app, "POST", "/admin/tokens/13/probe"))
+
+    assert response.status_code == 200
+    assert response.json() == {"id": 13, "probe_model": None}
+    assert calls["probe"] == {
+        "app": app,
+        "path": "/admin/tokens/13/probe",
+        "token_id": 13,
+        "probe_model": None,
+    }
 
 
 def test_chat_completions_preflight_is_handled_by_cors(monkeypatch) -> None:

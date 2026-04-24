@@ -1539,6 +1539,7 @@ button {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
+  align-items: end;
   gap: 10px;
 }
 
@@ -2286,6 +2287,65 @@ button {
   to {
     transform: rotate(360deg);
   }
+}
+
+.token-probe-model {
+  display: grid;
+  gap: 5px;
+  flex: 0 1 172px;
+  min-width: 154px;
+}
+
+.token-probe-model__label {
+  font-size: 0.68rem;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.token-probe-model__select {
+  appearance: none;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 36px 0 14px;
+  border: 1px solid color-mix(in oklab, var(--available) 38%, var(--border-panel));
+  border-radius: 14px;
+  background:
+    linear-gradient(45deg, transparent 50%, currentColor 50%) calc(100% - 18px) 19px / 6px 6px no-repeat,
+    linear-gradient(135deg, currentColor 50%, transparent 50%) calc(100% - 12px) 19px / 6px 6px no-repeat,
+    var(--surface-button);
+  color: color-mix(in oklab, var(--available) 62%, var(--ink));
+  font-size: 0.84rem;
+  font-weight: 800;
+  cursor: pointer;
+  transition:
+    transform 180ms ease,
+    background-color 180ms ease,
+    border-color 180ms ease,
+    color 180ms ease,
+    opacity 180ms ease;
+}
+
+.token-probe-model__select:hover,
+.token-probe-model__select:focus-visible {
+  transform: translateY(-1px);
+  outline: none;
+  background:
+    linear-gradient(45deg, transparent 50%, currentColor 50%) calc(100% - 18px) 19px / 6px 6px no-repeat,
+    linear-gradient(135deg, currentColor 50%, transparent 50%) calc(100% - 12px) 19px / 6px 6px no-repeat,
+    color-mix(in oklab, var(--available) 10%, var(--surface-button));
+}
+
+.token-probe-model__select:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+.token-probe-model__select:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+  transform: none;
 }
 
 .reveal {

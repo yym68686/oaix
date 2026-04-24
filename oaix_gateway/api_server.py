@@ -191,6 +191,10 @@ class TokenActivationUpdateRequest(BaseModel):
     clear_cooldown: bool = False
 
 
+class TokenProbeRequest(BaseModel):
+    model: str | None = None
+
+
 @dataclass(frozen=True)
 class ProxyRequestResult:
     response: Response
@@ -3458,11 +3462,13 @@ async def _probe_token_with_latest_access_token(
     *,
     http_request: Request,
     token_row: Any,
+    probe_model: str | None = None,
 ) -> dict[str, Any]:
     client: httpx.AsyncClient = app.state.http_client
     oauth_manager: CodexOAuthManager = app.state.oauth_manager
+    resolved_probe_model = _normalize_optional_text(probe_model) or _admin_token_probe_model()
     probe_request = ResponsesRequest(
-        model=_admin_token_probe_model(),
+        model=resolved_probe_model,
         input=[
             {
                 "type": "message",
@@ -4767,6 +4773,7 @@ def create_app() -> FastAPI:
     async def probe_token_route(
         http_request: Request,
         token_id: int,
+        payload: TokenProbeRequest | None = None,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         token_row = await get_token_row(token_id)
@@ -4776,6 +4783,7 @@ def create_app() -> FastAPI:
             http_request.app,
             http_request=http_request,
             token_row=token_row,
+            probe_model=payload.model if payload is not None else None,
         )
 
     @app.delete("/admin/tokens/{token_id}")
