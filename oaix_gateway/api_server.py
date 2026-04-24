@@ -2458,6 +2458,13 @@ def _chat_completion_usage_payload(payload: dict[str, Any], *, model_name: str |
     }
 
 
+def _chat_completion_stream_include_usage(request_data: ChatCompletionsRequest) -> bool:
+    stream_options = request_data.model_dump(exclude_unset=True).get("stream_options")
+    if not isinstance(stream_options, dict):
+        return True
+    return _coerce_bool(stream_options.get("include_usage"), True)
+
+
 def _build_chat_completions_response(
     payload: dict[str, Any],
     *,
@@ -2546,6 +2553,7 @@ def _build_chat_completion_chunk_bytes(
     model_name: str,
     delta: dict[str, Any],
     finish_reason: str | None = None,
+    usage_payload: dict[str, Any] | None = None,
 ) -> bytes:
     payload = {
         "id": response_id,
@@ -2560,6 +2568,8 @@ def _build_chat_completion_chunk_bytes(
             }
         ],
     }
+    if usage_payload is not None:
+        payload["usage"] = copy.deepcopy(usage_payload)
     return b"data: " + json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n\n"
 
 
@@ -2567,6 +2577,7 @@ async def _stream_responses_to_chat_completions(
     body_iterator: AsyncIterator[bytes],
     *,
     request_model: str,
+    include_usage: bool = True,
 ) -> AsyncGenerator[bytes, None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
@@ -2604,6 +2615,7 @@ async def _stream_responses_to_chat_completions(
             completed_response = {}
         message, finish_reason = _chat_completion_message_from_response_payload(completed_response)
         final_content = str(message.get("content") or "")
+        usage_payload = _chat_completion_usage_payload(event_payload, model_name=model_name) if include_usage else None
 
         if final_content:
             suffix = final_content
@@ -2644,6 +2656,7 @@ async def _stream_responses_to_chat_completions(
             model_name=model_name,
             delta={},
             finish_reason=finish_reason,
+            usage_payload=usage_payload,
         )
         yield b"data: [DONE]\n\n"
 
@@ -5324,6 +5337,7 @@ async def _proxy_chat_completions_with_token(
     access_token: str,
     account_id: str | None,
 ) -> ProxyRequestResult:
+    include_usage = _chat_completion_stream_include_usage(request_data)
     responses_request = await _chat_completions_request_to_responses_request(
         request_data,
         http_request=http_request,
@@ -5355,6 +5369,7 @@ async def _proxy_chat_completions_with_token(
                 _stream_responses_to_chat_completions(
                     proxy_result.response.body_iterator,
                     request_model=request_data.model,
+                    include_usage=include_usage,
                 ),
                 media_type="text/event-stream",
                 headers=_sse_response_headers(),

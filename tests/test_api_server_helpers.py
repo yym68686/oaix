@@ -754,6 +754,42 @@ def test_stream_responses_to_chat_completions_synthesizes_image_from_output_item
     assert body.rstrip().endswith("data: [DONE]")
 
 
+def test_stream_responses_to_chat_completions_emits_usage_on_terminal_chunk() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","response":{"id":"resp_usage_chunk","status":"in_progress","model":"gpt-5.4-mini","created_at":1710000000}}\n\n'
+        )
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"id":"resp_usage_chunk","status":"completed","model":"gpt-5.4-mini","created_at":1710000000,"output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> list[dict[str, object]]:
+        frames: list[dict[str, object]] = []
+        async for chunk in _stream_responses_to_chat_completions(
+            upstream(),
+            request_model="gpt-5.4-mini",
+        ):
+            text = chunk.decode("utf-8").strip()
+            if not text.startswith("data: ") or text == "data: [DONE]":
+                continue
+            frames.append(json.loads(text[6:]))
+        return frames
+
+    frames = asyncio.run(collect())
+
+    assert len(frames) == 2
+    assert frames[0]["choices"][0]["delta"]["content"] == "hello"
+    assert frames[1]["choices"][0]["finish_reason"] == "stop"
+    assert frames[1]["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 3,
+        "total_tokens": 5,
+    }
+
+
 def test_stream_upstream_response_image_compat_emits_keepalive_comment(monkeypatch) -> None:
     class DummyStreamContext:
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -2060,6 +2096,7 @@ def test_proxy_chat_completions_with_token_stream_returns_markdown_image_chunks(
     assert '"model": "gpt-image-2"' in body
     assert '"content": "![image](data:image/png;base64,stream-image)"' in body
     assert '"finish_reason": "stop"' in body
+    assert '"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}' in body.replace(" ", "")
     assert "data: [DONE]" in body
     assert result.on_success is not None
     asyncio.run(result.on_success(202))
