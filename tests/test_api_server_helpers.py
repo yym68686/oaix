@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -35,6 +36,7 @@ from oaix_gateway.api_server import (
     _iterate_with_sse_keepalive,
     _stream_keepalive_interval_seconds,
     _wrap_sse_stream_with_initial_keepalive,
+    _build_stream_error_event,
     _stream_responses_to_chat_completions,
     _stream_upstream_image_response,
     _stream_upstream_response,
@@ -696,6 +698,55 @@ def test_stream_responses_to_chat_completions_forwards_keepalive_comment() -> No
     assert "data: [DONE]" in body
 
 
+def test_stream_responses_to_chat_completions_rewrites_error_event_as_data_frame() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield _build_stream_error_event(502, "Upstream image stream aborted before completion")
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_responses_to_chat_completions(
+            upstream(),
+            request_model="gpt-image-2",
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert "event: error" not in body
+    assert '"message": "Upstream image stream aborted before completion"' in body
+    assert "data: [DONE]" in body
+
+
+def test_stream_responses_to_chat_completions_synthesizes_image_from_output_item_done() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","response":{"id":"resp_img_done","status":"in_progress","model":"gpt-image-2","created_at":1710000000}}\n\n'
+        )
+        yield (
+            b'event: response.output_item.done\n'
+            b'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","id":"ig_done","status":"completed","result":"done-image","output_format":"png"}}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_responses_to_chat_completions(
+            upstream(),
+            request_model="gpt-image-2",
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert "data:image/png;base64,done-image" in body
+    assert '"finish_reason":"stop"' in body.replace(" ", "")
+    assert body.rstrip().endswith("data: [DONE]")
+
+
 def test_stream_upstream_response_image_compat_emits_keepalive_comment(monkeypatch) -> None:
     class DummyStreamContext:
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -767,6 +818,41 @@ def test_stream_upstream_response_image_compat_emits_initial_keepalive_after_pri
     assert body.startswith(": keepalive")
     assert '"model": "gpt-image-2"' in body
     assert "data: [DONE]" in body
+
+
+def test_stream_upstream_response_image_compat_emits_error_event_on_network_abort() -> None:
+    class DummyStreamContext:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def upstream() -> AsyncIterator[bytes]:
+        raise httpx.RemoteProtocolError("incomplete chunked read")
+        yield b""
+
+    capture = _ProxyStreamCapture(initial_model_name="gpt-image-2")
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_upstream_response(
+            DummyStreamContext(),
+            upstream(),
+            [],
+            stream_committed=True,
+            stream_capture=capture,
+            response_model_alias="gpt-image-2",
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert "event: error" in body
+    assert "Upstream image stream aborted before completion" in body
+    assert "data: [DONE]" in body
+    assert capture.completed is False
+    assert capture.error_status_code == 502
+    assert capture.error_message is not None
+    assert "RemoteProtocolError" in capture.error_message
 
 
 def test_collect_responses_json_from_sse_merges_response_and_output_text() -> None:
@@ -961,6 +1047,42 @@ def test_stream_upstream_image_response_emits_initial_keepalive_after_prime_time
     assert body.startswith(": keepalive")
     assert "event: image_generation.completed" in body
     assert '"b64_json": "img-b64"' in body
+
+
+def test_stream_upstream_image_response_emits_error_event_on_network_abort() -> None:
+    class DummyStreamContext:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def upstream() -> AsyncIterator[bytes]:
+        raise httpx.RemoteProtocolError("incomplete chunked read")
+        yield b""
+
+    capture = _ProxyStreamCapture(initial_model_name="gpt-image-2")
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_upstream_image_response(
+            DummyStreamContext(),
+            upstream(),
+            [],
+            stream_committed=True,
+            response_format="b64_json",
+            stream_prefix="image_generation",
+            stream_capture=capture,
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert "event: error" in body
+    assert "Upstream image stream aborted before completion" in body
+    assert "data: [DONE]" in body
+    assert capture.completed is False
+    assert capture.error_status_code == 502
+    assert capture.error_message is not None
+    assert "RemoteProtocolError" in capture.error_message
 
 
 def test_collect_images_api_response_from_sse_enforces_read_timeout() -> None:
@@ -1512,6 +1634,127 @@ def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias() -> Non
     assert result.stream_capture.usage_metrics.total_tokens == 3
     assert '"model": "gpt-image-2"' in body
     assert "gpt-5.4-mini" not in body
+
+
+def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias_after_prime_keepalive(monkeypatch) -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse) -> None:
+            self._response = response
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyClient:
+        def stream(self, method, url, headers, content, timeout):
+            return DummyStreamContext(
+                DummyStreamingResponse(
+                    [
+                        b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_prime","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
+                    ]
+                )
+            )
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    request_data = ResponsesRequest(
+        model="gpt-image-2",
+        input=[{"role": "user", "content": [{"type": "input_text", "text": "Draw a mug"}]}],
+        stream=True,
+    )
+
+    monkeypatch.setattr("oaix_gateway.api_server._stream_keepalive_interval_seconds", lambda: 0.001)
+
+    async def run_stream() -> str:
+        original_aiter_raw = DummyStreamingResponse.aiter_raw
+
+        async def delayed_aiter_raw(self) -> AsyncIterator[bytes]:
+            async for chunk in original_aiter_raw(self):
+                yield chunk
+                if b"response.created" in chunk:
+                    await asyncio.sleep(0.02)
+                    yield (
+                        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_prime","status":"completed","model":"gpt-5.4-mini","output":[{"type":"image_generation_call","result":"prime-image","output_format":"png"}]}}\n\n'
+                    )
+                    yield b"data: [DONE]\n\n"
+                    return
+
+        DummyStreamingResponse.aiter_raw = delayed_aiter_raw  # type: ignore[method-assign]
+        result = await _proxy_request_with_token(
+            DummyClient(),
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+        )
+        chunks: list[bytes] = []
+        async for chunk in result.response.body_iterator:
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(run_stream())
+
+    assert body.startswith(": keepalive")
+    assert '"model": "gpt-image-2"' in body
+
+
+def test_stream_upstream_image_response_synthesizes_completed_event_from_output_item_done() -> None:
+    class DummyStreamContext:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def upstream() -> AsyncIterator[bytes]:
+        yield (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","response":{"id":"resp_img_done","status":"in_progress","model":"gpt-5.4-mini","created_at":1710000000}}\n\n'
+        )
+        yield (
+            b'event: response.output_item.done\n'
+            b'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","id":"ig_done","status":"completed","result":"final-done","output_format":"png","revised_prompt":"patched done"}}\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_upstream_image_response(
+            DummyStreamContext(),
+            upstream(),
+            [],
+            stream_committed=True,
+            response_format="b64_json",
+            stream_prefix="image_generation",
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert "event: image_generation.completed" in body
+    assert '"b64_json": "final-done"' in body
+    assert '"revised_prompt": "patched done"' in body
 
 
 def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_response(monkeypatch) -> None:
@@ -2478,6 +2721,458 @@ def test_execute_proxy_request_with_failover_wraps_gpt_image_2_stream_with_outer
     assert finalized[0]["token_id"] == 13
     assert finalized[0]["account_id"] == "acct_paid"
     assert finalized[0]["model_name"] == "gpt-image-2"
+
+
+def test_execute_proxy_request_with_failover_marks_gpt_image_stream_abort_as_failed(
+    monkeypatch,
+) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run in stream abort test")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    token_row = CodexToken(
+        id=33,
+        account_id="acct_paid",
+        refresh_token="refresh-token",
+        is_active=True,
+        raw_payload={},
+    )
+
+    claim_calls = 0
+    mark_success_calls: list[int] = []
+    mark_error_calls: list[tuple[int, str]] = []
+    finalized: list[dict[str, object]] = []
+    success_hook_calls: list[int] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        nonlocal claim_calls
+        claim_calls += 1
+        return token_row if claim_calls == 1 else None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=99)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        mark_error_calls.append((token_id, message))
+
+    async def fake_on_success(request_log_id: int) -> None:
+        success_hook_calls.append(request_log_id)
+
+    async def failed_stream(capture: _ProxyStreamCapture) -> AsyncIterator[bytes]:
+        error_event = _build_stream_error_event(
+            502,
+            "Upstream image stream aborted before completion: RemoteProtocolError: incomplete chunked read",
+        )
+        capture.feed(error_event)
+        yield error_event
+        yield b"data: [DONE]\n\n"
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        capture = _ProxyStreamCapture(initial_model_name="gpt-image-2")
+        return SimpleNamespace(
+            response=StreamingResponse(failed_stream(capture), media_type="text/event-stream"),
+            status_code=200,
+            model_name="gpt-image-2",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=fake_on_success,
+            stream_capture=capture,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/chat/completions",
+            request_model="gpt-image-2",
+            is_stream=True,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    async def collect_chunks() -> list[bytes]:
+        chunks: list[bytes] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(collect_chunks())
+    body = b"".join(chunks).decode("utf-8")
+
+    assert isinstance(response, StreamingResponse)
+    assert response.status_code == 200
+    assert chunks[0].startswith(b": keepalive")
+    assert "event: error" in body
+    assert "data: [DONE]" in body
+    assert mark_success_calls == []
+    assert len(mark_error_calls) == 1
+    assert mark_error_calls[0][0] == 33
+    assert "RemoteProtocolError" in mark_error_calls[0][1]
+    assert success_hook_calls == []
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 99
+    assert finalized[0]["status_code"] == 502
+    assert finalized[0]["success"] is False
+    assert finalized[0]["attempt_count"] == 1
+    assert finalized[0]["token_id"] == 33
+    assert finalized[0]["account_id"] == "acct_paid"
+    assert "RemoteProtocolError" in str(finalized[0]["error_message"])
+
+
+def test_execute_proxy_request_with_failover_emits_terminal_error_after_first_output_timeout(
+    monkeypatch,
+) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run in first-output-timeout retry test")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    token_row = CodexToken(
+        id=61,
+        account_id="acct-first",
+        refresh_token="refresh-first",
+        is_active=True,
+        raw_payload={},
+    )
+
+    claim_calls = 0
+    mark_success_calls: list[int] = []
+    mark_error_calls: list[tuple[int, str]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        nonlocal claim_calls
+        claim_calls += 1
+        return token_row if claim_calls == 1 else None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=111)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        mark_error_calls.append((token_id, message))
+
+    async def stalled_stream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(0.02)
+        yield b": upstream-keepalive\n\n"
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        return SimpleNamespace(
+            response=StreamingResponse(stalled_stream(), media_type="text/event-stream"),
+            status_code=200,
+            model_name="gpt-image-2",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=_ProxyStreamCapture(initial_model_name="gpt-image-2"),
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server._stream_keepalive_interval_seconds", lambda: 0.005)
+    monkeypatch.setattr("oaix_gateway.api_server._image_stream_first_output_timeout_seconds", lambda: 0.01)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/chat/completions",
+            request_model="gpt-image-2",
+            is_stream=True,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    async def collect_chunks() -> list[bytes]:
+        chunks: list[bytes] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(collect_chunks())
+    body = b"".join(chunks).decode("utf-8")
+
+    assert isinstance(response, StreamingResponse)
+    assert response.status_code == 200
+    assert chunks[0].startswith(b": keepalive")
+    assert '"status_code":504' in body.replace(" ", "")
+    assert "timed out before producing a response" in body
+    assert "data: [DONE]" in body
+    assert mark_success_calls == []
+    assert mark_error_calls == [
+        (
+            61,
+            "Upstream image stream timed out before producing a response (0.01s without image output)",
+        )
+    ]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 111
+    assert finalized[0]["status_code"] == 504
+    assert finalized[0]["success"] is False
+    assert finalized[0]["attempt_count"] == 1
+    assert finalized[0]["token_id"] == 61
+    assert finalized[0]["account_id"] == "acct-first"
+    assert "timed out before producing a response" in str(finalized[0]["error_message"])
+
+
+def test_execute_proxy_request_with_failover_retries_gpt_image_stream_after_premature_done(
+    monkeypatch,
+) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run in premature-done retry test")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    first_token = CodexToken(
+        id=71,
+        account_id="acct-first",
+        refresh_token="refresh-first",
+        is_active=True,
+        raw_payload={},
+        plan_type="team",
+    )
+    second_token = CodexToken(
+        id=72,
+        account_id="acct-second",
+        refresh_token="refresh-second",
+        is_active=True,
+        raw_payload={},
+        plan_type="team",
+    )
+
+    claim_calls = 0
+    seen_excludes: list[set[int]] = []
+    mark_success_calls: list[int] = []
+    mark_error_calls: list[tuple[int, str]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        nonlocal claim_calls
+        claim_calls += 1
+        excludes = set(exclude_token_ids or [])
+        seen_excludes.append(excludes)
+        if first_token.id not in excludes:
+            return first_token
+        if second_token.id not in excludes:
+            return second_token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=211)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_mark_token_error(token_id: int, message: str, **kwargs) -> None:
+        mark_error_calls.append((token_id, message))
+
+    async def premature_done_stream() -> AsyncIterator[bytes]:
+        yield b": upstream-keepalive\n\n"
+        yield b"data: [DONE]\n\n"
+
+    async def success_stream() -> AsyncIterator[bytes]:
+        yield b'data: {"id":"chatcmpl_success","choices":[{"index":0,"delta":{"content":"![image](data:image/png;base64,done-image)"},"finish_reason":null}]}\n\n'
+        yield b'data: {"id":"chatcmpl_success","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        if account_id == "acct-first":
+            return SimpleNamespace(
+                response=StreamingResponse(premature_done_stream(), media_type="text/event-stream"),
+                status_code=200,
+                model_name="gpt-image-2",
+                first_token_at=None,
+                usage_metrics=None,
+                on_success=None,
+                stream_capture=_ProxyStreamCapture(initial_model_name="gpt-image-2"),
+            )
+        return SimpleNamespace(
+            response=StreamingResponse(success_stream(), media_type="text/event-stream"),
+            status_code=200,
+            model_name="gpt-image-2",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=_ProxyStreamCapture(initial_model_name="gpt-image-2"),
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server._stream_keepalive_interval_seconds", lambda: 0.005)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/chat/completions",
+            request_model="gpt-image-2",
+            is_stream=True,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    async def collect_chunks() -> list[bytes]:
+        chunks: list[bytes] = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(collect_chunks())
+    body = b"".join(chunks).decode("utf-8")
+
+    assert isinstance(response, StreamingResponse)
+    assert response.status_code == 200
+    assert body.count(": keepalive") >= 1
+    assert "done-image" in body
+    assert "Upstream image stream ended before producing a response" not in body
+    assert mark_error_calls == [(71, "Upstream image stream ended before producing a response")]
+    assert mark_success_calls == [72]
+    assert seen_excludes[0] == set()
+    assert first_token.id in seen_excludes[1]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 211
+    assert finalized[0]["status_code"] == 200
+    assert finalized[0]["success"] is True
+    assert finalized[0]["attempt_count"] == 2
+    assert finalized[0]["token_id"] == 72
+    assert finalized[0]["account_id"] == "acct-second"
 
 
 def test_execute_proxy_request_with_failover_returns_immediately_for_gpt_image_2_stream_while_auth_is_pending(

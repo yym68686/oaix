@@ -238,6 +238,9 @@ class _ProxyStreamCapture:
         self.model_name = initial_model_name
         self.first_token_at = initial_first_token_at
         self.usage_metrics: UsageMetrics | None = None
+        self.completed = False
+        self.error_status_code: int | None = None
+        self.error_message: str | None = None
         self._response_snapshot: dict[str, Any] = {}
         self._output_items_by_index: dict[int, dict[str, Any]] = {}
         self._output_items_fallback: list[dict[str, Any]] = []
@@ -287,6 +290,15 @@ class _ProxyStreamCapture:
                 if not isinstance(event_payload, dict):
                     continue
 
+                if event_type == "error":
+                    error_obj = event_payload.get("error")
+                    if isinstance(error_obj, dict):
+                        self.error_status_code = _responses_error_status_code(error_obj)
+                        error_message = _normalize_optional_text(error_obj.get("message"))
+                        if error_message is not None:
+                            self.error_message = error_message
+                    continue
+
                 if event_type == "response.output_item.done":
                     _collect_responses_output_item_done(
                         event_payload,
@@ -298,6 +310,7 @@ class _ProxyStreamCapture:
                 response_obj = event_payload.get("response")
                 if isinstance(response_obj, dict):
                     if event_type == "response.completed":
+                        self.completed = True
                         event_payload = _patch_completed_output_from_output_items(
                             event_payload,
                             output_items_by_index=self._output_items_by_index,
@@ -521,6 +534,10 @@ def _image_non_stream_read_timeout_seconds() -> float:
 
 def _image_non_stream_disconnect_poll_seconds() -> float:
     return _float_env("IMAGE_NON_STREAM_DISCONNECT_POLL_SECONDS", 1.0, minimum=0.1)
+
+
+def _image_stream_first_output_timeout_seconds() -> float:
+    return _float_env("IMAGE_STREAM_FIRST_OUTPUT_TIMEOUT_SECONDS", 120.0, minimum=1.0)
 
 
 def _admin_quota_cache_ttl_seconds() -> int:
@@ -1936,6 +1953,43 @@ def _patch_completed_output_from_output_items(
     return patched_payload
 
 
+def _build_synthetic_completed_event_from_output_items(
+    *,
+    response_id: str | None = None,
+    model_name: str | None = None,
+    created_at: int | None = None,
+    output_items_by_index: dict[int, dict[str, Any]],
+    output_items_fallback: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not output_items_by_index and not output_items_fallback:
+        return None
+
+    response_payload: dict[str, Any] = {"status": "completed"}
+    if response_id:
+        response_payload["id"] = response_id
+    if model_name:
+        response_payload["model"] = model_name
+    if created_at is not None and created_at > 0:
+        response_payload["created_at"] = created_at
+
+    patched_payload = _patch_completed_output_from_output_items(
+        {
+            "type": "response.completed",
+            "response": response_payload,
+        },
+        output_items_by_index=output_items_by_index,
+        output_items_fallback=output_items_fallback,
+    )
+    patched_response = patched_payload.get("response")
+    if not isinstance(patched_response, dict):
+        return None
+
+    output_items = patched_response.get("output")
+    if not isinstance(output_items, list) or not output_items:
+        return None
+    return patched_payload
+
+
 def _non_retryable_gateway_http_exception(
     *,
     status_code: int,
@@ -2500,6 +2554,8 @@ async def _stream_responses_to_chat_completions(
     response_id = f"chatcmpl_{uuid.uuid4().hex}"
     created_at = int(utcnow().timestamp())
     model_name = request_model
+    completed_response_seen = False
+    error_seen = False
     output_items_by_index: dict[int, dict[str, Any]] = {}
     output_items_fallback: list[dict[str, Any]] = []
 
@@ -2518,6 +2574,57 @@ async def _stream_responses_to_chat_completions(
             model_name=model_name,
             delta=delta,
         )
+
+    async def emit_completed_payload(event_payload: dict[str, Any]) -> AsyncGenerator[bytes, None]:
+        nonlocal completed_response_seen, role_sent
+        completed_response_seen = True
+        completed_response = event_payload.get("response")
+        if not isinstance(completed_response, dict):
+            completed_response = {}
+        message, finish_reason = _chat_completion_message_from_response_payload(completed_response)
+        final_content = str(message.get("content") or "")
+
+        if final_content:
+            suffix = final_content
+            if emitted_content and final_content.startswith(emitted_content):
+                suffix = final_content[len(emitted_content):]
+            async for content_chunk in emit_content_delta(suffix):
+                yield content_chunk
+
+        if message.get("tool_calls"):
+            tool_call_deltas = []
+            for index, tool_call in enumerate(message["tool_calls"]):
+                tool_call_delta = copy.deepcopy(tool_call)
+                tool_call_delta["index"] = index
+                tool_call_deltas.append(tool_call_delta)
+            delta: dict[str, Any] = {"tool_calls": tool_call_deltas}
+            if not role_sent:
+                delta["role"] = "assistant"
+                role_sent = True
+            yield _build_chat_completion_chunk_bytes(
+                response_id=response_id,
+                created_at=created_at,
+                model_name=model_name,
+                delta=delta,
+            )
+
+        if not role_sent:
+            yield _build_chat_completion_chunk_bytes(
+                response_id=response_id,
+                created_at=created_at,
+                model_name=model_name,
+                delta={"role": "assistant"},
+            )
+            role_sent = True
+
+        yield _build_chat_completion_chunk_bytes(
+            response_id=response_id,
+            created_at=created_at,
+            model_name=model_name,
+            delta={},
+            finish_reason=finish_reason,
+        )
+        yield b"data: [DONE]\n\n"
 
     try:
         async for chunk in body_iterator:
@@ -2538,8 +2645,29 @@ async def _stream_responses_to_chat_completions(
 
                 event_type, event_payload = _extract_responses_stream_event(raw_event)
                 if event_type == "[DONE]":
+                    synthetic_completed_payload = None
+                    if not completed_response_seen and not error_seen:
+                        synthetic_completed_payload = _build_synthetic_completed_event_from_output_items(
+                            response_id=response_id,
+                            model_name=model_name,
+                            created_at=created_at,
+                            output_items_by_index=output_items_by_index,
+                            output_items_fallback=output_items_fallback,
+                        )
+                    if synthetic_completed_payload is not None:
+                        async for completed_chunk in emit_completed_payload(synthetic_completed_payload):
+                            yield completed_chunk
+                        return
                     yield b"data: [DONE]\n\n"
                     return
+
+                if event_type == "error":
+                    error_seen = True
+                    if isinstance(event_payload, dict):
+                        yield b"data: " + json.dumps(event_payload, ensure_ascii=False).encode("utf-8") + b"\n\n"
+                    else:
+                        yield raw_event.encode("utf-8") + b"\n\n"
+                    continue
 
                 if isinstance(event_payload, dict):
                     response_id = _chat_completion_response_id(event_payload)
@@ -2568,54 +2696,24 @@ async def _stream_responses_to_chat_completions(
                     output_items_by_index=output_items_by_index,
                     output_items_fallback=output_items_fallback,
                 )
-                completed_response = patched_payload.get("response")
-                if not isinstance(completed_response, dict):
-                    completed_response = {}
-                message, finish_reason = _chat_completion_message_from_response_payload(completed_response)
-                final_content = str(message.get("content") or "")
-
-                if final_content:
-                    suffix = final_content
-                    if emitted_content and final_content.startswith(emitted_content):
-                        suffix = final_content[len(emitted_content):]
-                    async for content_chunk in emit_content_delta(suffix):
-                        yield content_chunk
-
-                if message.get("tool_calls"):
-                    tool_call_deltas = []
-                    for index, tool_call in enumerate(message["tool_calls"]):
-                        tool_call_delta = copy.deepcopy(tool_call)
-                        tool_call_delta["index"] = index
-                        tool_call_deltas.append(tool_call_delta)
-                    delta: dict[str, Any] = {"tool_calls": tool_call_deltas}
-                    if not role_sent:
-                        delta["role"] = "assistant"
-                        role_sent = True
-                    yield _build_chat_completion_chunk_bytes(
-                        response_id=response_id,
-                        created_at=created_at,
-                        model_name=model_name,
-                        delta=delta,
-                    )
-
-                if not role_sent:
-                    yield _build_chat_completion_chunk_bytes(
-                        response_id=response_id,
-                        created_at=created_at,
-                        model_name=model_name,
-                        delta={"role": "assistant"},
-                    )
-                    role_sent = True
-
-                yield _build_chat_completion_chunk_bytes(
-                    response_id=response_id,
-                    created_at=created_at,
-                    model_name=model_name,
-                    delta={},
-                    finish_reason=finish_reason,
-                )
-                yield b"data: [DONE]\n\n"
+                async for completed_chunk in emit_completed_payload(patched_payload):
+                    yield completed_chunk
                 return
+
+        synthetic_completed_payload = None
+        if not completed_response_seen and not error_seen:
+            synthetic_completed_payload = _build_synthetic_completed_event_from_output_items(
+                response_id=response_id,
+                model_name=model_name,
+                created_at=created_at,
+                output_items_by_index=output_items_by_index,
+                output_items_fallback=output_items_fallback,
+            )
+        if synthetic_completed_payload is not None:
+            async for completed_chunk in emit_completed_payload(synthetic_completed_payload):
+                yield completed_chunk
+            return
+
         yield b"data: [DONE]\n\n"
     finally:
         close_iterator = getattr(body_iterator, "aclose", None)
@@ -2798,6 +2896,55 @@ def _build_stream_error_event(status_code: int, message: str) -> bytes:
     )
 
 
+def _build_chat_completions_stream_error_event(status_code: int, message: str) -> bytes:
+    error_type = "invalid_request_error" if 400 <= status_code < 500 else "server_error"
+    return b"data: " + json.dumps(
+        {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "status_code": status_code,
+            }
+        },
+        ensure_ascii=False,
+    ).encode("utf-8") + b"\n\n"
+
+
+def _build_downstream_stream_error_event(*, endpoint: str, status_code: int, message: str) -> bytes:
+    if endpoint == "/v1/chat/completions":
+        return _build_chat_completions_stream_error_event(status_code, message)
+    return _build_stream_error_event(status_code, message)
+
+
+def _is_sse_done_frame(chunk: bytes) -> bool:
+    return b"data: [DONE]" in chunk
+
+
+def _is_sse_comment_chunk(chunk: bytes) -> bool:
+    try:
+        return _is_sse_comment_frame(chunk.decode("utf-8"))
+    except Exception:
+        return False
+
+
+def _extract_stream_error_from_chunk(chunk: bytes) -> tuple[int | None, str | None]:
+    try:
+        _, payload = _extract_responses_stream_event(chunk.decode("utf-8"))
+    except Exception:
+        return None, None
+
+    if not isinstance(payload, dict):
+        return None, None
+
+    error_obj = payload.get("error")
+    if not isinstance(error_obj, dict):
+        return None, None
+
+    status_code = _responses_error_status_code(error_obj)
+    message = _normalize_optional_text(error_obj.get("message"))
+    return status_code, message
+
+
 def _transform_image_stream_event(
     event_type: str,
     event_payload: Any,
@@ -2864,11 +3011,15 @@ async def _stream_upstream_image_response(
 ) -> AsyncGenerator[bytes, None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    response_id: str | None = None
+    response_model_name: str | None = None
+    response_created_at: int | None = None
+    completed_response_seen = False
     output_items_by_index: dict[int, dict[str, Any]] = {}
     output_items_fallback: list[dict[str, Any]] = []
 
     def drain_buffer(*, final: bool = False) -> tuple[list[bytes], bool]:
-        nonlocal text_buffer
+        nonlocal text_buffer, response_id, response_model_name, response_created_at, completed_response_seen
         events: list[bytes] = []
         while True:
             match = re.search(r"\r?\n\r?\n", text_buffer)
@@ -2886,6 +3037,27 @@ async def _stream_upstream_image_response(
 
             event_type, event_payload = _extract_responses_stream_event(raw_event)
             if event_type == "[DONE]":
+                if not completed_response_seen:
+                    synthetic_completed_payload = _build_synthetic_completed_event_from_output_items(
+                        response_id=response_id,
+                        model_name=response_model_name,
+                        created_at=response_created_at,
+                        output_items_by_index=output_items_by_index,
+                        output_items_fallback=output_items_fallback,
+                    )
+                    if synthetic_completed_payload is not None:
+                        try:
+                            transformed_events, done = _transform_image_stream_event(
+                                "response.completed",
+                                synthetic_completed_payload,
+                                response_format=response_format,
+                                stream_prefix=stream_prefix,
+                            )
+                        except ValueError as exc:
+                            events.append(_build_stream_error_event(502, str(exc)))
+                            return events, True
+                        events.extend(transformed_events)
+                        return events, done
                 return events, True
 
             semantic_failure = _responses_failure_http_exception(event_payload)
@@ -2893,6 +3065,19 @@ async def _stream_upstream_image_response(
                 detail = str(getattr(semantic_failure, "detail", "") or semantic_failure)
                 events.append(_build_stream_error_event(semantic_failure.status_code, detail))
                 return events, True
+
+            if isinstance(event_payload, dict):
+                response_id = _normalize_optional_text(
+                    _mapping_get(event_payload, "response", "id") or response_id
+                ) or response_id
+                response_model_name = _normalize_optional_text(
+                    _mapping_get(event_payload, "response", "model") or response_model_name
+                ) or response_model_name
+                response_created_at = _coerce_int(
+                    _mapping_get(event_payload, "response", "created_at")
+                    or _mapping_get(event_payload, "response", "created")
+                    or response_created_at
+                )
 
             if event_type == "response.output_item.done":
                 _collect_responses_output_item_done(
@@ -2903,6 +3088,7 @@ async def _stream_upstream_image_response(
                 continue
 
             if event_type == "response.completed":
+                completed_response_seen = True
                 event_payload = _patch_completed_output_from_output_items(
                     event_payload,
                     output_items_by_index=output_items_by_index,
@@ -2923,6 +3109,28 @@ async def _stream_upstream_image_response(
             events.extend(transformed_events)
             if done:
                 return events, True
+
+        if final and not completed_response_seen:
+            synthetic_completed_payload = _build_synthetic_completed_event_from_output_items(
+                response_id=response_id,
+                model_name=response_model_name,
+                created_at=response_created_at,
+                output_items_by_index=output_items_by_index,
+                output_items_fallback=output_items_fallback,
+            )
+            if synthetic_completed_payload is not None:
+                try:
+                    transformed_events, done = _transform_image_stream_event(
+                        "response.completed",
+                        synthetic_completed_payload,
+                        response_format=response_format,
+                        stream_prefix=stream_prefix,
+                    )
+                except ValueError as exc:
+                    events.append(_build_stream_error_event(502, str(exc)))
+                    return events, True
+                events.extend(transformed_events)
+                return events, done
 
         if final and text_buffer.strip():
             events.append(_build_stream_error_event(502, "Upstream closed stream with an incomplete SSE event"))
@@ -2968,6 +3176,13 @@ async def _stream_upstream_image_response(
             str(exc) or type(exc).__name__,
         )
         if stream_committed:
+            error_event = _build_stream_error_event(
+                502,
+                f"Upstream image stream aborted before completion: {type(exc).__name__}: {str(exc) or type(exc).__name__}",
+            )
+            if stream_capture is not None:
+                stream_capture.feed(error_event)
+            yield error_event
             yield b"data: [DONE]\n\n"
     finally:
         await stream_cm.__aexit__(None, None, None)
@@ -3024,7 +3239,10 @@ async def _proxy_image_request_with_token(
 
             upstream_iter = upstream_response.aiter_raw()
             try:
-                primed_stream = await _prime_responses_upstream_stream(upstream_iter)
+                primed_stream = await _prime_responses_upstream_stream(
+                    upstream_iter,
+                    heartbeat_interval_seconds=stream_keepalive_interval_seconds,
+                )
             except Exception:
                 await stream_cm.__aexit__(None, None, None)
                 raise
@@ -3037,6 +3255,8 @@ async def _proxy_image_request_with_token(
                 response_format=image_request.response_format,
                 stream_prefix=image_request.stream_prefix,
                 heartbeat_interval_seconds=stream_keepalive_interval_seconds,
+                emit_initial_keepalive=primed_stream.emit_initial_keepalive,
+                pending_chunk_task=primed_stream.pending_chunk_task,
                 stream_capture=stream_capture,
             ):
                 yield chunk
@@ -3377,16 +3597,19 @@ async def _finalize_stream_request_log(
     stream_capture: _ProxyStreamCapture,
 ) -> None:
     try:
+        failed = stream_capture.error_message is not None and not stream_capture.completed
+        final_status_code = (stream_capture.error_status_code or status_code) if failed else status_code
         await finalize_request_log(
             request_log_id,
-            status_code=status_code,
-            success=True,
+            status_code=final_status_code,
+            success=not failed,
             attempt_count=attempt_count,
             finished_at=utcnow(),
             first_token_at=stream_capture.first_token_at or fallback_first_token_at,
             token_id=token_id,
             account_id=account_id,
             model_name=stream_capture.model_name or fallback_model_name,
+            error_message=stream_capture.error_message if failed else None,
             **_usage_finalize_kwargs(stream_capture.usage_metrics),
         )
     except Exception:
@@ -3438,6 +3661,7 @@ def _gpt_image_stream_keepalive_response(
     output_queue: asyncio.Queue[bytes | object] = asyncio.Queue()
     queue_done_sentinel = object()
     heartbeat_interval_seconds = _stream_keepalive_interval_seconds()
+    first_output_timeout_seconds = _image_stream_first_output_timeout_seconds()
 
     async def worker() -> None:
         client: httpx.AsyncClient = http_request.app.state.http_client
@@ -3535,8 +3759,6 @@ def _gpt_image_stream_keepalive_response(
                         output_queue=output_queue,
                         heartbeat_interval_seconds=heartbeat_interval_seconds,
                     )
-                    await mark_token_success(token_row.id)
-
                     if not isinstance(proxy_result.response, StreamingResponse):
                         raise HTTPException(
                             status_code=502,
@@ -3548,14 +3770,60 @@ def _gpt_image_stream_keepalive_response(
                         body_iterator,
                         heartbeat_interval_seconds=heartbeat_interval_seconds,
                     )
+                    saw_semantic_chunk = False
+                    stream_started_monotonic = asyncio.get_running_loop().time()
                     try:
                         async for chunk in body_iterator:
+                            if not saw_semantic_chunk:
+                                error_status_code, error_message = _extract_stream_error_from_chunk(chunk)
+                                if error_message is not None:
+                                    raise HTTPException(status_code=error_status_code or 502, detail=error_message)
+
+                                if _is_sse_done_frame(chunk) and (
+                                    proxy_result.stream_capture is None or not proxy_result.stream_capture.completed
+                                ):
+                                    raise HTTPException(
+                                        status_code=502,
+                                        detail="Upstream image stream ended before producing a response",
+                                    )
+
+                                if _is_sse_comment_chunk(chunk):
+                                    if (
+                                        asyncio.get_running_loop().time() - stream_started_monotonic
+                                        >= first_output_timeout_seconds
+                                    ):
+                                        raise HTTPException(
+                                            status_code=504,
+                                            detail=(
+                                                "Upstream image stream timed out before producing a response "
+                                                f"({first_output_timeout_seconds:g}s without image output)"
+                                            ),
+                                        )
+                                    await output_queue.put(chunk)
+                                    continue
+
+                                saw_semantic_chunk = True
                             await output_queue.put(chunk)
                     finally:
                         close_iterator = getattr(body_iterator, "aclose", None)
                         if callable(close_iterator):
                             with suppress(Exception):
                                 await close_iterator()
+
+                    if (
+                        not saw_semantic_chunk
+                        and (
+                            proxy_result.stream_capture is None
+                            or (
+                                proxy_result.stream_capture.error_message is None
+                                and not proxy_result.stream_capture.completed
+                            )
+                        )
+                    ):
+                        raise HTTPException(
+                            status_code=502,
+                            detail="Upstream image stream ended before producing a response",
+                        )
 
                     if proxy_result.stream_capture is not None:
                         await _finalize_stream_request_log(
@@ -3568,6 +3836,13 @@ def _gpt_image_stream_keepalive_response(
                             fallback_first_token_at=proxy_result.first_token_at,
                             stream_capture=proxy_result.stream_capture,
                         )
+                        if proxy_result.stream_capture.error_message is not None and not proxy_result.stream_capture.completed:
+                            await mark_token_error(
+                                token_row.id,
+                                proxy_result.stream_capture.error_message,
+                            )
+                            stream_finalized = True
+                            return
                     else:
                         await finalize_request_log(
                             request_log_id,
@@ -3580,6 +3855,7 @@ def _gpt_image_stream_keepalive_response(
                             account_id=token_row.account_id,
                             model_name=proxy_result.model_name,
                         )
+                    await mark_token_success(token_row.id)
                     stream_finalized = True
                     await _run_proxy_result_success_hook(proxy_result, request_log_id=request_log_id)
                     return
@@ -3651,6 +3927,7 @@ def _gpt_image_stream_keepalive_response(
                         error_text=detail,
                     )
                     if _should_retry_http_exception(exc) and attempt < max_attempts:
+                        excluded_token_ids.add(token_row.id)
                         mark_kwargs: dict[str, Any] = {}
                         if compact_server_error_cooling_time > 0:
                             mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
@@ -3668,6 +3945,9 @@ def _gpt_image_stream_keepalive_response(
                         last_error = exc
                         continue
 
+                    if _should_retry_http_exception(exc):
+                        await mark_token_error(token_row.id, detail)
+
                     raise
                 except httpx.HTTPError as exc:
                     message = f"Upstream request failed: {type(exc).__name__}: {exc}"
@@ -3677,6 +3957,7 @@ def _gpt_image_stream_keepalive_response(
                         error_text=message,
                     )
                     if attempt < max_attempts:
+                        excluded_token_ids.add(token_row.id)
                         mark_kwargs: dict[str, Any] = {}
                         if compact_server_error_cooling_time > 0:
                             mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
@@ -4764,7 +5045,16 @@ async def _stream_upstream_response(
             type(exc).__name__,
             str(exc) or type(exc).__name__,
         )
-        if stream_committed:
+        if stream_committed and response_model_alias is not None:
+            error_event = _build_stream_error_event(
+                502,
+                f"Upstream image stream aborted before completion: {type(exc).__name__}: {str(exc) or type(exc).__name__}",
+            )
+            if stream_capture is not None:
+                stream_capture.feed(error_event)
+            yield error_event
+            yield b"data: [DONE]\n\n"
+        elif stream_committed:
             yield b"data: [DONE]\n\n"
     finally:
         await stream_cm.__aexit__(None, None, None)
@@ -4834,7 +5124,10 @@ async def _proxy_request_with_token(
 
             upstream_iter = upstream_response.aiter_raw()
             try:
-                primed_stream = await _prime_responses_upstream_stream(upstream_iter)
+                primed_stream = await _prime_responses_upstream_stream(
+                    upstream_iter,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
             except Exception:
                 await stream_cm.__aexit__(None, None, None)
                 raise
@@ -4846,6 +5139,8 @@ async def _proxy_request_with_token(
                 stream_committed=primed_stream.stream_committed,
                 stream_capture=stream_capture,
                 response_model_alias=response_model_alias,
+                emit_initial_keepalive=primed_stream.emit_initial_keepalive,
+                pending_chunk_task=primed_stream.pending_chunk_task,
             ):
                 yield chunk
 
