@@ -211,6 +211,15 @@ button {
   isolation: isolate;
 }
 
+.hero__copy,
+.hero__meta,
+.overview,
+.import-panel,
+.token-panel,
+.request-panel {
+  min-width: 0;
+}
+
 .hero {
   display: grid;
   gap: 24px;
@@ -250,6 +259,7 @@ button {
   font-size: 1.04rem;
   line-height: 1.75;
   color: var(--ink-soft);
+  overflow-wrap: anywhere;
 }
 
 .hero__meta {
@@ -308,11 +318,13 @@ button {
   min-width: 0;
   font-size: 0.84rem;
   color: var(--ink-soft);
+  overflow-wrap: anywhere;
 }
 
 .theme-switch__rail {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-width: 0;
   gap: 8px;
   padding: 4px;
   border-radius: 999px;
@@ -320,6 +332,7 @@ button {
 }
 
 .theme-switch__button {
+  min-width: 0;
   min-height: 44px;
   border: 0;
   border-radius: 999px;
@@ -400,8 +413,17 @@ button {
   margin-bottom: 22px;
 }
 
+.section-head__copy {
+  min-width: 0;
+}
+
 .section-head--compact {
   align-items: start;
+}
+
+.section-head--token {
+  align-items: start;
+  margin-bottom: 14px;
 }
 
 .section-head h2 {
@@ -412,32 +434,39 @@ button {
   margin: 0;
   font-size: 0.92rem;
   color: var(--ink-soft);
+  overflow-wrap: anywhere;
 }
 
-.section-tools {
+.section-head--token .section-note {
+  max-width: 64ch;
+  margin-top: 12px;
+}
+
+.token-toolbar {
   display: grid;
-  justify-items: end;
-  gap: 10px;
-}
-
-.section-tools--token {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 12px;
-}
-
-.section-tools--token .section-note {
-  text-align: right;
+  grid-template-columns: minmax(340px, 1fr) minmax(300px, 0.42fr);
+  align-items: end;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: calc(var(--radius-xl) - 12px);
+  background: var(--surface-card);
 }
 
 .token-search {
-  flex: 1 1 320px;
   display: grid;
-  gap: 6px;
-  max-width: 360px;
-  min-width: min(100%, 260px);
+  min-width: 0;
+  gap: 8px;
+}
+
+.token-search__head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  min-width: 0;
 }
 
 .token-search__label {
@@ -450,8 +479,9 @@ button {
 
 .token-search__input {
   width: 100%;
-  min-height: 42px;
-  padding: 11px 15px;
+  min-width: 0;
+  min-height: 50px;
+  padding: 13px 18px;
   border: 1px solid var(--border-input);
   border-radius: 999px;
   background: var(--surface-input);
@@ -466,6 +496,9 @@ button {
 .token-search__input:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+.token-search__input:focus-visible {
   box-shadow: var(--focus-ring);
   transform: translateY(-1px);
 }
@@ -474,16 +507,24 @@ button {
   margin: 0;
   font-size: 0.78rem;
   line-height: 1.35;
+  text-align: left;
   color: var(--ink-soft);
 }
 
 .selection-switch {
+  display: grid;
+  align-self: stretch;
+  align-items: end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.selection-switch__head {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 10px;
-  max-width: 100%;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
 }
 
 .selection-switch__label {
@@ -498,11 +539,12 @@ button {
   min-width: 0;
   font-size: 0.82rem;
   line-height: 1.4;
+  text-align: right;
   color: var(--ink-soft);
 }
 
 .selection-switch__rail {
-  display: inline-grid;
+  display: grid;
   grid-template-columns: repeat(2, minmax(116px, 1fr));
   gap: 6px;
   padding: 4px;
@@ -811,6 +853,7 @@ button {
 .field input,
 .field textarea {
   width: 100%;
+  min-width: 0;
   border: 1px solid var(--border-input);
   border-radius: var(--radius-md);
   background: var(--surface-input);
@@ -866,6 +909,8 @@ button {
 
 .upload-zone input {
   display: block;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .upload-zone__title {
@@ -875,6 +920,7 @@ button {
 .upload-zone__hint {
   color: var(--ink-soft);
   font-size: 0.94rem;
+  overflow-wrap: anywhere;
 }
 
 .import-feedback {
@@ -2442,6 +2488,16 @@ button {
     padding-top: 18px;
   }
 
+  .hero h1 {
+    max-width: 100%;
+    font-size: clamp(2.55rem, 13vw, 3.35rem);
+    overflow-wrap: anywhere;
+  }
+
+  .hero__lede {
+    max-width: 100%;
+  }
+
   .stats-grid {
     grid-template-columns: 1fr;
   }
@@ -2460,16 +2516,20 @@ button {
     flex-direction: column;
   }
 
-  .section-tools {
-    width: 100%;
-    justify-items: start;
+  .token-toolbar {
+    grid-template-columns: 1fr;
+    padding: 12px;
   }
 
-  .section-tools--token {
-    justify-content: flex-start;
+  .token-search__head,
+  .selection-switch__head {
+    align-items: start;
+    flex-direction: column;
+    gap: 6px;
   }
 
-  .section-tools--token .section-note {
+  .token-search__summary,
+  .selection-switch__summary {
     text-align: left;
   }
 
@@ -2480,7 +2540,6 @@ button {
 
   .selection-switch {
     width: 100%;
-    justify-content: flex-start;
   }
 
   .theme-switch,

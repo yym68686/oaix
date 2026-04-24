@@ -182,47 +182,54 @@
         </aside>
 
         <section class="token-panel reveal" aria-labelledby="token-list-title">
-          <div class="section-head">
-            <div>
+          <div class="section-head section-head--token">
+            <div class="section-head__copy">
               <p class="section-kicker">Registry</p>
               <h2 id="token-list-title">最近 Key 状态</h2>
-            </div>
-            <div class="section-tools section-tools--token">
               <p class="section-note" id="list-note">正在载入最近 80 条 key…</p>
-              <div class="token-search" role="search" aria-label="搜索最近 Key 状态">
+            </div>
+          </div>
+
+          <div class="token-toolbar" role="group" aria-label="Key 列表工具">
+            <div class="token-search" role="search" aria-label="搜索最近 Key 状态">
+              <div class="token-search__head">
                 <label class="token-search__label" for="token-search-input">搜索 Key</label>
-                <input
-                  class="token-search__input"
-                  id="token-search-input"
-                  type="search"
-                  spellcheck="false"
-                  autocomplete="off"
-                  placeholder="邮箱 / 工作区 / Token ID / 来源"
-                  aria-describedby="token-search-summary"
-                />
                 <p class="token-search__summary" id="token-search-summary" aria-live="polite">等待载入</p>
               </div>
-              <div class="selection-switch" aria-label="Key 分发策略">
+              <input
+                class="token-search__input"
+                id="token-search-input"
+                name="token-search"
+                type="search"
+                spellcheck="false"
+                autocomplete="off"
+                placeholder="例如邮箱、工作区、Token ID 或来源…"
+                aria-describedby="token-search-summary"
+              />
+            </div>
+
+            <div class="selection-switch" aria-label="Key 分发策略">
+              <div class="selection-switch__head">
                 <span class="selection-switch__label">Key 分发</span>
-                <div class="selection-switch__rail" role="group" aria-label="切换 Key 分发策略">
-                  <button
-                    class="selection-switch__button"
-                    data-selection-strategy="least_recently_used"
-                    type="button"
-                    aria-pressed="true"
-                  >
-                    最旧未使用
-                  </button>
-                  <button
-                    class="selection-switch__button"
-                    data-selection-strategy="fill_first"
-                    type="button"
-                    aria-pressed="false"
-                  >
-                    Fill-first
-                  </button>
-                </div>
                 <span class="selection-switch__summary" id="token-selection-summary" aria-live="polite">正在同步策略</span>
+              </div>
+              <div class="selection-switch__rail" role="group" aria-label="切换 Key 分发策略">
+                <button
+                  class="selection-switch__button"
+                  data-selection-strategy="least_recently_used"
+                  type="button"
+                  aria-pressed="true"
+                >
+                  最旧未使用
+                </button>
+                <button
+                  class="selection-switch__button"
+                  data-selection-strategy="fill_first"
+                  type="button"
+                  aria-pressed="false"
+                >
+                  Fill-first
+                </button>
               </div>
             </div>
           </div>
