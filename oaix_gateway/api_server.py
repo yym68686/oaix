@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 from starlette.datastructures import UploadFile
 from .chat_image_store import create_chat_image_checkpoint, resolve_chat_image_output_items
+from .codex_constants import CODEX_CLI_VERSION, CODEX_USER_AGENT
 from .database import close_database, init_db, utcnow
 from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
@@ -637,10 +638,10 @@ def _build_upstream_headers(http_request: Request, access_token: str, account_id
         "Authorization": f"Bearer {access_token}",
         "Openai-Beta": (http_request.headers.get("Openai-Beta") or "responses=experimental").strip(),
         "Originator": (http_request.headers.get("Originator") or "codex_cli_rs").strip(),
-        "Version": (http_request.headers.get("Version") or "0.21.0").strip(),
+        "Version": (http_request.headers.get("Version") or CODEX_CLI_VERSION).strip(),
         "Session_id": session_id,
         "Conversation_id": conversation_id,
-        "User-Agent": (http_request.headers.get("User-Agent") or "codex_cli_rs/0.125.0").strip(),
+        "User-Agent": (http_request.headers.get("User-Agent") or CODEX_USER_AGENT).strip(),
         "Connection": "Keep-Alive",
         "Accept": "text/event-stream" if stream else "application/json",
     }

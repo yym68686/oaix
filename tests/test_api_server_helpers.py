@@ -197,6 +197,7 @@ def test_build_upstream_headers_uses_current_codex_user_agent_default() -> None:
 
     assert headers["Authorization"] == "Bearer access-token"
     assert headers["Accept"] == "application/json"
+    assert headers["Version"] == "0.125.0"
     assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
 
 
