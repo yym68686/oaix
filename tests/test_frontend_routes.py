@@ -72,6 +72,16 @@ def test_frontend_index_busts_asset_cache_with_content_hash() -> None:
     assert f'/assets/app.js?v={js_version}' in response.text
 
 
+def test_frontend_token_cards_always_render_probe_button() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+    action_renderer = app_js.split("function renderTokenActionButtons", 1)[1].split("function clampWidth", 1)[0]
+
+    assert 'const probeButton = `' in action_renderer
+    assert 'data-token-probe="true"' in action_renderer
+    assert "${probeButton}" in action_renderer
+    assert action_renderer.index("${probeButton}") < action_renderer.index('${actionButtons.join("")}')
+
+
 def test_chat_completions_preflight_is_handled_by_cors(monkeypatch) -> None:
     monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
     monkeypatch.delenv("API_KEY", raising=False)

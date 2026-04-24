@@ -697,19 +697,18 @@ function renderTokenActionButtons(item) {
   const makeAvailableLabel = pendingKind === "make-available" ? "处理中" : "转为可用";
   const disableLabel = pendingKind === "disable" ? "处理中" : "停用";
   const deleteLabel = pendingKind === "delete" ? "删除中" : "删除";
-  const actionButtons = [
-    `
-      <button
-        class="token-action-button token-action-button--probe"
-        type="button"
-        data-token-probe="true"
-        data-token-id="${tokenId}"
-        ${pending ? "disabled" : ""}
-      >
-        ${probeLabel}
-      </button>
-    `,
-  ];
+  const probeButton = `
+    <button
+      class="token-action-button token-action-button--probe"
+      type="button"
+      data-token-probe="true"
+      data-token-id="${tokenId}"
+      ${pending ? "disabled" : ""}
+    >
+      ${probeLabel}
+    </button>
+  `;
+  const actionButtons = [];
 
   if (status.tone === "cooling") {
     actionButtons.push(`
@@ -774,6 +773,7 @@ function renderTokenActionButtons(item) {
 
   return `
     <div class="token-card__actions">
+      ${probeButton}
       ${actionButtons.join("")}
     </div>
   `;
