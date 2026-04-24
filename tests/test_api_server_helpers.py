@@ -201,6 +201,22 @@ def test_build_upstream_headers_uses_current_codex_user_agent_default() -> None:
     assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
 
 
+def test_build_upstream_headers_overrides_stale_client_codex_version() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"version", b"0.21.0"), (b"user-agent", b"yaak")],
+        }
+    )
+
+    headers = _build_upstream_headers(request, access_token="access-token", account_id=None, stream=True)
+
+    assert headers["Version"] == "0.125.0"
+    assert headers["User-Agent"] == "yaak"
+
+
 def test_translate_responses_image_compat_payload_injects_image_tool() -> None:
     translated, response_model_alias = _translate_responses_image_compat_payload(
         {

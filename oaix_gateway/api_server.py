@@ -638,7 +638,7 @@ def _build_upstream_headers(http_request: Request, access_token: str, account_id
         "Authorization": f"Bearer {access_token}",
         "Openai-Beta": (http_request.headers.get("Openai-Beta") or "responses=experimental").strip(),
         "Originator": (http_request.headers.get("Originator") or "codex_cli_rs").strip(),
-        "Version": (http_request.headers.get("Version") or CODEX_CLI_VERSION).strip(),
+        "Version": CODEX_CLI_VERSION,
         "Session_id": session_id,
         "Conversation_id": conversation_id,
         "User-Agent": (http_request.headers.get("User-Agent") or CODEX_USER_AGENT).strip(),
