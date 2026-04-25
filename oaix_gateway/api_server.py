@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import anyio
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -128,6 +129,31 @@ RESPONSES_STREAM_NETWORK_ERRORS = (
 DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS = 30.0
 STREAM_KEEPALIVE_PADDING_BYTES = 2048
 STREAM_KEEPALIVE_COMMENT = b": keepalive" + (b" " * STREAM_KEEPALIVE_PADDING_BYTES) + b"\n\n"
+
+
+class _AsyncioSocketSendWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.name == "asyncio"
+            and record.levelno == logging.WARNING
+            and record.getMessage() == "socket.send() raised exception."
+        )
+
+
+_ASYNCIO_SOCKET_SEND_WARNING_FILTER = _AsyncioSocketSendWarningFilter()
+
+
+def _configure_runtime_logging() -> None:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+    asyncio_logger = logging.getLogger("asyncio")
+    if not any(isinstance(item, _AsyncioSocketSendWarningFilter) for item in asyncio_logger.filters):
+        asyncio_logger.addFilter(_ASYNCIO_SOCKET_SEND_WARNING_FILTER)
+
+    http_client_log_level = os.getenv("HTTP_CLIENT_LOG_LEVEL", "WARNING").upper()
+    logging.getLogger("httpx").setLevel(http_client_log_level)
+    logging.getLogger("httpcore").setLevel(http_client_log_level)
+
+
 RESPONSES_FAILURE_STATUS_BY_CODE = {
     "account_deactivated": 403,
     "account_disabled": 403,
@@ -378,46 +404,59 @@ class _SSEProxyStreamingResponse(Response):
 
     async def __call__(self, scope, receive, send) -> None:
         response_started = False
+        send_failed = False
         try:
             async for chunk in self.body_iterator:
                 if isinstance(chunk, str):
                     chunk = chunk.encode("utf-8")
-                if not response_started:
+                try:
+                    if not response_started:
+                        await send(
+                            {
+                                "type": "http.response.start",
+                                "status": self.status_code,
+                                "headers": self.raw_headers,
+                            }
+                        )
+                        response_started = True
                     await send(
                         {
-                            "type": "http.response.start",
-                            "status": self.status_code,
-                            "headers": self.raw_headers,
+                            "type": "http.response.body",
+                            "body": chunk,
+                            "more_body": True,
                         }
                     )
-                    response_started = True
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": chunk,
-                        "more_body": True,
-                    }
-                )
+                except (OSError, RuntimeError):
+                    send_failed = True
+                    break
+        except asyncio.CancelledError:
+            send_failed = True
+            raise
         finally:
-            if not response_started:
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": self.status_code,
-                        "headers": self.raw_headers,
-                    }
-                )
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": b"",
-                    "more_body": False,
-                }
-            )
-            close_iterator = getattr(self.body_iterator, "aclose", None)
-            if callable(close_iterator):
-                with suppress(Exception):
-                    await close_iterator()
+            try:
+                if not send_failed:
+                    if not response_started:
+                        await send(
+                            {
+                                "type": "http.response.start",
+                                "status": self.status_code,
+                                "headers": self.raw_headers,
+                            }
+                        )
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b"",
+                            "more_body": False,
+                        }
+                    )
+            except (OSError, RuntimeError):
+                pass
+            finally:
+                close_iterator = getattr(self.body_iterator, "aclose", None)
+                if callable(close_iterator):
+                    with suppress(Exception):
+                        await close_iterator()
 
 
 class ResponseTrafficLease:
@@ -543,13 +582,13 @@ def _compact_server_error_cooldown_seconds() -> int:
 
 
 def _image_non_stream_total_timeout_seconds() -> float:
-    return _float_env("IMAGE_NON_STREAM_TOTAL_TIMEOUT_SECONDS", 110.0, minimum=1.0)
+    return _float_env("IMAGE_NON_STREAM_TOTAL_TIMEOUT_SECONDS", 300.0, minimum=1.0)
 
 
 def _image_non_stream_read_timeout_seconds() -> float:
     return min(
         _image_non_stream_total_timeout_seconds(),
-        _float_env("IMAGE_NON_STREAM_READ_TIMEOUT_SECONDS", 60.0, minimum=1.0),
+        _float_env("IMAGE_NON_STREAM_READ_TIMEOUT_SECONDS", 300.0, minimum=1.0),
     )
 
 
@@ -558,7 +597,7 @@ def _image_non_stream_disconnect_poll_seconds() -> float:
 
 
 def _image_stream_first_output_timeout_seconds() -> float:
-    return _float_env("IMAGE_STREAM_FIRST_OUTPUT_TIMEOUT_SECONDS", 120.0, minimum=1.0)
+    return _float_env("IMAGE_STREAM_FIRST_OUTPUT_TIMEOUT_SECONDS", 300.0, minimum=1.0)
 
 
 def _admin_quota_cache_ttl_seconds() -> int:
@@ -3463,6 +3502,25 @@ def _usage_finalize_kwargs(usage_metrics: UsageMetrics | None) -> dict[str, Any]
     }
 
 
+async def _finalize_cancelled_request_log(*args, **kwargs) -> None:
+    async def finalize_with_cancel_shield() -> None:
+        with anyio.CancelScope(shield=True):
+            await finalize_request_log(*args, **kwargs)
+
+    finalize_task = asyncio.create_task(finalize_with_cancel_shield(), name="oaix-cancelled-request-log-finalize")
+    try:
+        await asyncio.shield(finalize_task)
+    except asyncio.CancelledError:
+        try:
+            with anyio.CancelScope(shield=True):
+                await asyncio.shield(finalize_task)
+        except Exception:
+            logger.exception("Failed to finalize cancelled request log")
+        raise
+    except Exception:
+        logger.exception("Failed to finalize cancelled request log")
+
+
 async def _probe_token_with_latest_access_token(
     app: FastAPI,
     *,
@@ -4041,17 +4099,16 @@ def _gpt_image_stream_keepalive_response(
             raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
         except asyncio.CancelledError:
             if not stream_finalized:
-                with suppress(Exception):
-                    await finalize_request_log(
-                        request_log_id,
-                        status_code=499,
-                        success=False,
-                        attempt_count=attempt_count,
-                        finished_at=utcnow(),
-                        token_id=last_token_id,
-                        account_id=last_account_id,
-                        error_message="Client disconnected",
-                    )
+                await _finalize_cancelled_request_log(
+                    request_log_id,
+                    status_code=499,
+                    success=False,
+                    attempt_count=attempt_count,
+                    finished_at=utcnow(),
+                    token_id=last_token_id,
+                    account_id=last_account_id,
+                    error_message="Client disconnected",
+                )
             raise
         except HTTPException as exc:
             if not stream_finalized:
@@ -4418,6 +4475,18 @@ async def _execute_proxy_request_with_failover(
                 detail=_non_free_codex_token_unavailable_detail(restricted_model_label),
             )
         raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
+    except asyncio.CancelledError:
+        await _finalize_cancelled_request_log(
+            request_log.id,
+            status_code=499,
+            success=False,
+            attempt_count=attempt_count,
+            finished_at=utcnow(),
+            token_id=last_token_id,
+            account_id=last_account_id,
+            error_message="Client disconnected",
+        )
+        raise
     except HTTPException as exc:
         await finalize_request_log(
             request_log.id,
@@ -4459,12 +4528,25 @@ async def _wrap_streaming_body_iterator(
         close_iterator = getattr(body_iterator, "aclose", None)
         if callable(close_iterator):
             try:
-                await close_iterator()
+                with anyio.CancelScope(shield=True):
+                    await close_iterator()
             except Exception:
                 logger.exception("Failed to close streamed response body iterator")
 
+        async def on_close_with_cancel_shield() -> None:
+            with anyio.CancelScope(shield=True):
+                await on_close()
+
+        cleanup_task = asyncio.create_task(on_close_with_cancel_shield(), name="oaix-streamed-response-cleanup")
         try:
-            await on_close()
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            try:
+                with anyio.CancelScope(shield=True):
+                    await asyncio.shield(cleanup_task)
+            except Exception:
+                logger.exception("Failed to run streamed response cleanup")
+            raise
         except Exception:
             logger.exception("Failed to run streamed response cleanup")
 
@@ -4653,7 +4735,7 @@ async def _build_admin_token_items(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+    _configure_runtime_logging()
     await init_db()
     repair_summary = await repair_duplicate_token_histories()
     if repair_summary.merged_row_count:

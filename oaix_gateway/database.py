@@ -213,7 +213,8 @@ async def _close_session(session: AsyncSession) -> None:
     try:
         await asyncio.shield(close_task)
     except asyncio.CancelledError:
-        await close_task
+        with anyio.CancelScope(shield=True):
+            await asyncio.shield(close_task)
         raise
 
 

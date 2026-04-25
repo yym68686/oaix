@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -14,6 +15,8 @@ from oaix_gateway.api_server import (
     ChatCompletionsRequest,
     ImageProxyRequest,
     _ProxyStreamCapture,
+    _AsyncioSocketSendWarningFilter,
+    _SSEProxyStreamingResponse,
     _chat_completions_request_to_responses_request,
     _collect_images_api_response_from_sse,
     _execute_proxy_request_with_failover,
@@ -86,6 +89,51 @@ def _make_json_request(path: str, payload: dict) -> Request:
         },
         receive,
     )
+
+
+def test_asyncio_socket_send_warning_filter_suppresses_disconnect_noise() -> None:
+    log_filter = _AsyncioSocketSendWarningFilter()
+    noisy_record = logging.LogRecord(
+        "asyncio",
+        logging.WARNING,
+        __file__,
+        1,
+        "socket.send() raised exception.",
+        (),
+        None,
+    )
+    other_record = logging.LogRecord("asyncio", logging.WARNING, __file__, 1, "other warning", (), None)
+
+    assert log_filter.filter(noisy_record) is False
+    assert log_filter.filter(other_record) is True
+
+
+def test_sse_proxy_streaming_response_stops_after_send_failure() -> None:
+    closed = False
+
+    async def source() -> AsyncIterator[bytes]:
+        nonlocal closed
+        try:
+            yield b"data: one\n\n"
+            yield b"data: two\n\n"
+        finally:
+            closed = True
+
+    sent: list[dict[str, object]] = []
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+        if message["type"] == "http.response.body" and message.get("body"):
+            raise RuntimeError("client disconnected")
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    response = _SSEProxyStreamingResponse(source(), media_type="text/event-stream")
+    asyncio.run(response({"type": "http", "method": "GET", "path": "/"}, receive, send))
+
+    assert closed is True
+    assert [message["type"] for message in sent] == ["http.response.start", "http.response.body"]
 
 
 def test_extract_usage_limit_cooldown_from_resets_in_seconds() -> None:
@@ -2408,6 +2456,66 @@ def test_should_retry_upstream_server_error_only_for_5xx() -> None:
     assert _should_retry_upstream_server_error(503) is True
     assert _should_retry_upstream_server_error(429) is False
     assert _should_retry_upstream_server_error(400) is False
+
+
+def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeypatch) -> None:
+    app = SimpleNamespace(state=SimpleNamespace(response_traffic=ResponseTrafficController()))
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/images/generations",
+            "headers": [(b"user-agent", b"test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    finalized: list[dict[str, object]] = []
+    counts_started = asyncio.Event()
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=515)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_get_token_counts():
+        counts_started.set()
+        await asyncio.Event().wait()
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        raise AssertionError("proxy call should not run after cancellation")
+
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+
+    async def run() -> None:
+        task = asyncio.create_task(
+            _execute_proxy_request_with_failover(
+                request,
+                endpoint="/v1/images/generations",
+                request_model="gpt-image-2",
+                is_stream=False,
+                proxy_call=fake_proxy_call,
+            )
+        )
+        await counts_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    assert finalized[0]["request_log_id"] == 515
+    assert finalized[0]["status_code"] == 499
+    assert finalized[0]["success"] is False
+    assert finalized[0]["attempt_count"] == 0
+    assert finalized[0]["token_id"] is None
+    assert finalized[0]["account_id"] is None
+    assert finalized[0]["error_message"] == "Client disconnected"
+    assert app.state.response_traffic.active_responses == 0
 
 
 def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monkeypatch) -> None:

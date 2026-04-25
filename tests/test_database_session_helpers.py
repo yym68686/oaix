@@ -1,5 +1,6 @@
 import asyncio
 
+import anyio
 import pytest
 
 from oaix_gateway import database
@@ -68,6 +69,27 @@ def test_get_session_waits_for_close_during_cancellation(monkeypatch) -> None:
         fake_session.close_release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert fake_session.close_finished is True
+
+    asyncio.run(run())
+
+
+def test_get_session_close_survives_anyio_cancel_scope(monkeypatch) -> None:
+    fake_session = _FakeSession()
+    monkeypatch.setattr(database, "get_session_factory", lambda: lambda: fake_session)
+
+    async def worker() -> None:
+        with anyio.CancelScope() as scope:
+            async with database.get_session():
+                scope.cancel()
+
+    async def run() -> None:
+        task = asyncio.create_task(worker())
+        await fake_session.close_started.wait()
+        await asyncio.sleep(0)
+        assert fake_session.close_finished is False
+        fake_session.close_release.set()
+        await task
         assert fake_session.close_finished is True
 
     asyncio.run(run())
