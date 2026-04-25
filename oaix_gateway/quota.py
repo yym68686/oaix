@@ -546,7 +546,8 @@ class CodexQuotaService:
                 account_id=effective_account_id,
             )
         except Exception as exc:
-            if is_permanently_invalid_refresh_token_error(exc):
+            permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
+            if permanent_refresh_failure:
                 oauth_manager.invalidate(token_row.id)
                 detail = getattr(exc, "detail", exc)
                 await mark_token_error(
@@ -555,7 +556,8 @@ class CodexQuotaService:
                     deactivate=True,
                     clear_access_token=True,
                 )
-            logger.warning("Failed to query wham quota for token_id=%s: %s", token_row.id, exc)
+            log_quota_failure = logger.info if permanent_refresh_failure else logger.warning
+            log_quota_failure("Failed to query wham quota for token_id=%s: %s", token_row.id, exc)
             return CodexQuotaSnapshot(
                 fetched_at=fetched_at,
                 error=_shorten_error(str(exc)),

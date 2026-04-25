@@ -3979,7 +3979,7 @@ def _gpt_image_stream_keepalive_response(
                             detail,
                             cooldown_seconds=cooldown_seconds,
                         )
-                        logger.warning(
+                        logger.info(
                             "Codex account cooled down: token_id=%s account_id=%s cooldown_seconds=%s attempt=%s/%s",
                             token_row.id,
                             token_row.account_id,
@@ -4360,7 +4360,7 @@ async def _execute_proxy_request_with_failover(
                         detail,
                         cooldown_seconds=cooldown_seconds,
                     )
-                    logger.warning(
+                    logger.info(
                         "Codex account cooled down: token_id=%s account_id=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
                         token_row.account_id,
