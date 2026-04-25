@@ -59,6 +59,7 @@ from .token_store import (
     mark_token_success,
     repair_duplicate_token_histories,
     set_token_active_state,
+    update_token_order_settings,
     update_token_selection_settings,
 )
 from .usage_cost import UsageMetrics, extract_usage_metrics
@@ -184,6 +185,10 @@ class ChatCompletionsRequest(BaseModel):
 
 class TokenSelectionUpdateRequest(BaseModel):
     strategy: str
+
+
+class TokenSelectionOrderUpdateRequest(BaseModel):
+    token_ids: list[int]
 
 
 class TokenActivationUpdateRequest(BaseModel):
@@ -4478,6 +4483,7 @@ def _serialize_token_selection_settings(settings: TokenSelectionSettings) -> dic
         "strategy": settings.strategy,
         "label": _selection_strategy_label(settings.strategy),
         "description": _selection_strategy_description(settings.strategy),
+        "token_order": list(settings.token_order),
         "updated_at": settings.updated_at,
         "options": [
             {
@@ -4725,6 +4731,15 @@ def create_app() -> FastAPI:
             selection = await update_token_selection_settings(strategy=payload.strategy)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        app.state.token_selection_settings = selection
+        return _serialize_token_selection_settings(selection)
+
+    @app.post("/admin/token-selection/order")
+    async def update_token_selection_order_route(
+        payload: TokenSelectionOrderUpdateRequest,
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        selection = await update_token_order_settings(token_ids=payload.token_ids)
         app.state.token_selection_settings = selection
         return _serialize_token_selection_settings(selection)
 

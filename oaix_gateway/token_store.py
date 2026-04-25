@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import delete, func, nullsfirst, or_, select, text
+from sqlalchemy import case, delete, func, nullsfirst, or_, select, text
 
 from .database import CodexToken, GatewaySetting, close_database, get_read_session, get_session, init_db, utcnow
 from .token_identity import (
@@ -82,6 +82,7 @@ class TokenFileImportSummary:
 @dataclass(frozen=True)
 class TokenSelectionSettings:
     strategy: str
+    token_order: tuple[int, ...] = ()
     updated_at: datetime | None = None
 
 
@@ -326,6 +327,24 @@ def normalize_token_selection_strategy(value: Any) -> str:
         return DEFAULT_TOKEN_SELECTION_STRATEGY
 
 
+def normalize_token_selection_order(value: Any) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+
+    seen: set[int] = set()
+    token_order: list[int] = []
+    for item in value:
+        try:
+            token_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if token_id <= 0 or token_id in seen:
+            continue
+        seen.add(token_id)
+        token_order.append(token_id)
+    return tuple(token_order)
+
+
 def _load_token_payload(token_data_or_json: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(token_data_or_json, dict):
         payload = token_data_or_json
@@ -349,9 +368,20 @@ def _available_token_filters(now: datetime) -> tuple[Any, ...]:
     )
 
 
-def _token_selection_order_clauses(strategy: str | None) -> tuple[Any, ...]:
+def _token_selection_order_clauses(
+    strategy: str | None,
+    *,
+    token_order: Iterable[int] | None = None,
+) -> tuple[Any, ...]:
     resolved = normalize_token_selection_strategy(strategy)
     if resolved == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        ordered_token_ids = normalize_token_selection_order(list(token_order or ()))
+        if ordered_token_ids:
+            order_map = {token_id: index for index, token_id in enumerate(ordered_token_ids)}
+            return (
+                case(order_map, value=CodexToken.id, else_=len(order_map)),
+                CodexToken.id.asc(),
+            )
         return (CodexToken.id.asc(),)
     return (
         nullsfirst(CodexToken.last_used_at.asc()),
@@ -363,10 +393,13 @@ def _token_selection_order_clauses(strategy: str | None) -> tuple[Any, ...]:
 def _build_token_selection_settings(setting: GatewaySetting | None) -> TokenSelectionSettings:
     value = setting.value if setting is not None else None
     strategy = None
+    token_order: tuple[int, ...] = ()
     if isinstance(value, dict):
         strategy = value.get("strategy")
+        token_order = normalize_token_selection_order(value.get("token_order"))
     return TokenSelectionSettings(
         strategy=normalize_token_selection_strategy(strategy),
+        token_order=token_order,
         updated_at=setting.updated_at if setting is not None else None,
     )
 
@@ -588,13 +621,39 @@ async def update_token_selection_settings(*, strategy: str) -> TokenSelectionSet
             if setting is None:
                 setting = GatewaySetting(
                     key=TOKEN_SELECTION_SETTING_KEY,
-                    value={"strategy": resolved_strategy},
+                    value={"strategy": resolved_strategy, "token_order": []},
                     updated_at=utcnow(),
                 )
                 session.add(setting)
             else:
-                payload = setting.value if isinstance(setting.value, dict) else {}
+                payload = dict(setting.value) if isinstance(setting.value, dict) else {}
                 payload["strategy"] = resolved_strategy
+                payload["token_order"] = list(normalize_token_selection_order(payload.get("token_order")))
+                setting.value = payload
+                setting.updated_at = utcnow()
+            await session.flush()
+            return _build_token_selection_settings(setting)
+
+
+async def update_token_order_settings(*, token_ids: Iterable[int]) -> TokenSelectionSettings:
+    resolved_token_order = normalize_token_selection_order(list(token_ids))
+    async with get_session() as session:
+        async with session.begin():
+            setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY, with_for_update=True)
+            if setting is None:
+                setting = GatewaySetting(
+                    key=TOKEN_SELECTION_SETTING_KEY,
+                    value={
+                        "strategy": DEFAULT_TOKEN_SELECTION_STRATEGY,
+                        "token_order": list(resolved_token_order),
+                    },
+                    updated_at=utcnow(),
+                )
+                session.add(setting)
+            else:
+                payload = dict(setting.value) if isinstance(setting.value, dict) else {}
+                payload["strategy"] = normalize_token_selection_strategy(payload.get("strategy"))
+                payload["token_order"] = list(resolved_token_order)
                 setting.value = payload
                 setting.updated_at = utcnow()
             await session.flush()
@@ -617,10 +676,16 @@ async def claim_next_active_token(
     excluded_ids = tuple(sorted({int(token_id) for token_id in (exclude_token_ids or ())}))
     async with get_session() as session:
         async with session.begin():
+            token_order: tuple[int, ...] = ()
+            if normalize_token_selection_strategy(selection_strategy) == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+                setting_result = await session.execute(
+                    select(GatewaySetting).where(GatewaySetting.key == TOKEN_SELECTION_SETTING_KEY).limit(1)
+                )
+                token_order = _build_token_selection_settings(setting_result.scalars().first()).token_order
             stmt = (
                 select(CodexToken)
                 .where(*_available_token_filters(now))
-                .order_by(*_token_selection_order_clauses(selection_strategy))
+                .order_by(*_token_selection_order_clauses(selection_strategy, token_order=token_order))
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )

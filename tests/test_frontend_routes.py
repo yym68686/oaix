@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from oaix_gateway.api_server import WEB_DIR, create_app
 from oaix_gateway.database import CodexToken
-from oaix_gateway.token_store import TokenCounts
+from oaix_gateway.token_store import TokenCounts, TokenSelectionSettings
 
 
 async def _request(
@@ -31,6 +31,7 @@ def test_frontend_routes_are_registered() -> None:
     assert "/healthz" in paths
     assert "/admin/tokens" in paths
     assert "/admin/token-selection" in paths
+    assert "/admin/token-selection/order" in paths
     assert "/admin/tokens/{token_id}/activation" in paths
     assert "/admin/tokens/{token_id}/probe" in paths
     assert "/admin/tokens/{token_id}" in paths
@@ -85,6 +86,16 @@ def test_frontend_token_cards_always_render_probe_button() -> None:
     assert action_renderer.index("${probeButton}") < action_renderer.index('${actionButtons.join("")}')
 
 
+def test_frontend_token_cards_support_fill_first_drag_ordering() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+
+    assert 'data-token-draggable="${draggable ? "true" : "false"}"' in app_js
+    assert 'draggable="${draggable ? "true" : "false"}"' in app_js
+    assert 'fetchJson("/admin/token-selection/order"' in app_js
+    assert 'elements.tokenList.addEventListener("dragstart", handleTokenCardDragStart)' in app_js
+    assert 'state.tokenSelectionStrategy === "fill_first"' in app_js
+
+
 def test_frontend_probe_request_sends_selected_model() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     probe_function = app_js.split("async function probeToken", 1)[1].split("async function deleteToken", 1)[0]
@@ -92,6 +103,33 @@ def test_frontend_probe_request_sends_selected_model() -> None:
     assert "const selectedModel = normalizeProbeModel(model)" in probe_function
     assert "headers: authHeaders(true)" in probe_function
     assert "body: JSON.stringify({ model: selectedModel })" in probe_function
+
+
+def test_token_selection_order_route_forwards_token_ids(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+    captured: dict[str, object] = {}
+
+    async def fake_update_token_order_settings(*, token_ids):
+        captured["token_ids"] = token_ids
+        return TokenSelectionSettings(strategy="fill_first", token_order=(7, 3, 9))
+
+    monkeypatch.setattr("oaix_gateway.api_server.update_token_order_settings", fake_update_token_order_settings)
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/admin/token-selection/order",
+            json={"token_ids": [7, 3, 7, 9]},
+        )
+    )
+
+    assert response.status_code == 200
+    assert captured == {"token_ids": [7, 3, 7, 9]}
+    assert response.json()["strategy"] == "fill_first"
+    assert response.json()["token_order"] == [7, 3, 9]
 
 
 def test_admin_token_probe_route_accepts_model_payload(monkeypatch) -> None:

@@ -1454,6 +1454,31 @@ button {
   overflow: hidden;
 }
 
+.token-card--draggable {
+  cursor: grab;
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    opacity 160ms ease,
+    transform 160ms ease;
+}
+
+.token-card--draggable:hover {
+  border-color: color-mix(in oklab, var(--available) 36%, var(--border-soft));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.02),
+    0 12px 28px color-mix(in oklab, var(--available) 12%, transparent);
+}
+
+.token-card--draggable:active {
+  cursor: grabbing;
+}
+
+.token-card.is-dragging {
+  opacity: 0.56;
+  transform: scale(0.992);
+}
+
 .token-card::before {
   content: "";
   position: absolute;

@@ -49,6 +49,9 @@ const state = {
   requestsLoaded: false,
   tokenSelectionSaving: false,
   tokenSelectionStrategy: "least_recently_used",
+  tokenSelectionOrder: [],
+  tokenOrderSaving: false,
+  tokenDragTokenId: null,
   probeModel: DEFAULT_PROBE_MODEL,
   themePreference: initialThemePreference,
   resolvedTheme: initialResolvedTheme,
@@ -496,6 +499,23 @@ function normalizeTokenSelectionStrategy(value) {
   return normalized === "fill_first" ? "fill_first" : "least_recently_used";
 }
 
+function normalizeTokenSelectionOrder(value) {
+  const seen = new Set();
+  const order = [];
+  if (!Array.isArray(value)) {
+    return order;
+  }
+  value.forEach((item) => {
+    const tokenId = Number(item);
+    if (!Number.isInteger(tokenId) || tokenId <= 0 || seen.has(tokenId)) {
+      return;
+    }
+    seen.add(tokenId);
+    order.push(tokenId);
+  });
+  return order;
+}
+
 function describeTokenSelectionStrategy(strategy) {
   if (normalizeTokenSelectionStrategy(strategy) === "fill_first") {
     return "首个可用优先";
@@ -596,6 +616,9 @@ function renderInitialLoadingStates() {
 function renderTokenSelection(selection) {
   const strategy = normalizeTokenSelectionStrategy(selection?.strategy);
   state.tokenSelectionStrategy = strategy;
+  if (Array.isArray(selection?.token_order)) {
+    state.tokenSelectionOrder = normalizeTokenSelectionOrder(selection.token_order);
+  }
 
   elements.tokenSelectionButtons.forEach((button) => {
     const active = button.dataset.selectionStrategy === strategy;
@@ -652,6 +675,50 @@ function filterTokenItems(items) {
     const haystack = buildTokenSearchIndex(item);
     return searchTerms.every((term) => haystack.includes(term));
   });
+}
+
+function canDragAvailableTokens() {
+  return (
+    state.tokenSelectionStrategy === "fill_first" &&
+    !state.tokenOrderSaving &&
+    getTokenSearchTerms().length === 0
+  );
+}
+
+function getTokenSelectionOrderRanks() {
+  const ranks = new Map();
+  state.tokenSelectionOrder.forEach((tokenId, index) => {
+    ranks.set(Number(tokenId), index);
+  });
+  return ranks;
+}
+
+function sortAvailableTokenItems(items) {
+  const list = Array.isArray(items) ? [...items] : [];
+  if (state.tokenSelectionStrategy !== "fill_first") {
+    return list;
+  }
+  const ranks = getTokenSelectionOrderRanks();
+  const fallbackRank = ranks.size;
+  return list.sort((left, right) => {
+    const leftId = Number(left?.id);
+    const rightId = Number(right?.id);
+    const leftRank = ranks.has(leftId) ? ranks.get(leftId) : fallbackRank;
+    const rightRank = ranks.has(rightId) ? ranks.get(rightId) : fallbackRank;
+    if (leftRank !== rightRank) {
+      return leftRank - rightRank;
+    }
+    return leftId - rightId;
+  });
+}
+
+function mergeVisibleTokenOrder(visibleTokenIds) {
+  const visibleOrder = normalizeTokenSelectionOrder(visibleTokenIds);
+  const visibleIds = new Set(visibleOrder);
+  return [
+    ...visibleOrder,
+    ...state.tokenSelectionOrder.filter((tokenId) => !visibleIds.has(Number(tokenId))),
+  ];
 }
 
 function renderTokenSearchSummary(totalCount, visibleCount, customMessage = "") {
@@ -1204,6 +1271,8 @@ function renderTokenErrorSection(item) {
 
 function renderTokenCard(item, workspaceTokenCounts) {
   const status = deriveStatus(item);
+  const tokenId = Number(item?.id);
+  const draggable = status.tone === "available" && canDragAvailableTokens();
   const presentation = buildTokenPresentation(item, workspaceTokenCounts);
   const planLabel = formatPlanType(item.plan_type);
   const planTone = derivePlanTone(item.plan_type);
@@ -1224,7 +1293,13 @@ function renderTokenCard(item, workspaceTokenCounts) {
   const errorSection = renderTokenErrorSection(item);
   const observedCostLabel = "已用金额";
   return `
-    <article class="token-card token-card--${status.tone}">
+    <article
+      class="token-card token-card--${status.tone}${draggable ? " token-card--draggable" : ""}"
+      data-token-card-id="${Number.isFinite(tokenId) ? tokenId : ""}"
+      data-token-draggable="${draggable ? "true" : "false"}"
+      draggable="${draggable ? "true" : "false"}"
+      aria-grabbed="false"
+    >
       <div class="token-card__top">
         <div class="token-card__identity">
           <span class="token-card__account">${escapeHtml(presentation.account)}</span>
@@ -1543,12 +1618,13 @@ function renderTokenList(items) {
     }
     availableItems.push(item);
   });
+  const orderedAvailableItems = sortAvailableTokenItems(availableItems);
 
   const availableOpen = resolveTokenGroupOpenState("available", true);
-  const coolingOpen = resolveTokenGroupOpenState("cooling", availableItems.length === 0 && coolingItems.length > 0);
+  const coolingOpen = resolveTokenGroupOpenState("cooling", orderedAvailableItems.length === 0 && coolingItems.length > 0);
   const disabledOpen = resolveTokenGroupOpenState(
     "disabled",
-    availableItems.length === 0 && coolingItems.length === 0 && disabledItems.length > 0,
+    orderedAvailableItems.length === 0 && coolingItems.length === 0 && disabledItems.length > 0,
   );
 
   elements.tokenList.innerHTML = `
@@ -1556,13 +1632,13 @@ function renderTokenList(items) {
       id: "available",
       title: "可用",
       meta: describeTokenGroupMeta(
-        availableItems,
+        orderedAvailableItems,
         "可立即调度",
         "当前没有可立即调度的 key",
-        buildWorkspaceTokenCounts(availableItems),
+        buildWorkspaceTokenCounts(orderedAvailableItems),
       ),
       tone: "available",
-      items: availableItems,
+      items: orderedAvailableItems,
       itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
       open: availableOpen,
       emptyMessage: "当前没有可立即调度的 key。",
@@ -1901,6 +1977,40 @@ async function saveTokenSelection(strategy) {
   }
 }
 
+async function saveTokenOrder(visibleTokenIds) {
+  const nextOrder = mergeVisibleTokenOrder(visibleTokenIds);
+  if (!nextOrder.length || state.tokenOrderSaving) {
+    return;
+  }
+  if (JSON.stringify(nextOrder) === JSON.stringify(state.tokenSelectionOrder)) {
+    return;
+  }
+
+  const previousOrder = [...state.tokenSelectionOrder];
+  state.tokenOrderSaving = true;
+  state.tokenSelectionOrder = nextOrder;
+  elements.listNote.textContent = "正在保存 Fill-first 顺序…";
+
+  try {
+    const data = await fetchJson("/admin/token-selection/order", {
+      method: "POST",
+      headers: authHeaders(true),
+      body: JSON.stringify({ token_ids: nextOrder }),
+    });
+    renderTokenSelection(data);
+    elements.listNote.textContent = "Fill-first 顺序已保存";
+  } catch (error) {
+    state.tokenSelectionOrder = previousOrder;
+    elements.listNote.textContent =
+      error.status === 401 ? "需要输入 Service API Key 才能保存 Fill-first 顺序" : `顺序保存失败：${error.message}`;
+    renderTokenList(state.tokenItems);
+    throw error;
+  } finally {
+    state.tokenOrderSaving = false;
+    renderTokenList(state.tokenItems);
+  }
+}
+
 async function toggleTokenActivation(
   tokenId,
   { nextActive, clearCooldown = false, pendingKind = nextActive ? "enable" : "disable" } = {},
@@ -2021,6 +2131,140 @@ async function deleteToken(tokenId) {
     if (state.tokenDeleteTargetId === resolvedTokenId) {
       setTokenDeleteDialogBusy(false);
     }
+    renderTokenList(state.tokenItems);
+  }
+}
+
+function isTokenDragGestureTarget(target) {
+  return (
+    target instanceof Element &&
+    !target.closest("button, select, input, textarea, label, a, summary")
+  );
+}
+
+function findAvailableTokenBody(target) {
+  if (!(target instanceof Element)) {
+    return null;
+  }
+  const group = target.closest('[data-token-group="available"]');
+  if (!(group instanceof HTMLElement)) {
+    return null;
+  }
+  const body = group.querySelector(".token-group__body");
+  return body instanceof HTMLElement ? body : null;
+}
+
+function findDraggedTokenCard(target) {
+  if (!(target instanceof Element)) {
+    return null;
+  }
+  const card = target.closest('[data-token-draggable="true"]');
+  if (!(card instanceof HTMLElement)) {
+    return null;
+  }
+  const group = card.closest("[data-token-group]");
+  if (!(group instanceof HTMLElement) || group.dataset.tokenGroup !== "available") {
+    return null;
+  }
+  return card;
+}
+
+function getTokenDragAfterElement(container, pointerY) {
+  const cards = Array.from(
+    container.querySelectorAll('.token-card[data-token-draggable="true"]:not(.is-dragging)'),
+  ).filter((card) => card instanceof HTMLElement);
+  return cards.reduce(
+    (closest, card) => {
+      const box = card.getBoundingClientRect();
+      const offset = pointerY - box.top - box.height / 2;
+      if (offset < 0 && offset > closest.offset) {
+        return { offset, element: card };
+      }
+      return closest;
+    },
+    { offset: Number.NEGATIVE_INFINITY, element: null },
+  ).element;
+}
+
+function collectAvailableTokenOrder(container) {
+  return Array.from(container.querySelectorAll("[data-token-card-id]"))
+    .map((card) => Number(card.getAttribute("data-token-card-id")))
+    .filter((tokenId) => Number.isInteger(tokenId) && tokenId > 0);
+}
+
+function clearTokenDragState() {
+  state.tokenDragTokenId = null;
+  elements.tokenList.querySelectorAll(".token-card.is-dragging").forEach((card) => {
+    card.classList.remove("is-dragging");
+    card.setAttribute("aria-grabbed", "false");
+  });
+}
+
+function handleTokenCardDragStart(event) {
+  if (!canDragAvailableTokens() || !isTokenDragGestureTarget(event.target)) {
+    event.preventDefault();
+    return;
+  }
+  const card = findDraggedTokenCard(event.target);
+  if (!card) {
+    event.preventDefault();
+    return;
+  }
+  const tokenId = Number(card.dataset.tokenCardId);
+  if (!Number.isInteger(tokenId) || tokenId <= 0) {
+    event.preventDefault();
+    return;
+  }
+  state.tokenDragTokenId = tokenId;
+  card.classList.add("is-dragging");
+  card.setAttribute("aria-grabbed", "true");
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", String(tokenId));
+  }
+}
+
+function handleTokenCardDragOver(event) {
+  if (!state.tokenDragTokenId || !canDragAvailableTokens()) {
+    return;
+  }
+  const body = findAvailableTokenBody(event.target);
+  const draggingCard = body?.querySelector(".token-card.is-dragging");
+  if (!(body instanceof HTMLElement) || !(draggingCard instanceof HTMLElement)) {
+    return;
+  }
+  event.preventDefault();
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = "move";
+  }
+  const afterElement = getTokenDragAfterElement(body, event.clientY);
+  if (afterElement == null) {
+    body.appendChild(draggingCard);
+    return;
+  }
+  body.insertBefore(draggingCard, afterElement);
+}
+
+async function handleTokenCardDrop(event) {
+  if (!state.tokenDragTokenId || !canDragAvailableTokens()) {
+    return;
+  }
+  const body = findAvailableTokenBody(event.target);
+  if (!(body instanceof HTMLElement)) {
+    return;
+  }
+  event.preventDefault();
+  const tokenOrder = collectAvailableTokenOrder(body);
+  clearTokenDragState();
+  try {
+    await saveTokenOrder(tokenOrder);
+  } catch {}
+}
+
+function handleTokenCardDragEnd() {
+  const wasDragging = Boolean(state.tokenDragTokenId);
+  clearTokenDragState();
+  if (wasDragging) {
     renderTokenList(state.tokenItems);
   }
 }
@@ -2328,6 +2572,13 @@ elements.tokenList.addEventListener("change", (event) => {
   state.probeModel = normalizeProbeModel(event.target.value);
   event.target.value = state.probeModel;
 });
+
+elements.tokenList.addEventListener("dragstart", handleTokenCardDragStart);
+elements.tokenList.addEventListener("dragover", handleTokenCardDragOver);
+elements.tokenList.addEventListener("drop", (event) => {
+  void handleTokenCardDrop(event);
+});
+elements.tokenList.addEventListener("dragend", handleTokenCardDragEnd);
 
 if (elements.toastStack) {
   elements.toastStack.addEventListener("click", (event) => {
