@@ -982,6 +982,40 @@ def test_stream_upstream_response_image_compat_emits_error_event_on_network_abor
     assert "RemoteProtocolError" in capture.error_message
 
 
+def test_stream_upstream_response_emits_error_event_on_network_abort() -> None:
+    class DummyStreamContext:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    async def upstream() -> AsyncIterator[bytes]:
+        raise httpx.RemoteProtocolError("incomplete chunked read")
+        yield b""
+
+    capture = _ProxyStreamCapture(initial_model_name="gpt-5.4")
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_upstream_response(
+            DummyStreamContext(),
+            upstream(),
+            [],
+            stream_committed=True,
+            stream_capture=capture,
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert "event: error" in body
+    assert "Upstream stream aborted before completion" in body
+    assert "data: [DONE]" in body
+    assert capture.completed is False
+    assert capture.error_status_code == 502
+    assert capture.error_message is not None
+    assert "RemoteProtocolError" in capture.error_message
+
+
 def test_collect_responses_json_from_sse_merges_response_and_output_text() -> None:
     async def upstream() -> AsyncIterator[bytes]:
         yield (
@@ -1098,6 +1132,23 @@ def test_collect_images_api_response_from_sse_patches_output_item_done() -> None
         "size": "1024x1024",
         "usage": {"images": 1},
     }
+
+
+def test_collect_images_api_response_from_sse_marks_empty_output_retryable() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"created_at":1710000007,"status":"completed","output":[]}}\n\n'
+        )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(_collect_images_api_response_from_sse(upstream(), response_format="b64_json"))
+
+    exc = exc_info.value
+    assert exc.status_code == 502
+    assert getattr(exc, "retryable", False) is True
+    assert getattr(exc, "record_token_error", False) is True
+    assert "Upstream did not return image output" in str(exc.detail)
 
 
 def test_stream_upstream_image_response_emits_keepalive_comment() -> None:
@@ -1231,7 +1282,7 @@ def test_collect_images_api_response_from_sse_enforces_read_timeout() -> None:
 
     exc = exc_info.value
     assert exc.status_code == 504
-    assert getattr(exc, "retryable", True) is False
+    assert getattr(exc, "retryable", False) is True
     assert getattr(exc, "record_token_error", False) is True
     assert "read timeout" in str(exc.detail)
 

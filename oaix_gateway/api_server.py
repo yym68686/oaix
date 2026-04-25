@@ -565,6 +565,10 @@ def _max_request_account_retries() -> int:
     return _int_env("MAX_REQUEST_ACCOUNT_RETRIES", 100, minimum=1)
 
 
+def _image_request_max_account_retries() -> int:
+    return _int_env("IMAGE_REQUEST_MAX_ACCOUNT_RETRIES", 3, minimum=1)
+
+
 def _default_usage_limit_cooldown_seconds() -> int:
     return _int_env("DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS", 300, minimum=1)
 
@@ -582,13 +586,13 @@ def _compact_server_error_cooldown_seconds() -> int:
 
 
 def _image_non_stream_total_timeout_seconds() -> float:
-    return _float_env("IMAGE_NON_STREAM_TOTAL_TIMEOUT_SECONDS", 300.0, minimum=1.0)
+    return _float_env("IMAGE_NON_STREAM_TOTAL_TIMEOUT_SECONDS", 600.0, minimum=1.0)
 
 
 def _image_non_stream_read_timeout_seconds() -> float:
     return min(
         _image_non_stream_total_timeout_seconds(),
-        _float_env("IMAGE_NON_STREAM_READ_TIMEOUT_SECONDS", 300.0, minimum=1.0),
+        _float_env("IMAGE_NON_STREAM_READ_TIMEOUT_SECONDS", 600.0, minimum=1.0),
     )
 
 
@@ -597,7 +601,7 @@ def _image_non_stream_disconnect_poll_seconds() -> float:
 
 
 def _image_stream_first_output_timeout_seconds() -> float:
-    return _float_env("IMAGE_STREAM_FIRST_OUTPUT_TIMEOUT_SECONDS", 300.0, minimum=1.0)
+    return _float_env("IMAGE_STREAM_FIRST_OUTPUT_TIMEOUT_SECONDS", 600.0, minimum=1.0)
 
 
 def _admin_quota_cache_ttl_seconds() -> int:
@@ -2075,6 +2079,20 @@ def _non_retryable_gateway_http_exception(
     )
 
 
+def _retryable_gateway_http_exception(
+    *,
+    status_code: int,
+    detail: str,
+    record_token_error: bool = True,
+) -> _GatewayProxyHTTPException:
+    return _GatewayProxyHTTPException(
+        status_code=status_code,
+        detail=detail,
+        retryable=True,
+        record_token_error=record_token_error,
+    )
+
+
 async def _collect_responses_json_from_sse(
     upstream_iter: AsyncIterator[bytes],
     *,
@@ -2827,7 +2845,7 @@ async def _await_image_non_stream_chunk(
             if total_timeout_seconds is not None:
                 remaining_total = total_timeout_seconds - (now - started_at_monotonic)
                 if remaining_total <= 0:
-                    raise _non_retryable_gateway_http_exception(
+                    raise _retryable_gateway_http_exception(
                         status_code=504,
                         detail=(
                             "Upstream image request exceeded total timeout "
@@ -2839,7 +2857,7 @@ async def _await_image_non_stream_chunk(
             if read_timeout_seconds is not None:
                 remaining_read = read_timeout_seconds - (now - read_started_at)
                 if remaining_read <= 0:
-                    raise _non_retryable_gateway_http_exception(
+                    raise _retryable_gateway_http_exception(
                         status_code=504,
                         detail=(
                             "Upstream image stream exceeded read timeout "
@@ -2893,7 +2911,7 @@ async def _collect_images_api_response_from_sse(
             )
         except StopAsyncIteration:
             if text_buffer.strip():
-                raise _non_retryable_gateway_http_exception(
+                raise _retryable_gateway_http_exception(
                     status_code=502,
                     detail="Upstream closed stream with an incomplete SSE event",
                 )
@@ -2912,7 +2930,7 @@ async def _collect_images_api_response_from_sse(
 
             event_type, event_payload = _extract_responses_stream_event(raw_event)
             if event_type == "[DONE]":
-                raise _non_retryable_gateway_http_exception(
+                raise _retryable_gateway_http_exception(
                     status_code=502,
                     detail="Upstream closed image stream before completion",
                 )
@@ -2943,7 +2961,7 @@ async def _collect_images_api_response_from_sse(
             try:
                 results, created_at, usage_payload = _extract_images_from_completed_response(patched_event_payload)
             except ValueError as exc:
-                raise _non_retryable_gateway_http_exception(
+                raise _retryable_gateway_http_exception(
                     status_code=502,
                     detail=str(exc),
                 ) from exc
@@ -2955,7 +2973,7 @@ async def _collect_images_api_response_from_sse(
                 response_format=response_format,
             ), first_token_at
 
-    raise _non_retryable_gateway_http_exception(
+    raise _retryable_gateway_http_exception(
         status_code=502,
         detail="Upstream closed image stream before completion",
     )
@@ -3254,7 +3272,7 @@ async def _stream_upstream_image_response(
         for event in events:
             yield event
     except RESPONSES_STREAM_NETWORK_ERRORS as exc:
-        logger.warning(
+        logger.info(
             "Codex upstream image stream aborted after response commit: error_type=%s detail=%s",
             type(exc).__name__,
             str(exc) or type(exc).__name__,
@@ -3489,6 +3507,17 @@ def _should_retry_http_exception(exc: HTTPException) -> bool:
 
 def _should_record_http_exception_token_error(exc: HTTPException) -> bool:
     return bool(getattr(exc, "record_token_error", False))
+
+
+def _is_images_endpoint(endpoint: str) -> bool:
+    return endpoint in {"/v1/images/generations", "/v1/images/edits"}
+
+
+def _effective_proxy_max_attempts(*, endpoint: str, counts_available: int) -> int:
+    max_attempts = max(1, min(counts_available, _max_request_account_retries()))
+    if _is_images_endpoint(endpoint):
+        max_attempts = min(max_attempts, _image_request_max_account_retries())
+    return max_attempts
 
 
 def _usage_finalize_kwargs(usage_metrics: UsageMetrics | None) -> dict[str, Any]:
@@ -3793,7 +3822,7 @@ def _gpt_image_stream_keepalive_response(
             if counts.available <= 0:
                 raise HTTPException(status_code=503, detail="No available Codex token in database")
 
-            max_attempts = max(1, min(counts.available, _max_request_account_retries()))
+            max_attempts = _effective_proxy_max_attempts(endpoint=endpoint, counts_available=counts.available)
             last_error: HTTPException | None = None
 
             while attempt_count < max_attempts:
@@ -4041,7 +4070,7 @@ def _gpt_image_stream_keepalive_response(
                         if compact_server_error_cooling_time > 0:
                             mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
                         await mark_token_error(token_row.id, detail, **mark_kwargs)
-                        logger.warning(
+                        logger.info(
                             "Codex upstream server error before response commit: token_id=%s account_id=%s status=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                             token_row.id,
                             token_row.account_id,
@@ -4071,7 +4100,7 @@ def _gpt_image_stream_keepalive_response(
                         if compact_server_error_cooling_time > 0:
                             mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
                         await mark_token_error(token_row.id, message, **mark_kwargs)
-                        logger.warning(
+                        logger.info(
                             "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                             token_row.id,
                             token_row.account_id,
@@ -4211,7 +4240,7 @@ async def _execute_proxy_request_with_failover(
         if counts.available <= 0:
             raise HTTPException(status_code=503, detail="No available Codex token in database")
 
-        max_attempts = max(1, min(counts.available, _max_request_account_retries()))
+        max_attempts = _effective_proxy_max_attempts(endpoint=endpoint, counts_available=counts.available)
         client: httpx.AsyncClient = http_request.app.state.http_client
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
@@ -4422,7 +4451,7 @@ async def _execute_proxy_request_with_failover(
                     if compact_server_error_cooling_time > 0:
                         mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
                     await mark_token_error(token_row.id, detail, **mark_kwargs)
-                    logger.warning(
+                    logger.info(
                         "Codex upstream server error before response commit: token_id=%s account_id=%s status=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
                         token_row.account_id,
@@ -4449,7 +4478,7 @@ async def _execute_proxy_request_with_failover(
                     if compact_server_error_cooling_time > 0:
                         mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
                     await mark_token_error(token_row.id, message, **mark_kwargs)
-                    logger.warning(
+                    logger.info(
                         "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
                         token_row.account_id,
@@ -5128,12 +5157,19 @@ async def _stream_upstream_response(
                     stream_capture.feed(chunk)
                 yield chunk
         except RESPONSES_STREAM_NETWORK_ERRORS as exc:
-            logger.warning(
+            logger.info(
                 "Codex upstream stream aborted after response commit: error_type=%s detail=%s",
                 type(exc).__name__,
                 str(exc) or type(exc).__name__,
             )
             if stream_committed:
+                error_event = _build_stream_error_event(
+                    502,
+                    f"Upstream stream aborted before completion: {type(exc).__name__}: {str(exc) or type(exc).__name__}",
+                )
+                if stream_capture is not None:
+                    stream_capture.feed(error_event)
+                yield error_event
                 yield b"data: [DONE]\n\n"
         finally:
             await stream_cm.__aexit__(None, None, None)
@@ -5212,7 +5248,7 @@ async def _stream_upstream_response(
                 stream_capture.feed(event)
             yield event
     except RESPONSES_STREAM_NETWORK_ERRORS as exc:
-        logger.warning(
+        logger.info(
             "Codex upstream stream aborted after response commit: error_type=%s detail=%s",
             type(exc).__name__,
             str(exc) or type(exc).__name__,

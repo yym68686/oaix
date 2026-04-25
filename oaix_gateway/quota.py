@@ -556,8 +556,7 @@ class CodexQuotaService:
                     deactivate=True,
                     clear_access_token=True,
                 )
-            log_quota_failure = logger.info if permanent_refresh_failure else logger.warning
-            log_quota_failure("Failed to query wham quota for token_id=%s: %s", token_row.id, exc)
+            logger.info("Failed to query wham quota for token_id=%s: %s", token_row.id, exc)
             return CodexQuotaSnapshot(
                 fetched_at=fetched_at,
                 error=_shorten_error(str(exc)),
