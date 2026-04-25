@@ -1,7 +1,7 @@
 const STORAGE_KEY = "oaix.serviceKey";
 const THEME_STORAGE_KEY = "oaix.themePreference";
 const IMPORT_JOB_STORAGE_KEY = "oaix.importJobId";
-const REFRESH_INTERVAL_MS = 15000;
+const REFRESH_INTERVAL_MS = 30000;
 const IMPORT_JOB_POLL_INTERVAL_MS = 1500;
 const TOAST_DURATION_MS = 5200;
 const TOAST_EXIT_DURATION_MS = 220;
@@ -52,6 +52,7 @@ const state = {
   tokenSelectionOrder: [],
   tokenOrderSaving: false,
   tokenDragTokenId: null,
+  refreshing: false,
   probeModel: DEFAULT_PROBE_MODEL,
   themePreference: initialThemePreference,
   resolvedTheme: initialResolvedTheme,
@@ -2310,15 +2311,21 @@ async function loadRequests() {
 }
 
 async function refreshDashboard() {
+  if (state.refreshing) {
+    return;
+  }
+  state.refreshing = true;
   elements.refreshButton.disabled = true;
   renderInitialLoadingStates();
   try {
     await loadHealth();
-    await Promise.all([loadTokens(), loadRequests()]);
+    await loadRequests();
+    await loadTokens();
   } catch (error) {
     elements.listNote.textContent = `面板同步失败：${error.message}`;
     elements.requestNote.textContent = `面板同步失败：${error.message}`;
   } finally {
+    state.refreshing = false;
     elements.refreshButton.disabled = false;
     if (state.importJobId && !state.importJobPollTimer) {
       resumeTrackedImportJob();

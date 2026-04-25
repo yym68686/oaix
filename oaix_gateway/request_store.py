@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from .database import CodexToken, GatewayRequestLog, get_read_session, get_session, utcnow
 
@@ -152,6 +152,20 @@ def _request_model_label_expr():
     return func.coalesce(GatewayRequestLog.model_name, GatewayRequestLog.model, "未识别模型")
 
 
+def _build_request_log_summary_stmt():
+    return select(
+        func.count().label("total"),
+        func.sum(case((GatewayRequestLog.success.is_(True), 1), else_=0)).label("successful"),
+        func.sum(case((GatewayRequestLog.success.is_(False), 1), else_=0)).label("failed"),
+        func.sum(case((GatewayRequestLog.is_stream.is_(True), 1), else_=0)).label("streaming"),
+        func.avg(GatewayRequestLog.ttft_ms).label("avg_ttft_ms"),
+        func.sum(GatewayRequestLog.input_tokens).label("input_tokens"),
+        func.sum(GatewayRequestLog.output_tokens).label("output_tokens"),
+        func.sum(GatewayRequestLog.total_tokens).label("total_tokens"),
+        func.sum(GatewayRequestLog.estimated_cost_usd).label("estimated_cost_usd"),
+    ).select_from(GatewayRequestLog)
+
+
 def _build_request_model_analytics_stmt(*, since: datetime, top_models: int):
     model_source = (
         select(
@@ -256,33 +270,27 @@ async def finalize_request_log(
 
 async def get_request_log_summary() -> RequestLogSummary:
     async with get_read_session() as session:
-        total_result = await session.execute(select(func.count()).select_from(GatewayRequestLog))
-        success_result = await session.execute(
-            select(func.count()).select_from(GatewayRequestLog).where(GatewayRequestLog.success.is_(True))
-        )
-        failed_result = await session.execute(
-            select(func.count()).select_from(GatewayRequestLog).where(GatewayRequestLog.success.is_(False))
-        )
-        streaming_result = await session.execute(
-            select(func.count()).select_from(GatewayRequestLog).where(GatewayRequestLog.is_stream.is_(True))
-        )
-        avg_ttft_result = await session.execute(select(func.avg(GatewayRequestLog.ttft_ms)).select_from(GatewayRequestLog))
-        input_tokens_result = await session.execute(select(func.sum(GatewayRequestLog.input_tokens)).select_from(GatewayRequestLog))
-        output_tokens_result = await session.execute(select(func.sum(GatewayRequestLog.output_tokens)).select_from(GatewayRequestLog))
-        total_tokens_result = await session.execute(select(func.sum(GatewayRequestLog.total_tokens)).select_from(GatewayRequestLog))
-        estimated_cost_result = await session.execute(
-            select(func.sum(GatewayRequestLog.estimated_cost_usd)).select_from(GatewayRequestLog)
-        )
-        avg_ttft_raw = avg_ttft_result.scalar_one_or_none()
+        row = (await session.execute(_build_request_log_summary_stmt())).one()
+        (
+            total,
+            successful,
+            failed,
+            streaming,
+            avg_ttft_raw,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            estimated_cost_usd,
+        ) = row
         return RequestLogSummary(
-            total=int(total_result.scalar_one() or 0),
-            successful=int(success_result.scalar_one() or 0),
-            failed=int(failed_result.scalar_one() or 0),
-            streaming=int(streaming_result.scalar_one() or 0),
-            input_tokens=_int_or_zero(input_tokens_result.scalar_one_or_none()),
-            output_tokens=_int_or_zero(output_tokens_result.scalar_one_or_none()),
-            total_tokens=_int_or_zero(total_tokens_result.scalar_one_or_none()),
-            estimated_cost_usd=_round_cost(_float_or_zero(estimated_cost_result.scalar_one_or_none())),
+            total=_int_or_zero(total),
+            successful=_int_or_zero(successful),
+            failed=_int_or_zero(failed),
+            streaming=_int_or_zero(streaming),
+            input_tokens=_int_or_zero(input_tokens),
+            output_tokens=_int_or_zero(output_tokens),
+            total_tokens=_int_or_zero(total_tokens),
+            estimated_cost_usd=_round_cost(_float_or_zero(estimated_cost_usd)),
             avg_ttft_ms=int(round(float(avg_ttft_raw))) if avg_ttft_raw is not None else None,
         )
 

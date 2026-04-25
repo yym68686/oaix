@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.datastructures import UploadFile
 from .chat_image_store import create_chat_image_checkpoint, resolve_chat_image_output_items
 from .codex_constants import CODEX_CLI_VERSION, CODEX_USER_AGENT
@@ -565,7 +566,7 @@ def _admin_quota_cache_ttl_seconds() -> int:
 
 
 def _admin_quota_max_concurrency() -> int:
-    return _int_env("ADMIN_QUOTA_MAX_CONCURRENCY", 4, minimum=1)
+    return _int_env("ADMIN_QUOTA_MAX_CONCURRENCY", 2, minimum=1)
 
 
 def _get_service_api_keys() -> set[str]:
@@ -4618,9 +4619,15 @@ async def _build_admin_token_items(
             token_row.id: plan_info_by_id[token_row.id].chatgpt_account_id or token_row.account_id
             for token_row in token_rows
         }
+        quota_token_rows = [
+            token_row
+            for token_row in token_rows
+            if bool(getattr(token_row, "is_active", False))
+            and _normalize_optional_text(getattr(token_row, "refresh_token", None)) is not None
+        ]
         try:
             quota_by_id = await quota_service.get_many(
-                token_rows,
+                quota_token_rows,
                 client=client,
                 oauth_manager=oauth_manager,
                 account_ids=effective_account_ids,
@@ -4829,9 +4836,12 @@ def create_app() -> FastAPI:
         limit: int = Query(100, ge=1, le=500),
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
-        summary = await get_request_log_summary()
-        analytics = await get_request_log_analytics(hours=24, bucket_minutes=60, top_models=6)
-        items = [asdict(item) for item in await list_request_logs(limit=limit)]
+        try:
+            summary = await get_request_log_summary()
+            analytics = await get_request_log_analytics(hours=24, bucket_minutes=60, top_models=6)
+            items = [asdict(item) for item in await list_request_logs(limit=limit)]
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail="Request logs temporarily unavailable") from exc
         return {
             "summary": asdict(summary),
             "analytics": asdict(analytics),

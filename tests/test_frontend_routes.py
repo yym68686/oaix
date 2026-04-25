@@ -107,6 +107,19 @@ def test_frontend_token_cards_support_fill_first_drag_ordering() -> None:
     assert 'state.tokenSelectionStrategy === "fill_first"' in app_js
 
 
+def test_frontend_dashboard_refresh_does_not_overlap_heavy_admin_requests() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+    refresh_function = app_js.split("async function refreshDashboard", 1)[1].split("function splitTokenInputLines", 1)[0]
+
+    assert "const REFRESH_INTERVAL_MS = 30000" in app_js
+    assert "refreshing: false" in app_js
+    assert "if (state.refreshing)" in refresh_function
+    assert "state.refreshing = true" in refresh_function
+    assert "await loadRequests();" in refresh_function
+    assert "await loadTokens();" in refresh_function
+    assert "Promise.all([loadTokens(), loadRequests()])" not in refresh_function
+
+
 def test_frontend_probe_request_sends_selected_model() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     probe_function = app_js.split("async function probeToken", 1)[1].split("async function deleteToken", 1)[0]

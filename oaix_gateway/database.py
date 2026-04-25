@@ -15,6 +15,28 @@ from .token_identity import collect_refresh_token_aliases
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/oaix_gateway"
 
 
+def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -161,6 +183,9 @@ def get_engine():
     if _engine is None:
         _engine = create_async_engine(
             normalize_database_url(),
+            pool_size=_int_env("DATABASE_POOL_SIZE", 20, minimum=1),
+            max_overflow=_int_env("DATABASE_MAX_OVERFLOW", 20, minimum=0),
+            pool_timeout=_float_env("DATABASE_POOL_TIMEOUT_SECONDS", 10.0, minimum=1.0),
             pool_pre_ping=True,
             pool_reset_on_return="rollback",
         )

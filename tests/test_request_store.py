@@ -3,12 +3,29 @@ from datetime import datetime, timezone
 from sqlalchemy.dialects import postgresql
 
 from oaix_gateway.request_store import (
+    _build_request_log_summary_stmt,
     _build_request_account_costs_stmt,
     _build_request_token_costs_stmt,
     _build_request_model_analytics_stmt,
     _normalize_request_account_ids,
     _normalize_request_token_ids,
 )
+
+
+def test_build_request_log_summary_stmt_uses_single_aggregate_query() -> None:
+    stmt = _build_request_log_summary_stmt()
+
+    sql = str(
+        stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "count(*) AS total" in sql
+    assert "CASE WHEN (gateway_request_logs.success IS true)" in sql
+    assert "sum(gateway_request_logs.estimated_cost_usd)" in sql
+    assert sql.count("FROM gateway_request_logs") == 1
 
 
 def test_build_request_model_analytics_stmt_groups_by_subquery_alias() -> None:

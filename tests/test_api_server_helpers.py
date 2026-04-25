@@ -38,6 +38,7 @@ from oaix_gateway.api_server import (
     _stream_keepalive_interval_seconds,
     _wrap_sse_stream_with_initial_keepalive,
     _build_stream_error_event,
+    _build_admin_token_items,
     _build_upstream_headers,
     _stream_responses_to_chat_completions,
     _stream_upstream_image_response,
@@ -5086,6 +5087,74 @@ def test_probe_token_with_latest_access_token_keeps_disabled_on_auth_failure(mon
 
 def test_codex_token_refresh_token_index_is_declared() -> None:
     assert "ix_codex_tokens_refresh_token" in {index.name for index in CodexToken.__table__.indexes}
+
+
+def test_build_admin_token_items_skips_inactive_tokens_for_quota_fetch(monkeypatch) -> None:
+    quota_token_ids: list[int] = []
+
+    class DummyQuotaService:
+        async def get_many(self, token_rows, *, client, oauth_manager, account_ids):
+            quota_token_ids.extend(token_row.id for token_row in token_rows)
+            return {
+                token_row.id: CodexQuotaSnapshot(
+                    fetched_at=datetime.now(timezone.utc),
+                    error=None,
+                    plan_type="plus",
+                    windows=[],
+                )
+                for token_row in token_rows
+            }
+
+    async def fake_get_request_costs_by_token(token_ids):
+        return {}
+
+    async def fake_get_request_costs_by_account(account_ids):
+        return {}
+
+    async def fake_get_token_counts_by_account_ids(account_ids):
+        return {}
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_request_costs_by_token", fake_get_request_costs_by_token)
+    monkeypatch.setattr("oaix_gateway.api_server.get_request_costs_by_account", fake_get_request_costs_by_account)
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.get_token_counts_by_account_ids",
+        fake_get_token_counts_by_account_ids,
+    )
+
+    active_token = CodexToken(
+        id=51,
+        account_id="acct_active",
+        refresh_token="refresh-active",
+        token_type="codex",
+        is_active=True,
+    )
+    disabled_token = CodexToken(
+        id=52,
+        account_id="acct_disabled",
+        refresh_token="refresh-disabled",
+        token_type="codex",
+        is_active=False,
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            quota_service=DummyQuotaService(),
+            http_client=object(),
+            oauth_manager=object(),
+        )
+    )
+
+    items = asyncio.run(
+        _build_admin_token_items(
+            app,
+            token_rows=[active_token, disabled_token],
+            include_quota=True,
+        )
+    )
+
+    assert quota_token_ids == [51]
+    quota_by_id = {item["id"]: item["quota"] for item in items}
+    assert quota_by_id[51] is not None
+    assert quota_by_id[52] is None
 
 
 def test_gateway_request_log_token_index_is_declared() -> None:
