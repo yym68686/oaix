@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import codecs
+import contextvars
 import copy
 import hashlib
 import json
@@ -8,9 +9,10 @@ import logging
 import mimetypes
 import os
 import re
+import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -129,6 +131,61 @@ RESPONSES_STREAM_NETWORK_ERRORS = (
 DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS = 30.0
 STREAM_KEEPALIVE_PADDING_BYTES = 2048
 STREAM_KEEPALIVE_COMMENT = b": keepalive" + (b" " * STREAM_KEEPALIVE_PADDING_BYTES) + b"\n\n"
+
+
+class _RequestTimingRecorder:
+    def __init__(self) -> None:
+        self._spans: dict[str, int] = {}
+
+    def add_elapsed(self, name: str, started_at: float) -> None:
+        self.add_ms(name, int((time.perf_counter() - started_at) * 1000))
+
+    def add_ms(self, name: str, value_ms: int | float) -> None:
+        key = str(name or "").strip()
+        if not key:
+            return
+        try:
+            value = max(0, int(round(float(value_ms))))
+        except (TypeError, ValueError):
+            return
+        self._spans[key] = self._spans.get(key, 0) + value
+
+    @contextmanager
+    def measure(self, name: str):
+        started_at = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add_elapsed(name, started_at)
+
+    def snapshot(self) -> dict[str, int]:
+        return dict(self._spans)
+
+
+async def _finalize_request_log_with_timing(
+    timing: _RequestTimingRecorder | None,
+    request_log_id: int,
+    **kwargs,
+) -> None:
+    if timing is not None and "timing_spans" not in kwargs:
+        kwargs["timing_spans"] = timing.snapshot()
+    resolved_spans = await finalize_request_log(request_log_id, **kwargs)
+    if resolved_spans:
+        logger.info(
+            "Request timing spans: request_log_id=%s spans=%s",
+            request_log_id,
+            json.dumps(resolved_spans, sort_keys=True, separators=(",", ":")),
+        )
+
+
+_REQUEST_TIMING: contextvars.ContextVar[_RequestTimingRecorder | None] = contextvars.ContextVar(
+    "oaix_request_timing",
+    default=None,
+)
+
+
+def _current_request_timing() -> _RequestTimingRecorder | None:
+    return _REQUEST_TIMING.get()
 
 
 class _AsyncioSocketSendWarningFilter(logging.Filter):
@@ -2336,6 +2393,29 @@ async def _prime_responses_upstream_stream(
                 await pending_chunk_task
 
 
+async def _enter_upstream_stream_with_timing(stream_cm):
+    timing = _current_request_timing()
+    started_at = time.perf_counter()
+    try:
+        return await stream_cm.__aenter__()
+    finally:
+        if timing is not None:
+            timing.add_elapsed("upstream_headers_ms", started_at)
+
+
+async def _prime_responses_upstream_stream_with_timing(
+    upstream_iter: AsyncIterator[bytes],
+    *,
+    heartbeat_interval_seconds: float | None = None,
+) -> _PrimedResponsesStream:
+    timing = _current_request_timing()
+    with timing.measure("upstream_first_semantic_sse_ms") if timing is not None else suppress():
+        return await _prime_responses_upstream_stream(
+            upstream_iter,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
+
+
 def _extract_images_from_completed_response(
     payload: Any,
 ) -> tuple[list[ImageCallResult], int, dict[str, Any] | None]:
@@ -3328,7 +3408,7 @@ async def _proxy_image_request_with_token(
                 content=json_payload,
                 timeout=timeout,
             )
-            upstream_response = await stream_cm.__aenter__()
+            upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
             if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
                 try:
                     raw = await upstream_response.aread()
@@ -3341,7 +3421,7 @@ async def _proxy_image_request_with_token(
 
             upstream_iter = upstream_response.aiter_raw()
             try:
-                primed_stream = await _prime_responses_upstream_stream(
+                primed_stream = await _prime_responses_upstream_stream_with_timing(
                     upstream_iter,
                     heartbeat_interval_seconds=stream_keepalive_interval_seconds,
                 )
@@ -3385,7 +3465,7 @@ async def _proxy_image_request_with_token(
         content=json_payload,
         timeout=timeout,
     )
-    upstream_response = await stream_cm.__aenter__()
+    upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
     try:
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()
@@ -3541,9 +3621,15 @@ def _usage_finalize_kwargs(usage_metrics: UsageMetrics | None) -> dict[str, Any]
     }
 
 
-async def _finalize_cancelled_request_log(*args, **kwargs) -> None:
+async def _finalize_cancelled_request_log(
+    *args,
+    timing: _RequestTimingRecorder | None = None,
+    **kwargs,
+) -> None:
     async def finalize_with_cancel_shield() -> None:
         with anyio.CancelScope(shield=True):
+            if timing is not None and "timing_spans" not in kwargs:
+                kwargs["timing_spans"] = timing.snapshot()
             await finalize_request_log(*args, **kwargs)
 
     finalize_task = asyncio.create_task(finalize_with_cancel_shield(), name="oaix-cancelled-request-log-finalize")
@@ -3739,11 +3825,13 @@ async def _finalize_stream_request_log(
     fallback_model_name: str | None,
     fallback_first_token_at: datetime | None,
     stream_capture: _ProxyStreamCapture,
+    timing: _RequestTimingRecorder | None = None,
 ) -> None:
     try:
         failed = stream_capture.error_message is not None and not stream_capture.completed
         final_status_code = (stream_capture.error_status_code or status_code) if failed else status_code
-        await finalize_request_log(
+        await _finalize_request_log_with_timing(
+            timing,
             request_log_id,
             status_code=final_status_code,
             success=not failed,
@@ -3801,6 +3889,7 @@ def _gpt_image_stream_keepalive_response(
     proxy_call: Callable[[httpx.AsyncClient, str, str | None], Awaitable[ProxyRequestResult]],
     request_log_id: int,
     response_lease: Any,
+    timing: _RequestTimingRecorder | None,
 ) -> StreamingResponse:
     output_queue: asyncio.Queue[bytes | object] = asyncio.Queue()
     queue_done_sentinel = object()
@@ -3808,6 +3897,7 @@ def _gpt_image_stream_keepalive_response(
     first_output_timeout_seconds = _image_stream_first_output_timeout_seconds()
 
     async def worker() -> None:
+        timing_context_token = _REQUEST_TIMING.set(timing) if timing is not None else None
         client: httpx.AsyncClient = http_request.app.state.http_client
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
@@ -3824,11 +3914,12 @@ def _gpt_image_stream_keepalive_response(
         postponed_unknown_plan_tokens: list[Any] = []
 
         try:
-            counts = await _await_with_keepalive_queue(
-                get_token_counts(),
-                output_queue=output_queue,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-            )
+            with timing.measure("token_counts_ms") if timing is not None else suppress():
+                counts = await _await_with_keepalive_queue(
+                    get_token_counts(),
+                    output_queue=output_queue,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
             if counts.available <= 0:
                 raise HTTPException(status_code=503, detail="No available Codex token in database")
 
@@ -3836,14 +3927,15 @@ def _gpt_image_stream_keepalive_response(
             last_error: HTTPException | None = None
 
             while attempt_count < max_attempts:
-                token_row = await _await_with_keepalive_queue(
-                    claim_next_active_token(
-                        selection_strategy=selection_settings.strategy,
-                        exclude_token_ids=excluded_token_ids,
-                    ),
-                    output_queue=output_queue,
-                    heartbeat_interval_seconds=heartbeat_interval_seconds,
-                )
+                with timing.measure("claim_token_ms") if timing is not None else suppress():
+                    token_row = await _await_with_keepalive_queue(
+                        claim_next_active_token(
+                            selection_strategy=selection_settings.strategy,
+                            exclude_token_ids=excluded_token_ids,
+                        ),
+                        output_queue=output_queue,
+                        heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    )
                 using_postponed_unknown_plan = False
                 if token_row is None:
                     if require_non_free_token and postponed_unknown_plan_tokens:
@@ -3882,11 +3974,12 @@ def _gpt_image_stream_keepalive_response(
                 last_account_id = token_row.account_id
 
                 try:
-                    access_token, access_token_refreshed = await _await_with_keepalive_queue(
-                        oauth_manager.get_access_token(token_row, client),
-                        output_queue=output_queue,
-                        heartbeat_interval_seconds=heartbeat_interval_seconds,
-                    )
+                    with timing.measure("oauth_ms") if timing is not None else suppress():
+                        access_token, access_token_refreshed = await _await_with_keepalive_queue(
+                            oauth_manager.get_access_token(token_row, client),
+                            output_queue=output_queue,
+                            heartbeat_interval_seconds=heartbeat_interval_seconds,
+                        )
                 except HTTPException as exc:
                     oauth_manager.invalidate(token_row.id)
                     permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
@@ -3983,6 +4076,7 @@ def _gpt_image_stream_keepalive_response(
                             fallback_model_name=proxy_result.model_name,
                             fallback_first_token_at=proxy_result.first_token_at,
                             stream_capture=proxy_result.stream_capture,
+                            timing=timing,
                         )
                         if proxy_result.stream_capture.error_message is not None and not proxy_result.stream_capture.completed:
                             await mark_token_error(
@@ -3992,7 +4086,8 @@ def _gpt_image_stream_keepalive_response(
                             stream_finalized = True
                             return
                     else:
-                        await finalize_request_log(
+                        await _finalize_request_log_with_timing(
+                            timing,
                             request_log_id,
                             status_code=proxy_result.status_code,
                             success=True,
@@ -4003,7 +4098,8 @@ def _gpt_image_stream_keepalive_response(
                             account_id=token_row.account_id,
                             model_name=proxy_result.model_name,
                         )
-                    await mark_token_success(token_row.id)
+                    with timing.measure("mark_success_ms") if timing is not None else suppress():
+                        await mark_token_success(token_row.id)
                     stream_finalized = True
                     await _run_proxy_result_success_hook(proxy_result, request_log_id=request_log_id)
                     return
@@ -4147,11 +4243,13 @@ def _gpt_image_stream_keepalive_response(
                     token_id=last_token_id,
                     account_id=last_account_id,
                     error_message="Client disconnected",
+                    timing=timing,
                 )
             raise
         except HTTPException as exc:
             if not stream_finalized:
-                await finalize_request_log(
+                await _finalize_request_log_with_timing(
+                    timing,
                     request_log_id,
                     status_code=getattr(exc, "status_code", 500),
                     success=False,
@@ -4165,7 +4263,8 @@ def _gpt_image_stream_keepalive_response(
             await output_queue.put(b"data: [DONE]\n\n")
         except Exception as exc:
             if not stream_finalized:
-                await finalize_request_log(
+                await _finalize_request_log_with_timing(
+                    timing,
                     request_log_id,
                     status_code=500,
                     success=False,
@@ -4178,8 +4277,12 @@ def _gpt_image_stream_keepalive_response(
             await output_queue.put(_build_stream_error_event(500, str(exc) or type(exc).__name__))
             await output_queue.put(b"data: [DONE]\n\n")
         finally:
-            await output_queue.put(queue_done_sentinel)
-            await response_lease.release()
+            try:
+                await output_queue.put(queue_done_sentinel)
+                await response_lease.release()
+            finally:
+                if timing_context_token is not None:
+                    _REQUEST_TIMING.reset(timing_context_token)
 
     async def response_body() -> AsyncGenerator[bytes, None]:
         worker_task = asyncio.create_task(worker())
@@ -4218,16 +4321,18 @@ async def _execute_proxy_request_with_failover(
     response_traffic: ResponseTrafficController = http_request.app.state.response_traffic
     response_lease = response_traffic.start_response()
     release_response_traffic = True
+    timing = _RequestTimingRecorder()
     request_started_at = utcnow()
-    request_log = await create_request_log(
-        request_id=str(uuid.uuid4()),
-        endpoint=endpoint,
-        model=request_model,
-        is_stream=is_stream,
-        started_at=request_started_at,
-        client_ip=http_request.client.host if http_request.client is not None else None,
-        user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
-    )
+    with timing.measure("request_log_ms"):
+        request_log = await create_request_log(
+            request_id=str(uuid.uuid4()),
+            endpoint=endpoint,
+            model=request_model,
+            is_stream=is_stream,
+            started_at=request_started_at,
+            client_ip=http_request.client.host if http_request.client is not None else None,
+            user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
+        )
 
     if is_stream and _is_responses_image_compat_model(request_model):
         release_response_traffic = False
@@ -4239,14 +4344,17 @@ async def _execute_proxy_request_with_failover(
             proxy_call=proxy_call,
             request_log_id=request_log.id,
             response_lease=response_lease,
+            timing=timing,
         )
 
     attempt_count = 0
     last_token_id: int | None = None
     last_account_id: str | None = None
 
+    timing_context_token = _REQUEST_TIMING.set(timing)
     try:
-        counts = await get_token_counts()
+        with timing.measure("token_counts_ms"):
+            counts = await get_token_counts()
         if counts.available <= 0:
             raise HTTPException(status_code=503, detail="No available Codex token in database")
 
@@ -4263,10 +4371,11 @@ async def _execute_proxy_request_with_failover(
         postponed_unknown_plan_tokens: list[Any] = []
 
         while attempt_count < max_attempts:
-            token_row = await claim_next_active_token(
-                selection_strategy=selection_settings.strategy,
-                exclude_token_ids=excluded_token_ids,
-            )
+            with timing.measure("claim_token_ms"):
+                token_row = await claim_next_active_token(
+                    selection_strategy=selection_settings.strategy,
+                    exclude_token_ids=excluded_token_ids,
+                )
             using_postponed_unknown_plan = False
             if token_row is None:
                 if require_non_free_token and postponed_unknown_plan_tokens:
@@ -4305,7 +4414,8 @@ async def _execute_proxy_request_with_failover(
             last_account_id = token_row.account_id
 
             try:
-                access_token, access_token_refreshed = await oauth_manager.get_access_token(token_row, client)
+                with timing.measure("oauth_ms"):
+                    access_token, access_token_refreshed = await oauth_manager.get_access_token(token_row, client)
             except HTTPException as exc:
                 oauth_manager.invalidate(token_row.id)
                 permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
@@ -4322,7 +4432,8 @@ async def _execute_proxy_request_with_failover(
 
             try:
                 proxy_result = await proxy_call(client, access_token, token_row.account_id)
-                await mark_token_success(token_row.id)
+                with timing.measure("mark_success_ms"):
+                    await mark_token_success(token_row.id)
                 if isinstance(proxy_result.response, StreamingResponse):
 
                     async def on_stream_close(
@@ -4343,9 +4454,11 @@ async def _execute_proxy_request_with_failover(
                                     fallback_model_name=proxied_result.model_name,
                                     fallback_first_token_at=proxied_result.first_token_at,
                                     stream_capture=proxied_result.stream_capture,
+                                    timing=timing,
                                 )
                             else:
-                                await finalize_request_log(
+                                await _finalize_request_log_with_timing(
+                                    timing,
                                     request_log.id,
                                     status_code=proxied_result.status_code,
                                     success=True,
@@ -4374,7 +4487,8 @@ async def _execute_proxy_request_with_failover(
                     release_response_traffic = False
                     return proxy_result.response
 
-                await finalize_request_log(
+                await _finalize_request_log_with_timing(
+                    timing,
                     request_log.id,
                     status_code=proxy_result.status_code,
                     success=True,
@@ -4553,10 +4667,12 @@ async def _execute_proxy_request_with_failover(
             token_id=last_token_id,
             account_id=last_account_id,
             error_message="Client disconnected",
+            timing=timing,
         )
         raise
     except HTTPException as exc:
-        await finalize_request_log(
+        await _finalize_request_log_with_timing(
+            timing,
             request_log.id,
             status_code=getattr(exc, "status_code", 500),
             success=False,
@@ -4568,7 +4684,8 @@ async def _execute_proxy_request_with_failover(
         )
         raise
     except Exception as exc:
-        await finalize_request_log(
+        await _finalize_request_log_with_timing(
+            timing,
             request_log.id,
             status_code=500,
             success=False,
@@ -4582,6 +4699,7 @@ async def _execute_proxy_request_with_failover(
     finally:
         if release_response_traffic:
             await response_lease.release()
+        _REQUEST_TIMING.reset(timing_context_token)
 
 
 async def _wrap_streaming_body_iterator(
@@ -5361,7 +5479,7 @@ async def _proxy_request_with_token(
                 content=json_payload,
                 timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
             )
-            upstream_response = await stream_cm.__aenter__()
+            upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
             if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
                 try:
                     raw = await upstream_response.aread()
@@ -5374,7 +5492,7 @@ async def _proxy_request_with_token(
 
             upstream_iter = upstream_response.aiter_raw()
             try:
-                primed_stream = await _prime_responses_upstream_stream(
+                primed_stream = await _prime_responses_upstream_stream_with_timing(
                     upstream_iter,
                     heartbeat_interval_seconds=heartbeat_interval_seconds,
                 )
@@ -5417,7 +5535,7 @@ async def _proxy_request_with_token(
             content=json_payload,
             timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
         )
-        upstream_response = await stream_cm.__aenter__()
+        upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()
             await stream_cm.__aexit__(None, None, None)
@@ -5428,7 +5546,7 @@ async def _proxy_request_with_token(
 
         upstream_iter = upstream_response.aiter_raw()
         try:
-            primed_stream = await _prime_responses_upstream_stream(upstream_iter)
+            primed_stream = await _prime_responses_upstream_stream_with_timing(upstream_iter)
         except HTTPException:
             await stream_cm.__aexit__(None, None, None)
             raise
@@ -5469,7 +5587,7 @@ async def _proxy_request_with_token(
             content=json_payload,
             timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
         )
-        upstream_response = await stream_cm.__aenter__()
+        upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
         try:
             if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
                 raw = await upstream_response.aread()
@@ -5504,7 +5622,7 @@ async def _proxy_request_with_token(
         content=json_payload,
         timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
     )
-    upstream_response = await stream_cm.__aenter__()
+    upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
     try:
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()

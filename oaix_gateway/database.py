@@ -101,6 +101,7 @@ class GatewayRequestLog(Base):
     first_token_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     ttft_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    timing_spans: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -294,6 +295,8 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN total_tokens INTEGER"))
         if "estimated_cost_usd" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN estimated_cost_usd DOUBLE PRECISION"))
+        if "timing_spans" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN timing_spans JSON"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_token_id ON gateway_request_logs (token_id)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model ON gateway_request_logs (model)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))

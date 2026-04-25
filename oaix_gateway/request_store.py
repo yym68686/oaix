@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from time import perf_counter
+from typing import Any
 
 from sqlalchemy import case, func, select, text
 
@@ -26,6 +28,7 @@ class RequestLogItem:
     first_token_at: datetime | None
     ttft_ms: int | None
     duration_ms: int | None
+    timing_spans: dict[str, Any] | None
     input_tokens: int | None
     output_tokens: int | None
     total_tokens: int | None
@@ -50,6 +53,22 @@ def _ms_between(started_at: datetime | None, ended_at: datetime | None) -> int |
     if started_at is None or ended_at is None:
         return None
     return max(0, int((ended_at - started_at).total_seconds() * 1000))
+
+
+def _normalize_timing_spans(timing_spans: dict[str, Any] | None) -> dict[str, int] | None:
+    if not isinstance(timing_spans, dict):
+        return None
+
+    normalized: dict[str, int] = {}
+    for key, value in timing_spans.items():
+        name = str(key or "").strip()
+        if not name or isinstance(value, bool):
+            continue
+        try:
+            normalized[name] = max(0, int(round(float(value))))
+        except (TypeError, ValueError):
+            continue
+    return normalized or None
 
 
 @dataclass(frozen=True)
@@ -259,14 +278,17 @@ async def finalize_request_log(
     output_tokens: int | None = None,
     total_tokens: int | None = None,
     estimated_cost_usd: float | None = None,
+    timing_spans: dict[str, Any] | None = None,
     error_message: str | None = None,
-) -> None:
+) -> dict[str, int] | None:
+    finalize_started = perf_counter()
     finished_at = finished_at or utcnow()
+    resolved_timing_spans = _normalize_timing_spans(timing_spans)
     async with get_session() as session:
         async with session.begin():
             item = await session.get(GatewayRequestLog, request_log_id, with_for_update=True)
             if item is None:
-                return
+                return None
             item.status_code = int(status_code)
             item.success = bool(success)
             item.attempt_count = max(0, int(attempt_count))
@@ -287,7 +309,11 @@ async def finalize_request_log(
             item.estimated_cost_usd = (
                 _round_cost(estimated_cost_usd) if estimated_cost_usd is not None else item.estimated_cost_usd
             )
+            if resolved_timing_spans is not None:
+                resolved_timing_spans["finalize_ms"] = max(0, int((perf_counter() - finalize_started) * 1000))
+                item.timing_spans = resolved_timing_spans
             item.error_message = (error_message or "").strip()[:4000] or None
+    return resolved_timing_spans
 
 
 async def get_request_log_summary() -> RequestLogSummary:
@@ -346,6 +372,7 @@ async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
                 first_token_at=item.first_token_at,
                 ttft_ms=item.ttft_ms,
                 duration_ms=item.duration_ms,
+                timing_spans=item.timing_spans if isinstance(item.timing_spans, dict) else None,
                 input_tokens=item.input_tokens,
                 output_tokens=item.output_tokens,
                 total_tokens=item.total_tokens,
