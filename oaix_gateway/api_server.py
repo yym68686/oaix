@@ -4987,9 +4987,12 @@ def create_app() -> FastAPI:
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         try:
-            summary = await get_request_log_summary()
-            analytics = await get_request_log_analytics(hours=24, bucket_minutes=60, top_models=6)
-            items = [asdict(item) for item in await list_request_logs(limit=limit)]
+            summary, analytics, raw_items = await asyncio.gather(
+                get_request_log_summary(),
+                get_request_log_analytics(hours=24, bucket_minutes=60, top_models=6),
+                list_request_logs(limit=limit),
+            )
+            items = [asdict(item) for item in raw_items]
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail="Request logs temporarily unavailable") from exc
         return {

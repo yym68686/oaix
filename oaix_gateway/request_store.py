@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, text
 
 from .database import CodexToken, GatewayRequestLog, get_read_session, get_session, utcnow
 
@@ -193,6 +193,28 @@ def _build_request_model_analytics_stmt(*, since: datetime, top_models: int):
     )
 
 
+def _build_request_bucket_analytics_stmt(*, since: datetime, bucket_minutes: int):
+    safe_bucket_minutes = max(1, int(bucket_minutes))
+    bucket_start = func.date_bin(
+        text(f"INTERVAL '{safe_bucket_minutes} minutes'"),
+        GatewayRequestLog.started_at,
+        text("TIMESTAMPTZ '1970-01-01 00:00:00+00'"),
+    ).label("bucket_start")
+    return (
+        select(
+            bucket_start,
+            func.count().label("request_count"),
+            func.sum(GatewayRequestLog.input_tokens).label("input_tokens"),
+            func.sum(GatewayRequestLog.output_tokens).label("output_tokens"),
+            func.sum(GatewayRequestLog.total_tokens).label("total_tokens"),
+            func.sum(GatewayRequestLog.estimated_cost_usd).label("estimated_cost_usd"),
+        )
+        .where(GatewayRequestLog.started_at >= since)
+        .group_by(bucket_start)
+        .order_by(bucket_start.asc())
+    )
+
+
 async def create_request_log(
     *,
     request_id: str,
@@ -376,18 +398,14 @@ async def get_request_log_analytics(*, hours: int = 24, bucket_minutes: int = 60
     last_bucket = _floor_bucket_start(now, bucket_minutes=effective_bucket_minutes)
 
     async with get_read_session() as session:
-        bucket_stmt = (
-            select(
-                GatewayRequestLog.started_at,
-                GatewayRequestLog.input_tokens,
-                GatewayRequestLog.output_tokens,
-                GatewayRequestLog.total_tokens,
-                GatewayRequestLog.estimated_cost_usd,
+        bucket_rows = (
+            await session.execute(
+                _build_request_bucket_analytics_stmt(
+                    since=since,
+                    bucket_minutes=effective_bucket_minutes,
+                )
             )
-            .where(GatewayRequestLog.started_at >= since)
-            .order_by(GatewayRequestLog.started_at.asc(), GatewayRequestLog.id.asc())
-        )
-        bucket_rows = (await session.execute(bucket_stmt)).all()
+        ).all()
 
         model_stmt = _build_request_model_analytics_stmt(since=since, top_models=effective_top_models)
         model_rows = (await session.execute(model_stmt)).all()
@@ -405,8 +423,7 @@ async def get_request_log_analytics(*, hours: int = 24, bucket_minutes: int = 60
         }
         cursor += timedelta(minutes=effective_bucket_minutes)
 
-    for started_at, input_tokens, output_tokens, total_tokens, estimated_cost_usd in bucket_rows:
-        bucket_start = _floor_bucket_start(started_at, bucket_minutes=effective_bucket_minutes)
+    for bucket_start, request_count, input_tokens, output_tokens, total_tokens, estimated_cost_usd in bucket_rows:
         bucket = bucket_map.setdefault(
             bucket_start,
             {
@@ -418,7 +435,7 @@ async def get_request_log_analytics(*, hours: int = 24, bucket_minutes: int = 60
                 "estimated_cost_usd": 0.0,
             },
         )
-        bucket["request_count"] = _int_or_zero(bucket["request_count"]) + 1
+        bucket["request_count"] = _int_or_zero(bucket["request_count"]) + _int_or_zero(request_count)
         bucket["input_tokens"] = _int_or_zero(bucket["input_tokens"]) + _int_or_zero(input_tokens)
         bucket["output_tokens"] = _int_or_zero(bucket["output_tokens"]) + _int_or_zero(output_tokens)
         bucket["total_tokens"] = _int_or_zero(bucket["total_tokens"]) + _int_or_zero(total_tokens)

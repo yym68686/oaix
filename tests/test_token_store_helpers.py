@@ -2,9 +2,12 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy.dialects import postgresql
+
 from oaix_gateway.database import CodexToken
 from oaix_gateway.token_store import (
     TokenHistoryRepairSummary,
+    _build_token_counts_stmt,
     _merge_duplicate_token_rows,
     repair_duplicate_token_histories,
     set_token_active_state,
@@ -29,6 +32,22 @@ class _FakeSession:
 
     async def close(self) -> None:
         return None
+
+
+def test_build_token_counts_stmt_uses_single_aggregate_query() -> None:
+    stmt = _build_token_counts_stmt(datetime(2026, 4, 25, tzinfo=timezone.utc))
+
+    sql = str(
+        stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "count(*) AS total" in sql
+    assert "sum(CASE WHEN (codex_tokens.is_active IS true)" in sql
+    assert "codex_tokens.type = 'codex'" in sql
+    assert sql.count("FROM codex_tokens") == 1
 
 
 def test_merge_duplicate_token_rows_marks_shadow_and_preserves_canonical_history() -> None:

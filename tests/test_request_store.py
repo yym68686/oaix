@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy.dialects import postgresql
 
 from oaix_gateway.request_store import (
+    _build_request_bucket_analytics_stmt,
     _build_request_log_summary_stmt,
     _build_request_account_costs_stmt,
     _build_request_token_costs_stmt,
@@ -44,6 +45,24 @@ def test_build_request_model_analytics_stmt_groups_by_subquery_alias() -> None:
     assert "FROM (SELECT" in sql
     assert "GROUP BY anon_1.model_name" in sql
     assert "GROUP BY coalesce(" not in sql
+
+
+def test_build_request_bucket_analytics_stmt_groups_in_database() -> None:
+    stmt = _build_request_bucket_analytics_stmt(
+        since=datetime(2026, 4, 14, tzinfo=timezone.utc),
+        bucket_minutes=60,
+    )
+
+    sql = str(
+        stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "date_bin(INTERVAL '60 minutes'" in sql
+    assert "GROUP BY date_bin(" in sql
+    assert "ORDER BY bucket_start ASC" in sql
 
 
 def test_normalize_request_account_ids_deduplicates_blank_values() -> None:

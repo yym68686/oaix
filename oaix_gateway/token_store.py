@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import case, delete, func, nullsfirst, or_, select, text
+from sqlalchemy import and_, case, delete, func, nullsfirst, or_, select, text
 
 from .database import CodexToken, GatewaySetting, close_database, get_read_session, get_session, init_db, utcnow
 from .token_identity import (
@@ -838,41 +838,43 @@ async def mark_token_error(
                 token.cooldown_until = utcnow() + timedelta(seconds=max(0, int(cooldown_seconds)))
 
 
+def _build_token_counts_stmt(now: datetime):
+    available_condition = and_(
+        CodexToken.is_active.is_(True),
+        CodexToken.refresh_token.is_not(None),
+        CodexToken.token_type == "codex",
+        or_(CodexToken.cooldown_until.is_(None), CodexToken.cooldown_until <= now),
+    )
+    cooling_condition = and_(
+        CodexToken.is_active.is_(True),
+        CodexToken.refresh_token.is_not(None),
+        CodexToken.token_type == "codex",
+        CodexToken.cooldown_until.is_not(None),
+        CodexToken.cooldown_until > now,
+    )
+    return (
+        select(
+            func.count().label("total"),
+            func.sum(case((CodexToken.is_active.is_(True), 1), else_=0)).label("active"),
+            func.sum(case((available_condition, 1), else_=0)).label("available"),
+            func.sum(case((cooling_condition, 1), else_=0)).label("cooling"),
+            func.sum(case((CodexToken.is_active.is_(False), 1), else_=0)).label("disabled"),
+        )
+        .select_from(CodexToken)
+        .where(*_canonical_token_filters())
+    )
+
+
 async def get_token_counts() -> TokenCounts:
     now = utcnow()
     async with get_read_session() as session:
-        total_result = await session.execute(
-            select(func.count()).select_from(CodexToken).where(*_canonical_token_filters())
-        )
-        active_result = await session.execute(
-            select(func.count())
-            .select_from(CodexToken)
-            .where(*_canonical_token_filters(), CodexToken.is_active.is_(True))
-        )
-        available_result = await session.execute(
-            select(func.count()).select_from(CodexToken).where(*_available_token_filters(now))
-        )
-        cooling_result = await session.execute(
-            select(func.count()).select_from(CodexToken).where(
-                *_canonical_token_filters(),
-                CodexToken.is_active.is_(True),
-                CodexToken.refresh_token.is_not(None),
-                CodexToken.token_type == "codex",
-                CodexToken.cooldown_until.is_not(None),
-                CodexToken.cooldown_until > now,
-            )
-        )
-        disabled_result = await session.execute(
-            select(func.count())
-            .select_from(CodexToken)
-            .where(*_canonical_token_filters(), CodexToken.is_active.is_(False))
-        )
+        total, active, available, cooling, disabled = (await session.execute(_build_token_counts_stmt(now))).one()
         return TokenCounts(
-            total=int(total_result.scalar_one() or 0),
-            active=int(active_result.scalar_one() or 0),
-            available=int(available_result.scalar_one() or 0),
-            cooling=int(cooling_result.scalar_one() or 0),
-            disabled=int(disabled_result.scalar_one() or 0),
+            total=int(total or 0),
+            active=int(active or 0),
+            available=int(available or 0),
+            cooling=int(cooling or 0),
+            disabled=int(disabled or 0),
         )
 
 
