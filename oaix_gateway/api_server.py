@@ -566,7 +566,7 @@ def _max_request_account_retries() -> int:
 
 
 def _image_request_max_account_retries() -> int:
-    return _int_env("IMAGE_REQUEST_MAX_ACCOUNT_RETRIES", 3, minimum=1)
+    return _int_env("IMAGE_REQUEST_MAX_ACCOUNT_RETRIES", 8, minimum=1)
 
 
 def _default_usage_limit_cooldown_seconds() -> int:
@@ -3509,6 +3509,16 @@ def _should_record_http_exception_token_error(exc: HTTPException) -> bool:
     return bool(getattr(exc, "record_token_error", False))
 
 
+def _is_retryable_upstream_transport_exception(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPError):
+        return True
+    if isinstance(exc, AttributeError):
+        return "'NoneType' object has no attribute 'call_soon'" in str(exc)
+    if isinstance(exc, RuntimeError):
+        return "Event loop is closed" in str(exc)
+    return False
+
+
 def _is_images_endpoint(endpoint: str) -> bool:
     return endpoint in {"/v1/images/generations", "/v1/images/edits"}
 
@@ -4466,6 +4476,35 @@ async def _execute_proxy_request_with_failover(
 
                 raise
             except httpx.HTTPError as exc:
+                message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                    compact=compact,
+                    status_code=500,
+                    error_text=message,
+                )
+                if attempt < max_attempts:
+                    excluded_token_ids.add(token_row.id)
+                    mark_kwargs: dict[str, Any] = {}
+                    if compact_server_error_cooling_time > 0:
+                        mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                    await mark_token_error(token_row.id, message, **mark_kwargs)
+                    logger.info(
+                        "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        type(exc).__name__,
+                        compact,
+                        compact_server_error_cooling_time,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = HTTPException(status_code=502, detail=message)
+                    continue
+                await mark_token_error(token_row.id, message)
+                raise HTTPException(status_code=502, detail=message) from exc
+            except Exception as exc:
+                if not _is_retryable_upstream_transport_exception(exc):
+                    raise
                 message = f"Upstream request failed: {type(exc).__name__}: {exc}"
                 compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
                     compact=compact,
