@@ -473,18 +473,22 @@ class CodexQuotaService:
             if cached is not None:
                 return cached
 
-            snapshot = await self._fetch_snapshot(
-                token_row,
-                client=client,
-                oauth_manager=oauth_manager,
-                account_id=account_id,
-            )
+            async with self._semaphore:
+                snapshot = await self._fetch_snapshot(
+                    token_row,
+                    client=client,
+                    oauth_manager=oauth_manager,
+                    account_id=account_id,
+                )
             self._cache[token_row.id] = _CachedQuotaSnapshot(
                 snapshot=snapshot,
                 expires_at=snapshot.fetched_at + timedelta(seconds=self._ttl_seconds),
             )
             if snapshot.plan_type:
-                await update_token_plan_type(token_row.id, plan_type=snapshot.plan_type)
+                try:
+                    await update_token_plan_type(token_row.id, plan_type=snapshot.plan_type)
+                except Exception:
+                    logger.exception("Failed to persist quota plan type for token_id=%s", token_row.id)
             return snapshot
 
     async def get_many(
@@ -496,12 +500,21 @@ class CodexQuotaService:
         account_ids: dict[int, str | None],
     ) -> dict[int, CodexQuotaSnapshot]:
         async def load(token_row: CodexToken) -> tuple[int, CodexQuotaSnapshot]:
-            snapshot = await self.get_snapshot(
-                token_row,
-                client=client,
-                oauth_manager=oauth_manager,
-                account_id=account_ids.get(token_row.id),
-            )
+            try:
+                snapshot = await self.get_snapshot(
+                    token_row,
+                    client=client,
+                    oauth_manager=oauth_manager,
+                    account_id=account_ids.get(token_row.id),
+                )
+            except Exception as exc:
+                logger.exception("Failed to build quota snapshot for token_id=%s", token_row.id)
+                snapshot = CodexQuotaSnapshot(
+                    fetched_at=utcnow(),
+                    error=_shorten_error(str(exc) or type(exc).__name__),
+                    plan_type=None,
+                    windows=[],
+                )
             return token_row.id, snapshot
 
         results = await asyncio.gather(*(load(token_row) for token_row in token_rows))
@@ -617,9 +630,8 @@ class CodexQuotaService:
             "User-Agent": WHAM_USER_AGENT,
             "Chatgpt-Account-Id": account_id,
         }
-        async with self._semaphore:
-            return await client.get(
-                WHAM_USAGE_URL,
-                headers=headers,
-                timeout=self._request_timeout_seconds,
-            )
+        return await client.get(
+            WHAM_USAGE_URL,
+            headers=headers,
+            timeout=self._request_timeout_seconds,
+        )

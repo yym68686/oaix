@@ -4359,6 +4359,7 @@ async def _execute_proxy_request_with_failover(
                     error_text=detail,
                 )
                 if _should_retry_http_exception(exc) and attempt < max_attempts:
+                    excluded_token_ids.add(token_row.id)
                     mark_kwargs: dict[str, Any] = {}
                     if compact_server_error_cooling_time > 0:
                         mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
@@ -4385,6 +4386,7 @@ async def _execute_proxy_request_with_failover(
                     error_text=message,
                 )
                 if attempt < max_attempts:
+                    excluded_token_ids.add(token_row.id)
                     mark_kwargs: dict[str, Any] = {}
                     if compact_server_error_cooling_time > 0:
                         mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
@@ -4701,6 +4703,12 @@ def create_app() -> FastAPI:
             content=html,
             headers={"Cache-Control": "no-store, max-age=0"},
         )
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    @app.get("/apple-touch-icon.png", include_in_schema=False)
+    @app.get("/apple-touch-icon-precomposed.png", include_in_schema=False)
+    async def empty_icon() -> Response:
+        return Response(status_code=204, headers={"Cache-Control": "public, max-age=86400"})
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -7,7 +8,7 @@ import httpx
 from fastapi import HTTPException
 
 from .database import CodexToken
-from .token_store import update_token_refresh_state
+from .token_store import get_token_row, update_token_refresh_state
 
 
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -34,6 +35,8 @@ PERMANENT_REFRESH_TOKEN_MESSAGE_MARKERS = (
     "refresh token not found",
     "refresh token revoked",
 )
+
+logger = logging.getLogger("oaix.gateway")
 
 
 def _normalize_optional_text(value: Any) -> str | None:
@@ -176,6 +179,35 @@ class CodexOAuthManager:
             "expires_at": expires_at,
         }
 
+    async def _recover_concurrent_refresh(
+        self,
+        token_row: CodexToken,
+        *,
+        attempted_refresh_token: str,
+    ) -> str | None:
+        try:
+            latest = await get_token_row(token_row.id)
+        except Exception:
+            logger.exception("Failed to inspect token state after refresh failure for token_id=%s", token_row.id)
+            return None
+
+        if latest is None or not latest.is_active:
+            return None
+        if str(latest.refresh_token or "").strip() == str(attempted_refresh_token or "").strip():
+            return None
+        if not self._access_token_is_valid(latest.access_token, latest.expires_at):
+            return None
+
+        self._cache[token_row.id] = {
+            "access_token": latest.access_token,
+            "refresh_token": latest.refresh_token,
+            "expires_at": latest.expires_at,
+        }
+        token_row.access_token = latest.access_token
+        token_row.refresh_token = latest.refresh_token
+        token_row.expires_at = latest.expires_at
+        return str(latest.access_token)
+
     async def get_access_token(
         self,
         token_row: CodexToken,
@@ -198,7 +230,18 @@ class CodexOAuthManager:
                 }
                 return str(token_row.access_token), False
 
-            refreshed = await self._refresh_codex_access_token(client, token_row.refresh_token)
+            attempted_refresh_token = token_row.refresh_token
+            try:
+                refreshed = await self._refresh_codex_access_token(client, attempted_refresh_token)
+            except HTTPException as exc:
+                if is_permanently_invalid_refresh_token_error(exc):
+                    recovered_access_token = await self._recover_concurrent_refresh(
+                        token_row,
+                        attempted_refresh_token=attempted_refresh_token,
+                    )
+                    if recovered_access_token is not None:
+                        return recovered_access_token, False
+                raise
             next_refresh_token = refreshed.get("refresh_token") or token_row.refresh_token
             await update_token_refresh_state(
                 token_row.id,

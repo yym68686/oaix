@@ -9,6 +9,7 @@ description = "Standalone Codex key-pool and responses gateway extracted from oa
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "anyio>=4.0",
     "asyncpg>=0.30",
     "fastapi>=0.115",
     "httpx>=0.28",

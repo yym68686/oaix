@@ -28,6 +28,9 @@ def test_frontend_routes_are_registered() -> None:
     paths = {route.path for route in app.routes}
 
     assert "/" in paths
+    assert "/favicon.ico" in paths
+    assert "/apple-touch-icon.png" in paths
+    assert "/apple-touch-icon-precomposed.png" in paths
     assert "/healthz" in paths
     assert "/admin/tokens" in paths
     assert "/admin/token-selection" in paths
@@ -72,6 +75,14 @@ def test_frontend_index_busts_asset_cache_with_content_hash() -> None:
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert f'/assets/styles.css?v={css_version}' in response.text
     assert f'/assets/app.js?v={js_version}' in response.text
+
+
+def test_browser_icon_routes_do_not_404() -> None:
+    app = create_app()
+
+    for path in ("/favicon.ico", "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"):
+        response = asyncio.run(_request(app, "GET", path))
+        assert response.status_code == 204
 
 
 def test_frontend_token_cards_always_render_probe_button() -> None:

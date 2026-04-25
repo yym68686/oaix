@@ -2409,6 +2409,122 @@ def test_should_retry_upstream_server_error_only_for_5xx() -> None:
     assert _should_retry_upstream_server_error(400) is False
 
 
+def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run for retryable server errors")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    first_token = CodexToken(
+        id=31,
+        account_id="acct_31",
+        refresh_token="refresh-31",
+        token_type="codex",
+        is_active=True,
+    )
+    second_token = CodexToken(
+        id=32,
+        account_id="acct_32",
+        refresh_token="refresh-32",
+        token_type="codex",
+        is_active=True,
+    )
+    claim_calls: list[tuple[int, ...]] = []
+    mark_error_calls: list[tuple[int, str]] = []
+    mark_success_calls: list[int] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if first_token.id not in excluded:
+            return first_token
+        if second_token.id not in excluded:
+            return second_token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=131)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_error(token_id: int, message: str, **kwargs) -> None:
+        mark_error_calls.append((token_id, message))
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        if account_id == "acct_31":
+            raise HTTPException(status_code=504, detail="upstream gateway timeout")
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-5",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    assert response.status_code == 200
+    assert claim_calls == [(), (31,)]
+    assert mark_error_calls == [(31, "upstream gateway timeout")]
+    assert mark_success_calls == [32]
+    assert finalized[0]["attempt_count"] == 2
+    assert finalized[0]["token_id"] == 32
+
+
 def test_execute_proxy_request_with_failover_does_not_retry_nonretryable_http_exception(
     monkeypatch,
 ) -> None:

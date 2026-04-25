@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import anyio
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -179,7 +180,11 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def _close_session(session: AsyncSession) -> None:
-    close_task = asyncio.create_task(session.close(), name="oaix-db-session-close")
+    async def close_with_cancel_shield() -> None:
+        with anyio.CancelScope(shield=True):
+            await session.close()
+
+    close_task = asyncio.create_task(close_with_cancel_shield(), name="oaix-db-session-close")
     try:
         await asyncio.shield(close_task)
     except asyncio.CancelledError:

@@ -6,7 +6,13 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 
 from oaix_gateway.database import CodexToken
-from oaix_gateway.quota import CodexQuotaService, WHAM_USER_AGENT, extract_codex_plan_info, parse_codex_quota_payload
+from oaix_gateway.quota import (
+    CodexQuotaService,
+    CodexQuotaSnapshot,
+    WHAM_USER_AGENT,
+    extract_codex_plan_info,
+    parse_codex_quota_payload,
+)
 
 
 def _jwt_like(payload: dict) -> str:
@@ -208,3 +214,90 @@ def test_quota_service_deactivates_permanently_invalid_refresh_tokens(monkeypatc
         "cooldown_seconds": None,
         "clear_access_token": True,
     }
+
+
+def test_quota_service_limits_full_snapshot_fetch_concurrency(monkeypatch) -> None:
+    active = 0
+    max_active = 0
+
+    async def fake_fetch_snapshot(self, token_row, *, client, oauth_manager, account_id):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return CodexQuotaSnapshot(
+            fetched_at=datetime.now(timezone.utc),
+            error=None,
+            plan_type="plus",
+            windows=[],
+        )
+
+    async def fake_update_token_plan_type(token_id: int, *, plan_type: str | None) -> None:
+        return None
+
+    monkeypatch.setattr("oaix_gateway.quota.CodexQuotaService._fetch_snapshot", fake_fetch_snapshot)
+    monkeypatch.setattr("oaix_gateway.quota.update_token_plan_type", fake_update_token_plan_type)
+
+    token_rows = [
+        CodexToken(
+            id=token_id,
+            account_id=f"acct_{token_id}",
+            refresh_token=f"rt_{token_id}",
+            token_type="codex",
+            is_active=True,
+        )
+        for token_id in range(1, 7)
+    ]
+    service = CodexQuotaService(ttl_seconds=60, concurrency=2)
+
+    async def runner():
+        return await service.get_many(
+            token_rows,
+            client=object(),
+            oauth_manager=object(),
+            account_ids={token_row.id: token_row.account_id for token_row in token_rows},
+        )
+
+    snapshots = asyncio.run(runner())
+
+    assert set(snapshots) == {1, 2, 3, 4, 5, 6}
+    assert max_active == 2
+
+
+def test_quota_service_returns_snapshot_when_plan_type_persist_fails(monkeypatch) -> None:
+    async def fake_fetch_snapshot(self, token_row, *, client, oauth_manager, account_id):
+        return CodexQuotaSnapshot(
+            fetched_at=datetime.now(timezone.utc),
+            error=None,
+            plan_type="plus",
+            windows=[],
+        )
+
+    async def fake_update_token_plan_type(token_id: int, *, plan_type: str | None) -> None:
+        raise TimeoutError("database pool exhausted")
+
+    monkeypatch.setattr("oaix_gateway.quota.CodexQuotaService._fetch_snapshot", fake_fetch_snapshot)
+    monkeypatch.setattr("oaix_gateway.quota.update_token_plan_type", fake_update_token_plan_type)
+
+    token_row = CodexToken(
+        id=17,
+        account_id="acct_17",
+        refresh_token="rt_17",
+        token_type="codex",
+        is_active=True,
+    )
+    service = CodexQuotaService(ttl_seconds=60, concurrency=1)
+
+    async def runner():
+        return await service.get_many(
+            [token_row],
+            client=object(),
+            oauth_manager=object(),
+            account_ids={17: "acct_17"},
+        )
+
+    snapshots = asyncio.run(runner())
+
+    assert snapshots[17].plan_type == "plus"
+    assert snapshots[17].error is None
