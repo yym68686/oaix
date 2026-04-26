@@ -1031,6 +1031,11 @@ function normalizeWhitespace(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function coerceHttpStatus(value) {
+  const status = Number(value);
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+}
+
 function resolveWorkspaceAccountId(item) {
   return normalizeWhitespace(item?.chatgpt_account_id || item?.account_id || "");
 }
@@ -1117,6 +1122,94 @@ function truncateText(value, maxLength = 160) {
   return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 }
 
+function looksLikeHtmlError(value, contentType = "") {
+  const text = String(value || "").trim();
+  if (!text) {
+    return false;
+  }
+  if (String(contentType || "").toLowerCase().includes("text/html")) {
+    return true;
+  }
+  return (
+    /^<!doctype\s+html\b/i.test(text) ||
+    /^<html[\s>]/i.test(text) ||
+    /<head[\s>]/i.test(text) ||
+    /<body[\s>]/i.test(text) ||
+    /<title[\s>][\s\S]*<\/title>/i.test(text)
+  );
+}
+
+function extractHtmlTitle(value) {
+  const raw = String(value || "");
+  if (!raw) {
+    return "";
+  }
+  try {
+    const doc = new DOMParser().parseFromString(raw, "text/html");
+    const title = normalizeWhitespace(doc.querySelector("title")?.textContent || "");
+    if (title) {
+      return title;
+    }
+  } catch {
+    // DOMParser is available in browsers; the regex fallback keeps tests and older runtimes safe.
+  }
+  const titleMatch = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return normalizeWhitespace(titleMatch?.[1] || "");
+}
+
+function stripHtmlErrorTitleNoise(value) {
+  return normalizeWhitespace(value).replace(/^[^|]{1,120}\|\s*/, "");
+}
+
+function inferHtmlErrorStatus(value, fallbackStatus = null) {
+  const status = coerceHttpStatus(fallbackStatus);
+  if (status) {
+    return status;
+  }
+  const titleStatus = extractHtmlTitle(value).match(/\b(5\d{2})\b/);
+  if (titleStatus) {
+    return coerceHttpStatus(titleStatus[1]);
+  }
+  const explicitStatus = normalizeWhitespace(value).match(/\bError(?:\s+code)?\s+(5\d{2})\b/i);
+  return explicitStatus ? coerceHttpStatus(explicitStatus[1]) : null;
+}
+
+function cloudflareErrorLabel(status) {
+  const labels = {
+    520: "Cloudflare 返回未知错误，请稍后重试",
+    521: "源站拒绝连接，请稍后重试",
+    522: "源站连接超时，请稍后重试",
+    523: "源站不可达，请稍后重试",
+    524: "源站响应超时，请稍后重试",
+    525: "SSL 握手失败，请检查源站证书",
+    526: "SSL 证书无效，请检查源站证书",
+    527: "边缘服务执行失败，请稍后重试",
+  };
+  return labels[status] || "";
+}
+
+function summarizeHtmlError(value, { status = null, contentType = "" } = {}) {
+  if (!looksLikeHtmlError(value, contentType)) {
+    return "";
+  }
+
+  const resolvedStatus = inferHtmlErrorStatus(value, status);
+  const statusLabel = resolvedStatus ? `HTTP ${resolvedStatus}` : "请求失败";
+  const cloudflareLabel = cloudflareErrorLabel(resolvedStatus);
+  if (cloudflareLabel) {
+    return `${statusLabel} · ${cloudflareLabel}`;
+  }
+
+  const title = stripHtmlErrorTitleNoise(extractHtmlTitle(value));
+  if (title) {
+    return truncateText(`${statusLabel} · ${title}`, 180);
+  }
+  if (resolvedStatus && resolvedStatus >= 500) {
+    return `${statusLabel} · 服务暂时不可用，请稍后重试`;
+  }
+  return `${statusLabel} · 服务返回了 HTML 错误页，请稍后重试`;
+}
+
 function extractErrorPayload(value) {
   const raw = normalizeWhitespace(value);
   if (!raw) {
@@ -1156,9 +1249,19 @@ function summarizeTokenError(value) {
   }
 
   const raw = payload.raw;
+  const rawHtmlSummary = summarizeHtmlError(raw);
+  if (rawHtmlSummary) {
+    return rawHtmlSummary;
+  }
+
   const source = payload.data && typeof payload.data === "object" ? payload.data : {};
   const type = normalizeWhitespace(source.type || source.code || "");
   const message = normalizeWhitespace(source.message || source.detail || raw);
+  const messageHtmlSummary = summarizeHtmlError(message);
+  if (messageHtmlSummary) {
+    return messageHtmlSummary;
+  }
+
   const haystack = `${type} ${message}`.toLowerCase();
 
   if (type === "usage_limit_reached" || haystack.includes("usage limit")) {
@@ -1834,7 +1937,9 @@ function renderRequestList(items) {
       const attemptLabel = item.attempt_count ? `${item.attempt_count} 次` : "—";
       const endpoint = item.endpoint || "—";
       const startedAt = item.started_at || "";
-      const errorMessage = item.error_message || "—";
+      const rawErrorMessage = item.error_message || "";
+      const errorMessage = rawErrorMessage ? summarizeTokenError(rawErrorMessage) || truncateText(rawErrorMessage, 180) : "—";
+      const errorTitle = rawErrorMessage ? truncateText(rawErrorMessage, 500) : "—";
       const requestedModel = item.model || "";
       const modelName = item.model_name || requestedModel || "未带 model";
       const requestedModelMeta =
@@ -1855,7 +1960,7 @@ function renderRequestList(items) {
           </div>
           <div class="request-row__time" data-label="首字时间">${renderTtftBadge(item.ttft_ms)}</div>
           <div class="request-row__time" data-label="尝试">${escapeHtml(attemptLabel)}</div>
-          <div class="request-row__error" data-label="错误" title="${escapeHtml(errorMessage)}">${escapeHtml(errorMessage)}</div>
+          <div class="request-row__error" data-label="错误" title="${escapeHtml(errorTitle)}">${escapeHtml(errorMessage)}</div>
         </article>
       `;
     })
@@ -1871,8 +1976,7 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
+async function readResponsePayload(response) {
   const text = await response.text();
   let data = null;
   if (text) {
@@ -1882,21 +1986,82 @@ async function fetchJson(url, options = {}) {
       data = text;
     }
   }
+  return { data, text };
+}
+
+function stringifyFetchErrorDetail(value) {
+  if (value == null) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => stringifyFetchErrorDetail(item))
+      .filter(Boolean)
+      .join("; ");
+  }
+  if (typeof value === "object") {
+    const source = value.error && typeof value.error === "object" ? value.error : value;
+    const candidate = source.message || source.detail || source.error || source.code || source.type;
+    if (candidate != null && candidate !== value) {
+      return stringifyFetchErrorDetail(candidate);
+    }
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function formatFetchErrorDetail(response, data) {
+  const status = coerceHttpStatus(response?.status);
+  const statusLabel = status ? `HTTP ${status}` : "请求失败";
+  const statusText = normalizeWhitespace(response?.statusText || "");
+  const contentType = response?.headers?.get?.("content-type") || "";
+
+  const htmlSummary = typeof data === "string" ? summarizeHtmlError(data, { status, contentType }) : "";
+  if (htmlSummary) {
+    return htmlSummary;
+  }
+
+  const detail = stringifyFetchErrorDetail(data);
+  const detailHtmlSummary = summarizeHtmlError(detail, { status, contentType });
+  if (detailHtmlSummary) {
+    return detailHtmlSummary;
+  }
+  if (detail) {
+    return truncateText(detail, 240);
+  }
+  return statusText ? `${statusLabel} · ${statusText}` : statusLabel;
+}
+
+function createFetchError(response, data) {
+  const error = new Error(formatFetchErrorDetail(response, data));
+  error.status = response.status;
+  error.statusText = response.statusText;
+  return error;
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const { data } = await readResponsePayload(response);
   if (!response.ok) {
-    const detail =
-      typeof data === "string"
-        ? data
-        : data?.detail || data?.message || `Request failed with ${response.status}`;
-    const error = new Error(detail);
-    error.status = response.status;
-    throw error;
+    throw createFetchError(response, data);
   }
   return data;
 }
 
 async function loadHealth() {
   const response = await fetch("/healthz");
-  const health = await response.json();
+  const { data } = await readResponsePayload(response);
+  if (!data || typeof data !== "object") {
+    throw createFetchError(response, data);
+  }
+  const health = data;
   state.healthLoaded = true;
   renderCounts(health.counts || {});
   state.protected = Boolean(health.service_key_protected);

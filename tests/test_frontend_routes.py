@@ -129,6 +129,18 @@ def test_frontend_probe_request_sends_selected_model() -> None:
     assert "body: JSON.stringify({ model: selectedModel })" in probe_function
 
 
+def test_frontend_summarizes_html_error_pages_before_rendering() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+    fetch_function = app_js.split("async function fetchJson", 1)[1].split("async function loadHealth", 1)[0]
+    request_renderer = app_js.split("function renderRequestList", 1)[1].split("function escapeHtml", 1)[0]
+
+    assert "function summarizeHtmlError" in app_js
+    assert "524: \"源站响应超时，请稍后重试\"" in app_js
+    assert "throw createFetchError(response, data)" in fetch_function
+    assert "summarizeTokenError(rawErrorMessage)" in request_renderer
+    assert "data?.detail || data?.message" not in fetch_function
+
+
 def test_token_selection_order_route_forwards_token_ids(monkeypatch) -> None:
     monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
     monkeypatch.delenv("API_KEY", raising=False)
