@@ -671,22 +671,36 @@ async def claim_next_active_token(
     *,
     selection_strategy: str | None = None,
     exclude_token_ids: Iterable[int] | None = None,
+    token_order: Iterable[int] | None = None,
 ) -> CodexToken | None:
     now = utcnow()
     excluded_ids = tuple(sorted({int(token_id) for token_id in (exclude_token_ids or ())}))
     resolved_strategy = normalize_token_selection_strategy(selection_strategy)
-    async with get_session() as session:
-        async with session.begin():
-            token_order: tuple[int, ...] = ()
-            if resolved_strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+    if resolved_strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        resolved_token_order = tuple(token_order) if token_order is not None else None
+        async with get_read_session() as session:
+            if resolved_token_order is None:
                 setting_result = await session.execute(
                     select(GatewaySetting).where(GatewaySetting.key == TOKEN_SELECTION_SETTING_KEY).limit(1)
                 )
-                token_order = _build_token_selection_settings(setting_result.scalars().first()).token_order
+                resolved_token_order = _build_token_selection_settings(setting_result.scalars().first()).token_order
             stmt = (
                 select(CodexToken)
                 .where(*_available_token_filters(now))
-                .order_by(*_token_selection_order_clauses(selection_strategy, token_order=token_order))
+                .order_by(*_token_selection_order_clauses(resolved_strategy, token_order=resolved_token_order))
+                .limit(1)
+            )
+            if excluded_ids:
+                stmt = stmt.where(CodexToken.id.notin_(excluded_ids))
+            result = await session.execute(stmt)
+            return result.scalars().first()
+
+    async with get_session() as session:
+        async with session.begin():
+            stmt = (
+                select(CodexToken)
+                .where(*_available_token_filters(now))
+                .order_by(*_token_selection_order_clauses(resolved_strategy))
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )
@@ -696,8 +710,6 @@ async def claim_next_active_token(
             token = result.scalars().first()
             if token is None:
                 return None
-            if resolved_strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
-                return token
             token.last_used_at = utcnow()
             token.updated_at = utcnow()
             await session.flush()

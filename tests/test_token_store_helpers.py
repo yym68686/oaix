@@ -6,9 +6,11 @@ from sqlalchemy.dialects import postgresql
 
 from oaix_gateway.database import CodexToken
 from oaix_gateway.token_store import (
+    TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenHistoryRepairSummary,
     _build_token_counts_stmt,
     _merge_duplicate_token_rows,
+    claim_next_active_token,
     repair_duplicate_token_histories,
     set_token_active_state,
     update_token_refresh_state,
@@ -34,6 +36,39 @@ class _FakeSession:
         return None
 
 
+class _FakeScalarResult:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def first(self):
+        return self._value
+
+
+class _FakeResult:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def scalars(self) -> _FakeScalarResult:
+        return _FakeScalarResult(self._value)
+
+
+class _FakeReadSession:
+    def __init__(self, value) -> None:
+        self._value = value
+        self.statements: list[str] = []
+
+    async def execute(self, stmt) -> _FakeResult:
+        self.statements.append(
+            str(
+                stmt.compile(
+                    dialect=postgresql.dialect(),
+                    compile_kwargs={"literal_binds": True},
+                )
+            )
+        )
+        return _FakeResult(self._value)
+
+
 def test_build_token_counts_stmt_uses_single_aggregate_query() -> None:
     stmt = _build_token_counts_stmt(datetime(2026, 4, 25, tzinfo=timezone.utc))
 
@@ -48,6 +83,45 @@ def test_build_token_counts_stmt_uses_single_aggregate_query() -> None:
     assert "sum(CASE WHEN (codex_tokens.is_active IS true)" in sql
     assert "codex_tokens.type = 'codex'" in sql
     assert sql.count("FROM codex_tokens") == 1
+
+
+def test_claim_next_active_token_fill_first_is_read_only_and_uses_app_token_order(monkeypatch) -> None:
+    token = CodexToken(
+        id=7,
+        refresh_token="rt_7",
+        token_type="codex",
+        is_active=True,
+        last_used_at=None,
+    )
+    read_session = _FakeReadSession(token)
+
+    @asynccontextmanager
+    async def fake_get_read_session():
+        yield read_session
+
+    @asynccontextmanager
+    async def fake_get_session():
+        raise AssertionError("fill_first claim should use the read-only session")
+        yield
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_read_session", fake_get_read_session)
+    monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
+
+    result = asyncio.run(
+        claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(9, 7, 5),
+        )
+    )
+
+    assert result is token
+    assert token.last_used_at is None
+    assert len(read_session.statements) == 1
+    sql = read_session.statements[0]
+    assert "FROM codex_tokens" in sql
+    assert "gateway_settings" not in sql
+    assert "FOR UPDATE" not in sql
+    assert "CASE codex_tokens.id" in sql
 
 
 def test_merge_duplicate_token_rows_marks_shadow_and_preserves_canonical_history() -> None:

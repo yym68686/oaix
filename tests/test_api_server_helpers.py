@@ -2510,7 +2510,13 @@ def test_should_retry_upstream_server_error_only_for_5xx() -> None:
 
 
 def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeypatch) -> None:
-    app = SimpleNamespace(state=SimpleNamespace(response_traffic=ResponseTrafficController()))
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=object(),
+        )
+    )
     request = Request(
         {
             "type": "http",
@@ -2523,7 +2529,7 @@ def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeyp
         receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
     )
     finalized: list[dict[str, object]] = []
-    counts_started = asyncio.Event()
+    claim_started = asyncio.Event()
 
     async def fake_create_request_log(**kwargs):
         return SimpleNamespace(id=515)
@@ -2531,8 +2537,8 @@ def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeyp
     async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
         finalized.append({"request_log_id": request_log_id, **kwargs})
 
-    async def fake_get_token_counts():
-        counts_started.set()
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        claim_started.set()
         await asyncio.Event().wait()
 
     async def fake_proxy_call(client, access_token: str, account_id: str | None):
@@ -2540,7 +2546,7 @@ def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeyp
 
     monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
     monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
-    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
 
     async def run() -> None:
         task = asyncio.create_task(
@@ -2552,7 +2558,7 @@ def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeyp
                 proxy_call=fake_proxy_call,
             )
         )
-        await counts_started.wait()
+        await claim_started.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -2723,15 +2729,19 @@ def test_execute_proxy_request_with_failover_returns_stream_before_mark_success(
     )
     mark_started = asyncio.Event()
     mark_continue = asyncio.Event()
+    create_started = asyncio.Event()
+    create_continue = asyncio.Event()
     finalized: list[dict[str, object]] = []
 
     async def fake_get_token_counts():
-        return SimpleNamespace(available=1)
+        raise AssertionError("get_token_counts should not run in the proxy hot path")
 
     async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
         return token_row
 
     async def fake_create_request_log(**kwargs):
+        create_started.set()
+        await create_continue.wait()
         return SimpleNamespace(id=141)
 
     async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
@@ -2763,16 +2773,17 @@ def test_execute_proxy_request_with_failover_returns_stream_before_mark_success(
     monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
 
     async def run() -> tuple[StreamingResponse, list[bytes]]:
-        response = await asyncio.wait_for(
+        execute_task = asyncio.create_task(
             _execute_proxy_request_with_failover(
                 request,
                 endpoint="/v1/responses",
                 request_model="gpt-5.5",
                 is_stream=True,
                 proxy_call=fake_proxy_call,
-            ),
-            timeout=0.05,
+            )
         )
+        await asyncio.wait_for(create_started.wait(), timeout=0.05)
+        response = await asyncio.wait_for(execute_task, timeout=0.05)
         assert isinstance(response, StreamingResponse)
         assert not mark_started.is_set()
 
@@ -2780,6 +2791,7 @@ def test_execute_proxy_request_with_failover_returns_stream_before_mark_success(
             return [chunk async for chunk in response.body_iterator]
 
         collect_task = asyncio.create_task(collect())
+        create_continue.set()
         await asyncio.wait_for(mark_started.wait(), timeout=0.05)
         mark_continue.set()
         chunks = await asyncio.wait_for(collect_task, timeout=0.05)
@@ -2794,7 +2806,7 @@ def test_execute_proxy_request_with_failover_returns_stream_before_mark_success(
     assert app.state.response_traffic.active_responses == 0
 
 
-def test_execute_proxy_request_with_failover_caches_token_counts(monkeypatch) -> None:
+def test_execute_proxy_request_with_failover_does_not_count_tokens_on_hot_path(monkeypatch) -> None:
     app = SimpleNamespace(
         state=SimpleNamespace(
             response_traffic=ResponseTrafficController(),
@@ -2819,13 +2831,10 @@ def test_execute_proxy_request_with_failover_caches_token_counts(monkeypatch) ->
         is_active=True,
         plan_type="team",
     )
-    counts_calls = 0
     log_id = 200
 
     async def fake_get_token_counts():
-        nonlocal counts_calls
-        counts_calls += 1
-        return SimpleNamespace(available=1)
+        raise AssertionError("get_token_counts should not run in the proxy hot path")
 
     async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
         return token_row
@@ -2885,7 +2894,6 @@ def test_execute_proxy_request_with_failover_caches_token_counts(monkeypatch) ->
 
     asyncio.run(run())
 
-    assert counts_calls == 1
     assert app.state.response_traffic.active_responses == 0
 
 

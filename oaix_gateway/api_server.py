@@ -164,18 +164,25 @@ class _RequestTimingRecorder:
 
 async def _finalize_request_log_with_timing(
     timing: _RequestTimingRecorder | None,
-    request_log_id: int,
+    request_log_ref: Any,
     **kwargs,
-) -> None:
-    if timing is not None and "timing_spans" not in kwargs:
-        kwargs["timing_spans"] = timing.snapshot()
-    resolved_spans = await finalize_request_log(request_log_id, **kwargs)
+) -> int | None:
+    finalize_method = getattr(request_log_ref, "finalize", None)
+    if callable(finalize_method):
+        request_log_id, resolved_spans = await finalize_method(timing=timing, **kwargs)
+    else:
+        if timing is not None and "timing_spans" not in kwargs:
+            kwargs["timing_spans"] = timing.snapshot()
+        request_log_id = int(request_log_ref)
+        resolved_spans = await finalize_request_log(request_log_id, **kwargs)
+
     if resolved_spans:
         logger.info(
             "Request timing spans: request_log_id=%s spans=%s",
             request_log_id,
             json.dumps(resolved_spans, sort_keys=True, separators=(",", ":")),
         )
+    return request_log_id
 
 
 _REQUEST_TIMING: contextvars.ContextVar[_RequestTimingRecorder | None] = contextvars.ContextVar(
@@ -225,79 +232,6 @@ async def _await_timed(
             timing.add_elapsed("db_pool_wait_ms", started_at)
 
 
-def _token_counts_cache_ttl_seconds() -> float:
-    return _float_env("TOKEN_COUNTS_CACHE_TTL_SECONDS", 2.0, minimum=0.0)
-
-
-def _token_counts_cache_state(app: Any) -> dict[str, Any]:
-    state = getattr(app, "state", app)
-    cache = getattr(state, "token_counts_cache", None)
-    if not isinstance(cache, dict) or not isinstance(cache.get("lock"), asyncio.Lock):
-        cache = {
-            "value": None,
-            "expires_at": 0.0,
-            "lock": asyncio.Lock(),
-        }
-        setattr(state, "token_counts_cache", cache)
-    return cache
-
-
-async def _get_cached_token_counts(
-    app: Any,
-    *,
-    timing: _RequestTimingRecorder | None,
-    output_queue: asyncio.Queue[bytes | object] | None = None,
-    heartbeat_interval_seconds: float | None = None,
-) -> Any:
-    ttl_seconds = _token_counts_cache_ttl_seconds()
-    if ttl_seconds <= 0:
-        return await _await_timed(
-            get_token_counts(),
-            timing=timing,
-            span_name="token_counts_ms",
-            db_wait=True,
-            output_queue=output_queue,
-            heartbeat_interval_seconds=heartbeat_interval_seconds,
-        )
-
-    loop = asyncio.get_running_loop()
-    now = loop.time()
-    cache = _token_counts_cache_state(app)
-    cached_value = cache.get("value")
-    expires_at = float(cache.get("expires_at") or 0.0)
-    if cached_value is not None and expires_at > now:
-        return cached_value
-
-    lock: asyncio.Lock = cache["lock"]
-    if cached_value is not None and lock.locked():
-        return cached_value
-
-    async with lock:
-        now = loop.time()
-        cached_value = cache.get("value")
-        expires_at = float(cache.get("expires_at") or 0.0)
-        if cached_value is not None and expires_at > now:
-            return cached_value
-
-        try:
-            counts = await _await_timed(
-                get_token_counts(),
-                timing=timing,
-                span_name="token_counts_ms",
-                db_wait=True,
-                output_queue=output_queue,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-            )
-        except Exception:
-            if cached_value is not None:
-                logger.warning("Using stale token counts after refresh failed", exc_info=True)
-                return cached_value
-            raise
-        cache["value"] = counts
-        cache["expires_at"] = loop.time() + ttl_seconds
-        return counts
-
-
 async def _mark_token_success_with_timing(timing: _RequestTimingRecorder | None, token_id: int) -> None:
     await _await_timed(
         mark_token_success(token_id),
@@ -305,6 +239,132 @@ async def _mark_token_success_with_timing(timing: _RequestTimingRecorder | None,
         span_name="mark_success_ms",
         db_wait=True,
     )
+
+
+async def _claim_next_active_token_for_request(
+    selection_settings: TokenSelectionSettings,
+    *,
+    exclude_token_ids: set[int],
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "selection_strategy": selection_settings.strategy,
+        "exclude_token_ids": exclude_token_ids,
+    }
+    if selection_settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        kwargs["token_order"] = selection_settings.token_order
+    return await claim_next_active_token(**kwargs)
+
+
+_REQUEST_LOG_WRITE_SEMAPHORE: asyncio.Semaphore | None = None
+_REQUEST_LOG_WRITE_SEMAPHORE_LIMIT: int | None = None
+
+
+def _request_log_write_semaphore() -> asyncio.Semaphore:
+    global _REQUEST_LOG_WRITE_SEMAPHORE, _REQUEST_LOG_WRITE_SEMAPHORE_LIMIT
+    limit = _int_env("REQUEST_LOG_WRITE_CONCURRENCY", 2, minimum=1)
+    if _REQUEST_LOG_WRITE_SEMAPHORE is None or _REQUEST_LOG_WRITE_SEMAPHORE_LIMIT != limit:
+        _REQUEST_LOG_WRITE_SEMAPHORE = asyncio.Semaphore(limit)
+        _REQUEST_LOG_WRITE_SEMAPHORE_LIMIT = limit
+    return _REQUEST_LOG_WRITE_SEMAPHORE
+
+
+@dataclass
+class _RequestLogHandle:
+    request_id: str
+    endpoint: str
+    model: str | None
+    is_stream: bool
+    started_at: datetime
+    client_ip: str | None
+    user_agent: str | None
+    timing: _RequestTimingRecorder
+    _create_task: asyncio.Task[int | None] | None = None
+    _request_log_id: int | None = None
+
+    @classmethod
+    def start(
+        cls,
+        *,
+        endpoint: str,
+        model: str | None,
+        is_stream: bool,
+        started_at: datetime,
+        client_ip: str | None,
+        user_agent: str | None,
+        timing: _RequestTimingRecorder,
+    ) -> "_RequestLogHandle":
+        handle = cls(
+            request_id=str(uuid.uuid4()),
+            endpoint=endpoint,
+            model=model,
+            is_stream=is_stream,
+            started_at=started_at,
+            client_ip=client_ip,
+            user_agent=user_agent,
+            timing=timing,
+        )
+        handle._create_task = asyncio.create_task(
+            handle._create(),
+            name=f"oaix-request-log-create-{handle.request_id}",
+        )
+        return handle
+
+    async def _create(self) -> int | None:
+        async with _request_log_write_semaphore():
+            item = await _await_timed(
+                create_request_log(
+                    request_id=self.request_id,
+                    endpoint=self.endpoint,
+                    model=self.model,
+                    is_stream=self.is_stream,
+                    started_at=self.started_at,
+                    client_ip=self.client_ip,
+                    user_agent=self.user_agent,
+                ),
+                timing=self.timing,
+                span_name="request_log_ms",
+                db_wait=True,
+            )
+        self._request_log_id = int(item.id)
+        return self._request_log_id
+
+    async def ensure_created(self) -> int | None:
+        if self._request_log_id is not None:
+            return self._request_log_id
+
+        task = self._create_task
+        if task is not None:
+            try:
+                request_log_id = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Background request log create failed; retrying before finalize")
+            else:
+                self._request_log_id = request_log_id
+                return request_log_id
+
+        try:
+            return await self._create()
+        except Exception:
+            logger.exception("Failed to create request log request_id=%s", self.request_id)
+            return None
+
+    async def finalize(self, *, timing: _RequestTimingRecorder | None, **kwargs) -> tuple[int | None, dict[str, int] | None]:
+        request_log_id = await self.ensure_created()
+        if request_log_id is None:
+            return None, None
+
+        async with _request_log_write_semaphore():
+            if timing is not None and "timing_spans" not in kwargs:
+                kwargs["timing_spans"] = timing.snapshot()
+            started_at = time.perf_counter()
+            try:
+                resolved_spans = await finalize_request_log(request_log_id, **kwargs)
+            finally:
+                if timing is not None:
+                    timing.add_elapsed("db_pool_wait_ms", started_at)
+        return request_log_id, resolved_spans
 
 
 class _AsyncioSocketSendWarningFilter(logging.Filter):
@@ -3724,8 +3784,8 @@ def _is_images_endpoint(endpoint: str) -> bool:
     return endpoint in {"/v1/images/generations", "/v1/images/edits"}
 
 
-def _effective_proxy_max_attempts(*, endpoint: str, counts_available: int) -> int:
-    max_attempts = max(1, min(counts_available, _max_request_account_retries()))
+def _effective_proxy_max_attempts(*, endpoint: str) -> int:
+    max_attempts = _max_request_account_retries()
     if _is_images_endpoint(endpoint):
         max_attempts = min(max_attempts, _image_request_max_account_retries())
     return max_attempts
@@ -3749,9 +3809,9 @@ async def _finalize_cancelled_request_log(
 ) -> None:
     async def finalize_with_cancel_shield() -> None:
         with anyio.CancelScope(shield=True):
-            if timing is not None and "timing_spans" not in kwargs:
-                kwargs["timing_spans"] = timing.snapshot()
-            await finalize_request_log(*args, **kwargs)
+            if not args:
+                return
+            await _finalize_request_log_with_timing(timing, args[0], **kwargs)
 
     finalize_task = asyncio.create_task(finalize_with_cancel_shield(), name="oaix-cancelled-request-log-finalize")
     try:
@@ -3938,7 +3998,7 @@ async def _probe_token_with_latest_access_token(
 
 async def _finalize_stream_request_log(
     *,
-    request_log_id: int,
+    request_log_ref: Any,
     status_code: int,
     attempt_count: int,
     token_id: int | None,
@@ -3947,13 +4007,13 @@ async def _finalize_stream_request_log(
     fallback_first_token_at: datetime | None,
     stream_capture: _ProxyStreamCapture,
     timing: _RequestTimingRecorder | None = None,
-) -> None:
+) -> int | None:
     try:
         failed = stream_capture.error_message is not None and not stream_capture.completed
         final_status_code = (stream_capture.error_status_code or status_code) if failed else status_code
-        await _finalize_request_log_with_timing(
+        return await _finalize_request_log_with_timing(
             timing,
-            request_log_id,
+            request_log_ref,
             status_code=final_status_code,
             success=not failed,
             attempt_count=attempt_count,
@@ -3966,7 +4026,8 @@ async def _finalize_stream_request_log(
             **_usage_finalize_kwargs(stream_capture.usage_metrics),
         )
     except Exception:
-        logger.exception("Failed to finalize streamed request log id=%s", request_log_id)
+        logger.exception("Failed to finalize streamed request log")
+        return None
 
 
 async def _run_proxy_result_success_hook(proxy_result: ProxyRequestResult, *, request_log_id: int) -> None:
@@ -4008,7 +4069,7 @@ def _gpt_image_stream_keepalive_response(
     request_model: str | None,
     compact: bool,
     proxy_call: Callable[[httpx.AsyncClient, str, str | None], Awaitable[ProxyRequestResult]],
-    request_log_id: int,
+    request_log: _RequestLogHandle,
     response_lease: Any,
     timing: _RequestTimingRecorder | None,
 ) -> StreamingResponse:
@@ -4036,22 +4097,16 @@ def _gpt_image_stream_keepalive_response(
 
         try:
             await _record_event_loop_lag(timing)
-            counts = await _get_cached_token_counts(
-                http_request.app,
-                timing=timing,
-                output_queue=output_queue,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-            )
-            if counts.available <= 0:
-                raise HTTPException(status_code=503, detail="No available Codex token in database")
-
-            max_attempts = _effective_proxy_max_attempts(endpoint=endpoint, counts_available=counts.available)
+            max_attempts = _effective_proxy_max_attempts(endpoint=endpoint)
+            max_claims = _max_request_account_retries()
+            claim_count = 0
             last_error: HTTPException | None = None
 
-            while attempt_count < max_attempts:
+            while attempt_count < max_attempts and claim_count < max_claims:
+                claim_count += 1
                 token_row = await _await_timed(
-                    claim_next_active_token(
-                        selection_strategy=selection_settings.strategy,
+                    _claim_next_active_token_for_request(
+                        selection_settings,
                         exclude_token_ids=excluded_token_ids,
                     ),
                     timing=timing,
@@ -4191,8 +4246,8 @@ def _gpt_image_stream_keepalive_response(
                         )
 
                     if proxy_result.stream_capture is not None:
-                        await _finalize_stream_request_log(
-                            request_log_id=request_log_id,
+                        finalized_request_log_id = await _finalize_stream_request_log(
+                            request_log_ref=request_log,
                             status_code=proxy_result.status_code,
                             attempt_count=attempt,
                             token_id=token_row.id,
@@ -4210,9 +4265,9 @@ def _gpt_image_stream_keepalive_response(
                             stream_finalized = True
                             return
                     else:
-                        await _finalize_request_log_with_timing(
+                        finalized_request_log_id = await _finalize_request_log_with_timing(
                             timing,
-                            request_log_id,
+                            request_log,
                             status_code=proxy_result.status_code,
                             success=True,
                             attempt_count=attempt,
@@ -4224,7 +4279,8 @@ def _gpt_image_stream_keepalive_response(
                         )
                     await _mark_token_success_with_timing(timing, token_row.id)
                     stream_finalized = True
-                    await _run_proxy_result_success_hook(proxy_result, request_log_id=request_log_id)
+                    if finalized_request_log_id is not None:
+                        await _run_proxy_result_success_hook(proxy_result, request_log_id=finalized_request_log_id)
                     return
                 except HTTPException as exc:
                     status_code = getattr(exc, "status_code", 500)
@@ -4345,6 +4401,8 @@ def _gpt_image_stream_keepalive_response(
                     raise HTTPException(status_code=502, detail=message) from exc
 
             if last_error is not None:
+                if _should_retry_http_exception(last_error):
+                    raise last_error
                 raise HTTPException(
                     status_code=503,
                     detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
@@ -4358,7 +4416,7 @@ def _gpt_image_stream_keepalive_response(
         except asyncio.CancelledError:
             if not stream_finalized:
                 await _finalize_cancelled_request_log(
-                    request_log_id,
+                    request_log,
                     status_code=499,
                     success=False,
                     attempt_count=attempt_count,
@@ -4373,7 +4431,7 @@ def _gpt_image_stream_keepalive_response(
             if not stream_finalized:
                 await _finalize_request_log_with_timing(
                     timing,
-                    request_log_id,
+                    request_log,
                     status_code=getattr(exc, "status_code", 500),
                     success=False,
                     attempt_count=attempt_count,
@@ -4388,7 +4446,7 @@ def _gpt_image_stream_keepalive_response(
             if not stream_finalized:
                 await _finalize_request_log_with_timing(
                     timing,
-                    request_log_id,
+                    request_log,
                     status_code=500,
                     success=False,
                     attempt_count=attempt_count,
@@ -4446,7 +4504,15 @@ async def _execute_proxy_request_with_failover(
     release_response_traffic = True
     timing = _RequestTimingRecorder()
     request_started_at = utcnow()
-    request_log = None
+    request_log = _RequestLogHandle.start(
+        endpoint=endpoint,
+        model=request_model,
+        is_stream=is_stream,
+        started_at=request_started_at,
+        client_ip=http_request.client.host if http_request.client is not None else None,
+        user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
+        timing=timing,
+    )
     attempt_count = 0
     last_token_id: int | None = None
     last_account_id: str | None = None
@@ -4454,21 +4520,6 @@ async def _execute_proxy_request_with_failover(
     timing_context_token = _REQUEST_TIMING.set(timing)
     try:
         await _record_event_loop_lag(timing)
-        request_log = await _await_timed(
-            create_request_log(
-                request_id=str(uuid.uuid4()),
-                endpoint=endpoint,
-                model=request_model,
-                is_stream=is_stream,
-                started_at=request_started_at,
-                client_ip=http_request.client.host if http_request.client is not None else None,
-                user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
-            ),
-            timing=timing,
-            span_name="request_log_ms",
-            db_wait=True,
-        )
-
         if is_stream and _is_responses_image_compat_model(request_model):
             release_response_traffic = False
             return _gpt_image_stream_keepalive_response(
@@ -4477,16 +4528,14 @@ async def _execute_proxy_request_with_failover(
                 request_model=request_model,
                 compact=compact,
                 proxy_call=proxy_call,
-                request_log_id=request_log.id,
+                request_log=request_log,
                 response_lease=response_lease,
                 timing=timing,
             )
 
-        counts = await _get_cached_token_counts(http_request.app, timing=timing)
-        if counts.available <= 0:
-            raise HTTPException(status_code=503, detail="No available Codex token in database")
-
-        max_attempts = _effective_proxy_max_attempts(endpoint=endpoint, counts_available=counts.available)
+        max_attempts = _effective_proxy_max_attempts(endpoint=endpoint)
+        max_claims = _max_request_account_retries()
+        claim_count = 0
         client: httpx.AsyncClient = http_request.app.state.http_client
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
@@ -4498,10 +4547,11 @@ async def _execute_proxy_request_with_failover(
         skipped_free_token_ids: set[int] = set()
         postponed_unknown_plan_tokens: list[Any] = []
 
-        while attempt_count < max_attempts:
+        while attempt_count < max_attempts and claim_count < max_claims:
+            claim_count += 1
             token_row = await _await_timed(
-                claim_next_active_token(
-                    selection_strategy=selection_settings.strategy,
+                _claim_next_active_token_for_request(
+                    selection_settings,
                     exclude_token_ids=excluded_token_ids,
                 ),
                 timing=timing,
@@ -4575,8 +4625,8 @@ async def _execute_proxy_request_with_failover(
                     ) -> None:
                         try:
                             if proxied_result.stream_capture is not None:
-                                await _finalize_stream_request_log(
-                                    request_log_id=request_log.id,
+                                finalized_request_log_id = await _finalize_stream_request_log(
+                                    request_log_ref=request_log,
                                     status_code=proxied_result.status_code,
                                     attempt_count=attempt_index,
                                     token_id=token_id,
@@ -4587,9 +4637,9 @@ async def _execute_proxy_request_with_failover(
                                     timing=timing,
                                 )
                             else:
-                                await _finalize_request_log_with_timing(
+                                finalized_request_log_id = await _finalize_request_log_with_timing(
                                     timing,
-                                    request_log.id,
+                                    request_log,
                                     status_code=proxied_result.status_code,
                                     success=True,
                                     attempt_count=attempt_index,
@@ -4605,7 +4655,11 @@ async def _execute_proxy_request_with_failover(
                                 or proxied_result.stream_capture.completed
                             ):
                                 await _mark_token_success_with_timing(timing, token_id)
-                            await _run_proxy_result_success_hook(proxied_result, request_log_id=request_log.id)
+                            if finalized_request_log_id is not None:
+                                await _run_proxy_result_success_hook(
+                                    proxied_result,
+                                    request_log_id=finalized_request_log_id,
+                                )
                         finally:
                             await response_lease.release()
 
@@ -4624,9 +4678,9 @@ async def _execute_proxy_request_with_failover(
                     return proxy_result.response
 
                 await _mark_token_success_with_timing(timing, token_row.id)
-                await _finalize_request_log_with_timing(
+                finalized_request_log_id = await _finalize_request_log_with_timing(
                     timing,
-                    request_log.id,
+                    request_log,
                     status_code=proxy_result.status_code,
                     success=True,
                     attempt_count=attempt,
@@ -4637,7 +4691,8 @@ async def _execute_proxy_request_with_failover(
                     model_name=proxy_result.model_name,
                     **_usage_finalize_kwargs(proxy_result.usage_metrics),
                 )
-                await _run_proxy_result_success_hook(proxy_result, request_log_id=request_log.id)
+                if finalized_request_log_id is not None:
+                    await _run_proxy_result_success_hook(proxy_result, request_log_id=finalized_request_log_id)
                 return proxy_result.response
             except HTTPException as exc:
                 status_code = getattr(exc, "status_code", 500)
@@ -4784,6 +4839,8 @@ async def _execute_proxy_request_with_failover(
                 raise HTTPException(status_code=502, detail=message) from exc
 
         if last_error is not None:
+            if _should_retry_http_exception(last_error):
+                raise last_error
             raise HTTPException(
                 status_code=503,
                 detail=f"All available Codex accounts are exhausted or cooling down. Last error: {last_error.detail}",
@@ -4795,46 +4852,43 @@ async def _execute_proxy_request_with_failover(
             )
         raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
     except asyncio.CancelledError:
-        if request_log is not None:
-            await _finalize_cancelled_request_log(
-                request_log.id,
-                status_code=499,
-                success=False,
-                attempt_count=attempt_count,
-                finished_at=utcnow(),
-                token_id=last_token_id,
-                account_id=last_account_id,
-                error_message="Client disconnected",
-                timing=timing,
-            )
+        await _finalize_cancelled_request_log(
+            request_log,
+            status_code=499,
+            success=False,
+            attempt_count=attempt_count,
+            finished_at=utcnow(),
+            token_id=last_token_id,
+            account_id=last_account_id,
+            error_message="Client disconnected",
+            timing=timing,
+        )
         raise
     except HTTPException as exc:
-        if request_log is not None:
-            await _finalize_request_log_with_timing(
-                timing,
-                request_log.id,
-                status_code=getattr(exc, "status_code", 500),
-                success=False,
-                attempt_count=attempt_count,
-                finished_at=utcnow(),
-                token_id=last_token_id,
-                account_id=last_account_id,
-                error_message=str(getattr(exc, "detail", "") or exc),
-            )
+        await _finalize_request_log_with_timing(
+            timing,
+            request_log,
+            status_code=getattr(exc, "status_code", 500),
+            success=False,
+            attempt_count=attempt_count,
+            finished_at=utcnow(),
+            token_id=last_token_id,
+            account_id=last_account_id,
+            error_message=str(getattr(exc, "detail", "") or exc),
+        )
         raise
     except Exception as exc:
-        if request_log is not None:
-            await _finalize_request_log_with_timing(
-                timing,
-                request_log.id,
-                status_code=500,
-                success=False,
-                attempt_count=attempt_count,
-                finished_at=utcnow(),
-                token_id=last_token_id,
-                account_id=last_account_id,
-                error_message=str(exc),
-            )
+        await _finalize_request_log_with_timing(
+            timing,
+            request_log,
+            status_code=500,
+            success=False,
+            attempt_count=attempt_count,
+            finished_at=utcnow(),
+            token_id=last_token_id,
+            account_id=last_account_id,
+            error_message=str(exc),
+        )
         raise
     finally:
         if release_response_traffic:
