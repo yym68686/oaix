@@ -188,6 +188,125 @@ def _current_request_timing() -> _RequestTimingRecorder | None:
     return _REQUEST_TIMING.get()
 
 
+async def _record_event_loop_lag(timing: _RequestTimingRecorder | None) -> None:
+    if timing is None:
+        await asyncio.sleep(0)
+        return
+    started_at = time.perf_counter()
+    await asyncio.sleep(0)
+    timing.add_elapsed("event_loop_lag_ms", started_at)
+
+
+async def _await_timed(
+    awaitable: Awaitable[Any],
+    *,
+    timing: _RequestTimingRecorder | None,
+    span_name: str | None = None,
+    db_wait: bool = False,
+    output_queue: asyncio.Queue[bytes | object] | None = None,
+    heartbeat_interval_seconds: float | None = None,
+) -> Any:
+    started_at = time.perf_counter()
+    try:
+        with timing.measure(span_name) if timing is not None and span_name else suppress():
+            if output_queue is None:
+                return await awaitable
+            return await _await_with_keepalive_queue(
+                awaitable,
+                output_queue=output_queue,
+                heartbeat_interval_seconds=(
+                    heartbeat_interval_seconds
+                    if heartbeat_interval_seconds is not None
+                    else _stream_keepalive_interval_seconds()
+                ),
+            )
+    finally:
+        if timing is not None and db_wait:
+            timing.add_elapsed("db_pool_wait_ms", started_at)
+
+
+def _token_counts_cache_ttl_seconds() -> float:
+    return _float_env("TOKEN_COUNTS_CACHE_TTL_SECONDS", 2.0, minimum=0.0)
+
+
+def _token_counts_cache_state(app: Any) -> dict[str, Any]:
+    state = getattr(app, "state", app)
+    cache = getattr(state, "token_counts_cache", None)
+    if not isinstance(cache, dict) or not isinstance(cache.get("lock"), asyncio.Lock):
+        cache = {
+            "value": None,
+            "expires_at": 0.0,
+            "lock": asyncio.Lock(),
+        }
+        setattr(state, "token_counts_cache", cache)
+    return cache
+
+
+async def _get_cached_token_counts(
+    app: Any,
+    *,
+    timing: _RequestTimingRecorder | None,
+    output_queue: asyncio.Queue[bytes | object] | None = None,
+    heartbeat_interval_seconds: float | None = None,
+) -> Any:
+    ttl_seconds = _token_counts_cache_ttl_seconds()
+    if ttl_seconds <= 0:
+        return await _await_timed(
+            get_token_counts(),
+            timing=timing,
+            span_name="token_counts_ms",
+            db_wait=True,
+            output_queue=output_queue,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
+
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    cache = _token_counts_cache_state(app)
+    cached_value = cache.get("value")
+    expires_at = float(cache.get("expires_at") or 0.0)
+    if cached_value is not None and expires_at > now:
+        return cached_value
+
+    lock: asyncio.Lock = cache["lock"]
+    if cached_value is not None and lock.locked():
+        return cached_value
+
+    async with lock:
+        now = loop.time()
+        cached_value = cache.get("value")
+        expires_at = float(cache.get("expires_at") or 0.0)
+        if cached_value is not None and expires_at > now:
+            return cached_value
+
+        try:
+            counts = await _await_timed(
+                get_token_counts(),
+                timing=timing,
+                span_name="token_counts_ms",
+                db_wait=True,
+                output_queue=output_queue,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+            )
+        except Exception:
+            if cached_value is not None:
+                logger.warning("Using stale token counts after refresh failed", exc_info=True)
+                return cached_value
+            raise
+        cache["value"] = counts
+        cache["expires_at"] = loop.time() + ttl_seconds
+        return counts
+
+
+async def _mark_token_success_with_timing(timing: _RequestTimingRecorder | None, token_id: int) -> None:
+    await _await_timed(
+        mark_token_success(token_id),
+        timing=timing,
+        span_name="mark_success_ms",
+        db_wait=True,
+    )
+
+
 class _AsyncioSocketSendWarningFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return not (
@@ -2400,7 +2519,9 @@ async def _enter_upstream_stream_with_timing(stream_cm):
         return await stream_cm.__aenter__()
     finally:
         if timing is not None:
-            timing.add_elapsed("upstream_headers_ms", started_at)
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            timing.add_ms("http_pool_wait_ms", elapsed_ms)
+            timing.add_ms("upstream_headers_ms", elapsed_ms)
 
 
 async def _prime_responses_upstream_stream_with_timing(
@@ -3914,12 +4035,13 @@ def _gpt_image_stream_keepalive_response(
         postponed_unknown_plan_tokens: list[Any] = []
 
         try:
-            with timing.measure("token_counts_ms") if timing is not None else suppress():
-                counts = await _await_with_keepalive_queue(
-                    get_token_counts(),
-                    output_queue=output_queue,
-                    heartbeat_interval_seconds=heartbeat_interval_seconds,
-                )
+            await _record_event_loop_lag(timing)
+            counts = await _get_cached_token_counts(
+                http_request.app,
+                timing=timing,
+                output_queue=output_queue,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+            )
             if counts.available <= 0:
                 raise HTTPException(status_code=503, detail="No available Codex token in database")
 
@@ -3927,15 +4049,17 @@ def _gpt_image_stream_keepalive_response(
             last_error: HTTPException | None = None
 
             while attempt_count < max_attempts:
-                with timing.measure("claim_token_ms") if timing is not None else suppress():
-                    token_row = await _await_with_keepalive_queue(
-                        claim_next_active_token(
-                            selection_strategy=selection_settings.strategy,
-                            exclude_token_ids=excluded_token_ids,
-                        ),
-                        output_queue=output_queue,
-                        heartbeat_interval_seconds=heartbeat_interval_seconds,
-                    )
+                token_row = await _await_timed(
+                    claim_next_active_token(
+                        selection_strategy=selection_settings.strategy,
+                        exclude_token_ids=excluded_token_ids,
+                    ),
+                    timing=timing,
+                    span_name="claim_token_ms",
+                    db_wait=True,
+                    output_queue=output_queue,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
                 using_postponed_unknown_plan = False
                 if token_row is None:
                     if require_non_free_token and postponed_unknown_plan_tokens:
@@ -4098,8 +4222,7 @@ def _gpt_image_stream_keepalive_response(
                             account_id=token_row.account_id,
                             model_name=proxy_result.model_name,
                         )
-                    with timing.measure("mark_success_ms") if timing is not None else suppress():
-                        await mark_token_success(token_row.id)
+                    await _mark_token_success_with_timing(timing, token_row.id)
                     stream_finalized = True
                     await _run_proxy_result_success_hook(proxy_result, request_log_id=request_log_id)
                     return
@@ -4323,38 +4446,43 @@ async def _execute_proxy_request_with_failover(
     release_response_traffic = True
     timing = _RequestTimingRecorder()
     request_started_at = utcnow()
-    with timing.measure("request_log_ms"):
-        request_log = await create_request_log(
-            request_id=str(uuid.uuid4()),
-            endpoint=endpoint,
-            model=request_model,
-            is_stream=is_stream,
-            started_at=request_started_at,
-            client_ip=http_request.client.host if http_request.client is not None else None,
-            user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
-        )
-
-    if is_stream and _is_responses_image_compat_model(request_model):
-        release_response_traffic = False
-        return _gpt_image_stream_keepalive_response(
-            http_request,
-            endpoint=endpoint,
-            request_model=request_model,
-            compact=compact,
-            proxy_call=proxy_call,
-            request_log_id=request_log.id,
-            response_lease=response_lease,
-            timing=timing,
-        )
-
+    request_log = None
     attempt_count = 0
     last_token_id: int | None = None
     last_account_id: str | None = None
 
     timing_context_token = _REQUEST_TIMING.set(timing)
     try:
-        with timing.measure("token_counts_ms"):
-            counts = await get_token_counts()
+        await _record_event_loop_lag(timing)
+        request_log = await _await_timed(
+            create_request_log(
+                request_id=str(uuid.uuid4()),
+                endpoint=endpoint,
+                model=request_model,
+                is_stream=is_stream,
+                started_at=request_started_at,
+                client_ip=http_request.client.host if http_request.client is not None else None,
+                user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
+            ),
+            timing=timing,
+            span_name="request_log_ms",
+            db_wait=True,
+        )
+
+        if is_stream and _is_responses_image_compat_model(request_model):
+            release_response_traffic = False
+            return _gpt_image_stream_keepalive_response(
+                http_request,
+                endpoint=endpoint,
+                request_model=request_model,
+                compact=compact,
+                proxy_call=proxy_call,
+                request_log_id=request_log.id,
+                response_lease=response_lease,
+                timing=timing,
+            )
+
+        counts = await _get_cached_token_counts(http_request.app, timing=timing)
         if counts.available <= 0:
             raise HTTPException(status_code=503, detail="No available Codex token in database")
 
@@ -4371,11 +4499,15 @@ async def _execute_proxy_request_with_failover(
         postponed_unknown_plan_tokens: list[Any] = []
 
         while attempt_count < max_attempts:
-            with timing.measure("claim_token_ms"):
-                token_row = await claim_next_active_token(
+            token_row = await _await_timed(
+                claim_next_active_token(
                     selection_strategy=selection_settings.strategy,
                     exclude_token_ids=excluded_token_ids,
-                )
+                ),
+                timing=timing,
+                span_name="claim_token_ms",
+                db_wait=True,
+            )
             using_postponed_unknown_plan = False
             if token_row is None:
                 if require_non_free_token and postponed_unknown_plan_tokens:
@@ -4432,8 +4564,6 @@ async def _execute_proxy_request_with_failover(
 
             try:
                 proxy_result = await proxy_call(client, access_token, token_row.account_id)
-                with timing.measure("mark_success_ms"):
-                    await mark_token_success(token_row.id)
                 if isinstance(proxy_result.response, StreamingResponse):
 
                     async def on_stream_close(
@@ -4469,6 +4599,12 @@ async def _execute_proxy_request_with_failover(
                                     account_id=proxied_account_id,
                                     model_name=proxied_result.model_name,
                                 )
+                            if (
+                                proxied_result.stream_capture is None
+                                or proxied_result.stream_capture.error_message is None
+                                or proxied_result.stream_capture.completed
+                            ):
+                                await _mark_token_success_with_timing(timing, token_id)
                             await _run_proxy_result_success_hook(proxied_result, request_log_id=request_log.id)
                         finally:
                             await response_lease.release()
@@ -4487,6 +4623,7 @@ async def _execute_proxy_request_with_failover(
                     release_response_traffic = False
                     return proxy_result.response
 
+                await _mark_token_success_with_timing(timing, token_row.id)
                 await _finalize_request_log_with_timing(
                     timing,
                     request_log.id,
@@ -4658,43 +4795,46 @@ async def _execute_proxy_request_with_failover(
             )
         raise HTTPException(status_code=503, detail="No available Codex token could satisfy this request")
     except asyncio.CancelledError:
-        await _finalize_cancelled_request_log(
-            request_log.id,
-            status_code=499,
-            success=False,
-            attempt_count=attempt_count,
-            finished_at=utcnow(),
-            token_id=last_token_id,
-            account_id=last_account_id,
-            error_message="Client disconnected",
-            timing=timing,
-        )
+        if request_log is not None:
+            await _finalize_cancelled_request_log(
+                request_log.id,
+                status_code=499,
+                success=False,
+                attempt_count=attempt_count,
+                finished_at=utcnow(),
+                token_id=last_token_id,
+                account_id=last_account_id,
+                error_message="Client disconnected",
+                timing=timing,
+            )
         raise
     except HTTPException as exc:
-        await _finalize_request_log_with_timing(
-            timing,
-            request_log.id,
-            status_code=getattr(exc, "status_code", 500),
-            success=False,
-            attempt_count=attempt_count,
-            finished_at=utcnow(),
-            token_id=last_token_id,
-            account_id=last_account_id,
-            error_message=str(getattr(exc, "detail", "") or exc),
-        )
+        if request_log is not None:
+            await _finalize_request_log_with_timing(
+                timing,
+                request_log.id,
+                status_code=getattr(exc, "status_code", 500),
+                success=False,
+                attempt_count=attempt_count,
+                finished_at=utcnow(),
+                token_id=last_token_id,
+                account_id=last_account_id,
+                error_message=str(getattr(exc, "detail", "") or exc),
+            )
         raise
     except Exception as exc:
-        await _finalize_request_log_with_timing(
-            timing,
-            request_log.id,
-            status_code=500,
-            success=False,
-            attempt_count=attempt_count,
-            finished_at=utcnow(),
-            token_id=last_token_id,
-            account_id=last_account_id,
-            error_message=str(exc),
-        )
+        if request_log is not None:
+            await _finalize_request_log_with_timing(
+                timing,
+                request_log.id,
+                status_code=500,
+                success=False,
+                attempt_count=attempt_count,
+                finished_at=utcnow(),
+                token_id=last_token_id,
+                account_id=last_account_id,
+                error_message=str(exc),
+            )
         raise
     finally:
         if release_response_traffic:

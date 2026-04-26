@@ -674,10 +674,11 @@ async def claim_next_active_token(
 ) -> CodexToken | None:
     now = utcnow()
     excluded_ids = tuple(sorted({int(token_id) for token_id in (exclude_token_ids or ())}))
+    resolved_strategy = normalize_token_selection_strategy(selection_strategy)
     async with get_session() as session:
         async with session.begin():
             token_order: tuple[int, ...] = ()
-            if normalize_token_selection_strategy(selection_strategy) == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+            if resolved_strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
                 setting_result = await session.execute(
                     select(GatewaySetting).where(GatewaySetting.key == TOKEN_SELECTION_SETTING_KEY).limit(1)
                 )
@@ -695,6 +696,8 @@ async def claim_next_active_token(
             token = result.scalars().first()
             if token is None:
                 return None
+            if resolved_strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+                return token
             token.last_used_at = utcnow()
             token.updated_at = utcnow()
             await session.flush()
@@ -756,8 +759,20 @@ async def update_token_plan_type(token_id: int, *, plan_type: str | None) -> Non
 async def mark_token_success(token_id: int) -> None:
     async with get_session() as session:
         async with session.begin():
+            current = await session.get(CodexToken, token_id)
+            if current is None:
+                return
+            if (
+                current.merged_into_token_id is None
+                and current.is_active is True
+                and current.cooldown_until is None
+                and not current.last_error
+            ):
+                return
             token = await _resolve_canonical_token_for_update(session, token_id)
             if token is None:
+                return
+            if token.is_active is True and token.cooldown_until is None and not token.last_error:
                 return
             token.is_active = True
             token.cooldown_until = None

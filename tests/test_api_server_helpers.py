@@ -2685,6 +2685,210 @@ def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monk
     assert finalized[0]["token_id"] == 32
 
 
+def test_execute_proxy_request_with_failover_returns_stream_before_mark_success(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run for successful stream")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    token_row = CodexToken(
+        id=41,
+        account_id="acct_41",
+        refresh_token="refresh-41",
+        token_type="codex",
+        is_active=True,
+        plan_type="team",
+    )
+    mark_started = asyncio.Event()
+    mark_continue = asyncio.Event()
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        return token_row
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=141)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_started.set()
+        await mark_continue.wait()
+
+    async def delayed_stream() -> AsyncIterator[bytes]:
+        yield b"data: first\n\n"
+        yield b"data: [DONE]\n\n"
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        return SimpleNamespace(
+            response=StreamingResponse(delayed_stream(), media_type="text/event-stream"),
+            status_code=200,
+            model_name="gpt-5.5",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    async def run() -> tuple[StreamingResponse, list[bytes]]:
+        response = await asyncio.wait_for(
+            _execute_proxy_request_with_failover(
+                request,
+                endpoint="/v1/responses",
+                request_model="gpt-5.5",
+                is_stream=True,
+                proxy_call=fake_proxy_call,
+            ),
+            timeout=0.05,
+        )
+        assert isinstance(response, StreamingResponse)
+        assert not mark_started.is_set()
+
+        async def collect() -> list[bytes]:
+            return [chunk async for chunk in response.body_iterator]
+
+        collect_task = asyncio.create_task(collect())
+        await asyncio.wait_for(mark_started.wait(), timeout=0.05)
+        mark_continue.set()
+        chunks = await asyncio.wait_for(collect_task, timeout=0.05)
+        return response, chunks
+
+    response, chunks = asyncio.run(run())
+
+    assert response.status_code == 200
+    assert chunks == [b"data: first\n\n", b"data: [DONE]\n\n"]
+    assert finalized[0]["request_log_id"] == 141
+    assert finalized[0]["success"] is True
+    assert app.state.response_traffic.active_responses == 0
+
+
+def test_execute_proxy_request_with_failover_caches_token_counts(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run for successful request")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    token_row = CodexToken(
+        id=42,
+        account_id="acct_42",
+        refresh_token="refresh-42",
+        token_type="codex",
+        is_active=True,
+        plan_type="team",
+    )
+    counts_calls = 0
+    log_id = 200
+
+    async def fake_get_token_counts():
+        nonlocal counts_calls
+        counts_calls += 1
+        return SimpleNamespace(available=1)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        return token_row
+
+    async def fake_create_request_log(**kwargs):
+        nonlocal log_id
+        log_id += 1
+        return SimpleNamespace(id=log_id)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        return None
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        return None
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-5.5",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    async def run_once() -> None:
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/responses",
+                "headers": [(b"user-agent", b"test-client")],
+                "client": ("127.0.0.1", 9000),
+                "app": app,
+            },
+            receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+        )
+        response = await _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.5",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+        assert response.status_code == 200
+
+    async def run() -> None:
+        await run_once()
+        await run_once()
+
+    asyncio.run(run())
+
+    assert counts_calls == 1
+    assert app.state.response_traffic.active_responses == 0
+
+
 def test_execute_proxy_request_with_failover_retries_httpx_close_attribute_error(monkeypatch) -> None:
     app = SimpleNamespace(
         state=SimpleNamespace(
