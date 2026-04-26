@@ -453,6 +453,28 @@ function formatDurationMs(value) {
   return `${Math.round(ms / 1000)} s`;
 }
 
+function deriveTtftTone(value) {
+  if (value == null) {
+    return "neutral";
+  }
+  const ms = Number(value);
+  if (!Number.isFinite(ms)) {
+    return "neutral";
+  }
+  if (ms <= 5000) {
+    return "available";
+  }
+  if (ms <= 10000) {
+    return "cooling";
+  }
+  return "disabled";
+}
+
+function renderTtftBadge(value) {
+  const tone = deriveTtftTone(value);
+  return `<span class="status-pill status-pill--${tone}">${escapeHtml(formatDurationMs(value))}</span>`;
+}
+
 function formatInteger(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) {
@@ -1831,7 +1853,7 @@ function renderRequestList(items) {
           <div class="request-row__status" data-label="状态">
             <span class="status-pill status-pill--${status.tone}">${escapeHtml(status.label)}</span>
           </div>
-          <div class="request-row__time" data-label="首字时间">${escapeHtml(formatDurationMs(item.ttft_ms))}</div>
+          <div class="request-row__time" data-label="首字时间">${renderTtftBadge(item.ttft_ms)}</div>
           <div class="request-row__time" data-label="尝试">${escapeHtml(attemptLabel)}</div>
           <div class="request-row__error" data-label="错误" title="${escapeHtml(errorMessage)}">${escapeHtml(errorMessage)}</div>
         </article>

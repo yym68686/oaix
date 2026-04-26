@@ -1894,6 +1894,11 @@ button {
   color: var(--status-disabled-fg);
 }
 
+.status-pill--neutral {
+  background: var(--surface-chip-subtle);
+  color: var(--ink-soft);
+}
+
 .token-action-button {
   min-height: 44px;
   padding: 0 16px;
