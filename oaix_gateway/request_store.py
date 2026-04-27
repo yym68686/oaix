@@ -4,6 +4,7 @@ from time import perf_counter
 from typing import Any
 
 from sqlalchemy import case, func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .database import CodexToken, GatewayRequestLog, get_read_session, get_request_log_session, utcnow
 
@@ -314,6 +315,207 @@ async def finalize_request_log(
                 item.timing_spans = resolved_timing_spans
             item.error_message = (error_message or "").strip()[:4000] or None
     return resolved_timing_spans
+
+
+def _request_log_payload_values(payload: dict[str, Any]) -> dict[str, Any]:
+    started_at = payload.get("started_at") or utcnow()
+    finished_at = payload.get("finished_at")
+    first_token_at = payload.get("first_token_at")
+    model = payload.get("model")
+    model_name = payload.get("model_name") or model
+    timing_spans = _normalize_timing_spans(payload.get("timing_spans"))
+    error_message = str(payload.get("error_message") or "").strip()[:4000] or None
+    status_code = payload.get("status_code")
+    try:
+        resolved_status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        resolved_status_code = None
+    try:
+        attempt_count = max(0, int(payload.get("attempt_count") or 0))
+    except (TypeError, ValueError):
+        attempt_count = 0
+    try:
+        token_id = payload.get("token_id")
+        resolved_token_id = max(1, int(token_id)) if token_id is not None else None
+    except (TypeError, ValueError):
+        resolved_token_id = None
+
+    return {
+        "request_id": str(payload["request_id"]),
+        "endpoint": str(payload.get("endpoint") or ""),
+        "model": model,
+        "model_name": model_name,
+        "is_stream": bool(payload.get("is_stream")),
+        "status_code": resolved_status_code,
+        "success": payload.get("success") if payload.get("success") is not None else None,
+        "attempt_count": attempt_count,
+        "token_id": resolved_token_id,
+        "account_id": payload.get("account_id"),
+        "client_ip": payload.get("client_ip"),
+        "user_agent": payload.get("user_agent"),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "first_token_at": first_token_at,
+        "ttft_ms": _ms_between(started_at, first_token_at),
+        "duration_ms": _ms_between(started_at, finished_at),
+        "timing_spans": timing_spans,
+        "input_tokens": _int_or_zero(payload.get("input_tokens")) if payload.get("input_tokens") is not None else None,
+        "output_tokens": _int_or_zero(payload.get("output_tokens")) if payload.get("output_tokens") is not None else None,
+        "total_tokens": _int_or_zero(payload.get("total_tokens")) if payload.get("total_tokens") is not None else None,
+        "estimated_cost_usd": (
+            _round_cost(payload.get("estimated_cost_usd")) if payload.get("estimated_cost_usd") is not None else None
+        ),
+        "error_message": error_message,
+    }
+
+
+def _merge_request_log_payload(item: GatewayRequestLog, values: dict[str, Any]) -> None:
+    item.endpoint = values["endpoint"] or item.endpoint
+    item.model = values["model"] if values["model"] is not None else item.model
+    item.model_name = values["model_name"] or item.model_name or item.model
+    item.is_stream = bool(values["is_stream"])
+    item.client_ip = values["client_ip"] or item.client_ip
+    item.user_agent = values["user_agent"] or item.user_agent
+    item.started_at = values["started_at"] or item.started_at
+    if values["status_code"] is not None:
+        item.status_code = values["status_code"]
+        item.success = bool(values["success"])
+        item.attempt_count = values["attempt_count"]
+        item.finished_at = values["finished_at"]
+        item.first_token_at = values["first_token_at"]
+        item.ttft_ms = values["ttft_ms"]
+        item.duration_ms = values["duration_ms"]
+        if values["token_id"] is not None:
+            item.token_id = values["token_id"]
+        item.account_id = values["account_id"] or item.account_id
+        item.model_name = values["model_name"] or item.model_name or item.model
+        item.input_tokens = values["input_tokens"] if values["input_tokens"] is not None else item.input_tokens
+        item.output_tokens = values["output_tokens"] if values["output_tokens"] is not None else item.output_tokens
+        item.total_tokens = values["total_tokens"] if values["total_tokens"] is not None else item.total_tokens
+        item.estimated_cost_usd = (
+            values["estimated_cost_usd"] if values["estimated_cost_usd"] is not None else item.estimated_cost_usd
+        )
+        item.timing_spans = values["timing_spans"] or item.timing_spans
+        item.error_message = values["error_message"]
+
+
+async def _upsert_request_logs_portable(values_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    async with get_request_log_session() as session:
+        async with session.begin():
+            for values in values_list:
+                result = await session.execute(
+                    select(GatewayRequestLog).where(GatewayRequestLog.request_id == values["request_id"]).limit(1)
+                )
+                item = result.scalars().first()
+                if item is None:
+                    item = GatewayRequestLog(**values)
+                    session.add(item)
+                    await session.flush()
+                else:
+                    _merge_request_log_payload(item, values)
+                results.append(
+                    {
+                        "request_id": item.request_id,
+                        "id": item.id,
+                        "timing_spans": item.timing_spans,
+                    }
+                )
+    return results
+
+
+def _timing_snapshot(timing_recorder: Any | None) -> dict[str, int] | None:
+    snapshot = getattr(timing_recorder, "snapshot", None)
+    if not callable(snapshot):
+        return None
+    try:
+        return _normalize_timing_spans(snapshot())
+    except Exception:
+        return None
+
+
+def _merge_payload_timing(values_list: list[dict[str, Any]], timing_spans: dict[str, Any] | None) -> None:
+    resolved = _normalize_timing_spans(timing_spans)
+    if not resolved:
+        return
+    for values in values_list:
+        current = _normalize_timing_spans(values.get("timing_spans")) or {}
+        merged = dict(current)
+        for key, value in resolved.items():
+            merged[key] = merged.get(key, 0) + value
+        values["timing_spans"] = merged
+
+
+async def upsert_request_logs(
+    payloads: list[dict[str, Any]],
+    *,
+    timing_recorder: Any | None = None,
+) -> list[dict[str, Any]]:
+    values_list = [_request_log_payload_values(payload) for payload in payloads if payload.get("request_id")]
+    if not values_list:
+        return []
+
+    timing_merged = False
+    async with get_request_log_session() as session:
+        try:
+            async with session.begin():
+                await session.connection()
+                _merge_payload_timing(values_list, _timing_snapshot(timing_recorder))
+                timing_merged = True
+                insert_stmt = pg_insert(GatewayRequestLog).values(values_list)
+                excluded = insert_stmt.excluded
+                update_values = {
+                    "endpoint": excluded.endpoint,
+                    "model": func.coalesce(excluded.model, GatewayRequestLog.model),
+                    "model_name": func.coalesce(excluded.model_name, GatewayRequestLog.model_name, GatewayRequestLog.model),
+                    "is_stream": excluded.is_stream,
+                    "client_ip": func.coalesce(excluded.client_ip, GatewayRequestLog.client_ip),
+                    "user_agent": func.coalesce(excluded.user_agent, GatewayRequestLog.user_agent),
+                    "started_at": func.coalesce(excluded.started_at, GatewayRequestLog.started_at),
+                    "status_code": func.coalesce(excluded.status_code, GatewayRequestLog.status_code),
+                    "success": func.coalesce(excluded.success, GatewayRequestLog.success),
+                    "attempt_count": case(
+                        (excluded.status_code.is_not(None), excluded.attempt_count),
+                        else_=GatewayRequestLog.attempt_count,
+                    ),
+                    "finished_at": func.coalesce(excluded.finished_at, GatewayRequestLog.finished_at),
+                    "first_token_at": func.coalesce(excluded.first_token_at, GatewayRequestLog.first_token_at),
+                    "ttft_ms": func.coalesce(excluded.ttft_ms, GatewayRequestLog.ttft_ms),
+                    "duration_ms": func.coalesce(excluded.duration_ms, GatewayRequestLog.duration_ms),
+                    "token_id": func.coalesce(excluded.token_id, GatewayRequestLog.token_id),
+                    "account_id": func.coalesce(excluded.account_id, GatewayRequestLog.account_id),
+                    "input_tokens": func.coalesce(excluded.input_tokens, GatewayRequestLog.input_tokens),
+                    "output_tokens": func.coalesce(excluded.output_tokens, GatewayRequestLog.output_tokens),
+                    "total_tokens": func.coalesce(excluded.total_tokens, GatewayRequestLog.total_tokens),
+                    "estimated_cost_usd": func.coalesce(excluded.estimated_cost_usd, GatewayRequestLog.estimated_cost_usd),
+                    "timing_spans": func.coalesce(excluded.timing_spans, GatewayRequestLog.timing_spans),
+                    "error_message": func.coalesce(excluded.error_message, GatewayRequestLog.error_message),
+                }
+                stmt = (
+                    insert_stmt.on_conflict_do_update(
+                        index_elements=[GatewayRequestLog.request_id],
+                        set_=update_values,
+                    )
+                    .returning(GatewayRequestLog.request_id, GatewayRequestLog.id, GatewayRequestLog.timing_spans)
+                )
+
+                result = await session.execute(stmt)
+                return [
+                    {
+                        "request_id": request_id,
+                        "id": request_log_id,
+                        "timing_spans": timing_spans,
+                    }
+                    for request_id, request_log_id, timing_spans in result.all()
+                ]
+        except Exception:
+            pass
+    if not timing_merged:
+        _merge_payload_timing(values_list, _timing_snapshot(timing_recorder))
+    try:
+        return await _upsert_request_logs_portable(values_list)
+    except Exception:
+        raise
 
 
 async def get_request_log_summary() -> RequestLogSummary:

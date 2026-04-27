@@ -1,11 +1,28 @@
 import asyncio
+import contextvars
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from time import perf_counter
 
 import anyio
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, func, inspect, select, text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    inspect,
+    select,
+    text,
+)
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -75,6 +92,26 @@ class CodexToken(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class CodexTokenScopedCooldown(Base):
+    __tablename__ = "codex_token_scoped_cooldowns"
+    __table_args__ = (
+        UniqueConstraint("token_id", "scope", name="uq_codex_token_scoped_cooldowns_token_scope"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    token_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("codex_tokens.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    scope: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    cooldown_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -179,6 +216,65 @@ _engine = None
 _session_factory = None
 _request_log_engine = None
 _request_log_session_factory = None
+_db_timing_recorder: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "oaix_db_timing_recorder",
+    default=None,
+)
+_db_pool_checkout_started_at: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "oaix_db_pool_checkout_started_at",
+    default=None,
+)
+_db_pool_checkout_recorded: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "oaix_db_pool_checkout_recorded",
+    default=False,
+)
+
+
+def set_db_timing_recorder(recorder: object | None):
+    return _db_timing_recorder.set(recorder)
+
+
+def reset_db_timing_recorder(token) -> None:
+    _db_timing_recorder.reset(token)
+
+
+@asynccontextmanager
+async def _db_pool_checkout_timer() -> AsyncIterator[None]:
+    start_token = _db_pool_checkout_started_at.set(perf_counter())
+    recorded_token = _db_pool_checkout_recorded.set(False)
+    try:
+        yield
+    finally:
+        _db_pool_checkout_recorded.reset(recorded_token)
+        _db_pool_checkout_started_at.reset(start_token)
+
+
+def _record_pool_checkout(span_name: str) -> None:
+    if _db_pool_checkout_recorded.get():
+        return
+    started_at = _db_pool_checkout_started_at.get()
+    if started_at is None:
+        return
+    recorder = _db_timing_recorder.get()
+    add_ms = getattr(recorder, "add_ms", None)
+    if not callable(add_ms):
+        return
+    add_ms(span_name, (perf_counter() - started_at) * 1000)
+    _db_pool_checkout_recorded.set(True)
+
+
+def _install_pool_checkout_timer(engine, span_name: str):
+    sync_engine = engine.sync_engine
+    if getattr(sync_engine, "_oaix_pool_checkout_timer_installed", False):
+        return engine
+
+    @event.listens_for(sync_engine, "checkout")
+    def _on_checkout(dbapi_connection, connection_record, connection_proxy) -> None:
+        del dbapi_connection, connection_record, connection_proxy
+        _record_pool_checkout(span_name)
+
+    setattr(sync_engine, "_oaix_pool_checkout_timer_installed", True)
+    return engine
 
 
 def get_engine():
@@ -192,6 +288,7 @@ def get_engine():
             pool_pre_ping=True,
             pool_reset_on_return="rollback",
         )
+        _install_pool_checkout_timer(_engine, "db_main_pool_checkout_wait_ms")
     return _engine
 
 
@@ -218,6 +315,7 @@ def get_request_log_engine():
             pool_pre_ping=True,
             pool_reset_on_return="rollback",
         )
+        _install_pool_checkout_timer(_request_log_engine, "db_log_pool_checkout_wait_ms")
     return _request_log_engine
 
 
@@ -249,11 +347,12 @@ async def _close_session(session: AsyncSession) -> None:
 
 @asynccontextmanager
 async def get_session() -> AsyncIterator[AsyncSession]:
-    session = get_session_factory()()
-    try:
-        yield session
-    finally:
-        await _close_session(session)
+    async with _db_pool_checkout_timer():
+        session = get_session_factory()()
+        try:
+            yield session
+        finally:
+            await _close_session(session)
 
 
 @asynccontextmanager
@@ -265,11 +364,12 @@ async def get_read_session() -> AsyncIterator[AsyncSession]:
 
 @asynccontextmanager
 async def get_request_log_session() -> AsyncIterator[AsyncSession]:
-    session = get_request_log_session_factory()()
-    try:
-        yield session
-    finally:
-        await _close_session(session)
+    async with _db_pool_checkout_timer():
+        session = get_request_log_session_factory()()
+        try:
+            yield session
+        finally:
+            await _close_session(session)
 
 
 async def init_db() -> None:
@@ -315,6 +415,33 @@ def _run_schema_migrations(sync_conn) -> None:
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_plan_type ON codex_tokens (plan_type)"))
         _drop_single_column_uniques(sync_conn, "codex_tokens", "account_id")
         _drop_single_column_uniques(sync_conn, "codex_tokens", "email")
+
+    if "codex_token_scoped_cooldowns" not in table_names:
+        CodexTokenScopedCooldown.__table__.create(sync_conn, checkfirst=True)
+    sync_conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_codex_token_scoped_cooldowns_token_scope "
+            "ON codex_token_scoped_cooldowns (token_id, scope)"
+        )
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_codex_token_scoped_cooldowns_token_id "
+            "ON codex_token_scoped_cooldowns (token_id)"
+        )
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_codex_token_scoped_cooldowns_scope "
+            "ON codex_token_scoped_cooldowns (scope)"
+        )
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_codex_token_scoped_cooldowns_cooldown_until "
+            "ON codex_token_scoped_cooldowns (cooldown_until)"
+        )
+    )
 
     if "gateway_request_logs" in table_names:
         request_columns = {column["name"] for column in inspector.get_columns("gateway_request_logs")}

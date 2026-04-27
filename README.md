@@ -35,6 +35,10 @@
 - `CORS_ALLOW_CREDENTIALS`: 是否允许浏览器跨域携带 credentials；默认 `false`
 - `CODEX_BASE_URL`: 上游 Codex responses 地址。默认 `https://chatgpt.com/backend-api/codex/responses`
 - `MAX_REQUEST_ACCOUNT_RETRIES`: 单次请求最多切换多少个 key，默认 `100`
+- `IMAGE_REQUEST_MAX_ACCOUNT_RETRIES`: 图片接口单次请求最多切换多少个 key，默认 `8`
+- `IMAGE_INPUT_MAX_PER_REQUEST`: 单次图片请求最多允许多少张输入图片，默认 `249`；达到上游 `input-images per min` 桶大小前直接拒绝超大请求
+- `IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS`: `gpt-image-2` 撞到上游 `input-images` 短速率限制且未返回明确重试时间时的 scoped 冷却秒数，默认 `5`
+- `IMAGE_RATE_LIMIT_MIN_COOLDOWN_SECONDS`: 解析到 `Please try again in ...` 时的最小 scoped 冷却秒数，默认 `1`
 - `DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS`: 429 且没有明确重置时间时的默认冷却秒数，默认 `300`
 - `IMPORT_RESPONSE_IDLE_GRACE_SECONDS`: 导入 key 遇到活跃 `/v1/responses*` 流量时，等流量清空后再额外静默多久继续补号，默认 `0.25`
 - `IMPORT_WAIT_TIMEOUT_SECONDS`: 导入 key 在为活跃 `/v1/responses*` 流量让路时，最多等待多久；超时后不再整批返回 `503`，而是记一次超时并继续低优先级导入，默认 `30`
@@ -169,6 +173,8 @@ account_id_3,refresh_token_3
 - 下游如果把 `/v1/responses` 当非流式调用，网关会自动把上游改成 `stream=true`，先在网关内收完整个 SSE，再拼成一个普通 JSON 响应返回
 - `/v1/images/generations` 和 `/v1/images/edits` 默认把 `model` 当作图片工具模型处理；未指定时默认 `gpt-image-2`，内部主模型固定走 `gpt-5.4-mini`
 - 图片接口内部统一走上游 `/responses` 的 `image_generation` tool；非流式会在网关内收完整个 SSE 后再拼成 OpenAI Images API 形状，流式会把上游 responses 事件改写成 `image_generation.*` / `image_edit.*`
+- 图片编辑或 `gpt-image-2` responses 请求的输入图片数超过 `IMAGE_INPUT_MAX_PER_REQUEST` 时，网关直接返回 `400`
+- `gpt-image-2` 上游返回 `429 rate_limit_exceeded` 且命中 `input-images` 速率桶时，只会对当前 key 的图片桶做短冷却并自动重试下一个 key，不影响该 key 处理其他模型
 - `/v1/responses/compact` 在上游 5xx 或传输错误时，会默认把当前 key 冷却 `60` 秒后切换下一把 key；可用 `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS=0` 关闭
 - 流式 `/v1/responses*` 会先预读开头的 SSE 状态事件；如果前缀已经是 `response.failed` / `type=error` / 不完整流 / 预读阶段网络错误，就不会先把坏流交给客户端，而是留在网关里切下一把 key
 - `/admin/tokens/import` 是低优先级导入；检测到活跃 `/v1/responses*` 流量时，会逐条暂停导入，让代理请求先占用数据库和事件循环；如果等待超过 `IMPORT_WAIT_TIMEOUT_SECONDS`，会记入 `response_traffic_timeout_count` 后继续导入，避免持续流量把整批补号永久饿死

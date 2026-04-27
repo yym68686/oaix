@@ -11,6 +11,7 @@ from oaix_gateway.token_store import (
     _build_token_counts_stmt,
     _merge_duplicate_token_rows,
     claim_next_active_token,
+    invalidate_fill_first_token_cache,
     repair_duplicate_token_histories,
     set_token_active_state,
     update_token_refresh_state,
@@ -122,6 +123,72 @@ def test_claim_next_active_token_fill_first_is_read_only_and_uses_app_token_orde
     assert "gateway_settings" not in sql
     assert "FOR UPDATE" not in sql
     assert "CASE codex_tokens.id" in sql
+
+
+def test_claim_next_active_token_filters_requested_scoped_cooldown(monkeypatch) -> None:
+    token = CodexToken(
+        id=8,
+        refresh_token="rt_8",
+        token_type="codex",
+        is_active=True,
+        last_used_at=None,
+    )
+    read_session = _FakeReadSession(token)
+
+    @asynccontextmanager
+    async def fake_get_read_session():
+        yield read_session
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_read_session", fake_get_read_session)
+
+    result = asyncio.run(
+        claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(8,),
+            scoped_cooldown_scope="gpt-image-2:input-images",
+        )
+    )
+
+    assert result is token
+    sql = read_session.statements[0]
+    assert "codex_token_scoped_cooldowns" in sql
+    assert "gpt-image-2:input-images" in sql
+
+
+def test_claim_next_active_token_fill_first_uses_short_ttl_cache(monkeypatch) -> None:
+    invalidate_fill_first_token_cache()
+    token = CodexToken(
+        id=9,
+        refresh_token="rt_9",
+        token_type="codex",
+        is_active=True,
+        last_used_at=None,
+    )
+    read_session = _FakeReadSession(token)
+
+    @asynccontextmanager
+    async def fake_get_read_session():
+        yield read_session
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_read_session", fake_get_read_session)
+
+    async def run() -> tuple[CodexToken | None, CodexToken | None]:
+        first = await claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(9,),
+        )
+        second = await claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(9,),
+        )
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first is token
+    assert second is token
+    assert len(read_session.statements) == 1
+    invalidate_fill_first_token_cache()
 
 
 def test_merge_duplicate_token_rows_marks_shadow_and_preserves_canonical_history() -> None:

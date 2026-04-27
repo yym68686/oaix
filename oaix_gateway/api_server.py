@@ -7,11 +7,13 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
 import time
 import uuid
+from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict, dataclass, field
@@ -31,7 +33,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.datastructures import UploadFile
 from .chat_image_store import create_chat_image_checkpoint, resolve_chat_image_output_items
 from .codex_constants import CODEX_CLI_VERSION, CODEX_USER_AGENT
-from .database import close_database, init_db, utcnow
+from .database import close_database, init_db, reset_db_timing_recorder, set_db_timing_recorder, utcnow
 from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
 from .request_store import (
@@ -42,6 +44,7 @@ from .request_store import (
     get_request_costs_by_account,
     get_request_log_summary,
     list_request_logs,
+    upsert_request_logs,
 )
 from .token_import_jobs import (
     TokenImportBackgroundWorker,
@@ -61,6 +64,7 @@ from .token_store import (
     get_token_selection_settings,
     list_token_rows,
     mark_token_error,
+    mark_token_scoped_cooldown,
     mark_token_success,
     repair_duplicate_token_histories,
     set_token_active_state,
@@ -71,10 +75,13 @@ from .usage_cost import UsageMetrics, extract_usage_metrics
 
 
 logger = logging.getLogger("oaix.gateway")
+_ORIGINAL_CREATE_REQUEST_LOG = create_request_log
+_ORIGINAL_FINALIZE_REQUEST_LOG = finalize_request_log
 WEB_DIR = Path(__file__).resolve().parent / "web"
 ADMIN_TOKEN_PROBE_INPUT = "say test"
 DEFAULT_IMAGES_MAIN_MODEL = "gpt-5.4-mini"
 DEFAULT_IMAGES_TOOL_MODEL = "gpt-image-2"
+IMAGE_INPUT_RATE_LIMIT_COOLDOWN_SCOPE = f"{DEFAULT_IMAGES_TOOL_MODEL}:input-images"
 NON_FREE_ONLY_CODEX_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL, "gpt-5.5"})
 RESPONSES_IMAGE_COMPAT_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL})
 RESPONSES_IMAGE_TOOL_TEXT_FIELDS = (
@@ -151,6 +158,16 @@ class _RequestTimingRecorder:
             return
         self._spans[key] = self._spans.get(key, 0) + value
 
+    def set_ms(self, name: str, value_ms: int | float) -> None:
+        key = str(name or "").strip()
+        if not key:
+            return
+        try:
+            value = max(0, int(round(float(value_ms))))
+        except (TypeError, ValueError):
+            return
+        self._spans[key] = value
+
     @contextmanager
     def measure(self, name: str):
         started_at = time.perf_counter()
@@ -163,24 +180,46 @@ class _RequestTimingRecorder:
         return dict(self._spans)
 
 
+def _merge_timing_spans(*spans: dict[str, Any] | None) -> dict[str, int] | None:
+    merged: dict[str, int] = {}
+    for span_map in spans:
+        if not isinstance(span_map, dict):
+            continue
+        for key, value in span_map.items():
+            name = str(key or "").strip()
+            if not name or isinstance(value, bool):
+                continue
+            try:
+                resolved = max(0, int(round(float(value))))
+            except (TypeError, ValueError):
+                continue
+            merged[name] = merged.get(name, 0) + resolved
+    return merged or None
+
+
 async def _finalize_request_log_with_timing(
     timing: _RequestTimingRecorder | None,
     request_log_ref: Any,
+    *,
+    success_hook: Callable[[int], Awaitable[None]] | None = None,
     **kwargs,
 ) -> int | None:
     finalize_method = getattr(request_log_ref, "finalize", None)
     if callable(finalize_method):
-        request_log_id, resolved_spans = await finalize_method(timing=timing, **kwargs)
+        request_log_id, resolved_spans = await finalize_method(timing=timing, success_hook=success_hook, **kwargs)
     else:
         if timing is not None and "timing_spans" not in kwargs:
             kwargs["timing_spans"] = timing.snapshot()
         request_log_id = int(request_log_ref)
         resolved_spans = await finalize_request_log(request_log_id, **kwargs)
+        if success_hook is not None:
+            await _run_request_log_success_hooks([success_hook], request_log_id)
 
     if resolved_spans:
         logger.info(
-            "Request timing spans: request_log_id=%s spans=%s",
+            "Request timing spans: request_log_id=%s request_id=%s spans=%s",
             request_log_id,
+            getattr(request_log_ref, "request_id", None),
             json.dumps(resolved_spans, sort_keys=True, separators=(",", ":")),
         )
     return request_log_id
@@ -194,10 +233,63 @@ _UPSTREAM_HTTP_PHASE_TIMING: contextvars.ContextVar[_RequestTimingRecorder | Non
     "oaix_upstream_http_phase_timing",
     default=None,
 )
+_UPSTREAM_HTTP_PHASE_COMPACT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "oaix_upstream_http_phase_compact",
+    default=False,
+)
+_TOKEN_ACTIVE_REQUESTS: dict[int, int] = {}
+_TOKEN_RECENT_TTFT_MS: dict[int, deque[int]] = {}
+_TOKEN_RECENT_TTFT_LIMIT = 200
 
 
 def _current_request_timing() -> _RequestTimingRecorder | None:
     return _REQUEST_TIMING.get()
+
+
+def _percentile(values: list[int], percentile: float) -> int | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values)
+    index = int(math.ceil((percentile / 100.0) * len(ordered))) - 1
+    return ordered[max(0, min(index, len(ordered) - 1))]
+
+
+def _record_selected_token_observation_start(token_id: int, timing: _RequestTimingRecorder | None) -> None:
+    if timing is None:
+        return
+    active_count = _TOKEN_ACTIVE_REQUESTS.get(token_id, 0)
+    timing.set_ms("selected_token_active_streams", active_count)
+    recent = list(_TOKEN_RECENT_TTFT_MS.get(token_id) or ())
+    recent_p50 = _percentile(recent, 50)
+    recent_p90 = _percentile(recent, 90)
+    if recent_p50 is not None:
+        timing.set_ms("selected_token_recent_ttft_p50", recent_p50)
+    if recent_p90 is not None:
+        timing.set_ms("selected_token_recent_ttft_p90", recent_p90)
+    _TOKEN_ACTIVE_REQUESTS[token_id] = active_count + 1
+
+
+def _record_selected_token_observation_finish(
+    token_id: int,
+    *,
+    started_at: datetime,
+    first_token_at: datetime | None,
+) -> None:
+    current = _TOKEN_ACTIVE_REQUESTS.get(token_id, 0)
+    if current <= 1:
+        _TOKEN_ACTIVE_REQUESTS.pop(token_id, None)
+    else:
+        _TOKEN_ACTIVE_REQUESTS[token_id] = current - 1
+    ttft_ms = int((first_token_at - started_at).total_seconds() * 1000) if first_token_at is not None else None
+    if ttft_ms is None or ttft_ms < 0:
+        return
+    bucket = _TOKEN_RECENT_TTFT_MS.get(token_id)
+    if bucket is None:
+        bucket = deque(maxlen=_TOKEN_RECENT_TTFT_LIMIT)
+        _TOKEN_RECENT_TTFT_MS[token_id] = bucket
+    bucket.append(ttft_ms)
 
 
 class _HTTPPhaseTraceRecorder:
@@ -239,7 +331,10 @@ class _HTTPPhaseTraceRecorder:
             self._timing.add_ms("http_request_write_ms", elapsed_ms)
             self._timing.add_ms(f"http_{operation}_ms", elapsed_ms)
         elif operation == "receive_response_headers":
-            self._timing.add_ms("upstream_headers_ms", elapsed_ms)
+            if _UPSTREAM_HTTP_PHASE_COMPACT.get():
+                self._timing.add_ms("upstream_compact_headers_ms", elapsed_ms)
+            else:
+                self._timing.add_ms("upstream_headers_ms", elapsed_ms)
         elif operation == "retry":
             self._timing.add_ms("http_connect_retry_sleep_ms", elapsed_ms)
 
@@ -305,7 +400,7 @@ async def _await_timed(
             )
     finally:
         if timing is not None and db_wait:
-            timing.add_elapsed("db_pool_wait_ms", started_at)
+            timing.add_elapsed("db_query_ms", started_at)
 
 
 async def _mark_token_success_with_timing(timing: _RequestTimingRecorder | None, token_id: int) -> None:
@@ -321,6 +416,7 @@ async def _claim_next_active_token_for_request(
     selection_settings: TokenSelectionSettings,
     *,
     exclude_token_ids: set[int],
+    scoped_cooldown_scope: str | None = None,
 ) -> Any:
     kwargs: dict[str, Any] = {
         "selection_strategy": selection_settings.strategy,
@@ -328,16 +424,18 @@ async def _claim_next_active_token_for_request(
     }
     if selection_settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
         kwargs["token_order"] = selection_settings.token_order
+    claim_signature = inspect.signature(claim_next_active_token)
+    if scoped_cooldown_scope is not None and "scoped_cooldown_scope" in claim_signature.parameters:
+        kwargs["scoped_cooldown_scope"] = scoped_cooldown_scope
     return await claim_next_active_token(**kwargs)
 
 
 @dataclass
 class _RequestLogWriteJob:
-    operation: Callable[[], Awaitable[Any]]
-    future: asyncio.Future[Any]
-    timing: _RequestTimingRecorder | None
-    span_name: str | None = None
-    db_wait: bool = True
+    payload: dict[str, Any]
+    queued_at: float
+    owner: "_RequestLogHandle | None" = None
+    success_hooks: list[Callable[[int], Awaitable[None]]] = field(default_factory=list)
 
 
 _REQUEST_LOG_WRITE_QUEUE: asyncio.Queue[_RequestLogWriteJob] | None = None
@@ -347,6 +445,10 @@ _REQUEST_LOG_WRITE_DRAINERS: set[asyncio.Task[None]] = set()
 
 def _request_log_write_concurrency() -> int:
     return _int_env("REQUEST_LOG_WRITE_CONCURRENCY", 2, minimum=1)
+
+
+def _request_log_write_batch_size() -> int:
+    return _int_env("REQUEST_LOG_WRITE_BATCH_SIZE", 50, minimum=1)
 
 
 def _request_log_write_queue() -> asyncio.Queue[_RequestLogWriteJob]:
@@ -359,31 +461,156 @@ def _request_log_write_queue() -> asyncio.Queue[_RequestLogWriteJob]:
     return _REQUEST_LOG_WRITE_QUEUE
 
 
+def _merge_request_log_payload(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in update.items():
+        if key == "timing_spans":
+            merged[key] = _merge_timing_spans(merged.get(key), value)
+        elif value is not None:
+            merged[key] = value
+    return merged
+
+
+def _request_log_job_payload_with_queue_wait(job: _RequestLogWriteJob) -> dict[str, Any]:
+    payload = dict(job.payload)
+    queue_wait_ms = max(0, int((time.perf_counter() - job.queued_at) * 1000))
+    payload["timing_spans"] = _merge_timing_spans(payload.get("timing_spans"), {"request_log_queue_wait_ms": queue_wait_ms})
+    return payload
+
+
+async def _run_request_log_success_hooks(hooks: list[Callable[[int], Awaitable[None]]], request_log_id: int) -> None:
+    for hook in hooks:
+        try:
+            await hook(request_log_id)
+        except Exception:
+            logger.exception("Failed to persist proxy success side effects for request log id=%s", request_log_id)
+
+
+def _request_log_store_is_monkeypatched() -> bool:
+    return create_request_log is not _ORIGINAL_CREATE_REQUEST_LOG or finalize_request_log is not _ORIGINAL_FINALIZE_REQUEST_LOG
+
+
+async def _write_request_log_batch_legacy(jobs: list[_RequestLogWriteJob]) -> None:
+    for job in jobs:
+        payload = _request_log_job_payload_with_queue_wait(job)
+        owner = job.owner
+        if owner is None:
+            continue
+        if owner._request_log_id is None:
+            item = await create_request_log(
+                request_id=owner.request_id,
+                endpoint=owner.endpoint,
+                model=owner.model,
+                is_stream=owner.is_stream,
+                started_at=owner.started_at,
+                client_ip=owner.client_ip,
+                user_agent=owner.user_agent,
+            )
+            owner._request_log_id = int(item.id)
+
+        if payload.get("status_code") is None:
+            continue
+
+        request_log_id = owner._request_log_id
+        if request_log_id is None:
+            continue
+        finalize_keys = {
+            "status_code",
+            "success",
+            "attempt_count",
+            "finished_at",
+            "first_token_at",
+            "token_id",
+            "account_id",
+            "model_name",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "estimated_cost_usd",
+            "timing_spans",
+            "error_message",
+        }
+        finalize_kwargs = {key: payload.get(key) for key in finalize_keys}
+        await finalize_request_log(request_log_id, **finalize_kwargs)
+        if job.success_hooks:
+            await _run_request_log_success_hooks(job.success_hooks, request_log_id)
+
+
+async def _write_request_log_batch(jobs: list[_RequestLogWriteJob]) -> None:
+    if not jobs:
+        return
+    if _request_log_store_is_monkeypatched():
+        await _write_request_log_batch_legacy(jobs)
+        return
+
+    coalesced_payloads: dict[str, dict[str, Any]] = {}
+    owners: dict[str, _RequestLogHandle] = {}
+    success_hooks: dict[str, list[Callable[[int], Awaitable[None]]]] = {}
+    for job in jobs:
+        request_id = str(job.payload.get("request_id") or "").strip()
+        if not request_id:
+            continue
+        payload = _request_log_job_payload_with_queue_wait(job)
+        current = coalesced_payloads.get(request_id)
+        coalesced_payloads[request_id] = payload if current is None else _merge_request_log_payload(current, payload)
+        if job.owner is not None:
+            owners[request_id] = job.owner
+        if job.success_hooks:
+            success_hooks.setdefault(request_id, []).extend(job.success_hooks)
+
+    if not coalesced_payloads:
+        return
+
+    log_timing = _RequestTimingRecorder()
+    db_timing_token = set_db_timing_recorder(log_timing)
+    try:
+        results = await upsert_request_logs(
+            list(coalesced_payloads.values()),
+            timing_recorder=log_timing,
+        )
+    finally:
+        reset_db_timing_recorder(db_timing_token)
+
+    for result in results:
+        request_id = str(result.get("request_id") or "").strip()
+        if not request_id:
+            continue
+        request_log_id = result.get("id")
+        try:
+            resolved_request_log_id = int(request_log_id)
+        except (TypeError, ValueError):
+            continue
+        owner = owners.get(request_id)
+        if owner is not None:
+            owner._request_log_id = resolved_request_log_id
+        hooks = success_hooks.get(request_id) or []
+        if hooks:
+            await _run_request_log_success_hooks(hooks, resolved_request_log_id)
+
+
 async def _drain_request_log_write_queue(queue: asyncio.Queue[_RequestLogWriteJob]) -> None:
     while True:
+        jobs: list[_RequestLogWriteJob] = []
         try:
-            job = queue.get_nowait()
+            jobs.append(queue.get_nowait())
         except asyncio.QueueEmpty:
             return
 
+        batch_size = _request_log_write_batch_size()
+        while len(jobs) < batch_size:
+            try:
+                jobs.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
         try:
-            if job.future.cancelled():
-                continue
             await asyncio.sleep(0)
-            result = await _await_timed(
-                job.operation(),
-                timing=job.timing,
-                span_name=job.span_name,
-                db_wait=job.db_wait,
-            )
+            await _write_request_log_batch(jobs)
         except Exception as exc:
-            if not job.future.done():
-                job.future.set_exception(exc)
-        else:
-            if not job.future.done():
-                job.future.set_result(result)
+            logger.exception("Request log write batch failed: %s", exc)
         finally:
-            queue.task_done()
+            for _ in jobs:
+                queue.task_done()
 
 
 def _discard_request_log_drainer(task: asyncio.Task[None]) -> None:
@@ -411,27 +638,10 @@ def _ensure_request_log_write_drainers() -> None:
         task.add_done_callback(_discard_request_log_drainer)
 
 
-def _submit_request_log_write(
-    operation: Callable[[], Awaitable[Any]],
-    *,
-    timing: _RequestTimingRecorder | None,
-    span_name: str | None = None,
-    db_wait: bool = True,
-) -> asyncio.Future[Any]:
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[Any] = loop.create_future()
+def _submit_request_log_write(job: _RequestLogWriteJob) -> None:
     queue = _request_log_write_queue()
-    queue.put_nowait(
-        _RequestLogWriteJob(
-            operation=operation,
-            future=future,
-            timing=timing,
-            span_name=span_name,
-            db_wait=db_wait,
-        )
-    )
+    queue.put_nowait(job)
     _ensure_request_log_write_drainers()
-    return future
 
 
 async def _flush_request_log_write_queue() -> None:
@@ -452,10 +662,10 @@ class _RequestLogHandle:
     client_ip: str | None
     user_agent: str | None
     timing: _RequestTimingRecorder
-    _create_task: asyncio.Future[int | None] | None = None
     _request_log_id: int | None = None
     _finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    _finalize_task: asyncio.Task[tuple[int | None, dict[str, int] | None]] | None = None
+    _finalized: bool = False
+    _finalized_spans: dict[str, int] | None = None
 
     @classmethod
     def start(
@@ -479,86 +689,61 @@ class _RequestLogHandle:
             user_agent=user_agent,
             timing=timing,
         )
-        handle._create_task = _submit_request_log_write(
-            handle._create,
-            timing=handle.timing,
-            span_name="request_log_ms",
-            db_wait=True,
-        )
+        handle._enqueue_start()
         return handle
 
-    async def _create(self) -> int | None:
-        item = await create_request_log(
-            request_id=self.request_id,
-            endpoint=self.endpoint,
-            model=self.model,
-            is_stream=self.is_stream,
-            started_at=self.started_at,
-            client_ip=self.client_ip,
-            user_agent=self.user_agent,
-        )
-        self._request_log_id = int(item.id)
-        return self._request_log_id
+    def _base_payload(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "endpoint": self.endpoint,
+            "model": self.model,
+            "model_name": self.model,
+            "is_stream": self.is_stream,
+            "started_at": self.started_at,
+            "client_ip": self.client_ip,
+            "user_agent": self.user_agent,
+        }
 
-    async def ensure_created(self) -> int | None:
-        if self._request_log_id is not None:
-            return self._request_log_id
-
-        task = self._create_task
-        if task is not None:
-            try:
-                request_log_id = await asyncio.shield(task)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Background request log create failed; retrying before finalize")
-            else:
-                self._request_log_id = request_log_id
-                return request_log_id
-
-        try:
-            self._create_task = _submit_request_log_write(
-                self._create,
-                timing=self.timing,
-                span_name="request_log_ms",
-                db_wait=True,
+    def _enqueue_start(self) -> None:
+        _submit_request_log_write(
+            _RequestLogWriteJob(
+                payload=self._base_payload(),
+                queued_at=time.perf_counter(),
+                owner=self,
             )
-            request_log_id = await asyncio.shield(self._create_task)
-            self._request_log_id = request_log_id
-            return request_log_id
-        except Exception:
-            logger.exception("Failed to create request log request_id=%s", self.request_id)
-            return None
+        )
 
-    async def finalize(self, *, timing: _RequestTimingRecorder | None, **kwargs) -> tuple[int | None, dict[str, int] | None]:
-        if self._finalize_task is None:
-            async with self._finalize_lock:
-                if self._finalize_task is None:
-                    self._finalize_task = asyncio.create_task(
-                        self._finalize_once(timing=timing, kwargs=dict(kwargs)),
-                        name=f"oaix-request-log-finalize-{self.request_id}",
-                    )
-        return await asyncio.shield(self._finalize_task)
-
-    async def _finalize_once(
+    async def finalize(
         self,
         *,
         timing: _RequestTimingRecorder | None,
-        kwargs: dict[str, Any],
+        success_hook: Callable[[int], Awaitable[None]] | None = None,
+        **kwargs,
     ) -> tuple[int | None, dict[str, int] | None]:
-        request_log_id = await self.ensure_created()
-        if request_log_id is None:
-            return None, None
+        async with self._finalize_lock:
+            if self._finalized:
+                if success_hook is not None and self._request_log_id is not None:
+                    await _run_request_log_success_hooks([success_hook], self._request_log_id)
+                return self._request_log_id, self._finalized_spans
 
-        if timing is not None and "timing_spans" not in kwargs:
-            kwargs["timing_spans"] = timing.snapshot()
-        future = _submit_request_log_write(
-            lambda: finalize_request_log(request_log_id, **kwargs),
-            timing=timing,
-            db_wait=True,
-        )
-        resolved_spans = await asyncio.shield(future)
-        return request_log_id, resolved_spans
+            if timing is not None and "timing_spans" not in kwargs:
+                kwargs["timing_spans"] = timing.snapshot()
+            resolved_spans = _merge_timing_spans(kwargs.get("timing_spans"))
+            kwargs["timing_spans"] = resolved_spans
+            payload = _merge_request_log_payload(self._base_payload(), kwargs)
+            job = _RequestLogWriteJob(
+                payload=payload,
+                queued_at=time.perf_counter(),
+                owner=self,
+                success_hooks=[success_hook] if success_hook is not None else [],
+            )
+            if _request_log_store_is_monkeypatched():
+                await _write_request_log_batch_legacy([job])
+            else:
+                _submit_request_log_write(job)
+            self._finalized = True
+            self._finalized_spans = resolved_spans
+            return self._request_log_id, resolved_spans
 
 
 class _AsyncioSocketSendWarningFilter(logging.Filter):
@@ -1050,6 +1235,18 @@ def _image_request_max_account_retries() -> int:
     return _int_env("IMAGE_REQUEST_MAX_ACCOUNT_RETRIES", 8, minimum=1)
 
 
+def _image_input_max_per_request() -> int:
+    return _int_env("IMAGE_INPUT_MAX_PER_REQUEST", 249, minimum=1)
+
+
+def _image_rate_limit_default_cooldown_seconds() -> int:
+    return _int_env("IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS", 5, minimum=1)
+
+
+def _image_rate_limit_min_cooldown_seconds() -> int:
+    return _int_env("IMAGE_RATE_LIMIT_MIN_COOLDOWN_SECONDS", 1, minimum=1)
+
+
 def _default_usage_limit_cooldown_seconds() -> int:
     return _int_env("DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS", 300, minimum=1)
 
@@ -1064,6 +1261,19 @@ def _import_wait_timeout_seconds() -> float:
 
 def _compact_server_error_cooldown_seconds() -> int:
     return _int_env("COMPACT_SERVER_ERROR_COOLDOWN_SECONDS", 60, minimum=0)
+
+
+def _compact_upstream_headers_timeout_seconds() -> float:
+    return _float_env("COMPACT_UPSTREAM_HEADERS_TIMEOUT_SECONDS", 45.0, minimum=1.0)
+
+
+def _compact_timeout_fallback_enabled() -> bool:
+    return str(os.getenv("COMPACT_TIMEOUT_FALLBACK_ENABLED", "1") or "").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _image_non_stream_total_timeout_seconds() -> float:
@@ -1300,6 +1510,49 @@ def _extract_chat_image_url(item: Any) -> str | None:
     if candidate is not None:
         return candidate
     return _normalize_optional_text(item.get("url"))
+
+
+def _image_rate_limit_scoped_cooldown_scope(request_model: str | None) -> str | None:
+    if _is_responses_image_compat_model(request_model):
+        return IMAGE_INPUT_RATE_LIMIT_COOLDOWN_SCOPE
+    return None
+
+
+def _count_responses_input_images(value: Any) -> int:
+    if isinstance(value, list):
+        return sum(_count_responses_input_images(item) for item in value)
+
+    if not isinstance(value, dict):
+        return 0
+
+    item_type = _normalize_optional_text(value.get("type"))
+    if item_type in {"image_url", "input_image"}:
+        return 1 if _extract_chat_image_url(value) is not None else 0
+
+    count = 0
+    mask_value = value.get("input_image_mask")
+    if mask_value is not None:
+        mask_candidate = _extract_image_url_candidate(mask_value)
+        if mask_candidate is None and isinstance(mask_value, dict):
+            mask_candidate = _extract_image_url_candidate(mask_value.get("image_url"))
+        if mask_candidate is not None:
+            count += 1
+
+    for key, child in value.items():
+        if key == "input_image_mask":
+            continue
+        count += _count_responses_input_images(child)
+    return count
+
+
+def _enforce_image_input_count_limit(image_count: int) -> None:
+    max_images = _image_input_max_per_request()
+    if image_count <= max_images:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=f"Too many input images: {image_count}. At most {max_images} input images are allowed per request.",
+    )
 
 
 def _append_chat_content_tokens_from_text(tokens: list[_ChatContentToken], text: str) -> None:
@@ -1742,6 +1995,7 @@ async def _chat_completions_request_to_responses_request(
             scope_hash=_chat_image_checkpoint_scope_hash(http_request),
             client_model=request_data.model,
         )
+        _enforce_image_input_count_limit(_count_responses_input_images(payload))
     else:
         payload["input"] = _chat_messages_to_responses_input(message_list)
     if request_data.stream is not None:
@@ -1852,6 +2106,8 @@ def _translate_responses_image_compat_payload(
 
     if compact:
         raise HTTPException(status_code=400, detail="gpt-image-2 is only supported on /v1/responses")
+
+    _enforce_image_input_count_limit(_count_responses_input_images(payload))
 
     translated = copy.deepcopy(payload)
     translated["model"] = DEFAULT_IMAGES_MAIN_MODEL
@@ -2035,6 +2291,7 @@ async def _parse_images_edits_json_request(http_request: Request) -> ImageProxyR
         raise HTTPException(status_code=400, detail="images[].image_url is required (file_id is not supported)")
 
     mask_image_url = _extract_json_mask_reference(body.get("mask"))
+    _enforce_image_input_count_limit(len(images) + (1 if mask_image_url is not None else 0))
     image_model = _normalize_optional_text(body.get("model")) or DEFAULT_IMAGES_TOOL_MODEL
     response_format = _normalize_image_response_format(body.get("response_format"))
     stream = _coerce_bool(body.get("stream"), False)
@@ -2077,6 +2334,19 @@ async def _parse_images_edits_multipart_request(http_request: Request) -> ImageP
         raise HTTPException(status_code=400, detail="prompt is required")
 
     image_entries = form.getlist("image[]") or form.getlist("image")
+    mask_value = form.get("mask")
+    image_entry_count = sum(
+        1
+        for entry in image_entries
+        if isinstance(entry, UploadFile) or _normalize_optional_text(entry) is not None
+    )
+    mask_entry_count = (
+        1
+        if isinstance(mask_value, UploadFile) or _normalize_optional_text(mask_value) is not None
+        else 0
+    )
+    _enforce_image_input_count_limit(image_entry_count + mask_entry_count)
+
     images: list[str] = []
     for entry in image_entries:
         if isinstance(entry, UploadFile):
@@ -2090,7 +2360,6 @@ async def _parse_images_edits_multipart_request(http_request: Request) -> ImageP
         raise HTTPException(status_code=400, detail="image is required")
 
     mask_image_url: str | None = None
-    mask_value = form.get("mask")
     if isinstance(mask_value, UploadFile):
         mask_image_url = await _upload_file_to_data_url(mask_value)
     else:
@@ -2817,17 +3086,22 @@ async def _prime_responses_upstream_stream(
                 await pending_chunk_task
 
 
-async def _enter_upstream_stream_with_timing(stream_cm):
+async def _enter_upstream_stream_with_timing(stream_cm, *, compact: bool = False):
     timing = _current_request_timing()
     started_at = time.perf_counter()
     timing_context_token = _UPSTREAM_HTTP_PHASE_TIMING.set(timing) if timing is not None else None
+    compact_context_token = _UPSTREAM_HTTP_PHASE_COMPACT.set(bool(compact))
     try:
         return await stream_cm.__aenter__()
     finally:
+        _UPSTREAM_HTTP_PHASE_COMPACT.reset(compact_context_token)
         if timing_context_token is not None:
             _UPSTREAM_HTTP_PHASE_TIMING.reset(timing_context_token)
         if timing is not None:
-            timing.add_elapsed("upstream_stream_enter_ms", started_at)
+            timing.add_elapsed(
+                "upstream_compact_stream_enter_ms" if compact else "upstream_stream_enter_ms",
+                started_at,
+            )
 
 
 async def _prime_responses_upstream_stream_with_timing(
@@ -3835,7 +4109,7 @@ async def _proxy_image_request_with_token(
                 content=json_payload,
                 timeout=timeout,
             )
-            upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
+            upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=False)
             if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
                 try:
                     raw = await upstream_response.aread()
@@ -3917,6 +4191,85 @@ async def _proxy_image_request_with_token(
         )
     finally:
         await stream_cm.__aexit__(None, None, None)
+
+
+def _load_error_mapping(error_text: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(error_text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    detail = payload.get("detail")
+    if isinstance(detail, str):
+        try:
+            detail_payload = json.loads(detail)
+        except Exception:
+            detail_payload = None
+        if isinstance(detail_payload, dict):
+            return detail_payload
+
+    return payload
+
+
+def _extract_error_object(error_text: str) -> dict[str, Any] | None:
+    payload = _load_error_mapping(error_text)
+    if not isinstance(payload, dict):
+        return None
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return error
+
+    detail = payload.get("detail")
+    if isinstance(detail, dict):
+        detail_error = detail.get("error")
+        if isinstance(detail_error, dict):
+            return detail_error
+        return detail
+
+    return None
+
+
+def _extract_retry_after_cooldown_seconds(message: str) -> int | None:
+    match = re.search(
+        r"try\s+again\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|milliseconds?|s|sec|secs|seconds?)\b",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    seconds = value / 1000.0 if unit.startswith("ms") or unit.startswith("millisecond") else value
+    return max(_image_rate_limit_min_cooldown_seconds(), int(math.ceil(seconds)))
+
+
+def _extract_image_rate_limit_cooldown_seconds(
+    status_code: int,
+    error_text: str,
+    *,
+    request_model: str | None,
+) -> int | None:
+    if status_code != 429 or _image_rate_limit_scoped_cooldown_scope(request_model) is None:
+        return None
+
+    error = _extract_error_object(error_text)
+    if error is None:
+        return None
+
+    error_type = str(error.get("type") or "").strip().lower()
+    error_code = str(error.get("code") or "").strip().lower()
+    error_message = str(error.get("message") or "").strip()
+    error_message_lower = error_message.lower()
+    is_rate_limit = error_code == "rate_limit_exceeded" or "rate limit" in error_message_lower
+    is_image_bucket = error_type == "input-images" or "input-images" in error_message_lower
+    if not is_rate_limit or not is_image_bucket:
+        return None
+
+    return _extract_retry_after_cooldown_seconds(error_message) or _image_rate_limit_default_cooldown_seconds()
 
 
 def _extract_usage_limit_cooldown_seconds(status_code: int, error_text: str) -> int | None:
@@ -4253,6 +4606,7 @@ async def _finalize_stream_request_log(
     fallback_first_token_at: datetime | None,
     stream_capture: _ProxyStreamCapture,
     timing: _RequestTimingRecorder | None = None,
+    success_hook: Callable[[int], Awaitable[None]] | None = None,
 ) -> int | None:
     try:
         failed = stream_capture.error_message is not None and not stream_capture.completed
@@ -4260,6 +4614,7 @@ async def _finalize_stream_request_log(
         return await _finalize_request_log_with_timing(
             timing,
             request_log_ref,
+            success_hook=success_hook if not failed else None,
             status_code=final_status_code,
             success=not failed,
             attempt_count=attempt_count,
@@ -4327,6 +4682,7 @@ def _gpt_image_stream_keepalive_response(
 
     async def worker() -> None:
         timing_context_token = _REQUEST_TIMING.set(timing) if timing is not None else None
+        db_timing_context_token = set_db_timing_recorder(timing) if timing is not None else None
         client: httpx.AsyncClient = http_request.app.state.http_client
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
@@ -4338,6 +4694,7 @@ def _gpt_image_stream_keepalive_response(
         restricted_model_name = _non_free_only_codex_model_name(request_model)
         require_non_free_token = restricted_model_name is not None
         restricted_model_label = restricted_model_name or "requested"
+        scoped_cooldown_scope = _image_rate_limit_scoped_cooldown_scope(request_model)
         skipped_free_token_ids: set[int] = set()
         excluded_token_ids: set[int] = set()
         postponed_unknown_plan_tokens: list[Any] = []
@@ -4355,6 +4712,7 @@ def _gpt_image_stream_keepalive_response(
                     _claim_next_active_token_for_request(
                         selection_settings,
                         exclude_token_ids=excluded_token_ids,
+                        scoped_cooldown_scope=scoped_cooldown_scope,
                     ),
                     timing=timing,
                     span_name="claim_token_ms",
@@ -4420,6 +4778,8 @@ def _gpt_image_stream_keepalive_response(
                         continue
                     raise
 
+                token_observation_first_token_at: datetime | None = None
+                _record_selected_token_observation_start(token_row.id, timing)
                 try:
                     proxy_result = await _await_with_keepalive_queue(
                         proxy_call(client, access_token, token_row.account_id),
@@ -4503,6 +4863,7 @@ def _gpt_image_stream_keepalive_response(
                             fallback_first_token_at=proxy_result.first_token_at,
                             stream_capture=proxy_result.stream_capture,
                             timing=timing,
+                            success_hook=proxy_result.on_success,
                         )
                         if proxy_result.stream_capture.error_message is not None and not proxy_result.stream_capture.completed:
                             await mark_token_error(
@@ -4523,11 +4884,18 @@ def _gpt_image_stream_keepalive_response(
                             token_id=token_row.id,
                             account_id=token_row.account_id,
                             model_name=proxy_result.model_name,
+                            success_hook=proxy_result.on_success,
                         )
                     await _mark_token_success_with_timing(timing, token_row.id)
+                    token_observation_first_token_at = (
+                        (
+                            proxy_result.stream_capture.first_token_at
+                            if proxy_result.stream_capture is not None
+                            else None
+                        )
+                        or proxy_result.first_token_at
+                    )
                     stream_finalized = True
-                    if finalized_request_log_id is not None:
-                        await _run_proxy_result_success_hook(proxy_result, request_log_id=finalized_request_log_id)
                     return
                 except HTTPException as exc:
                     status_code = getattr(exc, "status_code", 500)
@@ -4545,6 +4913,30 @@ def _gpt_image_stream_keepalive_response(
                             token_row.id,
                             token_row.account_id,
                             cooldown_seconds,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
+                    image_cooldown_seconds = _extract_image_rate_limit_cooldown_seconds(
+                        status_code,
+                        detail,
+                        request_model=request_model,
+                    )
+                    if image_cooldown_seconds is not None and scoped_cooldown_scope is not None:
+                        await mark_token_scoped_cooldown(
+                            token_row.id,
+                            scoped_cooldown_scope,
+                            detail,
+                            cooldown_seconds=image_cooldown_seconds,
+                        )
+                        logger.info(
+                            "Codex image bucket cooled down: token_id=%s account_id=%s scope=%s cooldown_seconds=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            scoped_cooldown_scope,
+                            image_cooldown_seconds,
                             attempt,
                             max_attempts,
                         )
@@ -4646,6 +5038,12 @@ def _gpt_image_stream_keepalive_response(
                         continue
                     await mark_token_error(token_row.id, message)
                     raise HTTPException(status_code=502, detail=message) from exc
+                finally:
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_log.started_at,
+                        first_token_at=token_observation_first_token_at,
+                    )
 
             if last_error is not None:
                 if _should_retry_http_exception(last_error):
@@ -4711,6 +5109,8 @@ def _gpt_image_stream_keepalive_response(
             finally:
                 if timing_context_token is not None:
                     _REQUEST_TIMING.reset(timing_context_token)
+                if db_timing_context_token is not None:
+                    reset_db_timing_recorder(db_timing_context_token)
 
     async def response_body() -> AsyncGenerator[bytes, None]:
         nonlocal response_body_started
@@ -4786,6 +5186,7 @@ async def _execute_proxy_request_with_failover(
     last_account_id: str | None = None
 
     timing_context_token = _REQUEST_TIMING.set(timing)
+    db_timing_context_token = set_db_timing_recorder(timing)
     try:
         await _record_event_loop_lag(timing)
         if is_stream and _is_responses_image_compat_model(request_model):
@@ -4811,6 +5212,7 @@ async def _execute_proxy_request_with_failover(
         restricted_model_name = _non_free_only_codex_model_name(request_model)
         require_non_free_token = restricted_model_name is not None
         restricted_model_label = restricted_model_name or "requested"
+        scoped_cooldown_scope = _image_rate_limit_scoped_cooldown_scope(request_model)
         excluded_token_ids: set[int] = set()
         skipped_free_token_ids: set[int] = set()
         postponed_unknown_plan_tokens: list[Any] = []
@@ -4821,6 +5223,7 @@ async def _execute_proxy_request_with_failover(
                 _claim_next_active_token_for_request(
                     selection_settings,
                     exclude_token_ids=excluded_token_ids,
+                    scoped_cooldown_scope=scoped_cooldown_scope,
                 ),
                 timing=timing,
                 span_name="claim_token_ms",
@@ -4880,6 +5283,9 @@ async def _execute_proxy_request_with_failover(
                     continue
                 raise
 
+            token_observation_transferred = False
+            token_observation_first_token_at: datetime | None = None
+            _record_selected_token_observation_start(token_row.id, timing)
             try:
                 proxy_result = await proxy_call(client, access_token, token_row.account_id)
                 if isinstance(proxy_result.response, StreamingResponse):
@@ -4891,6 +5297,7 @@ async def _execute_proxy_request_with_failover(
                         proxied_account_id: str | None = token_row.account_id,
                         proxied_result: ProxyRequestResult = proxy_result,
                     ) -> None:
+                        db_timing_context_token = set_db_timing_recorder(timing)
                         try:
                             disconnected_before_completion = (
                                 proxied_result.stream_capture is not None
@@ -4928,11 +5335,13 @@ async def _execute_proxy_request_with_failover(
                                     fallback_first_token_at=proxied_result.first_token_at,
                                     stream_capture=proxied_result.stream_capture,
                                     timing=timing,
+                                    success_hook=proxied_result.on_success,
                                 )
                             else:
                                 finalized_request_log_id = await _finalize_request_log_with_timing(
                                     timing,
                                     request_log,
+                                    success_hook=proxied_result.on_success,
                                     status_code=proxied_result.status_code,
                                     success=True,
                                     attempt_count=attempt_index,
@@ -4951,12 +5360,20 @@ async def _execute_proxy_request_with_failover(
                                 )
                             ):
                                 await _mark_token_success_with_timing(timing, token_id)
-                            if finalized_request_log_id is not None:
-                                await _run_proxy_result_success_hook(
-                                    proxied_result,
-                                    request_log_id=finalized_request_log_id,
-                                )
                         finally:
+                            _record_selected_token_observation_finish(
+                                token_id,
+                                started_at=request_started_at,
+                                first_token_at=(
+                                    (
+                                        proxied_result.stream_capture.first_token_at
+                                        if proxied_result.stream_capture is not None
+                                        else None
+                                    )
+                                    or proxied_result.first_token_at
+                                ),
+                            )
+                            reset_db_timing_recorder(db_timing_context_token)
                             await response_lease.release()
 
                     body_iterator = proxy_result.response.body_iterator
@@ -4971,6 +5388,7 @@ async def _execute_proxy_request_with_failover(
                         on_close=on_stream_close_once,
                     )
                     release_response_traffic = False
+                    token_observation_transferred = True
                     return _FinalizingStreamingResponse(
                         body_iterator,
                         on_close=on_stream_close_once,
@@ -4980,9 +5398,11 @@ async def _execute_proxy_request_with_failover(
                     )
 
                 await _mark_token_success_with_timing(timing, token_row.id)
+                token_observation_first_token_at = proxy_result.first_token_at
                 finalized_request_log_id = await _finalize_request_log_with_timing(
                     timing,
                     request_log,
+                    success_hook=proxy_result.on_success,
                     status_code=proxy_result.status_code,
                     success=True,
                     attempt_count=attempt,
@@ -4993,8 +5413,6 @@ async def _execute_proxy_request_with_failover(
                     model_name=proxy_result.model_name,
                     **_usage_finalize_kwargs(proxy_result.usage_metrics),
                 )
-                if finalized_request_log_id is not None:
-                    await _run_proxy_result_success_hook(proxy_result, request_log_id=finalized_request_log_id)
                 return proxy_result.response
             except HTTPException as exc:
                 status_code = getattr(exc, "status_code", 500)
@@ -5012,6 +5430,30 @@ async def _execute_proxy_request_with_failover(
                         token_row.id,
                         token_row.account_id,
                         cooldown_seconds,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = exc
+                    continue
+
+                image_cooldown_seconds = _extract_image_rate_limit_cooldown_seconds(
+                    status_code,
+                    detail,
+                    request_model=request_model,
+                )
+                if image_cooldown_seconds is not None and scoped_cooldown_scope is not None:
+                    await mark_token_scoped_cooldown(
+                        token_row.id,
+                        scoped_cooldown_scope,
+                        detail,
+                        cooldown_seconds=image_cooldown_seconds,
+                    )
+                    logger.info(
+                        "Codex image bucket cooled down: token_id=%s account_id=%s scope=%s cooldown_seconds=%s attempt=%s/%s",
+                        token_row.id,
+                        token_row.account_id,
+                        scoped_cooldown_scope,
+                        image_cooldown_seconds,
                         attempt,
                         max_attempts,
                     )
@@ -5139,6 +5581,13 @@ async def _execute_proxy_request_with_failover(
                     continue
                 await mark_token_error(token_row.id, message)
                 raise HTTPException(status_code=502, detail=message) from exc
+            finally:
+                if not token_observation_transferred:
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_started_at,
+                        first_token_at=token_observation_first_token_at,
+                    )
 
         if last_error is not None:
             if _should_retry_http_exception(last_error):
@@ -5195,6 +5644,7 @@ async def _execute_proxy_request_with_failover(
     finally:
         if release_response_traffic:
             await response_lease.release()
+        reset_db_timing_recorder(db_timing_context_token)
         _REQUEST_TIMING.reset(timing_context_token)
 
 
@@ -6034,7 +6484,7 @@ async def _proxy_request_with_token(
             content=json_payload,
             timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
         )
-        upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
+        upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()
             await stream_cm.__aexit__(None, None, None)
@@ -6086,7 +6536,7 @@ async def _proxy_request_with_token(
             content=json_payload,
             timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
         )
-        upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
+        upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
         try:
             if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
                 raw = await upstream_response.aread()
@@ -6114,14 +6564,71 @@ async def _proxy_request_with_token(
         finally:
             await stream_cm.__aexit__(None, None, None)
 
+    compact_headers_timeout = _compact_upstream_headers_timeout_seconds()
     stream_cm = client.stream(
         "POST",
         upstream_url,
         headers=headers,
         content=json_payload,
-        timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
+        timeout=httpx.Timeout(connect=30.0, read=compact_headers_timeout, write=30.0, pool=30.0),
     )
-    upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
+    try:
+        upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
+    except httpx.ReadTimeout as exc:
+        with suppress(Exception):
+            await stream_cm.__aexit__(type(exc), exc, exc.__traceback__)
+        timing = _current_request_timing()
+        if timing is not None:
+            timing.add_ms("upstream_compact_timeout_ms", compact_headers_timeout * 1000)
+        if not _compact_timeout_fallback_enabled():
+            raise HTTPException(
+                status_code=504,
+                detail=f"Upstream compact request timed out waiting for response headers after {compact_headers_timeout:g}s",
+            ) from exc
+        if timing is not None:
+            timing.add_ms("upstream_compact_fallback_count", 1)
+        fallback_payload = dict(payload)
+        fallback_payload["stream"] = True
+        fallback_headers = _build_upstream_headers(
+            http_request,
+            access_token=access_token,
+            account_id=account_id,
+            stream=True,
+        )
+        fallback_stream_cm = client.stream(
+            "POST",
+            _codex_responses_url(compact=False),
+            headers=fallback_headers,
+            content=json.dumps(fallback_payload, ensure_ascii=False),
+            timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
+        )
+        fallback_response = await _enter_upstream_stream_with_timing(fallback_stream_cm, compact=False)
+        try:
+            if fallback_response.status_code < 200 or fallback_response.status_code >= 300:
+                raw = await fallback_response.aread()
+                raise HTTPException(
+                    status_code=fallback_response.status_code,
+                    detail=_decode_error_body(raw),
+                )
+
+            data, first_token_at = await _collect_responses_json_from_sse(
+                fallback_response.aiter_raw(),
+                model=effective_requested_model,
+            )
+            if response_model_alias is not None:
+                data = _apply_response_model_alias(data, response_model_alias)
+                effective_model_name = response_model_alias
+            else:
+                effective_model_name = _extract_response_model_name(data) or request_data.model
+            return ProxyRequestResult(
+                response=JSONResponse(status_code=fallback_response.status_code, content=data),
+                status_code=fallback_response.status_code,
+                model_name=effective_model_name,
+                first_token_at=first_token_at,
+                usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
+            )
+        finally:
+            await fallback_stream_cm.__aexit__(None, None, None)
     try:
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()

@@ -16,6 +16,7 @@ from oaix_gateway.api_server import (
     ImageProxyRequest,
     _HTTPPhaseTraceRecorder,
     _ProxyStreamCapture,
+    _RequestLogHandle,
     _RequestTimingRecorder,
     _AsyncioSocketSendWarningFilter,
     _SSEProxyStreamingResponse,
@@ -28,6 +29,7 @@ from oaix_gateway.api_server import (
     _proxy_chat_completions_with_token,
     _proxy_image_request_with_token,
     _collect_responses_json_from_sse,
+    _extract_image_rate_limit_cooldown_seconds,
     _extract_usage_limit_cooldown_seconds,
     _get_compact_codex_server_error_cooling_time,
     _is_permanent_account_disable_error,
@@ -54,6 +56,7 @@ from oaix_gateway.api_server import (
     _should_retry_upstream_server_error,
     _translate_responses_image_compat_payload,
     _wrap_streaming_body_iterator,
+    _flush_request_log_write_queue,
     create_app,
 )
 from oaix_gateway.database import ChatImageCheckpoint, ChatImageCheckpointImage, CodexToken, GatewayRequestLog
@@ -154,6 +157,40 @@ def test_extract_usage_limit_cooldown_returns_none_for_other_errors() -> None:
     payload = json.dumps({"error": {"type": "server_error", "message": "boom"}})
     assert _extract_usage_limit_cooldown_seconds(500, payload) is None
     assert _extract_usage_limit_cooldown_seconds(429, payload) is None
+
+
+def test_extract_image_rate_limit_cooldown_from_retry_after_milliseconds(monkeypatch) -> None:
+    monkeypatch.delenv("IMAGE_RATE_LIMIT_MIN_COOLDOWN_SECONDS", raising=False)
+    payload = json.dumps(
+        {
+            "error": {
+                "type": "input-images",
+                "code": "rate_limit_exceeded",
+                "message": (
+                    "Rate limit reached for gpt-image-2 on input-images per min: "
+                    "Limit 250, Used 250, Requested 1. Please try again in 240ms."
+                ),
+            }
+        }
+    )
+
+    assert (
+        _extract_image_rate_limit_cooldown_seconds(
+            429,
+            payload,
+            request_model="gpt-image-2",
+        )
+        == 1
+    )
+    assert (
+        _extract_image_rate_limit_cooldown_seconds(
+            429,
+            json.dumps({"detail": payload}),
+            request_model="gpt-image-2",
+        )
+        == 1
+    )
+    assert _extract_image_rate_limit_cooldown_seconds(429, payload, request_model="gpt-5.4-mini") is None
 
 
 def test_detects_permanent_disable_errors() -> None:
@@ -311,6 +348,33 @@ def test_translate_responses_image_compat_payload_rejects_compact() -> None:
             },
             compact=True,
         )
+
+
+def test_translate_responses_image_compat_payload_rejects_too_many_input_images(monkeypatch) -> None:
+    monkeypatch.setenv("IMAGE_INPUT_MAX_PER_REQUEST", "2")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _translate_responses_image_compat_payload(
+            {
+                "model": "gpt-image-2",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "edit these"},
+                            {"type": "input_image", "image_url": "data:image/png;base64,one"},
+                            {"type": "input_image", "image_url": "data:image/png;base64,two"},
+                            {"type": "input_image", "image_url": "data:image/png;base64,three"},
+                        ],
+                    }
+                ],
+            },
+            compact=False,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "Too many input images: 3" in str(exc_info.value.detail)
 
 
 def test_chat_completions_request_to_responses_request_parses_markdown_image_history(monkeypatch) -> None:
@@ -569,6 +633,27 @@ def test_parse_images_edits_request_builds_image_inputs_and_mask() -> None:
         {"type": "input_image", "image_url": "data:image/png;base64,abc"},
         {"type": "input_image", "image_url": "https://example.com/second.png"},
     ]
+
+
+def test_parse_images_edits_request_rejects_too_many_input_images(monkeypatch) -> None:
+    monkeypatch.setenv("IMAGE_INPUT_MAX_PER_REQUEST", "2")
+    request = _make_json_request(
+        "/v1/images/edits",
+        {
+            "prompt": "replace the sky",
+            "images": [
+                {"image_url": "data:image/png;base64,abc"},
+                {"image_url": "https://example.com/second.png"},
+            ],
+            "mask": {"image_url": "https://example.com/mask.png"},
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(_parse_images_edits_request(request))
+
+    assert exc_info.value.status_code == 400
+    assert "Too many input images: 3" in str(exc_info.value.detail)
 
 
 def test_normalize_responses_compact_upstream_url() -> None:
@@ -1447,6 +1532,7 @@ def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request(
                     "url": url,
                     "headers": headers,
                     "content": content,
+                    "timeout": timeout,
                 }
             )
             response = DummyStreamingResponse(
@@ -1538,11 +1624,12 @@ def test_proxy_request_with_token_auto_translates_gpt_image_responses_request() 
             self.stream_calls.append(
                 {
                     "method": method,
-                    "url": url,
-                    "headers": headers,
-                    "content": content,
-                }
-            )
+                        "url": url,
+                        "headers": headers,
+                        "content": content,
+                        "timeout": timeout,
+                    }
+                )
             response = DummyStreamingResponse(
                 [
                     b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_img_123","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
@@ -1651,6 +1738,7 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
                     "url": url,
                     "headers": headers,
                     "content": content,
+                    "timeout": timeout,
                 }
             )
             response = DummyStreamingResponse(
@@ -1709,6 +1797,7 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
     stream_call = client.stream_calls[0]
     assert stream_call["headers"]["Accept"] == "application/json"
     assert "stream" not in json.loads(stream_call["content"])
+    assert stream_call["timeout"].read == 45.0
     assert result.first_token_at is not None
     assert result.status_code == 200
     assert result.model_name == "gpt-5.4-compact"
@@ -2511,6 +2600,65 @@ def test_should_retry_upstream_server_error_only_for_5xx() -> None:
     assert _should_retry_upstream_server_error(400) is False
 
 
+def test_request_log_handle_finalizes_via_async_outbox_without_waiting(monkeypatch) -> None:
+    written_batches: list[list[dict[str, object]]] = []
+    release_write = asyncio.Event()
+
+    async def fake_upsert_request_logs(payloads, *, timing_recorder=None):
+        del timing_recorder
+        written_batches.append(payloads)
+        await release_write.wait()
+        return [
+            {
+                "request_id": payload["request_id"],
+                "id": 777,
+                "timing_spans": payload.get("timing_spans"),
+            }
+            for payload in payloads
+        ]
+
+    monkeypatch.setattr("oaix_gateway.api_server.upsert_request_logs", fake_upsert_request_logs)
+
+    async def run() -> None:
+        timing = _RequestTimingRecorder()
+        handle = _RequestLogHandle.start(
+            endpoint="/v1/responses",
+            model="gpt-5.5",
+            is_stream=True,
+            started_at=datetime.now(timezone.utc),
+            client_ip="127.0.0.1",
+            user_agent="pytest",
+            timing=timing,
+        )
+        await asyncio.sleep(0)
+        request_log_id, spans = await asyncio.wait_for(
+            handle.finalize(
+                timing=timing,
+                status_code=200,
+                success=True,
+                attempt_count=1,
+                finished_at=datetime.now(timezone.utc),
+                first_token_at=None,
+                token_id=6,
+                account_id="acct_6",
+                model_name="gpt-5.5",
+            ),
+            timeout=0.05,
+        )
+        assert request_log_id is None
+        assert spans is None
+        release_write.set()
+        await _flush_request_log_write_queue()
+
+    asyncio.run(run())
+
+    flattened = [payload for batch in written_batches for payload in batch]
+    finalized = [payload for payload in flattened if payload.get("status_code") == 200]
+    assert finalized
+    assert finalized[0]["token_id"] == 6
+    assert "request_log_queue_wait_ms" in finalized[0]["timing_spans"]
+
+
 def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeypatch) -> None:
     app = SimpleNamespace(
         state=SimpleNamespace(
@@ -2691,6 +2839,164 @@ def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monk
     assert mark_success_calls == [32]
     assert finalized[0]["attempt_count"] == 2
     assert finalized[0]["token_id"] == 32
+
+
+def test_execute_proxy_request_with_failover_scopes_gpt_image_input_rate_limit(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run for image input rate limits")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/images/generations",
+            "headers": [(b"user-agent", b"test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    first_token = CodexToken(
+        id=131,
+        account_id="acct_131",
+        refresh_token="refresh-131",
+        token_type="codex",
+        is_active=True,
+        plan_type="team",
+    )
+    second_token = CodexToken(
+        id=132,
+        account_id="acct_132",
+        refresh_token="refresh-132",
+        token_type="codex",
+        is_active=True,
+        plan_type="team",
+    )
+    scoped_cooling_token_ids: set[int] = set()
+    claim_scopes: list[str | None] = []
+    scoped_cooldown_calls: list[dict[str, object]] = []
+    mark_error_calls: list[tuple[int, str]] = []
+    mark_success_calls: list[int] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_claim_next_active_token(
+        *,
+        selection_strategy: str,
+        exclude_token_ids=None,
+        scoped_cooldown_scope: str | None = None,
+    ):
+        claim_scopes.append(scoped_cooldown_scope)
+        excluded = {int(token_id) for token_id in (exclude_token_ids or ())}
+        for token in (first_token, second_token):
+            if token.id in excluded:
+                continue
+            if scoped_cooldown_scope == "gpt-image-2:input-images" and token.id in scoped_cooling_token_ids:
+                continue
+            return token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=231)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_scoped_cooldown(
+        token_id: int,
+        scope: str,
+        detail: str,
+        *,
+        cooldown_seconds: int,
+    ) -> None:
+        scoped_cooling_token_ids.add(token_id)
+        scoped_cooldown_calls.append(
+            {
+                "token_id": token_id,
+                "scope": scope,
+                "cooldown_seconds": cooldown_seconds,
+                "detail": detail,
+            }
+        )
+
+    async def fake_mark_token_error(token_id: int, message: str, **kwargs) -> None:
+        mark_error_calls.append((token_id, message))
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        if account_id == "acct_131":
+            raise HTTPException(
+                status_code=429,
+                detail=json.dumps(
+                    {
+                        "error": {
+                            "type": "input-images",
+                            "code": "rate_limit_exceeded",
+                            "message": (
+                                "Rate limit reached for gpt-image-2 on input-images per min: "
+                                "Limit 250, Used 250, Requested 1. Please try again in 240ms."
+                            ),
+                        }
+                    }
+                ),
+            )
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-image-2",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_scoped_cooldown", fake_mark_token_scoped_cooldown)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/images/generations",
+            request_model="gpt-image-2",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    assert response.status_code == 200
+    assert claim_scopes == ["gpt-image-2:input-images", "gpt-image-2:input-images"]
+    assert scoped_cooldown_calls[0]["token_id"] == 131
+    assert scoped_cooldown_calls[0]["scope"] == "gpt-image-2:input-images"
+    assert scoped_cooldown_calls[0]["cooldown_seconds"] == 1
+    assert mark_error_calls == []
+    assert mark_success_calls == [132]
+    assert finalized[0]["attempt_count"] == 2
+    assert finalized[0]["token_id"] == 132
 
 
 def test_execute_proxy_request_with_failover_returns_stream_before_mark_success(monkeypatch) -> None:

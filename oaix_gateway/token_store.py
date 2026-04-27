@@ -2,6 +2,8 @@ import asyncio
 import base64
 import glob
 import json
+import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,7 +11,16 @@ from typing import Any, Iterable
 
 from sqlalchemy import and_, case, delete, func, nullsfirst, or_, select, text
 
-from .database import CodexToken, GatewaySetting, close_database, get_read_session, get_session, init_db, utcnow
+from .database import (
+    CodexToken,
+    CodexTokenScopedCooldown,
+    GatewaySetting,
+    close_database,
+    get_read_session,
+    get_session,
+    init_db,
+    utcnow,
+)
 from .token_identity import (
     collect_refresh_token_aliases,
     group_rows_by_refresh_token_history,
@@ -24,6 +35,7 @@ TOKEN_SELECTION_SETTING_KEY = "token_selection"
 MERGED_DUPLICATE_TOKEN_ERROR_PREFIX = "Merged into token #"
 TOKEN_IDENTITY_LOCK_NAMESPACE = "codex-token-identity"
 TOKEN_HISTORY_REPAIR_LOCK_KEY = "codex-token-history:repair"
+DEFAULT_FILL_FIRST_TOKEN_CACHE_TTL_MS = 250
 
 
 @dataclass(frozen=True)
@@ -90,6 +102,28 @@ class TokenSelectionSettings:
 class TokenDeleteResult:
     canonical_id: int
     deleted_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _FillFirstTokenCacheEntry:
+    expires_at: float
+    tokens: tuple[CodexToken, ...]
+
+
+_FILL_FIRST_TOKEN_CACHE: dict[tuple[tuple[int, ...], str | None], _FillFirstTokenCacheEntry] = {}
+
+
+def _fill_first_token_cache_ttl_seconds() -> float:
+    raw = str(os.getenv("FILL_FIRST_TOKEN_CACHE_TTL_MS") or "").strip()
+    try:
+        ttl_ms = int(raw) if raw else DEFAULT_FILL_FIRST_TOKEN_CACHE_TTL_MS
+    except ValueError:
+        ttl_ms = DEFAULT_FILL_FIRST_TOKEN_CACHE_TTL_MS
+    return max(0.1, min(0.5, ttl_ms / 1000.0))
+
+
+def invalidate_fill_first_token_cache() -> None:
+    _FILL_FIRST_TOKEN_CACHE.clear()
 
 
 def _canonical_token_filters() -> tuple[Any, ...]:
@@ -358,14 +392,26 @@ def _load_token_payload(token_data_or_json: str | dict[str, Any]) -> dict[str, A
     return payload
 
 
-def _available_token_filters(now: datetime) -> tuple[Any, ...]:
-    return (
+def _available_token_filters(now: datetime, *, scoped_cooldown_scope: str | None = None) -> tuple[Any, ...]:
+    filters: list[Any] = [
         *_canonical_token_filters(),
         CodexToken.is_active.is_(True),
         CodexToken.refresh_token.is_not(None),
         CodexToken.token_type == "codex",
         or_(CodexToken.cooldown_until.is_(None), CodexToken.cooldown_until <= now),
-    )
+    ]
+    if scoped_cooldown_scope:
+        active_scoped_cooldown = (
+            select(CodexTokenScopedCooldown.id)
+            .where(
+                CodexTokenScopedCooldown.token_id == CodexToken.id,
+                CodexTokenScopedCooldown.scope == scoped_cooldown_scope,
+                CodexTokenScopedCooldown.cooldown_until > now,
+            )
+            .exists()
+        )
+        filters.append(~active_scoped_cooldown)
+    return tuple(filters)
 
 
 def _token_selection_order_clauses(
@@ -576,6 +622,7 @@ async def upsert_token_payload(
                 )
                 session.add(token)
                 await session.flush()
+                invalidate_fill_first_token_cache()
                 return TokenUpsertResult(token=token, action="created")
 
             token.email = token.email or email
@@ -597,9 +644,11 @@ async def upsert_token_payload(
                 token.cooldown_until = None
                 token.last_error = None
                 await session.flush()
+                invalidate_fill_first_token_cache()
                 return TokenUpsertResult(token=token, action="updated")
 
             await session.flush()
+            invalidate_fill_first_token_cache()
             return TokenUpsertResult(token=token, action="duplicate")
 
 
@@ -632,6 +681,7 @@ async def update_token_selection_settings(*, strategy: str) -> TokenSelectionSet
                 setting.value = payload
                 setting.updated_at = utcnow()
             await session.flush()
+            invalidate_fill_first_token_cache()
             return _build_token_selection_settings(setting)
 
 
@@ -657,6 +707,7 @@ async def update_token_order_settings(*, token_ids: Iterable[int]) -> TokenSelec
                 setting.value = payload
                 setting.updated_at = utcnow()
             await session.flush()
+            invalidate_fill_first_token_cache()
             return _build_token_selection_settings(setting)
 
 
@@ -667,39 +718,83 @@ async def repair_duplicate_token_histories() -> TokenHistoryRepairSummary:
             return await _repair_duplicate_token_histories_in_session(session)
 
 
+async def _load_fill_first_available_tokens(
+    *,
+    token_order: tuple[int, ...],
+    scoped_cooldown_scope: str | None,
+) -> tuple[CodexToken, ...]:
+    now = utcnow()
+    stmt = (
+        select(CodexToken)
+        .where(*_available_token_filters(now, scoped_cooldown_scope=scoped_cooldown_scope))
+        .order_by(*_token_selection_order_clauses(TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=token_order))
+    )
+    async with get_read_session() as session:
+        result = await session.execute(stmt)
+        scalars = result.scalars()
+        all_method = getattr(scalars, "all", None)
+        if callable(all_method):
+            return tuple(all_method())
+        first = scalars.first()
+        return (first,) if first is not None else ()
+
+
+async def _claim_fill_first_token_from_cache(
+    *,
+    exclude_token_ids: tuple[int, ...],
+    token_order: tuple[int, ...],
+    scoped_cooldown_scope: str | None,
+) -> CodexToken | None:
+    cache_key = (token_order, scoped_cooldown_scope)
+    now = time.monotonic()
+    cached = _FILL_FIRST_TOKEN_CACHE.get(cache_key)
+    if cached is None or cached.expires_at <= now:
+        tokens = await _load_fill_first_available_tokens(
+            token_order=token_order,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+        )
+        cached = _FillFirstTokenCacheEntry(
+            expires_at=time.monotonic() + _fill_first_token_cache_ttl_seconds(),
+            tokens=tokens,
+        )
+        _FILL_FIRST_TOKEN_CACHE[cache_key] = cached
+
+    excluded = set(exclude_token_ids)
+    for token in cached.tokens:
+        if token.id not in excluded:
+            return token
+    return None
+
+
 async def claim_next_active_token(
     *,
     selection_strategy: str | None = None,
     exclude_token_ids: Iterable[int] | None = None,
     token_order: Iterable[int] | None = None,
+    scoped_cooldown_scope: str | None = None,
 ) -> CodexToken | None:
     now = utcnow()
     excluded_ids = tuple(sorted({int(token_id) for token_id in (exclude_token_ids or ())}))
     resolved_strategy = normalize_token_selection_strategy(selection_strategy)
     if resolved_strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
         resolved_token_order = tuple(token_order) if token_order is not None else None
-        async with get_read_session() as session:
-            if resolved_token_order is None:
+        if resolved_token_order is None:
+            async with get_read_session() as session:
                 setting_result = await session.execute(
                     select(GatewaySetting).where(GatewaySetting.key == TOKEN_SELECTION_SETTING_KEY).limit(1)
                 )
                 resolved_token_order = _build_token_selection_settings(setting_result.scalars().first()).token_order
-            stmt = (
-                select(CodexToken)
-                .where(*_available_token_filters(now))
-                .order_by(*_token_selection_order_clauses(resolved_strategy, token_order=resolved_token_order))
-                .limit(1)
-            )
-            if excluded_ids:
-                stmt = stmt.where(CodexToken.id.notin_(excluded_ids))
-            result = await session.execute(stmt)
-            return result.scalars().first()
+        return await _claim_fill_first_token_from_cache(
+            exclude_token_ids=excluded_ids,
+            token_order=resolved_token_order,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+        )
 
     async with get_session() as session:
         async with session.begin():
             stmt = (
                 select(CodexToken)
-                .where(*_available_token_filters(now))
+                .where(*_available_token_filters(now, scoped_cooldown_scope=scoped_cooldown_scope))
                 .order_by(*_token_selection_order_clauses(resolved_strategy))
                 .limit(1)
                 .with_for_update(skip_locked=True)
@@ -750,6 +845,7 @@ async def update_token_refresh_state(
                 token.last_error = None
             token.updated_at = utcnow()
             await _repair_duplicate_token_histories_in_session(session)
+            invalidate_fill_first_token_cache()
 
 
 async def update_token_plan_type(token_id: int, *, plan_type: str | None) -> None:
@@ -766,6 +862,7 @@ async def update_token_plan_type(token_id: int, *, plan_type: str | None) -> Non
                 return
             token.plan_type = normalized_plan_type
             token.updated_at = utcnow()
+            invalidate_fill_first_token_cache()
 
 
 async def mark_token_success(token_id: int) -> None:
@@ -790,6 +887,7 @@ async def mark_token_success(token_id: int) -> None:
             token.cooldown_until = None
             token.last_error = None
             token.updated_at = utcnow()
+            invalidate_fill_first_token_cache()
 
 
 async def set_token_active_state(
@@ -808,6 +906,7 @@ async def set_token_active_state(
                 token.cooldown_until = None
             token.updated_at = utcnow()
             await session.flush()
+            invalidate_fill_first_token_cache()
             return token
 
 
@@ -836,6 +935,7 @@ async def delete_token(token_id: int) -> TokenDeleteResult | None:
 
             await session.execute(delete(CodexToken).where(CodexToken.id.in_(deleted_ids)))
             await session.flush()
+            invalidate_fill_first_token_cache()
             return TokenDeleteResult(canonical_id=canonical_id, deleted_ids=deleted_ids)
 
 
@@ -863,6 +963,54 @@ async def mark_token_error(
             elif cooldown_seconds is not None:
                 token.is_active = True
                 token.cooldown_until = utcnow() + timedelta(seconds=max(0, int(cooldown_seconds)))
+            invalidate_fill_first_token_cache()
+
+
+async def mark_token_scoped_cooldown(
+    token_id: int,
+    scope: str,
+    message: str,
+    *,
+    cooldown_seconds: int,
+) -> None:
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        return
+
+    async with get_session() as session:
+        async with session.begin():
+            token = await _resolve_canonical_token_for_update(session, token_id)
+            if token is None:
+                return
+
+            now = utcnow()
+            cooldown_until = now + timedelta(seconds=max(0, int(cooldown_seconds)))
+            result = await session.execute(
+                select(CodexTokenScopedCooldown)
+                .where(
+                    CodexTokenScopedCooldown.token_id == token.id,
+                    CodexTokenScopedCooldown.scope == normalized_scope,
+                )
+                .with_for_update()
+            )
+            cooldown = result.scalars().first()
+            if cooldown is None:
+                session.add(
+                    CodexTokenScopedCooldown(
+                        token_id=token.id,
+                        scope=normalized_scope,
+                        cooldown_until=cooldown_until,
+                        last_error=message[:4000],
+                        updated_at=now,
+                    )
+                )
+                invalidate_fill_first_token_cache()
+                return
+
+            cooldown.cooldown_until = cooldown_until
+            cooldown.last_error = message[:4000]
+            cooldown.updated_at = now
+            invalidate_fill_first_token_cache()
 
 
 def _build_token_counts_stmt(now: datetime):
