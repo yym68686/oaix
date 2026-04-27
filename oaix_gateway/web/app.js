@@ -1412,10 +1412,14 @@ function renderTokenCard(item, workspaceTokenCounts) {
   const createdAtValue = formatDate(item.created_at);
   const lastUsedValue = formatDate(item.last_used_at);
   const observedCostValue = item.observed_cost_usd == null ? "—" : formatUsd(item.observed_cost_usd);
+  const activeStreams = Math.max(0, Number(item.active_streams || 0));
+  const activeStreamCap = Math.max(1, Number(item.active_stream_cap || 10));
+  const activeStreamsValue = `${formatInteger(activeStreams)}/${formatInteger(activeStreamCap)}`;
   const cooldownTone = cooldownValue === "—" ? "muted" : "cooling";
   const createdAtTone = createdAtValue === "—" ? "muted" : "default";
   const lastUsedTone = lastUsedValue === "—" ? "muted" : "default";
   const observedCostTone = item.observed_cost_usd == null ? "muted" : "money";
+  const activeStreamsTone = activeStreams <= 0 ? "muted" : activeStreams >= activeStreamCap ? "cooling" : "default";
   const errorSection = renderTokenErrorSection(item);
   const observedCostLabel = "已用金额";
   return `
@@ -1441,6 +1445,7 @@ function renderTokenCard(item, workspaceTokenCounts) {
             ${renderTokenFact("冷却到", cooldownValue, cooldownTone)}
             ${renderTokenFact("入库时间", createdAtValue, createdAtTone)}
             ${renderTokenFact("最近使用", lastUsedValue, lastUsedTone)}
+            ${renderTokenFact("当前并发", activeStreamsValue, activeStreamsTone)}
             ${renderTokenFact(observedCostLabel, observedCostValue, observedCostTone)}
           </div>
         </div>

@@ -1246,7 +1246,7 @@ async def _claim_fill_first_token_from_cache(
             scoped_cooldown_scope=scoped_cooldown_scope,
         )
 
-    if cached is not None and cached.stale_until > now:
+    if cached is not None:
         _start_fill_first_token_cache_refresh(
             cache_key,
             token_order=token_order,
@@ -1271,6 +1271,21 @@ async def _claim_fill_first_token_from_cache(
     return _select_fill_first_token_from_cached_entry(
         cached,
         exclude_token_ids=exclude_token_ids,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+    )
+
+
+async def prewarm_fill_first_token_cache(
+    selection_settings: TokenSelectionSettings,
+    *,
+    scoped_cooldown_scope: str | None = None,
+) -> None:
+    if selection_settings.strategy != TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        return
+    resolved_token_order = tuple(selection_settings.token_order)
+    await _await_fill_first_token_cache_refresh(
+        (resolved_token_order, scoped_cooldown_scope),
+        token_order=resolved_token_order,
         scoped_cooldown_scope=scoped_cooldown_scope,
     )
 

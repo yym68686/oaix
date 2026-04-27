@@ -9,6 +9,7 @@ from oaix_gateway.database import CodexToken
 from oaix_gateway.token_store import (
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenHistoryRepairSummary,
+    TokenSelectionSettings,
     _FILL_FIRST_TOKEN_CACHE,
     _FILL_FIRST_TOKEN_REFRESH_TASKS,
     _FillFirstTokenCacheEntry,
@@ -18,6 +19,7 @@ from oaix_gateway.token_store import (
     _merge_duplicate_token_rows,
     claim_next_active_token,
     invalidate_fill_first_token_cache,
+    prewarm_fill_first_token_cache,
     repair_duplicate_token_histories,
     set_token_active_state,
     update_token_refresh_state,
@@ -279,6 +281,76 @@ def test_claim_next_active_token_fill_first_serves_stale_while_refreshing(monkey
     assert first is old_token
     assert second is new_token
     assert load_count == 1
+    invalidate_fill_first_token_cache()
+
+
+def test_claim_next_active_token_fill_first_serves_expired_stale_cache_without_waiting(monkeypatch) -> None:
+    invalidate_fill_first_token_cache()
+    old_token = CodexToken(id=16, refresh_token="rt_16", token_type="codex", is_active=True)
+    new_token = CodexToken(id=17, refresh_token="rt_17", token_type="codex", is_active=True)
+    cache_key = ((16, 17), None)
+    now = time.monotonic()
+    _FILL_FIRST_TOKEN_CACHE[cache_key] = _FillFirstTokenCacheEntry(
+        expires_at=now - 10,
+        stale_until=now - 1,
+        tokens=(old_token,),
+    )
+    refresh_released = asyncio.Event()
+    load_count = 0
+
+    async def fake_load(*, token_order, scoped_cooldown_scope):
+        nonlocal load_count
+        load_count += 1
+        await refresh_released.wait()
+        return (new_token,)
+
+    monkeypatch.setattr("oaix_gateway.token_store._load_fill_first_available_tokens", fake_load)
+
+    async def run() -> tuple[CodexToken | None, CodexToken | None]:
+        first = await asyncio.wait_for(
+            claim_next_active_token(
+                selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+                token_order=(16, 17),
+            ),
+            timeout=0.01,
+        )
+        assert first is old_token
+        refresh_task = _FILL_FIRST_TOKEN_REFRESH_TASKS[cache_key]
+        refresh_released.set()
+        await refresh_task
+        second = await claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(16, 17),
+        )
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first is old_token
+    assert second is new_token
+    assert load_count == 1
+    invalidate_fill_first_token_cache()
+
+
+def test_prewarm_fill_first_token_cache_loads_current_order(monkeypatch) -> None:
+    invalidate_fill_first_token_cache()
+    token = CodexToken(id=18, refresh_token="rt_18", token_type="codex", is_active=True)
+    load_calls: list[tuple[tuple[int, ...], str | None]] = []
+
+    async def fake_load(*, token_order, scoped_cooldown_scope):
+        load_calls.append((tuple(token_order), scoped_cooldown_scope))
+        return (token,)
+
+    monkeypatch.setattr("oaix_gateway.token_store._load_fill_first_available_tokens", fake_load)
+
+    asyncio.run(
+        prewarm_fill_first_token_cache(
+            TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=(18,))
+        )
+    )
+
+    assert load_calls == [((18,), None)]
+    assert _FILL_FIRST_TOKEN_CACHE[((18,), None)].tokens == (token,)
     invalidate_fill_first_token_cache()
 
 

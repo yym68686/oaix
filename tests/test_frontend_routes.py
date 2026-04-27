@@ -105,6 +105,7 @@ def test_frontend_token_cards_support_fill_first_drag_ordering() -> None:
     assert 'fetchJson("/admin/token-selection/order"' in app_js
     assert 'elements.tokenList.addEventListener("dragstart", handleTokenCardDragStart)' in app_js
     assert 'state.tokenSelectionStrategy === "fill_first"' in app_js
+    assert 'renderTokenFact("当前并发", activeStreamsValue, activeStreamsTone)' in app_js
 
 
 def test_frontend_dashboard_refresh_does_not_overlap_heavy_admin_requests() -> None:

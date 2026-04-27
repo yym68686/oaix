@@ -66,6 +66,7 @@ from .token_store import (
     mark_token_error,
     mark_token_scoped_cooldown,
     mark_token_success,
+    prewarm_fill_first_token_cache,
     repair_duplicate_token_histories,
     set_token_active_state,
     stop_token_status_write_queue,
@@ -241,6 +242,9 @@ _UPSTREAM_HTTP_PHASE_COMPACT: contextvars.ContextVar[bool] = contextvars.Context
 _TOKEN_ACTIVE_REQUESTS: dict[int, int] = {}
 _TOKEN_RECENT_TTFT_MS: dict[int, deque[int]] = {}
 _TOKEN_RECENT_TTFT_LIMIT = 200
+DEFAULT_FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP = 10
+DEFAULT_UPSTREAM_HTTP_MAX_CONNECTIONS = 512
+DEFAULT_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS = 128
 
 
 def _current_request_timing() -> _RequestTimingRecorder | None:
@@ -257,18 +261,25 @@ def _percentile(values: list[int], percentile: float) -> int | None:
     return ordered[max(0, min(index, len(ordered) - 1))]
 
 
+def _token_active_stream_count(token_id: int) -> int:
+    try:
+        resolved_token_id = int(token_id)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, int(_TOKEN_ACTIVE_REQUESTS.get(resolved_token_id, 0) or 0))
+
+
 def _record_selected_token_observation_start(token_id: int, timing: _RequestTimingRecorder | None) -> None:
-    if timing is None:
-        return
-    active_count = _TOKEN_ACTIVE_REQUESTS.get(token_id, 0)
-    timing.set_ms("selected_token_active_streams", active_count)
-    recent = list(_TOKEN_RECENT_TTFT_MS.get(token_id) or ())
-    recent_p50 = _percentile(recent, 50)
-    recent_p90 = _percentile(recent, 90)
-    if recent_p50 is not None:
-        timing.set_ms("selected_token_recent_ttft_p50", recent_p50)
-    if recent_p90 is not None:
-        timing.set_ms("selected_token_recent_ttft_p90", recent_p90)
+    active_count = _token_active_stream_count(token_id)
+    if timing is not None:
+        timing.set_ms("selected_token_active_streams", active_count)
+        recent = list(_TOKEN_RECENT_TTFT_MS.get(token_id) or ())
+        recent_p50 = _percentile(recent, 50)
+        recent_p90 = _percentile(recent, 90)
+        if recent_p50 is not None:
+            timing.set_ms("selected_token_recent_ttft_p50", recent_p50)
+        if recent_p90 is not None:
+            timing.set_ms("selected_token_recent_ttft_p90", recent_p90)
     _TOKEN_ACTIVE_REQUESTS[token_id] = active_count + 1
 
 
@@ -436,17 +447,41 @@ async def _claim_next_active_token_for_request(
     *,
     exclude_token_ids: set[int],
     scoped_cooldown_scope: str | None = None,
+    timing: _RequestTimingRecorder | None = None,
 ) -> Any:
-    kwargs: dict[str, Any] = {
-        "selection_strategy": selection_settings.strategy,
-        "exclude_token_ids": exclude_token_ids,
-    }
-    if selection_settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
-        kwargs["token_order"] = selection_settings.token_order
+    local_excluded_ids: set[int] = set()
+    fill_first = selection_settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST
     claim_signature = inspect.signature(claim_next_active_token)
-    if scoped_cooldown_scope is not None and "scoped_cooldown_scope" in claim_signature.parameters:
-        kwargs["scoped_cooldown_scope"] = scoped_cooldown_scope
-    return await claim_next_active_token(**kwargs)
+    while True:
+        effective_excluded_ids = set(exclude_token_ids)
+        effective_excluded_ids.update(local_excluded_ids)
+        if fill_first:
+            cap = _fill_first_token_active_stream_cap()
+            effective_excluded_ids.update(
+                token_id
+                for token_id, active_count in _TOKEN_ACTIVE_REQUESTS.items()
+                if int(active_count or 0) >= cap
+            )
+
+        kwargs: dict[str, Any] = {
+            "selection_strategy": selection_settings.strategy,
+            "exclude_token_ids": effective_excluded_ids,
+        }
+        if fill_first:
+            kwargs["token_order"] = selection_settings.token_order
+        if scoped_cooldown_scope is not None and "scoped_cooldown_scope" in claim_signature.parameters:
+            kwargs["scoped_cooldown_scope"] = scoped_cooldown_scope
+
+        token_row = await claim_next_active_token(**kwargs)
+        if token_row is None:
+            return None
+
+        token_id = int(token_row.id)
+        if not fill_first or _token_active_stream_count(token_id) < _fill_first_token_active_stream_cap():
+            _record_selected_token_observation_start(token_id, timing)
+            return token_row
+
+        local_excluded_ids.add(token_id)
 
 
 @dataclass
@@ -1248,6 +1283,32 @@ def _csv_env(name: str) -> list[str]:
 
 def _max_request_account_retries() -> int:
     return _int_env("MAX_REQUEST_ACCOUNT_RETRIES", 100, minimum=1)
+
+
+def _fill_first_token_active_stream_cap() -> int:
+    return _int_env(
+        "FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP",
+        DEFAULT_FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP,
+        minimum=1,
+    )
+
+
+def _upstream_http_max_connections() -> int:
+    return _int_env(
+        "UPSTREAM_HTTP_MAX_CONNECTIONS",
+        DEFAULT_UPSTREAM_HTTP_MAX_CONNECTIONS,
+        minimum=1,
+    )
+
+
+def _upstream_http_max_keepalive_connections() -> int:
+    max_connections = _upstream_http_max_connections()
+    keepalive_connections = _int_env(
+        "UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS",
+        DEFAULT_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS,
+        minimum=0,
+    )
+    return min(keepalive_connections, max_connections)
 
 
 def _image_request_max_account_retries() -> int:
@@ -4732,6 +4793,7 @@ def _gpt_image_stream_keepalive_response(
                         selection_settings,
                         exclude_token_ids=excluded_token_ids,
                         scoped_cooldown_scope=scoped_cooldown_scope,
+                        timing=timing,
                     ),
                     timing=timing,
                     span_name="claim_token_ms",
@@ -4744,6 +4806,7 @@ def _gpt_image_stream_keepalive_response(
                     if require_non_free_token and postponed_unknown_plan_tokens:
                         token_row = postponed_unknown_plan_tokens.pop(0)
                         using_postponed_unknown_plan = True
+                        _record_selected_token_observation_start(token_row.id, timing)
                     else:
                         break
 
@@ -4758,6 +4821,11 @@ def _gpt_image_stream_keepalive_response(
                             token_row.id,
                             token_row.account_id,
                         )
+                        _record_selected_token_observation_finish(
+                            token_row.id,
+                            started_at=request_log.started_at,
+                            first_token_at=None,
+                        )
                         continue
                     if effective_plan_type is None and not using_postponed_unknown_plan:
                         excluded_token_ids.add(token_row.id)
@@ -4768,6 +4836,11 @@ def _gpt_image_stream_keepalive_response(
                             restricted_model_label,
                             token_row.id,
                             token_row.account_id,
+                        )
+                        _record_selected_token_observation_finish(
+                            token_row.id,
+                            started_at=request_log.started_at,
+                            first_token_at=None,
                         )
                         continue
 
@@ -4794,11 +4867,27 @@ def _gpt_image_stream_keepalive_response(
                     )
                     if exc.status_code in (401, 403):
                         last_error = exc
+                        _record_selected_token_observation_finish(
+                            token_row.id,
+                            started_at=request_log.started_at,
+                            first_token_at=None,
+                        )
                         continue
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_log.started_at,
+                        first_token_at=None,
+                    )
+                    raise
+                except BaseException:
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_log.started_at,
+                        first_token_at=None,
+                    )
                     raise
 
                 token_observation_first_token_at: datetime | None = None
-                _record_selected_token_observation_start(token_row.id, timing)
                 try:
                     proxy_result = await _await_with_keepalive_queue(
                         proxy_call(client, access_token, token_row.account_id),
@@ -5243,6 +5332,7 @@ async def _execute_proxy_request_with_failover(
                     selection_settings,
                     exclude_token_ids=excluded_token_ids,
                     scoped_cooldown_scope=scoped_cooldown_scope,
+                    timing=timing,
                 ),
                 timing=timing,
                 span_name="claim_token_ms",
@@ -5253,6 +5343,7 @@ async def _execute_proxy_request_with_failover(
                 if require_non_free_token and postponed_unknown_plan_tokens:
                     token_row = postponed_unknown_plan_tokens.pop(0)
                     using_postponed_unknown_plan = True
+                    _record_selected_token_observation_start(token_row.id, timing)
                 else:
                     break
 
@@ -5267,6 +5358,11 @@ async def _execute_proxy_request_with_failover(
                         token_row.id,
                         token_row.account_id,
                     )
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_started_at,
+                        first_token_at=None,
+                    )
                     continue
                 if effective_plan_type is None and not using_postponed_unknown_plan:
                     excluded_token_ids.add(token_row.id)
@@ -5277,6 +5373,11 @@ async def _execute_proxy_request_with_failover(
                         restricted_model_label,
                         token_row.id,
                         token_row.account_id,
+                    )
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_started_at,
+                        first_token_at=None,
                     )
                     continue
 
@@ -5299,12 +5400,28 @@ async def _execute_proxy_request_with_failover(
                 )
                 if exc.status_code in (401, 403):
                     last_error = exc
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_started_at,
+                        first_token_at=None,
+                    )
                     continue
+                _record_selected_token_observation_finish(
+                    token_row.id,
+                    started_at=request_started_at,
+                    first_token_at=None,
+                )
+                raise
+            except BaseException:
+                _record_selected_token_observation_finish(
+                    token_row.id,
+                    started_at=request_started_at,
+                    first_token_at=None,
+                )
                 raise
 
             token_observation_transferred = False
             token_observation_first_token_at: datetime | None = None
-            _record_selected_token_observation_start(token_row.id, timing)
             try:
                 proxy_result = await proxy_call(client, access_token, token_row.account_id)
                 if isinstance(proxy_result.response, StreamingResponse):
@@ -5715,7 +5832,7 @@ def _selection_strategy_label(strategy: str) -> str:
 
 def _selection_strategy_description(strategy: str) -> str:
     if strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
-        return "持续使用第一个可用 key，直到该 key 冷却或失效再切到下一个。"
+        return "持续使用第一个可用 key；当前并发达到上限后才填下一个 key。"
     return "优先分配最久未使用的 key，把请求更均匀地摊在账号窗口上。"
 
 
@@ -5777,6 +5894,8 @@ def _serialize_admin_token_item(
         "subscription_active_start": plan_info.subscription_active_start,
         "subscription_active_until": plan_info.subscription_active_until,
         "observed_cost_usd": observed_cost_usd,
+        "active_streams": _token_active_stream_count(token_row.id),
+        "active_stream_cap": _fill_first_token_active_stream_cap(),
         "quota": asdict(quota_snapshot) if quota_snapshot is not None else None,
     }
     return item
@@ -5906,7 +6025,10 @@ async def lifespan(app: FastAPI):
         follow_redirects=True,
         transport=_TimingAsyncHTTPTransport(
             http2=False,
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            limits=httpx.Limits(
+                max_connections=_upstream_http_max_connections(),
+                max_keepalive_connections=_upstream_http_max_keepalive_connections(),
+            ),
         ),
     )
     app.state.oauth_manager = CodexOAuthManager()
@@ -5915,6 +6037,10 @@ async def lifespan(app: FastAPI):
         concurrency=_admin_quota_max_concurrency(),
     )
     app.state.token_selection_settings = await get_token_selection_settings()
+    try:
+        await prewarm_fill_first_token_cache(app.state.token_selection_settings)
+    except Exception:
+        logger.exception("Failed to prewarm fill_first token cache")
     app.state.token_import_worker = TokenImportBackgroundWorker(response_traffic=app.state.response_traffic)
     await app.state.token_import_worker.start()
     try:

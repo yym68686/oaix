@@ -20,7 +20,9 @@ from oaix_gateway.api_server import (
     _RequestTimingRecorder,
     _AsyncioSocketSendWarningFilter,
     _SSEProxyStreamingResponse,
+    _TOKEN_ACTIVE_REQUESTS,
     _chat_completions_request_to_responses_request,
+    _claim_next_active_token_for_request,
     _collect_images_api_response_from_sse,
     _execute_proxy_request_with_failover,
     ResponseTrafficController,
@@ -44,6 +46,8 @@ from oaix_gateway.api_server import (
     _iterate_with_sse_keepalive,
     _mark_token_success_with_timing,
     _stream_keepalive_interval_seconds,
+    _upstream_http_max_connections,
+    _upstream_http_max_keepalive_connections,
     _wrap_sse_stream_with_initial_keepalive,
     _build_stream_error_event,
     _build_admin_token_items,
@@ -72,7 +76,7 @@ from oaix_gateway.token_import_jobs import (
     get_token_import_job,
     process_token_import_job,
 )
-from oaix_gateway.token_store import TokenUpsertResult
+from oaix_gateway.token_store import TOKEN_SELECTION_STRATEGY_FILL_FIRST, TokenSelectionSettings, TokenUpsertResult
 
 
 def test_mark_token_success_with_timing_skips_obviously_healthy_token(monkeypatch) -> None:
@@ -1430,7 +1434,7 @@ def test_collect_images_api_response_from_sse_aborts_on_client_disconnect() -> N
     assert "Client disconnected" in str(exc.detail)
 
 
-def test_serialize_admin_token_item_includes_created_at() -> None:
+def test_serialize_admin_token_item_includes_created_at(monkeypatch) -> None:
     created_at = datetime(2026, 4, 15, 9, 30, tzinfo=timezone.utc)
     token = CodexToken(
         id=7,
@@ -1440,6 +1444,9 @@ def test_serialize_admin_token_item_includes_created_at() -> None:
         is_active=True,
     )
     token.created_at = created_at
+    _TOKEN_ACTIVE_REQUESTS.clear()
+    _TOKEN_ACTIVE_REQUESTS[token.id] = 3
+    monkeypatch.setenv("FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP", "10")
 
     item = _serialize_admin_token_item(
         token,
@@ -1454,6 +1461,55 @@ def test_serialize_admin_token_item_includes_created_at() -> None:
     )
 
     assert item["created_at"] == created_at
+    assert item["active_streams"] == 3
+    assert item["active_stream_cap"] == 10
+    _TOKEN_ACTIVE_REQUESTS.clear()
+
+
+def test_claim_next_active_token_for_request_skips_saturated_fill_first_token(monkeypatch) -> None:
+    tokens = {
+        11: SimpleNamespace(id=11),
+        12: SimpleNamespace(id=12),
+    }
+    calls: list[set[int]] = []
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None, token_order=None):
+        del selection_strategy
+        excluded = {int(token_id) for token_id in (exclude_token_ids or ())}
+        calls.append(excluded)
+        for token_id in token_order or ():
+            if int(token_id) not in excluded:
+                return tokens[int(token_id)]
+        return None
+
+    monkeypatch.setenv("FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP", "2")
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    _TOKEN_ACTIVE_REQUESTS.clear()
+    _TOKEN_ACTIVE_REQUESTS[11] = 2
+    timing = _RequestTimingRecorder()
+
+    result = asyncio.run(
+        _claim_next_active_token_for_request(
+            TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=(11, 12)),
+            exclude_token_ids=set(),
+            timing=timing,
+        )
+    )
+
+    assert result is tokens[12]
+    assert 11 in calls[0]
+    assert _TOKEN_ACTIVE_REQUESTS[11] == 2
+    assert _TOKEN_ACTIVE_REQUESTS[12] == 1
+    assert timing.snapshot()["selected_token_active_streams"] == 0
+    _TOKEN_ACTIVE_REQUESTS.clear()
+
+
+def test_upstream_http_pool_size_is_configurable(monkeypatch) -> None:
+    monkeypatch.setenv("UPSTREAM_HTTP_MAX_CONNECTIONS", "512")
+    monkeypatch.setenv("UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS", "128")
+
+    assert _upstream_http_max_connections() == 512
+    assert _upstream_http_max_keepalive_connections() == 128
 
 
 def test_resolve_token_observed_cost_usd_prefers_direct_token_cost() -> None:
