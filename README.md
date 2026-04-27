@@ -169,7 +169,7 @@ account_id_3,refresh_token_3
 ## 网关行为
 
 - 只会选择 `is_active=true` 且 `cooldown_until` 不在未来的 key
-- `/v1/responses/compact` 会透传到上游 `/responses/compact`，并按 `uni-api` 的相关逻辑去掉 `store`；非流式调用时也不会自动补 `stream`
+- `/v1/responses/compact` 会透传到上游 `/responses/compact`，并和 `/v1/responses` 一样强制 `store=false`；非流式调用时也不会自动补 `stream`
 - 下游如果把 `/v1/responses` 当非流式调用，网关会自动把上游改成 `stream=true`，先在网关内收完整个 SSE，再拼成一个普通 JSON 响应返回
 - `/v1/images/generations` 和 `/v1/images/edits` 默认把 `model` 当作图片工具模型处理；未指定时默认 `gpt-image-2`，内部主模型固定走 `gpt-5.4-mini`
 - 图片接口内部统一走上游 `/responses` 的 `image_generation` tool；非流式会在网关内收完整个 SSE 后再拼成 OpenAI Images API 形状，流式会把上游 responses 事件改写成 `image_generation.*` / `image_edit.*`

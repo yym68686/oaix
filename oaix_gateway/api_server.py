@@ -1406,10 +1406,7 @@ def _sanitize_codex_payload(
         payload.pop("previous_response_id", None)
     payload.pop("prompt_cache_retention", None)
     payload.pop("safety_identifier", None)
-    if compact:
-        payload.pop("store", None)
-    else:
-        payload["store"] = False
+    payload["store"] = False
     payload.setdefault("instructions", "")
     return payload
 

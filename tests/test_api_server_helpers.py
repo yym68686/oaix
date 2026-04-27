@@ -225,17 +225,18 @@ def test_sanitize_codex_payload_removes_unsupported_fields() -> None:
     }
 
 
-def test_sanitize_codex_payload_compact_strips_store() -> None:
+def test_sanitize_codex_payload_compact_forces_store_false() -> None:
     payload = {
         "model": "gpt-4.1",
         "input": "hi",
-        "store": False,
+        "store": True,
         "response_format": {"type": "json_schema"},
     }
     sanitized = _sanitize_codex_payload(payload, compact=True)
     assert sanitized == {
         "model": "gpt-4.1",
         "input": "hi",
+        "store": False,
         "instructions": "",
     }
 
