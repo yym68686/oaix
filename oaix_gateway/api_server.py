@@ -4,6 +4,7 @@ import codecs
 import contextvars
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import mimetypes
@@ -13,7 +14,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager, contextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -189,10 +190,85 @@ _REQUEST_TIMING: contextvars.ContextVar[_RequestTimingRecorder | None] = context
     "oaix_request_timing",
     default=None,
 )
+_UPSTREAM_HTTP_PHASE_TIMING: contextvars.ContextVar[_RequestTimingRecorder | None] = contextvars.ContextVar(
+    "oaix_upstream_http_phase_timing",
+    default=None,
+)
 
 
 def _current_request_timing() -> _RequestTimingRecorder | None:
     return _REQUEST_TIMING.get()
+
+
+class _HTTPPhaseTraceRecorder:
+    def __init__(self, timing: _RequestTimingRecorder) -> None:
+        self._timing = timing
+        self._started_at = time.perf_counter()
+        self._first_trace_seen = False
+        self._operation_started_at: dict[str, float] = {}
+
+    async def record(self, name: str, info: dict[str, Any]) -> None:
+        del info
+        parts = name.split(".")
+        if len(parts) < 2:
+            return
+
+        phase = parts[-1]
+        operation = parts[-2]
+        now = time.perf_counter()
+        if phase == "started":
+            if not self._first_trace_seen:
+                self._first_trace_seen = True
+                self._timing.add_ms("http_pool_wait_ms", (now - self._started_at) * 1000)
+            self._operation_started_at[operation] = now
+            return
+
+        if phase not in {"complete", "failed"}:
+            return
+
+        started_at = self._operation_started_at.pop(operation, None)
+        if started_at is None:
+            return
+
+        elapsed_ms = (now - started_at) * 1000
+        if operation in {"connect_tcp", "connect_unix_socket"}:
+            self._timing.add_ms("http_connect_ms", elapsed_ms)
+        elif operation == "start_tls":
+            self._timing.add_ms("http_tls_ms", elapsed_ms)
+        elif operation in {"send_request_headers", "send_request_body"}:
+            self._timing.add_ms("http_request_write_ms", elapsed_ms)
+            self._timing.add_ms(f"http_{operation}_ms", elapsed_ms)
+        elif operation == "receive_response_headers":
+            self._timing.add_ms("upstream_headers_ms", elapsed_ms)
+        elif operation == "retry":
+            self._timing.add_ms("http_connect_retry_sleep_ms", elapsed_ms)
+
+
+class _TimingAsyncHTTPTransport(httpx.AsyncBaseTransport):
+    def __init__(self, **kwargs: Any) -> None:
+        self._transport = httpx.AsyncHTTPTransport(**kwargs)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        timing = _UPSTREAM_HTTP_PHASE_TIMING.get()
+        if timing is None:
+            return await self._transport.handle_async_request(request)
+
+        recorder = _HTTPPhaseTraceRecorder(timing)
+        previous_trace = request.extensions.get("trace")
+
+        async def trace(name: str, info: dict[str, Any]) -> None:
+            await recorder.record(name, info)
+            if previous_trace is None:
+                return
+            result = previous_trace(name, info)
+            if inspect.isawaitable(result):
+                await result
+
+        request.extensions["trace"] = trace
+        return await self._transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
 
 
 async def _record_event_loop_lag(timing: _RequestTimingRecorder | None) -> None:
@@ -255,17 +331,115 @@ async def _claim_next_active_token_for_request(
     return await claim_next_active_token(**kwargs)
 
 
-_REQUEST_LOG_WRITE_SEMAPHORE: asyncio.Semaphore | None = None
-_REQUEST_LOG_WRITE_SEMAPHORE_LIMIT: int | None = None
+@dataclass
+class _RequestLogWriteJob:
+    operation: Callable[[], Awaitable[Any]]
+    future: asyncio.Future[Any]
+    timing: _RequestTimingRecorder | None
+    span_name: str | None = None
+    db_wait: bool = True
 
 
-def _request_log_write_semaphore() -> asyncio.Semaphore:
-    global _REQUEST_LOG_WRITE_SEMAPHORE, _REQUEST_LOG_WRITE_SEMAPHORE_LIMIT
-    limit = _int_env("REQUEST_LOG_WRITE_CONCURRENCY", 2, minimum=1)
-    if _REQUEST_LOG_WRITE_SEMAPHORE is None or _REQUEST_LOG_WRITE_SEMAPHORE_LIMIT != limit:
-        _REQUEST_LOG_WRITE_SEMAPHORE = asyncio.Semaphore(limit)
-        _REQUEST_LOG_WRITE_SEMAPHORE_LIMIT = limit
-    return _REQUEST_LOG_WRITE_SEMAPHORE
+_REQUEST_LOG_WRITE_QUEUE: asyncio.Queue[_RequestLogWriteJob] | None = None
+_REQUEST_LOG_WRITE_QUEUE_LOOP: asyncio.AbstractEventLoop | None = None
+_REQUEST_LOG_WRITE_DRAINERS: set[asyncio.Task[None]] = set()
+
+
+def _request_log_write_concurrency() -> int:
+    return _int_env("REQUEST_LOG_WRITE_CONCURRENCY", 2, minimum=1)
+
+
+def _request_log_write_queue() -> asyncio.Queue[_RequestLogWriteJob]:
+    global _REQUEST_LOG_WRITE_QUEUE, _REQUEST_LOG_WRITE_QUEUE_LOOP, _REQUEST_LOG_WRITE_DRAINERS
+    loop = asyncio.get_running_loop()
+    if _REQUEST_LOG_WRITE_QUEUE is None or _REQUEST_LOG_WRITE_QUEUE_LOOP is not loop:
+        _REQUEST_LOG_WRITE_QUEUE = asyncio.Queue()
+        _REQUEST_LOG_WRITE_QUEUE_LOOP = loop
+        _REQUEST_LOG_WRITE_DRAINERS = set()
+    return _REQUEST_LOG_WRITE_QUEUE
+
+
+async def _drain_request_log_write_queue(queue: asyncio.Queue[_RequestLogWriteJob]) -> None:
+    while True:
+        try:
+            job = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+
+        try:
+            if job.future.cancelled():
+                continue
+            await asyncio.sleep(0)
+            result = await _await_timed(
+                job.operation(),
+                timing=job.timing,
+                span_name=job.span_name,
+                db_wait=job.db_wait,
+            )
+        except Exception as exc:
+            if not job.future.done():
+                job.future.set_exception(exc)
+        else:
+            if not job.future.done():
+                job.future.set_result(result)
+        finally:
+            queue.task_done()
+
+
+def _discard_request_log_drainer(task: asyncio.Task[None]) -> None:
+    _REQUEST_LOG_WRITE_DRAINERS.discard(task)
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Request log write worker failed")
+    if _REQUEST_LOG_WRITE_QUEUE is not None and not _REQUEST_LOG_WRITE_QUEUE.empty():
+        _ensure_request_log_write_drainers()
+
+
+def _ensure_request_log_write_drainers() -> None:
+    global _REQUEST_LOG_WRITE_DRAINERS
+    queue = _request_log_write_queue()
+    _REQUEST_LOG_WRITE_DRAINERS = {task for task in _REQUEST_LOG_WRITE_DRAINERS if not task.done()}
+    while not queue.empty() and len(_REQUEST_LOG_WRITE_DRAINERS) < _request_log_write_concurrency():
+        task = asyncio.create_task(
+            _drain_request_log_write_queue(queue),
+            name="oaix-request-log-write-worker",
+        )
+        _REQUEST_LOG_WRITE_DRAINERS.add(task)
+        task.add_done_callback(_discard_request_log_drainer)
+
+
+def _submit_request_log_write(
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    timing: _RequestTimingRecorder | None,
+    span_name: str | None = None,
+    db_wait: bool = True,
+) -> asyncio.Future[Any]:
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+    queue = _request_log_write_queue()
+    queue.put_nowait(
+        _RequestLogWriteJob(
+            operation=operation,
+            future=future,
+            timing=timing,
+            span_name=span_name,
+            db_wait=db_wait,
+        )
+    )
+    _ensure_request_log_write_drainers()
+    return future
+
+
+async def _flush_request_log_write_queue() -> None:
+    queue = _request_log_write_queue()
+    _ensure_request_log_write_drainers()
+    await queue.join()
+    if _REQUEST_LOG_WRITE_DRAINERS:
+        await asyncio.gather(*list(_REQUEST_LOG_WRITE_DRAINERS), return_exceptions=True)
 
 
 @dataclass
@@ -278,8 +452,10 @@ class _RequestLogHandle:
     client_ip: str | None
     user_agent: str | None
     timing: _RequestTimingRecorder
-    _create_task: asyncio.Task[int | None] | None = None
+    _create_task: asyncio.Future[int | None] | None = None
     _request_log_id: int | None = None
+    _finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _finalize_task: asyncio.Task[tuple[int | None, dict[str, int] | None]] | None = None
 
     @classmethod
     def start(
@@ -303,28 +479,24 @@ class _RequestLogHandle:
             user_agent=user_agent,
             timing=timing,
         )
-        handle._create_task = asyncio.create_task(
-            handle._create(),
-            name=f"oaix-request-log-create-{handle.request_id}",
+        handle._create_task = _submit_request_log_write(
+            handle._create,
+            timing=handle.timing,
+            span_name="request_log_ms",
+            db_wait=True,
         )
         return handle
 
     async def _create(self) -> int | None:
-        async with _request_log_write_semaphore():
-            item = await _await_timed(
-                create_request_log(
-                    request_id=self.request_id,
-                    endpoint=self.endpoint,
-                    model=self.model,
-                    is_stream=self.is_stream,
-                    started_at=self.started_at,
-                    client_ip=self.client_ip,
-                    user_agent=self.user_agent,
-                ),
-                timing=self.timing,
-                span_name="request_log_ms",
-                db_wait=True,
-            )
+        item = await create_request_log(
+            request_id=self.request_id,
+            endpoint=self.endpoint,
+            model=self.model,
+            is_stream=self.is_stream,
+            started_at=self.started_at,
+            client_ip=self.client_ip,
+            user_agent=self.user_agent,
+        )
         self._request_log_id = int(item.id)
         return self._request_log_id
 
@@ -345,25 +517,47 @@ class _RequestLogHandle:
                 return request_log_id
 
         try:
-            return await self._create()
+            self._create_task = _submit_request_log_write(
+                self._create,
+                timing=self.timing,
+                span_name="request_log_ms",
+                db_wait=True,
+            )
+            request_log_id = await asyncio.shield(self._create_task)
+            self._request_log_id = request_log_id
+            return request_log_id
         except Exception:
             logger.exception("Failed to create request log request_id=%s", self.request_id)
             return None
 
     async def finalize(self, *, timing: _RequestTimingRecorder | None, **kwargs) -> tuple[int | None, dict[str, int] | None]:
+        if self._finalize_task is None:
+            async with self._finalize_lock:
+                if self._finalize_task is None:
+                    self._finalize_task = asyncio.create_task(
+                        self._finalize_once(timing=timing, kwargs=dict(kwargs)),
+                        name=f"oaix-request-log-finalize-{self.request_id}",
+                    )
+        return await asyncio.shield(self._finalize_task)
+
+    async def _finalize_once(
+        self,
+        *,
+        timing: _RequestTimingRecorder | None,
+        kwargs: dict[str, Any],
+    ) -> tuple[int | None, dict[str, int] | None]:
         request_log_id = await self.ensure_created()
         if request_log_id is None:
             return None, None
 
-        async with _request_log_write_semaphore():
-            if timing is not None and "timing_spans" not in kwargs:
-                kwargs["timing_spans"] = timing.snapshot()
-            started_at = time.perf_counter()
-            try:
-                resolved_spans = await finalize_request_log(request_log_id, **kwargs)
-            finally:
-                if timing is not None:
-                    timing.add_elapsed("db_pool_wait_ms", started_at)
+        if timing is not None and "timing_spans" not in kwargs:
+            kwargs["timing_spans"] = timing.snapshot()
+        future = _submit_request_log_write(
+            lambda: finalize_request_log(request_log_id, **kwargs),
+            timing=timing,
+            db_wait=True,
+        )
+        resolved_spans = await asyncio.shield(future)
         return request_log_id, resolved_spans
 
 
@@ -693,6 +887,57 @@ class _SSEProxyStreamingResponse(Response):
                 if callable(close_iterator):
                     with suppress(Exception):
                         await close_iterator()
+
+
+class _IdempotentAsyncCallback:
+    def __init__(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self._callback = callback
+        self._lock = asyncio.Lock()
+        self._called = False
+
+    async def __call__(self) -> None:
+        if self._called:
+            return
+        async with self._lock:
+            if self._called:
+                return
+            self._called = True
+            await self._callback()
+
+
+class _FinalizingStreamingResponse(StreamingResponse):
+    def __init__(
+        self,
+        content: AsyncIterator[bytes],
+        *,
+        on_close: Callable[[], Awaitable[None]],
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        super().__init__(content, status_code=status_code, headers=headers, media_type=media_type)
+        self._on_close_once = _IdempotentAsyncCallback(on_close)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            async def close_with_cancel_shield() -> None:
+                with anyio.CancelScope(shield=True):
+                    await self._on_close_once()
+
+            cleanup_task = asyncio.create_task(close_with_cancel_shield(), name="oaix-streamed-response-finalizer")
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                try:
+                    with anyio.CancelScope(shield=True):
+                        await asyncio.shield(cleanup_task)
+                except Exception:
+                    logger.exception("Failed to finalize streaming response after ASGI cancellation")
+                raise
+            except Exception:
+                logger.exception("Failed to finalize streaming response")
 
 
 class ResponseTrafficLease:
@@ -2575,13 +2820,14 @@ async def _prime_responses_upstream_stream(
 async def _enter_upstream_stream_with_timing(stream_cm):
     timing = _current_request_timing()
     started_at = time.perf_counter()
+    timing_context_token = _UPSTREAM_HTTP_PHASE_TIMING.set(timing) if timing is not None else None
     try:
         return await stream_cm.__aenter__()
     finally:
+        if timing_context_token is not None:
+            _UPSTREAM_HTTP_PHASE_TIMING.reset(timing_context_token)
         if timing is not None:
-            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-            timing.add_ms("http_pool_wait_ms", elapsed_ms)
-            timing.add_ms("upstream_headers_ms", elapsed_ms)
+            timing.add_elapsed("upstream_stream_enter_ms", started_at)
 
 
 async def _prime_responses_upstream_stream_with_timing(
@@ -4077,6 +4323,7 @@ def _gpt_image_stream_keepalive_response(
     queue_done_sentinel = object()
     heartbeat_interval_seconds = _stream_keepalive_interval_seconds()
     first_output_timeout_seconds = _image_stream_first_output_timeout_seconds()
+    response_body_started = False
 
     async def worker() -> None:
         timing_context_token = _REQUEST_TIMING.set(timing) if timing is not None else None
@@ -4466,6 +4713,8 @@ def _gpt_image_stream_keepalive_response(
                     _REQUEST_TIMING.reset(timing_context_token)
 
     async def response_body() -> AsyncGenerator[bytes, None]:
+        nonlocal response_body_started
+        response_body_started = True
         worker_task = asyncio.create_task(worker())
         try:
             # Commit an initial SSE comment immediately so downstream proxies/CDNs
@@ -4483,8 +4732,27 @@ def _gpt_image_stream_keepalive_response(
                 with suppress(asyncio.CancelledError):
                     await worker_task
 
-    return StreamingResponse(
+    async def on_response_close_before_body_start() -> None:
+        if response_body_started:
+            return
+        try:
+            await _finalize_cancelled_request_log(
+                request_log,
+                status_code=499,
+                success=False,
+                attempt_count=0,
+                finished_at=utcnow(),
+                token_id=None,
+                account_id=None,
+                error_message="Client disconnected",
+                timing=timing,
+            )
+        finally:
+            await response_lease.release()
+
+    return _FinalizingStreamingResponse(
         response_body(),
+        on_close=on_response_close_before_body_start,
         media_type="text/event-stream",
         headers=_sse_response_headers(),
     )
@@ -4624,7 +4892,32 @@ async def _execute_proxy_request_with_failover(
                         proxied_result: ProxyRequestResult = proxy_result,
                     ) -> None:
                         try:
-                            if proxied_result.stream_capture is not None:
+                            disconnected_before_completion = (
+                                proxied_result.stream_capture is not None
+                                and proxied_result.stream_capture.error_message is None
+                                and not proxied_result.stream_capture.completed
+                            )
+                            if disconnected_before_completion:
+                                finalized_request_log_id = await _finalize_request_log_with_timing(
+                                    timing,
+                                    request_log,
+                                    status_code=499,
+                                    success=False,
+                                    attempt_count=attempt_index,
+                                    finished_at=utcnow(),
+                                    first_token_at=(
+                                        proxied_result.stream_capture.first_token_at
+                                        or proxied_result.first_token_at
+                                    ),
+                                    token_id=token_id,
+                                    account_id=proxied_account_id,
+                                    model_name=(
+                                        proxied_result.stream_capture.model_name
+                                        or proxied_result.model_name
+                                    ),
+                                    error_message="Client disconnected",
+                                )
+                            elif proxied_result.stream_capture is not None:
                                 finalized_request_log_id = await _finalize_stream_request_log(
                                     request_log_ref=request_log,
                                     status_code=proxied_result.status_code,
@@ -4650,9 +4943,12 @@ async def _execute_proxy_request_with_failover(
                                     model_name=proxied_result.model_name,
                                 )
                             if (
-                                proxied_result.stream_capture is None
-                                or proxied_result.stream_capture.error_message is None
-                                or proxied_result.stream_capture.completed
+                                not disconnected_before_completion
+                                and (
+                                    proxied_result.stream_capture is None
+                                    or proxied_result.stream_capture.error_message is None
+                                    or proxied_result.stream_capture.completed
+                                )
                             ):
                                 await _mark_token_success_with_timing(timing, token_id)
                             if finalized_request_log_id is not None:
@@ -4669,13 +4965,19 @@ async def _execute_proxy_request_with_failover(
                             body_iterator,
                             heartbeat_interval_seconds=_stream_keepalive_interval_seconds(),
                         )
+                    on_stream_close_once = _IdempotentAsyncCallback(on_stream_close)
                     body_iterator = _wrap_streaming_body_iterator(
                         body_iterator,
-                        on_close=on_stream_close,
+                        on_close=on_stream_close_once,
                     )
-                    proxy_result.response.body_iterator = body_iterator
                     release_response_traffic = False
-                    return proxy_result.response
+                    return _FinalizingStreamingResponse(
+                        body_iterator,
+                        on_close=on_stream_close_once,
+                        status_code=proxy_result.response.status_code,
+                        headers=dict(proxy_result.response.headers),
+                        media_type=proxy_result.response.media_type,
+                    )
 
                 await _mark_token_success_with_timing(timing, token_row.id)
                 finalized_request_log_id = await _finalize_request_log_with_timing(
@@ -5128,8 +5430,10 @@ async def lifespan(app: FastAPI):
         )
     app.state.http_client = httpx.AsyncClient(
         follow_redirects=True,
-        http2=False,
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        transport=_TimingAsyncHTTPTransport(
+            http2=False,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        ),
     )
     app.state.oauth_manager = CodexOAuthManager()
     app.state.quota_service = CodexQuotaService(
@@ -5143,6 +5447,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await app.state.token_import_worker.stop()
+        await _flush_request_log_write_queue()
         await app.state.http_client.aclose()
         await close_database()
 

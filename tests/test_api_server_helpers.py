@@ -14,7 +14,9 @@ from starlette.requests import Request
 from oaix_gateway.api_server import (
     ChatCompletionsRequest,
     ImageProxyRequest,
+    _HTTPPhaseTraceRecorder,
     _ProxyStreamCapture,
+    _RequestTimingRecorder,
     _AsyncioSocketSendWarningFilter,
     _SSEProxyStreamingResponse,
     _chat_completions_request_to_responses_request,
@@ -5328,6 +5330,162 @@ def test_wrap_streaming_body_iterator_runs_cleanup_on_close() -> None:
     asyncio.run(runner())
 
     assert events == ["upstream_closed", "cleanup_ran"]
+
+
+def test_http_phase_trace_recorder_splits_upstream_request_phases(monkeypatch) -> None:
+    now = 100.0
+    monkeypatch.setattr("oaix_gateway.api_server.time.perf_counter", lambda: now)
+    timing = _RequestTimingRecorder()
+    recorder = _HTTPPhaseTraceRecorder(timing)
+
+    async def runner() -> None:
+        nonlocal now
+        now = 100.010
+        await recorder.record("connection.connect_tcp.started", {})
+        now = 100.030
+        await recorder.record("connection.connect_tcp.complete", {})
+        now = 100.040
+        await recorder.record("connection.start_tls.started", {})
+        now = 100.055
+        await recorder.record("connection.start_tls.complete", {})
+        now = 100.060
+        await recorder.record("http11.send_request_headers.started", {})
+        now = 100.062
+        await recorder.record("http11.send_request_headers.complete", {})
+        now = 100.063
+        await recorder.record("http11.send_request_body.started", {})
+        now = 100.067
+        await recorder.record("http11.send_request_body.complete", {})
+        now = 100.070
+        await recorder.record("http11.receive_response_headers.started", {})
+        now = 100.120
+        await recorder.record("http11.receive_response_headers.complete", {})
+
+    asyncio.run(runner())
+
+    spans = timing.snapshot()
+    assert spans["http_pool_wait_ms"] == 10
+    assert spans["http_connect_ms"] == 20
+    assert spans["http_tls_ms"] == 15
+    assert spans["http_request_write_ms"] == 6
+    assert spans["http_send_request_headers_ms"] == 2
+    assert spans["http_send_request_body_ms"] == 4
+    assert spans["upstream_headers_ms"] == 50
+
+
+def test_stream_response_finalizes_499_when_client_disconnects_before_body(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run for a disconnected stream")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    token_row = CodexToken(
+        id=51,
+        account_id="acct_51",
+        refresh_token="refresh-51",
+        token_type="codex",
+        is_active=True,
+        plan_type="team",
+    )
+    finalized: list[dict[str, object]] = []
+    marked_success: list[int] = []
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=909)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs):
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+        return kwargs.get("timing_spans")
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        return token_row
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        marked_success.append(token_id)
+
+    async def stalled_stream() -> AsyncIterator[bytes]:
+        await asyncio.sleep(60)
+        yield b"data: unreachable\n\n"
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        return SimpleNamespace(
+            response=StreamingResponse(stalled_stream(), media_type="text/event-stream"),
+            status_code=200,
+            model_name="gpt-5.5",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=_ProxyStreamCapture(initial_model_name="gpt-5.5", initial_first_token_at=None),
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    async def run() -> None:
+        response = await _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.5",
+            is_stream=True,
+            proxy_call=fake_proxy_call,
+        )
+
+        async def receive() -> dict[str, object]:
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, object]) -> None:
+            del message
+
+        await asyncio.wait_for(
+            response(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "method": "POST",
+                    "path": "/v1/responses",
+                    "headers": [],
+                },
+                receive,
+                send,
+            ),
+            timeout=0.2,
+        )
+
+    asyncio.run(run())
+
+    assert finalized[0]["request_log_id"] == 909
+    assert finalized[0]["status_code"] == 499
+    assert finalized[0]["success"] is False
+    assert finalized[0]["attempt_count"] == 1
+    assert finalized[0]["token_id"] == 51
+    assert finalized[0]["account_id"] == "acct_51"
+    assert finalized[0]["error_message"] == "Client disconnected"
+    assert marked_success == []
+    assert app.state.response_traffic.active_responses == 0
 
 
 def test_probe_token_with_latest_access_token_reactivates_on_success(monkeypatch) -> None:

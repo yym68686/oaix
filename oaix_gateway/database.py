@@ -177,6 +177,8 @@ class TokenImportJob(Base):
 
 _engine = None
 _session_factory = None
+_request_log_engine = None
+_request_log_session_factory = None
 
 
 def get_engine():
@@ -203,6 +205,32 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
             expire_on_commit=False,
         )
     return _session_factory
+
+
+def get_request_log_engine():
+    global _request_log_engine
+    if _request_log_engine is None:
+        _request_log_engine = create_async_engine(
+            normalize_database_url(),
+            pool_size=_int_env("REQUEST_LOG_DATABASE_POOL_SIZE", 2, minimum=1),
+            max_overflow=_int_env("REQUEST_LOG_DATABASE_MAX_OVERFLOW", 2, minimum=0),
+            pool_timeout=_float_env("REQUEST_LOG_DATABASE_POOL_TIMEOUT_SECONDS", 10.0, minimum=1.0),
+            pool_pre_ping=True,
+            pool_reset_on_return="rollback",
+        )
+    return _request_log_engine
+
+
+def get_request_log_session_factory() -> async_sessionmaker[AsyncSession]:
+    global _request_log_session_factory
+    if _request_log_session_factory is None:
+        _request_log_session_factory = async_sessionmaker(
+            get_request_log_engine(),
+            class_=AsyncSession,
+            autobegin=False,
+            expire_on_commit=False,
+        )
+    return _request_log_session_factory
 
 
 async def _close_session(session: AsyncSession) -> None:
@@ -233,6 +261,15 @@ async def get_read_session() -> AsyncIterator[AsyncSession]:
     async with get_session() as session:
         async with session.begin():
             yield session
+
+
+@asynccontextmanager
+async def get_request_log_session() -> AsyncIterator[AsyncSession]:
+    session = get_request_log_session_factory()()
+    try:
+        yield session
+    finally:
+        await _close_session(session)
 
 
 async def init_db() -> None:
@@ -355,8 +392,12 @@ async def _backfill_token_refresh_aliases() -> None:
 
 
 async def close_database() -> None:
-    global _engine, _session_factory
+    global _engine, _session_factory, _request_log_engine, _request_log_session_factory
     if _engine is not None:
         await _engine.dispose()
+    if _request_log_engine is not None:
+        await _request_log_engine.dispose()
     _engine = None
     _session_factory = None
+    _request_log_engine = None
+    _request_log_session_factory = None

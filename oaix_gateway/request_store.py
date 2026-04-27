@@ -5,7 +5,7 @@ from typing import Any
 
 from sqlalchemy import case, func, select, text
 
-from .database import CodexToken, GatewayRequestLog, get_read_session, get_session, utcnow
+from .database import CodexToken, GatewayRequestLog, get_read_session, get_request_log_session, utcnow
 
 
 @dataclass(frozen=True)
@@ -246,7 +246,7 @@ async def create_request_log(
     user_agent: str | None = None,
 ) -> GatewayRequestLog:
     started_at = started_at or utcnow()
-    async with get_session() as session:
+    async with get_request_log_session() as session:
         async with session.begin():
             item = GatewayRequestLog(
                 request_id=request_id,
@@ -284,7 +284,7 @@ async def finalize_request_log(
     finalize_started = perf_counter()
     finished_at = finished_at or utcnow()
     resolved_timing_spans = _normalize_timing_spans(timing_spans)
-    async with get_session() as session:
+    async with get_request_log_session() as session:
         async with session.begin():
             item = await session.get(GatewayRequestLog, request_log_id, with_for_update=True)
             if item is None:
