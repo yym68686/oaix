@@ -68,6 +68,7 @@ from .token_store import (
     mark_token_success,
     repair_duplicate_token_histories,
     set_token_active_state,
+    stop_token_status_write_queue,
     update_token_order_settings,
     update_token_selection_settings,
 )
@@ -403,12 +404,30 @@ async def _await_timed(
             timing.add_elapsed("db_query_ms", started_at)
 
 
-async def _mark_token_success_with_timing(timing: _RequestTimingRecorder | None, token_id: int) -> None:
+def _token_row_success_mark_is_noop(token_row: Any | None) -> bool:
+    if token_row is None:
+        return False
+    return (
+        getattr(token_row, "merged_into_token_id", None) is None
+        and getattr(token_row, "is_active", None) is True
+        and getattr(token_row, "cooldown_until", None) is None
+        and not getattr(token_row, "last_error", None)
+    )
+
+
+async def _mark_token_success_with_timing(
+    timing: _RequestTimingRecorder | None,
+    token_id: int,
+    *,
+    token_row: Any | None = None,
+) -> None:
+    if _token_row_success_mark_is_noop(token_row):
+        return
     await _await_timed(
         mark_token_success(token_id),
         timing=timing,
         span_name="mark_success_ms",
-        db_wait=True,
+        db_wait=False,
     )
 
 
@@ -1406,7 +1425,10 @@ def _sanitize_codex_payload(
         payload.pop("previous_response_id", None)
     payload.pop("prompt_cache_retention", None)
     payload.pop("safety_identifier", None)
-    payload["store"] = False
+    if compact:
+        payload.pop("store", None)
+    else:
+        payload["store"] = False
     payload.setdefault("instructions", "")
     return payload
 
@@ -4883,7 +4905,7 @@ def _gpt_image_stream_keepalive_response(
                             model_name=proxy_result.model_name,
                             success_hook=proxy_result.on_success,
                         )
-                    await _mark_token_success_with_timing(timing, token_row.id)
+                    await _mark_token_success_with_timing(timing, token_row.id, token_row=token_row)
                     token_observation_first_token_at = (
                         (
                             proxy_result.stream_capture.first_token_at
@@ -5293,6 +5315,7 @@ async def _execute_proxy_request_with_failover(
                         token_id: int = token_row.id,
                         proxied_account_id: str | None = token_row.account_id,
                         proxied_result: ProxyRequestResult = proxy_result,
+                        selected_token_row: Any = token_row,
                     ) -> None:
                         db_timing_context_token = set_db_timing_recorder(timing)
                         try:
@@ -5356,7 +5379,11 @@ async def _execute_proxy_request_with_failover(
                                     or proxied_result.stream_capture.completed
                                 )
                             ):
-                                await _mark_token_success_with_timing(timing, token_id)
+                                await _mark_token_success_with_timing(
+                                    timing,
+                                    token_id,
+                                    token_row=selected_token_row,
+                                )
                         finally:
                             _record_selected_token_observation_finish(
                                 token_id,
@@ -5394,7 +5421,7 @@ async def _execute_proxy_request_with_failover(
                         media_type=proxy_result.response.media_type,
                     )
 
-                await _mark_token_success_with_timing(timing, token_row.id)
+                await _mark_token_success_with_timing(timing, token_row.id, token_row=token_row)
                 token_observation_first_token_at = proxy_result.first_token_at
                 finalized_request_log_id = await _finalize_request_log_with_timing(
                     timing,
@@ -5895,6 +5922,7 @@ async def lifespan(app: FastAPI):
     finally:
         await app.state.token_import_worker.stop()
         await _flush_request_log_write_queue()
+        await stop_token_status_write_queue()
         await app.state.http_client.aclose()
         await close_database()
 
@@ -6585,6 +6613,7 @@ async def _proxy_request_with_token(
         if timing is not None:
             timing.add_ms("upstream_compact_fallback_count", 1)
         fallback_payload = dict(payload)
+        fallback_payload["store"] = False
         fallback_payload["stream"] = True
         fallback_headers = _build_upstream_headers(
             http_request,

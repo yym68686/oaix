@@ -1,4 +1,5 @@
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -8,6 +9,11 @@ from oaix_gateway.database import CodexToken
 from oaix_gateway.token_store import (
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenHistoryRepairSummary,
+    _FILL_FIRST_TOKEN_CACHE,
+    _FILL_FIRST_TOKEN_REFRESH_TASKS,
+    _FillFirstTokenCacheEntry,
+    _TOKEN_RUNTIME_STATE,
+    _apply_token_runtime_error_state,
     _build_token_counts_stmt,
     _merge_duplicate_token_rows,
     claim_next_active_token,
@@ -87,6 +93,7 @@ def test_build_token_counts_stmt_uses_single_aggregate_query() -> None:
 
 
 def test_claim_next_active_token_fill_first_is_read_only_and_uses_app_token_order(monkeypatch) -> None:
+    invalidate_fill_first_token_cache()
     token = CodexToken(
         id=7,
         refresh_token="rt_7",
@@ -123,9 +130,11 @@ def test_claim_next_active_token_fill_first_is_read_only_and_uses_app_token_orde
     assert "gateway_settings" not in sql
     assert "FOR UPDATE" not in sql
     assert "CASE codex_tokens.id" in sql
+    invalidate_fill_first_token_cache()
 
 
 def test_claim_next_active_token_filters_requested_scoped_cooldown(monkeypatch) -> None:
+    invalidate_fill_first_token_cache()
     token = CodexToken(
         id=8,
         refresh_token="rt_8",
@@ -153,6 +162,7 @@ def test_claim_next_active_token_filters_requested_scoped_cooldown(monkeypatch) 
     sql = read_session.statements[0]
     assert "codex_token_scoped_cooldowns" in sql
     assert "gpt-image-2:input-images" in sql
+    invalidate_fill_first_token_cache()
 
 
 def test_claim_next_active_token_fill_first_uses_short_ttl_cache(monkeypatch) -> None:
@@ -188,6 +198,117 @@ def test_claim_next_active_token_fill_first_uses_short_ttl_cache(monkeypatch) ->
     assert first is token
     assert second is token
     assert len(read_session.statements) == 1
+    invalidate_fill_first_token_cache()
+
+
+def test_claim_next_active_token_fill_first_singleflights_cache_miss(monkeypatch) -> None:
+    invalidate_fill_first_token_cache()
+    token = CodexToken(
+        id=11,
+        refresh_token="rt_11",
+        token_type="codex",
+        is_active=True,
+    )
+    load_count = 0
+
+    async def fake_load(*, token_order, scoped_cooldown_scope):
+        nonlocal load_count
+        load_count += 1
+        await asyncio.sleep(0.01)
+        return (token,)
+
+    monkeypatch.setattr("oaix_gateway.token_store._load_fill_first_available_tokens", fake_load)
+
+    async def run() -> list[CodexToken | None]:
+        return await asyncio.gather(
+            *[
+                claim_next_active_token(
+                    selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+                    token_order=(11,),
+                )
+                for _ in range(20)
+            ]
+        )
+
+    results = asyncio.run(run())
+
+    assert results == [token] * 20
+    assert load_count == 1
+    invalidate_fill_first_token_cache()
+
+
+def test_claim_next_active_token_fill_first_serves_stale_while_refreshing(monkeypatch) -> None:
+    invalidate_fill_first_token_cache()
+    old_token = CodexToken(id=12, refresh_token="rt_12", token_type="codex", is_active=True)
+    new_token = CodexToken(id=13, refresh_token="rt_13", token_type="codex", is_active=True)
+    cache_key = ((12, 13), None)
+    now = time.monotonic()
+    _FILL_FIRST_TOKEN_CACHE[cache_key] = _FillFirstTokenCacheEntry(
+        expires_at=now - 1,
+        stale_until=now + 10,
+        tokens=(old_token,),
+    )
+    refresh_released = asyncio.Event()
+    load_count = 0
+
+    async def fake_load(*, token_order, scoped_cooldown_scope):
+        nonlocal load_count
+        load_count += 1
+        await refresh_released.wait()
+        return (new_token,)
+
+    monkeypatch.setattr("oaix_gateway.token_store._load_fill_first_available_tokens", fake_load)
+
+    async def run() -> tuple[CodexToken | None, CodexToken | None]:
+        first = await claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(12, 13),
+        )
+        assert first is old_token
+        refresh_task = _FILL_FIRST_TOKEN_REFRESH_TASKS[cache_key]
+        refresh_released.set()
+        await refresh_task
+        second = await claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(12, 13),
+        )
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first is old_token
+    assert second is new_token
+    assert load_count == 1
+    invalidate_fill_first_token_cache()
+
+
+def test_claim_next_active_token_fill_first_respects_runtime_cooldown() -> None:
+    invalidate_fill_first_token_cache()
+    first_token = CodexToken(id=14, refresh_token="rt_14", token_type="codex", is_active=True)
+    second_token = CodexToken(id=15, refresh_token="rt_15", token_type="codex", is_active=True)
+    cache_key = ((14, 15), None)
+    _apply_token_runtime_error_state(
+        14,
+        message="rate limited",
+        deactivate=False,
+        cooldown_until=datetime.now(timezone.utc) + timedelta(seconds=60),
+    )
+    now = time.monotonic()
+    _FILL_FIRST_TOKEN_CACHE[cache_key] = _FillFirstTokenCacheEntry(
+        expires_at=now + 10,
+        stale_until=now + 10,
+        tokens=(first_token, second_token),
+    )
+
+    result = asyncio.run(
+        claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(14, 15),
+        )
+    )
+
+    assert result is second_token
+    _TOKEN_RUNTIME_STATE.clear()
     invalidate_fill_first_token_cache()
 
 
@@ -286,7 +407,7 @@ def test_merge_duplicate_token_rows_prefers_latest_state_even_if_it_is_inactive(
     assert [shadow.id for shadow in shadows] == [10]
 
 
-def test_update_token_refresh_state_acquires_history_lock_before_row_locks(monkeypatch) -> None:
+def test_update_token_refresh_state_skips_duplicate_repair_hot_path(monkeypatch) -> None:
     token = CodexToken(
         id=7,
         refresh_token="rt_old",
@@ -294,32 +415,28 @@ def test_update_token_refresh_state_acquires_history_lock_before_row_locks(monke
         token_type="codex",
         is_active=True,
     )
-    fake_session = _FakeSession()
     calls: list[str] = []
+
+    class _FakeRefreshSession(_FakeSession):
+        async def get(self, model, token_id: int):
+            assert model is CodexToken
+            calls.append(f"get:{token_id}")
+            return token if token_id == 7 else None
+
+    fake_session = _FakeRefreshSession()
 
     @asynccontextmanager
     async def fake_get_session():
         yield fake_session
 
     async def fake_acquire_history_lock(session) -> None:
-        assert session is fake_session
-        calls.append("lock")
-
-    async def fake_resolve(session, token_id: int) -> CodexToken:
-        assert session is fake_session
-        assert calls == ["lock"]
-        calls.append(f"resolve:{token_id}")
-        return token
+        raise AssertionError("refresh state should not take the duplicate-history repair lock")
 
     async def fake_repair(session) -> TokenHistoryRepairSummary:
-        assert session is fake_session
-        assert calls == ["lock", "resolve:7"]
-        calls.append("repair")
-        return TokenHistoryRepairSummary(duplicate_group_count=0, merged_row_count=0)
+        raise AssertionError("refresh state should not run duplicate-history repair")
 
     monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
     monkeypatch.setattr("oaix_gateway.token_store._acquire_token_history_repair_lock", fake_acquire_history_lock)
-    monkeypatch.setattr("oaix_gateway.token_store._resolve_canonical_token_for_update", fake_resolve)
     monkeypatch.setattr("oaix_gateway.token_store._repair_duplicate_token_histories_in_session", fake_repair)
 
     asyncio.run(
@@ -331,7 +448,7 @@ def test_update_token_refresh_state_acquires_history_lock_before_row_locks(monke
         )
     )
 
-    assert calls == ["lock", "resolve:7", "repair"]
+    assert calls == ["get:7"]
     assert token.access_token == "access_new"
     assert token.refresh_token == "rt_new"
     assert token.refresh_token_aliases == ["rt_old", "rt_new"]

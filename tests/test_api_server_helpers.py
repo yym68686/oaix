@@ -42,6 +42,7 @@ from oaix_gateway.api_server import (
     _request_requires_non_free_codex_token,
     _responses_failure_http_exception,
     _iterate_with_sse_keepalive,
+    _mark_token_success_with_timing,
     _stream_keepalive_interval_seconds,
     _wrap_sse_stream_with_initial_keepalive,
     _build_stream_error_event,
@@ -72,6 +73,28 @@ from oaix_gateway.token_import_jobs import (
     process_token_import_job,
 )
 from oaix_gateway.token_store import TokenUpsertResult
+
+
+def test_mark_token_success_with_timing_skips_obviously_healthy_token(monkeypatch) -> None:
+    mark_success_calls: list[int] = []
+    token = CodexToken(
+        id=501,
+        refresh_token="refresh-501",
+        token_type="codex",
+        is_active=True,
+        cooldown_until=None,
+        last_error=None,
+        merged_into_token_id=None,
+    )
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    asyncio.run(_mark_token_success_with_timing(None, token.id, token_row=token))
+
+    assert mark_success_calls == []
 
 
 def _make_json_request(path: str, payload: dict) -> Request:
@@ -225,7 +248,7 @@ def test_sanitize_codex_payload_removes_unsupported_fields() -> None:
     }
 
 
-def test_sanitize_codex_payload_compact_forces_store_false() -> None:
+def test_sanitize_codex_payload_compact_strips_store() -> None:
     payload = {
         "model": "gpt-4.1",
         "input": "hi",
@@ -236,7 +259,6 @@ def test_sanitize_codex_payload_compact_forces_store_false() -> None:
     assert sanitized == {
         "model": "gpt-4.1",
         "input": "hi",
-        "store": False,
         "instructions": "",
     }
 
@@ -1780,6 +1802,7 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
         model="gpt-5.4",
         input=[{"role": "user", "content": "hello compact"}],
         stream=False,
+        store=True,
     )
 
     client = DummyClient()
@@ -1797,7 +1820,9 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
     assert len(client.stream_calls) == 1
     stream_call = client.stream_calls[0]
     assert stream_call["headers"]["Accept"] == "application/json"
-    assert "stream" not in json.loads(stream_call["content"])
+    upstream_payload = json.loads(stream_call["content"])
+    assert "stream" not in upstream_payload
+    assert "store" not in upstream_payload
     assert stream_call["timeout"].read == 45.0
     assert result.first_token_at is not None
     assert result.status_code == 200
@@ -1808,6 +1833,102 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
     assert body["model"] == "gpt-5.4-compact"
     assert body["status"] == "completed"
     assert body["output"][0]["content"][0]["text"] == "hello compact"
+
+
+def test_proxy_request_with_token_compact_timeout_fallback_sets_store_false() -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse | None = None, *, raise_timeout: bool = False) -> None:
+            self._response = response
+            self._raise_timeout = raise_timeout
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            if self._raise_timeout:
+                raise httpx.ReadTimeout("compact timed out")
+            assert self._response is not None
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                    "timeout": timeout,
+                }
+            )
+            if len(self.stream_calls) == 1:
+                return DummyStreamContext(raise_timeout=True)
+            return DummyStreamContext(
+                DummyStreamingResponse(
+                    [
+                        b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_fallback","status":"in_progress","model":"gpt-5.4"}}\n\n',
+                        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_fallback","status":"completed","model":"gpt-5.4","output":[{"content":[{"type":"output_text","text":"fallback ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n',
+                        b"data: [DONE]\n\n",
+                    ]
+                )
+            )
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses/compact",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4",
+        input=[{"role": "user", "content": "hello compact"}],
+        stream=False,
+        store=True,
+    )
+
+    client = DummyClient()
+    result = asyncio.run(
+        _proxy_request_with_token(
+            client,
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+            compact=True,
+        )
+    )
+
+    assert len(client.stream_calls) == 2
+    compact_payload = json.loads(client.stream_calls[0]["content"])
+    fallback_payload = json.loads(client.stream_calls[1]["content"])
+    assert "store" not in compact_payload
+    assert "stream" not in compact_payload
+    assert fallback_payload["store"] is False
+    assert fallback_payload["stream"] is True
+    assert result.status_code == 200
+    assert result.model_name == "gpt-5.4"
+    assert result.usage_metrics is not None
+    assert result.usage_metrics.total_tokens == 3
 
 
 def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias() -> None:
@@ -2774,6 +2895,7 @@ def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monk
         refresh_token="refresh-32",
         token_type="codex",
         is_active=True,
+        last_error="previous error",
     )
     claim_calls: list[tuple[int, ...]] = []
     mark_error_calls: list[tuple[int, str]] = []
@@ -2892,6 +3014,7 @@ def test_execute_proxy_request_with_failover_scopes_gpt_image_input_rate_limit(m
         token_type="codex",
         is_active=True,
         plan_type="team",
+        last_error="previous error",
     )
     scoped_cooling_token_ids: set[int] = set()
     claim_scopes: list[str | None] = []
@@ -3035,6 +3158,7 @@ def test_execute_proxy_request_with_failover_returns_stream_before_mark_success(
         token_type="codex",
         is_active=True,
         plan_type="team",
+        last_error="previous error",
     )
     mark_started = asyncio.Event()
     mark_continue = asyncio.Event()
@@ -3254,6 +3378,7 @@ def test_execute_proxy_request_with_failover_retries_httpx_close_attribute_error
         refresh_token="refresh-42",
         token_type="codex",
         is_active=True,
+        last_error="previous error",
     )
     claim_calls: list[tuple[int, ...]] = []
     mark_error_calls: list[tuple[int, str]] = []
@@ -3515,6 +3640,7 @@ def test_execute_proxy_request_with_failover_skips_free_tokens_for_gpt_image_2(m
         refresh_token="refresh-paid",
         is_active=True,
         raw_payload={},
+        last_error="previous error",
     )
 
     claim_calls: list[tuple[int, ...]] = []
@@ -3632,6 +3758,7 @@ def test_execute_proxy_request_with_failover_wraps_gpt_image_2_stream_with_outer
         refresh_token="refresh-token",
         is_active=True,
         raw_payload={},
+        last_error="previous error",
     )
 
     claim_calls = 0
@@ -4059,6 +4186,7 @@ def test_execute_proxy_request_with_failover_retries_gpt_image_stream_after_prem
         is_active=True,
         raw_payload={},
         plan_type="team",
+        last_error="previous error",
     )
 
     claim_calls = 0
@@ -4218,6 +4346,7 @@ def test_execute_proxy_request_with_failover_returns_immediately_for_gpt_image_2
         is_active=True,
         raw_payload={},
         plan_type="team",
+        last_error="previous error",
     )
 
     claim_calls = 0
@@ -4361,6 +4490,7 @@ def test_execute_proxy_request_with_failover_keeps_retrying_gpt_image_2_stream_a
         is_active=True,
         raw_payload={},
         plan_type="team",
+        last_error="previous error",
     )
 
     claim_calls = 0
@@ -4499,6 +4629,7 @@ def test_execute_proxy_request_with_failover_allows_free_tokens_for_other_models
         refresh_token="refresh-free",
         is_active=True,
         raw_payload={"plan_type": "free"},
+        last_error="previous error",
     )
 
     claim_calls: list[tuple[int, ...]] = []

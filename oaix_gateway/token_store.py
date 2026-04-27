@@ -2,6 +2,7 @@ import asyncio
 import base64
 import glob
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -9,7 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import and_, case, delete, func, nullsfirst, or_, select, text
+from sqlalchemy import and_, case, delete, func, nullsfirst, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
 from .database import (
     CodexToken,
@@ -28,6 +30,8 @@ from .token_identity import (
     normalize_refresh_token,
 )
 
+logger = logging.getLogger("oaix.gateway")
+
 TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED = "least_recently_used"
 TOKEN_SELECTION_STRATEGY_FILL_FIRST = "fill_first"
 DEFAULT_TOKEN_SELECTION_STRATEGY = TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED
@@ -36,6 +40,9 @@ MERGED_DUPLICATE_TOKEN_ERROR_PREFIX = "Merged into token #"
 TOKEN_IDENTITY_LOCK_NAMESPACE = "codex-token-identity"
 TOKEN_HISTORY_REPAIR_LOCK_KEY = "codex-token-history:repair"
 DEFAULT_FILL_FIRST_TOKEN_CACHE_TTL_MS = 250
+DEFAULT_FILL_FIRST_TOKEN_STALE_TTL_SECONDS = 5.0
+DEFAULT_TOKEN_STATUS_WRITE_CONCURRENCY = 1
+DEFAULT_TOKEN_STATUS_WRITE_LOCK_TIMEOUT_MS = 250
 
 
 @dataclass(frozen=True)
@@ -107,10 +114,48 @@ class TokenDeleteResult:
 @dataclass(frozen=True)
 class _FillFirstTokenCacheEntry:
     expires_at: float
+    stale_until: float
     tokens: tuple[CodexToken, ...]
 
 
 _FILL_FIRST_TOKEN_CACHE: dict[tuple[tuple[int, ...], str | None], _FillFirstTokenCacheEntry] = {}
+_FILL_FIRST_TOKEN_REFRESH_TASKS: dict[tuple[tuple[int, ...], str | None], asyncio.Task[tuple[CodexToken, ...]]] = {}
+_FILL_FIRST_TOKEN_REFRESH_GENERATIONS: dict[tuple[tuple[int, ...], str | None], int] = {}
+_FILL_FIRST_TOKEN_CACHE_GENERATION = 0
+
+
+@dataclass(frozen=True)
+class _TokenRuntimeState:
+    is_active: bool | None = None
+    cooldown_until: datetime | None = None
+    last_error: str | None = None
+
+
+@dataclass(frozen=True)
+class _ScopedTokenRuntimeCooldown:
+    cooldown_until: datetime
+    last_error: str | None = None
+
+
+@dataclass
+class _TokenStatusWriteJob:
+    token_id: int
+    kind: str
+    message: str | None = None
+    deactivate: bool = False
+    cooldown_until: datetime | None = None
+    clear_access_token: bool = False
+    scope: str | None = None
+    attempts: int = 0
+
+
+_TOKEN_RUNTIME_STATE: dict[int, _TokenRuntimeState] = {}
+_TOKEN_SCOPED_RUNTIME_COOLDOWNS: dict[tuple[int, str], _ScopedTokenRuntimeCooldown] = {}
+_TOKEN_STATUS_WRITE_QUEUE: asyncio.Queue[tuple[int, str]] | None = None
+_TOKEN_STATUS_WRITE_QUEUE_LOOP: asyncio.AbstractEventLoop | None = None
+_TOKEN_STATUS_WRITE_DRAINERS: set[asyncio.Task[None]] = set()
+_TOKEN_STATUS_WRITE_RETRY_TASKS: set[asyncio.Task[None]] = set()
+_TOKEN_STATUS_WRITE_PENDING: dict[tuple[int, str], _TokenStatusWriteJob] = {}
 
 
 def _fill_first_token_cache_ttl_seconds() -> float:
@@ -122,8 +167,353 @@ def _fill_first_token_cache_ttl_seconds() -> float:
     return max(0.1, min(0.5, ttl_ms / 1000.0))
 
 
+def _fill_first_token_stale_ttl_seconds() -> float:
+    raw = str(os.getenv("FILL_FIRST_TOKEN_STALE_TTL_SECONDS") or "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_FILL_FIRST_TOKEN_STALE_TTL_SECONDS
+    except ValueError:
+        value = DEFAULT_FILL_FIRST_TOKEN_STALE_TTL_SECONDS
+    return max(0.5, min(30.0, value))
+
+
 def invalidate_fill_first_token_cache() -> None:
+    global _FILL_FIRST_TOKEN_CACHE_GENERATION
+    _FILL_FIRST_TOKEN_CACHE_GENERATION += 1
     _FILL_FIRST_TOKEN_CACHE.clear()
+
+
+def _token_status_write_concurrency() -> int:
+    raw = str(os.getenv("TOKEN_STATUS_WRITE_CONCURRENCY") or "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_TOKEN_STATUS_WRITE_CONCURRENCY
+    except ValueError:
+        value = DEFAULT_TOKEN_STATUS_WRITE_CONCURRENCY
+    return max(1, min(8, value))
+
+
+def _token_status_write_lock_timeout_ms() -> int:
+    raw = str(os.getenv("TOKEN_STATUS_WRITE_LOCK_TIMEOUT_MS") or "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_TOKEN_STATUS_WRITE_LOCK_TIMEOUT_MS
+    except ValueError:
+        value = DEFAULT_TOKEN_STATUS_WRITE_LOCK_TIMEOUT_MS
+    return max(50, min(5000, value))
+
+
+def _token_is_runtime_available(
+    token: CodexToken,
+    *,
+    now: datetime,
+    scoped_cooldown_scope: str | None,
+) -> bool:
+    token_id = int(token.id)
+    runtime_state = _TOKEN_RUNTIME_STATE.get(token_id)
+    if runtime_state is not None:
+        if runtime_state.is_active is False:
+            return False
+        if runtime_state.cooldown_until is not None:
+            if runtime_state.cooldown_until > now:
+                return False
+            _TOKEN_RUNTIME_STATE.pop(token_id, None)
+
+    if scoped_cooldown_scope:
+        cooldown_key = (token_id, scoped_cooldown_scope)
+        scoped_cooldown = _TOKEN_SCOPED_RUNTIME_COOLDOWNS.get(cooldown_key)
+        if scoped_cooldown is not None:
+            if scoped_cooldown.cooldown_until > now:
+                return False
+            _TOKEN_SCOPED_RUNTIME_COOLDOWNS.pop(cooldown_key, None)
+    return True
+
+
+def _runtime_unavailable_token_ids(*, now: datetime, scoped_cooldown_scope: str | None) -> tuple[int, ...]:
+    unavailable: set[int] = set()
+    for token_id, runtime_state in list(_TOKEN_RUNTIME_STATE.items()):
+        if runtime_state.is_active is False:
+            unavailable.add(token_id)
+            continue
+        if runtime_state.cooldown_until is not None:
+            if runtime_state.cooldown_until > now:
+                unavailable.add(token_id)
+            else:
+                _TOKEN_RUNTIME_STATE.pop(token_id, None)
+
+    if scoped_cooldown_scope:
+        for (token_id, scope), cooldown in list(_TOKEN_SCOPED_RUNTIME_COOLDOWNS.items()):
+            if scope != scoped_cooldown_scope:
+                continue
+            if cooldown.cooldown_until > now:
+                unavailable.add(token_id)
+            else:
+                _TOKEN_SCOPED_RUNTIME_COOLDOWNS.pop((token_id, scope), None)
+    return tuple(sorted(unavailable))
+
+
+def _apply_token_runtime_success_state(token_id: int) -> None:
+    removed = _TOKEN_RUNTIME_STATE.pop(int(token_id), None)
+    if removed is not None and (removed.is_active is False or removed.cooldown_until is not None):
+        invalidate_fill_first_token_cache()
+
+
+def _apply_token_runtime_error_state(
+    token_id: int,
+    *,
+    message: str,
+    deactivate: bool,
+    cooldown_until: datetime | None,
+) -> None:
+    token_id = int(token_id)
+    previous = _TOKEN_RUNTIME_STATE.get(token_id)
+    if deactivate:
+        next_state = _TokenRuntimeState(is_active=False, cooldown_until=None, last_error=message[:4000])
+    elif cooldown_until is not None:
+        next_state = _TokenRuntimeState(is_active=True, cooldown_until=cooldown_until, last_error=message[:4000])
+    else:
+        next_state = _TokenRuntimeState(
+            is_active=previous.is_active if previous is not None else None,
+            cooldown_until=previous.cooldown_until if previous is not None else None,
+            last_error=message[:4000],
+        )
+    _TOKEN_RUNTIME_STATE[token_id] = next_state
+    if deactivate or cooldown_until is not None:
+        invalidate_fill_first_token_cache()
+
+
+def _apply_token_runtime_scoped_cooldown(
+    token_id: int,
+    *,
+    scope: str,
+    message: str,
+    cooldown_until: datetime,
+) -> None:
+    _TOKEN_SCOPED_RUNTIME_COOLDOWNS[(int(token_id), scope)] = _ScopedTokenRuntimeCooldown(
+        cooldown_until=cooldown_until,
+        last_error=message[:4000],
+    )
+    invalidate_fill_first_token_cache()
+
+
+def _token_status_write_queue() -> asyncio.Queue[tuple[int, str]]:
+    global _TOKEN_STATUS_WRITE_QUEUE, _TOKEN_STATUS_WRITE_QUEUE_LOOP, _TOKEN_STATUS_WRITE_DRAINERS
+    loop = asyncio.get_running_loop()
+    if _TOKEN_STATUS_WRITE_QUEUE is None or _TOKEN_STATUS_WRITE_QUEUE_LOOP is not loop:
+        _TOKEN_STATUS_WRITE_QUEUE = asyncio.Queue()
+        _TOKEN_STATUS_WRITE_QUEUE_LOOP = loop
+        _TOKEN_STATUS_WRITE_DRAINERS = set()
+    while len(_TOKEN_STATUS_WRITE_DRAINERS) < _token_status_write_concurrency():
+        task = asyncio.create_task(_token_status_write_drainer(), name="oaix-token-status-write-drainer")
+        _TOKEN_STATUS_WRITE_DRAINERS.add(task)
+        task.add_done_callback(_TOKEN_STATUS_WRITE_DRAINERS.discard)
+    return _TOKEN_STATUS_WRITE_QUEUE
+
+
+def _merge_token_status_write_jobs(
+    existing: _TokenStatusWriteJob,
+    incoming: _TokenStatusWriteJob,
+) -> _TokenStatusWriteJob:
+    if incoming.kind == "success":
+        return existing
+    if existing.kind == "success":
+        return incoming
+    if incoming.kind == "scoped_cooldown":
+        if existing.kind != "scoped_cooldown":
+            return incoming
+        cooldown_until = max(existing.cooldown_until or incoming.cooldown_until, incoming.cooldown_until)
+        return _TokenStatusWriteJob(
+            token_id=incoming.token_id,
+            kind="scoped_cooldown",
+            message=incoming.message or existing.message,
+            cooldown_until=cooldown_until,
+            scope=incoming.scope,
+        )
+
+    cooldown_until = existing.cooldown_until
+    if incoming.cooldown_until is not None:
+        cooldown_until = max(cooldown_until, incoming.cooldown_until) if cooldown_until is not None else incoming.cooldown_until
+    return _TokenStatusWriteJob(
+        token_id=incoming.token_id,
+        kind="error",
+        message=incoming.message or existing.message,
+        deactivate=existing.deactivate or incoming.deactivate,
+        cooldown_until=None if existing.deactivate or incoming.deactivate else cooldown_until,
+        clear_access_token=existing.clear_access_token or incoming.clear_access_token,
+    )
+
+
+def _enqueue_token_status_write(job: _TokenStatusWriteJob) -> None:
+    key = (int(job.token_id), f"scope:{job.scope}" if job.kind == "scoped_cooldown" else "token")
+    pending = _TOKEN_STATUS_WRITE_PENDING.get(key)
+    if pending is None:
+        _TOKEN_STATUS_WRITE_PENDING[key] = job
+        _token_status_write_queue().put_nowait(key)
+        return
+    _TOKEN_STATUS_WRITE_PENDING[key] = _merge_token_status_write_jobs(pending, job)
+
+
+async def _set_low_priority_token_write_lock_timeout(session) -> None:
+    bind = session.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    timeout_ms = _token_status_write_lock_timeout_ms()
+    await session.execute(text(f"SET LOCAL lock_timeout = '{timeout_ms}ms'"))
+
+
+async def _write_token_success_job(session, job: _TokenStatusWriteJob) -> None:
+    now = utcnow()
+    await session.execute(
+        update(CodexToken)
+        .where(CodexToken.id == int(job.token_id))
+        .where(CodexToken.merged_into_token_id.is_(None))
+        .where(
+            or_(
+                CodexToken.is_active.is_not(True),
+                CodexToken.cooldown_until.is_not(None),
+                CodexToken.last_error.is_not(None),
+            )
+        )
+        .values(
+            is_active=True,
+            cooldown_until=None,
+            last_error=None,
+            updated_at=now,
+        )
+    )
+
+
+async def _write_token_error_job(session, job: _TokenStatusWriteJob) -> None:
+    now = utcnow()
+    values: dict[str, Any] = {
+        "last_error": (job.message or "")[:4000],
+        "updated_at": now,
+    }
+    if job.clear_access_token:
+        values["access_token"] = None
+        values["expires_at"] = None
+    if job.deactivate:
+        values["is_active"] = False
+        values["cooldown_until"] = None
+    elif job.cooldown_until is not None:
+        values["is_active"] = True
+        values["cooldown_until"] = job.cooldown_until
+    await session.execute(
+        update(CodexToken)
+        .where(CodexToken.id == int(job.token_id))
+        .where(CodexToken.merged_into_token_id.is_(None))
+        .values(**values)
+    )
+
+
+async def _write_token_scoped_cooldown_job(session, job: _TokenStatusWriteJob) -> None:
+    if not job.scope or job.cooldown_until is None:
+        return
+    now = utcnow()
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        stmt = postgresql_insert(CodexTokenScopedCooldown).values(
+            token_id=int(job.token_id),
+            scope=job.scope,
+            cooldown_until=job.cooldown_until,
+            last_error=(job.message or "")[:4000],
+            updated_at=now,
+        )
+        await session.execute(
+            stmt.on_conflict_do_update(
+                constraint="uq_codex_token_scoped_cooldowns_token_scope",
+                set_={
+                    "cooldown_until": job.cooldown_until,
+                    "last_error": (job.message or "")[:4000],
+                    "updated_at": now,
+                },
+            )
+        )
+        return
+
+    result = await session.execute(
+        select(CodexTokenScopedCooldown).where(
+            CodexTokenScopedCooldown.token_id == int(job.token_id),
+            CodexTokenScopedCooldown.scope == job.scope,
+        )
+    )
+    cooldown = result.scalars().first()
+    if cooldown is None:
+        session.add(
+            CodexTokenScopedCooldown(
+                token_id=int(job.token_id),
+                scope=job.scope,
+                cooldown_until=job.cooldown_until,
+                last_error=(job.message or "")[:4000],
+                updated_at=now,
+            )
+        )
+        return
+    cooldown.cooldown_until = job.cooldown_until
+    cooldown.last_error = (job.message or "")[:4000]
+    cooldown.updated_at = now
+
+
+async def _write_token_status_job(job: _TokenStatusWriteJob) -> None:
+    async with get_session() as session:
+        async with session.begin():
+            await _set_low_priority_token_write_lock_timeout(session)
+            if job.kind == "success":
+                await _write_token_success_job(session, job)
+            elif job.kind == "scoped_cooldown":
+                await _write_token_scoped_cooldown_job(session, job)
+            else:
+                await _write_token_error_job(session, job)
+
+
+async def _token_status_write_drainer() -> None:
+    queue = _TOKEN_STATUS_WRITE_QUEUE
+    if queue is None:
+        return
+    while True:
+        key = await queue.get()
+        job: _TokenStatusWriteJob | None = None
+        try:
+            job = _TOKEN_STATUS_WRITE_PENDING.pop(key, None)
+            if job is None:
+                continue
+            await _write_token_status_job(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to persist queued token status write")
+            if job is not None and job.kind != "success" and job.attempts < 10:
+                job.attempts += 1
+
+                async def requeue_failed_write(failed_job: _TokenStatusWriteJob) -> None:
+                    await asyncio.sleep(min(5.0, 0.25 * failed_job.attempts))
+                    _enqueue_token_status_write(failed_job)
+
+                retry_task = asyncio.create_task(requeue_failed_write(job), name="oaix-token-status-write-retry")
+                _TOKEN_STATUS_WRITE_RETRY_TASKS.add(retry_task)
+                retry_task.add_done_callback(_TOKEN_STATUS_WRITE_RETRY_TASKS.discard)
+        finally:
+            queue.task_done()
+
+
+async def flush_token_status_write_queue() -> None:
+    queue = _TOKEN_STATUS_WRITE_QUEUE
+    if queue is None:
+        return
+    await queue.join()
+
+
+async def stop_token_status_write_queue() -> None:
+    await flush_token_status_write_queue()
+    retry_tasks = list(_TOKEN_STATUS_WRITE_RETRY_TASKS)
+    for task in retry_tasks:
+        task.cancel()
+    if retry_tasks:
+        await asyncio.gather(*retry_tasks, return_exceptions=True)
+    _TOKEN_STATUS_WRITE_RETRY_TASKS.clear()
+    drainers = list(_TOKEN_STATUS_WRITE_DRAINERS)
+    for task in drainers:
+        task.cancel()
+    if drainers:
+        await asyncio.gather(*drainers, return_exceptions=True)
+    _TOKEN_STATUS_WRITE_DRAINERS.clear()
 
 
 def _canonical_token_filters() -> tuple[Any, ...]:
@@ -739,6 +1129,107 @@ async def _load_fill_first_available_tokens(
         return (first,) if first is not None else ()
 
 
+async def _refresh_fill_first_token_cache(
+    cache_key: tuple[tuple[int, ...], str | None],
+    *,
+    token_order: tuple[int, ...],
+    scoped_cooldown_scope: str | None,
+    generation: int,
+) -> tuple[CodexToken, ...]:
+    tokens = await _load_fill_first_available_tokens(
+        token_order=token_order,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+    )
+    if generation == _FILL_FIRST_TOKEN_CACHE_GENERATION:
+        now = time.monotonic()
+        _FILL_FIRST_TOKEN_CACHE[cache_key] = _FillFirstTokenCacheEntry(
+            expires_at=now + _fill_first_token_cache_ttl_seconds(),
+            stale_until=now + _fill_first_token_stale_ttl_seconds(),
+            tokens=tokens,
+        )
+    return tokens
+
+
+def _start_fill_first_token_cache_refresh(
+    cache_key: tuple[tuple[int, ...], str | None],
+    *,
+    token_order: tuple[int, ...],
+    scoped_cooldown_scope: str | None,
+) -> asyncio.Task[tuple[CodexToken, ...]]:
+    loop = asyncio.get_running_loop()
+    task = _FILL_FIRST_TOKEN_REFRESH_TASKS.get(cache_key)
+    if (
+        task is not None
+        and not task.done()
+        and task.get_loop() is loop
+        and _FILL_FIRST_TOKEN_REFRESH_GENERATIONS.get(cache_key) == _FILL_FIRST_TOKEN_CACHE_GENERATION
+    ):
+        return task
+
+    generation = _FILL_FIRST_TOKEN_CACHE_GENERATION
+    task = asyncio.create_task(
+        _refresh_fill_first_token_cache(
+            cache_key,
+            token_order=token_order,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            generation=generation,
+        ),
+        name="oaix-fill-first-token-cache-refresh",
+    )
+    _FILL_FIRST_TOKEN_REFRESH_TASKS[cache_key] = task
+    _FILL_FIRST_TOKEN_REFRESH_GENERATIONS[cache_key] = generation
+
+    def _on_done(done_task: asyncio.Task[tuple[CodexToken, ...]]) -> None:
+        if _FILL_FIRST_TOKEN_REFRESH_TASKS.get(cache_key) is done_task:
+            _FILL_FIRST_TOKEN_REFRESH_TASKS.pop(cache_key, None)
+            _FILL_FIRST_TOKEN_REFRESH_GENERATIONS.pop(cache_key, None)
+        if done_task.cancelled():
+            return
+        try:
+            done_task.result()
+        except Exception:
+            logger.exception("Failed to refresh fill_first token cache")
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+async def _await_fill_first_token_cache_refresh(
+    cache_key: tuple[tuple[int, ...], str | None],
+    *,
+    token_order: tuple[int, ...],
+    scoped_cooldown_scope: str | None,
+) -> tuple[CodexToken, ...]:
+    task = _start_fill_first_token_cache_refresh(
+        cache_key,
+        token_order=token_order,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+    )
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if _FILL_FIRST_TOKEN_REFRESH_TASKS.get(cache_key) is task and task.done():
+            _FILL_FIRST_TOKEN_REFRESH_TASKS.pop(cache_key, None)
+            _FILL_FIRST_TOKEN_REFRESH_GENERATIONS.pop(cache_key, None)
+
+
+def _select_fill_first_token_from_cached_entry(
+    cached: _FillFirstTokenCacheEntry,
+    *,
+    exclude_token_ids: tuple[int, ...],
+    scoped_cooldown_scope: str | None,
+) -> CodexToken | None:
+    excluded = set(exclude_token_ids)
+    now = utcnow()
+    for token in cached.tokens:
+        if token.id in excluded:
+            continue
+        if not _token_is_runtime_available(token, now=now, scoped_cooldown_scope=scoped_cooldown_scope):
+            continue
+        return token
+    return None
+
+
 async def _claim_fill_first_token_from_cache(
     *,
     exclude_token_ids: tuple[int, ...],
@@ -748,22 +1239,40 @@ async def _claim_fill_first_token_from_cache(
     cache_key = (token_order, scoped_cooldown_scope)
     now = time.monotonic()
     cached = _FILL_FIRST_TOKEN_CACHE.get(cache_key)
-    if cached is None or cached.expires_at <= now:
-        tokens = await _load_fill_first_available_tokens(
+    if cached is not None and cached.expires_at > now:
+        return _select_fill_first_token_from_cached_entry(
+            cached,
+            exclude_token_ids=exclude_token_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+        )
+
+    if cached is not None and cached.stale_until > now:
+        _start_fill_first_token_cache_refresh(
+            cache_key,
             token_order=token_order,
             scoped_cooldown_scope=scoped_cooldown_scope,
         )
-        cached = _FillFirstTokenCacheEntry(
-            expires_at=time.monotonic() + _fill_first_token_cache_ttl_seconds(),
-            tokens=tokens,
+        return _select_fill_first_token_from_cached_entry(
+            cached,
+            exclude_token_ids=exclude_token_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
         )
-        _FILL_FIRST_TOKEN_CACHE[cache_key] = cached
 
-    excluded = set(exclude_token_ids)
-    for token in cached.tokens:
-        if token.id not in excluded:
-            return token
-    return None
+    tokens = await _await_fill_first_token_cache_refresh(
+        cache_key,
+        token_order=token_order,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+    )
+    cached = _FILL_FIRST_TOKEN_CACHE.get(cache_key) or _FillFirstTokenCacheEntry(
+        expires_at=0.0,
+        stale_until=0.0,
+        tokens=tokens,
+    )
+    return _select_fill_first_token_from_cached_entry(
+        cached,
+        exclude_token_ids=exclude_token_ids,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+    )
 
 
 async def claim_next_active_token(
@@ -801,6 +1310,12 @@ async def claim_next_active_token(
             )
             if excluded_ids:
                 stmt = stmt.where(CodexToken.id.notin_(excluded_ids))
+            runtime_unavailable_ids = _runtime_unavailable_token_ids(
+                now=now,
+                scoped_cooldown_scope=scoped_cooldown_scope,
+            )
+            if runtime_unavailable_ids:
+                stmt = stmt.where(CodexToken.id.notin_(runtime_unavailable_ids))
             result = await session.execute(stmt)
             token = result.scalars().first()
             if token is None:
@@ -821,12 +1336,18 @@ async def update_token_refresh_state(
 ) -> None:
     async with get_session() as session:
         async with session.begin():
-            # Refresh writes may already hold a token row lock; serialize the
-            # duplicate-history repair scan first so concurrent refreshes do not
-            # deadlock while escalating to a full canonical-token FOR UPDATE pass.
-            await _acquire_token_history_repair_lock(session)
-            token = await _resolve_canonical_token_for_update(session, token_id)
-            if token is None:
+            current_id: int | None = int(token_id)
+            visited: set[int] = set()
+            token: CodexToken | None = None
+            while current_id is not None and current_id not in visited:
+                visited.add(current_id)
+                token = await session.get(CodexToken, current_id)
+                if token is None:
+                    return
+                if token.merged_into_token_id is None:
+                    break
+                current_id = token.merged_into_token_id
+            if token is None or token.merged_into_token_id is not None:
                 return
             previous_refresh_token = token.refresh_token
             token.access_token = access_token
@@ -843,8 +1364,9 @@ async def update_token_refresh_state(
                 token.is_active = True
                 token.cooldown_until = None
                 token.last_error = None
+                _TOKEN_STATUS_WRITE_PENDING.pop((int(token.id), "token"), None)
+                _apply_token_runtime_success_state(token.id)
             token.updated_at = utcnow()
-            await _repair_duplicate_token_histories_in_session(session)
             invalidate_fill_first_token_cache()
 
 
@@ -866,28 +1388,8 @@ async def update_token_plan_type(token_id: int, *, plan_type: str | None) -> Non
 
 
 async def mark_token_success(token_id: int) -> None:
-    async with get_session() as session:
-        async with session.begin():
-            current = await session.get(CodexToken, token_id)
-            if current is None:
-                return
-            if (
-                current.merged_into_token_id is None
-                and current.is_active is True
-                and current.cooldown_until is None
-                and not current.last_error
-            ):
-                return
-            token = await _resolve_canonical_token_for_update(session, token_id)
-            if token is None:
-                return
-            if token.is_active is True and token.cooldown_until is None and not token.last_error:
-                return
-            token.is_active = True
-            token.cooldown_until = None
-            token.last_error = None
-            token.updated_at = utcnow()
-            invalidate_fill_first_token_cache()
+    _apply_token_runtime_success_state(token_id)
+    _enqueue_token_status_write(_TokenStatusWriteJob(token_id=int(token_id), kind="success"))
 
 
 async def set_token_active_state(
@@ -906,6 +1408,15 @@ async def set_token_active_state(
                 token.cooldown_until = None
             token.updated_at = utcnow()
             await session.flush()
+            if active and clear_cooldown:
+                _apply_token_runtime_success_state(token.id)
+            elif not active:
+                _apply_token_runtime_error_state(
+                    token.id,
+                    message="Manually disabled",
+                    deactivate=True,
+                    cooldown_until=None,
+                )
             invalidate_fill_first_token_cache()
             return token
 
@@ -947,23 +1458,27 @@ async def mark_token_error(
     cooldown_seconds: int | None = None,
     clear_access_token: bool = False,
 ) -> None:
-    async with get_session() as session:
-        async with session.begin():
-            token = await _resolve_canonical_token_for_update(session, token_id)
-            if token is None:
-                return
-            token.last_error = message[:4000]
-            token.updated_at = utcnow()
-            if clear_access_token:
-                token.access_token = None
-                token.expires_at = None
-            if deactivate:
-                token.is_active = False
-                token.cooldown_until = None
-            elif cooldown_seconds is not None:
-                token.is_active = True
-                token.cooldown_until = utcnow() + timedelta(seconds=max(0, int(cooldown_seconds)))
-            invalidate_fill_first_token_cache()
+    cooldown_until = (
+        utcnow() + timedelta(seconds=max(0, int(cooldown_seconds)))
+        if cooldown_seconds is not None
+        else None
+    )
+    _apply_token_runtime_error_state(
+        token_id,
+        message=message,
+        deactivate=deactivate,
+        cooldown_until=cooldown_until,
+    )
+    _enqueue_token_status_write(
+        _TokenStatusWriteJob(
+            token_id=int(token_id),
+            kind="error",
+            message=message[:4000],
+            deactivate=deactivate,
+            cooldown_until=cooldown_until,
+            clear_access_token=clear_access_token,
+        )
+    )
 
 
 async def mark_token_scoped_cooldown(
@@ -977,40 +1492,22 @@ async def mark_token_scoped_cooldown(
     if not normalized_scope:
         return
 
-    async with get_session() as session:
-        async with session.begin():
-            token = await _resolve_canonical_token_for_update(session, token_id)
-            if token is None:
-                return
-
-            now = utcnow()
-            cooldown_until = now + timedelta(seconds=max(0, int(cooldown_seconds)))
-            result = await session.execute(
-                select(CodexTokenScopedCooldown)
-                .where(
-                    CodexTokenScopedCooldown.token_id == token.id,
-                    CodexTokenScopedCooldown.scope == normalized_scope,
-                )
-                .with_for_update()
-            )
-            cooldown = result.scalars().first()
-            if cooldown is None:
-                session.add(
-                    CodexTokenScopedCooldown(
-                        token_id=token.id,
-                        scope=normalized_scope,
-                        cooldown_until=cooldown_until,
-                        last_error=message[:4000],
-                        updated_at=now,
-                    )
-                )
-                invalidate_fill_first_token_cache()
-                return
-
-            cooldown.cooldown_until = cooldown_until
-            cooldown.last_error = message[:4000]
-            cooldown.updated_at = now
-            invalidate_fill_first_token_cache()
+    cooldown_until = utcnow() + timedelta(seconds=max(0, int(cooldown_seconds)))
+    _apply_token_runtime_scoped_cooldown(
+        token_id,
+        scope=normalized_scope,
+        message=message,
+        cooldown_until=cooldown_until,
+    )
+    _enqueue_token_status_write(
+        _TokenStatusWriteJob(
+            token_id=int(token_id),
+            kind="scoped_cooldown",
+            message=message[:4000],
+            cooldown_until=cooldown_until,
+            scope=normalized_scope,
+        )
+    )
 
 
 def _build_token_counts_stmt(now: datetime):
