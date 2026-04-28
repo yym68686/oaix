@@ -60,6 +60,7 @@ from oaix_gateway.api_server import (
     _sanitize_codex_payload,
     _should_retry_upstream_server_error,
     _translate_responses_image_compat_payload,
+    _upstream_error_http_exception,
     _wrap_streaming_body_iterator,
     _flush_request_log_write_queue,
     create_app,
@@ -749,6 +750,39 @@ def test_responses_failure_http_exception_detects_response_failed_payload() -> N
             "message": "Too many requests",
         }
     }
+
+
+def test_responses_failure_http_exception_marks_moderation_blocked_nonretryable() -> None:
+    exc = _responses_failure_http_exception(
+        {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "type": "image_generation_user_error",
+                    "code": "moderation_blocked",
+                    "message": "Your request was rejected by the safety system.",
+                },
+            },
+        }
+    )
+
+    assert exc is not None
+    assert exc.status_code == 500
+    assert getattr(exc, "retryable", None) is False
+    assert getattr(exc, "record_token_error", None) is False
+    assert json.loads(exc.detail)["error"]["code"] == "moderation_blocked"
+
+
+def test_upstream_error_http_exception_marks_plain_safety_rejection_nonretryable() -> None:
+    detail = "Your request was rejected by the safety system. Include request ID 701166b1."
+
+    exc = _upstream_error_http_exception(500, detail)
+
+    assert exc.status_code == 500
+    assert exc.detail == detail
+    assert getattr(exc, "retryable", None) is False
+    assert getattr(exc, "record_token_error", None) is False
 
 
 def test_prime_responses_upstream_stream_commits_after_first_non_prefight_event() -> None:
@@ -3632,6 +3666,114 @@ def test_execute_proxy_request_with_failover_does_not_retry_nonretryable_http_ex
     assert finalized[0]["token_id"] == 11
     assert finalized[0]["account_id"] == "acct_11"
     assert finalized[0]["error_message"] == "Upstream did not return image output"
+
+
+def test_execute_proxy_request_with_failover_does_not_retry_image_moderation_error(
+    monkeypatch,
+) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run for moderation errors")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/images/generations",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    tokens = [
+        CodexToken(id=11, account_id="acct_11", refresh_token="refresh-11", is_active=True, plan_type="plus"),
+        CodexToken(id=12, account_id="acct_12", refresh_token="refresh-12", is_active=True, plan_type="plus"),
+    ]
+
+    claim_calls: list[int] = []
+    finalized: list[dict[str, object]] = []
+    detail = json.dumps(
+        {
+            "error": {
+                "type": "image_generation_user_error",
+                "code": "moderation_blocked",
+                "message": "Your request was rejected by the safety system.",
+                "param": None,
+            }
+        }
+    )
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        claim_calls.append(1)
+        return tokens[len(claim_calls) - 1] if len(claim_calls) <= len(tokens) else None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=78)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("moderation errors should not mark the token unhealthy")
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        raise AssertionError("mark_token_success should not run when proxy_call fails")
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        raise _upstream_error_http_exception(500, detail)
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            _execute_proxy_request_with_failover(
+                request,
+                endpoint="/v1/images/generations",
+                request_model="gpt-image-2",
+                is_stream=False,
+                proxy_call=fake_proxy_call,
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert str(exc_info.value.detail) == detail
+    assert claim_calls == [1]
+    assert len(finalized) == 1
+    assert finalized[0]["request_log_id"] == 78
+    assert finalized[0]["status_code"] == 500
+    assert finalized[0]["success"] is False
+    assert finalized[0]["attempt_count"] == 1
+    assert finalized[0]["token_id"] == 11
+    assert finalized[0]["account_id"] == "acct_11"
+    assert finalized[0]["error_message"] == detail
 
 
 def test_execute_proxy_request_with_failover_skips_free_tokens_for_gpt_image_2(monkeypatch) -> None:

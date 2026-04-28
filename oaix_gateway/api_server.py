@@ -2691,6 +2691,29 @@ def _responses_error_status_code(error_obj: Any) -> int:
     return 500
 
 
+def _is_terminal_image_generation_error_text(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return (
+        "image_generation_user_error" in text
+        or "moderation_blocked" in text
+        or "rejected by the safety system" in text
+        or "safety_violations" in text
+    )
+
+
+def _is_terminal_image_generation_error(error_obj: Any) -> bool:
+    if not isinstance(error_obj, dict):
+        return _is_terminal_image_generation_error_text(error_obj)
+
+    error_type = str(error_obj.get("type") or "").strip().lower()
+    error_code = str(error_obj.get("code") or "").strip().lower()
+    return (
+        error_type == "image_generation_user_error"
+        or error_code == "moderation_blocked"
+        or _is_terminal_image_generation_error_text(error_obj.get("message"))
+    )
+
+
 def _responses_failure_http_exception(payload: Any) -> HTTPException | None:
     if not isinstance(payload, dict):
         return None
@@ -2717,10 +2740,15 @@ def _responses_failure_http_exception(payload: Any) -> HTTPException | None:
     if error_obj is None:
         return None
 
-    return HTTPException(
-        status_code=_responses_error_status_code(error_obj),
-        detail=json.dumps({"error": error_obj}, ensure_ascii=False),
-    )
+    detail = json.dumps({"error": error_obj}, ensure_ascii=False)
+    if _is_terminal_image_generation_error(error_obj):
+        return _non_retryable_gateway_http_exception(
+            status_code=_responses_error_status_code(error_obj),
+            detail=detail,
+            record_token_error=False,
+        )
+
+    return HTTPException(status_code=_responses_error_status_code(error_obj), detail=detail)
 
 
 def _merge_mapping(target: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -2921,6 +2949,17 @@ def _retryable_gateway_http_exception(
         retryable=True,
         record_token_error=record_token_error,
     )
+
+
+def _upstream_error_http_exception(status_code: int, detail: str) -> HTTPException:
+    error_obj = _extract_error_object(detail)
+    if _is_terminal_image_generation_error(error_obj) or _is_terminal_image_generation_error_text(detail):
+        return _non_retryable_gateway_http_exception(
+            status_code=status_code,
+            detail=detail,
+            record_token_error=False,
+        )
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 async def _collect_responses_json_from_sse(
@@ -3890,22 +3929,24 @@ def _is_sse_comment_chunk(chunk: bytes) -> bool:
         return False
 
 
-def _extract_stream_error_from_chunk(chunk: bytes) -> tuple[int | None, str | None]:
+def _extract_stream_error_from_chunk(chunk: bytes) -> HTTPException | None:
     try:
         _, payload = _extract_responses_stream_event(chunk.decode("utf-8"))
     except Exception:
-        return None, None
+        return None
 
     if not isinstance(payload, dict):
-        return None, None
+        return None
 
     error_obj = payload.get("error")
     if not isinstance(error_obj, dict):
-        return None, None
+        return None
 
     status_code = _responses_error_status_code(error_obj)
     message = _normalize_optional_text(error_obj.get("message"))
-    return status_code, message
+    if message is None:
+        return None
+    return _upstream_error_http_exception(status_code, message)
 
 
 def _transform_image_stream_event(
@@ -4195,10 +4236,7 @@ async def _proxy_image_request_with_token(
                     raw = await upstream_response.aread()
                 finally:
                     await stream_cm.__aexit__(None, None, None)
-                raise HTTPException(
-                    status_code=upstream_response.status_code,
-                    detail=_decode_error_body(raw),
-                )
+                raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
             upstream_iter = upstream_response.aiter_raw()
             try:
@@ -4250,10 +4288,7 @@ async def _proxy_image_request_with_token(
     try:
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()
-            raise HTTPException(
-                status_code=upstream_response.status_code,
-                detail=_decode_error_body(raw),
-            )
+            raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
         response_body, first_token_at = await _collect_images_api_response_from_sse(
             upstream_response.aiter_raw(),
@@ -4910,9 +4945,9 @@ def _gpt_image_stream_keepalive_response(
                     try:
                         async for chunk in body_iterator:
                             if not saw_semantic_chunk:
-                                error_status_code, error_message = _extract_stream_error_from_chunk(chunk)
-                                if error_message is not None:
-                                    raise HTTPException(status_code=error_status_code or 502, detail=error_message)
+                                stream_error = _extract_stream_error_from_chunk(chunk)
+                                if stream_error is not None:
+                                    raise stream_error
 
                                 if _is_sse_done_frame(chunk) and (
                                     proxy_result.stream_capture is None or not proxy_result.stream_capture.completed
@@ -6585,10 +6620,7 @@ async def _proxy_request_with_token(
                     raw = await upstream_response.aread()
                 finally:
                     await stream_cm.__aexit__(None, None, None)
-                raise HTTPException(
-                    status_code=upstream_response.status_code,
-                    detail=_decode_error_body(raw),
-                )
+                raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
             upstream_iter = upstream_response.aiter_raw()
             try:
@@ -6639,10 +6671,7 @@ async def _proxy_request_with_token(
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()
             await stream_cm.__aexit__(None, None, None)
-            raise HTTPException(
-                status_code=upstream_response.status_code,
-                detail=_decode_error_body(raw),
-            )
+            raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
         upstream_iter = upstream_response.aiter_raw()
         try:
@@ -6691,10 +6720,7 @@ async def _proxy_request_with_token(
         try:
             if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
                 raw = await upstream_response.aread()
-                raise HTTPException(
-                    status_code=upstream_response.status_code,
-                    detail=_decode_error_body(raw),
-                )
+                raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
             data, first_token_at = await _collect_responses_json_from_sse(
                 upstream_response.aiter_raw(),
@@ -6758,10 +6784,7 @@ async def _proxy_request_with_token(
         try:
             if fallback_response.status_code < 200 or fallback_response.status_code >= 300:
                 raw = await fallback_response.aread()
-                raise HTTPException(
-                    status_code=fallback_response.status_code,
-                    detail=_decode_error_body(raw),
-                )
+                raise _upstream_error_http_exception(fallback_response.status_code, _decode_error_body(raw))
 
             data, first_token_at = await _collect_responses_json_from_sse(
                 fallback_response.aiter_raw(),
@@ -6784,10 +6807,7 @@ async def _proxy_request_with_token(
     try:
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()
-            raise HTTPException(
-                status_code=upstream_response.status_code,
-                detail=_decode_error_body(raw),
-            )
+            raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
         raw, first_token_at = await _read_response_body_with_first_chunk_time(upstream_response.aiter_raw())
         data = _decode_responses_json_body(raw)
