@@ -141,6 +141,29 @@ RESPONSES_STREAM_NETWORK_ERRORS = (
 DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS = 30.0
 STREAM_KEEPALIVE_PADDING_BYTES = 2048
 STREAM_KEEPALIVE_COMMENT = b": keepalive" + (b" " * STREAM_KEEPALIVE_PADDING_BYTES) + b"\n\n"
+_SSE_SEPARATOR_TAIL_CHARS = 3
+_SSE_EVENT_SEPARATORS = ("\r\n\r\n", "\r\n\n", "\n\r\n", "\n\n")
+
+
+def _find_sse_event_separator(text: str, start: int = 0) -> tuple[int, int] | None:
+    start = max(0, min(start, len(text)))
+    best: tuple[int, int] | None = None
+    for separator in _SSE_EVENT_SEPARATORS:
+        index = text.find(separator, start)
+        if index < 0:
+            continue
+        end = index + len(separator)
+        if best is None or index < best[0] or (index == best[0] and end > best[1]):
+            best = (index, end)
+    return best
+
+
+def _pop_sse_event_from_buffer(text_buffer: str, scan_start: int = 0) -> tuple[str | None, str, int]:
+    separator = _find_sse_event_separator(text_buffer, scan_start)
+    if separator is None:
+        return None, text_buffer, max(0, len(text_buffer) - _SSE_SEPARATOR_TAIL_CHARS)
+    start, end = separator
+    return text_buffer[:start], text_buffer[end:], 0
 
 
 class _RequestTimingRecorder:
@@ -962,6 +985,7 @@ class _ProxyStreamCapture:
         self._output_items_fallback: list[dict[str, Any]] = []
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._text_buffer = ""
+        self._sse_scan_start = 0
 
     @property
     def response_payload(self) -> dict[str, Any] | None:
@@ -986,12 +1010,13 @@ class _ProxyStreamCapture:
             self._text_buffer += self._decoder.decode(chunk)
 
             while True:
-                match = re.search(r"\r?\n\r?\n", self._text_buffer)
-                if not match:
+                raw_event, self._text_buffer, self._sse_scan_start = _pop_sse_event_from_buffer(
+                    self._text_buffer,
+                    self._sse_scan_start,
+                )
+                if raw_event is None:
                     break
 
-                raw_event = self._text_buffer[:match.start()]
-                self._text_buffer = self._text_buffer[match.end():]
                 if not raw_event.strip():
                     continue
 
@@ -2975,6 +3000,7 @@ async def _collect_responses_json_from_sse(
 
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    sse_scan_start = 0
 
     while True:
         try:
@@ -2987,12 +3013,10 @@ async def _collect_responses_json_from_sse(
         text_buffer += decoder.decode(chunk)
 
         while True:
-            match = re.search(r"\r?\n\r?\n", text_buffer)
-            if not match:
+            raw_event, text_buffer, sse_scan_start = _pop_sse_event_from_buffer(text_buffer, sse_scan_start)
+            if raw_event is None:
                 break
 
-            raw_event = text_buffer[:match.start()]
-            text_buffer = text_buffer[match.end():]
             if not raw_event.strip():
                 continue
 
@@ -3106,6 +3130,7 @@ async def _prime_responses_upstream_stream(
     buffered_chunks: list[bytes] = []
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    sse_scan_start = 0
     model_name: str | None = None
     keepalive_deadline: float | None = None
     pending_chunk_task: asyncio.Task[bytes] | None = None
@@ -3164,12 +3189,10 @@ async def _prime_responses_upstream_stream(
             text_buffer += decoder.decode(chunk)
 
             while True:
-                match = re.search(r"\r?\n\r?\n", text_buffer)
-                if not match:
+                raw_event, text_buffer, sse_scan_start = _pop_sse_event_from_buffer(text_buffer, sse_scan_start)
+                if raw_event is None:
                     break
 
-                raw_event = text_buffer[:match.start()]
-                text_buffer = text_buffer[match.end():]
                 if not raw_event.strip():
                     continue
 
@@ -3549,6 +3572,7 @@ async def _stream_responses_to_chat_completions(
 ) -> AsyncGenerator[bytes, None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    sse_scan_start = 0
     emitted_content = ""
     role_sent = False
     response_id = f"chatcmpl_{uuid.uuid4().hex}"
@@ -3632,12 +3656,10 @@ async def _stream_responses_to_chat_completions(
         async for chunk in body_iterator:
             text_buffer += decoder.decode(chunk)
             while True:
-                match = re.search(r"\r?\n\r?\n", text_buffer)
-                if not match:
+                raw_event, text_buffer, sse_scan_start = _pop_sse_event_from_buffer(text_buffer, sse_scan_start)
+                if raw_event is None:
                     break
 
-                raw_event = text_buffer[:match.start()]
-                text_buffer = text_buffer[match.end():]
                 if not raw_event.strip():
                     continue
 
@@ -3794,6 +3816,7 @@ async def _collect_images_api_response_from_sse(
 ) -> tuple[dict[str, Any], datetime | None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    sse_scan_start = 0
     first_token_at: datetime | None = None
     output_items_by_index: dict[int, dict[str, Any]] = {}
     output_items_fallback: list[dict[str, Any]] = []
@@ -3819,12 +3842,10 @@ async def _collect_images_api_response_from_sse(
 
         text_buffer += decoder.decode(chunk)
         while True:
-            match = re.search(r"\r?\n\r?\n", text_buffer)
-            if not match:
+            raw_event, text_buffer, sse_scan_start = _pop_sse_event_from_buffer(text_buffer, sse_scan_start)
+            if raw_event is None:
                 break
 
-            raw_event = text_buffer[:match.start()]
-            text_buffer = text_buffer[match.end():]
             if not raw_event.strip():
                 continue
 
@@ -4015,6 +4036,7 @@ async def _stream_upstream_image_response(
 ) -> AsyncGenerator[bytes, None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    sse_scan_start = 0
     response_id: str | None = None
     response_model_name: str | None = None
     response_created_at: int | None = None
@@ -4023,15 +4045,13 @@ async def _stream_upstream_image_response(
     output_items_fallback: list[dict[str, Any]] = []
 
     def drain_buffer(*, final: bool = False) -> tuple[list[bytes], bool]:
-        nonlocal text_buffer, response_id, response_model_name, response_created_at, completed_response_seen
+        nonlocal text_buffer, sse_scan_start, response_id, response_model_name, response_created_at, completed_response_seen
         events: list[bytes] = []
         while True:
-            match = re.search(r"\r?\n\r?\n", text_buffer)
-            if not match:
+            raw_event, text_buffer, sse_scan_start = _pop_sse_event_from_buffer(text_buffer, sse_scan_start)
+            if raw_event is None:
                 break
 
-            raw_event = text_buffer[:match.start()]
-            text_buffer = text_buffer[match.end():]
             if not raw_event.strip():
                 continue
 
@@ -4139,6 +4159,7 @@ async def _stream_upstream_image_response(
         if final and text_buffer.strip():
             events.append(_build_stream_error_event(502, "Upstream closed stream with an incomplete SSE event"))
             text_buffer = ""
+            sse_scan_start = 0
             return events, True
 
         return events, False
@@ -6472,21 +6493,20 @@ async def _stream_upstream_response(
 
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    sse_scan_start = 0
     heartbeat_interval_seconds = (
         _stream_keepalive_interval_seconds() if _is_responses_image_compat_model(response_model_alias) else None
     )
 
     def drain_buffer(*, final: bool = False) -> tuple[list[bytes], bool]:
-        nonlocal text_buffer
+        nonlocal text_buffer, sse_scan_start
         events: list[bytes] = []
 
         while True:
-            match = re.search(r"\r?\n\r?\n", text_buffer)
-            if not match:
+            raw_event, text_buffer, sse_scan_start = _pop_sse_event_from_buffer(text_buffer, sse_scan_start)
+            if raw_event is None:
                 break
 
-            raw_event = text_buffer[:match.start()]
-            text_buffer = text_buffer[match.end():]
             if not raw_event.strip():
                 continue
 
@@ -6506,6 +6526,7 @@ async def _stream_upstream_response(
         if final and text_buffer.strip():
             events.append(text_buffer.encode("utf-8"))
             text_buffer = ""
+            sse_scan_start = 0
             return events, True
 
         return events, False

@@ -28,6 +28,7 @@ from oaix_gateway.api_server import (
     ResponseTrafficController,
     _parse_images_edits_request,
     _parse_images_generations_request,
+    _pop_sse_event_from_buffer,
     _proxy_chat_completions_with_token,
     _proxy_image_request_with_token,
     _collect_responses_json_from_sse,
@@ -78,6 +79,39 @@ from oaix_gateway.token_import_jobs import (
     process_token_import_job,
 )
 from oaix_gateway.token_store import TOKEN_SELECTION_STRATEGY_FILL_FIRST, TokenSelectionSettings, TokenUpsertResult
+
+
+@pytest.mark.parametrize("separator", ["\n\n", "\r\n\n", "\n\r\n", "\r\n\r\n"])
+def test_pop_sse_event_from_buffer_accepts_supported_separators(separator: str) -> None:
+    raw_event, remaining, scan_start = _pop_sse_event_from_buffer(
+        f"event: response.created{separator}data: next\n\n"
+    )
+
+    assert raw_event == "event: response.created"
+    assert remaining == "data: next\n\n"
+    assert scan_start == 0
+
+
+def test_pop_sse_event_from_buffer_scans_incrementally_across_chunks() -> None:
+    text_buffer = "data: " + ("x" * 10000)
+
+    raw_event, text_buffer, scan_start = _pop_sse_event_from_buffer(text_buffer)
+
+    assert raw_event is None
+    assert scan_start == len(text_buffer) - 3
+
+    text_buffer += "\r"
+    raw_event, text_buffer, scan_start = _pop_sse_event_from_buffer(text_buffer, scan_start)
+
+    assert raw_event is None
+    assert scan_start == len(text_buffer) - 3
+
+    text_buffer += "\n\r\nrest"
+    raw_event, remaining, scan_start = _pop_sse_event_from_buffer(text_buffer, scan_start)
+
+    assert raw_event == "data: " + ("x" * 10000)
+    assert remaining == "rest"
+    assert scan_start == 0
 
 
 def test_mark_token_success_with_timing_skips_obviously_healthy_token(monkeypatch) -> None:
