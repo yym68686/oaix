@@ -171,7 +171,7 @@ account_id_3,refresh_token_3
 - 只会选择 `is_active=true` 且 `cooldown_until` 不在未来的 key
 - `/v1/responses/compact` 会透传到上游 `/responses/compact`；上游不支持 `store` 参数，网关会先移除该字段，非流式调用时也不会自动补 `stream`。如果 compact 等待响应头超时并 fallback 到普通 `/responses`，fallback 请求会补 `store=false`
 - 下游如果把 `/v1/responses` 当非流式调用，网关会自动把上游改成 `stream=true`，先在网关内收完整个 SSE，再拼成一个普通 JSON 响应返回
-- `/v1/images/generations` 和 `/v1/images/edits` 默认把 `model` 当作图片工具模型处理；未指定时默认 `gpt-image-2`，内部主模型固定走 `gpt-5.4-mini`
+- `/v1/images/generations` 和 `/v1/images/edits` 默认把 `model` 当作图片工具模型处理；未指定时默认 `gpt-image-2`，内部主模型固定走 `gpt-5.5`
 - 图片接口内部统一走上游 `/responses` 的 `image_generation` tool；非流式会在网关内收完整个 SSE 后再拼成 OpenAI Images API 形状，流式会把上游 responses 事件改写成 `image_generation.*` / `image_edit.*`
 - 图片编辑或 `gpt-image-2` responses 请求的输入图片数超过 `IMAGE_INPUT_MAX_PER_REQUEST` 时，网关直接返回 `400`
 - `gpt-image-2` 上游返回 `429 rate_limit_exceeded` 且命中 `input-images` 速率桶时，只会对当前 key 的图片桶做短冷却并自动重试下一个 key，不影响该 key 处理其他模型

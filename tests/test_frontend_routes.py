@@ -89,7 +89,7 @@ def test_frontend_token_cards_always_render_probe_button() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     action_renderer = app_js.split("function renderTokenActionButtons", 1)[1].split("function clampWidth", 1)[0]
 
-    assert 'const PROBE_MODEL_OPTIONS = ["gpt-5.4-mini", "gpt-5.5"]' in app_js
+    assert 'const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"]' in app_js
     assert 'data-token-probe-model="true"' in action_renderer
     assert 'const probeButton = `' in action_renderer
     assert 'data-token-probe="true"' in action_renderer

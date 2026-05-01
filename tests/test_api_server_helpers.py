@@ -262,9 +262,9 @@ def test_detects_permanent_disable_errors() -> None:
     assert _is_permanent_account_disable_error(401, payload_401) is True
 
 
-def test_request_requires_non_free_codex_token_for_restricted_models() -> None:
+def test_request_requires_non_free_codex_token_only_for_image_tool_model() -> None:
     assert _request_requires_non_free_codex_token("gpt-image-2") is True
-    assert _request_requires_non_free_codex_token("gpt-5.5") is True
+    assert _request_requires_non_free_codex_token("gpt-5.5") is False
     assert _request_requires_non_free_codex_token("gpt-5.4-mini") is False
 
 
@@ -381,7 +381,7 @@ def test_translate_responses_image_compat_payload_injects_image_tool() -> None:
     )
 
     assert response_model_alias == "gpt-image-2"
-    assert translated["model"] == "gpt-5.4-mini"
+    assert translated["model"] == "gpt-5.5"
     assert translated["previous_response_id"] == "resp_prev_123"
     assert translated["store"] is False
     assert translated["parallel_tool_calls"] is True
@@ -648,7 +648,7 @@ def test_parse_images_generations_request_builds_image_tool_payload() -> None:
     assert image_request.response_format == "url"
     assert image_request.stream is True
     assert image_request.stream_prefix == "image_generation"
-    assert image_request.responses_payload["model"] == "gpt-5.4-mini"
+    assert image_request.responses_payload["model"] == "gpt-5.5"
     assert image_request.responses_payload["stream"] is True
     assert "tool_choice" not in image_request.responses_payload
     assert image_request.responses_payload["tools"][0] == {
@@ -1819,7 +1819,7 @@ def test_proxy_request_with_token_auto_translates_gpt_image_responses_request() 
     assert len(client.stream_calls) == 1
     stream_call = client.stream_calls[0]
     upstream_payload = json.loads(stream_call["content"])
-    assert upstream_payload["model"] == "gpt-5.4-mini"
+    assert upstream_payload["model"] == "gpt-5.5"
     assert upstream_payload["stream"] is True
     assert upstream_payload["store"] is False
     assert upstream_payload["parallel_tool_calls"] is True
@@ -2134,7 +2134,7 @@ def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias() -> Non
     result, body, stream_calls = asyncio.run(run_stream())
 
     upstream_payload = json.loads(stream_calls[0]["content"])
-    assert upstream_payload["model"] == "gpt-5.4-mini"
+    assert upstream_payload["model"] == "gpt-5.5"
     assert upstream_payload["store"] is False
     assert upstream_payload["parallel_tool_calls"] is True
     assert upstream_payload["reasoning"] == {"effort": "medium", "summary": "auto"}
@@ -2403,7 +2403,7 @@ def test_proxy_chat_completions_with_token_non_stream_returns_markdown_image_res
     )
 
     upstream_payload = json.loads(client.stream_calls[0]["content"])
-    assert upstream_payload["model"] == "gpt-5.4-mini"
+    assert upstream_payload["model"] == "gpt-5.5"
     assert upstream_payload["store"] is False
     assert upstream_payload["parallel_tool_calls"] is True
     assert upstream_payload["reasoning"] == {"effort": "medium", "summary": "auto"}
@@ -2547,7 +2547,7 @@ def test_proxy_chat_completions_with_token_stream_returns_markdown_image_chunks(
     result, body = asyncio.run(run_stream())
 
     upstream_payload = json.loads(client.stream_calls[0]["content"])
-    assert upstream_payload["model"] == "gpt-5.4-mini"
+    assert upstream_payload["model"] == "gpt-5.5"
     assert upstream_payload["store"] is False
     assert upstream_payload["parallel_tool_calls"] is True
     assert upstream_payload["reasoning"] == {"effort": "medium", "summary": "auto"}
@@ -4820,7 +4820,7 @@ def test_execute_proxy_request_with_failover_keeps_retrying_gpt_image_2_stream_a
     assert finalized[0]["account_id"] == "acct-second"
 
 
-def test_execute_proxy_request_with_failover_allows_free_tokens_for_other_models(monkeypatch) -> None:
+def test_execute_proxy_request_with_failover_allows_free_tokens_for_gpt_5_5(monkeypatch) -> None:
     app = SimpleNamespace(
         state=SimpleNamespace(
             response_traffic=ResponseTrafficController(),
@@ -4893,7 +4893,7 @@ def test_execute_proxy_request_with_failover_allows_free_tokens_for_other_models
         return SimpleNamespace(
             response=JSONResponse({"ok": True}),
             status_code=200,
-            model_name="gpt-5.4-mini",
+            model_name="gpt-5.5",
             first_token_at=None,
             usage_metrics=None,
             on_success=None,
@@ -4911,7 +4911,7 @@ def test_execute_proxy_request_with_failover_allows_free_tokens_for_other_models
         _execute_proxy_request_with_failover(
             request,
             endpoint="/v1/responses",
-            request_model="gpt-5.4-mini",
+            request_model="gpt-5.5",
             is_stream=False,
             proxy_call=fake_proxy_call,
         )
@@ -5038,123 +5038,6 @@ def test_execute_proxy_request_with_failover_returns_clear_503_when_only_free_to
     assert finalized[0]["token_id"] is None
     assert finalized[0]["account_id"] is None
     assert finalized[0]["error_message"] == "No non-free Codex token available for gpt-image-2 requests"
-
-
-def test_execute_proxy_request_with_failover_returns_clear_503_when_only_free_tokens_exist_for_gpt_5_5(
-    monkeypatch,
-) -> None:
-    class DummyQuotaService:
-        def get_cached_snapshot(self, token_id: int):
-            return CodexQuotaSnapshot(
-                fetched_at=datetime.now(timezone.utc),
-                error=None,
-                plan_type="free",
-                windows=[],
-            )
-
-        async def get_snapshot(self, *args, **kwargs):
-            raise AssertionError("gpt-5.5 token selection should not fetch quota snapshots on the hot path")
-
-    app = SimpleNamespace(
-        state=SimpleNamespace(
-            response_traffic=ResponseTrafficController(),
-            http_client=object(),
-            oauth_manager=None,
-            quota_service=DummyQuotaService(),
-        )
-    )
-
-    class DummyOAuthManager:
-        async def get_access_token(
-            self,
-            token_row,
-            client,
-            *,
-            force_refresh: bool = False,
-            reactivate_on_refresh: bool = True,
-        ) -> tuple[str, bool]:
-            raise AssertionError("free tokens should be skipped before fetching access tokens")
-
-        def invalidate(self, token_id: int) -> None:
-            raise AssertionError("invalidate should never run when no request is attempted")
-
-    app.state.oauth_manager = DummyOAuthManager()
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [(b"user-agent", b"yaak")],
-            "client": ("127.0.0.1", 9000),
-            "app": app,
-        },
-        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
-    )
-    free_token = CodexToken(
-        id=32,
-        account_id="acct_free",
-        refresh_token="refresh-free",
-        is_active=True,
-        raw_payload={},
-    )
-
-    claim_calls: list[tuple[int, ...]] = []
-    finalized: list[dict[str, object]] = []
-
-    async def fake_get_token_counts():
-        return SimpleNamespace(available=1)
-
-    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
-        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
-        claim_calls.append(excluded)
-        if 32 in excluded:
-            return None
-        return free_token
-
-    async def fake_create_request_log(**kwargs):
-        return SimpleNamespace(id=93)
-
-    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
-        finalized.append({"request_log_id": request_log_id, **kwargs})
-
-    async def fake_mark_token_success(token_id: int) -> None:
-        raise AssertionError("mark_token_success should not run when no request is attempted")
-
-    async def fake_mark_token_error(*args, **kwargs) -> None:
-        raise AssertionError("mark_token_error should not run when free tokens are skipped")
-
-    async def fake_proxy_call(client, access_token: str, account_id: str | None):
-        raise AssertionError("proxy_call should not run when only free tokens are available")
-
-    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
-    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
-    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
-    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
-    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
-    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
-
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            _execute_proxy_request_with_failover(
-                request,
-                endpoint="/v1/chat/completions",
-                request_model="gpt-5.5",
-                is_stream=False,
-                proxy_call=fake_proxy_call,
-            )
-        )
-
-    assert exc_info.value.status_code == 503
-    assert str(exc_info.value.detail) == "No non-free Codex token available for gpt-5.5 requests"
-    assert claim_calls == [(), (32,)]
-    assert len(finalized) == 1
-    assert finalized[0]["request_log_id"] == 93
-    assert finalized[0]["status_code"] == 503
-    assert finalized[0]["success"] is False
-    assert finalized[0]["attempt_count"] == 0
-    assert finalized[0]["token_id"] is None
-    assert finalized[0]["account_id"] is None
-    assert finalized[0]["error_message"] == "No non-free Codex token available for gpt-5.5 requests"
 
 
 def test_execute_proxy_request_with_failover_falls_back_to_declared_plan_type_when_quota_missing(

@@ -7,7 +7,7 @@ const TOAST_DURATION_MS = 5200;
 const TOAST_EXIT_DURATION_MS = 220;
 const TOKEN_LIST_BASE_NOTE = "显示最近 80 条记录 · 可用 / 冷却 / 已禁用分组";
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
-const PROBE_MODEL_OPTIONS = ["gpt-5.4-mini", "gpt-5.5"];
+const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
 const DEFAULT_PROBE_MODEL = PROBE_MODEL_OPTIONS[0];
 const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 

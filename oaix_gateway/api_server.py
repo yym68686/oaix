@@ -81,10 +81,10 @@ _ORIGINAL_CREATE_REQUEST_LOG = create_request_log
 _ORIGINAL_FINALIZE_REQUEST_LOG = finalize_request_log
 WEB_DIR = Path(__file__).resolve().parent / "web"
 ADMIN_TOKEN_PROBE_INPUT = "say test"
-DEFAULT_IMAGES_MAIN_MODEL = "gpt-5.4-mini"
+DEFAULT_IMAGES_MAIN_MODEL = "gpt-5.5"
 DEFAULT_IMAGES_TOOL_MODEL = "gpt-image-2"
 IMAGE_INPUT_RATE_LIMIT_COOLDOWN_SCOPE = f"{DEFAULT_IMAGES_TOOL_MODEL}:input-images"
-NON_FREE_ONLY_CODEX_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL, "gpt-5.5"})
+NON_FREE_ONLY_CODEX_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL})
 RESPONSES_IMAGE_COMPAT_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL})
 RESPONSES_IMAGE_TOOL_TEXT_FIELDS = (
     "size",
@@ -1520,7 +1520,7 @@ def _sanitize_codex_payload(
 
 
 def _admin_token_probe_model() -> str:
-    return _normalize_optional_text(os.getenv("ADMIN_TOKEN_PROBE_MODEL")) or "gpt-5.4-mini"
+    return _normalize_optional_text(os.getenv("ADMIN_TOKEN_PROBE_MODEL")) or "gpt-5.5"
 
 
 def _decode_error_body(raw: bytes) -> str:
