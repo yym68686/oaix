@@ -35,6 +35,7 @@ def test_frontend_routes_are_registered() -> None:
     assert "/admin/tokens" in paths
     assert "/admin/token-selection" in paths
     assert "/admin/token-selection/order" in paths
+    assert "/admin/token-selection/plan-order" in paths
     assert "/admin/tokens/{token_id}/activation" in paths
     assert "/admin/tokens/{token_id}/probe" in paths
     assert "/admin/tokens/{token_id}" in paths
@@ -106,6 +107,19 @@ def test_frontend_token_cards_support_fill_first_drag_ordering() -> None:
     assert 'elements.tokenList.addEventListener("dragstart", handleTokenCardDragStart)' in app_js
     assert 'state.tokenSelectionStrategy === "fill_first"' in app_js
     assert 'renderTokenFact("当前并发", activeStreamsValue, activeStreamsTone)' in app_js
+
+
+def test_frontend_supports_custom_plan_order_and_available_plan_filters() -> None:
+    index_html = (WEB_DIR / "index.html").read_text()
+    app_js = (WEB_DIR / "app.js").read_text()
+
+    assert 'id="token-plan-order-summary"' in index_html
+    assert 'id="token-plan-order-list"' in index_html
+    assert 'data-plan-order-enabled="true"' in index_html
+    assert 'const PLAN_TYPE_OPTIONS = ["free", "plus", "team", "pro"]' in app_js
+    assert 'fetchJson("/admin/token-selection/plan-order"' in app_js
+    assert 'data-available-plan-filter="${escapeHtml(planType)}"' in app_js
+    assert "state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL" in app_js
 
 
 def test_frontend_import_panel_supports_queue_position_switch() -> None:
@@ -181,6 +195,41 @@ def test_token_selection_order_route_forwards_token_ids(monkeypatch) -> None:
     assert captured == {"token_ids": [7, 3, 7, 9]}
     assert response.json()["strategy"] == "fill_first"
     assert response.json()["token_order"] == [7, 3, 9]
+
+
+def test_token_selection_plan_order_route_forwards_plan_order(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+    captured: dict[str, object] = {}
+
+    async def fake_update_token_plan_order_settings(*, enabled, plan_order):
+        captured["enabled"] = enabled
+        captured["plan_order"] = plan_order
+        return TokenSelectionSettings(
+            strategy="least_recently_used",
+            plan_order_enabled=True,
+            plan_order=("team", "plus", "pro", "free"),
+        )
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.update_token_plan_order_settings",
+        fake_update_token_plan_order_settings,
+    )
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/admin/token-selection/plan-order",
+            json={"enabled": True, "plan_order": ["team", "plus", "pro", "free"]},
+        )
+    )
+
+    assert response.status_code == 200
+    assert captured == {"enabled": True, "plan_order": ["team", "plus", "pro", "free"]}
+    assert response.json()["plan_order_enabled"] is True
+    assert response.json()["plan_order"] == ["team", "plus", "pro", "free"]
 
 
 def test_admin_token_probe_route_accepts_model_payload(monkeypatch) -> None:

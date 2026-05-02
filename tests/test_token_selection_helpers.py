@@ -8,6 +8,7 @@ from oaix_gateway.token_store import (
     TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED,
     _token_selection_order_clauses,
     merge_imported_token_order,
+    normalize_token_plan_order,
     normalize_token_selection_order,
     normalize_token_selection_strategy,
     parse_token_import_queue_position,
@@ -38,6 +39,15 @@ def test_normalize_token_selection_order_keeps_unique_positive_ids() -> None:
     assert normalize_token_selection_order([7, "3", 7, 0, -2, "bad", None, 9]) == (7, 3, 9)
 
 
+def test_normalize_token_plan_order_keeps_known_plans_and_appends_missing_defaults() -> None:
+    assert normalize_token_plan_order(["team", "free", "team", "business", None]) == (
+        "team",
+        "free",
+        "plus",
+        "pro",
+    )
+
+
 def test_parse_token_import_queue_position_accepts_front_and_back_aliases() -> None:
     assert parse_token_import_queue_position("head") == TOKEN_IMPORT_QUEUE_POSITION_FRONT
     assert parse_token_import_queue_position("append") == TOKEN_IMPORT_QUEUE_POSITION_BACK
@@ -58,3 +68,20 @@ def test_fill_first_order_clauses_rank_custom_order_before_id() -> None:
 
     assert len(clauses) == 2
     assert "CASE" in str(clauses[0].compile(compile_kwargs={"literal_binds": True}))
+
+
+def test_plan_order_clauses_wrap_existing_fill_first_order() -> None:
+    clauses = _token_selection_order_clauses(
+        TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+        token_order=[9, 3],
+        plan_order_enabled=True,
+        plan_order=["team", "free", "plus", "pro"],
+    )
+
+    compiled = [str(clause.compile(compile_kwargs={"literal_binds": True})) for clause in clauses]
+
+    assert len(clauses) == 3
+    assert "codex_tokens.plan_type" in compiled[0]
+    assert "team" in compiled[0]
+    assert "CASE" in compiled[1]
+    assert "codex_tokens.id" in compiled[1]

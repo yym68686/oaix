@@ -9,6 +9,9 @@ const TOKEN_LIST_BASE_NOTE = "显示最近 80 条记录 · 可用 / 冷却 / 已
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
 const DEFAULT_PROBE_MODEL = PROBE_MODEL_OPTIONS[0];
+const PLAN_TYPE_OPTIONS = ["free", "plus", "team", "pro"];
+const DEFAULT_PLAN_ORDER = [...PLAN_TYPE_OPTIONS];
+const AVAILABLE_PLAN_FILTER_ALL = "all";
 const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 const IMPORT_QUEUE_POSITION_OPTIONS = new Set(["front", "back"]);
 const DEFAULT_IMPORT_QUEUE_POSITION = "front";
@@ -60,6 +63,11 @@ const state = {
   tokenSelectionSaving: false,
   tokenSelectionStrategy: "least_recently_used",
   tokenSelectionOrder: [],
+  tokenPlanOrderEnabled: false,
+  tokenPlanOrder: [...DEFAULT_PLAN_ORDER],
+  tokenPlanOrderSaving: false,
+  tokenPlanOrderDragType: "",
+  availablePlanFilter: AVAILABLE_PLAN_FILTER_ALL,
   tokenOrderSaving: false,
   tokenDragTokenId: null,
   importQueuePosition: DEFAULT_IMPORT_QUEUE_POSITION,
@@ -103,6 +111,9 @@ const elements = {
   tokenSearchSummary: document.getElementById("token-search-summary"),
   tokenSelectionSummary: document.getElementById("token-selection-summary"),
   tokenSelectionButtons: Array.from(document.querySelectorAll("[data-selection-strategy]")),
+  tokenPlanOrderSummary: document.getElementById("token-plan-order-summary"),
+  tokenPlanOrderButtons: Array.from(document.querySelectorAll("[data-plan-order-enabled]")),
+  tokenPlanOrderList: document.getElementById("token-plan-order-list"),
   requestList: document.getElementById("request-list"),
   requestNote: document.getElementById("request-note"),
   requestTotalCount: document.getElementById("request-total-count"),
@@ -552,11 +563,61 @@ function normalizeTokenSelectionOrder(value) {
   return order;
 }
 
+function normalizePlanType(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^chatgpt_/, "");
+  if (PLAN_TYPE_OPTIONS.includes(normalized)) {
+    return normalized;
+  }
+  return "unknown";
+}
+
+function normalizeTokenPlanOrder(value) {
+  const seen = new Set();
+  const order = [];
+  const source = Array.isArray(value) ? value : [];
+  source.forEach((item) => {
+    const planType = normalizePlanType(item);
+    if (!PLAN_TYPE_OPTIONS.includes(planType) || seen.has(planType)) {
+      return;
+    }
+    seen.add(planType);
+    order.push(planType);
+  });
+  DEFAULT_PLAN_ORDER.forEach((planType) => {
+    if (seen.has(planType)) {
+      return;
+    }
+    order.push(planType);
+  });
+  return order;
+}
+
+function normalizeAvailablePlanFilter(value) {
+  const planType = normalizePlanType(value);
+  if (value === AVAILABLE_PLAN_FILTER_ALL || planType === AVAILABLE_PLAN_FILTER_ALL) {
+    return AVAILABLE_PLAN_FILTER_ALL;
+  }
+  if (PLAN_TYPE_OPTIONS.includes(planType) || planType === "unknown") {
+    return planType;
+  }
+  return AVAILABLE_PLAN_FILTER_ALL;
+}
+
 function describeTokenSelectionStrategy(strategy) {
   if (normalizeTokenSelectionStrategy(strategy) === "fill_first") {
     return "首个可用优先";
   }
   return "最久未用优先";
+}
+
+function describeTokenPlanOrder(enabled = state.tokenPlanOrderEnabled, planOrder = state.tokenPlanOrder) {
+  if (!enabled) {
+    return "默认请求顺序";
+  }
+  return normalizeTokenPlanOrder(planOrder).map(formatPlanType).join(" → ");
 }
 
 function describeImportQueuePosition(position) {
@@ -581,6 +642,18 @@ function renderImportQueuePosition(position) {
 function setTokenSelectionDisabled(disabled) {
   elements.tokenSelectionButtons.forEach((button) => {
     button.disabled = disabled;
+  });
+}
+
+function setTokenPlanOrderDisabled(disabled) {
+  elements.tokenPlanOrderButtons.forEach((button) => {
+    button.disabled = disabled;
+  });
+  if (!elements.tokenPlanOrderList) {
+    return;
+  }
+  elements.tokenPlanOrderList.querySelectorAll("button").forEach((button) => {
+    button.disabled = disabled || !state.tokenPlanOrderEnabled;
   });
 }
 
@@ -656,7 +729,11 @@ function renderInitialLoadingStates() {
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "正在同步策略";
     }
+    if (elements.tokenPlanOrderSummary) {
+      elements.tokenPlanOrderSummary.textContent = "正在同步顺序";
+    }
     setTokenSelectionDisabled(true);
+    setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
     renderTokenListLoading();
   }
@@ -674,15 +751,74 @@ function renderTokenSelection(selection) {
   if (Array.isArray(selection?.token_order)) {
     state.tokenSelectionOrder = normalizeTokenSelectionOrder(selection.token_order);
   }
+  if (Object.prototype.hasOwnProperty.call(selection || {}, "plan_order_enabled")) {
+    state.tokenPlanOrderEnabled = Boolean(selection?.plan_order_enabled);
+  }
+  if (Array.isArray(selection?.plan_order)) {
+    state.tokenPlanOrder = normalizeTokenPlanOrder(selection.plan_order);
+  } else {
+    state.tokenPlanOrder = normalizeTokenPlanOrder(state.tokenPlanOrder);
+  }
 
   elements.tokenSelectionButtons.forEach((button) => {
     const active = button.dataset.selectionStrategy === strategy;
+    button.setAttribute("aria-pressed", String(active));
+  });
+  elements.tokenPlanOrderButtons.forEach((button) => {
+    const active = (button.dataset.planOrderEnabled === "true") === state.tokenPlanOrderEnabled;
     button.setAttribute("aria-pressed", String(active));
   });
 
   if (elements.tokenSelectionSummary) {
     elements.tokenSelectionSummary.textContent = describeTokenSelectionStrategy(strategy);
   }
+  if (elements.tokenPlanOrderSummary) {
+    elements.tokenPlanOrderSummary.textContent = describeTokenPlanOrder();
+  }
+  renderTokenPlanOrderList();
+}
+
+function renderTokenPlanOrderList() {
+  if (!elements.tokenPlanOrderList) {
+    return;
+  }
+  const planOrder = normalizeTokenPlanOrder(state.tokenPlanOrder);
+  const disabled = state.tokenPlanOrderSaving || !state.tokenPlanOrderEnabled;
+  elements.tokenPlanOrderList.innerHTML = planOrder
+    .map((planType, index) => {
+      const label = formatPlanType(planType);
+      const draggable = state.tokenPlanOrderEnabled && !state.tokenPlanOrderSaving;
+      return `
+        <div
+          class="plan-order-item${disabled ? " plan-order-item--disabled" : ""}"
+          data-plan-order-item="${escapeHtml(planType)}"
+          draggable="${draggable ? "true" : "false"}"
+          role="listitem"
+        >
+          <span class="plan-order-item__rank">${index + 1}</span>
+          <span class="plan-order-item__label">${escapeHtml(label)}</span>
+          <span class="plan-order-item__actions" aria-label="${escapeHtml(label)} 顺序操作">
+            <button
+              class="plan-order-item__move"
+              type="button"
+              data-plan-order-move="up"
+              data-plan-type="${escapeHtml(planType)}"
+              aria-label="${escapeHtml(`${label} 上移`)}"
+              ${disabled || index === 0 ? "disabled" : ""}
+            >↑</button>
+            <button
+              class="plan-order-item__move"
+              type="button"
+              data-plan-order-move="down"
+              data-plan-type="${escapeHtml(planType)}"
+              aria-label="${escapeHtml(`${label} 下移`)}"
+              ${disabled || index === planOrder.length - 1 ? "disabled" : ""}
+            >↓</button>
+          </span>
+        </div>
+      `;
+    })
+    .join("");
 }
 
 function normalizeTokenSearchQuery(value) {
@@ -736,6 +872,7 @@ function canDragAvailableTokens() {
   return (
     state.tokenSelectionStrategy === "fill_first" &&
     !state.tokenOrderSaving &&
+    state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL &&
     getTokenSearchTerms().length === 0
   );
 }
@@ -750,12 +887,29 @@ function getTokenSelectionOrderRanks() {
 
 function sortAvailableTokenItems(items) {
   const list = Array.isArray(items) ? [...items] : [];
-  if (state.tokenSelectionStrategy !== "fill_first") {
-    return list;
-  }
   const ranks = getTokenSelectionOrderRanks();
   const fallbackRank = ranks.size;
+  const planRanks = new Map();
+  if (state.tokenPlanOrderEnabled) {
+    normalizeTokenPlanOrder(state.tokenPlanOrder).forEach((planType, index) => {
+      planRanks.set(planType, index);
+    });
+  }
   return list.sort((left, right) => {
+    if (state.tokenPlanOrderEnabled) {
+      const leftPlanRank = planRanks.has(normalizePlanType(left?.plan_type))
+        ? planRanks.get(normalizePlanType(left?.plan_type))
+        : planRanks.size;
+      const rightPlanRank = planRanks.has(normalizePlanType(right?.plan_type))
+        ? planRanks.get(normalizePlanType(right?.plan_type))
+        : planRanks.size;
+      if (leftPlanRank !== rightPlanRank) {
+        return leftPlanRank - rightPlanRank;
+      }
+    }
+    if (state.tokenSelectionStrategy !== "fill_first") {
+      return 0;
+    }
     const leftId = Number(left?.id);
     const rightId = Number(right?.id);
     const leftRank = ranks.has(leftId) ? ranks.get(leftId) : fallbackRank;
@@ -765,6 +919,89 @@ function sortAvailableTokenItems(items) {
     }
     return leftId - rightId;
   });
+}
+
+function buildPlanTypeCounts(items) {
+  const counts = Object.create(null);
+  PLAN_TYPE_OPTIONS.forEach((planType) => {
+    counts[planType] = 0;
+  });
+  counts.unknown = 0;
+  if (!Array.isArray(items)) {
+    return counts;
+  }
+  items.forEach((item) => {
+    const planType = normalizePlanType(item?.plan_type);
+    counts[planType] = (counts[planType] || 0) + 1;
+  });
+  return counts;
+}
+
+function getVisiblePlanFilters(counts) {
+  const filters = [...PLAN_TYPE_OPTIONS];
+  if (Number(counts?.unknown || 0) > 0) {
+    filters.push("unknown");
+  }
+  return filters;
+}
+
+function describePlanTypeCounts(counts) {
+  return getVisiblePlanFilters(counts)
+    .map((planType) => `${formatPlanType(planType)} ${formatInteger(counts?.[planType] || 0)}`)
+    .join(" · ");
+}
+
+function filterAvailableItemsByPlan(items) {
+  const filter = normalizeAvailablePlanFilter(state.availablePlanFilter);
+  if (filter === AVAILABLE_PLAN_FILTER_ALL) {
+    return items;
+  }
+  return items.filter((item) => normalizePlanType(item?.plan_type) === filter);
+}
+
+function renderAvailablePlanFilters(allItems, visibleItems) {
+  const counts = buildPlanTypeCounts(allItems);
+  const activeFilter = normalizeAvailablePlanFilter(state.availablePlanFilter);
+  const filters = getVisiblePlanFilters(counts);
+  const totalCount = Array.isArray(allItems) ? allItems.length : 0;
+  const activeLabel =
+    activeFilter === AVAILABLE_PLAN_FILTER_ALL ? "全部计划" : `${formatPlanType(activeFilter)} 计划`;
+  const visibleCount = Array.isArray(visibleItems) ? visibleItems.length : 0;
+  return `
+    <div class="available-plan-filter" aria-label="按计划筛选可用 Key">
+      <div class="available-plan-filter__head">
+        <span class="available-plan-filter__label">计划数量</span>
+        <span class="available-plan-filter__summary">${escapeHtml(`${activeLabel} · ${formatInteger(visibleCount)} / ${formatInteger(totalCount)}`)}</span>
+      </div>
+      <div class="available-plan-filter__chips" role="group" aria-label="选择可用计划分组">
+        <button
+          class="available-plan-filter__chip"
+          type="button"
+          data-available-plan-filter="${AVAILABLE_PLAN_FILTER_ALL}"
+          aria-pressed="${activeFilter === AVAILABLE_PLAN_FILTER_ALL ? "true" : "false"}"
+        >
+          <span>全部</span>
+          <strong>${escapeHtml(formatInteger(totalCount))}</strong>
+        </button>
+        ${filters
+          .map((planType) => {
+            const count = counts?.[planType] || 0;
+            return `
+              <button
+                class="available-plan-filter__chip"
+                type="button"
+                data-available-plan-filter="${escapeHtml(planType)}"
+                aria-pressed="${activeFilter === planType ? "true" : "false"}"
+              >
+                <span>${escapeHtml(formatPlanType(planType))}</span>
+                <strong>${escapeHtml(formatInteger(count))}</strong>
+              </button>
+            `;
+          })
+          .join("")}
+      </div>
+    </div>
+  `;
 }
 
 function mergeVisibleTokenOrder(visibleTokenIds) {
@@ -1493,7 +1730,17 @@ function renderTokenCard(item, workspaceTokenCounts) {
   `;
 }
 
-function renderTokenGroup({ id, title, meta, tone, items, open = false, emptyMessage, itemRenderer = renderTokenCard }) {
+function renderTokenGroup({
+  id,
+  title,
+  meta,
+  tone,
+  items,
+  open = false,
+  emptyMessage,
+  itemRenderer = renderTokenCard,
+  beforeItems = "",
+}) {
   const list = Array.isArray(items) ? items : [];
   return `
     <details class="token-group token-group--${escapeHtml(tone)}" data-token-group="${escapeHtml(id)}"${open ? " open" : ""}>
@@ -1512,6 +1759,7 @@ function renderTokenGroup({ id, title, meta, tone, items, open = false, emptyMes
         </span>
       </summary>
       <div class="token-group__body token-group__body--fold">
+        ${beforeItems}
         ${
           list.length > 0
             ? list.map((item) => itemRenderer(item)).join("")
@@ -1782,29 +2030,44 @@ function renderTokenList(items) {
     availableItems.push(item);
   });
   const orderedAvailableItems = sortAvailableTokenItems(availableItems);
+  const availablePlanCounts = buildPlanTypeCounts(orderedAvailableItems);
+  const visibleAvailableItems = filterAvailableItemsByPlan(orderedAvailableItems);
+  const availablePlanCountLabel = describePlanTypeCounts(availablePlanCounts);
+  const availableMeta =
+    state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL
+      ? describeTokenGroupMeta(
+          orderedAvailableItems,
+          `可立即调度 · ${availablePlanCountLabel}`,
+          "当前没有可立即调度的 key",
+          buildWorkspaceTokenCounts(orderedAvailableItems),
+        )
+      : `${formatPlanType(state.availablePlanFilter)} 计划 · ${formatInteger(visibleAvailableItems.length)} / ${formatInteger(
+          orderedAvailableItems.length,
+        )} · ${availablePlanCountLabel}`;
 
   const availableOpen = resolveTokenGroupOpenState("available", true);
-  const coolingOpen = resolveTokenGroupOpenState("cooling", orderedAvailableItems.length === 0 && coolingItems.length > 0);
+  const coolingOpen = resolveTokenGroupOpenState("cooling", visibleAvailableItems.length === 0 && coolingItems.length > 0);
   const disabledOpen = resolveTokenGroupOpenState(
     "disabled",
-    orderedAvailableItems.length === 0 && coolingItems.length === 0 && disabledItems.length > 0,
+    visibleAvailableItems.length === 0 && coolingItems.length === 0 && disabledItems.length > 0,
   );
 
   elements.tokenList.innerHTML = `
     ${renderTokenGroup({
       id: "available",
       title: "可用",
-      meta: describeTokenGroupMeta(
-        orderedAvailableItems,
-        "可立即调度",
-        "当前没有可立即调度的 key",
-        buildWorkspaceTokenCounts(orderedAvailableItems),
-      ),
+      meta: availableMeta,
       tone: "available",
-      items: orderedAvailableItems,
+      items: visibleAvailableItems,
       itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
+      beforeItems: orderedAvailableItems.length
+        ? renderAvailablePlanFilters(orderedAvailableItems, visibleAvailableItems)
+        : "",
       open: availableOpen,
-      emptyMessage: "当前没有可立即调度的 key。",
+      emptyMessage:
+        state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL
+          ? "当前没有可立即调度的 key。"
+          : `当前没有可用的 ${formatPlanType(state.availablePlanFilter)} 计划 key。`,
     })}
     ${renderTokenGroup({
       id: "cooling",
@@ -2127,6 +2390,7 @@ async function loadTokens() {
     elements.listNote.textContent = TOKEN_LIST_BASE_NOTE;
     renderTokenSelection(data.selection || {});
     setTokenSelectionDisabled(state.tokenSelectionSaving);
+    setTokenPlanOrderDisabled(state.tokenPlanOrderSaving);
     setTokenSearchDisabled(false);
     renderTokenList(state.tokenItems);
     if (data.counts) {
@@ -2141,7 +2405,11 @@ async function loadTokens() {
       if (elements.tokenSelectionSummary) {
         elements.tokenSelectionSummary.textContent = "需要 Service API Key";
       }
+      if (elements.tokenPlanOrderSummary) {
+        elements.tokenPlanOrderSummary.textContent = "需要 Service API Key";
+      }
       setTokenSelectionDisabled(true);
+      setTokenPlanOrderDisabled(true);
       setTokenSearchDisabled(true);
       elements.tokenList.innerHTML = `
         <article class="empty-state">
@@ -2155,7 +2423,11 @@ async function loadTokens() {
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "切换器同步失败";
     }
+    if (elements.tokenPlanOrderSummary) {
+      elements.tokenPlanOrderSummary.textContent = "顺序同步失败";
+    }
     setTokenSelectionDisabled(true);
+    setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
     elements.tokenList.innerHTML = `
       <article class="empty-state">
@@ -2234,6 +2506,85 @@ async function saveTokenOrder(visibleTokenIds) {
     state.tokenOrderSaving = false;
     renderTokenList(state.tokenItems);
   }
+}
+
+async function saveTokenPlanOrder({ enabled = state.tokenPlanOrderEnabled, planOrder = state.tokenPlanOrder } = {}) {
+  const nextEnabled = Boolean(enabled);
+  const nextPlanOrder = normalizeTokenPlanOrder(planOrder);
+  const currentPlanOrder = normalizeTokenPlanOrder(state.tokenPlanOrder);
+  if (
+    state.tokenPlanOrderSaving ||
+    (nextEnabled === state.tokenPlanOrderEnabled &&
+      JSON.stringify(nextPlanOrder) === JSON.stringify(currentPlanOrder))
+  ) {
+    return;
+  }
+
+  const previousEnabled = state.tokenPlanOrderEnabled;
+  const previousPlanOrder = [...state.tokenPlanOrder];
+  let disableAfterSave = false;
+  state.tokenPlanOrderSaving = true;
+  state.tokenPlanOrderEnabled = nextEnabled;
+  state.tokenPlanOrder = nextPlanOrder;
+  renderTokenSelection({
+    strategy: state.tokenSelectionStrategy,
+    token_order: state.tokenSelectionOrder,
+    plan_order_enabled: nextEnabled,
+    plan_order: nextPlanOrder,
+  });
+  renderTokenList(state.tokenItems);
+  elements.listNote.textContent = nextEnabled ? "正在保存计划优先级…" : "正在关闭计划优先级…";
+  setTokenPlanOrderDisabled(true);
+
+  try {
+    const data = await fetchJson("/admin/token-selection/plan-order", {
+      method: "POST",
+      headers: authHeaders(true),
+      body: JSON.stringify({
+        enabled: nextEnabled,
+        plan_order: nextPlanOrder,
+      }),
+    });
+    renderTokenSelection(data);
+    renderTokenList(state.tokenItems);
+    elements.listNote.textContent = nextEnabled ? "计划优先级已保存" : TOKEN_LIST_BASE_NOTE;
+  } catch (error) {
+    state.tokenPlanOrderEnabled = previousEnabled;
+    state.tokenPlanOrder = previousPlanOrder;
+    renderTokenSelection({
+      strategy: state.tokenSelectionStrategy,
+      token_order: state.tokenSelectionOrder,
+      plan_order_enabled: previousEnabled,
+      plan_order: previousPlanOrder,
+    });
+    renderTokenList(state.tokenItems);
+    if (elements.tokenPlanOrderSummary) {
+      elements.tokenPlanOrderSummary.textContent =
+        error.status === 401 ? "需要 Service API Key" : "保存失败，请重试";
+    }
+    elements.listNote.textContent =
+      error.status === 401 ? "需要输入 Service API Key 才能保存计划优先级" : `计划优先级保存失败：${error.message}`;
+    disableAfterSave = error.status === 401;
+    throw error;
+  } finally {
+    state.tokenPlanOrderSaving = false;
+    setTokenPlanOrderDisabled(disableAfterSave);
+    renderTokenPlanOrderList();
+  }
+}
+
+function movePlanOrderItem(planType, direction) {
+  const resolvedPlanType = normalizePlanType(planType);
+  const order = normalizeTokenPlanOrder(state.tokenPlanOrder);
+  const index = order.indexOf(resolvedPlanType);
+  const offset = direction === "up" ? -1 : direction === "down" ? 1 : 0;
+  const nextIndex = index + offset;
+  if (index < 0 || offset === 0 || nextIndex < 0 || nextIndex >= order.length) {
+    return order;
+  }
+  const [item] = order.splice(index, 1);
+  order.splice(nextIndex, 0, item);
+  return order;
 }
 
 async function toggleTokenActivation(
@@ -2494,6 +2845,75 @@ function handleTokenCardDragEnd() {
   }
 }
 
+function findPlanOrderItem(target) {
+  if (!(target instanceof Element)) {
+    return null;
+  }
+  const item = target.closest("[data-plan-order-item]");
+  return item instanceof HTMLElement ? item : null;
+}
+
+function handlePlanOrderDragStart(event) {
+  if (!state.tokenPlanOrderEnabled || state.tokenPlanOrderSaving) {
+    event.preventDefault();
+    return;
+  }
+  const item = findPlanOrderItem(event.target);
+  const planType = normalizePlanType(item?.dataset.planOrderItem);
+  if (!item || !PLAN_TYPE_OPTIONS.includes(planType)) {
+    event.preventDefault();
+    return;
+  }
+  state.tokenPlanOrderDragType = planType;
+  item.classList.add("is-dragging");
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", planType);
+  }
+}
+
+function handlePlanOrderDragOver(event) {
+  if (!state.tokenPlanOrderDragType || !state.tokenPlanOrderEnabled || state.tokenPlanOrderSaving) {
+    return;
+  }
+  event.preventDefault();
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = "move";
+  }
+}
+
+async function handlePlanOrderDrop(event) {
+  if (!state.tokenPlanOrderDragType || !state.tokenPlanOrderEnabled || state.tokenPlanOrderSaving) {
+    return;
+  }
+  event.preventDefault();
+  const draggedType = state.tokenPlanOrderDragType;
+  const targetItem = findPlanOrderItem(event.target);
+  const targetType = normalizePlanType(targetItem?.dataset.planOrderItem);
+  if (targetType === draggedType) {
+    state.tokenPlanOrderDragType = "";
+    renderTokenPlanOrderList();
+    return;
+  }
+  const nextOrder = normalizeTokenPlanOrder(state.tokenPlanOrder).filter((planType) => planType !== draggedType);
+  const targetIndex = nextOrder.indexOf(targetType);
+  if (targetIndex >= 0) {
+    nextOrder.splice(targetIndex, 0, draggedType);
+  } else {
+    nextOrder.push(draggedType);
+  }
+  state.tokenPlanOrderDragType = "";
+  renderTokenPlanOrderList();
+  try {
+    await saveTokenPlanOrder({ enabled: true, planOrder: nextOrder });
+  } catch {}
+}
+
+function handlePlanOrderDragEnd() {
+  state.tokenPlanOrderDragType = "";
+  renderTokenPlanOrderList();
+}
+
 async function loadRequests() {
   try {
     const data = await fetchJson("/admin/requests?limit=80", {
@@ -2741,6 +3161,7 @@ function syncSystemTheme() {
 applyTheme(state.themePreference, { persist: false });
 renderImportQueuePosition(state.importQueuePosition);
 renderTokenSelection({ strategy: state.tokenSelectionStrategy });
+renderTokenPlanOrderList();
 renderInitialLoadingStates();
 if (state.importJobId) {
   setImportButtonBusy(true, "后台导入中…");
@@ -2763,6 +3184,39 @@ elements.tokenSelectionButtons.forEach((button) => {
   });
 });
 
+elements.tokenPlanOrderButtons.forEach((button) => {
+  button.addEventListener("click", async () => {
+    try {
+      await saveTokenPlanOrder({
+        enabled: button.dataset.planOrderEnabled === "true",
+        planOrder: state.tokenPlanOrder,
+      });
+    } catch {}
+  });
+});
+
+if (elements.tokenPlanOrderList) {
+  elements.tokenPlanOrderList.addEventListener("click", async (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const moveButton = event.target.closest("[data-plan-order-move]");
+    if (!(moveButton instanceof HTMLElement)) {
+      return;
+    }
+    const nextOrder = movePlanOrderItem(moveButton.dataset.planType, moveButton.dataset.planOrderMove);
+    try {
+      await saveTokenPlanOrder({ enabled: true, planOrder: nextOrder });
+    } catch {}
+  });
+  elements.tokenPlanOrderList.addEventListener("dragstart", handlePlanOrderDragStart);
+  elements.tokenPlanOrderList.addEventListener("dragover", handlePlanOrderDragOver);
+  elements.tokenPlanOrderList.addEventListener("drop", (event) => {
+    void handlePlanOrderDrop(event);
+  });
+  elements.tokenPlanOrderList.addEventListener("dragend", handlePlanOrderDragEnd);
+}
+
 if (elements.tokenSearchInput) {
   elements.tokenSearchInput.addEventListener("input", (event) => {
     if (!(event.target instanceof HTMLInputElement)) {
@@ -2775,6 +3229,12 @@ if (elements.tokenSearchInput) {
 
 elements.tokenList.addEventListener("click", async (event) => {
   if (!(event.target instanceof Element)) {
+    return;
+  }
+  const availablePlanFilter = event.target.closest("[data-available-plan-filter]");
+  if (availablePlanFilter instanceof HTMLElement) {
+    state.availablePlanFilter = normalizeAvailablePlanFilter(availablePlanFilter.dataset.availablePlanFilter);
+    renderTokenList(state.tokenItems);
     return;
   }
   const probeButton = event.target.closest("[data-token-probe]");

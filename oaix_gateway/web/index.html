@@ -257,6 +257,34 @@
                 </button>
               </div>
             </div>
+
+            <div class="plan-order-panel" aria-label="账号计划请求顺序">
+              <div class="selection-switch plan-order-switch">
+                <div class="selection-switch__head">
+                  <span class="selection-switch__label">计划顺序</span>
+                  <span class="selection-switch__summary" id="token-plan-order-summary" aria-live="polite">正在同步顺序</span>
+                </div>
+                <div class="selection-switch__rail" role="group" aria-label="切换计划优先级">
+                  <button
+                    class="selection-switch__button"
+                    data-plan-order-enabled="false"
+                    type="button"
+                    aria-pressed="true"
+                  >
+                    默认
+                  </button>
+                  <button
+                    class="selection-switch__button"
+                    data-plan-order-enabled="true"
+                    type="button"
+                    aria-pressed="false"
+                  >
+                    自定义
+                  </button>
+                </div>
+              </div>
+              <div class="plan-order-list" id="token-plan-order-list" role="list" aria-label="拖拽调整计划请求顺序"></div>
+            </div>
           </div>
 
           <div class="token-panel__body">

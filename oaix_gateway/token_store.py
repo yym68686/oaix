@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, TypeAlias
 
 from sqlalchemy import and_, case, delete, func, nullsfirst, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -36,6 +36,16 @@ TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED = "least_recently_used"
 TOKEN_SELECTION_STRATEGY_FILL_FIRST = "fill_first"
 DEFAULT_TOKEN_SELECTION_STRATEGY = TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED
 TOKEN_SELECTION_SETTING_KEY = "token_selection"
+TOKEN_PLAN_TYPE_FREE = "free"
+TOKEN_PLAN_TYPE_PLUS = "plus"
+TOKEN_PLAN_TYPE_TEAM = "team"
+TOKEN_PLAN_TYPE_PRO = "pro"
+DEFAULT_TOKEN_PLAN_ORDER = (
+    TOKEN_PLAN_TYPE_FREE,
+    TOKEN_PLAN_TYPE_PLUS,
+    TOKEN_PLAN_TYPE_TEAM,
+    TOKEN_PLAN_TYPE_PRO,
+)
 TOKEN_IMPORT_QUEUE_POSITION_FRONT = "front"
 TOKEN_IMPORT_QUEUE_POSITION_BACK = "back"
 DEFAULT_TOKEN_IMPORT_QUEUE_POSITION = TOKEN_IMPORT_QUEUE_POSITION_FRONT
@@ -105,6 +115,8 @@ class TokenFileImportSummary:
 class TokenSelectionSettings:
     strategy: str
     token_order: tuple[int, ...] = ()
+    plan_order_enabled: bool = False
+    plan_order: tuple[str, ...] = DEFAULT_TOKEN_PLAN_ORDER
     updated_at: datetime | None = None
 
 
@@ -121,9 +133,10 @@ class _FillFirstTokenCacheEntry:
     tokens: tuple[CodexToken, ...]
 
 
-_FILL_FIRST_TOKEN_CACHE: dict[tuple[tuple[int, ...], str | None], _FillFirstTokenCacheEntry] = {}
-_FILL_FIRST_TOKEN_REFRESH_TASKS: dict[tuple[tuple[int, ...], str | None], asyncio.Task[tuple[CodexToken, ...]]] = {}
-_FILL_FIRST_TOKEN_REFRESH_GENERATIONS: dict[tuple[tuple[int, ...], str | None], int] = {}
+_FillFirstCacheKey: TypeAlias = tuple[tuple[int, ...], bool, tuple[str, ...], str | None]
+_FILL_FIRST_TOKEN_CACHE: dict[_FillFirstCacheKey, _FillFirstTokenCacheEntry] = {}
+_FILL_FIRST_TOKEN_REFRESH_TASKS: dict[_FillFirstCacheKey, asyncio.Task[tuple[CodexToken, ...]]] = {}
+_FILL_FIRST_TOKEN_REFRESH_GENERATIONS: dict[_FillFirstCacheKey, int] = {}
 _FILL_FIRST_TOKEN_CACHE_GENERATION = 0
 
 
@@ -772,6 +785,39 @@ def normalize_token_selection_order(value: Any) -> tuple[int, ...]:
     return tuple(token_order)
 
 
+def normalize_token_plan_order_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled", "custom"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled", "default"}:
+            return False
+    return bool(value)
+
+
+def normalize_token_plan_order(value: Any) -> tuple[str, ...]:
+    plan_order: list[str] = []
+    seen: set[str] = set()
+    source = value if isinstance(value, (list, tuple)) else ()
+    allowed = set(DEFAULT_TOKEN_PLAN_ORDER)
+
+    for item in source:
+        normalized = _normalize_plan_type(item)
+        if normalized not in allowed or normalized in seen:
+            continue
+        seen.add(normalized)
+        plan_order.append(normalized)
+
+    for plan_type in DEFAULT_TOKEN_PLAN_ORDER:
+        if plan_type in seen:
+            continue
+        plan_order.append(plan_type)
+
+    return tuple(plan_order)
+
+
 def parse_token_import_queue_position(value: Any) -> str:
     normalized = str(value or "").strip().lower().replace("-", "_")
     if normalized in {"front", "head", "start", "first", "prepend"}:
@@ -846,18 +892,29 @@ def _token_selection_order_clauses(
     strategy: str | None,
     *,
     token_order: Iterable[int] | None = None,
+    plan_order_enabled: bool = False,
+    plan_order: Iterable[str] | None = None,
 ) -> tuple[Any, ...]:
     resolved = normalize_token_selection_strategy(strategy)
+    plan_clauses: tuple[Any, ...] = ()
+    if plan_order_enabled:
+        resolved_plan_order = normalize_token_plan_order(list(plan_order or ()))
+        plan_order_map = {plan_type: index for index, plan_type in enumerate(resolved_plan_order)}
+        plan_value = func.replace(func.lower(func.coalesce(CodexToken.plan_type, "")), "chatgpt_", "")
+        plan_clauses = (case(plan_order_map, value=plan_value, else_=len(plan_order_map)),)
+
     if resolved == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
         ordered_token_ids = normalize_token_selection_order(list(token_order or ()))
         if ordered_token_ids:
             order_map = {token_id: index for index, token_id in enumerate(ordered_token_ids)}
             return (
+                *plan_clauses,
                 case(order_map, value=CodexToken.id, else_=len(order_map)),
                 CodexToken.id.asc(),
             )
-        return (CodexToken.id.asc(),)
+        return (*plan_clauses, CodexToken.id.asc())
     return (
+        *plan_clauses,
         nullsfirst(CodexToken.last_used_at.asc()),
         CodexToken.updated_at.asc(),
         CodexToken.id.asc(),
@@ -871,9 +928,16 @@ def _build_token_selection_settings(setting: GatewaySetting | None) -> TokenSele
     if isinstance(value, dict):
         strategy = value.get("strategy")
         token_order = normalize_token_selection_order(value.get("token_order"))
+        plan_order_enabled = normalize_token_plan_order_enabled(value.get("plan_order_enabled"))
+        plan_order = normalize_token_plan_order(value.get("plan_order"))
+    else:
+        plan_order_enabled = False
+        plan_order = DEFAULT_TOKEN_PLAN_ORDER
     return TokenSelectionSettings(
         strategy=normalize_token_selection_strategy(strategy),
         token_order=token_order,
+        plan_order_enabled=plan_order_enabled,
+        plan_order=plan_order,
         updated_at=setting.updated_at if setting is not None else None,
     )
 
@@ -1098,7 +1162,12 @@ async def update_token_selection_settings(*, strategy: str) -> TokenSelectionSet
             if setting is None:
                 setting = GatewaySetting(
                     key=TOKEN_SELECTION_SETTING_KEY,
-                    value={"strategy": resolved_strategy, "token_order": []},
+                    value={
+                        "strategy": resolved_strategy,
+                        "token_order": [],
+                        "plan_order_enabled": False,
+                        "plan_order": list(DEFAULT_TOKEN_PLAN_ORDER),
+                    },
                     updated_at=utcnow(),
                 )
                 session.add(setting)
@@ -1106,6 +1175,8 @@ async def update_token_selection_settings(*, strategy: str) -> TokenSelectionSet
                 payload = dict(setting.value) if isinstance(setting.value, dict) else {}
                 payload["strategy"] = resolved_strategy
                 payload["token_order"] = list(normalize_token_selection_order(payload.get("token_order")))
+                payload["plan_order_enabled"] = normalize_token_plan_order_enabled(payload.get("plan_order_enabled"))
+                payload["plan_order"] = list(normalize_token_plan_order(payload.get("plan_order")))
                 setting.value = payload
                 setting.updated_at = utcnow()
             await session.flush()
@@ -1124,6 +1195,8 @@ async def update_token_order_settings(*, token_ids: Iterable[int]) -> TokenSelec
                     value={
                         "strategy": DEFAULT_TOKEN_SELECTION_STRATEGY,
                         "token_order": list(resolved_token_order),
+                        "plan_order_enabled": False,
+                        "plan_order": list(DEFAULT_TOKEN_PLAN_ORDER),
                     },
                     updated_at=utcnow(),
                 )
@@ -1132,6 +1205,43 @@ async def update_token_order_settings(*, token_ids: Iterable[int]) -> TokenSelec
                 payload = dict(setting.value) if isinstance(setting.value, dict) else {}
                 payload["strategy"] = normalize_token_selection_strategy(payload.get("strategy"))
                 payload["token_order"] = list(resolved_token_order)
+                payload["plan_order_enabled"] = normalize_token_plan_order_enabled(payload.get("plan_order_enabled"))
+                payload["plan_order"] = list(normalize_token_plan_order(payload.get("plan_order")))
+                setting.value = payload
+                setting.updated_at = utcnow()
+            await session.flush()
+            invalidate_fill_first_token_cache()
+            return _build_token_selection_settings(setting)
+
+
+async def update_token_plan_order_settings(
+    *,
+    enabled: bool,
+    plan_order: Iterable[str],
+) -> TokenSelectionSettings:
+    resolved_plan_order_enabled = bool(enabled)
+    resolved_plan_order = normalize_token_plan_order(list(plan_order))
+    async with get_session() as session:
+        async with session.begin():
+            setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY, with_for_update=True)
+            if setting is None:
+                setting = GatewaySetting(
+                    key=TOKEN_SELECTION_SETTING_KEY,
+                    value={
+                        "strategy": DEFAULT_TOKEN_SELECTION_STRATEGY,
+                        "token_order": [],
+                        "plan_order_enabled": resolved_plan_order_enabled,
+                        "plan_order": list(resolved_plan_order),
+                    },
+                    updated_at=utcnow(),
+                )
+                session.add(setting)
+            else:
+                payload = dict(setting.value) if isinstance(setting.value, dict) else {}
+                payload["strategy"] = normalize_token_selection_strategy(payload.get("strategy"))
+                payload["token_order"] = list(normalize_token_selection_order(payload.get("token_order")))
+                payload["plan_order_enabled"] = resolved_plan_order_enabled
+                payload["plan_order"] = list(resolved_plan_order)
                 setting.value = payload
                 setting.updated_at = utcnow()
             await session.flush()
@@ -1168,6 +1278,8 @@ async def apply_imported_token_queue_position(
                     value={
                         "strategy": DEFAULT_TOKEN_SELECTION_STRATEGY,
                         "token_order": list(next_order),
+                        "plan_order_enabled": False,
+                        "plan_order": list(DEFAULT_TOKEN_PLAN_ORDER),
                     },
                     updated_at=utcnow(),
                 )
@@ -1175,6 +1287,10 @@ async def apply_imported_token_queue_position(
             else:
                 existing_payload["strategy"] = normalize_token_selection_strategy(existing_payload.get("strategy"))
                 existing_payload["token_order"] = list(next_order)
+                existing_payload["plan_order_enabled"] = normalize_token_plan_order_enabled(
+                    existing_payload.get("plan_order_enabled")
+                )
+                existing_payload["plan_order"] = list(normalize_token_plan_order(existing_payload.get("plan_order")))
                 setting.value = existing_payload
                 setting.updated_at = utcnow()
             await session.flush()
@@ -1192,13 +1308,22 @@ async def repair_duplicate_token_histories() -> TokenHistoryRepairSummary:
 async def _load_fill_first_available_tokens(
     *,
     token_order: tuple[int, ...],
+    plan_order_enabled: bool,
+    plan_order: tuple[str, ...],
     scoped_cooldown_scope: str | None,
 ) -> tuple[CodexToken, ...]:
     now = utcnow()
     stmt = (
         select(CodexToken)
         .where(*_available_token_filters(now, scoped_cooldown_scope=scoped_cooldown_scope))
-        .order_by(*_token_selection_order_clauses(TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=token_order))
+        .order_by(
+            *_token_selection_order_clauses(
+                TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+                token_order=token_order,
+                plan_order_enabled=plan_order_enabled,
+                plan_order=plan_order,
+            )
+        )
     )
     async with get_read_session() as session:
         result = await session.execute(stmt)
@@ -1211,14 +1336,18 @@ async def _load_fill_first_available_tokens(
 
 
 async def _refresh_fill_first_token_cache(
-    cache_key: tuple[tuple[int, ...], str | None],
+    cache_key: _FillFirstCacheKey,
     *,
     token_order: tuple[int, ...],
+    plan_order_enabled: bool,
+    plan_order: tuple[str, ...],
     scoped_cooldown_scope: str | None,
     generation: int,
 ) -> tuple[CodexToken, ...]:
     tokens = await _load_fill_first_available_tokens(
         token_order=token_order,
+        plan_order_enabled=plan_order_enabled,
+        plan_order=plan_order,
         scoped_cooldown_scope=scoped_cooldown_scope,
     )
     if generation == _FILL_FIRST_TOKEN_CACHE_GENERATION:
@@ -1232,9 +1361,11 @@ async def _refresh_fill_first_token_cache(
 
 
 def _start_fill_first_token_cache_refresh(
-    cache_key: tuple[tuple[int, ...], str | None],
+    cache_key: _FillFirstCacheKey,
     *,
     token_order: tuple[int, ...],
+    plan_order_enabled: bool,
+    plan_order: tuple[str, ...],
     scoped_cooldown_scope: str | None,
 ) -> asyncio.Task[tuple[CodexToken, ...]]:
     loop = asyncio.get_running_loop()
@@ -1252,6 +1383,8 @@ def _start_fill_first_token_cache_refresh(
         _refresh_fill_first_token_cache(
             cache_key,
             token_order=token_order,
+            plan_order_enabled=plan_order_enabled,
+            plan_order=plan_order,
             scoped_cooldown_scope=scoped_cooldown_scope,
             generation=generation,
         ),
@@ -1276,14 +1409,18 @@ def _start_fill_first_token_cache_refresh(
 
 
 async def _await_fill_first_token_cache_refresh(
-    cache_key: tuple[tuple[int, ...], str | None],
+    cache_key: _FillFirstCacheKey,
     *,
     token_order: tuple[int, ...],
+    plan_order_enabled: bool,
+    plan_order: tuple[str, ...],
     scoped_cooldown_scope: str | None,
 ) -> tuple[CodexToken, ...]:
     task = _start_fill_first_token_cache_refresh(
         cache_key,
         token_order=token_order,
+        plan_order_enabled=plan_order_enabled,
+        plan_order=plan_order,
         scoped_cooldown_scope=scoped_cooldown_scope,
     )
     try:
@@ -1311,13 +1448,35 @@ def _select_fill_first_token_from_cached_entry(
     return None
 
 
+def _fill_first_token_cache_key(
+    *,
+    token_order: tuple[int, ...],
+    plan_order_enabled: bool,
+    plan_order: tuple[str, ...],
+    scoped_cooldown_scope: str | None,
+) -> _FillFirstCacheKey:
+    return (
+        token_order,
+        bool(plan_order_enabled),
+        normalize_token_plan_order(plan_order) if plan_order_enabled else (),
+        scoped_cooldown_scope,
+    )
+
+
 async def _claim_fill_first_token_from_cache(
     *,
     exclude_token_ids: tuple[int, ...],
     token_order: tuple[int, ...],
+    plan_order_enabled: bool,
+    plan_order: tuple[str, ...],
     scoped_cooldown_scope: str | None,
 ) -> CodexToken | None:
-    cache_key = (token_order, scoped_cooldown_scope)
+    cache_key = _fill_first_token_cache_key(
+        token_order=token_order,
+        plan_order_enabled=plan_order_enabled,
+        plan_order=plan_order,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+    )
     now = time.monotonic()
     cached = _FILL_FIRST_TOKEN_CACHE.get(cache_key)
     if cached is not None and cached.expires_at > now:
@@ -1331,6 +1490,8 @@ async def _claim_fill_first_token_from_cache(
         _start_fill_first_token_cache_refresh(
             cache_key,
             token_order=token_order,
+            plan_order_enabled=plan_order_enabled,
+            plan_order=plan_order,
             scoped_cooldown_scope=scoped_cooldown_scope,
         )
         return _select_fill_first_token_from_cached_entry(
@@ -1342,6 +1503,8 @@ async def _claim_fill_first_token_from_cache(
     tokens = await _await_fill_first_token_cache_refresh(
         cache_key,
         token_order=token_order,
+        plan_order_enabled=plan_order_enabled,
+        plan_order=plan_order,
         scoped_cooldown_scope=scoped_cooldown_scope,
     )
     cached = _FILL_FIRST_TOKEN_CACHE.get(cache_key) or _FillFirstTokenCacheEntry(
@@ -1364,9 +1527,18 @@ async def prewarm_fill_first_token_cache(
     if selection_settings.strategy != TOKEN_SELECTION_STRATEGY_FILL_FIRST:
         return
     resolved_token_order = tuple(selection_settings.token_order)
+    resolved_plan_order_enabled = bool(selection_settings.plan_order_enabled)
+    resolved_plan_order = normalize_token_plan_order(selection_settings.plan_order)
     await _await_fill_first_token_cache_refresh(
-        (resolved_token_order, scoped_cooldown_scope),
+        _fill_first_token_cache_key(
+            token_order=resolved_token_order,
+            plan_order_enabled=resolved_plan_order_enabled,
+            plan_order=resolved_plan_order,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+        ),
         token_order=resolved_token_order,
+        plan_order_enabled=resolved_plan_order_enabled,
+        plan_order=resolved_plan_order,
         scoped_cooldown_scope=scoped_cooldown_scope,
     )
 
@@ -1376,11 +1548,15 @@ async def claim_next_active_token(
     selection_strategy: str | None = None,
     exclude_token_ids: Iterable[int] | None = None,
     token_order: Iterable[int] | None = None,
+    plan_order_enabled: bool | None = None,
+    plan_order: Iterable[str] | None = None,
     scoped_cooldown_scope: str | None = None,
 ) -> CodexToken | None:
     now = utcnow()
     excluded_ids = tuple(sorted({int(token_id) for token_id in (exclude_token_ids or ())}))
     resolved_strategy = normalize_token_selection_strategy(selection_strategy)
+    resolved_plan_order_enabled = normalize_token_plan_order_enabled(plan_order_enabled)
+    resolved_plan_order = normalize_token_plan_order(list(plan_order or ()))
     if resolved_strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
         resolved_token_order = tuple(token_order) if token_order is not None else None
         if resolved_token_order is None:
@@ -1388,10 +1564,17 @@ async def claim_next_active_token(
                 setting_result = await session.execute(
                     select(GatewaySetting).where(GatewaySetting.key == TOKEN_SELECTION_SETTING_KEY).limit(1)
                 )
-                resolved_token_order = _build_token_selection_settings(setting_result.scalars().first()).token_order
+                settings = _build_token_selection_settings(setting_result.scalars().first())
+                resolved_token_order = settings.token_order
+                if plan_order_enabled is None:
+                    resolved_plan_order_enabled = settings.plan_order_enabled
+                if plan_order is None:
+                    resolved_plan_order = settings.plan_order
         return await _claim_fill_first_token_from_cache(
             exclude_token_ids=excluded_ids,
             token_order=resolved_token_order,
+            plan_order_enabled=resolved_plan_order_enabled,
+            plan_order=resolved_plan_order,
             scoped_cooldown_scope=scoped_cooldown_scope,
         )
 
@@ -1400,7 +1583,13 @@ async def claim_next_active_token(
             stmt = (
                 select(CodexToken)
                 .where(*_available_token_filters(now, scoped_cooldown_scope=scoped_cooldown_scope))
-                .order_by(*_token_selection_order_clauses(resolved_strategy))
+                .order_by(
+                    *_token_selection_order_clauses(
+                        resolved_strategy,
+                        plan_order_enabled=resolved_plan_order_enabled,
+                        plan_order=resolved_plan_order,
+                    )
+                )
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )

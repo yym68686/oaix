@@ -73,6 +73,7 @@ from .token_store import (
     stop_token_status_write_queue,
     parse_token_import_queue_position,
     update_token_order_settings,
+    update_token_plan_order_settings,
     update_token_selection_settings,
 )
 from .usage_cost import UsageMetrics, extract_usage_metrics
@@ -494,6 +495,10 @@ async def _claim_next_active_token_for_request(
         }
         if fill_first:
             kwargs["token_order"] = selection_settings.token_order
+        if "plan_order_enabled" in claim_signature.parameters:
+            kwargs["plan_order_enabled"] = selection_settings.plan_order_enabled
+        if "plan_order" in claim_signature.parameters:
+            kwargs["plan_order"] = selection_settings.plan_order
         if scoped_cooldown_scope is not None and "scoped_cooldown_scope" in claim_signature.parameters:
             kwargs["scoped_cooldown_scope"] = scoped_cooldown_scope
 
@@ -910,6 +915,11 @@ class TokenSelectionUpdateRequest(BaseModel):
 
 class TokenSelectionOrderUpdateRequest(BaseModel):
     token_ids: list[int]
+
+
+class TokenSelectionPlanOrderUpdateRequest(BaseModel):
+    enabled: bool
+    plan_order: list[str] = []
 
 
 class TokenActivationUpdateRequest(BaseModel):
@@ -5900,6 +5910,8 @@ def _serialize_token_selection_settings(settings: TokenSelectionSettings) -> dic
         "label": _selection_strategy_label(settings.strategy),
         "description": _selection_strategy_description(settings.strategy),
         "token_order": list(settings.token_order),
+        "plan_order_enabled": settings.plan_order_enabled,
+        "plan_order": list(settings.plan_order),
         "updated_at": settings.updated_at,
         "options": [
             {
@@ -6188,6 +6200,18 @@ def create_app() -> FastAPI:
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         selection = await update_token_order_settings(token_ids=payload.token_ids)
+        app.state.token_selection_settings = selection
+        return _serialize_token_selection_settings(selection)
+
+    @app.post("/admin/token-selection/plan-order")
+    async def update_token_selection_plan_order_route(
+        payload: TokenSelectionPlanOrderUpdateRequest,
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        selection = await update_token_plan_order_settings(
+            enabled=payload.enabled,
+            plan_order=payload.plan_order,
+        )
         app.state.token_selection_settings = selection
         return _serialize_token_selection_settings(selection)
 

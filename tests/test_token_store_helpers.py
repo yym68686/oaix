@@ -213,7 +213,8 @@ def test_claim_next_active_token_fill_first_singleflights_cache_miss(monkeypatch
     )
     load_count = 0
 
-    async def fake_load(*, token_order, scoped_cooldown_scope):
+    async def fake_load(*, token_order, plan_order_enabled=False, plan_order=(), scoped_cooldown_scope):
+        del plan_order_enabled, plan_order
         nonlocal load_count
         load_count += 1
         await asyncio.sleep(0.01)
@@ -243,7 +244,7 @@ def test_claim_next_active_token_fill_first_serves_stale_while_refreshing(monkey
     invalidate_fill_first_token_cache()
     old_token = CodexToken(id=12, refresh_token="rt_12", token_type="codex", is_active=True)
     new_token = CodexToken(id=13, refresh_token="rt_13", token_type="codex", is_active=True)
-    cache_key = ((12, 13), None)
+    cache_key = ((12, 13), False, (), None)
     now = time.monotonic()
     _FILL_FIRST_TOKEN_CACHE[cache_key] = _FillFirstTokenCacheEntry(
         expires_at=now - 1,
@@ -253,7 +254,8 @@ def test_claim_next_active_token_fill_first_serves_stale_while_refreshing(monkey
     refresh_released = asyncio.Event()
     load_count = 0
 
-    async def fake_load(*, token_order, scoped_cooldown_scope):
+    async def fake_load(*, token_order, plan_order_enabled=False, plan_order=(), scoped_cooldown_scope):
+        del token_order, plan_order_enabled, plan_order, scoped_cooldown_scope
         nonlocal load_count
         load_count += 1
         await refresh_released.wait()
@@ -288,7 +290,7 @@ def test_claim_next_active_token_fill_first_serves_expired_stale_cache_without_w
     invalidate_fill_first_token_cache()
     old_token = CodexToken(id=16, refresh_token="rt_16", token_type="codex", is_active=True)
     new_token = CodexToken(id=17, refresh_token="rt_17", token_type="codex", is_active=True)
-    cache_key = ((16, 17), None)
+    cache_key = ((16, 17), False, (), None)
     now = time.monotonic()
     _FILL_FIRST_TOKEN_CACHE[cache_key] = _FillFirstTokenCacheEntry(
         expires_at=now - 10,
@@ -298,7 +300,8 @@ def test_claim_next_active_token_fill_first_serves_expired_stale_cache_without_w
     refresh_released = asyncio.Event()
     load_count = 0
 
-    async def fake_load(*, token_order, scoped_cooldown_scope):
+    async def fake_load(*, token_order, plan_order_enabled=False, plan_order=(), scoped_cooldown_scope):
+        del token_order, plan_order_enabled, plan_order, scoped_cooldown_scope
         nonlocal load_count
         load_count += 1
         await refresh_released.wait()
@@ -335,10 +338,10 @@ def test_claim_next_active_token_fill_first_serves_expired_stale_cache_without_w
 def test_prewarm_fill_first_token_cache_loads_current_order(monkeypatch) -> None:
     invalidate_fill_first_token_cache()
     token = CodexToken(id=18, refresh_token="rt_18", token_type="codex", is_active=True)
-    load_calls: list[tuple[tuple[int, ...], str | None]] = []
+    load_calls: list[tuple[tuple[int, ...], bool, tuple[str, ...], str | None]] = []
 
-    async def fake_load(*, token_order, scoped_cooldown_scope):
-        load_calls.append((tuple(token_order), scoped_cooldown_scope))
+    async def fake_load(*, token_order, plan_order_enabled=False, plan_order=(), scoped_cooldown_scope):
+        load_calls.append((tuple(token_order), bool(plan_order_enabled), tuple(plan_order), scoped_cooldown_scope))
         return (token,)
 
     monkeypatch.setattr("oaix_gateway.token_store._load_fill_first_available_tokens", fake_load)
@@ -349,8 +352,8 @@ def test_prewarm_fill_first_token_cache_loads_current_order(monkeypatch) -> None
         )
     )
 
-    assert load_calls == [((18,), None)]
-    assert _FILL_FIRST_TOKEN_CACHE[((18,), None)].tokens == (token,)
+    assert load_calls == [((18,), False, ("free", "plus", "team", "pro"), None)]
+    assert _FILL_FIRST_TOKEN_CACHE[((18,), False, (), None)].tokens == (token,)
     invalidate_fill_first_token_cache()
 
 
@@ -358,7 +361,7 @@ def test_claim_next_active_token_fill_first_respects_runtime_cooldown() -> None:
     invalidate_fill_first_token_cache()
     first_token = CodexToken(id=14, refresh_token="rt_14", token_type="codex", is_active=True)
     second_token = CodexToken(id=15, refresh_token="rt_15", token_type="codex", is_active=True)
-    cache_key = ((14, 15), None)
+    cache_key = ((14, 15), False, (), None)
     _apply_token_runtime_error_state(
         14,
         message="rate limited",
