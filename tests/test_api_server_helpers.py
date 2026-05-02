@@ -5339,12 +5339,15 @@ def test_import_route_enqueues_background_job(monkeypatch) -> None:
         payloads: list[dict[str, object]],
         *,
         start_immediately: bool = False,
+        import_queue_position: str = "front",
     ) -> TokenImportJobLease:
         captured["payloads"] = payloads
         captured["start_immediately"] = start_immediately
+        captured["import_queue_position"] = import_queue_position
         return TokenImportJobLease(
             id=42,
             status=IMPORT_JOB_STATUS_RUNNING if start_immediately else IMPORT_JOB_STATUS_QUEUED,
+            import_queue_position=import_queue_position,
             total_count=len(payloads),
             processed_count=0,
             created_count=0,
@@ -5397,12 +5400,85 @@ def test_import_route_enqueues_background_job(monkeypatch) -> None:
 
     assert captured["payloads"] == [{"refresh_token": "rt-123"}]
     assert captured["start_immediately"] is False
+    assert captured["import_queue_position"] == "front"
     assert app.state.token_import_worker.start_calls == 1
     assert [job.id for job in app.state.token_import_worker.submitted_jobs] == [42]
     assert result["job"]["id"] == 42
     assert result["job"]["status"] == IMPORT_JOB_STATUS_QUEUED
     assert result["job"]["total_count"] == 1
     assert "payloads" not in result["job"]
+
+
+def test_import_route_forwards_requested_import_queue_position(monkeypatch) -> None:
+    app = create_app()
+    captured: dict[str, object] = {}
+
+    async def fake_create_token_import_job(
+        payloads: list[dict[str, object]],
+        *,
+        start_immediately: bool = False,
+        import_queue_position: str = "front",
+    ) -> TokenImportJobLease:
+        captured["payloads"] = payloads
+        captured["start_immediately"] = start_immediately
+        captured["import_queue_position"] = import_queue_position
+        return TokenImportJobLease(
+            id=43,
+            status=IMPORT_JOB_STATUS_QUEUED,
+            import_queue_position=import_queue_position,
+            total_count=len(payloads),
+            processed_count=0,
+            created_count=0,
+            updated_count=0,
+            skipped_count=0,
+            failed_count=0,
+            yielded_to_response_traffic_count=0,
+            response_traffic_timeout_count=0,
+            created=[],
+            updated=[],
+            skipped=[],
+            failed=[],
+            submitted_at=None,
+            started_at=None,
+            heartbeat_at=None,
+            finished_at=None,
+            last_error=None,
+            payloads=list(payloads),
+        )
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": b'{"tokens":[{"refresh_token":"rt-456"}],"import_queue_position":"back"}',
+            "more_body": False,
+        }
+
+    monkeypatch.setattr("oaix_gateway.api_server.create_token_import_job", fake_create_token_import_job)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/admin/tokens/import",
+            "headers": [(b"content-type", b"application/json")],
+            "app": app,
+        },
+        receive=receive,
+    )
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/admin/tokens/import" and "POST" in getattr(route, "methods", set())
+    )
+
+    result = asyncio.run(route.endpoint(request, None))
+
+    assert captured == {
+        "payloads": [{"refresh_token": "rt-456"}],
+        "start_immediately": False,
+        "import_queue_position": "back",
+    }
+    assert result["job"]["import_queue_position"] == "back"
 
 
 def test_get_import_job_route_restarts_background_worker(monkeypatch) -> None:
@@ -5421,6 +5497,7 @@ def test_get_import_job_route_restarts_background_worker(monkeypatch) -> None:
         return TokenImportJobState(
             id=job_id,
             status=IMPORT_JOB_STATUS_RUNNING,
+            import_queue_position="front",
             total_count=3,
             processed_count=1,
             created_count=1,
@@ -5526,6 +5603,7 @@ def test_token_import_background_worker_recovers_after_claim_error(monkeypatch) 
     job = TokenImportJobLease(
         id=93,
         status=IMPORT_JOB_STATUS_RUNNING,
+        import_queue_position="front",
         total_count=1,
         processed_count=0,
         created_count=0,
@@ -5584,6 +5662,81 @@ def test_token_import_background_worker_recovers_after_claim_error(monkeypatch) 
 
     assert claim_attempts["count"] >= 2
     assert processed_job_ids == [93]
+
+
+def test_token_import_background_worker_applies_completed_import_queue_position(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    published: list[TokenSelectionSettings] = []
+
+    class FakeResponseTraffic:
+        active_responses = 0
+
+        async def wait_for_import_turn(self, *, timeout_seconds=None) -> bool:
+            return False
+
+    async def fake_apply_imported_token_queue_position(token_ids, *, position: str) -> TokenSelectionSettings:
+        calls.append({"token_ids": tuple(token_ids), "position": position})
+        return TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=(17, 23))
+
+    monkeypatch.setattr(
+        "oaix_gateway.token_import_jobs.apply_imported_token_queue_position",
+        fake_apply_imported_token_queue_position,
+    )
+
+    worker = TokenImportBackgroundWorker(
+        response_traffic=FakeResponseTraffic(),
+        on_token_selection_settings_updated=lambda selection: published.append(selection),
+    )
+    job = TokenImportJobLease(
+        id=94,
+        status=IMPORT_JOB_STATUS_RUNNING,
+        import_queue_position="back",
+        total_count=3,
+        processed_count=0,
+        created_count=0,
+        updated_count=0,
+        skipped_count=0,
+        failed_count=0,
+        yielded_to_response_traffic_count=0,
+        response_traffic_timeout_count=0,
+        created=[],
+        updated=[],
+        skipped=[],
+        failed=[],
+        submitted_at=None,
+        started_at=None,
+        heartbeat_at=None,
+        finished_at=None,
+        last_error=None,
+        payloads=[],
+    )
+    result = TokenImportJobState(
+        id=94,
+        status=IMPORT_JOB_STATUS_COMPLETED,
+        import_queue_position="back",
+        total_count=3,
+        processed_count=3,
+        created_count=2,
+        updated_count=1,
+        skipped_count=0,
+        failed_count=0,
+        yielded_to_response_traffic_count=0,
+        response_traffic_timeout_count=0,
+        created=[{"id": 23, "index": 2}, {"id": 17, "index": 0}],
+        updated=[{"id": 23, "index": 1}],
+        skipped=[],
+        failed=[],
+        submitted_at=None,
+        started_at=None,
+        heartbeat_at=None,
+        finished_at=None,
+        last_error=None,
+    )
+
+    asyncio.run(worker._apply_imported_token_queue_position(job, result))
+
+    assert calls == [{"token_ids": (17, 23), "position": "back"}]
+    assert published == [TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=(17, 23))]
 
 
 def test_process_token_import_job_runs_payloads_in_parallel_without_response_traffic_wait(monkeypatch) -> None:
@@ -5668,6 +5821,7 @@ def test_process_token_import_job_runs_payloads_in_parallel_without_response_tra
         return TokenImportJobState(
             id=job_id,
             status=IMPORT_JOB_STATUS_COMPLETED,
+            import_queue_position="front",
             total_count=2,
             processed_count=processed_count,
             created_count=len(created),
@@ -5701,6 +5855,7 @@ def test_process_token_import_job_runs_payloads_in_parallel_without_response_tra
     job = TokenImportJobLease(
         id=7,
         status=IMPORT_JOB_STATUS_RUNNING,
+        import_queue_position="front",
         total_count=2,
         processed_count=0,
         created_count=0,
@@ -5794,6 +5949,7 @@ def test_process_token_import_job_batches_progress_updates_for_small_fast_jobs(m
         return TokenImportJobState(
             id=job_id,
             status=IMPORT_JOB_STATUS_COMPLETED,
+            import_queue_position="front",
             total_count=17,
             processed_count=processed_count,
             created_count=len(created),
@@ -5827,6 +5983,7 @@ def test_process_token_import_job_batches_progress_updates_for_small_fast_jobs(m
     job = TokenImportJobLease(
         id=8,
         status=IMPORT_JOB_STATUS_RUNNING,
+        import_queue_position="front",
         total_count=17,
         processed_count=0,
         created_count=0,

@@ -10,6 +10,8 @@ const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
 const DEFAULT_PROBE_MODEL = PROBE_MODEL_OPTIONS[0];
 const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
+const IMPORT_QUEUE_POSITION_OPTIONS = new Set(["front", "back"]);
+const DEFAULT_IMPORT_QUEUE_POSITION = "front";
 
 function readStoredImportJobId() {
   const raw = localStorage.getItem(IMPORT_JOB_STORAGE_KEY) || "";
@@ -23,6 +25,14 @@ function normalizeThemePreference(value) {
 
 function normalizeProbeModel(value) {
   return PROBE_MODEL_OPTIONS.includes(value) ? value : DEFAULT_PROBE_MODEL;
+}
+
+function normalizeImportQueuePosition(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("-", "_");
+  return IMPORT_QUEUE_POSITION_OPTIONS.has(normalized) ? normalized : DEFAULT_IMPORT_QUEUE_POSITION;
 }
 
 const initialThemePreference = normalizeThemePreference(
@@ -52,6 +62,7 @@ const state = {
   tokenSelectionOrder: [],
   tokenOrderSaving: false,
   tokenDragTokenId: null,
+  importQueuePosition: DEFAULT_IMPORT_QUEUE_POSITION,
   refreshing: false,
   probeModel: DEFAULT_PROBE_MODEL,
   themePreference: initialThemePreference,
@@ -81,6 +92,8 @@ const elements = {
   clearKeyButton: document.getElementById("clear-key-button"),
   tokenJson: document.getElementById("token-json"),
   tokenFiles: document.getElementById("token-files"),
+  importQueuePositionSummary: document.getElementById("import-queue-position-summary"),
+  importQueuePositionButtons: Array.from(document.querySelectorAll("[data-import-queue-position]")),
   importButton: document.getElementById("import-button"),
   resetImportButton: document.getElementById("reset-import-button"),
   importFeedback: document.getElementById("import-feedback"),
@@ -544,6 +557,25 @@ function describeTokenSelectionStrategy(strategy) {
     return "首个可用优先";
   }
   return "最久未用优先";
+}
+
+function describeImportQueuePosition(position) {
+  if (normalizeImportQueuePosition(position) === "back") {
+    return "放在队列最后";
+  }
+  return "放在队列开头";
+}
+
+function renderImportQueuePosition(position) {
+  const resolvedPosition = normalizeImportQueuePosition(position);
+  state.importQueuePosition = resolvedPosition;
+  elements.importQueuePositionButtons.forEach((button) => {
+    const active = button.dataset.importQueuePosition === resolvedPosition;
+    button.setAttribute("aria-pressed", String(active));
+  });
+  if (elements.importQueuePositionSummary) {
+    elements.importQueuePositionSummary.textContent = describeImportQueuePosition(resolvedPosition);
+  }
 }
 
 function setTokenSelectionDisabled(disabled) {
@@ -2640,7 +2672,10 @@ async function importTokens() {
     const data = await fetchJson("/admin/tokens/import", {
       method: "POST",
       headers: authHeaders(true),
-      body: JSON.stringify(payloads),
+      body: JSON.stringify({
+        tokens: payloads,
+        import_queue_position: state.importQueuePosition,
+      }),
     });
     const job = data?.job;
     if (!job?.id) {
@@ -2704,6 +2739,7 @@ function syncSystemTheme() {
 }
 
 applyTheme(state.themePreference, { persist: false });
+renderImportQueuePosition(state.importQueuePosition);
 renderTokenSelection({ strategy: state.tokenSelectionStrategy });
 renderInitialLoadingStates();
 if (state.importJobId) {
@@ -2713,6 +2749,10 @@ if (state.importJobId) {
 
 elements.themeButtons.forEach((button) => {
   button.addEventListener("click", () => applyTheme(button.dataset.themeOption));
+});
+
+elements.importQueuePositionButtons.forEach((button) => {
+  button.addEventListener("click", () => renderImportQueuePosition(button.dataset.importQueuePosition));
 });
 
 elements.tokenSelectionButtons.forEach((button) => {

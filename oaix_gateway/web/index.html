@@ -171,6 +171,31 @@
             <span class="upload-zone__hint">支持 JSON，或 account_id,refresh_token；单条 key 被断行时也会自动拼接</span>
           </label>
 
+          <div class="selection-switch import-placement-switch" aria-label="导入后 Key 请求队列位置">
+            <div class="selection-switch__head">
+              <span class="selection-switch__label">导入位置</span>
+              <span class="selection-switch__summary" id="import-queue-position-summary" aria-live="polite">放在队列开头</span>
+            </div>
+            <div class="selection-switch__rail" role="group" aria-label="切换导入后的 Key 位置">
+              <button
+                class="selection-switch__button"
+                data-import-queue-position="front"
+                type="button"
+                aria-pressed="true"
+              >
+                开头
+              </button>
+              <button
+                class="selection-switch__button"
+                data-import-queue-position="back"
+                type="button"
+                aria-pressed="false"
+              >
+                最后
+              </button>
+            </div>
+          </div>
+
           <div class="field-actions field-actions--primary">
             <button class="primary-button" id="import-button" type="button">开始导入</button>
             <button class="ghost-button" id="reset-import-button" type="button">清空内容</button>

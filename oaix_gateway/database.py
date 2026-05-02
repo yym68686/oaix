@@ -192,6 +192,7 @@ class TokenImportJob(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
+    import_queue_position: Mapped[str] = mapped_column(String(16), nullable=False, default="front", server_default="front")
     payloads: Mapped[list[dict] | None] = mapped_column(JSON, nullable=False)
     total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     processed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -467,6 +468,10 @@ def _run_schema_migrations(sync_conn) -> None:
 
     if "token_import_jobs" in table_names:
         job_columns = {column["name"] for column in inspector.get_columns("token_import_jobs")}
+        if "import_queue_position" not in job_columns:
+            sync_conn.execute(
+                text("ALTER TABLE token_import_jobs ADD COLUMN import_queue_position VARCHAR(16) NOT NULL DEFAULT 'front'")
+            )
         if "heartbeat_at" not in job_columns:
             sync_conn.execute(text("ALTER TABLE token_import_jobs ADD COLUMN heartbeat_at TIMESTAMPTZ"))
         if "response_traffic_timeout_count" not in job_columns:

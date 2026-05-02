@@ -108,6 +108,20 @@ def test_frontend_token_cards_support_fill_first_drag_ordering() -> None:
     assert 'renderTokenFact("当前并发", activeStreamsValue, activeStreamsTone)' in app_js
 
 
+def test_frontend_import_panel_supports_queue_position_switch() -> None:
+    index_html = (WEB_DIR / "index.html").read_text()
+    app_js = (WEB_DIR / "app.js").read_text()
+    import_function = app_js.split("async function importTokens", 1)[1].split("function resetImportForm", 1)[0]
+
+    assert 'id="import-queue-position-summary"' in index_html
+    assert 'data-import-queue-position="front"' in index_html
+    assert 'data-import-queue-position="back"' in index_html
+    assert 'const DEFAULT_IMPORT_QUEUE_POSITION = "front"' in app_js
+    assert "renderImportQueuePosition(state.importQueuePosition)" in app_js
+    assert "tokens: payloads" in import_function
+    assert "import_queue_position: state.importQueuePosition" in import_function
+
+
 def test_frontend_dashboard_refresh_does_not_overlap_heavy_admin_requests() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     refresh_function = app_js.split("async function refreshDashboard", 1)[1].split("function splitTokenInputLines", 1)[0]

@@ -36,6 +36,9 @@ TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED = "least_recently_used"
 TOKEN_SELECTION_STRATEGY_FILL_FIRST = "fill_first"
 DEFAULT_TOKEN_SELECTION_STRATEGY = TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED
 TOKEN_SELECTION_SETTING_KEY = "token_selection"
+TOKEN_IMPORT_QUEUE_POSITION_FRONT = "front"
+TOKEN_IMPORT_QUEUE_POSITION_BACK = "back"
+DEFAULT_TOKEN_IMPORT_QUEUE_POSITION = TOKEN_IMPORT_QUEUE_POSITION_FRONT
 MERGED_DUPLICATE_TOKEN_ERROR_PREFIX = "Merged into token #"
 TOKEN_IDENTITY_LOCK_NAMESPACE = "codex-token-identity"
 TOKEN_HISTORY_REPAIR_LOCK_KEY = "codex-token-history:repair"
@@ -769,6 +772,41 @@ def normalize_token_selection_order(value: Any) -> tuple[int, ...]:
     return tuple(token_order)
 
 
+def parse_token_import_queue_position(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"front", "head", "start", "first", "prepend"}:
+        return TOKEN_IMPORT_QUEUE_POSITION_FRONT
+    if normalized in {"back", "tail", "end", "last", "append"}:
+        return TOKEN_IMPORT_QUEUE_POSITION_BACK
+    raise ValueError("Unsupported import queue position; expected one of: front, back")
+
+
+def normalize_token_import_queue_position(value: Any) -> str:
+    try:
+        return parse_token_import_queue_position(value)
+    except ValueError:
+        return DEFAULT_TOKEN_IMPORT_QUEUE_POSITION
+
+
+def merge_imported_token_order(
+    current_token_ids: Iterable[int],
+    imported_token_ids: Iterable[int],
+    *,
+    position: str,
+) -> tuple[int, ...]:
+    current_order = normalize_token_selection_order(list(current_token_ids))
+    imported_order = normalize_token_selection_order(list(imported_token_ids))
+    if not imported_order:
+        return current_order
+
+    imported_set = set(imported_order)
+    remaining_order = [token_id for token_id in current_order if token_id not in imported_set]
+    resolved_position = parse_token_import_queue_position(position)
+    if resolved_position == TOKEN_IMPORT_QUEUE_POSITION_BACK:
+        return tuple([*remaining_order, *imported_order])
+    return tuple([*imported_order, *remaining_order])
+
+
 def _load_token_payload(token_data_or_json: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(token_data_or_json, dict):
         payload = token_data_or_json
@@ -1095,6 +1133,49 @@ async def update_token_order_settings(*, token_ids: Iterable[int]) -> TokenSelec
                 payload["strategy"] = normalize_token_selection_strategy(payload.get("strategy"))
                 payload["token_order"] = list(resolved_token_order)
                 setting.value = payload
+                setting.updated_at = utcnow()
+            await session.flush()
+            invalidate_fill_first_token_cache()
+            return _build_token_selection_settings(setting)
+
+
+async def apply_imported_token_queue_position(
+    token_ids: Iterable[int],
+    *,
+    position: str,
+) -> TokenSelectionSettings:
+    imported_token_ids = normalize_token_selection_order(list(token_ids))
+    resolved_position = parse_token_import_queue_position(position)
+    async with get_session() as session:
+        async with session.begin():
+            setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY, with_for_update=True)
+            existing_payload = dict(setting.value) if setting is not None and isinstance(setting.value, dict) else {}
+            existing_order = normalize_token_selection_order(existing_payload.get("token_order"))
+            current_result = await session.execute(
+                select(CodexToken.id)
+                .where(*_canonical_token_filters())
+                .order_by(*_token_selection_order_clauses(TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=existing_order))
+            )
+            current_token_ids = [int(token_id) for token_id in current_result.scalars().all()]
+            next_order = merge_imported_token_order(
+                current_token_ids,
+                imported_token_ids,
+                position=resolved_position,
+            )
+            if setting is None:
+                setting = GatewaySetting(
+                    key=TOKEN_SELECTION_SETTING_KEY,
+                    value={
+                        "strategy": DEFAULT_TOKEN_SELECTION_STRATEGY,
+                        "token_order": list(next_order),
+                    },
+                    updated_at=utcnow(),
+                )
+                session.add(setting)
+            else:
+                existing_payload["strategy"] = normalize_token_selection_strategy(existing_payload.get("strategy"))
+                existing_payload["token_order"] = list(next_order)
+                setting.value = existing_payload
                 setting.updated_at = utcnow()
             await session.flush()
             invalidate_fill_first_token_cache()

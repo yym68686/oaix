@@ -3,10 +3,14 @@ import pytest
 from oaix_gateway.token_store import (
     DEFAULT_TOKEN_SELECTION_STRATEGY,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+    TOKEN_IMPORT_QUEUE_POSITION_BACK,
+    TOKEN_IMPORT_QUEUE_POSITION_FRONT,
     TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED,
     _token_selection_order_clauses,
+    merge_imported_token_order,
     normalize_token_selection_order,
     normalize_token_selection_strategy,
+    parse_token_import_queue_position,
     parse_token_selection_strategy,
 )
 
@@ -32,6 +36,21 @@ def test_normalize_token_selection_strategy_falls_back_to_default() -> None:
 
 def test_normalize_token_selection_order_keeps_unique_positive_ids() -> None:
     assert normalize_token_selection_order([7, "3", 7, 0, -2, "bad", None, 9]) == (7, 3, 9)
+
+
+def test_parse_token_import_queue_position_accepts_front_and_back_aliases() -> None:
+    assert parse_token_import_queue_position("head") == TOKEN_IMPORT_QUEUE_POSITION_FRONT
+    assert parse_token_import_queue_position("append") == TOKEN_IMPORT_QUEUE_POSITION_BACK
+
+
+def test_parse_token_import_queue_position_rejects_unknown_values() -> None:
+    with pytest.raises(ValueError):
+        parse_token_import_queue_position("middle")
+
+
+def test_merge_imported_token_order_moves_imported_ids_to_requested_side() -> None:
+    assert merge_imported_token_order([1, 2, 3], [4, 2], position="front") == (4, 2, 1, 3)
+    assert merge_imported_token_order([1, 2, 3], [4, 2], position="back") == (1, 3, 4, 2)
 
 
 def test_fill_first_order_clauses_rank_custom_order_before_id() -> None:

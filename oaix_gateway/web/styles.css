@@ -923,6 +923,10 @@ button {
   overflow-wrap: anywhere;
 }
 
+.import-placement-switch {
+  margin-bottom: 18px;
+}
+
 .import-feedback {
   min-height: 72px;
   padding: 14px 16px;

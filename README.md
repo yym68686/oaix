@@ -152,6 +152,7 @@ account_id_3,refresh_token_3
 - 系统会为每条 key 记录保存 RT 历史链；如果后续轮转出了 `rt2`、`rt3`，再次导入这些 RT 会命中同一条记录并判为重复
 - 如果重复的是当前仍在使用的最新 RT，导入会视为“更新现有记录”
 - 如果重复的是历史旧 RT，导入会直接跳过，不会把当前最新 RT 回滚成旧值
+- 前端导入时可选择把本批新增/更新的 key 放到请求队列开头或最后，默认放到开头
 - 批量导入时，如果同时有活跃的 `/v1/responses*` 请求，导入会在每条记录前主动让路，尽量把代理请求放在前面
 
 ## 接口
@@ -159,7 +160,7 @@ account_id_3,refresh_token_3
 - `GET /healthz`: 查看可用 key 数量与状态
 - `GET /admin/tokens`: 查看 key 列表与统计
 - `GET /admin/requests`: 查看请求次数汇总与最近请求日志
-- `POST /admin/tokens/import`: 导入单个 key、key 数组，或 `{"tokens": [...]}` 批量导入
+- `POST /admin/tokens/import`: 导入单个 key、key 数组，或 `{"tokens": [...], "import_queue_position": "front|back"}` 批量导入
 - `POST /v1/responses`: 代理到上游 Codex responses
 - `POST /v1/responses/compact`: 代理到上游 Codex responses compact
 - `POST /v1/images/generations`: OpenAI 兼容图片生成，内部转到 Codex responses 的 `image_generation` tool

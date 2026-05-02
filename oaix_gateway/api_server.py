@@ -54,6 +54,7 @@ from .token_import_jobs import (
 )
 from .token_store import (
     DEFAULT_TOKEN_SELECTION_STRATEGY,
+    DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenSelectionSettings,
     claim_next_active_token,
@@ -70,6 +71,7 @@ from .token_store import (
     repair_duplicate_token_histories,
     set_token_active_state,
     stop_token_status_write_queue,
+    parse_token_import_queue_position,
     update_token_order_settings,
     update_token_selection_settings,
 )
@@ -5921,6 +5923,10 @@ def _current_token_selection_settings(app: FastAPI) -> TokenSelectionSettings:
     return TokenSelectionSettings(strategy=DEFAULT_TOKEN_SELECTION_STRATEGY)
 
 
+def _set_current_token_selection_settings(app: FastAPI, selection: TokenSelectionSettings) -> None:
+    app.state.token_selection_settings = selection
+
+
 def _serialize_admin_token_item(
     token_row,
     *,
@@ -6097,7 +6103,10 @@ async def lifespan(app: FastAPI):
         await prewarm_fill_first_token_cache(app.state.token_selection_settings)
     except Exception:
         logger.exception("Failed to prewarm fill_first token cache")
-    app.state.token_import_worker = TokenImportBackgroundWorker(response_traffic=app.state.response_traffic)
+    app.state.token_import_worker = TokenImportBackgroundWorker(
+        response_traffic=app.state.response_traffic,
+        on_token_selection_settings_updated=lambda selection: _set_current_token_selection_settings(app, selection),
+    )
     await app.state.token_import_worker.start()
     try:
         yield
@@ -6287,10 +6296,18 @@ def create_app() -> FastAPI:
 
         if isinstance(body, dict) and isinstance(body.get("tokens"), list):
             payloads = body["tokens"]
+            try:
+                import_queue_position = parse_token_import_queue_position(
+                    body.get("import_queue_position", DEFAULT_TOKEN_IMPORT_QUEUE_POSITION)
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         elif isinstance(body, list):
             payloads = body
+            import_queue_position = DEFAULT_TOKEN_IMPORT_QUEUE_POSITION
         elif isinstance(body, dict):
             payloads = [body]
+            import_queue_position = DEFAULT_TOKEN_IMPORT_QUEUE_POSITION
         else:
             raise HTTPException(
                 status_code=400,
@@ -6299,7 +6316,7 @@ def create_app() -> FastAPI:
         worker = getattr(http_request.app.state, "token_import_worker", None)
         if worker is not None:
             await worker.start()
-        job = await create_token_import_job(payloads)
+        job = await create_token_import_job(payloads, import_queue_position=import_queue_position)
         if worker is not None:
             worker.submit(job)
         return {"job": asdict(job_state_from_lease(job))}

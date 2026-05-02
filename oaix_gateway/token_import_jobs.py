@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from sqlalchemy import and_, or_, select
 
 from .database import TokenImportJob, get_read_session, get_session, utcnow
-from .token_store import upsert_token_payload
+from .token_store import (
+    DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
+    TokenSelectionSettings,
+    apply_imported_token_queue_position,
+    normalize_token_import_queue_position,
+    upsert_token_payload,
+)
 
 
 logger = logging.getLogger("oaix.import_jobs")
@@ -92,6 +99,7 @@ def _summarize_error(value: Any) -> str | None:
 class TokenImportJobState:
     id: int
     status: str
+    import_queue_position: str
     total_count: int
     processed_count: int
     created_count: int
@@ -129,6 +137,9 @@ def _serialize_job_state(job: TokenImportJob) -> TokenImportJobState:
     return TokenImportJobState(
         id=job.id,
         status=str(job.status or IMPORT_JOB_STATUS_QUEUED),
+        import_queue_position=normalize_token_import_queue_position(
+            getattr(job, "import_queue_position", DEFAULT_TOKEN_IMPORT_QUEUE_POSITION)
+        ),
         total_count=int(job.total_count or 0),
         processed_count=int(job.processed_count or 0),
         created_count=int(job.created_count or 0),
@@ -161,6 +172,7 @@ def job_state_from_lease(job: TokenImportJobLease) -> TokenImportJobState:
     return TokenImportJobState(
         id=job.id,
         status=job.status,
+        import_queue_position=job.import_queue_position,
         total_count=job.total_count,
         processed_count=job.processed_count,
         created_count=job.created_count,
@@ -181,12 +193,19 @@ def job_state_from_lease(job: TokenImportJobLease) -> TokenImportJobState:
     )
 
 
-async def create_token_import_job(payloads: list[Any], *, start_immediately: bool = False) -> TokenImportJobLease:
+async def create_token_import_job(
+    payloads: list[Any],
+    *,
+    start_immediately: bool = False,
+    import_queue_position: str = DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
+) -> TokenImportJobLease:
     normalized_payloads = list(payloads)
+    resolved_import_queue_position = normalize_token_import_queue_position(import_queue_position)
     async with get_session() as session:
         async with session.begin():
             job = TokenImportJob(
                 status=IMPORT_JOB_STATUS_QUEUED,
+                import_queue_position=resolved_import_queue_position,
                 payloads=normalized_payloads,
                 total_count=len(normalized_payloads),
                 processed_count=0,
@@ -433,6 +452,29 @@ def _build_progress_snapshot(
     )
 
 
+def _imported_token_ids_from_job_state(job: TokenImportJobState) -> tuple[int, ...]:
+    items = [*job.created, *job.updated]
+
+    def sort_key(item: dict[str, Any]) -> tuple[int, int]:
+        try:
+            return (int(item.get("index")), 0)
+        except (TypeError, ValueError):
+            return (2**31 - 1, 1)
+
+    token_ids: list[int] = []
+    seen: set[int] = set()
+    for item in sorted(items, key=sort_key):
+        try:
+            token_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if token_id <= 0 or token_id in seen:
+            continue
+        seen.add(token_id)
+        token_ids.append(token_id)
+    return tuple(token_ids)
+
+
 async def _process_single_token_import_payload(
     job_id: int,
     index: int,
@@ -640,8 +682,10 @@ class TokenImportBackgroundWorker:
         response_traffic: ResponseTrafficLike,
         poll_interval_seconds: float | None = None,
         stale_after_seconds: float | None = None,
+        on_token_selection_settings_updated: Callable[[TokenSelectionSettings], Awaitable[None] | None] | None = None,
     ) -> None:
         self._response_traffic = response_traffic
+        self._on_token_selection_settings_updated = on_token_selection_settings_updated
         self._poll_interval_seconds = (
             _import_job_poll_interval_seconds() if poll_interval_seconds is None else max(0.25, float(poll_interval_seconds))
         )
@@ -696,6 +740,25 @@ class TokenImportBackgroundWorker:
             return
         logger.exception("Token import worker task crashed", exc_info=exc)
 
+    async def _publish_token_selection_settings(self, selection: TokenSelectionSettings | None) -> None:
+        if selection is None or self._on_token_selection_settings_updated is None:
+            return
+        result = self._on_token_selection_settings_updated(selection)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _apply_imported_token_queue_position(self, job: TokenImportJobLease, result: TokenImportJobState | None) -> None:
+        if result is None or result.status != IMPORT_JOB_STATUS_COMPLETED:
+            return
+        imported_token_ids = _imported_token_ids_from_job_state(result)
+        if not imported_token_ids:
+            return
+        selection = await apply_imported_token_queue_position(
+            imported_token_ids,
+            position=job.import_queue_position,
+        )
+        await self._publish_token_selection_settings(selection)
+
     async def _run(self) -> None:
         while not self._stopping:
             try:
@@ -728,7 +791,8 @@ class TokenImportBackgroundWorker:
                     max(1, min(_import_job_max_concurrency(), job.total_count - job.processed_count or 1)),
                     _import_job_respect_response_traffic(),
                 )
-                await process_token_import_job(job, response_traffic=self._response_traffic)
+                result = await process_token_import_job(job, response_traffic=self._response_traffic)
+                await self._apply_imported_token_queue_position(job, result)
             except asyncio.CancelledError:
                 raise
             except Exception:
