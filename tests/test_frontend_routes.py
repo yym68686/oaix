@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -7,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from oaix_gateway.api_server import WEB_DIR, create_app
 from oaix_gateway.database import CodexToken
+from oaix_gateway.token_import_jobs import TokenImportBatchSummary
 from oaix_gateway.token_store import TokenCounts, TokenSelectionSettings
 
 
@@ -122,6 +124,18 @@ def test_frontend_supports_custom_plan_order_and_available_plan_filters() -> Non
     assert "state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL" in app_js
 
 
+def test_frontend_supports_import_batch_grouping() -> None:
+    index_html = (WEB_DIR / "index.html").read_text()
+    app_js = (WEB_DIR / "app.js").read_text()
+
+    assert 'id="token-group-mode-summary"' in index_html
+    assert 'data-token-group-mode="import_batch"' in index_html
+    assert "state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : []" in app_js
+    assert "function renderImportBatchTokenList" in app_js
+    assert "导入批次 #" in app_js
+    assert "可用 ${formatInteger(counts.available)}" in app_js
+
+
 def test_frontend_import_panel_supports_queue_position_switch() -> None:
     index_html = (WEB_DIR / "index.html").read_text()
     app_js = (WEB_DIR / "app.js").read_text()
@@ -230,6 +244,70 @@ def test_token_selection_plan_order_route_forwards_plan_order(monkeypatch) -> No
     assert captured == {"enabled": True, "plan_order": ["team", "plus", "pro", "free"]}
     assert response.json()["plan_order_enabled"] is True
     assert response.json()["plan_order"] == ["team", "plus", "pro", "free"]
+
+
+def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+
+    async def fake_get_token_counts():
+        return TokenCounts(total=3, active=2, available=1, cooling=1, disabled=1)
+
+    async def fake_list_token_rows(*, limit):
+        assert limit == 10
+        return [SimpleNamespace(id=7)]
+
+    async def fake_build_admin_token_items(app, *, token_rows, include_quota):
+        del app
+        assert include_quota is False
+        assert [item.id for item in token_rows] == [7]
+        return [{"id": 7, "email": "a@example.com"}]
+
+    async def fake_list_token_import_batch_summaries(*, limit):
+        assert limit == 30
+        submitted_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+        return [
+            TokenImportBatchSummary(
+                id=42,
+                status="completed",
+                import_queue_position="front",
+                total_count=3,
+                processed_count=3,
+                created_count=2,
+                updated_count=1,
+                skipped_count=0,
+                failed_count=0,
+                token_count=3,
+                available=1,
+                cooling=1,
+                disabled=1,
+                missing=0,
+                token_ids=(7, 8, 9),
+                submitted_at=submitted_at,
+                started_at=submitted_at,
+                finished_at=submitted_at,
+            )
+        ]
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.list_token_rows", fake_list_token_rows)
+    monkeypatch.setattr("oaix_gateway.api_server._build_admin_token_items", fake_build_admin_token_items)
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.list_token_import_batch_summaries",
+        fake_list_token_import_batch_summaries,
+    )
+
+    response = asyncio.run(_request(app, "GET", "/admin/tokens?limit=10"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"] == [{"id": 7, "email": "a@example.com"}]
+    assert body["import_batches"][0]["id"] == 42
+    assert body["import_batches"][0]["available"] == 1
+    assert body["import_batches"][0]["cooling"] == 1
+    assert body["import_batches"][0]["disabled"] == 1
+    assert body["import_batches"][0]["token_ids"] == [7, 8, 9]
 
 
 def test_admin_token_probe_route_accepts_model_payload(monkeypatch) -> None:

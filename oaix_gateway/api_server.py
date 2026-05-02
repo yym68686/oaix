@@ -48,9 +48,11 @@ from .request_store import (
 )
 from .token_import_jobs import (
     TokenImportBackgroundWorker,
+    TokenImportBatchSummary,
     create_token_import_job,
     get_token_import_job,
     job_state_from_lease,
+    list_token_import_batch_summaries,
 )
 from .token_store import (
     DEFAULT_TOKEN_SELECTION_STRATEGY,
@@ -5928,6 +5930,10 @@ def _serialize_token_selection_settings(settings: TokenSelectionSettings) -> dic
     }
 
 
+def _serialize_token_import_batch_summary(batch: TokenImportBatchSummary) -> dict[str, Any]:
+    return asdict(batch)
+
+
 def _current_token_selection_settings(app: FastAPI) -> TokenSelectionSettings:
     selection = getattr(app.state, "token_selection_settings", None)
     if isinstance(selection, TokenSelectionSettings):
@@ -6223,7 +6229,10 @@ def create_app() -> FastAPI:
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         counts = await get_token_counts()
-        token_rows = await list_token_rows(limit=limit)
+        token_rows, import_batches = await asyncio.gather(
+            list_token_rows(limit=limit),
+            list_token_import_batch_summaries(limit=30),
+        )
         items = await _build_admin_token_items(
             http_request.app,
             token_rows=token_rows,
@@ -6232,6 +6241,7 @@ def create_app() -> FastAPI:
         return {
             "counts": asdict(counts),
             "selection": _serialize_token_selection_settings(_current_token_selection_settings(http_request.app)),
+            "import_batches": [_serialize_token_import_batch_summary(batch) for batch in import_batches],
             "items": items,
         }
 

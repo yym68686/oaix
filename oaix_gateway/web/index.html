@@ -258,6 +258,31 @@
               </div>
             </div>
 
+            <div class="selection-switch" aria-label="Key 列表分组">
+              <div class="selection-switch__head">
+                <span class="selection-switch__label">列表分组</span>
+                <span class="selection-switch__summary" id="token-group-mode-summary" aria-live="polite">按状态</span>
+              </div>
+              <div class="selection-switch__rail" role="group" aria-label="切换 Key 列表分组">
+                <button
+                  class="selection-switch__button"
+                  data-token-group-mode="status"
+                  type="button"
+                  aria-pressed="true"
+                >
+                  状态
+                </button>
+                <button
+                  class="selection-switch__button"
+                  data-token-group-mode="import_batch"
+                  type="button"
+                  aria-pressed="false"
+                >
+                  导入批次
+                </button>
+              </div>
+            </div>
+
             <div class="plan-order-panel" aria-label="账号计划请求顺序">
               <div class="selection-switch plan-order-switch">
                 <div class="selection-switch__head">

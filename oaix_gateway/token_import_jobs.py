@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from sqlalchemy import and_, or_, select
 
-from .database import TokenImportJob, get_read_session, get_session, utcnow
+from .database import CodexToken, TokenImportJob, get_read_session, get_session, utcnow
 from .token_store import (
     DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
     TokenSelectionSettings,
@@ -122,6 +122,28 @@ class TokenImportJobState:
 @dataclass(frozen=True)
 class TokenImportJobLease(TokenImportJobState):
     payloads: list[Any]
+
+
+@dataclass(frozen=True)
+class TokenImportBatchSummary:
+    id: int
+    status: str
+    import_queue_position: str
+    total_count: int
+    processed_count: int
+    created_count: int
+    updated_count: int
+    skipped_count: int
+    failed_count: int
+    token_count: int
+    available: int
+    cooling: int
+    disabled: int
+    missing: int
+    token_ids: tuple[int, ...]
+    submitted_at: datetime | None
+    started_at: datetime | None
+    finished_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -454,7 +476,10 @@ def _build_progress_snapshot(
 
 def _imported_token_ids_from_job_state(job: TokenImportJobState) -> tuple[int, ...]:
     items = [*job.created, *job.updated]
+    return _token_ids_from_import_items(items)
 
+
+def _token_ids_from_import_items(items: list[dict[str, Any]]) -> tuple[int, ...]:
     def sort_key(item: dict[str, Any]) -> tuple[int, int]:
         try:
             return (int(item.get("index")), 0)
@@ -473,6 +498,102 @@ def _imported_token_ids_from_job_state(job: TokenImportJobState) -> tuple[int, .
         seen.add(token_id)
         token_ids.append(token_id)
     return tuple(token_ids)
+
+
+def _token_import_batch_status(token: CodexToken, *, now: datetime) -> str:
+    if not bool(getattr(token, "is_active", False)):
+        return "disabled"
+    cooldown_until = getattr(token, "cooldown_until", None)
+    if cooldown_until is not None and cooldown_until > now:
+        return "cooling"
+    return "available"
+
+
+def _build_token_import_batch_summary(
+    job: TokenImportJob,
+    *,
+    tokens_by_id: dict[int, CodexToken],
+    now: datetime,
+) -> TokenImportBatchSummary:
+    state = _serialize_job_state(job)
+    token_ids = _token_ids_from_import_items([*state.created, *state.updated, *state.skipped])
+    available = 0
+    cooling = 0
+    disabled = 0
+
+    for token_id in token_ids:
+        token = tokens_by_id.get(token_id)
+        if token is None:
+            continue
+        status = _token_import_batch_status(token, now=now)
+        if status == "disabled":
+            disabled += 1
+        elif status == "cooling":
+            cooling += 1
+        else:
+            available += 1
+
+    present_count = available + cooling + disabled
+    return TokenImportBatchSummary(
+        id=state.id,
+        status=state.status,
+        import_queue_position=state.import_queue_position,
+        total_count=state.total_count,
+        processed_count=state.processed_count,
+        created_count=state.created_count,
+        updated_count=state.updated_count,
+        skipped_count=state.skipped_count,
+        failed_count=state.failed_count,
+        token_count=present_count,
+        available=available,
+        cooling=cooling,
+        disabled=disabled,
+        missing=max(0, len(token_ids) - present_count),
+        token_ids=token_ids,
+        submitted_at=state.submitted_at,
+        started_at=state.started_at,
+        finished_at=state.finished_at,
+    )
+
+
+async def list_token_import_batch_summaries(limit: int = 30) -> list[TokenImportBatchSummary]:
+    resolved_limit = max(1, min(int(limit or 30), 100))
+    async with get_read_session() as session:
+        result = await session.execute(
+            select(TokenImportJob)
+            .order_by(TokenImportJob.submitted_at.desc(), TokenImportJob.id.desc())
+            .limit(resolved_limit)
+        )
+        jobs = list(result.scalars().all())
+        if not jobs:
+            return []
+
+        token_ids = {
+            token_id
+            for job in jobs
+            for token_id in _token_ids_from_import_items(
+                [
+                    *_as_item_list(job.created_items),
+                    *_as_item_list(job.updated_items),
+                    *_as_item_list(job.skipped_items),
+                ]
+            )
+        }
+        tokens_by_id: dict[int, CodexToken] = {}
+        if token_ids:
+            token_result = await session.execute(
+                select(CodexToken).where(
+                    CodexToken.merged_into_token_id.is_(None),
+                    CodexToken.id.in_(token_ids),
+                )
+            )
+            tokens_by_id = {int(token.id): token for token in token_result.scalars().all()}
+
+        now = utcnow()
+        return [
+            _build_token_import_batch_summary(job, tokens_by_id=tokens_by_id, now=now)
+            for job in jobs
+        ]
 
 
 async def _process_single_token_import_payload(

@@ -444,7 +444,7 @@ button {
 
 .token-toolbar {
   display: grid;
-  grid-template-columns: minmax(300px, 1fr) minmax(270px, 0.42fr) minmax(320px, 0.68fr);
+  grid-template-columns: minmax(260px, 1fr) minmax(220px, 0.34fr) minmax(250px, 0.42fr) minmax(320px, 0.68fr);
   align-items: end;
   gap: 14px;
   margin-bottom: 18px;
@@ -1628,6 +1628,49 @@ button {
   font-variant-numeric: tabular-nums;
 }
 
+.import-batch-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid color-mix(in oklab, var(--token-group-accent) 20%, var(--border-soft));
+  border-radius: calc(var(--radius-lg) - 8px);
+  background: color-mix(in oklab, var(--token-group-accent) 6%, var(--surface-card));
+}
+
+.batch-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--border-panel);
+  border-radius: 14px;
+  background: var(--surface-button);
+  font-size: 0.84rem;
+  font-weight: 800;
+}
+
+.batch-count strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.batch-count--available {
+  border-color: color-mix(in oklab, var(--available) 34%, var(--border-panel));
+  color: var(--status-available-fg);
+}
+
+.batch-count--cooling {
+  border-color: color-mix(in oklab, var(--cooling) 36%, var(--border-panel));
+  color: var(--status-cooling-fg);
+}
+
+.batch-count--disabled,
+.batch-count--missing {
+  border-color: color-mix(in oklab, var(--disabled) 34%, var(--border-panel));
+  color: var(--status-disabled-fg);
+}
+
 .empty-state--inline {
   padding: 24px 18px;
   border: 1px dashed color-mix(in oklab, var(--border-soft) 92%, transparent);
@@ -2694,6 +2737,15 @@ button {
 
   .chart-grid {
     grid-template-columns: 1fr;
+  }
+
+  .token-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .token-search,
+  .plan-order-panel {
+    grid-column: 1 / -1;
   }
 
   .token-card__top {

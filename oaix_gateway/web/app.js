@@ -12,6 +12,7 @@ const DEFAULT_PROBE_MODEL = PROBE_MODEL_OPTIONS[0];
 const PLAN_TYPE_OPTIONS = ["free", "plus", "team", "pro"];
 const DEFAULT_PLAN_ORDER = [...PLAN_TYPE_OPTIONS];
 const AVAILABLE_PLAN_FILTER_ALL = "all";
+const TOKEN_GROUP_MODES = new Set(["status", "import_batch"]);
 const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 const IMPORT_QUEUE_POSITION_OPTIONS = new Set(["front", "back"]);
 const DEFAULT_IMPORT_QUEUE_POSITION = "front";
@@ -55,8 +56,10 @@ const state = {
   tokenActionPendingKinds: new Map(),
   tokenDeleteTargetId: null,
   tokenGroupOpenStates: Object.create(null),
+  tokenGroupMode: "status",
   tokenSearchTerm: "",
   tokenItems: [],
+  tokenImportBatches: [],
   healthLoaded: false,
   tokensLoaded: false,
   requestsLoaded: false,
@@ -109,6 +112,8 @@ const elements = {
   listNote: document.getElementById("list-note"),
   tokenSearchInput: document.getElementById("token-search-input"),
   tokenSearchSummary: document.getElementById("token-search-summary"),
+  tokenGroupModeSummary: document.getElementById("token-group-mode-summary"),
+  tokenGroupModeButtons: Array.from(document.querySelectorAll("[data-token-group-mode]")),
   tokenSelectionSummary: document.getElementById("token-selection-summary"),
   tokenSelectionButtons: Array.from(document.querySelectorAll("[data-selection-strategy]")),
   tokenPlanOrderSummary: document.getElementById("token-plan-order-summary"),
@@ -606,6 +611,14 @@ function normalizeAvailablePlanFilter(value) {
   return AVAILABLE_PLAN_FILTER_ALL;
 }
 
+function normalizeTokenGroupMode(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("-", "_");
+  return TOKEN_GROUP_MODES.has(normalized) ? normalized : "status";
+}
+
 function describeTokenSelectionStrategy(strategy) {
   if (normalizeTokenSelectionStrategy(strategy) === "fill_first") {
     return "首个可用优先";
@@ -618,6 +631,10 @@ function describeTokenPlanOrder(enabled = state.tokenPlanOrderEnabled, planOrder
     return "默认请求顺序";
   }
   return normalizeTokenPlanOrder(planOrder).map(formatPlanType).join(" → ");
+}
+
+function describeTokenGroupMode(mode = state.tokenGroupMode) {
+  return normalizeTokenGroupMode(mode) === "import_batch" ? "按导入批次" : "按状态";
 }
 
 function describeImportQueuePosition(position) {
@@ -641,6 +658,12 @@ function renderImportQueuePosition(position) {
 
 function setTokenSelectionDisabled(disabled) {
   elements.tokenSelectionButtons.forEach((button) => {
+    button.disabled = disabled;
+  });
+}
+
+function setTokenGroupModeDisabled(disabled) {
+  elements.tokenGroupModeButtons.forEach((button) => {
     button.disabled = disabled;
   });
 }
@@ -729,10 +752,14 @@ function renderInitialLoadingStates() {
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "正在同步策略";
     }
+    if (elements.tokenGroupModeSummary) {
+      elements.tokenGroupModeSummary.textContent = "正在同步分组";
+    }
     if (elements.tokenPlanOrderSummary) {
       elements.tokenPlanOrderSummary.textContent = "正在同步顺序";
     }
     setTokenSelectionDisabled(true);
+    setTokenGroupModeDisabled(true);
     setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
     renderTokenListLoading();
@@ -776,6 +803,17 @@ function renderTokenSelection(selection) {
     elements.tokenPlanOrderSummary.textContent = describeTokenPlanOrder();
   }
   renderTokenPlanOrderList();
+}
+
+function renderTokenGroupMode(mode = state.tokenGroupMode) {
+  state.tokenGroupMode = normalizeTokenGroupMode(mode);
+  elements.tokenGroupModeButtons.forEach((button) => {
+    const active = normalizeTokenGroupMode(button.dataset.tokenGroupMode) === state.tokenGroupMode;
+    button.setAttribute("aria-pressed", String(active));
+  });
+  if (elements.tokenGroupModeSummary) {
+    elements.tokenGroupModeSummary.textContent = describeTokenGroupMode();
+  }
 }
 
 function renderTokenPlanOrderList() {
@@ -870,6 +908,7 @@ function filterTokenItems(items) {
 
 function canDragAvailableTokens() {
   return (
+    state.tokenGroupMode === "status" &&
     state.tokenSelectionStrategy === "fill_first" &&
     !state.tokenOrderSaving &&
     state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL &&
@@ -1988,12 +2027,165 @@ function renderRequestAnalytics(analytics) {
   renderRequestCostChart(analytics);
 }
 
+function normalizeImportBatchTokenIds(batch) {
+  const ids = [];
+  const seen = new Set();
+  const source = Array.isArray(batch?.token_ids) ? batch.token_ids : [];
+  source.forEach((value) => {
+    const tokenId = Number(value);
+    if (!Number.isInteger(tokenId) || tokenId <= 0 || seen.has(tokenId)) {
+      return;
+    }
+    seen.add(tokenId);
+    ids.push(tokenId);
+  });
+  return ids;
+}
+
+function buildImportBatchCounts(batch) {
+  return {
+    available: Math.max(0, Number(batch?.available || 0)),
+    cooling: Math.max(0, Number(batch?.cooling || 0)),
+    disabled: Math.max(0, Number(batch?.disabled || 0)),
+    missing: Math.max(0, Number(batch?.missing || 0)),
+    tokenCount: Math.max(0, Number(batch?.token_count || 0)),
+    totalCount: Math.max(0, Number(batch?.total_count || 0)),
+    processedCount: Math.max(0, Number(batch?.processed_count || 0)),
+    failedCount: Math.max(0, Number(batch?.failed_count || 0)),
+  };
+}
+
+function deriveImportBatchTone(batch) {
+  const counts = buildImportBatchCounts(batch);
+  if (counts.available > 0) {
+    return "available";
+  }
+  if (counts.cooling > 0) {
+    return "cooling";
+  }
+  if (counts.disabled > 0 || counts.missing > 0) {
+    return "disabled";
+  }
+  return "cooling";
+}
+
+function formatImportBatchTitle(batch) {
+  const batchId = Number(batch?.id);
+  return Number.isInteger(batchId) && batchId > 0 ? `导入批次 #${batchId}` : "导入批次";
+}
+
+function formatImportBatchStatus(batch) {
+  const status = normalizeWhitespace(batch?.status || "");
+  const labels = {
+    queued: "排队中",
+    running: "导入中",
+    completed: "已完成",
+    failed: "失败",
+  };
+  return labels[status] || status || "未知状态";
+}
+
+function describeImportBatchMeta(batch, visibleCount) {
+  const counts = buildImportBatchCounts(batch);
+  const submittedAt = formatDate(batch?.submitted_at);
+  const progress =
+    counts.totalCount > 0
+      ? `进度 ${formatInteger(counts.processedCount)}/${formatInteger(counts.totalCount)}`
+      : "无提交记录";
+  const missingText = counts.missing > 0 ? ` · 已删除 ${formatInteger(counts.missing)}` : "";
+  return `${formatImportBatchStatus(batch)} · ${progress} · 可用 ${formatInteger(counts.available)} · 冷却 ${formatInteger(
+    counts.cooling,
+  )} · 禁用 ${formatInteger(counts.disabled)}${missingText} · 显示 ${formatInteger(visibleCount)} 条 · 提交 ${submittedAt}`;
+}
+
+function renderImportBatchCountStrip(batch) {
+  const counts = buildImportBatchCounts(batch);
+  const missingMarkup =
+    counts.missing > 0
+      ? `<span class="batch-count batch-count--missing"><span>已删除</span><strong>${escapeHtml(formatInteger(counts.missing))}</strong></span>`
+      : "";
+  return `
+    <div class="import-batch-counts" aria-label="导入批次当前状态数量">
+      <span class="batch-count batch-count--available"><span>可用</span><strong>${escapeHtml(formatInteger(counts.available))}</strong></span>
+      <span class="batch-count batch-count--cooling"><span>冷却</span><strong>${escapeHtml(formatInteger(counts.cooling))}</strong></span>
+      <span class="batch-count batch-count--disabled"><span>禁用</span><strong>${escapeHtml(formatInteger(counts.disabled))}</strong></span>
+      ${missingMarkup}
+    </div>
+  `;
+}
+
+function compareImportBatches(left, right) {
+  const leftTime = new Date(left?.submitted_at || 0).getTime();
+  const rightTime = new Date(right?.submitted_at || 0).getTime();
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
+    return rightTime - leftTime;
+  }
+  return Number(right?.id || 0) - Number(left?.id || 0);
+}
+
+function renderImportBatchTokenList(filteredItems) {
+  const batches = Array.isArray(state.tokenImportBatches) ? [...state.tokenImportBatches].sort(compareImportBatches) : [];
+  if (!batches.length) {
+    elements.tokenList.innerHTML = `
+      <article class="empty-state">
+        <p>还没有可展示的导入批次。新的后台导入任务完成后会显示每批当前状态数量。</p>
+      </article>
+    `;
+    return;
+  }
+
+  const workspaceTokenCounts = buildWorkspaceTokenCounts(filteredItems);
+  const itemsById = new Map(filteredItems.map((item) => [Number(item?.id), item]));
+  const assignedVisibleIds = new Set();
+  const batchGroups = batches
+    .map((batch, index) => {
+      const tokenIds = normalizeImportBatchTokenIds(batch);
+      const visibleItems = tokenIds
+        .map((tokenId) => itemsById.get(Number(tokenId)))
+        .filter(Boolean);
+      visibleItems.forEach((item) => assignedVisibleIds.add(Number(item.id)));
+      const groupId = `import-batch-${Number(batch?.id || index)}`;
+      return renderTokenGroup({
+        id: groupId,
+        title: formatImportBatchTitle(batch),
+        meta: describeImportBatchMeta(batch, visibleItems.length),
+        tone: deriveImportBatchTone(batch),
+        items: visibleItems,
+        itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
+        beforeItems: renderImportBatchCountStrip(batch),
+        open: resolveTokenGroupOpenState(groupId, index === 0),
+        emptyMessage: "这批导入关联的 key 不在当前列表或已被搜索条件过滤。",
+      });
+    })
+    .join("");
+
+  const unbatchedItems = filteredItems.filter((item) => !assignedVisibleIds.has(Number(item?.id)));
+  const unbatchedGroup = unbatchedItems.length
+    ? renderTokenGroup({
+        id: "import-batch-unassigned",
+        title: "未归入最近批次",
+        meta: `当前筛选里有 ${formatInteger(unbatchedItems.length)} 把 key 不在最近导入批次中`,
+        tone: "cooling",
+        items: unbatchedItems,
+        itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
+        open: resolveTokenGroupOpenState("import-batch-unassigned", false),
+        emptyMessage: "当前没有未归入最近批次的 key。",
+      })
+    : "";
+
+  elements.tokenList.innerHTML = `${batchGroups}${unbatchedGroup}`;
+}
+
 function renderTokenList(items) {
   const list = Array.isArray(items) ? items : [];
   const filteredItems = filterTokenItems(list);
   renderTokenSearchSummary(list.length, filteredItems.length);
 
   if (list.length === 0) {
+    if (state.tokenGroupMode === "import_batch" && state.tokenImportBatches.length > 0) {
+      renderImportBatchTokenList([]);
+      return;
+    }
     elements.tokenList.innerHTML = `
       <article class="empty-state">
         <p>没有最近记录。先导入一批 key，列表会在这里展开。</p>
@@ -2012,6 +2204,15 @@ function renderTokenList(items) {
     return;
   }
 
+  if (state.tokenGroupMode === "import_batch") {
+    renderImportBatchTokenList(filteredItems);
+    return;
+  }
+
+  renderStatusTokenList(filteredItems);
+}
+
+function renderStatusTokenList(filteredItems) {
   const availableItems = [];
   const coolingItems = [];
   const disabledItems = [];
@@ -2387,9 +2588,11 @@ async function loadTokens() {
     });
     state.tokensLoaded = true;
     state.tokenItems = Array.isArray(data.items) ? data.items : [];
+    state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : [];
     elements.listNote.textContent = TOKEN_LIST_BASE_NOTE;
     renderTokenSelection(data.selection || {});
     setTokenSelectionDisabled(state.tokenSelectionSaving);
+    setTokenGroupModeDisabled(false);
     setTokenPlanOrderDisabled(state.tokenPlanOrderSaving);
     setTokenSearchDisabled(false);
     renderTokenList(state.tokenItems);
@@ -2399,16 +2602,21 @@ async function loadTokens() {
   } catch (error) {
     state.tokensLoaded = true;
     state.tokenItems = [];
+    state.tokenImportBatches = [];
     if (error.status === 401) {
       elements.listNote.textContent = "需要输入 Service API Key 才能查看明细和导入";
       renderTokenSearchSummary(0, 0, "需要 Service API Key");
       if (elements.tokenSelectionSummary) {
         elements.tokenSelectionSummary.textContent = "需要 Service API Key";
       }
+      if (elements.tokenGroupModeSummary) {
+        elements.tokenGroupModeSummary.textContent = "需要 Service API Key";
+      }
       if (elements.tokenPlanOrderSummary) {
         elements.tokenPlanOrderSummary.textContent = "需要 Service API Key";
       }
       setTokenSelectionDisabled(true);
+      setTokenGroupModeDisabled(true);
       setTokenPlanOrderDisabled(true);
       setTokenSearchDisabled(true);
       elements.tokenList.innerHTML = `
@@ -2423,10 +2631,14 @@ async function loadTokens() {
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "切换器同步失败";
     }
+    if (elements.tokenGroupModeSummary) {
+      elements.tokenGroupModeSummary.textContent = "分组同步失败";
+    }
     if (elements.tokenPlanOrderSummary) {
       elements.tokenPlanOrderSummary.textContent = "顺序同步失败";
     }
     setTokenSelectionDisabled(true);
+    setTokenGroupModeDisabled(true);
     setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
     elements.tokenList.innerHTML = `
@@ -3160,6 +3372,7 @@ function syncSystemTheme() {
 
 applyTheme(state.themePreference, { persist: false });
 renderImportQueuePosition(state.importQueuePosition);
+renderTokenGroupMode(state.tokenGroupMode);
 renderTokenSelection({ strategy: state.tokenSelectionStrategy });
 renderTokenPlanOrderList();
 renderInitialLoadingStates();
@@ -3174,6 +3387,13 @@ elements.themeButtons.forEach((button) => {
 
 elements.importQueuePositionButtons.forEach((button) => {
   button.addEventListener("click", () => renderImportQueuePosition(button.dataset.importQueuePosition));
+});
+
+elements.tokenGroupModeButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    renderTokenGroupMode(button.dataset.tokenGroupMode);
+    renderTokenList(state.tokenItems);
+  });
 });
 
 elements.tokenSelectionButtons.forEach((button) => {
