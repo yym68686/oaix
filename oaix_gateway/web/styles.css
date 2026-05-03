@@ -523,6 +523,73 @@ button {
   color: var(--ink-soft);
 }
 
+.token-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+  margin: -4px 0 22px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border-table-row);
+}
+
+.token-pagination__actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.token-pagination__button {
+  min-width: 82px;
+  padding: 10px 14px;
+  min-height: 42px;
+  font-size: 0.86rem;
+}
+
+.token-pagination__jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.token-pagination__input {
+  width: 88px;
+  min-height: 42px;
+  padding: 9px 12px;
+  border: 1px solid var(--border-input);
+  border-radius: 14px;
+  background: var(--surface-input);
+  color: var(--ink);
+  font-weight: 800;
+  text-align: center;
+}
+
+.token-pagination__input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.token-pagination__input:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+.token-pagination__summary {
+  flex: 1 1 220px;
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 0.84rem;
+  font-weight: 700;
+  line-height: 1.4;
+  text-align: center;
+}
+
 .selection-switch {
   display: grid;
   align-self: stretch;
@@ -766,11 +833,19 @@ button {
   color: var(--ink);
 }
 
-.ghost-button:hover,
+.ghost-button:disabled,
+.primary-button:disabled,
+.token-pagination__input:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+  transform: none;
+}
+
+.ghost-button:not(:disabled):hover,
 .ghost-button:focus-visible,
-.primary-button:hover,
+.primary-button:not(:disabled):hover,
 .primary-button:focus-visible,
-.danger-button:hover,
+.danger-button:not(:disabled):hover,
 .danger-button:focus-visible {
   transform: translateY(-2px);
 }
@@ -2872,6 +2947,30 @@ button {
 
   .selection-switch {
     width: 100%;
+  }
+
+  .token-pagination {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .token-pagination__actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .token-pagination__button {
+    width: 100%;
+  }
+
+  .token-pagination__jump {
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .token-pagination__summary {
+    flex-basis: auto;
+    text-align: left;
   }
 
   .plan-order-panel {

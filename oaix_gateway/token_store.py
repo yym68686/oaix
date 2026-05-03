@@ -1857,13 +1857,14 @@ async def get_token_counts_by_account_ids(account_ids: list[str] | set[str] | tu
     }
 
 
-async def list_token_rows(limit: int = 100) -> list[CodexToken]:
+async def list_token_rows(limit: int = 100, offset: int = 0) -> list[CodexToken]:
     async with get_read_session() as session:
         stmt = (
             select(CodexToken)
             .where(*_canonical_token_filters())
             .order_by(CodexToken.id.desc())
             .limit(max(1, min(limit, 500)))
+            .offset(max(0, int(offset)))
         )
         result = await session.execute(stmt)
         return result.scalars().all()
@@ -1884,8 +1885,8 @@ async def get_token_row(token_id: int) -> CodexToken | None:
     return None
 
 
-async def list_tokens(limit: int = 100) -> list[TokenStatus]:
-    tokens = await list_token_rows(limit=limit)
+async def list_tokens(limit: int = 100, offset: int = 0) -> list[TokenStatus]:
+    tokens = await list_token_rows(limit=limit, offset=offset)
     return [
         TokenStatus(
             id=token.id,

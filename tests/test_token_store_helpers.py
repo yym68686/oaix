@@ -19,6 +19,7 @@ from oaix_gateway.token_store import (
     _merge_duplicate_token_rows,
     claim_next_active_token,
     invalidate_fill_first_token_cache,
+    list_token_rows,
     prewarm_fill_first_token_cache,
     repair_duplicate_token_histories,
     set_token_active_state,
@@ -51,6 +52,13 @@ class _FakeScalarResult:
 
     def first(self):
         return self._value
+
+    def all(self):
+        if isinstance(self._value, list):
+            return self._value
+        if self._value is None:
+            return []
+        return [self._value]
 
 
 class _FakeResult:
@@ -92,6 +100,27 @@ def test_build_token_counts_stmt_uses_single_aggregate_query() -> None:
     assert "sum(CASE WHEN (codex_tokens.is_active IS true)" in sql
     assert "codex_tokens.type = 'codex'" in sql
     assert sql.count("FROM codex_tokens") == 1
+
+
+def test_list_token_rows_applies_limit_and_offset(monkeypatch) -> None:
+    tokens = [
+        CodexToken(id=10, refresh_token="rt_10", token_type="codex"),
+        CodexToken(id=9, refresh_token="rt_9", token_type="codex"),
+    ]
+    read_session = _FakeReadSession(tokens)
+
+    @asynccontextmanager
+    async def fake_get_read_session():
+        yield read_session
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_read_session", fake_get_read_session)
+
+    result = asyncio.run(list_token_rows(limit=25, offset=50))
+
+    assert result == tokens
+    sql = read_session.statements[-1]
+    assert "LIMIT 25" in sql
+    assert "OFFSET 50" in sql
 
 
 def test_claim_next_active_token_fill_first_is_read_only_and_uses_app_token_order(monkeypatch) -> None:

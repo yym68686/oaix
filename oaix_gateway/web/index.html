@@ -210,13 +210,13 @@
           <div class="section-head section-head--token">
             <div class="section-head__copy">
               <p class="section-kicker">Registry</p>
-              <h2 id="token-list-title">最近 Key 状态</h2>
-              <p class="section-note" id="list-note">正在载入最近 80 条 key…</p>
+              <h2 id="token-list-title">Key 状态</h2>
+              <p class="section-note" id="list-note">正在载入 key 池…</p>
             </div>
           </div>
 
           <div class="token-toolbar" role="group" aria-label="Key 列表工具">
-            <div class="token-search" role="search" aria-label="搜索最近 Key 状态">
+            <div class="token-search" role="search" aria-label="搜索当前页 Key 状态">
               <div class="token-search__head">
                 <label class="token-search__label" for="token-search-input">搜索 Key</label>
                 <p class="token-search__summary" id="token-search-summary" aria-live="polite">等待载入</p>
@@ -309,6 +309,32 @@
                 </div>
               </div>
               <div class="plan-order-list" id="token-plan-order-list" role="list" aria-label="拖拽调整计划请求顺序"></div>
+            </div>
+          </div>
+
+          <div class="token-pagination" id="token-pagination" aria-label="Key 列表分页">
+            <div class="token-pagination__actions">
+              <button class="ghost-button token-pagination__button" id="token-page-first" type="button">首页</button>
+              <button class="ghost-button token-pagination__button" id="token-page-prev" type="button">上一页</button>
+            </div>
+            <label class="token-pagination__jump" for="token-page-input">
+              <span>页码</span>
+              <input
+                class="token-pagination__input"
+                id="token-page-input"
+                name="token-page"
+                type="number"
+                min="1"
+                step="1"
+                inputmode="numeric"
+                value="1"
+                aria-describedby="token-pagination-summary"
+              />
+            </label>
+            <p class="token-pagination__summary" id="token-pagination-summary" aria-live="polite">等待载入</p>
+            <div class="token-pagination__actions">
+              <button class="ghost-button token-pagination__button" id="token-page-next" type="button">下一页</button>
+              <button class="ghost-button token-pagination__button" id="token-page-last" type="button">末页</button>
             </div>
           </div>
 

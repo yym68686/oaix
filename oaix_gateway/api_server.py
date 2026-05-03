@@ -6225,12 +6225,13 @@ def create_app() -> FastAPI:
     async def list_tokens_route(
         http_request: Request,
         limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
         include_quota: bool = Query(False),
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         counts = await get_token_counts()
         token_rows, import_batches = await asyncio.gather(
-            list_token_rows(limit=limit),
+            list_token_rows(limit=limit, offset=offset),
             list_token_import_batch_summaries(limit=30),
         )
         items = await _build_admin_token_items(
@@ -6238,10 +6239,22 @@ def create_app() -> FastAPI:
             token_rows=token_rows,
             include_quota=include_quota,
         )
+        total = max(0, int(counts.total))
+        total_pages = max(1, int(math.ceil(total / limit))) if limit else 1
         return {
             "counts": asdict(counts),
             "selection": _serialize_token_selection_settings(_current_token_selection_settings(http_request.app)),
             "import_batches": [_serialize_token_import_batch_summary(batch) for batch in import_batches],
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "returned": len(items),
+                "total": total,
+                "page": int(offset // limit) + 1,
+                "total_pages": total_pages,
+                "has_previous": offset > 0,
+                "has_next": offset + len(items) < total,
+            },
             "items": items,
         }
 

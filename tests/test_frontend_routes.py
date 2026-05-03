@@ -64,6 +64,8 @@ def test_frontend_index_includes_token_search_input() -> None:
     assert response.status_code == 200
     assert 'id="token-search-input"' in response.text
     assert 'id="token-search-summary"' in response.text
+    assert 'id="token-pagination"' in response.text
+    assert 'id="token-page-input"' in response.text
 
 
 def test_frontend_index_busts_asset_cache_with_content_hash() -> None:
@@ -252,10 +254,11 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
     app = create_app()
 
     async def fake_get_token_counts():
-        return TokenCounts(total=3, active=2, available=1, cooling=1, disabled=1)
+        return TokenCounts(total=21, active=20, available=19, cooling=1, disabled=1)
 
-    async def fake_list_token_rows(*, limit):
+    async def fake_list_token_rows(*, limit, offset):
         assert limit == 10
+        assert offset == 20
         return [SimpleNamespace(id=7)]
 
     async def fake_build_admin_token_items(app, *, token_rows, include_quota):
@@ -298,11 +301,21 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         fake_list_token_import_batch_summaries,
     )
 
-    response = asyncio.run(_request(app, "GET", "/admin/tokens?limit=10"))
+    response = asyncio.run(_request(app, "GET", "/admin/tokens?limit=10&offset=20"))
 
     assert response.status_code == 200
     body = response.json()
     assert body["items"] == [{"id": 7, "email": "a@example.com"}]
+    assert body["pagination"] == {
+        "limit": 10,
+        "offset": 20,
+        "returned": 1,
+        "total": 21,
+        "page": 3,
+        "total_pages": 3,
+        "has_previous": True,
+        "has_next": False,
+    }
     assert body["import_batches"][0]["id"] == 42
     assert body["import_batches"][0]["available"] == 1
     assert body["import_batches"][0]["cooling"] == 1

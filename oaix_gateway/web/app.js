@@ -5,7 +5,8 @@ const REFRESH_INTERVAL_MS = 30000;
 const IMPORT_JOB_POLL_INTERVAL_MS = 1500;
 const TOAST_DURATION_MS = 5200;
 const TOAST_EXIT_DURATION_MS = 220;
-const TOKEN_LIST_BASE_NOTE = "显示最近 80 条记录 · 可用 / 冷却 / 已禁用分组";
+const TOKEN_PAGE_SIZE = 80;
+const TOKEN_LIST_BASE_NOTE = `每页 ${TOKEN_PAGE_SIZE} 条记录 · 可翻页查看全部 key · 可用 / 冷却 / 已禁用分组`;
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
 const DEFAULT_PROBE_MODEL = PROBE_MODEL_OPTIONS[0];
@@ -58,6 +59,19 @@ const state = {
   tokenGroupOpenStates: Object.create(null),
   tokenGroupMode: "status",
   tokenSearchTerm: "",
+  tokenPage: 1,
+  tokenPageSize: TOKEN_PAGE_SIZE,
+  tokenPageLoading: false,
+  tokenPagination: {
+    total: 0,
+    limit: TOKEN_PAGE_SIZE,
+    offset: 0,
+    returned: 0,
+    page: 1,
+    totalPages: 1,
+    hasPrevious: false,
+    hasNext: false,
+  },
   tokenItems: [],
   tokenImportBatches: [],
   healthLoaded: false,
@@ -112,6 +126,13 @@ const elements = {
   listNote: document.getElementById("list-note"),
   tokenSearchInput: document.getElementById("token-search-input"),
   tokenSearchSummary: document.getElementById("token-search-summary"),
+  tokenPagination: document.getElementById("token-pagination"),
+  tokenPageFirst: document.getElementById("token-page-first"),
+  tokenPagePrev: document.getElementById("token-page-prev"),
+  tokenPageNext: document.getElementById("token-page-next"),
+  tokenPageLast: document.getElementById("token-page-last"),
+  tokenPageInput: document.getElementById("token-page-input"),
+  tokenPaginationSummary: document.getElementById("token-pagination-summary"),
   tokenGroupModeSummary: document.getElementById("token-group-mode-summary"),
   tokenGroupModeButtons: Array.from(document.querySelectorAll("[data-token-group-mode]")),
   tokenSelectionSummary: document.getElementById("token-selection-summary"),
@@ -611,6 +632,43 @@ function normalizeAvailablePlanFilter(value) {
   return AVAILABLE_PLAN_FILTER_ALL;
 }
 
+function normalizePositiveInteger(value, fallback = 1) {
+  const number = Number.parseInt(value, 10);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function normalizeNonNegativeInteger(value, fallback = 0) {
+  const number = Number.parseInt(value, 10);
+  return Number.isInteger(number) && number >= 0 ? number : fallback;
+}
+
+function normalizeTokenPagination(raw = {}, itemCount = 0, fallbackPage = state.tokenPage) {
+  const limit = Math.max(1, Math.min(normalizePositiveInteger(raw?.limit, state.tokenPageSize), 500));
+  const total = normalizeNonNegativeInteger(raw?.total, Math.max(0, Number(itemCount) || 0));
+  const offset = normalizeNonNegativeInteger(raw?.offset, (normalizePositiveInteger(fallbackPage, 1) - 1) * limit);
+  const returned = normalizeNonNegativeInteger(raw?.returned, Math.max(0, Number(itemCount) || 0));
+  const inferredTotalPages = Math.max(1, Math.ceil(total / limit));
+  const totalPages = Math.max(1, normalizePositiveInteger(raw?.total_pages, inferredTotalPages));
+  const inferredPage = Math.floor(offset / limit) + 1;
+  const rawPage = normalizePositiveInteger(raw?.page, inferredPage);
+  const page = total > 0 ? Math.min(Math.max(1, rawPage), totalPages) : 1;
+  const firstItem = total > 0 && returned > 0 ? offset + 1 : 0;
+  const lastItem = total > 0 && returned > 0 ? Math.min(offset + returned, total) : 0;
+
+  return {
+    total,
+    limit,
+    offset,
+    returned,
+    page,
+    totalPages,
+    hasPrevious: Boolean(raw?.has_previous ?? raw?.has_prev ?? page > 1),
+    hasNext: Boolean(raw?.has_next ?? page < totalPages),
+    firstItem,
+    lastItem,
+  };
+}
+
 function normalizeTokenGroupMode(value) {
   const normalized = String(value || "")
     .trim()
@@ -687,6 +745,21 @@ function setTokenSearchDisabled(disabled) {
   elements.tokenSearchInput.disabled = disabled;
 }
 
+function setTokenPaginationDisabled(disabled) {
+  [
+    elements.tokenPageFirst,
+    elements.tokenPagePrev,
+    elements.tokenPageNext,
+    elements.tokenPageLast,
+    elements.tokenPageInput,
+  ].forEach((control) => {
+    if (!control) {
+      return;
+    }
+    control.disabled = disabled;
+  });
+}
+
 function renderLoadingState(message, className = "") {
   const classes = ["loading-state", className].filter(Boolean).join(" ");
   return `
@@ -748,7 +821,7 @@ function renderInitialLoadingStates() {
     elements.syncChip.textContent = "正在首次同步";
   }
   if (!state.tokensLoaded) {
-    elements.listNote.textContent = "正在载入最近 80 条 key…";
+    elements.listNote.textContent = "正在载入 key 池…";
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "正在同步策略";
     }
@@ -762,6 +835,8 @@ function renderInitialLoadingStates() {
     setTokenGroupModeDisabled(true);
     setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
+    setTokenPaginationDisabled(true);
+    renderTokenPagination("正在载入分页");
     renderTokenListLoading();
   }
   if (!state.requestsLoaded) {
@@ -1066,6 +1141,65 @@ function renderTokenSearchSummary(totalCount, visibleCount, customMessage = "") 
     return;
   }
   elements.tokenSearchSummary.textContent = `匹配 ${formatInteger(visibleCount)} / ${formatInteger(totalCount)} 条`;
+}
+
+function buildTokenListNote() {
+  const pagination = state.tokenPagination;
+  if (pagination.total > 0 && pagination.returned > 0) {
+    return `每页 ${formatInteger(pagination.limit)} 条 · 当前 ${formatInteger(pagination.firstItem)}-${formatInteger(
+      pagination.lastItem,
+    )} / ${formatInteger(pagination.total)} · 可用 / 冷却 / 已禁用分组`;
+  }
+  return TOKEN_LIST_BASE_NOTE;
+}
+
+function renderTokenPagination(customMessage = "") {
+  if (!elements.tokenPagination) {
+    return;
+  }
+
+  const pagination = state.tokenPagination;
+  const page = pagination.page || 1;
+  const totalPages = pagination.totalPages || 1;
+  const hasTokens = pagination.total > 0;
+  const disabled = state.refreshing || state.tokenPageLoading || !state.tokensLoaded || !hasTokens;
+  const previousDisabled = disabled || !pagination.hasPrevious || page <= 1;
+  const nextDisabled = disabled || !pagination.hasNext || page >= totalPages;
+
+  if (elements.tokenPageFirst) {
+    elements.tokenPageFirst.disabled = previousDisabled;
+  }
+  if (elements.tokenPagePrev) {
+    elements.tokenPagePrev.disabled = previousDisabled;
+  }
+  if (elements.tokenPageNext) {
+    elements.tokenPageNext.disabled = nextDisabled;
+  }
+  if (elements.tokenPageLast) {
+    elements.tokenPageLast.disabled = nextDisabled;
+  }
+  if (elements.tokenPageInput) {
+    elements.tokenPageInput.disabled = disabled;
+    elements.tokenPageInput.min = "1";
+    elements.tokenPageInput.max = String(totalPages);
+    elements.tokenPageInput.value = String(page);
+  }
+  if (!elements.tokenPaginationSummary) {
+    return;
+  }
+  if (customMessage) {
+    elements.tokenPaginationSummary.textContent = customMessage;
+    return;
+  }
+  if (!hasTokens) {
+    elements.tokenPaginationSummary.textContent = state.tokensLoaded ? "暂无 key" : "等待载入";
+    return;
+  }
+  elements.tokenPaginationSummary.textContent = `第 ${formatInteger(page)} / ${formatInteger(
+    totalPages,
+  )} 页 · ${formatInteger(pagination.firstItem)}-${formatInteger(pagination.lastItem)} / ${formatInteger(
+    pagination.total,
+  )}`;
 }
 
 function resolveTokenGroupOpenState(groupId, fallbackOpen) {
@@ -2189,7 +2323,7 @@ function renderTokenList(items) {
     }
     elements.tokenList.innerHTML = `
       <article class="empty-state">
-        <p>没有最近记录。先导入一批 key，列表会在这里展开。</p>
+        <p>没有 key 记录。先导入一批 key，列表会在这里展开。</p>
       </article>
     `;
     return;
@@ -2199,7 +2333,7 @@ function renderTokenList(items) {
     const query = normalizeWhitespace(state.tokenSearchTerm);
     elements.tokenList.innerHTML = `
       <article class="empty-state">
-        <p>最近 80 条记录里没有匹配“${escapeHtml(query)}”的 key。</p>
+        <p>当前页没有匹配“${escapeHtml(query)}”的 key。</p>
       </article>
     `;
     return;
@@ -2582,20 +2716,42 @@ async function loadHealth() {
   return health;
 }
 
-async function loadTokens() {
+async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {}) {
+  const requestedPage = normalizePositiveInteger(page, 1);
+  const limit = state.tokenPageSize;
+  const offset = (requestedPage - 1) * limit;
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+    include_quota: "1",
+  });
+
+  state.tokenPage = requestedPage;
+  state.tokenPageLoading = true;
+  renderTokenPagination("正在载入当前页");
+
   try {
-    const data = await fetchJson("/admin/tokens?limit=80&include_quota=1", {
+    const data = await fetchJson(`/admin/tokens?${params.toString()}`, {
       headers: authHeaders(),
     });
     state.tokensLoaded = true;
     state.tokenItems = Array.isArray(data.items) ? data.items : [];
     state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : [];
-    elements.listNote.textContent = TOKEN_LIST_BASE_NOTE;
+    const pagination = normalizeTokenPagination(data.pagination || {}, state.tokenItems.length, requestedPage);
+    if (allowPageAdjust && pagination.total > 0 && state.tokenItems.length === 0 && requestedPage > pagination.totalPages) {
+      state.tokenPage = pagination.totalPages;
+      return loadTokens({ page: pagination.totalPages, allowPageAdjust: false });
+    }
+    state.tokenPagination = pagination;
+    state.tokenPage = pagination.page;
+    state.tokenPageLoading = false;
+    elements.listNote.textContent = buildTokenListNote();
     renderTokenSelection(data.selection || {});
     setTokenSelectionDisabled(state.tokenSelectionSaving);
     setTokenGroupModeDisabled(false);
     setTokenPlanOrderDisabled(state.tokenPlanOrderSaving);
     setTokenSearchDisabled(false);
+    renderTokenPagination();
     renderTokenList(state.tokenItems);
     if (data.counts) {
       renderCounts(data.counts);
@@ -2604,9 +2760,13 @@ async function loadTokens() {
     state.tokensLoaded = true;
     state.tokenItems = [];
     state.tokenImportBatches = [];
+    state.tokenPagination = normalizeTokenPagination({}, 0, 1);
+    state.tokenPage = 1;
+    state.tokenPageLoading = false;
     if (error.status === 401) {
       elements.listNote.textContent = "需要输入 Service API Key 才能查看明细和导入";
       renderTokenSearchSummary(0, 0, "需要 Service API Key");
+      renderTokenPagination("需要 Service API Key");
       if (elements.tokenSelectionSummary) {
         elements.tokenSelectionSummary.textContent = "需要 Service API Key";
       }
@@ -2620,6 +2780,7 @@ async function loadTokens() {
       setTokenGroupModeDisabled(true);
       setTokenPlanOrderDisabled(true);
       setTokenSearchDisabled(true);
+      setTokenPaginationDisabled(true);
       elements.tokenList.innerHTML = `
         <article class="empty-state">
           <p>管理接口已加锁。填入 Service API Key 后可查看明细和导入 key。</p>
@@ -2629,6 +2790,7 @@ async function loadTokens() {
     }
     elements.listNote.textContent = `列表加载失败：${error.message}`;
     renderTokenSearchSummary(0, 0, "列表加载失败");
+    renderTokenPagination("列表加载失败");
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "切换器同步失败";
     }
@@ -2642,12 +2804,28 @@ async function loadTokens() {
     setTokenGroupModeDisabled(true);
     setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
+    setTokenPaginationDisabled(true);
     elements.tokenList.innerHTML = `
       <article class="empty-state">
         <p>${escapeHtml(error.message)}</p>
       </article>
     `;
   }
+}
+
+async function goToTokenPage(page) {
+  if (state.tokenPageLoading) {
+    return;
+  }
+  const requestedPage = normalizePositiveInteger(page, state.tokenPage);
+  const totalPages = state.tokenPagination.totalPages || 1;
+  const nextPage = Math.min(Math.max(1, requestedPage), totalPages);
+  if (nextPage === state.tokenPage && state.tokensLoaded) {
+    renderTokenPagination();
+    return;
+  }
+  state.availablePlanFilter = AVAILABLE_PLAN_FILTER_ALL;
+  await loadTokens({ page: nextPage });
 }
 
 async function saveTokenSelection(strategy) {
@@ -2672,7 +2850,7 @@ async function saveTokenSelection(strategy) {
       body: JSON.stringify({ strategy: nextStrategy }),
     });
     renderTokenSelection(data);
-    elements.listNote.textContent = TOKEN_LIST_BASE_NOTE;
+    elements.listNote.textContent = buildTokenListNote();
   } catch (error) {
     renderTokenSelection({ strategy: previousStrategy });
     if (elements.tokenSelectionSummary) {
@@ -2760,7 +2938,7 @@ async function saveTokenPlanOrder({ enabled = state.tokenPlanOrderEnabled, planO
     });
     renderTokenSelection(data);
     renderTokenList(state.tokenItems);
-    elements.listNote.textContent = nextEnabled ? "计划优先级已保存" : TOKEN_LIST_BASE_NOTE;
+    elements.listNote.textContent = nextEnabled ? "计划优先级已保存" : buildTokenListNote();
   } catch (error) {
     state.tokenPlanOrderEnabled = previousEnabled;
     state.tokenPlanOrder = previousPlanOrder;
@@ -3445,6 +3623,42 @@ if (elements.tokenSearchInput) {
     }
     state.tokenSearchTerm = event.target.value;
     renderTokenList(state.tokenItems);
+  });
+}
+
+[
+  [elements.tokenPageFirst, () => 1],
+  [elements.tokenPagePrev, () => state.tokenPage - 1],
+  [elements.tokenPageNext, () => state.tokenPage + 1],
+  [elements.tokenPageLast, () => state.tokenPagination.totalPages || 1],
+].forEach(([button, resolvePage]) => {
+  if (!button) {
+    return;
+  }
+  button.addEventListener("click", async () => {
+    try {
+      await goToTokenPage(resolvePage());
+    } catch {}
+  });
+});
+
+if (elements.tokenPageInput) {
+  elements.tokenPageInput.addEventListener("change", async (event) => {
+    if (!(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+    try {
+      await goToTokenPage(event.target.value);
+    } catch {}
+  });
+  elements.tokenPageInput.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter" || !(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+    event.preventDefault();
+    try {
+      await goToTokenPage(event.target.value);
+    } catch {}
   });
 }
 
