@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, TypeAlias
 
-from sqlalchemy import and_, case, delete, func, nullsfirst, or_, select, text, update
+from sqlalchemy import String, and_, case, cast, delete, func, nullsfirst, nullslast, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
 from .database import (
@@ -46,6 +46,34 @@ DEFAULT_TOKEN_PLAN_ORDER = (
     TOKEN_PLAN_TYPE_TEAM,
     TOKEN_PLAN_TYPE_PRO,
 )
+TOKEN_LIST_STATUS_ALL = "all"
+TOKEN_LIST_STATUS_AVAILABLE = "available"
+TOKEN_LIST_STATUS_COOLING = "cooling"
+TOKEN_LIST_STATUS_DISABLED = "disabled"
+TOKEN_LIST_STATUSES = (
+    TOKEN_LIST_STATUS_ALL,
+    TOKEN_LIST_STATUS_AVAILABLE,
+    TOKEN_LIST_STATUS_COOLING,
+    TOKEN_LIST_STATUS_DISABLED,
+)
+TOKEN_LIST_PLAN_ALL = "all"
+TOKEN_LIST_PLAN_UNKNOWN = "unknown"
+TOKEN_LIST_SORT_NEWEST = "-created_at"
+TOKEN_LIST_SORT_OLDEST = "created_at"
+TOKEN_LIST_SORT_LAST_USED_DESC = "-last_used_at"
+TOKEN_LIST_SORT_LAST_USED_ASC = "last_used_at"
+TOKEN_LIST_SORT_STATUS = "status"
+TOKEN_LIST_SORT_PLAN = "plan_type"
+TOKEN_LIST_SORT_ACCOUNT = "account"
+TOKEN_LIST_SORTS = (
+    TOKEN_LIST_SORT_NEWEST,
+    TOKEN_LIST_SORT_OLDEST,
+    TOKEN_LIST_SORT_LAST_USED_DESC,
+    TOKEN_LIST_SORT_LAST_USED_ASC,
+    TOKEN_LIST_SORT_STATUS,
+    TOKEN_LIST_SORT_PLAN,
+    TOKEN_LIST_SORT_ACCOUNT,
+)
 TOKEN_IMPORT_QUEUE_POSITION_FRONT = "front"
 TOKEN_IMPORT_QUEUE_POSITION_BACK = "back"
 DEFAULT_TOKEN_IMPORT_QUEUE_POSITION = TOKEN_IMPORT_QUEUE_POSITION_FRONT
@@ -72,6 +100,15 @@ class TokenCounts:
     available: int
     cooling: int
     disabled: int
+
+
+@dataclass(frozen=True)
+class TokenPlanCounts:
+    free: int = 0
+    plus: int = 0
+    team: int = 0
+    pro: int = 0
+    unknown: int = 0
 
 
 @dataclass(frozen=True)
@@ -818,6 +855,26 @@ def normalize_token_plan_order(value: Any) -> tuple[str, ...]:
     return tuple(plan_order)
 
 
+def normalize_token_list_status(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    return normalized if normalized in TOKEN_LIST_STATUSES else TOKEN_LIST_STATUS_ALL
+
+
+def normalize_token_list_plan_type(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if not normalized or normalized == TOKEN_LIST_PLAN_ALL:
+        return TOKEN_LIST_PLAN_ALL
+    if normalized in {TOKEN_LIST_PLAN_UNKNOWN, "unrecognized"}:
+        return TOKEN_LIST_PLAN_UNKNOWN
+    plan_type = _normalize_plan_type(normalized)
+    return plan_type or TOKEN_LIST_PLAN_ALL
+
+
+def normalize_token_list_sort(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in TOKEN_LIST_SORTS else TOKEN_LIST_SORT_NEWEST
+
+
 def parse_token_import_queue_position(value: Any) -> str:
     normalized = str(value or "").strip().lower().replace("-", "_")
     if normalized in {"front", "head", "start", "first", "prepend"}:
@@ -886,6 +943,147 @@ def _available_token_filters(now: datetime, *, scoped_cooldown_scope: str | None
         )
         filters.append(~active_scoped_cooldown)
     return tuple(filters)
+
+
+def _token_available_condition(now: datetime) -> Any:
+    return and_(
+        CodexToken.is_active.is_(True),
+        or_(CodexToken.cooldown_until.is_(None), CodexToken.cooldown_until <= now),
+    )
+
+
+def _token_cooling_condition(now: datetime) -> Any:
+    return and_(
+        CodexToken.is_active.is_(True),
+        CodexToken.cooldown_until.is_not(None),
+        CodexToken.cooldown_until > now,
+    )
+
+
+def _token_plan_value_expr() -> Any:
+    return func.replace(func.lower(func.coalesce(CodexToken.plan_type, "")), "chatgpt_", "")
+
+
+def _normalize_token_id_filter(token_ids: Iterable[int] | None) -> tuple[int, ...] | None:
+    if token_ids is None:
+        return None
+    seen: set[int] = set()
+    normalized: list[int] = []
+    for value in token_ids:
+        try:
+            token_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if token_id <= 0 or token_id in seen:
+            continue
+        seen.add(token_id)
+        normalized.append(token_id)
+    return tuple(normalized)
+
+
+def _escape_sql_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _token_search_terms(search: str | None) -> tuple[str, ...]:
+    return tuple(term for term in str(search or "").strip().lower().split() if term)
+
+
+def _token_search_filters(search: str | None) -> tuple[Any, ...]:
+    filters: list[Any] = []
+    for term in _token_search_terms(search):
+        pattern = f"%{_escape_sql_like(term)}%"
+        haystacks = (
+            cast(CodexToken.id, String),
+            func.coalesce(CodexToken.email, ""),
+            func.coalesce(CodexToken.account_id, ""),
+            func.coalesce(CodexToken.source_file, ""),
+            func.coalesce(CodexToken.plan_type, ""),
+            func.coalesce(CodexToken.last_error, ""),
+        )
+        filters.append(
+            or_(
+                *(
+                    func.lower(haystack).like(pattern, escape="\\")
+                    for haystack in haystacks
+                )
+            )
+        )
+    return tuple(filters)
+
+
+def _token_status_filter(status: str | None, now: datetime) -> Any | None:
+    normalized = normalize_token_list_status(status)
+    if normalized == TOKEN_LIST_STATUS_AVAILABLE:
+        return _token_available_condition(now)
+    if normalized == TOKEN_LIST_STATUS_COOLING:
+        return _token_cooling_condition(now)
+    if normalized == TOKEN_LIST_STATUS_DISABLED:
+        return CodexToken.is_active.is_(False)
+    return None
+
+
+def _token_plan_filter(plan_type: str | None) -> Any | None:
+    normalized = normalize_token_list_plan_type(plan_type)
+    if normalized == TOKEN_LIST_PLAN_ALL:
+        return None
+    plan_value = _token_plan_value_expr()
+    if normalized == TOKEN_LIST_PLAN_UNKNOWN:
+        return or_(plan_value == "", ~plan_value.in_(DEFAULT_TOKEN_PLAN_ORDER))
+    return plan_value == normalized
+
+
+def _token_query_filters(
+    now: datetime,
+    *,
+    search: str | None = None,
+    status: str | None = TOKEN_LIST_STATUS_ALL,
+    plan_type: str | None = TOKEN_LIST_PLAN_ALL,
+    token_ids: Iterable[int] | None = None,
+) -> tuple[Any, ...]:
+    filters: list[Any] = [*_canonical_token_filters()]
+    filters.extend(_token_search_filters(search))
+    status_filter = _token_status_filter(status, now)
+    if status_filter is not None:
+        filters.append(status_filter)
+    plan_filter = _token_plan_filter(plan_type)
+    if plan_filter is not None:
+        filters.append(plan_filter)
+
+    resolved_token_ids = _normalize_token_id_filter(token_ids)
+    if resolved_token_ids is not None:
+        filters.append(CodexToken.id.in_(resolved_token_ids) if resolved_token_ids else text("false"))
+    return tuple(filters)
+
+
+def _token_list_order_clauses(sort: str | None, now: datetime) -> tuple[Any, ...]:
+    normalized = normalize_token_list_sort(sort)
+    plan_value = _token_plan_value_expr()
+
+    if normalized == TOKEN_LIST_SORT_OLDEST:
+        return (CodexToken.created_at.asc(), CodexToken.id.asc())
+    if normalized == TOKEN_LIST_SORT_LAST_USED_DESC:
+        return (nullslast(CodexToken.last_used_at.desc()), CodexToken.id.desc())
+    if normalized == TOKEN_LIST_SORT_LAST_USED_ASC:
+        return (nullsfirst(CodexToken.last_used_at.asc()), CodexToken.id.asc())
+    if normalized == TOKEN_LIST_SORT_STATUS:
+        return (
+            case(
+                (_token_available_condition(now), 0),
+                (_token_cooling_condition(now), 1),
+                (CodexToken.is_active.is_(False), 2),
+                else_=3,
+            ),
+            CodexToken.id.desc(),
+        )
+    if normalized == TOKEN_LIST_SORT_PLAN:
+        return (plan_value.asc(), CodexToken.id.desc())
+    if normalized == TOKEN_LIST_SORT_ACCOUNT:
+        return (
+            func.lower(func.coalesce(CodexToken.email, CodexToken.account_id, "")).asc(),
+            CodexToken.id.desc(),
+        )
+    return (CodexToken.created_at.desc(), CodexToken.id.desc())
 
 
 def _token_selection_order_clauses(
@@ -1835,6 +2033,73 @@ async def get_token_counts() -> TokenCounts:
         )
 
 
+async def get_token_status_counts(
+    *,
+    search: str | None = None,
+    plan_type: str | None = TOKEN_LIST_PLAN_ALL,
+    token_ids: Iterable[int] | None = None,
+) -> TokenCounts:
+    now = utcnow()
+    filters = _token_query_filters(
+        now,
+        search=search,
+        status=TOKEN_LIST_STATUS_ALL,
+        plan_type=plan_type,
+        token_ids=token_ids,
+    )
+    async with get_read_session() as session:
+        total, active, available, cooling, disabled = (
+            await session.execute(_build_token_counts_stmt(now).where(*filters))
+        ).one()
+        return TokenCounts(
+            total=int(total or 0),
+            active=int(active or 0),
+            available=int(available or 0),
+            cooling=int(cooling or 0),
+            disabled=int(disabled or 0),
+        )
+
+
+async def get_token_plan_counts(
+    *,
+    search: str | None = None,
+    status: str | None = TOKEN_LIST_STATUS_ALL,
+    token_ids: Iterable[int] | None = None,
+) -> TokenPlanCounts:
+    now = utcnow()
+    plan_value = _token_plan_value_expr()
+    filters = _token_query_filters(
+        now,
+        search=search,
+        status=status,
+        plan_type=TOKEN_LIST_PLAN_ALL,
+        token_ids=token_ids,
+    )
+    async with get_read_session() as session:
+        result = await session.execute(
+            select(plan_value.label("plan_type"), func.count().label("count"))
+            .where(*filters)
+            .group_by(plan_value)
+        )
+        rows = result.all()
+
+    counts = {plan_type: 0 for plan_type in DEFAULT_TOKEN_PLAN_ORDER}
+    counts[TOKEN_LIST_PLAN_UNKNOWN] = 0
+    for raw_plan_type, raw_count in rows:
+        plan_type = normalize_token_list_plan_type(raw_plan_type)
+        if plan_type not in DEFAULT_TOKEN_PLAN_ORDER:
+            plan_type = TOKEN_LIST_PLAN_UNKNOWN
+        counts[plan_type] += int(raw_count or 0)
+
+    return TokenPlanCounts(
+        free=counts[TOKEN_PLAN_TYPE_FREE],
+        plus=counts[TOKEN_PLAN_TYPE_PLUS],
+        team=counts[TOKEN_PLAN_TYPE_TEAM],
+        pro=counts[TOKEN_PLAN_TYPE_PRO],
+        unknown=counts[TOKEN_LIST_PLAN_UNKNOWN],
+    )
+
+
 async def get_token_counts_by_account_ids(account_ids: list[str] | set[str] | tuple[str, ...]) -> dict[str, int]:
     resolved_account_ids = _normalize_token_account_ids(account_ids)
     if not resolved_account_ids:
@@ -1857,12 +2122,55 @@ async def get_token_counts_by_account_ids(account_ids: list[str] | set[str] | tu
     }
 
 
-async def list_token_rows(limit: int = 100, offset: int = 0) -> list[CodexToken]:
+async def count_token_rows(
+    *,
+    search: str | None = None,
+    status: str | None = TOKEN_LIST_STATUS_ALL,
+    plan_type: str | None = TOKEN_LIST_PLAN_ALL,
+    token_ids: Iterable[int] | None = None,
+) -> int:
+    now = utcnow()
+    async with get_read_session() as session:
+        result = await session.execute(
+            select(func.count())
+            .select_from(CodexToken)
+            .where(
+                *_token_query_filters(
+                    now,
+                    search=search,
+                    status=status,
+                    plan_type=plan_type,
+                    token_ids=token_ids,
+                )
+            )
+        )
+        return int(result.scalar_one() or 0)
+
+
+async def list_token_rows(
+    limit: int = 100,
+    offset: int = 0,
+    *,
+    search: str | None = None,
+    status: str | None = TOKEN_LIST_STATUS_ALL,
+    plan_type: str | None = TOKEN_LIST_PLAN_ALL,
+    sort: str | None = TOKEN_LIST_SORT_NEWEST,
+    token_ids: Iterable[int] | None = None,
+) -> list[CodexToken]:
+    now = utcnow()
     async with get_read_session() as session:
         stmt = (
             select(CodexToken)
-            .where(*_canonical_token_filters())
-            .order_by(CodexToken.id.desc())
+            .where(
+                *_token_query_filters(
+                    now,
+                    search=search,
+                    status=status,
+                    plan_type=plan_type,
+                    token_ids=token_ids,
+                )
+            )
+            .order_by(*_token_list_order_clauses(sort, now))
             .limit(max(1, min(limit, 500)))
             .offset(max(0, int(offset)))
         )

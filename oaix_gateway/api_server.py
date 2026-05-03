@@ -58,13 +58,19 @@ from .token_store import (
     DEFAULT_TOKEN_SELECTION_STRATEGY,
     DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+    TOKEN_LIST_PLAN_ALL,
+    TOKEN_LIST_SORT_NEWEST,
+    TOKEN_LIST_STATUS_ALL,
     TokenSelectionSettings,
     claim_next_active_token,
+    count_token_rows,
     delete_token,
     get_token_row,
     get_token_counts,
     get_token_counts_by_account_ids,
+    get_token_plan_counts,
     get_token_selection_settings,
+    get_token_status_counts,
     list_token_rows,
     mark_token_error,
     mark_token_scoped_cooldown,
@@ -6227,24 +6233,63 @@ def create_app() -> FastAPI:
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
         include_quota: bool = Query(False),
+        q: str = Query("", max_length=512),
+        status: str = Query(TOKEN_LIST_STATUS_ALL, max_length=32),
+        plan_type: str = Query(TOKEN_LIST_PLAN_ALL, max_length=32),
+        sort: str = Query(TOKEN_LIST_SORT_NEWEST, max_length=64),
+        import_batch_id: int | None = Query(None, ge=1),
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
-        counts = await get_token_counts()
-        token_rows, import_batches = await asyncio.gather(
-            list_token_rows(limit=limit, offset=offset),
-            list_token_import_batch_summaries(limit=30),
+        import_batches = await list_token_import_batch_summaries(limit=30)
+        batch_token_ids: tuple[int, ...] | None = None
+        selected_import_batch: TokenImportBatchSummary | None = None
+        if import_batch_id is not None:
+            selected_import_batch = next(
+                (batch for batch in import_batches if int(batch.id) == int(import_batch_id)),
+                None,
+            )
+            batch_token_ids = selected_import_batch.token_ids if selected_import_batch is not None else ()
+
+        counts, filtered_counts, plan_counts, filtered_total, token_rows = await asyncio.gather(
+            get_token_counts(),
+            get_token_status_counts(search=q, plan_type=plan_type, token_ids=batch_token_ids),
+            get_token_plan_counts(search=q, status=status, token_ids=batch_token_ids),
+            count_token_rows(search=q, status=status, plan_type=plan_type, token_ids=batch_token_ids),
+            list_token_rows(
+                limit=limit,
+                offset=offset,
+                search=q,
+                status=status,
+                plan_type=plan_type,
+                sort=sort,
+                token_ids=batch_token_ids,
+            ),
         )
         items = await _build_admin_token_items(
             http_request.app,
             token_rows=token_rows,
             include_quota=include_quota,
         )
-        total = max(0, int(counts.total))
+        total = max(0, int(filtered_total))
         total_pages = max(1, int(math.ceil(total / limit))) if limit else 1
         return {
             "counts": asdict(counts),
+            "filtered_counts": asdict(filtered_counts),
+            "plan_counts": asdict(plan_counts),
             "selection": _serialize_token_selection_settings(_current_token_selection_settings(http_request.app)),
             "import_batches": [_serialize_token_import_batch_summary(batch) for batch in import_batches],
+            "selected_import_batch": (
+                _serialize_token_import_batch_summary(selected_import_batch)
+                if selected_import_batch is not None
+                else None
+            ),
+            "query": {
+                "q": q,
+                "status": status,
+                "plan_type": plan_type,
+                "sort": sort,
+                "import_batch_id": import_batch_id,
+            },
             "pagination": {
                 "limit": limit,
                 "offset": offset,

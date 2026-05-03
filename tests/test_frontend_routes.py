@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from oaix_gateway.api_server import WEB_DIR, create_app
 from oaix_gateway.database import CodexToken
 from oaix_gateway.token_import_jobs import TokenImportBatchSummary
-from oaix_gateway.token_store import TokenCounts, TokenSelectionSettings
+from oaix_gateway.token_store import TokenCounts, TokenPlanCounts, TokenSelectionSettings
 
 
 async def _request(
@@ -110,32 +110,34 @@ def test_frontend_token_cards_support_fill_first_drag_ordering() -> None:
     assert 'fetchJson("/admin/token-selection/order"' in app_js
     assert 'elements.tokenList.addEventListener("dragstart", handleTokenCardDragStart)' in app_js
     assert 'state.tokenSelectionStrategy === "fill_first"' in app_js
-    assert 'renderTokenFact("当前并发", activeStreamsValue, activeStreamsTone)' in app_js
+    assert "const activeStreamsValue =" in app_js
+    assert "token-result__usage" in app_js
 
 
-def test_frontend_supports_custom_plan_order_and_available_plan_filters() -> None:
+def test_frontend_supports_custom_plan_order_and_global_plan_filters() -> None:
     index_html = (WEB_DIR / "index.html").read_text()
     app_js = (WEB_DIR / "app.js").read_text()
 
     assert 'id="token-plan-order-summary"' in index_html
     assert 'id="token-plan-order-list"' in index_html
+    assert 'id="token-plan-filters"' in index_html
     assert 'data-plan-order-enabled="true"' in index_html
     assert 'const PLAN_TYPE_OPTIONS = ["free", "plus", "team", "pro"]' in app_js
     assert 'fetchJson("/admin/token-selection/plan-order"' in app_js
-    assert 'data-available-plan-filter="${escapeHtml(planType)}"' in app_js
-    assert "state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL" in app_js
+    assert 'data-token-plan-filter="${escapeHtml(planType)}"' in app_js
+    assert "state.tokenPlanFilter === AVAILABLE_PLAN_FILTER_ALL" in app_js
 
 
-def test_frontend_supports_import_batch_grouping() -> None:
+def test_frontend_supports_import_batch_view() -> None:
     index_html = (WEB_DIR / "index.html").read_text()
     app_js = (WEB_DIR / "app.js").read_text()
 
-    assert 'id="token-group-mode-summary"' in index_html
-    assert 'data-token-group-mode="import_batch"' in index_html
+    assert 'data-token-view-mode="import_batches"' in index_html
     assert "state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : []" in app_js
-    assert "function renderImportBatchTokenList" in app_js
+    assert "function renderImportBatchList" in app_js
+    assert 'params.set("import_batch_id", String(state.selectedImportBatchId))' in app_js
     assert "导入批次 #" in app_js
-    assert "可用 ${formatInteger(counts.available)}" in app_js
+    assert "data-import-batch-view" in app_js
 
 
 def test_frontend_import_panel_supports_queue_position_switch() -> None:
@@ -256,9 +258,26 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
     async def fake_get_token_counts():
         return TokenCounts(total=21, active=20, available=19, cooling=1, disabled=1)
 
-    async def fake_list_token_rows(*, limit, offset):
+    async def fake_get_token_status_counts(**kwargs):
+        assert kwargs == {"search": "acct", "plan_type": "plus", "token_ids": None}
+        return TokenCounts(total=21, active=20, available=19, cooling=1, disabled=1)
+
+    async def fake_get_token_plan_counts(**kwargs):
+        assert kwargs == {"search": "acct", "status": "available", "token_ids": None}
+        return TokenPlanCounts(free=1, plus=20, team=0, pro=0, unknown=0)
+
+    async def fake_count_token_rows(**kwargs):
+        assert kwargs == {"search": "acct", "status": "available", "plan_type": "plus", "token_ids": None}
+        return 21
+
+    async def fake_list_token_rows(*, limit, offset, search, status, plan_type, sort, token_ids):
         assert limit == 10
         assert offset == 20
+        assert search == "acct"
+        assert status == "available"
+        assert plan_type == "plus"
+        assert sort == "account"
+        assert token_ids is None
         return [SimpleNamespace(id=7)]
 
     async def fake_build_admin_token_items(app, *, token_rows, include_quota):
@@ -294,6 +313,9 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         ]
 
     monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_status_counts", fake_get_token_status_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_plan_counts", fake_get_token_plan_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.count_token_rows", fake_count_token_rows)
     monkeypatch.setattr("oaix_gateway.api_server.list_token_rows", fake_list_token_rows)
     monkeypatch.setattr("oaix_gateway.api_server._build_admin_token_items", fake_build_admin_token_items)
     monkeypatch.setattr(
@@ -301,7 +323,7 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         fake_list_token_import_batch_summaries,
     )
 
-    response = asyncio.run(_request(app, "GET", "/admin/tokens?limit=10&offset=20"))
+    response = asyncio.run(_request(app, "GET", "/admin/tokens?limit=10&offset=20&q=acct&status=available&plan_type=plus&sort=account"))
 
     assert response.status_code == 200
     body = response.json()
@@ -321,6 +343,15 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
     assert body["import_batches"][0]["cooling"] == 1
     assert body["import_batches"][0]["disabled"] == 1
     assert body["import_batches"][0]["token_ids"] == [7, 8, 9]
+    assert body["filtered_counts"]["available"] == 19
+    assert body["plan_counts"]["plus"] == 20
+    assert body["query"] == {
+        "q": "acct",
+        "status": "available",
+        "plan_type": "plus",
+        "sort": "account",
+        "import_batch_id": None,
+    }
 
 
 def test_admin_token_probe_route_accepts_model_payload(monkeypatch) -> None:

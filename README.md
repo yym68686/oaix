@@ -79,7 +79,8 @@ http://127.0.0.1:8000/
 - 已禁用的 key 数量
 - 请求总数、成功/失败数、平均首字时间
 - 最近请求日志，包括请求端点、状态码、首字时间、尝试次数和错误摘要
-- 可翻页查看全部 key 状态列表
+- 可按搜索、状态、计划和排序全局查询 key 状态列表
+- 可独立查看导入批次，并从批次进入关联 key
 - 导入 key 的表单和 JSON 文件导入入口
 
 ## Docker Compose
@@ -158,7 +159,7 @@ account_id_3,refresh_token_3
 ## 接口
 
 - `GET /healthz`: 查看可用 key 数量与状态
-- `GET /admin/tokens`: 查看 key 列表与统计，支持 `limit` / `offset` 分页
+- `GET /admin/tokens`: 查看 key 列表与统计，支持 `limit` / `offset` 分页，以及 `q` / `status` / `plan_type` / `sort` / `import_batch_id` 查询
 - `GET /admin/requests`: 查看请求次数汇总与最近请求日志
 - `POST /admin/tokens/import`: 导入单个 key、key 数组，或 `{"tokens": [...], "import_queue_position": "front|back"}` 批量导入
 - `POST /v1/responses`: 代理到上游 Codex responses

@@ -6,17 +6,31 @@ const IMPORT_JOB_POLL_INTERVAL_MS = 1500;
 const TOAST_DURATION_MS = 5200;
 const TOAST_EXIT_DURATION_MS = 220;
 const TOKEN_PAGE_SIZE = 80;
-const TOKEN_LIST_BASE_NOTE = `每页 ${TOKEN_PAGE_SIZE} 条记录 · 可翻页查看全部 key · 可用 / 冷却 / 已禁用分组`;
+const TOKEN_LIST_BASE_NOTE = `每页 ${TOKEN_PAGE_SIZE} 条记录 · 搜索、筛选、排序均作用于全池`;
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
 const DEFAULT_PROBE_MODEL = PROBE_MODEL_OPTIONS[0];
 const PLAN_TYPE_OPTIONS = ["free", "plus", "team", "pro"];
 const DEFAULT_PLAN_ORDER = [...PLAN_TYPE_OPTIONS];
+const TOKEN_STATUS_FILTERS = new Set(["all", "available", "cooling", "disabled"]);
+const TOKEN_VIEW_MODES = new Set(["keys", "import_batches"]);
+const DEFAULT_TOKEN_STATUS_FILTER = "all";
 const AVAILABLE_PLAN_FILTER_ALL = "all";
-const TOKEN_GROUP_MODES = new Set(["status", "import_batch"]);
+const TOKEN_PLAN_FILTER_UNKNOWN = "unknown";
+const TOKEN_SORT_OPTIONS = new Set([
+  "-created_at",
+  "created_at",
+  "-last_used_at",
+  "last_used_at",
+  "status",
+  "plan_type",
+  "account",
+]);
+const DEFAULT_TOKEN_SORT = "-created_at";
 const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 const IMPORT_QUEUE_POSITION_OPTIONS = new Set(["front", "back"]);
 const DEFAULT_IMPORT_QUEUE_POSITION = "front";
+const TOKEN_QUERY_DEBOUNCE_MS = 240;
 
 function readStoredImportJobId() {
   const raw = localStorage.getItem(IMPORT_JOB_STORAGE_KEY) || "";
@@ -54,11 +68,16 @@ const state = {
   toastCleanupTimer: null,
   protected: false,
   timer: null,
+  tokenSearchDebounceTimer: null,
   tokenActionPendingKinds: new Map(),
   tokenDeleteTargetId: null,
-  tokenGroupOpenStates: Object.create(null),
-  tokenGroupMode: "status",
+  tokenDetailsOpenStates: Object.create(null),
+  tokenViewMode: "keys",
   tokenSearchTerm: "",
+  tokenStatusFilter: DEFAULT_TOKEN_STATUS_FILTER,
+  tokenPlanFilter: AVAILABLE_PLAN_FILTER_ALL,
+  tokenSort: DEFAULT_TOKEN_SORT,
+  selectedImportBatchId: null,
   tokenPage: 1,
   tokenPageSize: TOKEN_PAGE_SIZE,
   tokenPageLoading: false,
@@ -74,6 +93,20 @@ const state = {
   },
   tokenItems: [],
   tokenImportBatches: [],
+  tokenFilteredCounts: {
+    total: 0,
+    active: 0,
+    available: 0,
+    cooling: 0,
+    disabled: 0,
+  },
+  tokenPlanCounts: {
+    free: 0,
+    plus: 0,
+    team: 0,
+    pro: 0,
+    unknown: 0,
+  },
   healthLoaded: false,
   tokensLoaded: false,
   requestsLoaded: false,
@@ -84,7 +117,6 @@ const state = {
   tokenPlanOrder: [...DEFAULT_PLAN_ORDER],
   tokenPlanOrderSaving: false,
   tokenPlanOrderDragType: "",
-  availablePlanFilter: AVAILABLE_PLAN_FILTER_ALL,
   tokenOrderSaving: false,
   tokenDragTokenId: null,
   importQueuePosition: DEFAULT_IMPORT_QUEUE_POSITION,
@@ -124,8 +156,13 @@ const elements = {
   importFeedback: document.getElementById("import-feedback"),
   tokenList: document.getElementById("token-list"),
   listNote: document.getElementById("list-note"),
+  tokenViewButtons: Array.from(document.querySelectorAll("[data-token-view-mode]")),
+  tokenQueryBar: document.getElementById("token-querybar"),
   tokenSearchInput: document.getElementById("token-search-input"),
   tokenSearchSummary: document.getElementById("token-search-summary"),
+  tokenStatusFilters: document.getElementById("token-status-filters"),
+  tokenPlanFilters: document.getElementById("token-plan-filters"),
+  tokenSortSelect: document.getElementById("token-sort-select"),
   tokenPagination: document.getElementById("token-pagination"),
   tokenPageFirst: document.getElementById("token-page-first"),
   tokenPagePrev: document.getElementById("token-page-prev"),
@@ -133,8 +170,7 @@ const elements = {
   tokenPageLast: document.getElementById("token-page-last"),
   tokenPageInput: document.getElementById("token-page-input"),
   tokenPaginationSummary: document.getElementById("token-pagination-summary"),
-  tokenGroupModeSummary: document.getElementById("token-group-mode-summary"),
-  tokenGroupModeButtons: Array.from(document.querySelectorAll("[data-token-group-mode]")),
+  dispatchSettings: document.getElementById("dispatch-settings"),
   tokenSelectionSummary: document.getElementById("token-selection-summary"),
   tokenSelectionButtons: Array.from(document.querySelectorAll("[data-selection-strategy]")),
   tokenPlanOrderSummary: document.getElementById("token-plan-order-summary"),
@@ -632,6 +668,27 @@ function normalizeAvailablePlanFilter(value) {
   return AVAILABLE_PLAN_FILTER_ALL;
 }
 
+function normalizeTokenStatusFilter(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("-", "_");
+  return TOKEN_STATUS_FILTERS.has(normalized) ? normalized : DEFAULT_TOKEN_STATUS_FILTER;
+}
+
+function normalizeTokenViewMode(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("-", "_");
+  return TOKEN_VIEW_MODES.has(normalized) ? normalized : "keys";
+}
+
+function normalizeTokenSort(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return TOKEN_SORT_OPTIONS.has(normalized) ? normalized : DEFAULT_TOKEN_SORT;
+}
+
 function normalizePositiveInteger(value, fallback = 1) {
   const number = Number.parseInt(value, 10);
   return Number.isInteger(number) && number > 0 ? number : fallback;
@@ -669,14 +726,6 @@ function normalizeTokenPagination(raw = {}, itemCount = 0, fallbackPage = state.
   };
 }
 
-function normalizeTokenGroupMode(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replaceAll("-", "_");
-  return TOKEN_GROUP_MODES.has(normalized) ? normalized : "status";
-}
-
 function describeTokenSelectionStrategy(strategy) {
   if (normalizeTokenSelectionStrategy(strategy) === "fill_first") {
     return "首个可用优先";
@@ -689,10 +738,6 @@ function describeTokenPlanOrder(enabled = state.tokenPlanOrderEnabled, planOrder
     return "默认请求顺序";
   }
   return normalizeTokenPlanOrder(planOrder).map(formatPlanType).join(" → ");
-}
-
-function describeTokenGroupMode(mode = state.tokenGroupMode) {
-  return normalizeTokenGroupMode(mode) === "import_batch" ? "按导入批次" : "按状态";
 }
 
 function describeImportQueuePosition(position) {
@@ -716,12 +761,6 @@ function renderImportQueuePosition(position) {
 
 function setTokenSelectionDisabled(disabled) {
   elements.tokenSelectionButtons.forEach((button) => {
-    button.disabled = disabled;
-  });
-}
-
-function setTokenGroupModeDisabled(disabled) {
-  elements.tokenGroupModeButtons.forEach((button) => {
     button.disabled = disabled;
   });
 }
@@ -825,14 +864,10 @@ function renderInitialLoadingStates() {
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "正在同步策略";
     }
-    if (elements.tokenGroupModeSummary) {
-      elements.tokenGroupModeSummary.textContent = "正在同步分组";
-    }
     if (elements.tokenPlanOrderSummary) {
       elements.tokenPlanOrderSummary.textContent = "正在同步顺序";
     }
     setTokenSelectionDisabled(true);
-    setTokenGroupModeDisabled(true);
     setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
     setTokenPaginationDisabled(true);
@@ -880,15 +915,114 @@ function renderTokenSelection(selection) {
   renderTokenPlanOrderList();
 }
 
-function renderTokenGroupMode(mode = state.tokenGroupMode) {
-  state.tokenGroupMode = normalizeTokenGroupMode(mode);
-  elements.tokenGroupModeButtons.forEach((button) => {
-    const active = normalizeTokenGroupMode(button.dataset.tokenGroupMode) === state.tokenGroupMode;
+function describeTokenStatusFilter(status) {
+  switch (normalizeTokenStatusFilter(status)) {
+    case "available":
+      return "可用";
+    case "cooling":
+      return "冷却";
+    case "disabled":
+      return "已禁用";
+    default:
+      return "全部";
+  }
+}
+
+function renderTokenViewMode(mode = state.tokenViewMode) {
+  state.tokenViewMode = normalizeTokenViewMode(mode);
+  elements.tokenViewButtons.forEach((button) => {
+    const active = normalizeTokenViewMode(button.dataset.tokenViewMode) === state.tokenViewMode;
     button.setAttribute("aria-pressed", String(active));
   });
-  if (elements.tokenGroupModeSummary) {
-    elements.tokenGroupModeSummary.textContent = describeTokenGroupMode();
+  if (elements.tokenQueryBar) {
+    elements.tokenQueryBar.hidden = state.tokenViewMode !== "keys";
   }
+  if (elements.tokenPagination) {
+    elements.tokenPagination.hidden = state.tokenViewMode !== "keys";
+  }
+}
+
+function statusFilterCount(status, counts = state.tokenFilteredCounts) {
+  if (status === "available") {
+    return Number(counts?.available || 0);
+  }
+  if (status === "cooling") {
+    return Number(counts?.cooling || 0);
+  }
+  if (status === "disabled") {
+    return Number(counts?.disabled || 0);
+  }
+  return Number(counts?.total || 0);
+}
+
+function renderTokenStatusFilters(counts = state.tokenFilteredCounts) {
+  if (!elements.tokenStatusFilters) {
+    return;
+  }
+  const statuses = ["all", "available", "cooling", "disabled"];
+  const activeStatus = normalizeTokenStatusFilter(state.tokenStatusFilter);
+  elements.tokenStatusFilters.innerHTML = statuses
+    .map(
+      (status) => `
+        <button
+          class="token-filter-chip token-filter-chip--${escapeHtml(status)}"
+          type="button"
+          data-token-status-filter="${escapeHtml(status)}"
+          aria-pressed="${activeStatus === status ? "true" : "false"}"
+        >
+          <span>${escapeHtml(describeTokenStatusFilter(status))}</span>
+          <strong>${escapeHtml(formatInteger(statusFilterCount(status, counts)))}</strong>
+        </button>
+      `,
+    )
+    .join("");
+}
+
+function planFilterCount(planType, counts = state.tokenPlanCounts) {
+  if (planType === AVAILABLE_PLAN_FILTER_ALL) {
+    return PLAN_TYPE_OPTIONS.reduce((sum, item) => sum + Number(counts?.[item] || 0), 0) + Number(counts?.unknown || 0);
+  }
+  return Number(counts?.[planType] || 0);
+}
+
+function renderTokenPlanFilters(counts = state.tokenPlanCounts) {
+  if (!elements.tokenPlanFilters) {
+    return;
+  }
+  const filters = [AVAILABLE_PLAN_FILTER_ALL, ...PLAN_TYPE_OPTIONS];
+  if (Number(counts?.unknown || 0) > 0 || state.tokenPlanFilter === TOKEN_PLAN_FILTER_UNKNOWN) {
+    filters.push(TOKEN_PLAN_FILTER_UNKNOWN);
+  }
+  const activeFilter = normalizeAvailablePlanFilter(state.tokenPlanFilter);
+  elements.tokenPlanFilters.innerHTML = filters
+    .map(
+      (planType) => `
+        <button
+          class="token-filter-chip"
+          type="button"
+          data-token-plan-filter="${escapeHtml(planType)}"
+          aria-pressed="${activeFilter === planType ? "true" : "false"}"
+        >
+          <span>${escapeHtml(planType === AVAILABLE_PLAN_FILTER_ALL ? "全部计划" : formatPlanType(planType))}</span>
+          <strong>${escapeHtml(formatInteger(planFilterCount(planType, counts)))}</strong>
+        </button>
+      `,
+    )
+    .join("");
+}
+
+function renderTokenSort() {
+  if (!elements.tokenSortSelect) {
+    return;
+  }
+  elements.tokenSortSelect.value = normalizeTokenSort(state.tokenSort);
+}
+
+function renderTokenQueryControls() {
+  renderTokenViewMode(state.tokenViewMode);
+  renderTokenStatusFilters();
+  renderTokenPlanFilters();
+  renderTokenSort();
 }
 
 function renderTokenPlanOrderList() {
@@ -984,10 +1118,11 @@ function filterTokenItems(items) {
 
 function canDragAvailableTokens() {
   return (
-    state.tokenGroupMode === "status" &&
+    state.tokenViewMode === "keys" &&
     state.tokenSelectionStrategy === "fill_first" &&
     !state.tokenOrderSaving &&
-    state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL &&
+    state.tokenStatusFilter === "available" &&
+    state.tokenPlanFilter === AVAILABLE_PLAN_FILTER_ALL &&
     getTokenSearchTerms().length === 0
   );
 }
@@ -1036,89 +1171,6 @@ function sortAvailableTokenItems(items) {
   });
 }
 
-function buildPlanTypeCounts(items) {
-  const counts = Object.create(null);
-  PLAN_TYPE_OPTIONS.forEach((planType) => {
-    counts[planType] = 0;
-  });
-  counts.unknown = 0;
-  if (!Array.isArray(items)) {
-    return counts;
-  }
-  items.forEach((item) => {
-    const planType = normalizePlanType(item?.plan_type);
-    counts[planType] = (counts[planType] || 0) + 1;
-  });
-  return counts;
-}
-
-function getVisiblePlanFilters(counts) {
-  const filters = [...PLAN_TYPE_OPTIONS];
-  if (Number(counts?.unknown || 0) > 0) {
-    filters.push("unknown");
-  }
-  return filters;
-}
-
-function describePlanTypeCounts(counts) {
-  return getVisiblePlanFilters(counts)
-    .map((planType) => `${formatPlanType(planType)} ${formatInteger(counts?.[planType] || 0)}`)
-    .join(" · ");
-}
-
-function filterAvailableItemsByPlan(items) {
-  const filter = normalizeAvailablePlanFilter(state.availablePlanFilter);
-  if (filter === AVAILABLE_PLAN_FILTER_ALL) {
-    return items;
-  }
-  return items.filter((item) => normalizePlanType(item?.plan_type) === filter);
-}
-
-function renderAvailablePlanFilters(allItems, visibleItems) {
-  const counts = buildPlanTypeCounts(allItems);
-  const activeFilter = normalizeAvailablePlanFilter(state.availablePlanFilter);
-  const filters = getVisiblePlanFilters(counts);
-  const totalCount = Array.isArray(allItems) ? allItems.length : 0;
-  const activeLabel =
-    activeFilter === AVAILABLE_PLAN_FILTER_ALL ? "全部计划" : `${formatPlanType(activeFilter)} 计划`;
-  const visibleCount = Array.isArray(visibleItems) ? visibleItems.length : 0;
-  return `
-    <div class="available-plan-filter" aria-label="按计划筛选可用 Key">
-      <div class="available-plan-filter__head">
-        <span class="available-plan-filter__label">计划数量</span>
-        <span class="available-plan-filter__summary">${escapeHtml(`${activeLabel} · ${formatInteger(visibleCount)} / ${formatInteger(totalCount)}`)}</span>
-      </div>
-      <div class="available-plan-filter__chips" role="group" aria-label="选择可用计划分组">
-        <button
-          class="available-plan-filter__chip"
-          type="button"
-          data-available-plan-filter="${AVAILABLE_PLAN_FILTER_ALL}"
-          aria-pressed="${activeFilter === AVAILABLE_PLAN_FILTER_ALL ? "true" : "false"}"
-        >
-          <span>全部</span>
-          <strong>${escapeHtml(formatInteger(totalCount))}</strong>
-        </button>
-        ${filters
-          .map((planType) => {
-            const count = counts?.[planType] || 0;
-            return `
-              <button
-                class="available-plan-filter__chip"
-                type="button"
-                data-available-plan-filter="${escapeHtml(planType)}"
-                aria-pressed="${activeFilter === planType ? "true" : "false"}"
-              >
-                <span>${escapeHtml(formatPlanType(planType))}</span>
-                <strong>${escapeHtml(formatInteger(count))}</strong>
-              </button>
-            `;
-          })
-          .join("")}
-      </div>
-    </div>
-  `;
-}
-
 function mergeVisibleTokenOrder(visibleTokenIds) {
   const visibleOrder = normalizeTokenSelectionOrder(visibleTokenIds);
   const visibleIds = new Set(visibleOrder);
@@ -1126,6 +1178,14 @@ function mergeVisibleTokenOrder(visibleTokenIds) {
     ...visibleOrder,
     ...state.tokenSelectionOrder.filter((tokenId) => !visibleIds.has(Number(tokenId))),
   ];
+}
+
+function hasActiveTokenQuery() {
+  return (
+    getTokenSearchTerms().length > 0 ||
+    normalizeTokenStatusFilter(state.tokenStatusFilter) !== DEFAULT_TOKEN_STATUS_FILTER ||
+    normalizeAvailablePlanFilter(state.tokenPlanFilter) !== AVAILABLE_PLAN_FILTER_ALL
+  );
 }
 
 function renderTokenSearchSummary(totalCount, visibleCount, customMessage = "") {
@@ -1136,8 +1196,8 @@ function renderTokenSearchSummary(totalCount, visibleCount, customMessage = "") 
     elements.tokenSearchSummary.textContent = customMessage;
     return;
   }
-  if (!getTokenSearchTerms().length) {
-    elements.tokenSearchSummary.textContent = totalCount > 0 ? `显示 ${formatInteger(totalCount)} 条` : "等待导入或刷新";
+  if (!hasActiveTokenQuery()) {
+    elements.tokenSearchSummary.textContent = totalCount > 0 ? `全池 ${formatInteger(totalCount)} 条` : "等待导入或刷新";
     return;
   }
   elements.tokenSearchSummary.textContent = `匹配 ${formatInteger(visibleCount)} / ${formatInteger(totalCount)} 条`;
@@ -1145,10 +1205,12 @@ function renderTokenSearchSummary(totalCount, visibleCount, customMessage = "") 
 
 function buildTokenListNote() {
   const pagination = state.tokenPagination;
+  const viewPrefix =
+    state.selectedImportBatchId != null ? `导入批次 #${state.selectedImportBatchId}` : "Key Explorer";
   if (pagination.total > 0 && pagination.returned > 0) {
-    return `每页 ${formatInteger(pagination.limit)} 条 · 当前 ${formatInteger(pagination.firstItem)}-${formatInteger(
+    return `${viewPrefix} · 每页 ${formatInteger(pagination.limit)} 条 · 当前 ${formatInteger(pagination.firstItem)}-${formatInteger(
       pagination.lastItem,
-    )} / ${formatInteger(pagination.total)} · 可用 / 冷却 / 已禁用分组`;
+    )} / ${formatInteger(pagination.total)} · 搜索、筛选、排序均为全局结果`;
   }
   return TOKEN_LIST_BASE_NOTE;
 }
@@ -1200,12 +1262,6 @@ function renderTokenPagination(customMessage = "") {
   )} 页 · ${formatInteger(pagination.firstItem)}-${formatInteger(pagination.lastItem)} / ${formatInteger(
     pagination.total,
   )}`;
-}
-
-function resolveTokenGroupOpenState(groupId, fallbackOpen) {
-  return Object.prototype.hasOwnProperty.call(state.tokenGroupOpenStates, groupId)
-    ? Boolean(state.tokenGroupOpenStates[groupId])
-    : Boolean(fallbackOpen);
 }
 
 function getTokenActionPendingKind(tokenId) {
@@ -1417,20 +1473,6 @@ function derivePlanTone(value) {
   }
 }
 
-function formatSubscriptionUntil(value) {
-  if (!value) {
-    return "—";
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
-  if (date.getTime() <= Date.now()) {
-    return `已过期 ${formatDate(value)}`;
-  }
-  return formatDate(value);
-}
-
 function formatCooldownUntil(value) {
   if (!value) {
     return "—";
@@ -1496,27 +1538,6 @@ function buildWorkspaceTokenCounts(items) {
     counts[workspaceAccountId] = (counts[workspaceAccountId] || 0) + 1;
   });
   return counts;
-}
-
-function countDistinctWorkspaces(items, workspaceTokenCounts = null) {
-  if (!Array.isArray(items) || items.length === 0) {
-    return 0;
-  }
-  if (workspaceTokenCounts && typeof workspaceTokenCounts === "object") {
-    return Object.keys(workspaceTokenCounts).length;
-  }
-  return Object.keys(buildWorkspaceTokenCounts(items)).length;
-}
-
-function describeTokenGroupMeta(items, presentText, emptyText, workspaceTokenCounts = null) {
-  if (!Array.isArray(items) || items.length === 0) {
-    return emptyText;
-  }
-  const distinctWorkspaceCount = countDistinctWorkspaces(items, workspaceTokenCounts);
-  if (!distinctWorkspaceCount || distinctWorkspaceCount === items.length) {
-    return presentText;
-  }
-  return `${presentText} · ${formatInteger(distinctWorkspaceCount)} 个工作区共享这 ${formatInteger(items.length)} 把 token`;
 }
 
 function buildTokenPresentation(item, workspaceTokenCounts) {
@@ -1736,15 +1757,6 @@ function summarizeTokenError(value) {
   return truncateText(raw, 148);
 }
 
-function renderTokenFact(label, value, tone = "default") {
-  return `
-    <span class="token-fact">
-      <span class="token-fact__label">${escapeHtml(label)}</span>
-      <span class="token-fact__value token-fact__value--${tone}">${escapeHtml(value)}</span>
-    </span>
-  `;
-}
-
 function renderQuotaWindow(window, fallbackLabel) {
   const label = window?.label || fallbackLabel;
   const remainingLabel = formatPercentValue(window?.remaining_percent);
@@ -1838,107 +1850,76 @@ function renderTokenErrorSection(item) {
   `;
 }
 
-function renderTokenCard(item, workspaceTokenCounts) {
+function resolveTokenDetailsOpenState(tokenId, fallbackOpen = false) {
+  const key = String(tokenId);
+  return Object.prototype.hasOwnProperty.call(state.tokenDetailsOpenStates, key)
+    ? Boolean(state.tokenDetailsOpenStates[key])
+    : Boolean(fallbackOpen);
+}
+
+function renderQuotaPreview(item) {
+  const window5h = getQuotaWindow(item, "code-5h");
+  const window7d = getQuotaWindow(item, "code-7d");
+  const formatPreview = (window, label) => `${label} ${formatPercentValue(window?.remaining_percent)}`;
+  return `
+    <div class="token-result__quota-preview" data-label="配额">
+      <span>${escapeHtml(formatPreview(window5h, "5h"))}</span>
+      <span>${escapeHtml(formatPreview(window7d, "7d"))}</span>
+    </div>
+  `;
+}
+
+function renderTokenResultRow(item, workspaceTokenCounts) {
   const status = deriveStatus(item);
   const tokenId = Number(item?.id);
   const draggable = status.tone === "available" && canDragAvailableTokens();
   const presentation = buildTokenPresentation(item, workspaceTokenCounts);
   const planLabel = formatPlanType(item.plan_type);
   const planTone = derivePlanTone(item.plan_type);
-  const subscriptionValue = formatSubscriptionUntil(item.subscription_active_until);
-  const subscriptionTone = subscriptionValue.startsWith("已过期")
-    ? "disabled"
-    : subscriptionValue === "—"
-      ? "muted"
-      : "default";
   const cooldownValue = formatCooldownUntil(item.cooldown_until);
-  const createdAtValue = formatDate(item.created_at);
   const lastUsedValue = formatDate(item.last_used_at);
-  const observedCostValue = item.observed_cost_usd == null ? "—" : formatUsd(item.observed_cost_usd);
   const activeStreams = Math.max(0, Number(item.active_streams || 0));
   const activeStreamCap = Math.max(1, Number(item.active_stream_cap || 10));
   const activeStreamsValue = `${formatInteger(activeStreams)}/${formatInteger(activeStreamCap)}`;
-  const cooldownTone = cooldownValue === "—" ? "muted" : "cooling";
-  const createdAtTone = createdAtValue === "—" ? "muted" : "default";
-  const lastUsedTone = lastUsedValue === "—" ? "muted" : "default";
-  const observedCostTone = item.observed_cost_usd == null ? "muted" : "money";
-  const activeStreamsTone = activeStreams <= 0 ? "muted" : activeStreams >= activeStreamCap ? "cooling" : "default";
+  const observedCostValue = item.observed_cost_usd == null ? "—" : formatUsd(item.observed_cost_usd);
   const errorSection = renderTokenErrorSection(item);
-  const observedCostLabel = "已用金额";
+  const open = resolveTokenDetailsOpenState(tokenId, false);
+
   return `
-    <article
-      class="token-card token-card--${status.tone}${draggable ? " token-card--draggable" : ""}"
+    <details
+      class="token-result token-result--${status.tone}${draggable ? " token-result--draggable" : ""}"
       data-token-card-id="${Number.isFinite(tokenId) ? tokenId : ""}"
       data-token-draggable="${draggable ? "true" : "false"}"
       draggable="${draggable ? "true" : "false"}"
       aria-grabbed="false"
+      ${open ? "open" : ""}
     >
-      <div class="token-card__top">
-        <div class="token-card__identity">
-          <span class="token-card__account">${escapeHtml(presentation.account)}</span>
-          <span class="token-card__meta">${escapeHtml(presentation.meta)}</span>
-        </div>
-        <div class="token-card__overview">
-          <div class="token-card__chips">
-            <span class="status-pill status-pill--${status.tone}">${status.label}</span>
-            <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
-          </div>
-          <div class="token-card__facts">
-            ${renderTokenFact("订阅", subscriptionValue, subscriptionTone)}
-            ${renderTokenFact("冷却到", cooldownValue, cooldownTone)}
-            ${renderTokenFact("入库时间", createdAtValue, createdAtTone)}
-            ${renderTokenFact("最近使用", lastUsedValue, lastUsedTone)}
-            ${renderTokenFact("当前并发", activeStreamsValue, activeStreamsTone)}
-            ${renderTokenFact(observedCostLabel, observedCostValue, observedCostTone)}
-          </div>
-        </div>
-        <div class="token-card__action">
-          ${renderTokenActionButtons(item)}
-        </div>
-      </div>
-      <div class="token-card__bottom${errorSection ? " token-card__bottom--with-error" : ""}">
-        ${renderQuotaSection(item, presentation)}
-        ${errorSection}
-      </div>
-    </article>
-  `;
-}
-
-function renderTokenGroup({
-  id,
-  title,
-  meta,
-  tone,
-  items,
-  open = false,
-  emptyMessage,
-  itemRenderer = renderTokenCard,
-  beforeItems = "",
-}) {
-  const list = Array.isArray(items) ? items : [];
-  return `
-    <details class="token-group token-group--${escapeHtml(tone)}" data-token-group="${escapeHtml(id)}"${open ? " open" : ""}>
-      <summary class="token-group__summary">
-        <span class="token-group__summary-main">
-          <span class="token-group__title-row">
-            <span class="token-group__title">${escapeHtml(title)}</span>
-            <span class="token-group__count">${escapeHtml(formatInteger(list.length))}</span>
-          </span>
-          <span class="token-group__meta">${escapeHtml(meta)}</span>
+      <summary class="token-result__summary">
+        <span class="token-result__identity">
+          <span class="token-result__account">${escapeHtml(presentation.account)}</span>
+          <span class="token-result__meta">${escapeHtml(presentation.meta)}</span>
         </span>
-        <span class="token-group__summary-action">
-          <span class="token-group__toggle-label token-group__toggle-label--closed">展开</span>
-          <span class="token-group__toggle-label token-group__toggle-label--open">收起</span>
-          <span class="token-group__toggle-icon" aria-hidden="true"></span>
+        <span class="token-result__status" data-label="状态">
+          <span class="status-pill status-pill--${status.tone}">${status.label}</span>
+          <span class="status-pill status-pill--${planTone}">${escapeHtml(planLabel)}</span>
         </span>
+        ${renderQuotaPreview(item)}
+        <span class="token-result__lifecycle" data-label="生命周期">
+          <span>冷却 ${escapeHtml(cooldownValue)}</span>
+          <span>最近 ${escapeHtml(lastUsedValue)}</span>
+        </span>
+        <span class="token-result__usage" data-label="并发/金额">
+          <span>${escapeHtml(activeStreamsValue)}</span>
+          <span>${escapeHtml(observedCostValue)}</span>
+        </span>
+        <span class="token-result__expand" aria-hidden="true">详情</span>
       </summary>
-      <div class="token-group__body token-group__body--fold">
-        ${beforeItems}
-        ${
-          list.length > 0
-            ? list.map((item) => itemRenderer(item)).join("")
-            : `<article class="empty-state empty-state--inline"><p>${escapeHtml(emptyMessage)}</p></article>`
-        }
+      <div class="token-result__details">
+        <div class="token-result__detail-grid">
+          ${renderQuotaSection(item, presentation)}
+          ${errorSection || `<div class="token-result__quiet-note">当前没有最近错误。</div>`}
+        </div>
+        ${renderTokenActionButtons(item)}
       </div>
     </details>
   `;
@@ -2162,21 +2143,6 @@ function renderRequestAnalytics(analytics) {
   renderRequestCostChart(analytics);
 }
 
-function normalizeImportBatchTokenIds(batch) {
-  const ids = [];
-  const seen = new Set();
-  const source = Array.isArray(batch?.token_ids) ? batch.token_ids : [];
-  source.forEach((value) => {
-    const tokenId = Number(value);
-    if (!Number.isInteger(tokenId) || tokenId <= 0 || seen.has(tokenId)) {
-      return;
-    }
-    seen.add(tokenId);
-    ids.push(tokenId);
-  });
-  return ids;
-}
-
 function buildImportBatchCounts(batch) {
   return {
     available: Math.max(0, Number(batch?.available || 0)),
@@ -2188,20 +2154,6 @@ function buildImportBatchCounts(batch) {
     processedCount: Math.max(0, Number(batch?.processed_count || 0)),
     failedCount: Math.max(0, Number(batch?.failed_count || 0)),
   };
-}
-
-function deriveImportBatchTone(batch) {
-  const counts = buildImportBatchCounts(batch);
-  if (counts.available > 0) {
-    return "available";
-  }
-  if (counts.cooling > 0) {
-    return "cooling";
-  }
-  if (counts.disabled > 0 || counts.missing > 0) {
-    return "disabled";
-  }
-  return "cooling";
 }
 
 function formatImportBatchTitle(batch) {
@@ -2220,31 +2172,51 @@ function formatImportBatchStatus(batch) {
   return labels[status] || status || "未知状态";
 }
 
-function describeImportBatchMeta(batch, visibleCount) {
-  const counts = buildImportBatchCounts(batch);
-  const submittedAt = formatDate(batch?.submitted_at);
-  const progress =
-    counts.totalCount > 0
-      ? `进度 ${formatInteger(counts.processedCount)}/${formatInteger(counts.totalCount)}`
-      : "无提交记录";
-  const missingText = counts.missing > 0 ? ` · 已删除 ${formatInteger(counts.missing)}` : "";
-  return `${formatImportBatchStatus(batch)} · ${progress} · 可用 ${formatInteger(counts.available)} · 冷却 ${formatInteger(
-    counts.cooling,
-  )} · 禁用 ${formatInteger(counts.disabled)}${missingText} · 显示 ${formatInteger(visibleCount)} 条 · 提交 ${submittedAt}`;
-}
+function renderImportBatchList() {
+  const batches = Array.isArray(state.tokenImportBatches) ? [...state.tokenImportBatches].sort(compareImportBatches) : [];
+  if (!batches.length) {
+    elements.tokenList.innerHTML = `
+      <article class="empty-state">
+        <p>还没有可展示的导入批次。新的后台导入任务完成后会显示每批当前状态数量。</p>
+      </article>
+    `;
+    return;
+  }
 
-function renderImportBatchCountStrip(batch) {
-  const counts = buildImportBatchCounts(batch);
-  const missingMarkup =
-    counts.missing > 0
-      ? `<span class="batch-count batch-count--missing"><span>已删除</span><strong>${escapeHtml(formatInteger(counts.missing))}</strong></span>`
-      : "";
-  return `
-    <div class="import-batch-counts" aria-label="导入批次当前状态数量">
-      <span class="batch-count batch-count--available"><span>可用</span><strong>${escapeHtml(formatInteger(counts.available))}</strong></span>
-      <span class="batch-count batch-count--cooling"><span>冷却</span><strong>${escapeHtml(formatInteger(counts.cooling))}</strong></span>
-      <span class="batch-count batch-count--disabled"><span>禁用</span><strong>${escapeHtml(formatInteger(counts.disabled))}</strong></span>
-      ${missingMarkup}
+  elements.tokenList.innerHTML = `
+    <div class="import-batch-list" role="list" aria-label="导入批次">
+      ${batches
+        .map((batch) => {
+          const counts = buildImportBatchCounts(batch);
+          const batchId = Number(batch?.id);
+          const selected = state.selectedImportBatchId === batchId;
+          return `
+            <article class="import-batch-card${selected ? " import-batch-card--selected" : ""}" role="listitem">
+              <div class="import-batch-card__main">
+                <div>
+                  <h3>${escapeHtml(formatImportBatchTitle(batch))}</h3>
+                  <p>${escapeHtml(formatImportBatchStatus(batch))} · 提交 ${escapeHtml(formatDate(batch?.submitted_at))}</p>
+                </div>
+                <button
+                  class="ghost-button import-batch-card__button"
+                  type="button"
+                  data-import-batch-view="${escapeHtml(batchId)}"
+                >
+                  查看 Key
+                </button>
+              </div>
+              <div class="import-batch-card__metrics" aria-label="批次结果">
+                <span><strong>${escapeHtml(formatInteger(counts.totalCount))}</strong><small>提交</small></span>
+                <span><strong>${escapeHtml(formatInteger(counts.processedCount))}</strong><small>已处理</small></span>
+                <span><strong>${escapeHtml(formatInteger(counts.available))}</strong><small>可用</small></span>
+                <span><strong>${escapeHtml(formatInteger(counts.cooling))}</strong><small>冷却</small></span>
+                <span><strong>${escapeHtml(formatInteger(counts.disabled))}</strong><small>禁用</small></span>
+                <span><strong>${escapeHtml(formatInteger(counts.failedCount))}</strong><small>失败</small></span>
+              </div>
+            </article>
+          `;
+        })
+        .join("")}
     </div>
   `;
 }
@@ -2258,183 +2230,35 @@ function compareImportBatches(left, right) {
   return Number(right?.id || 0) - Number(left?.id || 0);
 }
 
-function renderImportBatchTokenList(filteredItems) {
-  const batches = Array.isArray(state.tokenImportBatches) ? [...state.tokenImportBatches].sort(compareImportBatches) : [];
-  if (!batches.length) {
-    elements.tokenList.innerHTML = `
-      <article class="empty-state">
-        <p>还没有可展示的导入批次。新的后台导入任务完成后会显示每批当前状态数量。</p>
-      </article>
-    `;
-    return;
-  }
-
-  const workspaceTokenCounts = buildWorkspaceTokenCounts(filteredItems);
-  const itemsById = new Map(filteredItems.map((item) => [Number(item?.id), item]));
-  const assignedVisibleIds = new Set();
-  const batchGroups = batches
-    .map((batch, index) => {
-      const tokenIds = normalizeImportBatchTokenIds(batch);
-      const visibleItems = tokenIds
-        .map((tokenId) => itemsById.get(Number(tokenId)))
-        .filter(Boolean);
-      visibleItems.forEach((item) => assignedVisibleIds.add(Number(item.id)));
-      const groupId = `import-batch-${Number(batch?.id || index)}`;
-      return renderTokenGroup({
-        id: groupId,
-        title: formatImportBatchTitle(batch),
-        meta: describeImportBatchMeta(batch, visibleItems.length),
-        tone: deriveImportBatchTone(batch),
-        items: visibleItems,
-        itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
-        beforeItems: renderImportBatchCountStrip(batch),
-        open: resolveTokenGroupOpenState(groupId, index === 0),
-        emptyMessage: "这批导入关联的 key 不在当前列表或已被搜索条件过滤。",
-      });
-    })
-    .join("");
-
-  const unbatchedItems = filteredItems.filter((item) => !assignedVisibleIds.has(Number(item?.id)));
-  const unbatchedGroup = unbatchedItems.length
-    ? renderTokenGroup({
-        id: "import-batch-unassigned",
-        title: "未归入最近批次",
-        meta: `当前筛选里有 ${formatInteger(unbatchedItems.length)} 把 key 不在最近导入批次中`,
-        tone: "cooling",
-        items: unbatchedItems,
-        itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
-        open: resolveTokenGroupOpenState("import-batch-unassigned", false),
-        emptyMessage: "当前没有未归入最近批次的 key。",
-      })
-    : "";
-
-  elements.tokenList.innerHTML = `${batchGroups}${unbatchedGroup}`;
-}
-
 function renderTokenList(items) {
   const list = Array.isArray(items) ? items : [];
-  const filteredItems = filterTokenItems(list);
-  renderTokenSearchSummary(list.length, filteredItems.length);
+  const totalCount = Number(state.tokenPagination.total || list.length || 0);
+  renderTokenSearchSummary(Number(state.tokenFilteredCounts?.total || totalCount), totalCount);
+
+  if (state.tokenViewMode === "import_batches") {
+    renderImportBatchList();
+    return;
+  }
 
   if (list.length === 0) {
-    if (state.tokenGroupMode === "import_batch" && state.tokenImportBatches.length > 0) {
-      renderImportBatchTokenList([]);
-      return;
-    }
+    const queryParts = [
+      normalizeWhitespace(state.tokenSearchTerm) ? `搜索“${normalizeWhitespace(state.tokenSearchTerm)}”` : "",
+      state.tokenStatusFilter !== DEFAULT_TOKEN_STATUS_FILTER ? describeTokenStatusFilter(state.tokenStatusFilter) : "",
+      state.tokenPlanFilter !== AVAILABLE_PLAN_FILTER_ALL ? `${formatPlanType(state.tokenPlanFilter)} 计划` : "",
+    ].filter(Boolean);
     elements.tokenList.innerHTML = `
       <article class="empty-state">
-        <p>没有 key 记录。先导入一批 key，列表会在这里展开。</p>
+        <p>${escapeHtml(queryParts.length ? `没有匹配 ${queryParts.join(" · ")} 的 key。` : "没有 key 记录。先导入一批 key，列表会在这里展开。")}</p>
       </article>
     `;
     return;
   }
 
-  if (filteredItems.length === 0) {
-    const query = normalizeWhitespace(state.tokenSearchTerm);
-    elements.tokenList.innerHTML = `
-      <article class="empty-state">
-        <p>当前页没有匹配“${escapeHtml(query)}”的 key。</p>
-      </article>
-    `;
-    return;
-  }
-
-  if (state.tokenGroupMode === "import_batch") {
-    renderImportBatchTokenList(filteredItems);
-    return;
-  }
-
-  renderStatusTokenList(filteredItems);
-}
-
-function renderStatusTokenList(filteredItems) {
-  const availableItems = [];
-  const coolingItems = [];
-  const disabledItems = [];
-  const workspaceTokenCounts = buildWorkspaceTokenCounts(filteredItems);
-
-  filteredItems.forEach((item) => {
-    const status = deriveStatus(item);
-    if (status.tone === "disabled") {
-      disabledItems.push(item);
-      return;
-    }
-    if (status.tone === "cooling") {
-      coolingItems.push(item);
-      return;
-    }
-    availableItems.push(item);
-  });
-  const orderedAvailableItems = sortAvailableTokenItems(availableItems);
-  const availablePlanCounts = buildPlanTypeCounts(orderedAvailableItems);
-  const visibleAvailableItems = filterAvailableItemsByPlan(orderedAvailableItems);
-  const availablePlanCountLabel = describePlanTypeCounts(availablePlanCounts);
-  const availableMeta =
-    state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL
-      ? describeTokenGroupMeta(
-          orderedAvailableItems,
-          `可立即调度 · ${availablePlanCountLabel}`,
-          "当前没有可立即调度的 key",
-          buildWorkspaceTokenCounts(orderedAvailableItems),
-        )
-      : `${formatPlanType(state.availablePlanFilter)} 计划 · ${formatInteger(visibleAvailableItems.length)} / ${formatInteger(
-          orderedAvailableItems.length,
-        )} · ${availablePlanCountLabel}`;
-
-  const availableOpen = resolveTokenGroupOpenState("available", true);
-  const coolingOpen = resolveTokenGroupOpenState("cooling", visibleAvailableItems.length === 0 && coolingItems.length > 0);
-  const disabledOpen = resolveTokenGroupOpenState(
-    "disabled",
-    visibleAvailableItems.length === 0 && coolingItems.length === 0 && disabledItems.length > 0,
-  );
-
+  const workspaceTokenCounts = buildWorkspaceTokenCounts(list);
   elements.tokenList.innerHTML = `
-    ${renderTokenGroup({
-      id: "available",
-      title: "可用",
-      meta: availableMeta,
-      tone: "available",
-      items: visibleAvailableItems,
-      itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
-      beforeItems: orderedAvailableItems.length
-        ? renderAvailablePlanFilters(orderedAvailableItems, visibleAvailableItems)
-        : "",
-      open: availableOpen,
-      emptyMessage:
-        state.availablePlanFilter === AVAILABLE_PLAN_FILTER_ALL
-          ? "当前没有可立即调度的 key。"
-          : `当前没有可用的 ${formatPlanType(state.availablePlanFilter)} 计划 key。`,
-    })}
-    ${renderTokenGroup({
-      id: "cooling",
-      title: "冷却",
-      meta: describeTokenGroupMeta(
-        coolingItems,
-        "等待冷却窗口结束",
-        "当前没有冷却中的 key",
-        buildWorkspaceTokenCounts(coolingItems),
-      ),
-      tone: "cooling",
-      items: coolingItems,
-      itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
-      open: coolingOpen,
-      emptyMessage: "当前没有处于冷却窗口的 key。",
-    })}
-    ${renderTokenGroup({
-      id: "disabled",
-      title: "已禁用",
-      meta: describeTokenGroupMeta(
-        disabledItems,
-        "已移出调度池",
-        "当前没有已禁用 key",
-        buildWorkspaceTokenCounts(disabledItems),
-      ),
-      tone: "disabled",
-      items: disabledItems,
-      itemRenderer: (item) => renderTokenCard(item, workspaceTokenCounts),
-      open: disabledOpen,
-      emptyMessage: "当前没有已禁用的 key。",
-    })}
+    <div class="token-result-list" role="list" aria-label="Key 查询结果">
+      ${list.map((item) => renderTokenResultRow(item, workspaceTokenCounts)).join("")}
+    </div>
   `;
 }
 
@@ -2724,7 +2548,14 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     limit: String(limit),
     offset: String(offset),
     include_quota: "1",
+    q: normalizeWhitespace(state.tokenSearchTerm),
+    status: normalizeTokenStatusFilter(state.tokenStatusFilter),
+    plan_type: normalizeAvailablePlanFilter(state.tokenPlanFilter),
+    sort: normalizeTokenSort(state.tokenSort),
   });
+  if (state.selectedImportBatchId != null) {
+    params.set("import_batch_id", String(state.selectedImportBatchId));
+  }
 
   state.tokenPage = requestedPage;
   state.tokenPageLoading = true;
@@ -2737,6 +2568,8 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     state.tokensLoaded = true;
     state.tokenItems = Array.isArray(data.items) ? data.items : [];
     state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : [];
+    state.tokenFilteredCounts = data.filtered_counts || data.counts || state.tokenFilteredCounts;
+    state.tokenPlanCounts = data.plan_counts || state.tokenPlanCounts;
     const pagination = normalizeTokenPagination(data.pagination || {}, state.tokenItems.length, requestedPage);
     if (allowPageAdjust && pagination.total > 0 && state.tokenItems.length === 0 && requestedPage > pagination.totalPages) {
       state.tokenPage = pagination.totalPages;
@@ -2748,9 +2581,9 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     elements.listNote.textContent = buildTokenListNote();
     renderTokenSelection(data.selection || {});
     setTokenSelectionDisabled(state.tokenSelectionSaving);
-    setTokenGroupModeDisabled(false);
     setTokenPlanOrderDisabled(state.tokenPlanOrderSaving);
     setTokenSearchDisabled(false);
+    renderTokenQueryControls();
     renderTokenPagination();
     renderTokenList(state.tokenItems);
     if (data.counts) {
@@ -2760,6 +2593,8 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     state.tokensLoaded = true;
     state.tokenItems = [];
     state.tokenImportBatches = [];
+    state.tokenFilteredCounts = { total: 0, active: 0, available: 0, cooling: 0, disabled: 0 };
+    state.tokenPlanCounts = { free: 0, plus: 0, team: 0, pro: 0, unknown: 0 };
     state.tokenPagination = normalizeTokenPagination({}, 0, 1);
     state.tokenPage = 1;
     state.tokenPageLoading = false;
@@ -2770,17 +2605,14 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
       if (elements.tokenSelectionSummary) {
         elements.tokenSelectionSummary.textContent = "需要 Service API Key";
       }
-      if (elements.tokenGroupModeSummary) {
-        elements.tokenGroupModeSummary.textContent = "需要 Service API Key";
-      }
       if (elements.tokenPlanOrderSummary) {
         elements.tokenPlanOrderSummary.textContent = "需要 Service API Key";
       }
       setTokenSelectionDisabled(true);
-      setTokenGroupModeDisabled(true);
       setTokenPlanOrderDisabled(true);
       setTokenSearchDisabled(true);
       setTokenPaginationDisabled(true);
+      renderTokenQueryControls();
       elements.tokenList.innerHTML = `
         <article class="empty-state">
           <p>管理接口已加锁。填入 Service API Key 后可查看明细和导入 key。</p>
@@ -2794,17 +2626,14 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "切换器同步失败";
     }
-    if (elements.tokenGroupModeSummary) {
-      elements.tokenGroupModeSummary.textContent = "分组同步失败";
-    }
     if (elements.tokenPlanOrderSummary) {
       elements.tokenPlanOrderSummary.textContent = "顺序同步失败";
     }
     setTokenSelectionDisabled(true);
-    setTokenGroupModeDisabled(true);
     setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
     setTokenPaginationDisabled(true);
+    renderTokenQueryControls();
     elements.tokenList.innerHTML = `
       <article class="empty-state">
         <p>${escapeHtml(error.message)}</p>
@@ -2824,8 +2653,75 @@ async function goToTokenPage(page) {
     renderTokenPagination();
     return;
   }
-  state.availablePlanFilter = AVAILABLE_PLAN_FILTER_ALL;
   await loadTokens({ page: nextPage });
+}
+
+async function applyTokenQuery(updates = {}) {
+  if (Object.prototype.hasOwnProperty.call(updates, "search")) {
+    state.tokenSearchTerm = String(updates.search || "");
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, "status")) {
+    state.tokenStatusFilter = normalizeTokenStatusFilter(updates.status);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, "planType")) {
+    state.tokenPlanFilter = normalizeAvailablePlanFilter(updates.planType);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, "sort")) {
+    state.tokenSort = normalizeTokenSort(updates.sort);
+  }
+  state.tokenPage = 1;
+  await loadTokens({ page: 1 });
+}
+
+function queueTokenSearch(value) {
+  state.tokenSearchTerm = String(value || "");
+  if (state.tokenSearchDebounceTimer) {
+    window.clearTimeout(state.tokenSearchDebounceTimer);
+  }
+  state.tokenSearchDebounceTimer = window.setTimeout(() => {
+    state.tokenSearchDebounceTimer = null;
+    void applyTokenQuery({ search: state.tokenSearchTerm });
+  }, TOKEN_QUERY_DEBOUNCE_MS);
+}
+
+async function setTokenViewMode(mode) {
+  const nextMode = normalizeTokenViewMode(mode);
+  if (nextMode === state.tokenViewMode) {
+    if (nextMode === "keys" && state.selectedImportBatchId != null) {
+      state.selectedImportBatchId = null;
+      await loadTokens({ page: 1 });
+      return;
+    }
+    renderTokenViewMode(nextMode);
+    return;
+  }
+  state.tokenViewMode = nextMode;
+  state.selectedImportBatchId = null;
+  state.tokenPage = 1;
+  renderTokenViewMode(nextMode);
+  if (nextMode === "import_batches") {
+    renderImportBatchList();
+    elements.listNote.textContent = "导入批次独立展示；点击批次可查看关联 key。";
+    return;
+  }
+  await loadTokens({ page: 1 });
+}
+
+async function viewImportBatch(batchId) {
+  const resolvedBatchId = normalizePositiveInteger(batchId, 0);
+  if (!resolvedBatchId) {
+    return;
+  }
+  state.selectedImportBatchId = resolvedBatchId;
+  state.tokenViewMode = "keys";
+  state.tokenStatusFilter = DEFAULT_TOKEN_STATUS_FILTER;
+  state.tokenPlanFilter = AVAILABLE_PLAN_FILTER_ALL;
+  state.tokenSearchTerm = "";
+  if (elements.tokenSearchInput) {
+    elements.tokenSearchInput.value = "";
+  }
+  renderTokenViewMode("keys");
+  await loadTokens({ page: 1 });
 }
 
 async function saveTokenSelection(strategy) {
@@ -3113,12 +3009,8 @@ function findAvailableTokenBody(target) {
   if (!(target instanceof Element)) {
     return null;
   }
-  const group = target.closest('[data-token-group="available"]');
-  if (!(group instanceof HTMLElement)) {
-    return null;
-  }
-  const body = group.querySelector(".token-group__body");
-  return body instanceof HTMLElement ? body : null;
+  const list = target.closest(".token-result-list");
+  return list instanceof HTMLElement ? list : null;
 }
 
 function findDraggedTokenCard(target) {
@@ -3129,16 +3021,12 @@ function findDraggedTokenCard(target) {
   if (!(card instanceof HTMLElement)) {
     return null;
   }
-  const group = card.closest("[data-token-group]");
-  if (!(group instanceof HTMLElement) || group.dataset.tokenGroup !== "available") {
-    return null;
-  }
   return card;
 }
 
 function getTokenDragAfterElement(container, pointerY) {
   const cards = Array.from(
-    container.querySelectorAll('.token-card[data-token-draggable="true"]:not(.is-dragging)'),
+    container.querySelectorAll('.token-result[data-token-draggable="true"]:not(.is-dragging)'),
   ).filter((card) => card instanceof HTMLElement);
   return cards.reduce(
     (closest, card) => {
@@ -3161,7 +3049,7 @@ function collectAvailableTokenOrder(container) {
 
 function clearTokenDragState() {
   state.tokenDragTokenId = null;
-  elements.tokenList.querySelectorAll(".token-card.is-dragging").forEach((card) => {
+  elements.tokenList.querySelectorAll(".token-result.is-dragging").forEach((card) => {
     card.classList.remove("is-dragging");
     card.setAttribute("aria-grabbed", "false");
   });
@@ -3196,7 +3084,7 @@ function handleTokenCardDragOver(event) {
     return;
   }
   const body = findAvailableTokenBody(event.target);
-  const draggingCard = body?.querySelector(".token-card.is-dragging");
+  const draggingCard = body?.querySelector(".token-result.is-dragging");
   if (!(body instanceof HTMLElement) || !(draggingCard instanceof HTMLElement)) {
     return;
   }
@@ -3362,6 +3250,7 @@ async function refreshDashboard() {
   } finally {
     state.refreshing = false;
     elements.refreshButton.disabled = false;
+    renderTokenPagination();
     if (state.importJobId && !state.importJobPollTimer) {
       resumeTrackedImportJob();
     }
@@ -3551,7 +3440,8 @@ function syncSystemTheme() {
 
 applyTheme(state.themePreference, { persist: false });
 renderImportQueuePosition(state.importQueuePosition);
-renderTokenGroupMode(state.tokenGroupMode);
+renderTokenViewMode(state.tokenViewMode);
+renderTokenQueryControls();
 renderTokenSelection({ strategy: state.tokenSelectionStrategy });
 renderTokenPlanOrderList();
 renderInitialLoadingStates();
@@ -3568,10 +3458,9 @@ elements.importQueuePositionButtons.forEach((button) => {
   button.addEventListener("click", () => renderImportQueuePosition(button.dataset.importQueuePosition));
 });
 
-elements.tokenGroupModeButtons.forEach((button) => {
+elements.tokenViewButtons.forEach((button) => {
   button.addEventListener("click", () => {
-    renderTokenGroupMode(button.dataset.tokenGroupMode);
-    renderTokenList(state.tokenItems);
+    void setTokenViewMode(button.dataset.tokenViewMode);
   });
 });
 
@@ -3621,8 +3510,42 @@ if (elements.tokenSearchInput) {
     if (!(event.target instanceof HTMLInputElement)) {
       return;
     }
-    state.tokenSearchTerm = event.target.value;
-    renderTokenList(state.tokenItems);
+    queueTokenSearch(event.target.value);
+  });
+}
+
+if (elements.tokenStatusFilters) {
+  elements.tokenStatusFilters.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const button = event.target.closest("[data-token-status-filter]");
+    if (!(button instanceof HTMLElement)) {
+      return;
+    }
+    void applyTokenQuery({ status: button.dataset.tokenStatusFilter });
+  });
+}
+
+if (elements.tokenPlanFilters) {
+  elements.tokenPlanFilters.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const button = event.target.closest("[data-token-plan-filter]");
+    if (!(button instanceof HTMLElement)) {
+      return;
+    }
+    void applyTokenQuery({ planType: button.dataset.tokenPlanFilter });
+  });
+}
+
+if (elements.tokenSortSelect) {
+  elements.tokenSortSelect.addEventListener("change", (event) => {
+    if (!(event.target instanceof HTMLSelectElement)) {
+      return;
+    }
+    void applyTokenQuery({ sort: event.target.value });
   });
 }
 
@@ -3666,10 +3589,11 @@ elements.tokenList.addEventListener("click", async (event) => {
   if (!(event.target instanceof Element)) {
     return;
   }
-  const availablePlanFilter = event.target.closest("[data-available-plan-filter]");
-  if (availablePlanFilter instanceof HTMLElement) {
-    state.availablePlanFilter = normalizeAvailablePlanFilter(availablePlanFilter.dataset.availablePlanFilter);
-    renderTokenList(state.tokenItems);
+  const importBatchButton = event.target.closest("[data-import-batch-view]");
+  if (importBatchButton instanceof HTMLElement) {
+    try {
+      await viewImportBatch(importBatchButton.dataset.importBatchView);
+    } catch {}
     return;
   }
   const probeButton = event.target.closest("[data-token-probe]");
@@ -3733,11 +3657,11 @@ elements.tokenList.addEventListener(
     if (!(target instanceof HTMLDetailsElement)) {
       return;
     }
-    const groupId = target.dataset.tokenGroup;
-    if (!groupId) {
+    const tokenId = target.dataset.tokenCardId;
+    if (!tokenId) {
       return;
     }
-    state.tokenGroupOpenStates[groupId] = target.open;
+    state.tokenDetailsOpenStates[String(tokenId)] = target.open;
   },
   true,
 );
