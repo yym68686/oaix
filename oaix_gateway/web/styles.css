@@ -444,20 +444,32 @@ button {
 
 .token-toolbar {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(220px, 0.34fr) minmax(250px, 0.42fr) minmax(320px, 0.68fr);
-  align-items: end;
-  gap: 14px;
-  margin-bottom: 18px;
-  padding: 14px;
-  border: 1px solid var(--border-soft);
-  border-radius: calc(var(--radius-xl) - 12px);
-  background: var(--surface-card);
+  grid-template-columns: minmax(300px, 1fr) minmax(220px, 0.52fr) minmax(320px, 0.62fr);
+  grid-template-areas:
+    "search search plan"
+    "selection grouping plan";
+  align-items: start;
+  gap: 16px 18px;
+  margin: 18px 0 20px;
+  padding: 18px 0 20px;
+  border-top: 1px solid var(--border-table-row);
+  border-bottom: 1px solid var(--border-table-row);
+  background: transparent;
 }
 
 .token-search {
+  grid-area: search;
   display: grid;
   min-width: 0;
   gap: 8px;
+}
+
+.token-selection-switch {
+  grid-area: selection;
+}
+
+.token-group-switch {
+  grid-area: grouping;
 }
 
 .token-search__head {
@@ -593,16 +605,25 @@ button {
 }
 
 .plan-order-panel {
+  grid-area: plan;
   display: grid;
-  gap: 10px;
+  align-self: stretch;
+  align-content: start;
+  gap: 12px;
   min-width: 0;
+  padding-left: 18px;
+  border-left: 1px solid var(--border-table-row);
 }
 
 .plan-order-list {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   min-width: 0;
+}
+
+.plan-order-list--editable {
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
 }
 
 .plan-order-item {
@@ -643,6 +664,16 @@ button {
   opacity: 0.72;
 }
 
+.plan-order-list:not(.plan-order-list--editable) .plan-order-item {
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 36px;
+  padding: 6px 10px;
+}
+
+.plan-order-list:not(.plan-order-list--editable) .plan-order-item--disabled {
+  opacity: 1;
+}
+
 .plan-order-item__rank {
   display: inline-flex;
   align-items: center;
@@ -667,6 +698,10 @@ button {
 .plan-order-item__actions {
   display: inline-flex;
   gap: 4px;
+}
+
+.plan-order-list:not(.plan-order-list--editable) .plan-order-item__actions {
+  display: none;
 }
 
 .plan-order-item__move {
@@ -2741,11 +2776,21 @@ button {
 
   .token-toolbar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-areas:
+      "search search"
+      "selection grouping"
+      "plan plan";
   }
 
-  .token-search,
   .plan-order-panel {
-    grid-column: 1 / -1;
+    padding-top: 16px;
+    padding-left: 0;
+    border-top: 1px solid var(--border-table-row);
+    border-left: 0;
+  }
+
+  .plan-order-list:not(.plan-order-list--editable) {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .token-card__top {
@@ -2797,7 +2842,15 @@ button {
 
   .token-toolbar {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      "search"
+      "selection"
+      "grouping"
+      "plan";
     padding: 12px;
+    border: 1px solid var(--border-soft);
+    border-radius: calc(var(--radius-xl) - 14px);
+    background: color-mix(in oklab, var(--surface-card) 58%, transparent);
   }
 
   .token-search__head,
@@ -2819,6 +2872,15 @@ button {
 
   .selection-switch {
     width: 100%;
+  }
+
+  .plan-order-panel {
+    padding-top: 12px;
+  }
+
+  .plan-order-list,
+  .plan-order-list:not(.plan-order-list--editable) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .theme-switch,

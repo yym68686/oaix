@@ -822,6 +822,7 @@ function renderTokenPlanOrderList() {
   }
   const planOrder = normalizeTokenPlanOrder(state.tokenPlanOrder);
   const disabled = state.tokenPlanOrderSaving || !state.tokenPlanOrderEnabled;
+  elements.tokenPlanOrderList.classList.toggle("plan-order-list--editable", state.tokenPlanOrderEnabled);
   elements.tokenPlanOrderList.innerHTML = planOrder
     .map((planType, index) => {
       const label = formatPlanType(planType);
