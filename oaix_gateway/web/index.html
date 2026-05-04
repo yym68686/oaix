@@ -161,14 +161,14 @@
               autocapitalize="off"
               autocomplete="off"
               autocorrect="off"
-              placeholder='支持 JSON；也支持 account_id,refresh_token。单条 key 被换行打断时会自动拼接'
+              placeholder='支持 JSON；也支持每行 refresh_token，或 account_id,refresh_token。逗号格式的单条 key 被换行打断时会自动拼接'
             ></textarea>
           </label>
 
           <label class="upload-zone" for="token-files">
             <input id="token-files" type="file" accept=".json,.txt,.csv,application/json,text/plain" multiple />
             <span class="upload-zone__title">选择一个或多个 JSON / TXT / CSV 文件</span>
-            <span class="upload-zone__hint">支持 JSON，或 account_id,refresh_token；单条 key 被断行时也会自动拼接</span>
+            <span class="upload-zone__hint">支持 JSON、每行 refresh_token，或 account_id,refresh_token；逗号格式断行时会自动拼接</span>
           </label>
 
           <div class="selection-switch import-placement-switch" aria-label="导入后 Key 请求队列位置">

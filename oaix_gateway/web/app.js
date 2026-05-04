@@ -3411,9 +3411,9 @@ function collectLogicalKeyLines(text) {
     const currentHasComma = current.includes(",");
     const nextHasComma = line.includes(",");
 
-    // Some paste sources hard-wrap a single key across multiple lines.
-    // Keep joining until we see a new record that clearly starts with its own comma pair.
-    if (currentHasComma && nextHasComma) {
+    // Some paste sources hard-wrap the refresh_token part of account_id,refresh_token rows.
+    // Refresh-token-only rows have no delimiter, so keep those as one record per line.
+    if (!currentHasComma || nextHasComma) {
       logicalLines.push(line);
       continue;
     }
@@ -3430,8 +3430,16 @@ function parseAccountRefreshLines(text, sourceLabel) {
 
   lines.forEach((line, index) => {
     const commaIndex = line.indexOf(",");
+    if (commaIndex === -1) {
+      payloads.push({
+        refresh_token: line.trim(),
+        type: "codex",
+      });
+      return;
+    }
+
     if (commaIndex <= 0 || commaIndex === line.length - 1) {
-      throw new Error(`${sourceLabel} 第 ${index + 1} 条记录格式错误，应为 account_id,refresh_token`);
+      throw new Error(`${sourceLabel} 第 ${index + 1} 条记录格式错误，应为 refresh_token 或 account_id,refresh_token`);
     }
 
     const accountId = line.slice(0, commaIndex).trim();
@@ -3482,7 +3490,7 @@ async function collectImportPayloads() {
   }
 
   if (payloads.length === 0) {
-    throw new Error("请先粘贴 JSON / account_id,refresh_token 文本，或选择至少一个文件");
+    throw new Error("请先粘贴 JSON / refresh_token / account_id,refresh_token 文本，或选择至少一个文件");
   }
   return payloads;
 }

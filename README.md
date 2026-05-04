@@ -136,7 +136,15 @@ curl -X POST http://127.0.0.1:8000/admin/tokens/import \
 python import_tokens.py token_*.json
 ```
 
-前端控制台里除了 JSON，也支持直接粘贴这种逐行格式：
+前端控制台里除了 JSON，也支持直接粘贴逐行格式。只有 refresh token 时可以每行一个：
+
+```text
+refresh_token_1
+refresh_token_2
+refresh_token_3
+```
+
+如果已经有账号 ID，也可以继续使用兼容格式：
 
 ```text
 account_id_1,refresh_token_1
@@ -144,7 +152,7 @@ account_id_2,refresh_token_2
 account_id_3,refresh_token_3
 ```
 
-也就是每行一个 `account_id,refresh_token`，粘贴后会自动解析成导入批次。
+粘贴后会自动解析成导入批次；只有 `refresh_token` 的行会让 `account_id` 留空，后续由 token 刷新和请求过程补齐可获取的信息。
 
 导入去重规则：
 
