@@ -84,6 +84,9 @@ DEFAULT_FILL_FIRST_TOKEN_CACHE_TTL_MS = 250
 DEFAULT_FILL_FIRST_TOKEN_STALE_TTL_SECONDS = 5.0
 DEFAULT_TOKEN_STATUS_WRITE_CONCURRENCY = 1
 DEFAULT_TOKEN_STATUS_WRITE_LOCK_TIMEOUT_MS = 250
+MIN_TOKEN_ACTIVE_STREAM_CAP = 1
+MAX_TOKEN_ACTIVE_STREAM_CAP = 10
+DEFAULT_TOKEN_ACTIVE_STREAM_CAP = 10
 
 
 @dataclass(frozen=True)
@@ -154,6 +157,7 @@ class TokenSelectionSettings:
     token_order: tuple[int, ...] = ()
     plan_order_enabled: bool = False
     plan_order: tuple[str, ...] = DEFAULT_TOKEN_PLAN_ORDER
+    active_stream_cap: int = DEFAULT_TOKEN_ACTIVE_STREAM_CAP
     updated_at: datetime | None = None
 
 
@@ -804,6 +808,34 @@ def normalize_token_selection_strategy(value: Any) -> str:
         return DEFAULT_TOKEN_SELECTION_STRATEGY
 
 
+def parse_token_active_stream_cap(value: Any) -> int:
+    try:
+        cap = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Unsupported token concurrency cap; expected an integer from {MIN_TOKEN_ACTIVE_STREAM_CAP} to {MAX_TOKEN_ACTIVE_STREAM_CAP}"
+        ) from None
+    if cap < MIN_TOKEN_ACTIVE_STREAM_CAP or cap > MAX_TOKEN_ACTIVE_STREAM_CAP:
+        raise ValueError(
+            f"Unsupported token concurrency cap; expected an integer from {MIN_TOKEN_ACTIVE_STREAM_CAP} to {MAX_TOKEN_ACTIVE_STREAM_CAP}"
+        )
+    return cap
+
+
+def normalize_token_active_stream_cap(value: Any, *, default: int | None = None) -> int:
+    try:
+        return parse_token_active_stream_cap(value)
+    except ValueError:
+        return DEFAULT_TOKEN_ACTIVE_STREAM_CAP if default is None else default
+
+
+def default_token_active_stream_cap() -> int:
+    raw = str(os.getenv("FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP") or "").strip()
+    if not raw:
+        return DEFAULT_TOKEN_ACTIVE_STREAM_CAP
+    return normalize_token_active_stream_cap(raw)
+
+
 def normalize_token_selection_order(value: Any) -> tuple[int, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
@@ -1128,14 +1160,20 @@ def _build_token_selection_settings(setting: GatewaySetting | None) -> TokenSele
         token_order = normalize_token_selection_order(value.get("token_order"))
         plan_order_enabled = normalize_token_plan_order_enabled(value.get("plan_order_enabled"))
         plan_order = normalize_token_plan_order(value.get("plan_order"))
+        active_stream_cap = normalize_token_active_stream_cap(
+            value.get("active_stream_cap"),
+            default=default_token_active_stream_cap(),
+        )
     else:
         plan_order_enabled = False
         plan_order = DEFAULT_TOKEN_PLAN_ORDER
+        active_stream_cap = default_token_active_stream_cap()
     return TokenSelectionSettings(
         strategy=normalize_token_selection_strategy(strategy),
         token_order=token_order,
         plan_order_enabled=plan_order_enabled,
         plan_order=plan_order,
+        active_stream_cap=active_stream_cap,
         updated_at=setting.updated_at if setting is not None else None,
     )
 
@@ -1365,6 +1403,7 @@ async def update_token_selection_settings(*, strategy: str) -> TokenSelectionSet
                         "token_order": [],
                         "plan_order_enabled": False,
                         "plan_order": list(DEFAULT_TOKEN_PLAN_ORDER),
+                        "active_stream_cap": default_token_active_stream_cap(),
                     },
                     updated_at=utcnow(),
                 )
@@ -1375,6 +1414,10 @@ async def update_token_selection_settings(*, strategy: str) -> TokenSelectionSet
                 payload["token_order"] = list(normalize_token_selection_order(payload.get("token_order")))
                 payload["plan_order_enabled"] = normalize_token_plan_order_enabled(payload.get("plan_order_enabled"))
                 payload["plan_order"] = list(normalize_token_plan_order(payload.get("plan_order")))
+                payload["active_stream_cap"] = normalize_token_active_stream_cap(
+                    payload.get("active_stream_cap"),
+                    default=default_token_active_stream_cap(),
+                )
                 setting.value = payload
                 setting.updated_at = utcnow()
             await session.flush()
@@ -1395,6 +1438,7 @@ async def update_token_order_settings(*, token_ids: Iterable[int]) -> TokenSelec
                         "token_order": list(resolved_token_order),
                         "plan_order_enabled": False,
                         "plan_order": list(DEFAULT_TOKEN_PLAN_ORDER),
+                        "active_stream_cap": default_token_active_stream_cap(),
                     },
                     updated_at=utcnow(),
                 )
@@ -1405,6 +1449,10 @@ async def update_token_order_settings(*, token_ids: Iterable[int]) -> TokenSelec
                 payload["token_order"] = list(resolved_token_order)
                 payload["plan_order_enabled"] = normalize_token_plan_order_enabled(payload.get("plan_order_enabled"))
                 payload["plan_order"] = list(normalize_token_plan_order(payload.get("plan_order")))
+                payload["active_stream_cap"] = normalize_token_active_stream_cap(
+                    payload.get("active_stream_cap"),
+                    default=default_token_active_stream_cap(),
+                )
                 setting.value = payload
                 setting.updated_at = utcnow()
             await session.flush()
@@ -1430,6 +1478,7 @@ async def update_token_plan_order_settings(
                         "token_order": [],
                         "plan_order_enabled": resolved_plan_order_enabled,
                         "plan_order": list(resolved_plan_order),
+                        "active_stream_cap": default_token_active_stream_cap(),
                     },
                     updated_at=utcnow(),
                 )
@@ -1440,6 +1489,42 @@ async def update_token_plan_order_settings(
                 payload["token_order"] = list(normalize_token_selection_order(payload.get("token_order")))
                 payload["plan_order_enabled"] = resolved_plan_order_enabled
                 payload["plan_order"] = list(resolved_plan_order)
+                payload["active_stream_cap"] = normalize_token_active_stream_cap(
+                    payload.get("active_stream_cap"),
+                    default=default_token_active_stream_cap(),
+                )
+                setting.value = payload
+                setting.updated_at = utcnow()
+            await session.flush()
+            invalidate_fill_first_token_cache()
+            return _build_token_selection_settings(setting)
+
+
+async def update_token_active_stream_cap_settings(*, active_stream_cap: int) -> TokenSelectionSettings:
+    resolved_active_stream_cap = parse_token_active_stream_cap(active_stream_cap)
+    async with get_session() as session:
+        async with session.begin():
+            setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY, with_for_update=True)
+            if setting is None:
+                setting = GatewaySetting(
+                    key=TOKEN_SELECTION_SETTING_KEY,
+                    value={
+                        "strategy": DEFAULT_TOKEN_SELECTION_STRATEGY,
+                        "token_order": [],
+                        "plan_order_enabled": False,
+                        "plan_order": list(DEFAULT_TOKEN_PLAN_ORDER),
+                        "active_stream_cap": resolved_active_stream_cap,
+                    },
+                    updated_at=utcnow(),
+                )
+                session.add(setting)
+            else:
+                payload = dict(setting.value) if isinstance(setting.value, dict) else {}
+                payload["strategy"] = normalize_token_selection_strategy(payload.get("strategy"))
+                payload["token_order"] = list(normalize_token_selection_order(payload.get("token_order")))
+                payload["plan_order_enabled"] = normalize_token_plan_order_enabled(payload.get("plan_order_enabled"))
+                payload["plan_order"] = list(normalize_token_plan_order(payload.get("plan_order")))
+                payload["active_stream_cap"] = resolved_active_stream_cap
                 setting.value = payload
                 setting.updated_at = utcnow()
             await session.flush()
@@ -1478,6 +1563,7 @@ async def apply_imported_token_queue_position(
                         "token_order": list(next_order),
                         "plan_order_enabled": False,
                         "plan_order": list(DEFAULT_TOKEN_PLAN_ORDER),
+                        "active_stream_cap": default_token_active_stream_cap(),
                     },
                     updated_at=utcnow(),
                 )
@@ -1489,6 +1575,10 @@ async def apply_imported_token_queue_position(
                     existing_payload.get("plan_order_enabled")
                 )
                 existing_payload["plan_order"] = list(normalize_token_plan_order(existing_payload.get("plan_order")))
+                existing_payload["active_stream_cap"] = normalize_token_active_stream_cap(
+                    existing_payload.get("active_stream_cap"),
+                    default=default_token_active_stream_cap(),
+                )
                 setting.value = existing_payload
                 setting.updated_at = utcnow()
             await session.flush()

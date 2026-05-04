@@ -1,16 +1,21 @@
 import pytest
 
 from oaix_gateway.token_store import (
+    DEFAULT_TOKEN_ACTIVE_STREAM_CAP,
     DEFAULT_TOKEN_SELECTION_STRATEGY,
+    MAX_TOKEN_ACTIVE_STREAM_CAP,
+    MIN_TOKEN_ACTIVE_STREAM_CAP,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TOKEN_IMPORT_QUEUE_POSITION_BACK,
     TOKEN_IMPORT_QUEUE_POSITION_FRONT,
     TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED,
     _token_selection_order_clauses,
     merge_imported_token_order,
+    normalize_token_active_stream_cap,
     normalize_token_plan_order,
     normalize_token_selection_order,
     normalize_token_selection_strategy,
+    parse_token_active_stream_cap,
     parse_token_import_queue_position,
     parse_token_selection_strategy,
 )
@@ -33,6 +38,23 @@ def test_parse_token_selection_strategy_rejects_unknown_values() -> None:
 
 def test_normalize_token_selection_strategy_falls_back_to_default() -> None:
     assert normalize_token_selection_strategy("unknown") == DEFAULT_TOKEN_SELECTION_STRATEGY
+
+
+def test_parse_token_active_stream_cap_accepts_ui_range() -> None:
+    assert parse_token_active_stream_cap(MIN_TOKEN_ACTIVE_STREAM_CAP) == 1
+    assert parse_token_active_stream_cap("7") == 7
+    assert parse_token_active_stream_cap(MAX_TOKEN_ACTIVE_STREAM_CAP) == 10
+
+
+def test_parse_token_active_stream_cap_rejects_out_of_range_values() -> None:
+    with pytest.raises(ValueError):
+        parse_token_active_stream_cap(0)
+    with pytest.raises(ValueError):
+        parse_token_active_stream_cap(11)
+
+
+def test_normalize_token_active_stream_cap_falls_back_to_default() -> None:
+    assert normalize_token_active_stream_cap("bad") == DEFAULT_TOKEN_ACTIVE_STREAM_CAP
 
 
 def test_normalize_token_selection_order_keeps_unique_positive_ids() -> None:

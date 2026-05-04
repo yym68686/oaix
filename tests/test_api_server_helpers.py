@@ -1558,7 +1558,11 @@ def test_claim_next_active_token_for_request_skips_saturated_fill_first_token(mo
 
     result = asyncio.run(
         _claim_next_active_token_for_request(
-            TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=(11, 12)),
+            TokenSelectionSettings(
+                strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+                token_order=(11, 12),
+                active_stream_cap=2,
+            ),
             exclude_token_ids=set(),
             timing=timing,
         )

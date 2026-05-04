@@ -272,7 +272,7 @@
                 <span class="dispatch-settings__kicker">Dispatch Settings</span>
                 <strong>调度设置</strong>
               </span>
-              <span class="dispatch-settings__hint">Key 分发、Fill-first 顺序和计划优先级</span>
+              <span class="dispatch-settings__hint">Key 分发、每 Key 并发、Fill-first 顺序和计划优先级</span>
             </summary>
             <div class="dispatch-settings__body">
               <div class="selection-switch token-selection-switch" aria-label="Key 分发策略">
@@ -296,6 +296,40 @@
                     aria-pressed="false"
                   >
                     Fill-first
+                  </button>
+                </div>
+              </div>
+
+              <div class="concurrency-panel" aria-label="每个 Key 并发上限">
+                <div class="selection-switch__head">
+                  <label class="selection-switch__label" for="token-active-stream-cap">每 Key 并发</label>
+                  <span class="selection-switch__summary" id="token-concurrency-summary" aria-live="polite">默认 10 并发</span>
+                </div>
+                <div class="concurrency-panel__controls">
+                  <input
+                    class="concurrency-panel__range"
+                    id="token-active-stream-cap-range"
+                    type="range"
+                    min="1"
+                    max="10"
+                    step="1"
+                    value="10"
+                    aria-labelledby="token-concurrency-summary"
+                  />
+                  <input
+                    class="concurrency-panel__input"
+                    id="token-active-stream-cap"
+                    name="token-active-stream-cap"
+                    type="number"
+                    min="1"
+                    max="10"
+                    step="1"
+                    inputmode="numeric"
+                    value="10"
+                    aria-describedby="token-concurrency-summary"
+                  />
+                  <button class="ghost-button concurrency-panel__save" id="token-active-stream-cap-save" type="button">
+                    保存
                   </button>
                 </div>
               </div>

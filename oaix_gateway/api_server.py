@@ -57,6 +57,7 @@ from .token_import_jobs import (
 from .token_store import (
     DEFAULT_TOKEN_SELECTION_STRATEGY,
     DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
+    DEFAULT_TOKEN_ACTIVE_STREAM_CAP,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TOKEN_LIST_PLAN_ALL,
     TOKEN_LIST_SORT_NEWEST,
@@ -75,11 +76,13 @@ from .token_store import (
     mark_token_error,
     mark_token_scoped_cooldown,
     mark_token_success,
+    normalize_token_active_stream_cap,
     prewarm_fill_first_token_cache,
     repair_duplicate_token_histories,
     set_token_active_state,
     stop_token_status_write_queue,
     parse_token_import_queue_position,
+    update_token_active_stream_cap_settings,
     update_token_order_settings,
     update_token_plan_order_settings,
     update_token_selection_settings,
@@ -276,7 +279,7 @@ _UPSTREAM_HTTP_PHASE_COMPACT: contextvars.ContextVar[bool] = contextvars.Context
 _TOKEN_ACTIVE_REQUESTS: dict[int, int] = {}
 _TOKEN_RECENT_TTFT_MS: dict[int, deque[int]] = {}
 _TOKEN_RECENT_TTFT_LIMIT = 200
-DEFAULT_FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP = 10
+DEFAULT_FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP = DEFAULT_TOKEN_ACTIVE_STREAM_CAP
 DEFAULT_UPSTREAM_HTTP_MAX_CONNECTIONS = 512
 DEFAULT_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS = 128
 
@@ -485,17 +488,16 @@ async def _claim_next_active_token_for_request(
 ) -> Any:
     local_excluded_ids: set[int] = set()
     fill_first = selection_settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST
+    active_stream_cap = normalize_token_active_stream_cap(selection_settings.active_stream_cap)
     claim_signature = inspect.signature(claim_next_active_token)
     while True:
         effective_excluded_ids = set(exclude_token_ids)
         effective_excluded_ids.update(local_excluded_ids)
-        if fill_first:
-            cap = _fill_first_token_active_stream_cap()
-            effective_excluded_ids.update(
-                token_id
-                for token_id, active_count in _TOKEN_ACTIVE_REQUESTS.items()
-                if int(active_count or 0) >= cap
-            )
+        effective_excluded_ids.update(
+            token_id
+            for token_id, active_count in _TOKEN_ACTIVE_REQUESTS.items()
+            if int(active_count or 0) >= active_stream_cap
+        )
 
         kwargs: dict[str, Any] = {
             "selection_strategy": selection_settings.strategy,
@@ -515,7 +517,7 @@ async def _claim_next_active_token_for_request(
             return None
 
         token_id = int(token_row.id)
-        if not fill_first or _token_active_stream_count(token_id) < _fill_first_token_active_stream_cap():
+        if _token_active_stream_count(token_id) < active_stream_cap:
             _record_selected_token_observation_start(token_id, timing)
             return token_row
 
@@ -930,6 +932,10 @@ class TokenSelectionPlanOrderUpdateRequest(BaseModel):
     plan_order: list[str] = []
 
 
+class TokenSelectionConcurrencyUpdateRequest(BaseModel):
+    active_stream_cap: int
+
+
 class TokenActivationUpdateRequest(BaseModel):
     active: bool
     clear_cooldown: bool = False
@@ -1331,10 +1337,12 @@ def _max_request_account_retries() -> int:
 
 
 def _fill_first_token_active_stream_cap() -> int:
-    return _int_env(
-        "FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP",
-        DEFAULT_FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP,
-        minimum=1,
+    return normalize_token_active_stream_cap(
+        _int_env(
+            "FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP",
+            DEFAULT_FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP,
+            minimum=1,
+        )
     )
 
 
@@ -5920,6 +5928,7 @@ def _serialize_token_selection_settings(settings: TokenSelectionSettings) -> dic
         "token_order": list(settings.token_order),
         "plan_order_enabled": settings.plan_order_enabled,
         "plan_order": list(settings.plan_order),
+        "active_stream_cap": normalize_token_active_stream_cap(settings.active_stream_cap),
         "updated_at": settings.updated_at,
         "options": [
             {
@@ -5957,7 +5966,11 @@ def _serialize_admin_token_item(
     plan_info: CodexPlanInfo,
     quota_snapshot: CodexQuotaSnapshot | None,
     observed_cost_usd: float | None,
+    active_stream_cap: int | None = None,
 ) -> dict[str, Any]:
+    resolved_active_stream_cap = normalize_token_active_stream_cap(
+        active_stream_cap if active_stream_cap is not None else _fill_first_token_active_stream_cap()
+    )
     item = {
         "id": token_row.id,
         "email": token_row.email,
@@ -5981,7 +5994,7 @@ def _serialize_admin_token_item(
         "subscription_active_until": plan_info.subscription_active_until,
         "observed_cost_usd": observed_cost_usd,
         "active_streams": _token_active_stream_count(token_row.id),
-        "active_stream_cap": _fill_first_token_active_stream_cap(),
+        "active_stream_cap": resolved_active_stream_cap,
         "quota": asdict(quota_snapshot) if quota_snapshot is not None else None,
     }
     return item
@@ -6019,6 +6032,9 @@ async def _build_admin_token_items(
     token_rows: list[Any],
     include_quota: bool,
 ) -> list[dict[str, Any]]:
+    active_stream_cap = normalize_token_active_stream_cap(
+        _current_token_selection_settings(app).active_stream_cap
+    )
     plan_info_by_id = {
         token_row.id: extract_codex_plan_info(
             token_row.id_token,
@@ -6089,6 +6105,7 @@ async def _build_admin_token_items(
                 token_counts_by_account,
                 token_row=token_row,
             ),
+            active_stream_cap=active_stream_cap,
         )
         for token_row in token_rows
     ]
@@ -6224,6 +6241,18 @@ def create_app() -> FastAPI:
             enabled=payload.enabled,
             plan_order=payload.plan_order,
         )
+        app.state.token_selection_settings = selection
+        return _serialize_token_selection_settings(selection)
+
+    @app.post("/admin/token-selection/concurrency")
+    async def update_token_selection_concurrency_route(
+        payload: TokenSelectionConcurrencyUpdateRequest,
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        try:
+            selection = await update_token_active_stream_cap_settings(active_stream_cap=payload.active_stream_cap)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         app.state.token_selection_settings = selection
         return _serialize_token_selection_settings(selection)
 

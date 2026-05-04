@@ -120,9 +120,13 @@ def test_frontend_supports_custom_plan_order_and_global_plan_filters() -> None:
 
     assert 'id="token-plan-order-summary"' in index_html
     assert 'id="token-plan-order-list"' in index_html
+    assert 'id="token-active-stream-cap"' in index_html
+    assert 'id="token-active-stream-cap-range"' in index_html
     assert 'id="token-plan-filters"' in index_html
     assert 'data-plan-order-enabled="true"' in index_html
+    assert "const TOKEN_ACTIVE_STREAM_CAP_MAX = 10" in app_js
     assert 'const PLAN_TYPE_OPTIONS = ["free", "plus", "team", "pro"]' in app_js
+    assert 'fetchJson("/admin/token-selection/concurrency"' in app_js
     assert 'fetchJson("/admin/token-selection/plan-order"' in app_js
     assert 'data-token-plan-filter="${escapeHtml(planType)}"' in app_js
     assert "state.tokenPlanFilter === AVAILABLE_PLAN_FILTER_ALL" in app_js
@@ -248,6 +252,40 @@ def test_token_selection_plan_order_route_forwards_plan_order(monkeypatch) -> No
     assert captured == {"enabled": True, "plan_order": ["team", "plus", "pro", "free"]}
     assert response.json()["plan_order_enabled"] is True
     assert response.json()["plan_order"] == ["team", "plus", "pro", "free"]
+
+
+def test_token_selection_concurrency_route_forwards_active_stream_cap(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+    captured: dict[str, object] = {}
+
+    async def fake_update_token_active_stream_cap_settings(*, active_stream_cap):
+        captured["active_stream_cap"] = active_stream_cap
+        return TokenSelectionSettings(
+            strategy="fill_first",
+            token_order=(7,),
+            active_stream_cap=4,
+        )
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.update_token_active_stream_cap_settings",
+        fake_update_token_active_stream_cap_settings,
+    )
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/admin/token-selection/concurrency",
+            json={"active_stream_cap": 4},
+        )
+    )
+
+    assert response.status_code == 200
+    assert captured == {"active_stream_cap": 4}
+    assert response.json()["strategy"] == "fill_first"
+    assert response.json()["active_stream_cap"] == 4
 
 
 def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None:

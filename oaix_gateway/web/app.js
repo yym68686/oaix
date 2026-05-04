@@ -31,6 +31,9 @@ const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 const IMPORT_QUEUE_POSITION_OPTIONS = new Set(["front", "back"]);
 const DEFAULT_IMPORT_QUEUE_POSITION = "front";
 const TOKEN_QUERY_DEBOUNCE_MS = 240;
+const TOKEN_ACTIVE_STREAM_CAP_MIN = 1;
+const TOKEN_ACTIVE_STREAM_CAP_MAX = 10;
+const DEFAULT_TOKEN_ACTIVE_STREAM_CAP = 10;
 
 function readStoredImportJobId() {
   const raw = localStorage.getItem(IMPORT_JOB_STORAGE_KEY) || "";
@@ -117,6 +120,9 @@ const state = {
   tokenPlanOrder: [...DEFAULT_PLAN_ORDER],
   tokenPlanOrderSaving: false,
   tokenPlanOrderDragType: "",
+  tokenActiveStreamCap: DEFAULT_TOKEN_ACTIVE_STREAM_CAP,
+  tokenActiveStreamCapDraft: DEFAULT_TOKEN_ACTIVE_STREAM_CAP,
+  tokenActiveStreamCapSaving: false,
   tokenOrderSaving: false,
   tokenDragTokenId: null,
   importQueuePosition: DEFAULT_IMPORT_QUEUE_POSITION,
@@ -173,6 +179,10 @@ const elements = {
   dispatchSettings: document.getElementById("dispatch-settings"),
   tokenSelectionSummary: document.getElementById("token-selection-summary"),
   tokenSelectionButtons: Array.from(document.querySelectorAll("[data-selection-strategy]")),
+  tokenConcurrencySummary: document.getElementById("token-concurrency-summary"),
+  tokenConcurrencyInput: document.getElementById("token-active-stream-cap"),
+  tokenConcurrencyRange: document.getElementById("token-active-stream-cap-range"),
+  tokenConcurrencySave: document.getElementById("token-active-stream-cap-save"),
   tokenPlanOrderSummary: document.getElementById("token-plan-order-summary"),
   tokenPlanOrderButtons: Array.from(document.querySelectorAll("[data-plan-order-enabled]")),
   tokenPlanOrderList: document.getElementById("token-plan-order-list"),
@@ -608,6 +618,13 @@ function normalizeTokenSelectionStrategy(value) {
   return normalized === "fill_first" ? "fill_first" : "least_recently_used";
 }
 
+function normalizeTokenActiveStreamCap(value, fallback = DEFAULT_TOKEN_ACTIVE_STREAM_CAP) {
+  const fallbackCap = Number.isInteger(Number(fallback)) ? Number(fallback) : DEFAULT_TOKEN_ACTIVE_STREAM_CAP;
+  const number = Number.parseInt(value, 10);
+  const resolved = Number.isInteger(number) ? number : fallbackCap;
+  return Math.min(TOKEN_ACTIVE_STREAM_CAP_MAX, Math.max(TOKEN_ACTIVE_STREAM_CAP_MIN, resolved));
+}
+
 function normalizeTokenSelectionOrder(value) {
   const seen = new Set();
   const order = [];
@@ -733,6 +750,10 @@ function describeTokenSelectionStrategy(strategy) {
   return "最久未用优先";
 }
 
+function describeTokenConcurrency(cap = state.tokenActiveStreamCapDraft) {
+  return `每 key ${formatInteger(normalizeTokenActiveStreamCap(cap))} 并发`;
+}
+
 function describeTokenPlanOrder(enabled = state.tokenPlanOrderEnabled, planOrder = state.tokenPlanOrder) {
   if (!enabled) {
     return "默认请求顺序";
@@ -762,6 +783,19 @@ function renderImportQueuePosition(position) {
 function setTokenSelectionDisabled(disabled) {
   elements.tokenSelectionButtons.forEach((button) => {
     button.disabled = disabled;
+  });
+}
+
+function setTokenConcurrencyDisabled(disabled) {
+  [
+    elements.tokenConcurrencyInput,
+    elements.tokenConcurrencyRange,
+    elements.tokenConcurrencySave,
+  ].forEach((control) => {
+    if (!control) {
+      return;
+    }
+    control.disabled = disabled;
   });
 }
 
@@ -867,7 +901,11 @@ function renderInitialLoadingStates() {
     if (elements.tokenPlanOrderSummary) {
       elements.tokenPlanOrderSummary.textContent = "正在同步顺序";
     }
+    if (elements.tokenConcurrencySummary) {
+      elements.tokenConcurrencySummary.textContent = "正在同步上限";
+    }
     setTokenSelectionDisabled(true);
+    setTokenConcurrencyDisabled(true);
     setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
     setTokenPaginationDisabled(true);
@@ -882,8 +920,36 @@ function renderInitialLoadingStates() {
   }
 }
 
+function syncTokenConcurrencyControls(value, { updateDraft = true } = {}) {
+  const cap = normalizeTokenActiveStreamCap(value, state.tokenActiveStreamCap);
+  if (updateDraft) {
+    state.tokenActiveStreamCapDraft = cap;
+  }
+  if (elements.tokenConcurrencyInput) {
+    elements.tokenConcurrencyInput.value = String(cap);
+  }
+  if (elements.tokenConcurrencyRange) {
+    elements.tokenConcurrencyRange.value = String(cap);
+  }
+  if (elements.tokenConcurrencySummary && !state.tokenActiveStreamCapSaving) {
+    elements.tokenConcurrencySummary.textContent = describeTokenConcurrency(cap);
+  }
+}
+
+function renderTokenConcurrency(selection) {
+  const hasCap = Object.prototype.hasOwnProperty.call(selection || {}, "active_stream_cap");
+  const cap = normalizeTokenActiveStreamCap(
+    hasCap ? selection.active_stream_cap : state.tokenActiveStreamCap,
+    state.tokenActiveStreamCap,
+  );
+  state.tokenActiveStreamCap = cap;
+  state.tokenActiveStreamCapDraft = cap;
+  syncTokenConcurrencyControls(cap);
+}
+
 function renderTokenSelection(selection) {
-  const strategy = normalizeTokenSelectionStrategy(selection?.strategy);
+  const hasStrategy = Object.prototype.hasOwnProperty.call(selection || {}, "strategy");
+  const strategy = hasStrategy ? normalizeTokenSelectionStrategy(selection?.strategy) : state.tokenSelectionStrategy;
   state.tokenSelectionStrategy = strategy;
   if (Array.isArray(selection?.token_order)) {
     state.tokenSelectionOrder = normalizeTokenSelectionOrder(selection.token_order);
@@ -912,6 +978,7 @@ function renderTokenSelection(selection) {
   if (elements.tokenPlanOrderSummary) {
     elements.tokenPlanOrderSummary.textContent = describeTokenPlanOrder();
   }
+  renderTokenConcurrency(selection || {});
   renderTokenPlanOrderList();
 }
 
@@ -1879,7 +1946,7 @@ function renderTokenResultRow(item, workspaceTokenCounts) {
   const cooldownValue = formatCooldownUntil(item.cooldown_until);
   const lastUsedValue = formatDate(item.last_used_at);
   const activeStreams = Math.max(0, Number(item.active_streams || 0));
-  const activeStreamCap = Math.max(1, Number(item.active_stream_cap || 10));
+  const activeStreamCap = normalizeTokenActiveStreamCap(state.tokenActiveStreamCap, item.active_stream_cap);
   const activeStreamsValue = `${formatInteger(activeStreams)}/${formatInteger(activeStreamCap)}`;
   const observedCostValue = item.observed_cost_usd == null ? "—" : formatUsd(item.observed_cost_usd);
   const errorSection = renderTokenErrorSection(item);
@@ -2581,6 +2648,7 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     elements.listNote.textContent = buildTokenListNote();
     renderTokenSelection(data.selection || {});
     setTokenSelectionDisabled(state.tokenSelectionSaving);
+    setTokenConcurrencyDisabled(state.tokenActiveStreamCapSaving);
     setTokenPlanOrderDisabled(state.tokenPlanOrderSaving);
     setTokenSearchDisabled(false);
     renderTokenQueryControls();
@@ -2608,7 +2676,11 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
       if (elements.tokenPlanOrderSummary) {
         elements.tokenPlanOrderSummary.textContent = "需要 Service API Key";
       }
+      if (elements.tokenConcurrencySummary) {
+        elements.tokenConcurrencySummary.textContent = "需要 Service API Key";
+      }
       setTokenSelectionDisabled(true);
+      setTokenConcurrencyDisabled(true);
       setTokenPlanOrderDisabled(true);
       setTokenSearchDisabled(true);
       setTokenPaginationDisabled(true);
@@ -2629,7 +2701,11 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     if (elements.tokenPlanOrderSummary) {
       elements.tokenPlanOrderSummary.textContent = "顺序同步失败";
     }
+    if (elements.tokenConcurrencySummary) {
+      elements.tokenConcurrencySummary.textContent = "上限同步失败";
+    }
     setTokenSelectionDisabled(true);
+    setTokenConcurrencyDisabled(true);
     setTokenPlanOrderDisabled(true);
     setTokenSearchDisabled(true);
     setTokenPaginationDisabled(true);
@@ -2758,6 +2834,53 @@ async function saveTokenSelection(strategy) {
   } finally {
     state.tokenSelectionSaving = false;
     setTokenSelectionDisabled(disableAfterSave);
+  }
+}
+
+async function saveTokenConcurrency(value = state.tokenActiveStreamCapDraft) {
+  const nextCap = normalizeTokenActiveStreamCap(value, state.tokenActiveStreamCap);
+  syncTokenConcurrencyControls(nextCap);
+  if (state.tokenActiveStreamCapSaving || nextCap === state.tokenActiveStreamCap) {
+    return;
+  }
+
+  const previousCap = state.tokenActiveStreamCap;
+  let disableAfterSave = false;
+  let saved = false;
+  state.tokenActiveStreamCapSaving = true;
+  if (elements.tokenConcurrencySummary) {
+    elements.tokenConcurrencySummary.textContent = "正在保存上限";
+  }
+  setTokenConcurrencyDisabled(true);
+
+  try {
+    const data = await fetchJson("/admin/token-selection/concurrency", {
+      method: "POST",
+      headers: authHeaders(true),
+      body: JSON.stringify({ active_stream_cap: nextCap }),
+    });
+    renderTokenSelection(data);
+    state.tokenItems = state.tokenItems.map((item) => ({
+      ...item,
+      active_stream_cap: state.tokenActiveStreamCap,
+    }));
+    renderTokenList(state.tokenItems);
+    elements.listNote.textContent = buildTokenListNote();
+    saved = true;
+  } catch (error) {
+    renderTokenConcurrency({ active_stream_cap: previousCap });
+    if (elements.tokenConcurrencySummary) {
+      elements.tokenConcurrencySummary.textContent =
+        error.status === 401 ? "需要 Service API Key" : "保存失败，请重试";
+    }
+    disableAfterSave = error.status === 401;
+    throw error;
+  } finally {
+    state.tokenActiveStreamCapSaving = false;
+    if (saved) {
+      syncTokenConcurrencyControls(state.tokenActiveStreamCap);
+    }
+    setTokenConcurrencyDisabled(disableAfterSave);
   }
 }
 
@@ -3471,6 +3594,63 @@ elements.tokenSelectionButtons.forEach((button) => {
     } catch {}
   });
 });
+
+if (elements.tokenConcurrencyRange) {
+  elements.tokenConcurrencyRange.addEventListener("input", (event) => {
+    if (!(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+    syncTokenConcurrencyControls(event.target.value);
+  });
+  elements.tokenConcurrencyRange.addEventListener("change", async (event) => {
+    if (!(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+    try {
+      await saveTokenConcurrency(event.target.value);
+    } catch {}
+  });
+}
+
+if (elements.tokenConcurrencyInput) {
+  elements.tokenConcurrencyInput.addEventListener("input", (event) => {
+    if (!(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+    if (!event.target.value.trim()) {
+      if (elements.tokenConcurrencySummary) {
+        elements.tokenConcurrencySummary.textContent = "范围 1-10 并发";
+      }
+      return;
+    }
+    syncTokenConcurrencyControls(event.target.value);
+  });
+  elements.tokenConcurrencyInput.addEventListener("change", async (event) => {
+    if (!(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+    try {
+      await saveTokenConcurrency(event.target.value);
+    } catch {}
+  });
+  elements.tokenConcurrencyInput.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter" || !(event.target instanceof HTMLInputElement)) {
+      return;
+    }
+    event.preventDefault();
+    try {
+      await saveTokenConcurrency(event.target.value);
+    } catch {}
+  });
+}
+
+if (elements.tokenConcurrencySave) {
+  elements.tokenConcurrencySave.addEventListener("click", async () => {
+    try {
+      await saveTokenConcurrency();
+    } catch {}
+  });
+}
 
 elements.tokenPlanOrderButtons.forEach((button) => {
   button.addEventListener("click", async () => {
