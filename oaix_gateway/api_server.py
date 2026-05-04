@@ -6031,6 +6031,27 @@ def _resolve_token_observed_cost_usd(
     return round(float(fallback_cost), 6)
 
 
+def _parse_admin_token_ids(value: str, *, limit: int = 100) -> tuple[int, ...]:
+    token_ids: list[int] = []
+    seen: set[int] = set()
+    for raw_part in re.split(r"[\s,]+", str(value or "").strip()):
+        if not raw_part:
+            continue
+        try:
+            token_id = int(raw_part)
+        except ValueError as exc:
+            raise ValueError("ids must be a comma-separated list of positive integers") from exc
+        if token_id <= 0:
+            raise ValueError("ids must be a comma-separated list of positive integers")
+        if token_id in seen:
+            continue
+        seen.add(token_id)
+        token_ids.append(token_id)
+        if len(token_ids) >= max(1, int(limit)):
+            break
+    return tuple(token_ids)
+
+
 async def _build_admin_token_items(
     app: FastAPI,
     *,
@@ -6112,6 +6133,66 @@ async def _build_admin_token_items(
             ),
             active_stream_cap=active_stream_cap,
         )
+        for token_row in token_rows
+    ]
+
+
+async def _build_admin_token_quota_items(
+    app: FastAPI,
+    *,
+    token_rows: list[Any],
+) -> list[dict[str, Any]]:
+    if not token_rows:
+        return []
+
+    active_stream_cap = normalize_token_active_stream_cap(
+        _current_token_selection_settings(app).active_stream_cap
+    )
+    plan_info_by_id = {
+        token_row.id: extract_codex_plan_info(
+            token_row.id_token,
+            account_id=token_row.account_id,
+            raw_payload=token_row.raw_payload,
+        )
+        for token_row in token_rows
+    }
+    quota_by_id: dict[int, CodexQuotaSnapshot] = {}
+    quota_token_rows = [
+        token_row
+        for token_row in token_rows
+        if bool(getattr(token_row, "is_active", False))
+        and _normalize_optional_text(getattr(token_row, "refresh_token", None)) is not None
+    ]
+    if quota_token_rows:
+        quota_service: CodexQuotaService = app.state.quota_service
+        client: httpx.AsyncClient = app.state.http_client
+        oauth_manager: CodexOAuthManager = app.state.oauth_manager
+        effective_account_ids = {
+            token_row.id: plan_info_by_id[token_row.id].chatgpt_account_id or token_row.account_id
+            for token_row in token_rows
+        }
+        try:
+            quota_by_id = await quota_service.get_many(
+                quota_token_rows,
+                client=client,
+                oauth_manager=oauth_manager,
+                account_ids=effective_account_ids,
+            )
+        except Exception:
+            logger.exception("Failed to collect admin token quota snapshots")
+
+    return [
+        {
+            "id": token_row.id,
+            "plan_type": (
+                quota_by_id[token_row.id].plan_type
+                if token_row.id in quota_by_id and quota_by_id[token_row.id].plan_type
+                else _normalize_optional_text(getattr(token_row, "plan_type", None)) or plan_info_by_id[token_row.id].plan_type
+            ),
+            "active_streams": _token_active_stream_count(token_row.id),
+            "active_stream_cap": active_stream_cap,
+            "quota": asdict(quota_by_id[token_row.id]) if token_row.id in quota_by_id else None,
+        }
         for token_row in token_rows
     ]
 
@@ -6336,6 +6417,27 @@ def create_app() -> FastAPI:
             },
             "items": items,
         }
+
+    @app.get("/admin/tokens/quota")
+    async def list_token_quota_route(
+        http_request: Request,
+        ids: str = Query("", max_length=2048),
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        try:
+            token_ids = _parse_admin_token_ids(ids, limit=100)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not token_ids:
+            return {"items": []}
+
+        token_rows = await list_token_rows(
+            limit=len(token_ids),
+            offset=0,
+            token_ids=token_ids,
+        )
+        items = await _build_admin_token_quota_items(http_request.app, token_rows=token_rows)
+        return {"items": items}
 
     @app.post("/admin/tokens/{token_id}/activation")
     async def update_token_activation_route(

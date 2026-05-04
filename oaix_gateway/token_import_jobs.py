@@ -13,11 +13,13 @@ import httpx
 from sqlalchemy import and_, or_, select
 
 from .database import CodexToken, TokenImportJob, get_read_session, get_session, utcnow
-from .oauth import CodexOAuthManager
+from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
 from .token_store import (
     DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
     TokenSelectionSettings,
     apply_imported_token_queue_position,
+    mark_token_error,
+    mark_token_import_validation_pending,
     normalize_token_import_queue_position,
     upsert_token_payload,
 )
@@ -65,7 +67,7 @@ def _import_job_stale_after_seconds() -> float:
 
 
 def _import_job_max_concurrency() -> int:
-    return _int_env("IMPORT_JOB_MAX_CONCURRENCY", 16, minimum=1)
+    return _int_env("IMPORT_JOB_MAX_CONCURRENCY", 4, minimum=1)
 
 
 def _import_job_progress_flush_every() -> int:
@@ -77,7 +79,11 @@ def _import_job_progress_flush_interval_seconds() -> float:
 
 
 def _import_job_respect_response_traffic() -> bool:
-    return _bool_env("IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC", False)
+    return _bool_env("IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC", True)
+
+
+def _import_token_validation_cooldown_seconds() -> int:
+    return _int_env("IMPORT_TOKEN_VALIDATION_COOLDOWN_SECONDS", 300, minimum=1)
 
 
 def _as_item_list(value: Any) -> list[dict[str, Any]]:
@@ -451,6 +457,32 @@ class ResponseTrafficLike(Protocol):
         ...
 
 
+async def _wait_for_response_traffic_turn(
+    *,
+    job_id: int,
+    index: int,
+    response_traffic: ResponseTrafficLike,
+    respect_response_traffic: bool,
+    phase: str,
+) -> tuple[int, int]:
+    if not respect_response_traffic:
+        return 0, 0
+
+    try:
+        yielded = await response_traffic.wait_for_import_turn()
+        return (1 if yielded else 0), 0
+    except TimeoutError:
+        logger.warning(
+            "Token import job wait timed out while /v1/responses traffic remained active; continuing import: job_id=%s index=%s phase=%s active_responses=%s",
+            job_id,
+            index,
+            phase,
+            response_traffic.active_responses,
+        )
+        await asyncio.sleep(0)
+        return 0, 1
+
+
 def _sort_items_by_index(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def sort_key(item: dict[str, Any]) -> tuple[int, int]:
         try:
@@ -611,19 +643,15 @@ async def _process_single_token_import_payload(
     yielded_to_response_traffic_count = 0
     response_traffic_timeout_count = 0
 
-    if respect_response_traffic:
-        try:
-            if await response_traffic.wait_for_import_turn():
-                yielded_to_response_traffic_count = 1
-        except TimeoutError:
-            response_traffic_timeout_count = 1
-            logger.warning(
-                "Token import job wait timed out while /v1/responses traffic remained active; continuing import: job_id=%s index=%s active_responses=%s",
-                job_id,
-                index,
-                response_traffic.active_responses,
-            )
-            await asyncio.sleep(0)
+    yielded, timed_out = await _wait_for_response_traffic_turn(
+        job_id=job_id,
+        index=index,
+        response_traffic=response_traffic,
+        respect_response_traffic=respect_response_traffic,
+        phase="upsert",
+    )
+    yielded_to_response_traffic_count += yielded
+    response_traffic_timeout_count += timed_out
 
     if not isinstance(payload, dict):
         return _TokenImportItemResult(
@@ -637,15 +665,51 @@ async def _process_single_token_import_payload(
     try:
         result = await upsert_token_payload(payload)
         if result.action in {"created", "updated"} and not result.token.account_id:
+            validation_cooldown_seconds = _import_token_validation_cooldown_seconds()
+            await mark_token_import_validation_pending(
+                result.token.id,
+                "Import validation pending",
+                cooldown_seconds=validation_cooldown_seconds,
+            )
+            yielded, timed_out = await _wait_for_response_traffic_turn(
+                job_id=job_id,
+                index=index,
+                response_traffic=response_traffic,
+                respect_response_traffic=respect_response_traffic,
+                phase="oauth_refresh",
+            )
+            yielded_to_response_traffic_count += yielded
+            response_traffic_timeout_count += timed_out
             try:
                 await oauth_manager.get_access_token(result.token, http_client, force_refresh=True)
-            except Exception:
+            except Exception as exc:
+                permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
+                await mark_token_error(
+                    result.token.id,
+                    str(getattr(exc, "detail", exc) or exc),
+                    deactivate=permanent_refresh_failure,
+                    cooldown_seconds=None if permanent_refresh_failure else validation_cooldown_seconds,
+                    clear_access_token=True,
+                )
                 logger.warning(
                     "Token import could not enrich missing account_id: job_id=%s index=%s token_id=%s",
                     job_id,
                     index,
                     result.token.id,
                     exc_info=True,
+                )
+                return _TokenImportItemResult(
+                    index=index,
+                    category="failed",
+                    item={
+                        "id": result.token.id,
+                        "email": result.token.email,
+                        "account_id": result.token.account_id,
+                        "index": index,
+                        "error": str(getattr(exc, "detail", exc) or exc),
+                    },
+                    yielded_to_response_traffic_count=yielded_to_response_traffic_count,
+                    response_traffic_timeout_count=response_traffic_timeout_count,
                 )
         item = {
             "id": result.token.id,

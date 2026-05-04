@@ -84,6 +84,10 @@ const state = {
   tokenPage: 1,
   tokenPageSize: TOKEN_PAGE_SIZE,
   tokenPageLoading: false,
+  tokenListAbortController: null,
+  tokenListRequestSeq: 0,
+  tokenQuotaAbortController: null,
+  tokenQuotaRequestSeq: 0,
   tokenPagination: {
     total: 0,
     limit: TOKEN_PAGE_SIZE,
@@ -887,13 +891,13 @@ function renderRequestAnalyticsLoading() {
   renderChartLoading(elements.requestCostChart, "正在汇总模型金额…");
 }
 
-function renderInitialLoadingStates() {
+function renderInitialLoadingStates({ includeTokens = true } = {}) {
   if (!state.healthLoaded) {
     renderCountsLoading();
     elements.protectionChip.textContent = "正在检测服务状态";
     elements.syncChip.textContent = "正在首次同步";
   }
-  if (!state.tokensLoaded) {
+  if (includeTokens && !state.tokensLoaded) {
     elements.listNote.textContent = "正在载入 key 池…";
     if (elements.tokenSelectionSummary) {
       elements.tokenSelectionSummary.textContent = "正在同步策略";
@@ -1824,7 +1828,7 @@ function summarizeTokenError(value) {
   return truncateText(raw, 148);
 }
 
-function renderQuotaWindow(window, fallbackLabel) {
+function renderQuotaWindow(window, fallbackLabel, { pendingMeta = "未返回窗口" } = {}) {
   const label = window?.label || fallbackLabel;
   const remainingLabel = formatPercentValue(window?.remaining_percent);
   const resetLabel = formatDate(window?.reset_at);
@@ -1837,7 +1841,7 @@ function renderQuotaWindow(window, fallbackLabel) {
         <div class="quota-band__head">
           <div class="quota-band__title">
             <span class="quota-band__label">${escapeHtml(label)}</span>
-            <span class="quota-band__meta">未返回窗口</span>
+            <span class="quota-band__meta">${escapeHtml(pendingMeta)}</span>
           </div>
           <span class="quota-band__value">—</span>
         </div>
@@ -1869,6 +1873,8 @@ function renderQuotaWindow(window, fallbackLabel) {
 
 function renderQuotaSection(item, presentation) {
   const quota = item.quota;
+  const quotaLoading = Boolean(item?.quota_loading && !quota);
+  const pendingMeta = quotaLoading ? "读取中" : "未返回窗口";
   const notes = [];
   if (presentation?.hasSharedWorkspace) {
     notes.push(
@@ -1885,8 +1891,8 @@ function renderQuotaSection(item, presentation) {
   return `
     <div class="token-card__quota">
       <div class="token-card__quota-grid">
-        ${renderQuotaWindow(getQuotaWindow(item, "code-5h"), "5h")}
-        ${renderQuotaWindow(getQuotaWindow(item, "code-7d"), "7d")}
+        ${renderQuotaWindow(getQuotaWindow(item, "code-5h"), "5h", { pendingMeta })}
+        ${renderQuotaWindow(getQuotaWindow(item, "code-7d"), "7d", { pendingMeta })}
       </div>
       ${notes.map((note) => `<p class="token-card__quota-note">${escapeHtml(note)}</p>`).join("")}
     </div>
@@ -1925,6 +1931,14 @@ function resolveTokenDetailsOpenState(tokenId, fallbackOpen = false) {
 }
 
 function renderQuotaPreview(item) {
+  if (item?.quota_loading && !item?.quota) {
+    return `
+      <div class="token-result__quota-preview" data-label="配额">
+        <span>5h 读取中</span>
+        <span>7d 读取中</span>
+      </div>
+    `;
+  }
   const window5h = getQuotaWindow(item, "code-5h");
   const window7d = getQuotaWindow(item, "code-7d");
   const formatPreview = (window, label) => `${label} ${formatPercentValue(window?.remaining_percent)}`;
@@ -2582,6 +2596,46 @@ async function fetchJson(url, options = {}) {
   return data;
 }
 
+function isAbortError(error) {
+  return error?.name === "AbortError";
+}
+
+function abortTokenQuotaRequest() {
+  state.tokenQuotaRequestSeq += 1;
+  if (state.tokenQuotaAbortController) {
+    state.tokenQuotaAbortController.abort();
+    state.tokenQuotaAbortController = null;
+  }
+}
+
+function markTokenQuotaPending(item) {
+  return {
+    ...item,
+    quota_loading: !item?.quota,
+  };
+}
+
+function markTokenQuotaError(ids, message) {
+  const idSet = new Set(ids.map((id) => Number(id)).filter((id) => Number.isFinite(id)));
+  const errorMessage = normalizeWhitespace(message) || "Quota request failed";
+  const fetchedAt = new Date().toISOString();
+  state.tokenItems = state.tokenItems.map((item) => {
+    const tokenId = Number(item?.id);
+    if (!idSet.has(tokenId)) {
+      return item;
+    }
+    return {
+      ...item,
+      quota_loading: false,
+      quota: item.quota || {
+        error: errorMessage,
+        fetched_at: fetchedAt,
+        windows: [],
+      },
+    };
+  });
+}
+
 async function loadHealth() {
   const response = await fetch("/healthz");
   const { data } = await readResponsePayload(response);
@@ -2607,6 +2661,73 @@ async function loadHealth() {
   return health;
 }
 
+async function loadTokenQuotas(tokenIds, { listRequestSeq = state.tokenListRequestSeq } = {}) {
+  const resolvedIds = Array.from(
+    new Set(
+      (Array.isArray(tokenIds) ? tokenIds : [])
+        .map((id) => Number(id))
+        .filter((id) => Number.isFinite(id) && id > 0),
+    ),
+  );
+  if (!resolvedIds.length || listRequestSeq !== state.tokenListRequestSeq) {
+    return;
+  }
+
+  abortTokenQuotaRequest();
+  const quotaRequestSeq = state.tokenQuotaRequestSeq;
+  const controller = new AbortController();
+  state.tokenQuotaAbortController = controller;
+
+  try {
+    const params = new URLSearchParams({ ids: resolvedIds.join(",") });
+    const data = await fetchJson(`/admin/tokens/quota?${params.toString()}`, {
+      headers: authHeaders(),
+      signal: controller.signal,
+    });
+    if (quotaRequestSeq !== state.tokenQuotaRequestSeq || listRequestSeq !== state.tokenListRequestSeq) {
+      return;
+    }
+
+    const patchesById = new Map();
+    (Array.isArray(data.items) ? data.items : []).forEach((item) => {
+      const tokenId = Number(item?.id);
+      if (Number.isFinite(tokenId)) {
+        patchesById.set(tokenId, item);
+      }
+    });
+    const requestedIdSet = new Set(resolvedIds);
+    state.tokenItems = state.tokenItems.map((item) => {
+      const tokenId = Number(item?.id);
+      const patch = patchesById.get(tokenId);
+      if (patch) {
+        return {
+          ...item,
+          ...patch,
+          quota_loading: false,
+        };
+      }
+      if (requestedIdSet.has(tokenId)) {
+        return {
+          ...item,
+          quota_loading: false,
+        };
+      }
+      return item;
+    });
+    renderTokenList(state.tokenItems);
+  } catch (error) {
+    if (isAbortError(error) || quotaRequestSeq !== state.tokenQuotaRequestSeq || listRequestSeq !== state.tokenListRequestSeq) {
+      return;
+    }
+    markTokenQuotaError(resolvedIds, error.message);
+    renderTokenList(state.tokenItems);
+  } finally {
+    if (state.tokenQuotaAbortController === controller) {
+      state.tokenQuotaAbortController = null;
+    }
+  }
+}
+
 async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {}) {
   const requestedPage = normalizePositiveInteger(page, 1);
   const limit = state.tokenPageSize;
@@ -2614,7 +2735,6 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
   const params = new URLSearchParams({
     limit: String(limit),
     offset: String(offset),
-    include_quota: "1",
     q: normalizeWhitespace(state.tokenSearchTerm),
     status: normalizeTokenStatusFilter(state.tokenStatusFilter),
     plan_type: normalizeAvailablePlanFilter(state.tokenPlanFilter),
@@ -2624,16 +2744,31 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     params.set("import_batch_id", String(state.selectedImportBatchId));
   }
 
+  state.tokenListRequestSeq += 1;
+  const listRequestSeq = state.tokenListRequestSeq;
+  if (state.tokenListAbortController) {
+    state.tokenListAbortController.abort();
+    state.tokenListAbortController = null;
+  }
+  abortTokenQuotaRequest();
+  const controller = new AbortController();
+  state.tokenListAbortController = controller;
+
   state.tokenPage = requestedPage;
   state.tokenPageLoading = true;
+  renderTokenQueryControls();
   renderTokenPagination("正在载入当前页");
 
   try {
     const data = await fetchJson(`/admin/tokens?${params.toString()}`, {
       headers: authHeaders(),
+      signal: controller.signal,
     });
+    if (listRequestSeq !== state.tokenListRequestSeq) {
+      return;
+    }
     state.tokensLoaded = true;
-    state.tokenItems = Array.isArray(data.items) ? data.items : [];
+    state.tokenItems = Array.isArray(data.items) ? data.items.map(markTokenQuotaPending) : [];
     state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : [];
     state.tokenFilteredCounts = data.filtered_counts || data.counts || state.tokenFilteredCounts;
     state.tokenPlanCounts = data.plan_counts || state.tokenPlanCounts;
@@ -2657,7 +2792,15 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     if (data.counts) {
       renderCounts(data.counts);
     }
+    const quotaTokenIds = state.tokenItems
+      .filter((item) => item?.quota_loading)
+      .map((item) => Number(item?.id))
+      .filter((tokenId) => Number.isFinite(tokenId) && tokenId > 0);
+    void loadTokenQuotas(quotaTokenIds, { listRequestSeq });
   } catch (error) {
+    if (isAbortError(error) || listRequestSeq !== state.tokenListRequestSeq) {
+      return;
+    }
     state.tokensLoaded = true;
     state.tokenItems = [];
     state.tokenImportBatches = [];
@@ -2715,6 +2858,10 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
         <p>${escapeHtml(error.message)}</p>
       </article>
     `;
+  } finally {
+    if (state.tokenListAbortController === controller) {
+      state.tokenListAbortController = null;
+    }
   }
 }
 
@@ -2746,6 +2893,7 @@ async function applyTokenQuery(updates = {}) {
     state.tokenSort = normalizeTokenSort(updates.sort);
   }
   state.tokenPage = 1;
+  renderTokenQueryControls();
   await loadTokens({ page: 1 });
 }
 
@@ -3356,24 +3504,30 @@ async function loadRequests() {
   }
 }
 
-async function refreshDashboard() {
+async function refreshDashboard({ includeTokens = true } = {}) {
   if (state.refreshing) {
     return;
   }
   state.refreshing = true;
   elements.refreshButton.disabled = true;
-  renderInitialLoadingStates();
+  renderInitialLoadingStates({ includeTokens });
   try {
     await loadHealth();
     await loadRequests();
-    await loadTokens();
+    if (includeTokens) {
+      await loadTokens();
+    }
   } catch (error) {
-    elements.listNote.textContent = `面板同步失败：${error.message}`;
+    if (includeTokens) {
+      elements.listNote.textContent = `面板同步失败：${error.message}`;
+    }
     elements.requestNote.textContent = `面板同步失败：${error.message}`;
   } finally {
     state.refreshing = false;
     elements.refreshButton.disabled = false;
-    renderTokenPagination();
+    if (includeTokens || state.tokensLoaded) {
+      renderTokenPagination();
+    }
     if (state.importJobId && !state.importJobPollTimer) {
       resumeTrackedImportJob();
     }
@@ -3897,12 +4051,16 @@ if (supportsTokenDeleteDialog) {
   });
 }
 
-elements.refreshButton.addEventListener("click", refreshDashboard);
+elements.refreshButton.addEventListener("click", () => {
+  void refreshDashboard();
+});
 elements.saveKeyButton.addEventListener("click", saveServiceKey);
 elements.clearKeyButton.addEventListener("click", clearServiceKey);
 elements.importButton.addEventListener("click", importTokens);
 elements.resetImportButton.addEventListener("click", resetImportForm);
 
 refreshDashboard();
-state.timer = window.setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
+state.timer = window.setInterval(() => {
+  void refreshDashboard({ includeTokens: false });
+}, REFRESH_INTERVAL_MS);
 resumeTrackedImportJob();

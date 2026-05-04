@@ -35,6 +35,7 @@ def test_frontend_routes_are_registered() -> None:
     assert "/apple-touch-icon-precomposed.png" in paths
     assert "/healthz" in paths
     assert "/admin/tokens" in paths
+    assert "/admin/tokens/quota" in paths
     assert "/admin/token-selection" in paths
     assert "/admin/token-selection/order" in paths
     assert "/admin/token-selection/plan-order" in paths
@@ -175,11 +176,28 @@ def test_frontend_dashboard_refresh_does_not_overlap_heavy_admin_requests() -> N
 
     assert "const REFRESH_INTERVAL_MS = 30000" in app_js
     assert "refreshing: false" in app_js
+    assert "async function refreshDashboard({ includeTokens = true } = {})" in app_js
     assert "if (state.refreshing)" in refresh_function
     assert "state.refreshing = true" in refresh_function
     assert "await loadRequests();" in refresh_function
+    assert "if (includeTokens)" in refresh_function
     assert "await loadTokens();" in refresh_function
+    assert "refreshDashboard({ includeTokens: false })" in app_js
     assert "Promise.all([loadTokens(), loadRequests()])" not in refresh_function
+
+
+def test_frontend_loads_token_quota_lazily_after_list_render() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+    load_tokens_function = app_js.split("async function loadTokens", 1)[1].split("async function goToTokenPage", 1)[0]
+    quota_function = app_js.split("async function loadTokenQuotas", 1)[1].split("async function loadTokens", 1)[0]
+
+    assert 'include_quota: "1"' not in load_tokens_function
+    assert "void loadTokenQuotas(quotaTokenIds, { listRequestSeq })" in load_tokens_function
+    assert "`/admin/tokens/quota?${params.toString()}`" in quota_function
+    assert "new AbortController()" in load_tokens_function
+    assert "new AbortController()" in quota_function
+    assert "listRequestSeq !== state.tokenListRequestSeq" in quota_function
+    assert "quota_loading" in app_js
 
 
 def test_frontend_probe_request_sends_selected_model() -> None:
@@ -401,6 +419,43 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         "sort": "account",
         "import_batch_id": None,
     }
+
+
+def test_admin_token_quota_route_forwards_requested_ids(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+
+    async def fake_list_token_rows(*, limit, offset, token_ids, **kwargs):
+        assert limit == 2
+        assert offset == 0
+        assert token_ids == (7, 12)
+        assert kwargs == {}
+        return [SimpleNamespace(id=7), SimpleNamespace(id=12)]
+
+    async def fake_build_admin_token_quota_items(app_arg, *, token_rows):
+        assert app_arg is app
+        assert [item.id for item in token_rows] == [7, 12]
+        return [
+            {"id": 7, "quota": {"windows": []}},
+            {"id": 12, "quota": None},
+        ]
+
+    monkeypatch.setattr("oaix_gateway.api_server.list_token_rows", fake_list_token_rows)
+    monkeypatch.setattr("oaix_gateway.api_server._build_admin_token_quota_items", fake_build_admin_token_quota_items)
+
+    response = asyncio.run(_request(app, "GET", "/admin/tokens/quota?ids=7,12,7"))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [
+            {"id": 7, "quota": {"windows": []}},
+            {"id": 12, "quota": None},
+        ]
+    }
+
+    response = asyncio.run(_request(app, "GET", "/admin/tokens/quota?ids=7,nope"))
+    assert response.status_code == 400
 
 
 def test_admin_token_probe_route_accepts_model_payload(monkeypatch) -> None:

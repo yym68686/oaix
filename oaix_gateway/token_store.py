@@ -2002,6 +2002,32 @@ async def update_token_plan_type(token_id: int, *, plan_type: str | None) -> Non
             invalidate_fill_first_token_cache()
 
 
+async def mark_token_import_validation_pending(
+    token_id: int,
+    message: str,
+    *,
+    cooldown_seconds: int,
+) -> None:
+    cooldown_until = utcnow() + timedelta(seconds=max(0, int(cooldown_seconds)))
+    _apply_token_runtime_error_state(
+        token_id,
+        message=message,
+        deactivate=False,
+        cooldown_until=cooldown_until,
+    )
+    async with get_session() as session:
+        async with session.begin():
+            token = await _resolve_canonical_token_for_update(session, token_id)
+            if token is None:
+                return
+            token.is_active = True
+            token.cooldown_until = cooldown_until
+            token.last_error = message[:4000]
+            token.updated_at = utcnow()
+            await session.flush()
+            invalidate_fill_first_token_cache()
+
+
 async def mark_token_success(token_id: int) -> None:
     _apply_token_runtime_success_state(token_id)
     _enqueue_token_status_write(_TokenStatusWriteJob(token_id=int(token_id), kind="success"))

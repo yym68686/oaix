@@ -40,8 +40,11 @@
 - `IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS`: `gpt-image-2` 撞到上游 `input-images` 短速率限制且未返回明确重试时间时的 scoped 冷却秒数，默认 `5`
 - `IMAGE_RATE_LIMIT_MIN_COOLDOWN_SECONDS`: 解析到 `Please try again in ...` 时的最小 scoped 冷却秒数，默认 `1`
 - `DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS`: 429 且没有明确重置时间时的默认冷却秒数，默认 `300`
+- `IMPORT_JOB_MAX_CONCURRENCY`: 后台导入 key 的最大并发数，默认 `4`
+- `IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC`: 后台导入是否为活跃 `/v1/responses*` 流量让路，默认 `true`
 - `IMPORT_RESPONSE_IDLE_GRACE_SECONDS`: 导入 key 遇到活跃 `/v1/responses*` 流量时，等流量清空后再额外静默多久继续补号，默认 `0.25`
 - `IMPORT_WAIT_TIMEOUT_SECONDS`: 导入 key 在为活跃 `/v1/responses*` 流量让路时，最多等待多久；超时后不再整批返回 `503`，而是记一次超时并继续低优先级导入，默认 `30`
+- `IMPORT_TOKEN_VALIDATION_COOLDOWN_SECONDS`: 只带 `refresh_token` 的新 key 在后台刷新验证期间和临时失败后的冷却秒数，默认 `300`
 - `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS`: `/v1/responses/compact` 遇到上游 5xx / 传输错误时的冷却秒数，默认 `60`；设为 `0` 可关闭
 - `HOST`: 内置启动命令监听地址，默认 `0.0.0.0`
 - `PORT`: 内置启动命令端口，默认 `8000`
@@ -106,8 +109,11 @@ export POSTGRES_PASSWORD='oaix_password'
 export SERVICE_API_KEYS='change-me'
 export CORS_ALLOW_ORIGINS='https://your-app.example'
 export CODEX_BASE_URL=''
+export IMPORT_JOB_MAX_CONCURRENCY='4'
+export IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC='true'
 export IMPORT_RESPONSE_IDLE_GRACE_SECONDS='0.25'
 export IMPORT_WAIT_TIMEOUT_SECONDS='30'
+export IMPORT_TOKEN_VALIDATION_COOLDOWN_SECONDS='300'
 export COMPACT_SERVER_ERROR_COOLDOWN_SECONDS='60'
 ```
 
@@ -187,7 +193,8 @@ account_id_3,refresh_token_3
 - `gpt-image-2` 上游返回 `429 rate_limit_exceeded` 且命中 `input-images` 速率桶时，只会对当前 key 的图片桶做短冷却并自动重试下一个 key，不影响该 key 处理其他模型
 - `/v1/responses/compact` 在上游 5xx 或传输错误时，会默认把当前 key 冷却 `60` 秒后切换下一把 key；可用 `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS=0` 关闭
 - 流式 `/v1/responses*` 会先预读开头的 SSE 状态事件；如果前缀已经是 `response.failed` / `type=error` / 不完整流 / 预读阶段网络错误，就不会先把坏流交给客户端，而是留在网关里切下一把 key
-- `/admin/tokens/import` 是低优先级导入；检测到活跃 `/v1/responses*` 流量时，会逐条暂停导入，让代理请求先占用数据库和事件循环；如果等待超过 `IMPORT_WAIT_TIMEOUT_SECONDS`，会记入 `response_traffic_timeout_count` 后继续导入，避免持续流量把整批补号永久饿死
+- `/admin/tokens/import` 是低优先级导入；默认最多 4 并发，检测到活跃 `/v1/responses*` 流量时会逐条暂停，让代理请求先占用数据库和事件循环；如果等待超过 `IMPORT_WAIT_TIMEOUT_SECONDS`，会记入 `response_traffic_timeout_count` 后继续导入，避免持续流量把整批补号永久饿死
+- 只带 `refresh_token`、尚未刷新出账号信息的新 key 会先进入临时冷却；刷新成功后自动恢复可用，刷新失败则保留冷却或永久停用，避免正常请求立刻命中未验证 key
 - 如果上游返回 `429` 且 `error.type=usage_limit_reached`，会按 `resets_in_seconds` 或 `resets_at` 冷却当前 key，然后自动重试下一个 key
 - 如果上游返回 `402 {"detail":{"code":"deactivated_workspace"}}` 或 `401` 且 `error.code=account_deactivated`，会永久停用该 key
 - 如果 refresh token 明确已经失效，例如 `refresh_token_reused` / `invalid_grant` / “Please try signing in again”，网关会清空 access token 并永久停用该 key
