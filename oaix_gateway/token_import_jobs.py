@@ -9,9 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Protocol
 
+import httpx
 from sqlalchemy import and_, or_, select
 
 from .database import CodexToken, TokenImportJob, get_read_session, get_session, utcnow
+from .oauth import CodexOAuthManager
 from .token_store import (
     DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
     TokenSelectionSettings,
@@ -601,6 +603,8 @@ async def _process_single_token_import_payload(
     index: int,
     payload: Any,
     *,
+    http_client: httpx.AsyncClient,
+    oauth_manager: CodexOAuthManager,
     response_traffic: ResponseTrafficLike,
     respect_response_traffic: bool,
 ) -> _TokenImportItemResult:
@@ -632,6 +636,17 @@ async def _process_single_token_import_payload(
 
     try:
         result = await upsert_token_payload(payload)
+        if result.action in {"created", "updated"} and not result.token.account_id:
+            try:
+                await oauth_manager.get_access_token(result.token, http_client, force_refresh=True)
+            except Exception:
+                logger.warning(
+                    "Token import could not enrich missing account_id: job_id=%s index=%s token_id=%s",
+                    job_id,
+                    index,
+                    result.token.id,
+                    exc_info=True,
+                )
         item = {
             "id": result.token.id,
             "email": result.token.email,
@@ -682,6 +697,7 @@ async def process_token_import_job(
     progress_flush_interval_seconds = _import_job_progress_flush_interval_seconds()
     respect_response_traffic = _import_job_respect_response_traffic()
     pending_tasks: list[asyncio.Task[_TokenImportItemResult]] = []
+    oauth_manager = CodexOAuthManager()
 
     try:
         if processed_count < len(payloads):
@@ -689,76 +705,79 @@ async def process_token_import_job(
             last_progress_flush_at = time.monotonic()
             pending_results_since_flush = 0
 
-            async def run_limited(index: int, payload: Any) -> _TokenImportItemResult:
-                async with semaphore:
-                    result = await _process_single_token_import_payload(
-                        job.id,
-                        index,
-                        payload,
-                        response_traffic=response_traffic,
-                        respect_response_traffic=respect_response_traffic,
-                    )
-                    if result.response_traffic_timeout_count:
-                        logger.warning(
-                            "Token import job wait timed out while /v1/responses traffic remained active; continuing import: job_id=%s index=%s total_payloads=%s active_responses=%s",
+            async with httpx.AsyncClient() as http_client:
+                async def run_limited(index: int, payload: Any) -> _TokenImportItemResult:
+                    async with semaphore:
+                        result = await _process_single_token_import_payload(
                             job.id,
                             index,
-                            len(payloads),
-                            response_traffic.active_responses,
+                            payload,
+                            http_client=http_client,
+                            oauth_manager=oauth_manager,
+                            response_traffic=response_traffic,
+                            respect_response_traffic=respect_response_traffic,
                         )
-                    return result
+                        if result.response_traffic_timeout_count:
+                            logger.warning(
+                                "Token import job wait timed out while /v1/responses traffic remained active; continuing import: job_id=%s index=%s total_payloads=%s active_responses=%s",
+                                job.id,
+                                index,
+                                len(payloads),
+                                response_traffic.active_responses,
+                            )
+                        return result
 
-            pending_tasks = [
-                asyncio.create_task(
-                    run_limited(index, payloads[index]),
-                    name=f"oaix-token-import-{job.id}-{index}",
-                )
-                for index in range(processed_count, len(payloads))
-            ]
-
-            for task in asyncio.as_completed(pending_tasks):
-                result = await task
-                yielded_to_response_traffic += result.yielded_to_response_traffic_count
-                response_traffic_timeout_count += result.response_traffic_timeout_count
-                if result.category == "created":
-                    created.append(result.item)
-                elif result.category == "updated":
-                    updated.append(result.item)
-                elif result.category == "skipped":
-                    skipped.append(result.item)
-                else:
-                    failed.append(result.item)
-
-                processed_count += 1
-                pending_results_since_flush += 1
-
-                should_flush_progress = (
-                    processed_count < len(payloads)
-                    and pending_results_since_flush > 0
-                    and (
-                        pending_results_since_flush >= progress_flush_every
-                        or time.monotonic() - last_progress_flush_at >= progress_flush_interval_seconds
+                pending_tasks = [
+                    asyncio.create_task(
+                        run_limited(index, payloads[index]),
+                        name=f"oaix-token-import-{job.id}-{index}",
                     )
-                )
-                if should_flush_progress:
-                    progress_created, progress_updated, progress_skipped, progress_failed = _build_progress_snapshot(
-                        created=created,
-                        updated=updated,
-                        skipped=skipped,
-                        failed=failed,
+                    for index in range(processed_count, len(payloads))
+                ]
+
+                for task in asyncio.as_completed(pending_tasks):
+                    result = await task
+                    yielded_to_response_traffic += result.yielded_to_response_traffic_count
+                    response_traffic_timeout_count += result.response_traffic_timeout_count
+                    if result.category == "created":
+                        created.append(result.item)
+                    elif result.category == "updated":
+                        updated.append(result.item)
+                    elif result.category == "skipped":
+                        skipped.append(result.item)
+                    else:
+                        failed.append(result.item)
+
+                    processed_count += 1
+                    pending_results_since_flush += 1
+
+                    should_flush_progress = (
+                        processed_count < len(payloads)
+                        and pending_results_since_flush > 0
+                        and (
+                            pending_results_since_flush >= progress_flush_every
+                            or time.monotonic() - last_progress_flush_at >= progress_flush_interval_seconds
+                        )
                     )
-                    await update_token_import_job_progress(
-                        job.id,
-                        processed_count=processed_count,
-                        created=progress_created,
-                        updated=progress_updated,
-                        skipped=progress_skipped,
-                        failed=progress_failed,
-                        yielded_to_response_traffic_count=yielded_to_response_traffic,
-                        response_traffic_timeout_count=response_traffic_timeout_count,
-                    )
-                    last_progress_flush_at = time.monotonic()
-                    pending_results_since_flush = 0
+                    if should_flush_progress:
+                        progress_created, progress_updated, progress_skipped, progress_failed = _build_progress_snapshot(
+                            created=created,
+                            updated=updated,
+                            skipped=skipped,
+                            failed=failed,
+                        )
+                        await update_token_import_job_progress(
+                            job.id,
+                            processed_count=processed_count,
+                            created=progress_created,
+                            updated=progress_updated,
+                            skipped=progress_skipped,
+                            failed=progress_failed,
+                            yielded_to_response_traffic_count=yielded_to_response_traffic,
+                            response_traffic_timeout_count=response_traffic_timeout_count,
+                        )
+                        last_progress_flush_at = time.monotonic()
+                        pending_results_since_flush = 0
 
         created, updated, skipped, failed = _build_progress_snapshot(
             created=created,

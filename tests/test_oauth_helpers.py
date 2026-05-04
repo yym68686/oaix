@@ -102,6 +102,72 @@ def test_get_access_token_force_refresh_bypasses_cached_token(monkeypatch) -> No
     }
 
 
+def test_get_access_token_persists_account_id_from_refresh(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    refreshed_expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+
+    async def fake_refresh_codex_access_token(self, client, refresh_token: str) -> dict[str, object]:
+        return {
+            "access_token": "fresh-access-token",
+            "refresh_token": "fresh-refresh-token",
+            "expires_at": refreshed_expires_at,
+            "id_token": "id-token-with-account",
+            "account_id": "acct_from_refresh",
+            "email": "user@example.com",
+        }
+
+    async def fake_update_token_refresh_state(
+        token_id: int,
+        *,
+        access_token: str,
+        refresh_token: str | None,
+        expires_at,
+        id_token: str | None = None,
+        account_id: str | None = None,
+        email: str | None = None,
+        reactivate: bool = True,
+    ) -> None:
+        captured["update"] = {
+            "token_id": token_id,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at,
+            "id_token": id_token,
+            "account_id": account_id,
+            "email": email,
+            "reactivate": reactivate,
+        }
+
+    monkeypatch.setattr(CodexOAuthManager, "_refresh_codex_access_token", fake_refresh_codex_access_token)
+    monkeypatch.setattr("oaix_gateway.oauth.update_token_refresh_state", fake_update_token_refresh_state)
+
+    manager = CodexOAuthManager()
+    token = CodexToken(
+        id=18,
+        refresh_token="refresh-token-old",
+        account_id=None,
+        is_active=True,
+    )
+
+    access_token, refreshed = asyncio.run(manager.get_access_token(token, object(), force_refresh=True))
+
+    assert access_token == "fresh-access-token"
+    assert refreshed is True
+    assert token.account_id == "acct_from_refresh"
+    assert token.id_token == "id-token-with-account"
+    assert token.email == "user@example.com"
+    assert captured["update"] == {
+        "token_id": 18,
+        "access_token": "fresh-access-token",
+        "refresh_token": "fresh-refresh-token",
+        "expires_at": refreshed_expires_at,
+        "id_token": "id-token-with-account",
+        "account_id": "acct_from_refresh",
+        "email": "user@example.com",
+        "reactivate": True,
+    }
+
+
 def test_get_access_token_recovers_when_refresh_token_was_rotated_by_another_worker(monkeypatch) -> None:
     latest_expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
 

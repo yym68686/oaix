@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import json
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -18,6 +20,7 @@ from oaix_gateway.token_store import (
     _build_token_counts_stmt,
     _merge_duplicate_token_rows,
     claim_next_active_token,
+    extract_token_account_id_from_payload,
     invalidate_fill_first_token_cache,
     list_token_rows,
     prewarm_fill_first_token_cache,
@@ -84,6 +87,27 @@ class _FakeReadSession:
             )
         )
         return _FakeResult(self._value)
+
+
+def _unsigned_jwt(payload: dict) -> str:
+    def encode(part: dict) -> str:
+        raw = json.dumps(part, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{encode({'alg': 'none'})}.{encode(payload)}."
+
+
+def test_extract_token_account_id_from_id_token_claims() -> None:
+    id_token = _unsigned_jwt(
+        {
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_from_id_token",
+            },
+        }
+    )
+
+    assert extract_token_account_id_from_payload({"refresh_token": "rt", "id_token": id_token}) == "acct_from_id_token"
 
 
 def test_build_token_counts_stmt_uses_single_aggregate_query() -> None:

@@ -152,7 +152,7 @@ account_id_2,refresh_token_2
 account_id_3,refresh_token_3
 ```
 
-粘贴后会自动解析成导入批次；只有 `refresh_token` 的行会让 `account_id` 留空，后续由 token 刷新和请求过程补齐可获取的信息。
+粘贴后会自动解析成导入批次；只有 `refresh_token` 的行会先导入为缺少 `account_id` 的记录，后台导入 worker 会立即尝试刷新一次 token，并从刷新响应的 `id_token` 里提取 `chatgpt_account_id` 保存为 `account_id`。如果上游没有返回 `id_token` 或 claim 缺失，则保留为空，后续运行时刷新也会继续尝试补齐。
 
 导入去重规则：
 

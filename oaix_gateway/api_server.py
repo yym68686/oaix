@@ -877,6 +877,7 @@ RESPONSES_FAILURE_STATUS_BY_CODE = {
     "invalid_request_error": 400,
     "invalid_type": 400,
     "model_not_found": 404,
+    "moderation_blocked": 400,
     "not_found_error": 404,
     "permission_denied": 403,
     "rate_limit_exceeded": 429,
@@ -895,6 +896,7 @@ def _web_asset_version(path: Path) -> str:
 
 RESPONSES_FAILURE_STATUS_BY_TYPE = {
     "authentication_error": 401,
+    "image_generation_user_error": 400,
     "invalid_request_error": 400,
     "not_found_error": 404,
     "permission_error": 403,
@@ -2712,6 +2714,9 @@ async def _wrap_sse_stream_with_initial_keepalive(
 
 
 def _responses_error_status_code(error_obj: Any) -> int:
+    if _is_terminal_image_generation_error(error_obj):
+        return 400
+
     if isinstance(error_obj, dict):
         raw_status = error_obj.get("status_code") or error_obj.get("status")
         try:
@@ -3008,7 +3013,7 @@ def _upstream_error_http_exception(status_code: int, detail: str) -> HTTPExcepti
     error_obj = _extract_error_object(detail)
     if _is_terminal_image_generation_error(error_obj) or _is_terminal_image_generation_error_text(detail):
         return _non_retryable_gateway_http_exception(
-            status_code=status_code,
+            status_code=400,
             detail=detail,
             record_token_error=False,
         )

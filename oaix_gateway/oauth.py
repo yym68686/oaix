@@ -8,7 +8,7 @@ import httpx
 from fastapi import HTTPException
 
 from .database import CodexToken
-from .token_store import get_token_row, update_token_refresh_state
+from .token_store import extract_token_account_id_from_payload, get_token_row, update_token_refresh_state
 
 
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -164,6 +164,9 @@ class CodexOAuthManager:
             raise HTTPException(status_code=401, detail="Codex token refresh returned empty access_token")
 
         refresh_token_out = str(payload.get("refresh_token") or "").strip() or None
+        id_token = str(payload.get("id_token") or "").strip() or None
+        account_id = extract_token_account_id_from_payload(payload)
+        email = str(payload.get("email") or "").strip() or None
         expires_at = None
         expires_in = payload.get("expires_in")
         try:
@@ -176,6 +179,9 @@ class CodexOAuthManager:
         return {
             "access_token": access_token,
             "refresh_token": refresh_token_out,
+            "id_token": id_token,
+            "account_id": account_id,
+            "email": email,
             "expires_at": expires_at,
         }
 
@@ -243,12 +249,20 @@ class CodexOAuthManager:
                         return recovered_access_token, False
                 raise
             next_refresh_token = refreshed.get("refresh_token") or token_row.refresh_token
+            update_kwargs: dict[str, Any] = {}
+            if refreshed.get("id_token"):
+                update_kwargs["id_token"] = refreshed["id_token"]
+            if refreshed.get("account_id"):
+                update_kwargs["account_id"] = refreshed["account_id"]
+            if refreshed.get("email"):
+                update_kwargs["email"] = refreshed["email"]
             await update_token_refresh_state(
                 token_row.id,
                 access_token=refreshed["access_token"],
                 refresh_token=next_refresh_token,
                 expires_at=refreshed.get("expires_at"),
                 reactivate=reactivate_on_refresh,
+                **update_kwargs,
             )
             self._cache[token_row.id] = {
                 "access_token": refreshed["access_token"],
@@ -258,4 +272,10 @@ class CodexOAuthManager:
             token_row.access_token = refreshed["access_token"]
             token_row.refresh_token = next_refresh_token
             token_row.expires_at = refreshed.get("expires_at")
+            if refreshed.get("id_token"):
+                token_row.id_token = str(refreshed["id_token"])
+            if refreshed.get("account_id") and not token_row.account_id:
+                token_row.account_id = str(refreshed["account_id"])
+            if refreshed.get("email") and not token_row.email:
+                token_row.email = str(refreshed["email"])
             return refreshed["access_token"], True

@@ -802,7 +802,7 @@ def test_responses_failure_http_exception_marks_moderation_blocked_nonretryable(
     )
 
     assert exc is not None
-    assert exc.status_code == 500
+    assert exc.status_code == 400
     assert getattr(exc, "retryable", None) is False
     assert getattr(exc, "record_token_error", None) is False
     assert json.loads(exc.detail)["error"]["code"] == "moderation_blocked"
@@ -813,7 +813,31 @@ def test_upstream_error_http_exception_marks_plain_safety_rejection_nonretryable
 
     exc = _upstream_error_http_exception(500, detail)
 
-    assert exc.status_code == 500
+    assert exc.status_code == 400
+    assert exc.detail == detail
+    assert getattr(exc, "retryable", None) is False
+    assert getattr(exc, "record_token_error", None) is False
+
+
+def test_upstream_error_http_exception_maps_wrapped_moderation_detail_to_bad_request() -> None:
+    detail = json.dumps(
+        {
+            "detail": json.dumps(
+                {
+                    "error": {
+                        "type": "image_generation_user_error",
+                        "code": "moderation_blocked",
+                        "message": "Your request was rejected by the safety system. safety_violations=[sexual].",
+                        "param": None,
+                    }
+                }
+            )
+        }
+    )
+
+    exc = _upstream_error_http_exception(500, detail)
+
+    assert exc.status_code == 400
     assert exc.detail == detail
     assert getattr(exc, "retryable", None) is False
     assert getattr(exc, "record_token_error", None) is False
@@ -3801,12 +3825,12 @@ def test_execute_proxy_request_with_failover_does_not_retry_image_moderation_err
             )
         )
 
-    assert exc_info.value.status_code == 500
+    assert exc_info.value.status_code == 400
     assert str(exc_info.value.detail) == detail
     assert claim_calls == [1]
     assert len(finalized) == 1
     assert finalized[0]["request_log_id"] == 78
-    assert finalized[0]["status_code"] == 500
+    assert finalized[0]["status_code"] == 400
     assert finalized[0]["success"] is False
     assert finalized[0]["attempt_count"] == 1
     assert finalized[0]["token_id"] == 11
@@ -5741,6 +5765,119 @@ def test_token_import_background_worker_applies_completed_import_queue_position(
 
     assert calls == [{"token_ids": (17, 23), "position": "back"}]
     assert published == [TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=(17, 23))]
+
+
+def test_process_token_import_job_enriches_missing_account_id(monkeypatch) -> None:
+    completed: dict[str, object] = {}
+
+    class IdleResponseTraffic:
+        active_responses = 0
+
+        async def wait_for_import_turn(self, *, timeout_seconds=None) -> bool:
+            return False
+
+    async def fake_upsert_token_payload(payload: dict) -> TokenUpsertResult:
+        token = CodexToken(
+            id=41,
+            email=None,
+            account_id=None,
+            refresh_token=payload["refresh_token"],
+            token_type="codex",
+            is_active=True,
+        )
+        return TokenUpsertResult(token=token, action="created")
+
+    async def fake_get_access_token(
+        self,
+        token_row: CodexToken,
+        client,
+        *,
+        force_refresh: bool = False,
+        reactivate_on_refresh: bool = True,
+    ) -> tuple[str, bool]:
+        assert force_refresh is True
+        token_row.access_token = "access-from-refresh"
+        token_row.account_id = "acct_from_refresh"
+        return "access-from-refresh", True
+
+    async def fake_complete_token_import_job(
+        job_id: int,
+        *,
+        processed_count: int,
+        created: list[dict[str, object]],
+        updated: list[dict[str, object]],
+        skipped: list[dict[str, object]],
+        failed: list[dict[str, object]],
+        yielded_to_response_traffic_count: int,
+        response_traffic_timeout_count: int,
+    ) -> TokenImportJobState:
+        completed.update(
+            {
+                "processed_count": processed_count,
+                "created": list(created),
+                "updated": list(updated),
+                "skipped": list(skipped),
+                "failed": list(failed),
+            }
+        )
+        return TokenImportJobState(
+            id=job_id,
+            status=IMPORT_JOB_STATUS_COMPLETED,
+            import_queue_position="front",
+            total_count=1,
+            processed_count=processed_count,
+            created_count=len(created),
+            updated_count=len(updated),
+            skipped_count=len(skipped),
+            failed_count=len(failed),
+            yielded_to_response_traffic_count=yielded_to_response_traffic_count,
+            response_traffic_timeout_count=response_traffic_timeout_count,
+            created=list(created),
+            updated=list(updated),
+            skipped=list(skipped),
+            failed=list(failed),
+            submitted_at=None,
+            started_at=None,
+            heartbeat_at=None,
+            finished_at=None,
+            last_error=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.upsert_token_payload", fake_upsert_token_payload)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.CodexOAuthManager.get_access_token", fake_get_access_token)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.complete_token_import_job", fake_complete_token_import_job)
+
+    job = TokenImportJobLease(
+        id=95,
+        status=IMPORT_JOB_STATUS_RUNNING,
+        import_queue_position="front",
+        total_count=1,
+        processed_count=0,
+        created_count=0,
+        updated_count=0,
+        skipped_count=0,
+        failed_count=0,
+        yielded_to_response_traffic_count=0,
+        response_traffic_timeout_count=0,
+        created=[],
+        updated=[],
+        skipped=[],
+        failed=[],
+        submitted_at=None,
+        started_at=None,
+        heartbeat_at=None,
+        finished_at=None,
+        last_error=None,
+        payloads=[{"refresh_token": "rt-only"}],
+    )
+
+    result = asyncio.run(process_token_import_job(job, response_traffic=IdleResponseTraffic()))
+
+    assert completed["processed_count"] == 1
+    assert completed["created"] == [{"id": 41, "email": None, "account_id": "acct_from_refresh", "index": 0}]
+    assert completed["failed"] == []
+    assert result is not None
+    assert result.created_count == 1
 
 
 def test_process_token_import_job_runs_payloads_in_parallel_without_response_traffic_wait(monkeypatch) -> None:

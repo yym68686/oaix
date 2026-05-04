@@ -636,6 +636,32 @@ def _parse_mapping_or_jwt(value: Any) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def extract_token_account_id_from_payload(payload: dict[str, Any]) -> str | None:
+    def account_id_from_mapping(mapping: dict[str, Any]) -> str | None:
+        direct = str(mapping.get("account_id") or mapping.get("chatgpt_account_id") or "").strip()
+        if direct:
+            return direct
+        auth_payload = mapping.get("https://api.openai.com/auth")
+        if isinstance(auth_payload, dict):
+            nested = str(auth_payload.get("chatgpt_account_id") or auth_payload.get("account_id") or "").strip()
+            if nested:
+                return nested
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    direct = account_id_from_mapping(payload)
+    if direct is not None:
+        return direct
+
+    id_token_payload = _parse_mapping_or_jwt(payload.get("id_token"))
+    if isinstance(id_token_payload, dict):
+        return account_id_from_mapping(id_token_payload)
+
+    return None
+
+
 def _extract_plan_type_from_payload(payload: dict[str, Any]) -> str | None:
     auth_payload = payload.get("https://api.openai.com/auth")
     if isinstance(auth_payload, dict):
@@ -1315,7 +1341,7 @@ async def upsert_token_payload(
 ) -> TokenUpsertResult:
     payload = _load_token_payload(token_data_or_json)
     email = str(payload.get("email") or "").strip() or None
-    account_id = str(payload.get("account_id") or "").strip() or None
+    account_id = extract_token_account_id_from_payload(payload)
     refresh_token = normalize_refresh_token(payload.get("refresh_token"))
     if refresh_token is None:
         raise ValueError("Token payload missing refresh_token")
@@ -1905,6 +1931,10 @@ async def update_token_refresh_state(
     access_token: str,
     refresh_token: str | None,
     expires_at: datetime | None,
+    id_token: str | None = None,
+    account_id: str | None = None,
+    email: str | None = None,
+    plan_type: str | None = None,
     reactivate: bool = True,
 ) -> None:
     async with get_session() as session:
@@ -1924,6 +1954,18 @@ async def update_token_refresh_state(
                 return
             previous_refresh_token = token.refresh_token
             token.access_token = access_token
+            normalized_id_token = str(id_token or "").strip() or None
+            normalized_account_id = str(account_id or "").strip() or None
+            normalized_email = str(email or "").strip() or None
+            normalized_plan_type = _normalize_plan_type(plan_type)
+            if normalized_id_token:
+                token.id_token = normalized_id_token
+            if normalized_account_id and not token.account_id:
+                token.account_id = normalized_account_id
+            if normalized_email and not token.email:
+                token.email = normalized_email
+            if normalized_plan_type:
+                token.plan_type = normalized_plan_type
             if refresh_token:
                 token.refresh_token = refresh_token
             token.refresh_token_aliases = merge_refresh_token_aliases(
