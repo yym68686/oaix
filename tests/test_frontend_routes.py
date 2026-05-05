@@ -70,6 +70,13 @@ def test_frontend_index_includes_token_search_input() -> None:
     assert 'id="token-page-input"' in response.text
 
 
+def test_frontend_defaults_key_status_to_available_tab() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+
+    assert 'const DEFAULT_TOKEN_STATUS_FILTER = "available";' in app_js
+    assert 'tokenStatusFilter: DEFAULT_TOKEN_STATUS_FILTER' in app_js
+
+
 def test_livez_returns_without_token_count_query(monkeypatch) -> None:
     async def fail_get_token_counts():
         raise AssertionError("livez should not query token counts")
