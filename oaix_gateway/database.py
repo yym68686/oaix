@@ -552,7 +552,7 @@ def _run_schema_migrations(sync_conn) -> None:
         sync_conn.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS ix_codex_tokens_pool_snapshot "
-                "ON codex_tokens (token_type, is_active, cooldown_until, id) "
+                "ON codex_tokens (type, is_active, cooldown_until, id) "
                 "WHERE merged_into_token_id IS NULL AND refresh_token IS NOT NULL"
             )
         )
@@ -560,7 +560,7 @@ def _run_schema_migrations(sync_conn) -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_codex_tokens_lru_available "
                 "ON codex_tokens (last_used_at, updated_at, id) "
-                "WHERE merged_into_token_id IS NULL AND is_active IS TRUE AND token_type = 'codex' "
+                "WHERE merged_into_token_id IS NULL AND is_active IS TRUE AND type = 'codex' "
                 "AND refresh_token IS NOT NULL"
             )
         )
