@@ -23,6 +23,7 @@ from oaix_gateway.api_server import (
     _TOKEN_ACTIVE_REQUESTS,
     _chat_completions_request_to_responses_request,
     _claim_next_active_token_for_request,
+    _claim_next_token_for_model_request,
     _collect_images_api_response_from_sse,
     _execute_proxy_request_with_failover,
     ResponseTrafficController,
@@ -1638,6 +1639,138 @@ def test_claim_next_active_token_for_request_does_not_db_fallback_when_snapshot_
     spans = timing.snapshot()
     assert spans["claim_token_source"] == "memory"
     assert spans["claim_token_memory_miss_count"] == 1
+
+
+def test_claim_next_token_for_model_request_prefilters_free_snapshot_tokens() -> None:
+    free_token = SimpleNamespace(
+        id=21,
+        plan_type="free",
+        refresh_token="rt_free",
+        token_type="codex",
+        is_active=True,
+        cooldown_until=None,
+        merged_into_token_id=None,
+    )
+    plus_token = SimpleNamespace(
+        id=22,
+        plan_type="plus",
+        refresh_token="rt_plus",
+        token_type="codex",
+        is_active=True,
+        cooldown_until=None,
+        merged_into_token_id=None,
+    )
+    snapshot = SimpleNamespace(
+        tokens=(free_token, plus_token),
+        scoped_cooldowns={},
+        loaded_at=0.0,
+    )
+
+    _TOKEN_ACTIVE_REQUESTS.clear()
+    result = asyncio.run(
+        _claim_next_token_for_model_request(
+            TokenSelectionSettings(
+                strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+                token_order=(21, 22),
+                plan_order_enabled=True,
+                plan_order=("free", "plus", "team", "pro"),
+                active_stream_cap=5,
+            ),
+            exclude_token_ids=set(),
+            scoped_cooldown_scope=None,
+            timing=_RequestTimingRecorder(),
+            token_pool_snapshot=snapshot,
+            require_non_free_token=True,
+        )
+    )
+
+    assert result is plus_token
+    assert 21 not in _TOKEN_ACTIVE_REQUESTS
+    assert _TOKEN_ACTIVE_REQUESTS[22] == 1
+    _TOKEN_ACTIVE_REQUESTS.clear()
+
+
+def test_claim_next_token_for_model_request_prefers_known_non_free_before_unknown_snapshot_token() -> None:
+    unknown_token = SimpleNamespace(
+        id=31,
+        plan_type=None,
+        raw_payload={},
+        id_token=None,
+        account_id="acct_unknown",
+        refresh_token="rt_unknown",
+        token_type="codex",
+        is_active=True,
+        cooldown_until=None,
+        merged_into_token_id=None,
+    )
+    plus_token = SimpleNamespace(
+        id=32,
+        plan_type="plus",
+        refresh_token="rt_plus",
+        token_type="codex",
+        is_active=True,
+        cooldown_until=None,
+        merged_into_token_id=None,
+    )
+    snapshot = SimpleNamespace(
+        tokens=(unknown_token, plus_token),
+        scoped_cooldowns={},
+        loaded_at=0.0,
+    )
+
+    _TOKEN_ACTIVE_REQUESTS.clear()
+    result = asyncio.run(
+        _claim_next_token_for_model_request(
+            TokenSelectionSettings(
+                strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+                token_order=(31, 32),
+                plan_order_enabled=False,
+                active_stream_cap=5,
+            ),
+            exclude_token_ids=set(),
+            scoped_cooldown_scope=None,
+            timing=_RequestTimingRecorder(),
+            token_pool_snapshot=snapshot,
+            require_non_free_token=True,
+        )
+    )
+
+    assert result is plus_token
+    assert 31 not in _TOKEN_ACTIVE_REQUESTS
+    assert _TOKEN_ACTIVE_REQUESTS[32] == 1
+    _TOKEN_ACTIVE_REQUESTS.clear()
+
+
+def test_claim_next_token_for_model_request_returns_none_when_snapshot_has_only_free_tokens() -> None:
+    free_token = SimpleNamespace(
+        id=41,
+        plan_type="free",
+        refresh_token="rt_free",
+        token_type="codex",
+        is_active=True,
+        cooldown_until=None,
+        merged_into_token_id=None,
+    )
+    snapshot = SimpleNamespace(
+        tokens=(free_token,),
+        scoped_cooldowns={},
+        loaded_at=0.0,
+    )
+
+    _TOKEN_ACTIVE_REQUESTS.clear()
+    result = asyncio.run(
+        _claim_next_token_for_model_request(
+            TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=(41,)),
+            exclude_token_ids=set(),
+            scoped_cooldown_scope=None,
+            timing=_RequestTimingRecorder(),
+            token_pool_snapshot=snapshot,
+            require_non_free_token=True,
+        )
+    )
+
+    assert result is None
+    assert _TOKEN_ACTIVE_REQUESTS == {}
 
 
 def test_upstream_http_pool_size_is_configurable(monkeypatch) -> None:

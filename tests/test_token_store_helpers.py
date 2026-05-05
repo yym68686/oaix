@@ -89,6 +89,23 @@ class _FakeReadSession:
         return _FakeResult(self._value)
 
 
+class _FakeWriteSession(_FakeSession):
+    def __init__(self, value) -> None:
+        self._value = value
+        self.statements: list[str] = []
+
+    async def execute(self, stmt) -> _FakeResult:
+        self.statements.append(
+            str(
+                stmt.compile(
+                    dialect=postgresql.dialect(),
+                    compile_kwargs={"literal_binds": True},
+                )
+            )
+        )
+        return _FakeResult(self._value)
+
+
 def _unsigned_jwt(payload: dict) -> str:
     def encode(part: dict) -> str:
         raw = json.dumps(part, separators=(",", ":")).encode("utf-8")
@@ -217,6 +234,112 @@ def test_claim_next_active_token_filters_requested_scoped_cooldown(monkeypatch) 
     sql = read_session.statements[0]
     assert "codex_token_scoped_cooldowns" in sql
     assert "gpt-image-2:input-images" in sql
+    invalidate_fill_first_token_cache()
+
+
+def test_claim_next_active_token_fill_first_filters_plan_types_from_cache() -> None:
+    invalidate_fill_first_token_cache()
+    free_token = CodexToken(
+        id=21,
+        refresh_token="rt_free",
+        token_type="codex",
+        is_active=True,
+        plan_type="free",
+    )
+    plus_token = CodexToken(
+        id=22,
+        refresh_token="rt_plus",
+        token_type="codex",
+        is_active=True,
+        plan_type="plus",
+    )
+    cache_key = ((21, 22), False, (), None)
+    now = time.monotonic()
+    _FILL_FIRST_TOKEN_CACHE[cache_key] = _FillFirstTokenCacheEntry(
+        expires_at=now + 10,
+        stale_until=now + 10,
+        tokens=(free_token, plus_token),
+    )
+
+    result = asyncio.run(
+        claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(21, 22),
+            include_plan_types=("plus", "team", "pro"),
+        )
+    )
+
+    assert result is plus_token
+    invalidate_fill_first_token_cache()
+
+
+def test_claim_next_active_token_fill_first_keeps_unknown_when_excluding_free_from_cache() -> None:
+    invalidate_fill_first_token_cache()
+    free_token = CodexToken(
+        id=23,
+        refresh_token="rt_free",
+        token_type="codex",
+        is_active=True,
+        plan_type="free",
+    )
+    unknown_token = CodexToken(
+        id=24,
+        refresh_token="rt_unknown",
+        token_type="codex",
+        is_active=True,
+        plan_type=None,
+    )
+    cache_key = ((23, 24), False, (), None)
+    now = time.monotonic()
+    _FILL_FIRST_TOKEN_CACHE[cache_key] = _FillFirstTokenCacheEntry(
+        expires_at=now + 10,
+        stale_until=now + 10,
+        tokens=(free_token, unknown_token),
+    )
+
+    result = asyncio.run(
+        claim_next_active_token(
+            selection_strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+            token_order=(23, 24),
+            exclude_plan_types=("free",),
+        )
+    )
+
+    assert result is unknown_token
+    invalidate_fill_first_token_cache()
+
+
+def test_claim_next_active_token_filters_plan_types_in_db_query(monkeypatch) -> None:
+    invalidate_fill_first_token_cache()
+    token = CodexToken(
+        id=25,
+        refresh_token="rt_25",
+        token_type="codex",
+        is_active=True,
+        plan_type="plus",
+    )
+    session = _FakeWriteSession(token)
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield session
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
+
+    result = asyncio.run(
+        claim_next_active_token(
+            selection_strategy="least_recently_used",
+            token_order=(25,),
+            include_plan_types=("plus", "team", "pro"),
+            exclude_plan_types=("free",),
+        )
+    )
+
+    assert result is token
+    sql = session.statements[0]
+    assert "replace(lower(coalesce(codex_tokens.plan_type" in sql
+    assert "IN ('plus', 'team', 'pro')" in sql
+    assert "NOT IN ('free')" in sql
     invalidate_fill_first_token_cache()
 
 

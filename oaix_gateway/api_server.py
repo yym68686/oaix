@@ -14,7 +14,7 @@ import re
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -66,6 +66,8 @@ from .token_store import (
     DEFAULT_TOKEN_SELECTION_STRATEGY,
     DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
     DEFAULT_TOKEN_ACTIVE_STREAM_CAP,
+    DEFAULT_TOKEN_PLAN_ORDER,
+    TOKEN_PLAN_TYPE_FREE,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TOKEN_LIST_PLAN_ALL,
     TOKEN_LIST_SORT_NEWEST,
@@ -111,6 +113,9 @@ DEFAULT_IMAGES_TOOL_MODEL = "gpt-image-2"
 IMAGE_INPUT_RATE_LIMIT_COOLDOWN_SCOPE = f"{DEFAULT_IMAGES_TOOL_MODEL}:input-images"
 NON_FREE_ONLY_CODEX_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL})
 RESPONSES_IMAGE_COMPAT_MODELS = frozenset({DEFAULT_IMAGES_TOOL_MODEL})
+KNOWN_NON_FREE_TOKEN_PLAN_TYPES = tuple(
+    plan_type for plan_type in DEFAULT_TOKEN_PLAN_ORDER if plan_type != TOKEN_PLAN_TYPE_FREE
+)
 RESPONSES_IMAGE_TOOL_TEXT_FIELDS = (
     "size",
     "quality",
@@ -520,6 +525,48 @@ def _token_plan_sort_value(token_row: Any, settings: TokenSelectionSettings) -> 
     return plan_map.get(plan_type, len(plan_map))
 
 
+def _normalize_token_plan_value(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized.startswith("chatgpt_"):
+        normalized = normalized[len("chatgpt_") :]
+    return normalized or None
+
+
+def _normalize_token_plan_filter(values: Iterable[str] | None) -> set[str]:
+    if values is None:
+        return set()
+    return {
+        plan_type
+        for value in values
+        if (plan_type := _normalize_token_plan_value(value)) is not None
+    }
+
+
+def _token_row_prefilter_plan_type(token_row: Any) -> str | None:
+    stored_plan_type = _normalize_token_plan_value(getattr(token_row, "plan_type", None))
+    if stored_plan_type is not None:
+        return stored_plan_type
+    return _declared_token_plan_info(token_row).plan_type
+
+
+def _token_row_matches_plan_filters(
+    token_row: Any,
+    *,
+    include_plan_types: Iterable[str] | None,
+    exclude_plan_types: Iterable[str] | None,
+) -> bool:
+    include = _normalize_token_plan_filter(include_plan_types)
+    exclude = _normalize_token_plan_filter(exclude_plan_types)
+    if not include and not exclude:
+        return True
+    plan_type = _token_row_prefilter_plan_type(token_row)
+    if include and plan_type not in include:
+        return False
+    if plan_type is not None and plan_type in exclude:
+        return False
+    return True
+
+
 def _token_order_sort_value(token_row: Any, settings: TokenSelectionSettings) -> int:
     order = list(settings.token_order)
     if not order:
@@ -648,6 +695,8 @@ def _claim_next_active_token_from_snapshot(
     exclude_token_ids: set[int],
     scoped_cooldown_scope: str | None,
     timing: _RequestTimingRecorder | None,
+    include_plan_types: Iterable[str] | None = None,
+    exclude_plan_types: Iterable[str] | None = None,
 ) -> Any | None:
     now = utcnow()
     active_stream_cap = normalize_token_active_stream_cap(selection_settings.active_stream_cap)
@@ -664,6 +713,12 @@ def _claim_next_active_token_from_snapshot(
     for token_row in _token_snapshot_ordered_tokens(snapshot, selection_settings):
         token_id = int(getattr(token_row, "id", 0) or 0)
         if token_id <= 0 or token_id in effective_excluded_ids:
+            continue
+        if not _token_row_matches_plan_filters(
+            token_row,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        ):
             continue
         if not _token_snapshot_row_available(
             token_row,
@@ -691,6 +746,8 @@ async def _claim_next_active_token_for_request(
     scoped_cooldown_scope: str | None = None,
     timing: _RequestTimingRecorder | None = None,
     token_pool_snapshot: _TokenPoolSnapshot | None = None,
+    include_plan_types: Iterable[str] | None = None,
+    exclude_plan_types: Iterable[str] | None = None,
 ) -> Any:
     if token_pool_snapshot is not None:
         token_row = _claim_next_active_token_from_snapshot(
@@ -699,6 +756,8 @@ async def _claim_next_active_token_for_request(
             exclude_token_ids=exclude_token_ids,
             scoped_cooldown_scope=scoped_cooldown_scope,
             timing=timing,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
         )
         if token_row is not None:
             return token_row
@@ -732,6 +791,10 @@ async def _claim_next_active_token_for_request(
             kwargs["plan_order"] = selection_settings.plan_order
         if scoped_cooldown_scope is not None and "scoped_cooldown_scope" in claim_signature.parameters:
             kwargs["scoped_cooldown_scope"] = scoped_cooldown_scope
+        if include_plan_types is not None and "include_plan_types" in claim_signature.parameters:
+            kwargs["include_plan_types"] = include_plan_types
+        if exclude_plan_types is not None and "exclude_plan_types" in claim_signature.parameters:
+            kwargs["exclude_plan_types"] = exclude_plan_types
 
         token_row = await claim_next_active_token(**kwargs)
         if token_row is None:
@@ -746,6 +809,59 @@ async def _claim_next_active_token_for_request(
             return token_row
 
         local_excluded_ids.add(token_id)
+
+
+async def _claim_next_token_for_model_request(
+    selection_settings: TokenSelectionSettings,
+    *,
+    exclude_token_ids: set[int],
+    scoped_cooldown_scope: str | None,
+    timing: _RequestTimingRecorder | None,
+    token_pool_snapshot: _TokenPoolSnapshot | None,
+    require_non_free_token: bool,
+) -> Any:
+    if not require_non_free_token:
+        return await _claim_next_active_token_for_request(
+            selection_settings,
+            exclude_token_ids=exclude_token_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            timing=timing,
+            token_pool_snapshot=token_pool_snapshot,
+        )
+
+    if token_pool_snapshot is None:
+        claim_signature = inspect.signature(claim_next_active_token)
+        if (
+            "include_plan_types" not in claim_signature.parameters
+            or "exclude_plan_types" not in claim_signature.parameters
+        ):
+            return await _claim_next_active_token_for_request(
+                selection_settings,
+                exclude_token_ids=exclude_token_ids,
+                scoped_cooldown_scope=scoped_cooldown_scope,
+                timing=timing,
+                token_pool_snapshot=token_pool_snapshot,
+            )
+
+    token_row = await _claim_next_active_token_for_request(
+        selection_settings,
+        exclude_token_ids=exclude_token_ids,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+        timing=timing,
+        token_pool_snapshot=token_pool_snapshot,
+        include_plan_types=KNOWN_NON_FREE_TOKEN_PLAN_TYPES,
+    )
+    if token_row is not None:
+        return token_row
+
+    return await _claim_next_active_token_for_request(
+        selection_settings,
+        exclude_token_ids=exclude_token_ids,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+        timing=timing,
+        token_pool_snapshot=token_pool_snapshot,
+        exclude_plan_types=(TOKEN_PLAN_TYPE_FREE,),
+    )
 
 
 @dataclass
@@ -5131,12 +5247,13 @@ def _gpt_image_stream_keepalive_response(
             while attempt_count < max_attempts and claim_count < max_claims:
                 claim_count += 1
                 token_row = await _await_timed(
-                    _claim_next_active_token_for_request(
+                    _claim_next_token_for_model_request(
                         selection_settings,
                         exclude_token_ids=excluded_token_ids,
                         scoped_cooldown_scope=scoped_cooldown_scope,
                         timing=timing,
                         token_pool_snapshot=_current_token_pool_snapshot(http_request.app),
+                        require_non_free_token=require_non_free_token,
                     ),
                     timing=timing,
                     span_name="claim_token_ms",
@@ -5671,12 +5788,13 @@ async def _execute_proxy_request_with_failover(
         while attempt_count < max_attempts and claim_count < max_claims:
             claim_count += 1
             token_row = await _await_timed(
-                _claim_next_active_token_for_request(
+                _claim_next_token_for_model_request(
                     selection_settings,
                     exclude_token_ids=excluded_token_ids,
                     scoped_cooldown_scope=scoped_cooldown_scope,
                     timing=timing,
                     token_pool_snapshot=_current_token_pool_snapshot(http_request.app),
+                    require_non_free_token=require_non_free_token,
                 ),
                 timing=timing,
                 span_name="claim_token_ms",

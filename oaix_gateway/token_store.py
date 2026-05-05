@@ -616,6 +616,20 @@ def _normalize_plan_type(value: Any) -> str | None:
     return normalized or None
 
 
+def _normalize_plan_type_filter(values: Iterable[str] | None) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for value in values:
+        plan_type = _normalize_plan_type(value)
+        if plan_type is None or plan_type in seen:
+            continue
+        seen.add(plan_type)
+        normalized.append(plan_type)
+    return tuple(normalized)
+
+
 def _decode_base64_url(segment: str) -> bytes:
     value = segment.strip()
     padding = len(value) % 4
@@ -1000,7 +1014,13 @@ def _load_token_payload(token_data_or_json: str | dict[str, Any]) -> dict[str, A
     return payload
 
 
-def _available_token_filters(now: datetime, *, scoped_cooldown_scope: str | None = None) -> tuple[Any, ...]:
+def _available_token_filters(
+    now: datetime,
+    *,
+    scoped_cooldown_scope: str | None = None,
+    include_plan_types: Iterable[str] | None = None,
+    exclude_plan_types: Iterable[str] | None = None,
+) -> tuple[Any, ...]:
     filters: list[Any] = [
         *_canonical_token_filters(),
         CodexToken.is_active.is_(True),
@@ -1008,6 +1028,13 @@ def _available_token_filters(now: datetime, *, scoped_cooldown_scope: str | None
         CodexToken.token_type == "codex",
         or_(CodexToken.cooldown_until.is_(None), CodexToken.cooldown_until <= now),
     ]
+    plan_value = _token_plan_value_expr()
+    resolved_include_plan_types = _normalize_plan_type_filter(include_plan_types)
+    if resolved_include_plan_types:
+        filters.append(plan_value.in_(resolved_include_plan_types))
+    resolved_exclude_plan_types = _normalize_plan_type_filter(exclude_plan_types)
+    if resolved_exclude_plan_types:
+        filters.append(~plan_value.in_(resolved_exclude_plan_types))
     if scoped_cooldown_scope:
         active_scoped_cooldown = (
             select(CodexTokenScopedCooldown.id)
@@ -1835,11 +1862,20 @@ def _select_fill_first_token_from_cached_entry(
     *,
     exclude_token_ids: tuple[int, ...],
     scoped_cooldown_scope: str | None,
+    include_plan_types: Iterable[str] | None = None,
+    exclude_plan_types: Iterable[str] | None = None,
 ) -> CodexToken | None:
     excluded = set(exclude_token_ids)
+    resolved_include_plan_types = set(_normalize_plan_type_filter(include_plan_types))
+    resolved_exclude_plan_types = set(_normalize_plan_type_filter(exclude_plan_types))
     now = utcnow()
     for token in cached.tokens:
         if token.id in excluded:
+            continue
+        plan_type = _normalize_plan_type(getattr(token, "plan_type", None))
+        if resolved_include_plan_types and plan_type not in resolved_include_plan_types:
+            continue
+        if plan_type is not None and plan_type in resolved_exclude_plan_types:
             continue
         if not _token_is_runtime_available(token, now=now, scoped_cooldown_scope=scoped_cooldown_scope):
             continue
@@ -1869,6 +1905,8 @@ async def _claim_fill_first_token_from_cache(
     plan_order_enabled: bool,
     plan_order: tuple[str, ...],
     scoped_cooldown_scope: str | None,
+    include_plan_types: Iterable[str] | None = None,
+    exclude_plan_types: Iterable[str] | None = None,
 ) -> CodexToken | None:
     cache_key = _fill_first_token_cache_key(
         token_order=token_order,
@@ -1883,6 +1921,8 @@ async def _claim_fill_first_token_from_cache(
             cached,
             exclude_token_ids=exclude_token_ids,
             scoped_cooldown_scope=scoped_cooldown_scope,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
         )
 
     if cached is not None:
@@ -1897,6 +1937,8 @@ async def _claim_fill_first_token_from_cache(
             cached,
             exclude_token_ids=exclude_token_ids,
             scoped_cooldown_scope=scoped_cooldown_scope,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
         )
 
     tokens = await _await_fill_first_token_cache_refresh(
@@ -1915,6 +1957,8 @@ async def _claim_fill_first_token_from_cache(
         cached,
         exclude_token_ids=exclude_token_ids,
         scoped_cooldown_scope=scoped_cooldown_scope,
+        include_plan_types=include_plan_types,
+        exclude_plan_types=exclude_plan_types,
     )
 
 
@@ -1950,6 +1994,8 @@ async def claim_next_active_token(
     plan_order_enabled: bool | None = None,
     plan_order: Iterable[str] | None = None,
     scoped_cooldown_scope: str | None = None,
+    include_plan_types: Iterable[str] | None = None,
+    exclude_plan_types: Iterable[str] | None = None,
 ) -> CodexToken | None:
     now = utcnow()
     excluded_ids = tuple(sorted({int(token_id) for token_id in (exclude_token_ids or ())}))
@@ -1975,13 +2021,22 @@ async def claim_next_active_token(
             plan_order_enabled=resolved_plan_order_enabled,
             plan_order=resolved_plan_order,
             scoped_cooldown_scope=scoped_cooldown_scope,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
         )
 
     async with get_session() as session:
         async with session.begin():
             stmt = (
                 select(CodexToken)
-                .where(*_available_token_filters(now, scoped_cooldown_scope=scoped_cooldown_scope))
+                .where(
+                    *_available_token_filters(
+                        now,
+                        scoped_cooldown_scope=scoped_cooldown_scope,
+                        include_plan_types=include_plan_types,
+                        exclude_plan_types=exclude_plan_types,
+                    )
+                )
                 .order_by(
                     *_token_selection_order_clauses(
                         resolved_strategy,
