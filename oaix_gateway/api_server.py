@@ -33,7 +33,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.datastructures import UploadFile
 from .chat_image_store import create_chat_image_checkpoint, resolve_chat_image_output_items
 from .codex_constants import CODEX_CLI_VERSION, CODEX_USER_AGENT
-from .database import close_database, init_db, reset_db_timing_recorder, set_db_timing_recorder, utcnow
+from .database import (
+    close_database,
+    init_db,
+    reset_db_pool_role,
+    reset_db_timing_recorder,
+    set_db_pool_role,
+    set_db_timing_recorder,
+    utcnow,
+)
 from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
 from .request_store import (
@@ -185,7 +193,7 @@ def _pop_sse_event_from_buffer(text_buffer: str, scan_start: int = 0) -> tuple[s
 
 class _RequestTimingRecorder:
     def __init__(self) -> None:
-        self._spans: dict[str, int] = {}
+        self._spans: dict[str, int | str] = {}
 
     def add_elapsed(self, name: str, started_at: float) -> None:
         self.add_ms(name, int((time.perf_counter() - started_at) * 1000))
@@ -210,6 +218,12 @@ class _RequestTimingRecorder:
             return
         self._spans[key] = value
 
+    def set_tag(self, name: str, value: str) -> None:
+        key = str(name or "").strip()
+        text = str(value or "").strip()
+        if key and text:
+            self._spans[key] = text[:128]
+
     @contextmanager
     def measure(self, name: str):
         started_at = time.perf_counter()
@@ -218,12 +232,12 @@ class _RequestTimingRecorder:
         finally:
             self.add_elapsed(name, started_at)
 
-    def snapshot(self) -> dict[str, int]:
+    def snapshot(self) -> dict[str, int | str]:
         return dict(self._spans)
 
 
-def _merge_timing_spans(*spans: dict[str, Any] | None) -> dict[str, int] | None:
-    merged: dict[str, int] = {}
+def _merge_timing_spans(*spans: dict[str, Any] | None) -> dict[str, int | str] | None:
+    merged: dict[str, int | str] = {}
     for span_map in spans:
         if not isinstance(span_map, dict):
             continue
@@ -231,11 +245,17 @@ def _merge_timing_spans(*spans: dict[str, Any] | None) -> dict[str, int] | None:
             name = str(key or "").strip()
             if not name or isinstance(value, bool):
                 continue
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    merged[name] = text[:128]
+                continue
             try:
                 resolved = max(0, int(round(float(value))))
             except (TypeError, ValueError):
                 continue
-            merged[name] = merged.get(name, 0) + resolved
+            previous = merged.get(name, 0)
+            merged[name] = (previous if isinstance(previous, int) else 0) + resolved
     return merged or None
 
 
@@ -609,6 +629,13 @@ async def _refresh_token_pool_snapshot(app: FastAPI) -> _TokenPoolSnapshot:
     return snapshot
 
 
+async def _refresh_token_pool_snapshot_best_effort(app: FastAPI, *, reason: str) -> None:
+    try:
+        await _refresh_token_pool_snapshot(app)
+    except Exception:
+        logger.exception("Failed to refresh token pool snapshot: reason=%s", reason)
+
+
 def _current_token_pool_snapshot(app: FastAPI) -> _TokenPoolSnapshot | None:
     snapshot = getattr(app.state, "token_pool_snapshot", None)
     return snapshot if isinstance(snapshot, _TokenPoolSnapshot) else None
@@ -651,6 +678,7 @@ def _claim_next_active_token_from_snapshot(
         token_row.updated_at = now
         if timing is not None:
             timing.add_ms("claim_token_memory_count", 1)
+            timing.set_tag("claim_token_source", "memory")
         _record_selected_token_observation_start(token_id, timing)
         return token_row
     return None
@@ -675,7 +703,9 @@ async def _claim_next_active_token_for_request(
         if token_row is not None:
             return token_row
         if timing is not None:
-            timing.add_ms("claim_token_db_fallback_count", 1)
+            timing.add_ms("claim_token_memory_miss_count", 1)
+            timing.set_tag("claim_token_source", "memory")
+        return None
 
     local_excluded_ids: set[int] = set()
     fill_first = selection_settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST
@@ -709,6 +739,9 @@ async def _claim_next_active_token_for_request(
 
         token_id = int(token_row.id)
         if _token_active_stream_count(token_id) < active_stream_cap:
+            if timing is not None:
+                timing.add_ms("claim_token_db_fallback_count", 1)
+                timing.set_tag("claim_token_source", "db")
             _record_selected_token_observation_start(token_id, timing)
             return token_row
 
@@ -950,7 +983,7 @@ class _RequestLogHandle:
     _request_log_id: int | None = None
     _finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _finalized: bool = False
-    _finalized_spans: dict[str, int] | None = None
+    _finalized_spans: dict[str, Any] | None = None
 
     @classmethod
     def start(
@@ -1004,7 +1037,7 @@ class _RequestLogHandle:
         timing: _RequestTimingRecorder | None,
         success_hook: Callable[[int], Awaitable[None]] | None = None,
         **kwargs,
-    ) -> tuple[int | None, dict[str, int] | None]:
+    ) -> tuple[int | None, dict[str, Any] | None]:
         async with self._finalize_lock:
             if self._finalized:
                 if success_hook is not None and self._request_log_id is not None:
@@ -6511,6 +6544,14 @@ def create_app() -> FastAPI:
     )
     app.mount("/assets", StaticFiles(directory=str(WEB_DIR)), name="assets")
 
+    @app.middleware("http")
+    async def db_pool_role_middleware(request: Request, call_next):
+        role_token = set_db_pool_role("admin" if request.url.path.startswith("/admin/") else "request")
+        try:
+            return await call_next(request)
+        finally:
+            reset_db_pool_role(role_token)
+
     @app.get("/")
     async def index() -> HTMLResponse:
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
@@ -6551,6 +6592,7 @@ def create_app() -> FastAPI:
 
     @app.post("/admin/token-selection")
     async def update_token_selection_route(
+        http_request: Request,
         payload: TokenSelectionUpdateRequest,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
@@ -6559,19 +6601,23 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         app.state.token_selection_settings = selection
+        await _refresh_token_pool_snapshot_best_effort(http_request.app, reason="token_selection_update")
         return _serialize_token_selection_settings(selection)
 
     @app.post("/admin/token-selection/order")
     async def update_token_selection_order_route(
+        http_request: Request,
         payload: TokenSelectionOrderUpdateRequest,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         selection = await update_token_order_settings(token_ids=payload.token_ids)
         app.state.token_selection_settings = selection
+        await _refresh_token_pool_snapshot_best_effort(http_request.app, reason="token_selection_order_update")
         return _serialize_token_selection_settings(selection)
 
     @app.post("/admin/token-selection/plan-order")
     async def update_token_selection_plan_order_route(
+        http_request: Request,
         payload: TokenSelectionPlanOrderUpdateRequest,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
@@ -6580,10 +6626,12 @@ def create_app() -> FastAPI:
             plan_order=payload.plan_order,
         )
         app.state.token_selection_settings = selection
+        await _refresh_token_pool_snapshot_best_effort(http_request.app, reason="token_selection_plan_order_update")
         return _serialize_token_selection_settings(selection)
 
     @app.post("/admin/token-selection/concurrency")
     async def update_token_selection_concurrency_route(
+        http_request: Request,
         payload: TokenSelectionConcurrencyUpdateRequest,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
@@ -6592,6 +6640,7 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         app.state.token_selection_settings = selection
+        await _refresh_token_pool_snapshot_best_effort(http_request.app, reason="token_selection_concurrency_update")
         return _serialize_token_selection_settings(selection)
 
     @app.get("/admin/tokens")
@@ -6693,6 +6742,7 @@ def create_app() -> FastAPI:
 
     @app.post("/admin/tokens/{token_id}/activation")
     async def update_token_activation_route(
+        http_request: Request,
         token_id: int,
         payload: TokenActivationUpdateRequest,
         _: None = Depends(verify_service_api_key),
@@ -6704,6 +6754,7 @@ def create_app() -> FastAPI:
         )
         if token is None:
             raise HTTPException(status_code=404, detail="Token not found")
+        await _refresh_token_pool_snapshot_best_effort(http_request.app, reason="token_activation_update")
         counts = await get_token_counts()
         return {
             "id": token.id,
@@ -6731,12 +6782,14 @@ def create_app() -> FastAPI:
 
     @app.delete("/admin/tokens/{token_id}")
     async def delete_token_route(
+        http_request: Request,
         token_id: int,
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         deleted = await delete_token(token_id)
         if deleted is None:
             raise HTTPException(status_code=404, detail="Token not found")
+        await _refresh_token_pool_snapshot_best_effort(http_request.app, reason="token_delete")
         counts = await get_token_counts()
         return {
             "id": deleted.canonical_id,

@@ -56,14 +56,19 @@ def _ms_between(started_at: datetime | None, ended_at: datetime | None) -> int |
     return max(0, int((ended_at - started_at).total_seconds() * 1000))
 
 
-def _normalize_timing_spans(timing_spans: dict[str, Any] | None) -> dict[str, int] | None:
+def _normalize_timing_spans(timing_spans: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(timing_spans, dict):
         return None
 
-    normalized: dict[str, int] = {}
+    normalized: dict[str, Any] = {}
     for key, value in timing_spans.items():
         name = str(key or "").strip()
         if not name or isinstance(value, bool):
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                normalized[name] = text[:128]
             continue
         try:
             normalized[name] = max(0, int(round(float(value))))
@@ -281,7 +286,7 @@ async def finalize_request_log(
     estimated_cost_usd: float | None = None,
     timing_spans: dict[str, Any] | None = None,
     error_message: str | None = None,
-) -> dict[str, int] | None:
+) -> dict[str, Any] | None:
     finalize_started = perf_counter()
     finished_at = finished_at or utcnow()
     resolved_timing_spans = _normalize_timing_spans(timing_spans)
@@ -424,7 +429,7 @@ async def _upsert_request_logs_portable(values_list: list[dict[str, Any]]) -> li
     return results
 
 
-def _timing_snapshot(timing_recorder: Any | None) -> dict[str, int] | None:
+def _timing_snapshot(timing_recorder: Any | None) -> dict[str, Any] | None:
     snapshot = getattr(timing_recorder, "snapshot", None)
     if not callable(snapshot):
         return None
@@ -442,7 +447,11 @@ def _merge_payload_timing(values_list: list[dict[str, Any]], timing_spans: dict[
         current = _normalize_timing_spans(values.get("timing_spans")) or {}
         merged = dict(current)
         for key, value in resolved.items():
-            merged[key] = merged.get(key, 0) + value
+            if isinstance(value, str):
+                merged[key] = value
+                continue
+            previous = merged.get(key, 0)
+            merged[key] = (previous if isinstance(previous, int) else 0) + value
         values["timing_spans"] = merged
 
 

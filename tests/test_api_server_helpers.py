@@ -79,8 +79,18 @@ from oaix_gateway.token_import_jobs import (
     TokenImportJobState,
     get_token_import_job,
     process_token_import_job,
+    IMPORT_ITEM_STATUS_QUEUED,
+    IMPORT_ITEM_STATUS_VALIDATED,
+    IMPORT_ITEM_STATUS_FAILED,
+    IMPORT_ITEM_STATUS_PUBLISH_PENDING,
+    IMPORT_ITEM_STATUS_PUBLISHED,
 )
-from oaix_gateway.token_store import TOKEN_SELECTION_STRATEGY_FILL_FIRST, TokenSelectionSettings, TokenUpsertResult
+from oaix_gateway.token_store import (
+    TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+    TokenPublishBatchResult,
+    TokenSelectionSettings,
+    TokenUpsertResult,
+)
 
 
 @pytest.mark.parametrize("separator", ["\n\n", "\r\n\n", "\n\r\n", "\r\n\r\n"])
@@ -1600,6 +1610,34 @@ def test_claim_next_active_token_for_request_skips_saturated_fill_first_token(mo
     assert _TOKEN_ACTIVE_REQUESTS[12] == 1
     assert timing.snapshot()["selected_token_active_streams"] == 0
     _TOKEN_ACTIVE_REQUESTS.clear()
+
+
+def test_claim_next_active_token_for_request_does_not_db_fallback_when_snapshot_exists(monkeypatch) -> None:
+    async def fake_claim_next_active_token(**kwargs):
+        del kwargs
+        raise AssertionError("request hot path should not query DB when a token pool snapshot exists")
+
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    timing = _RequestTimingRecorder()
+    snapshot = SimpleNamespace(tokens=(), scoped_cooldowns={}, loaded_at=0.0)
+
+    result = asyncio.run(
+        _claim_next_active_token_for_request(
+            TokenSelectionSettings(
+                strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST,
+                token_order=(11, 12),
+                active_stream_cap=2,
+            ),
+            exclude_token_ids=set(),
+            timing=timing,
+            token_pool_snapshot=snapshot,
+        )
+    )
+
+    assert result is None
+    spans = timing.snapshot()
+    assert spans["claim_token_source"] == "memory"
+    assert spans["claim_token_memory_miss_count"] == 1
 
 
 def test_upstream_http_pool_size_is_configurable(monkeypatch) -> None:
@@ -5609,7 +5647,7 @@ def test_get_token_import_job_reads_via_execute(monkeypatch) -> None:
     async def fake_get_read_session():
         yield fake_session
 
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.get_read_session", fake_get_read_session)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.get_import_read_session", fake_get_read_session)
 
     result = asyncio.run(get_token_import_job(25))
 
@@ -5769,9 +5807,80 @@ def test_token_import_background_worker_applies_completed_import_queue_position(
     assert published == [TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=(17, 23))]
 
 
+def _install_staged_import_fakes(monkeypatch, job_id: int, payloads: list[object]) -> list[SimpleNamespace]:
+    staged_items = [
+        SimpleNamespace(
+            id=index + 1,
+            job_id=job_id,
+            index=index,
+            status=IMPORT_ITEM_STATUS_QUEUED,
+            payload=payload if isinstance(payload, dict) else {"_raw": payload},
+            validated_payload=None,
+            token_id=None,
+            action=None,
+            error_message=None,
+        )
+        for index, payload in enumerate(payloads)
+    ]
+
+    async def fake_list_token_import_items(requested_job_id: int):
+        assert requested_job_id == job_id
+        return list(staged_items)
+
+    async def fake_mark_import_item_validating(item_id: int) -> None:
+        staged_items[item_id - 1].status = "validating"
+
+    async def fake_mark_import_item_validated(
+        item_id: int,
+        *,
+        validated_payload: dict[str, object],
+        validation_ms: int,
+    ) -> None:
+        del validation_ms
+        staged_items[item_id - 1].status = IMPORT_ITEM_STATUS_VALIDATED
+        staged_items[item_id - 1].validated_payload = dict(validated_payload)
+
+    async def fake_mark_import_item_failed(
+        item_id: int,
+        *,
+        error_message: str,
+        validation_ms: int | None = None,
+        publish_ms: int | None = None,
+    ) -> None:
+        del validation_ms, publish_ms
+        staged_items[item_id - 1].status = IMPORT_ITEM_STATUS_FAILED
+        staged_items[item_id - 1].error_message = error_message
+
+    async def fake_mark_import_items_publish_pending(item_ids) -> None:
+        for item_id in item_ids:
+            staged_items[int(item_id) - 1].status = IMPORT_ITEM_STATUS_PUBLISH_PENDING
+
+    async def fake_mark_import_item_published(
+        item_id: int,
+        *,
+        token_id: int,
+        action: str,
+        publish_ms: int,
+    ) -> None:
+        del publish_ms
+        staged_items[item_id - 1].status = IMPORT_ITEM_STATUS_PUBLISHED
+        staged_items[item_id - 1].token_id = token_id
+        staged_items[item_id - 1].action = action
+
+    monkeypatch.setattr("oaix_gateway.token_import_jobs._list_token_import_items", fake_list_token_import_items)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs._mark_import_item_validating", fake_mark_import_item_validating)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs._mark_import_item_validated", fake_mark_import_item_validated)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs._mark_import_item_failed", fake_mark_import_item_failed)
+    monkeypatch.setattr(
+        "oaix_gateway.token_import_jobs._mark_import_items_publish_pending",
+        fake_mark_import_items_publish_pending,
+    )
+    monkeypatch.setattr("oaix_gateway.token_import_jobs._mark_import_item_published", fake_mark_import_item_published)
+    return staged_items
+
+
 def test_process_token_import_job_enriches_missing_account_id(monkeypatch) -> None:
     completed: dict[str, object] = {}
-    pending: list[dict[str, object]] = []
 
     class IdleResponseTraffic:
         active_responses = 0
@@ -5779,43 +5888,29 @@ def test_process_token_import_job_enriches_missing_account_id(monkeypatch) -> No
         async def wait_for_import_turn(self, *, timeout_seconds=None) -> bool:
             return False
 
-    async def fake_upsert_token_payload(payload: dict) -> TokenUpsertResult:
+    async def fake_refresh_codex_access_token(self, client, refresh_token: str) -> dict[str, object]:
+        assert refresh_token == "rt-only"
+        return {
+            "access_token": "access-from-refresh",
+            "refresh_token": "rt-only",
+            "account_id": "acct_from_refresh",
+            "email": None,
+            "expires_at": None,
+        }
+
+    async def fake_publish_token_payload_batch(payloads, *, import_queue_position: str) -> TokenPublishBatchResult:
+        assert import_queue_position == "front"
+        payload = list(payloads)[0]
+        assert payload["access_token"] == "access-from-refresh"
         token = CodexToken(
             id=41,
             email=None,
-            account_id=None,
+            account_id=payload["account_id"],
             refresh_token=payload["refresh_token"],
             token_type="codex",
             is_active=True,
         )
-        return TokenUpsertResult(token=token, action="created")
-
-    async def fake_mark_token_import_validation_pending(
-        token_id: int,
-        message: str,
-        *,
-        cooldown_seconds: int,
-    ) -> None:
-        pending.append(
-            {
-                "token_id": token_id,
-                "message": message,
-                "cooldown_seconds": cooldown_seconds,
-            }
-        )
-
-    async def fake_get_access_token(
-        self,
-        token_row: CodexToken,
-        client,
-        *,
-        force_refresh: bool = False,
-        reactivate_on_refresh: bool = True,
-    ) -> tuple[str, bool]:
-        assert force_refresh is True
-        token_row.access_token = "access-from-refresh"
-        token_row.account_id = "acct_from_refresh"
-        return "access-from-refresh", True
+        return TokenPublishBatchResult(results=(TokenUpsertResult(token=token, action="created"),))
 
     async def fake_complete_token_import_job(
         job_id: int,
@@ -5860,12 +5955,9 @@ def test_process_token_import_job_enriches_missing_account_id(monkeypatch) -> No
             last_error=None,
         )
 
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.upsert_token_payload", fake_upsert_token_payload)
-    monkeypatch.setattr(
-        "oaix_gateway.token_import_jobs.mark_token_import_validation_pending",
-        fake_mark_token_import_validation_pending,
-    )
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.CodexOAuthManager.get_access_token", fake_get_access_token)
+    _install_staged_import_fakes(monkeypatch, 95, [{"refresh_token": "rt-only"}])
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.CodexOAuthManager._refresh_codex_access_token", fake_refresh_codex_access_token)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.publish_token_payload_batch", fake_publish_token_payload_batch)
     monkeypatch.setattr("oaix_gateway.token_import_jobs.complete_token_import_job", fake_complete_token_import_job)
 
     job = TokenImportJobLease(
@@ -5894,13 +5986,6 @@ def test_process_token_import_job_enriches_missing_account_id(monkeypatch) -> No
 
     result = asyncio.run(process_token_import_job(job, response_traffic=IdleResponseTraffic()))
 
-    assert pending == [
-        {
-            "token_id": 41,
-            "message": "Import validation pending",
-            "cooldown_seconds": 300,
-        }
-    ]
     assert completed["processed_count"] == 1
     assert completed["created"] == [{"id": 41, "email": None, "account_id": "acct_from_refresh", "index": 0}]
     assert completed["failed"] == []
@@ -5910,8 +5995,6 @@ def test_process_token_import_job_enriches_missing_account_id(monkeypatch) -> No
 
 def test_process_token_import_job_marks_refresh_only_tokens_failed_when_validation_fails(monkeypatch) -> None:
     completed: dict[str, object] = {}
-    pending: list[int] = []
-    error_marks: list[dict[str, object]] = []
 
     class IdleResponseTraffic:
         active_responses = 0
@@ -5919,52 +6002,9 @@ def test_process_token_import_job_marks_refresh_only_tokens_failed_when_validati
         async def wait_for_import_turn(self, *, timeout_seconds=None) -> bool:
             return False
 
-    async def fake_upsert_token_payload(payload: dict) -> TokenUpsertResult:
-        token = CodexToken(
-            id=42,
-            email=None,
-            account_id=None,
-            refresh_token=payload["refresh_token"],
-            token_type="codex",
-            is_active=True,
-        )
-        return TokenUpsertResult(token=token, action="created")
-
-    async def fake_mark_token_import_validation_pending(
-        token_id: int,
-        message: str,
-        *,
-        cooldown_seconds: int,
-    ) -> None:
-        pending.append(token_id)
-
-    async def fake_get_access_token(
-        self,
-        token_row: CodexToken,
-        client,
-        *,
-        force_refresh: bool = False,
-        reactivate_on_refresh: bool = True,
-    ) -> tuple[str, bool]:
+    async def fake_refresh_codex_access_token(self, client, refresh_token: str) -> dict[str, object]:
+        assert refresh_token == "rt-only"
         raise HTTPException(status_code=401, detail="refresh token revoked")
-
-    async def fake_mark_token_error(
-        token_id: int,
-        message: str,
-        *,
-        deactivate: bool = False,
-        cooldown_seconds: int | None = None,
-        clear_access_token: bool = False,
-    ) -> None:
-        error_marks.append(
-            {
-                "token_id": token_id,
-                "message": message,
-                "deactivate": deactivate,
-                "cooldown_seconds": cooldown_seconds,
-                "clear_access_token": clear_access_token,
-            }
-        )
 
     async def fake_complete_token_import_job(
         job_id: int,
@@ -6009,13 +6049,8 @@ def test_process_token_import_job_marks_refresh_only_tokens_failed_when_validati
             last_error=None,
         )
 
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.upsert_token_payload", fake_upsert_token_payload)
-    monkeypatch.setattr(
-        "oaix_gateway.token_import_jobs.mark_token_import_validation_pending",
-        fake_mark_token_import_validation_pending,
-    )
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.CodexOAuthManager.get_access_token", fake_get_access_token)
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.mark_token_error", fake_mark_token_error)
+    _install_staged_import_fakes(monkeypatch, 96, [{"refresh_token": "rt-only"}])
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.CodexOAuthManager._refresh_codex_access_token", fake_refresh_codex_access_token)
     monkeypatch.setattr("oaix_gateway.token_import_jobs.complete_token_import_job", fake_complete_token_import_job)
 
     job = TokenImportJobLease(
@@ -6044,22 +6079,12 @@ def test_process_token_import_job_marks_refresh_only_tokens_failed_when_validati
 
     result = asyncio.run(process_token_import_job(job, response_traffic=IdleResponseTraffic()))
 
-    assert pending == [42]
-    assert error_marks == [
-        {
-            "token_id": 42,
-            "message": "refresh token revoked",
-            "deactivate": True,
-            "cooldown_seconds": None,
-            "clear_access_token": True,
-        }
-    ]
-    assert completed["failed"] == [{"id": 42, "email": None, "account_id": None, "index": 0, "error": "refresh token revoked"}]
+    assert completed["failed"] == [{"index": 0, "error": "refresh token revoked"}]
     assert result is not None
     assert result.failed_count == 1
 
 
-def test_process_token_import_job_waits_for_response_traffic_by_default(monkeypatch) -> None:
+def test_process_token_import_job_does_not_wait_for_response_traffic_by_default(monkeypatch) -> None:
     wait_calls: list[int] = []
 
     class BusyResponseTraffic:
@@ -6069,7 +6094,17 @@ def test_process_token_import_job_waits_for_response_traffic_by_default(monkeypa
             wait_calls.append(self.active_responses)
             return True
 
-    async def fake_upsert_token_payload(payload: dict) -> TokenUpsertResult:
+    async def fake_refresh_codex_access_token(self, client, refresh_token: str) -> dict[str, object]:
+        return {
+            "access_token": "access-43",
+            "refresh_token": refresh_token,
+            "account_id": "acct_123",
+            "email": "user@example.com",
+            "expires_at": None,
+        }
+
+    async def fake_publish_token_payload_batch(payloads, *, import_queue_position: str) -> TokenPublishBatchResult:
+        payload = list(payloads)[0]
         token = CodexToken(
             id=43,
             email="user@example.com",
@@ -6077,7 +6112,7 @@ def test_process_token_import_job_waits_for_response_traffic_by_default(monkeypa
             refresh_token=payload["refresh_token"],
             is_active=True,
         )
-        return TokenUpsertResult(token=token, action="created")
+        return TokenPublishBatchResult(results=(TokenUpsertResult(token=token, action="created"),))
 
     async def fake_complete_token_import_job(
         job_id: int,
@@ -6114,7 +6149,9 @@ def test_process_token_import_job_waits_for_response_traffic_by_default(monkeypa
         )
 
     monkeypatch.delenv("IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC", raising=False)
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.upsert_token_payload", fake_upsert_token_payload)
+    _install_staged_import_fakes(monkeypatch, 97, [{"refresh_token": "rt-43"}])
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.CodexOAuthManager._refresh_codex_access_token", fake_refresh_codex_access_token)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.publish_token_payload_batch", fake_publish_token_payload_batch)
     monkeypatch.setattr("oaix_gateway.token_import_jobs.complete_token_import_job", fake_complete_token_import_job)
 
     job = TokenImportJobLease(
@@ -6143,9 +6180,9 @@ def test_process_token_import_job_waits_for_response_traffic_by_default(monkeypa
 
     result = asyncio.run(process_token_import_job(job, response_traffic=BusyResponseTraffic()))
 
-    assert wait_calls == [2]
+    assert wait_calls == []
     assert result is not None
-    assert result.yielded_to_response_traffic_count == 1
+    assert result.yielded_to_response_traffic_count == 0
     assert result.created_count == 1
 
 
@@ -6166,19 +6203,33 @@ def test_process_token_import_job_runs_payloads_in_parallel_without_response_tra
 
     response_traffic = BusyResponseTraffic()
 
-    async def fake_upsert_token_payload(payload: dict) -> TokenUpsertResult:
+    async def fake_refresh_codex_access_token(self, client, refresh_token: str) -> dict[str, object]:
         concurrency["active"] += 1
         concurrency["max_active"] = max(concurrency["max_active"], concurrency["active"])
         await asyncio.sleep(0.02)
         concurrency["active"] -= 1
-        token = CodexToken(
-            id=int(str(payload["refresh_token"]).split("-")[-1]),
-            email="user@example.com",
-            account_id="acct_123",
-            refresh_token=payload["refresh_token"],
-            is_active=True,
-        )
-        return TokenUpsertResult(token=token, action="created")
+        return {
+            "access_token": f"access-{refresh_token}",
+            "refresh_token": refresh_token,
+            "account_id": "acct_123",
+            "email": "user@example.com",
+            "expires_at": None,
+        }
+
+    async def fake_publish_token_payload_batch(payloads, *, import_queue_position: str) -> TokenPublishBatchResult:
+        results: list[TokenUpsertResult] = []
+        for payload in payloads:
+            refresh_token = str(payload["refresh_token"])
+            token_id = int(refresh_token.split("-")[-1])
+            token = CodexToken(
+                id=token_id,
+                email="user@example.com",
+                account_id="acct_123",
+                refresh_token=refresh_token,
+                is_active=True,
+            )
+            results.append(TokenUpsertResult(token=token, action="created"))
+        return TokenPublishBatchResult(results=tuple(results))
 
     async def fake_update_token_import_job_progress(
         job_id: int,
@@ -6255,7 +6306,18 @@ def test_process_token_import_job_runs_payloads_in_parallel_without_response_tra
     monkeypatch.setenv("IMPORT_JOB_PROGRESS_FLUSH_EVERY", "1")
     monkeypatch.setenv("IMPORT_JOB_PROGRESS_FLUSH_INTERVAL_SECONDS", "0")
     monkeypatch.setenv("IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC", "0")
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.upsert_token_payload", fake_upsert_token_payload)
+    _install_staged_import_fakes(
+        monkeypatch,
+        7,
+        [
+            {"refresh_token": "rt-1"},
+            {"refresh_token": "rt-2"},
+            {"refresh_token": "rt-3"},
+            "bad-payload",
+        ],
+    )
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.CodexOAuthManager._refresh_codex_access_token", fake_refresh_codex_access_token)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.publish_token_payload_batch", fake_publish_token_payload_batch)
     monkeypatch.setattr(
         "oaix_gateway.token_import_jobs.update_token_import_job_progress",
         fake_update_token_import_job_progress,
@@ -6300,8 +6362,7 @@ def test_process_token_import_job_runs_payloads_in_parallel_without_response_tra
 
     assert response_traffic.calls == 0
     assert concurrency["max_active"] > 1
-    assert [call["processed_count"] for call in progress_calls] == [1, 2, 3]
-    assert progress_calls[-1]["response_traffic_timeout_count"] == 0
+    assert progress_calls == []
     assert completed["processed_count"] == 4
     assert completed["response_traffic_timeout_count"] == 0
     assert [item["index"] for item in completed["created"]] == [0, 1, 2]
@@ -6321,15 +6382,28 @@ def test_process_token_import_job_batches_progress_updates_for_small_fast_jobs(m
         async def wait_for_import_turn(self, *, timeout_seconds=None) -> bool:
             raise AssertionError("wait_for_import_turn should stay disabled by default")
 
-    async def fake_upsert_token_payload(payload: dict) -> TokenUpsertResult:
-        token = CodexToken(
-            id=int(str(payload["refresh_token"]).split("-")[-1]),
-            email="user@example.com",
-            account_id="acct_123",
-            refresh_token=payload["refresh_token"],
-            is_active=True,
-        )
-        return TokenUpsertResult(token=token, action="created")
+    async def fake_refresh_codex_access_token(self, client, refresh_token: str) -> dict[str, object]:
+        return {
+            "access_token": f"access-{refresh_token}",
+            "refresh_token": refresh_token,
+            "account_id": "acct_123",
+            "email": "user@example.com",
+            "expires_at": None,
+        }
+
+    async def fake_publish_token_payload_batch(payloads, *, import_queue_position: str) -> TokenPublishBatchResult:
+        results = []
+        for payload in payloads:
+            refresh_token = str(payload["refresh_token"])
+            token = CodexToken(
+                id=int(refresh_token.split("-")[-1]),
+                email="user@example.com",
+                account_id="acct_123",
+                refresh_token=refresh_token,
+                is_active=True,
+            )
+            results.append(TokenUpsertResult(token=token, action="created"))
+        return TokenPublishBatchResult(results=tuple(results))
 
     async def fake_update_token_import_job_progress(
         job_id: int,
@@ -6383,7 +6457,9 @@ def test_process_token_import_job_batches_progress_updates_for_small_fast_jobs(m
     monkeypatch.setenv("IMPORT_JOB_PROGRESS_FLUSH_EVERY", "64")
     monkeypatch.setenv("IMPORT_JOB_PROGRESS_FLUSH_INTERVAL_SECONDS", "3600")
     monkeypatch.setenv("IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC", "0")
-    monkeypatch.setattr("oaix_gateway.token_import_jobs.upsert_token_payload", fake_upsert_token_payload)
+    _install_staged_import_fakes(monkeypatch, 8, [{"refresh_token": f"rt-{index + 1}"} for index in range(17)])
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.CodexOAuthManager._refresh_codex_access_token", fake_refresh_codex_access_token)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.publish_token_payload_batch", fake_publish_token_payload_batch)
     monkeypatch.setattr(
         "oaix_gateway.token_import_jobs.update_token_import_job_progress",
         fake_update_token_import_job_progress,

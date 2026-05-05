@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import inspect
+import json
 import logging
 import os
+import secrets
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Protocol
 
 import httpx
 from sqlalchemy import and_, or_, select
@@ -20,19 +24,16 @@ from .database import (
     get_import_read_session,
     get_import_session,
     get_read_session,
-    get_session,
     utcnow,
 )
-from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
+from .oauth import CodexOAuthManager
 from .token_identity import normalize_refresh_token
 from .token_store import (
     DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
     TokenSelectionSettings,
     apply_imported_token_queue_position,
-    mark_token_error,
-    mark_token_import_validation_pending,
     normalize_token_import_queue_position,
-    upsert_token_payload,
+    publish_token_payload_batch,
 )
 
 
@@ -45,7 +46,8 @@ IMPORT_JOB_STATUS_FAILED = "failed"
 IMPORT_ITEM_STATUS_QUEUED = "queued"
 IMPORT_ITEM_STATUS_VALIDATING = "validating"
 IMPORT_ITEM_STATUS_VALIDATED = "validated"
-IMPORT_ITEM_STATUS_PUBLISHING = "publishing"
+IMPORT_ITEM_STATUS_PUBLISH_PENDING = "publish_pending"
+IMPORT_ITEM_STATUS_LEGACY_PUBLISHING = "publishing"
 IMPORT_ITEM_STATUS_PUBLISHED = "published"
 IMPORT_ITEM_STATUS_FAILED = "failed"
 IMPORT_ITEM_STATUS_DUPLICATE = "duplicate"
@@ -85,23 +87,19 @@ def _import_job_stale_after_seconds() -> float:
 
 
 def _import_job_max_concurrency() -> int:
-    return _int_env("IMPORT_JOB_MAX_CONCURRENCY", 4, minimum=1)
+    return _int_env("IMPORT_JOB_MAX_CONCURRENCY", 16, minimum=1)
 
 
-def _import_job_progress_flush_every() -> int:
-    return _int_env("IMPORT_JOB_PROGRESS_FLUSH_EVERY", 32, minimum=1)
+def _import_publish_batch_size() -> int:
+    return _int_env("IMPORT_PUBLISH_BATCH_SIZE", 20, minimum=1)
 
 
-def _import_job_progress_flush_interval_seconds() -> float:
-    return _float_env("IMPORT_JOB_PROGRESS_FLUSH_INTERVAL_SECONDS", 2.0, minimum=0.0)
+def _import_publish_flush_interval_seconds() -> float:
+    return _float_env("IMPORT_PUBLISH_FLUSH_INTERVAL_SECONDS", 0.5, minimum=0.0)
 
 
 def _import_job_respect_response_traffic() -> bool:
-    return _bool_env("IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC", True)
-
-
-def _import_token_validation_cooldown_seconds() -> int:
-    return _int_env("IMPORT_TOKEN_VALIDATION_COOLDOWN_SECONDS", 300, minimum=1)
+    return _bool_env("IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC", False)
 
 
 def _as_item_list(value: Any) -> list[dict[str, Any]]:
@@ -240,9 +238,77 @@ def _refresh_token_hash_from_payload(payload: Any) -> str | None:
     return hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
 
 
+def _b64_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64_decode(raw: str) -> bytes:
+    padded = raw + ("=" * (-len(raw) % 4))
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _import_payload_secret() -> bytes:
+    explicit = str(os.getenv("TOKEN_IMPORT_PAYLOAD_SECRET") or os.getenv("TOKEN_IMPORT_ENCRYPTION_KEY") or "").strip()
+    seed = explicit or str(os.getenv("DATABASE_URL") or "oaix-token-import")
+    return hashlib.sha256(seed.encode("utf-8")).digest()
+
+
+def _import_payload_keystream(secret: bytes, nonce: bytes, length: int) -> bytes:
+    chunks: list[bytes] = []
+    counter = 0
+    while sum(len(chunk) for chunk in chunks) < length:
+        chunks.append(hashlib.sha256(secret + nonce + counter.to_bytes(4, "big")).digest())
+        counter += 1
+    return b"".join(chunks)[:length]
+
+
+def _encrypt_import_payload(payload: Any) -> str:
+    plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    secret = _import_payload_secret()
+    nonce = secrets.token_bytes(16)
+    stream = _import_payload_keystream(secret, nonce, len(plaintext))
+    ciphertext = bytes(left ^ right for left, right in zip(plaintext, stream))
+    version = b"v1"
+    mac = hmac.new(secret, version + nonce + ciphertext, hashlib.sha256).digest()
+    return ":".join(("v1", _b64_encode(nonce), _b64_encode(ciphertext), _b64_encode(mac)))
+
+
+def _decrypt_import_payload(encrypted_payload: str | None) -> Any:
+    if not encrypted_payload:
+        return None
+    try:
+        version, nonce_raw, ciphertext_raw, mac_raw = encrypted_payload.split(":", 3)
+        if version != "v1":
+            return None
+        secret = _import_payload_secret()
+        nonce = _b64_decode(nonce_raw)
+        ciphertext = _b64_decode(ciphertext_raw)
+        expected_mac = hmac.new(secret, b"v1" + nonce + ciphertext, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected_mac, _b64_decode(mac_raw)):
+            return None
+        stream = _import_payload_keystream(secret, nonce, len(ciphertext))
+        plaintext = bytes(left ^ right for left, right in zip(ciphertext, stream))
+        return json.loads(plaintext.decode("utf-8"))
+    except Exception:
+        logger.exception("Failed to decrypt token import staging payload")
+        return None
+
+
 def _serialize_staged_item(item: TokenImportItem) -> _TokenImportStagedItem:
     payload = item.payload if isinstance(item.payload, dict) else None
     validated_payload = item.validated_payload if isinstance(item.validated_payload, dict) else None
+    decrypted_payload = _decrypt_import_payload(getattr(item, "encrypted_payload", None))
+    if isinstance(decrypted_payload, dict):
+        if str(item.status or "") in {
+            IMPORT_ITEM_STATUS_VALIDATED,
+            IMPORT_ITEM_STATUS_PUBLISH_PENDING,
+            IMPORT_ITEM_STATUS_LEGACY_PUBLISHING,
+            IMPORT_ITEM_STATUS_PUBLISHED,
+            IMPORT_ITEM_STATUS_DUPLICATE,
+        }:
+            validated_payload = decrypted_payload
+        else:
+            payload = decrypted_payload
     return _TokenImportStagedItem(
         id=int(item.id),
         job_id=int(item.job_id),
@@ -321,13 +387,16 @@ async def create_token_import_job(
                         item_index=index,
                         status=IMPORT_ITEM_STATUS_QUEUED,
                         refresh_token_hash=_refresh_token_hash_from_payload(payload),
-                        payload=payload if isinstance(payload, dict) else {"_raw": payload},
+                        encrypted_payload=_encrypt_import_payload(payload if isinstance(payload, dict) else {"_raw": payload}),
+                        payload=None,
                         validated_payload=None,
                         token_id=None,
                         action=None,
                         error_message=None,
                         validation_ms=None,
                         publish_ms=None,
+                        import_validate_ms=None,
+                        import_publish_ms=None,
                         validation_started_at=None,
                         validation_finished_at=None,
                         published_at=None,
@@ -719,6 +788,44 @@ async def _list_token_import_items(job_id: int) -> list[_TokenImportStagedItem]:
         return [_serialize_staged_item(item) for item in result.scalars().all()]
 
 
+async def _materialize_token_import_items_from_payloads(job: TokenImportJobLease) -> list[_TokenImportStagedItem]:
+    payloads = list(job.payloads)
+    if not payloads:
+        return []
+    async with get_import_session() as session:
+        async with session.begin():
+            existing_result = await session.execute(
+                select(TokenImportItem.item_index).where(TokenImportItem.job_id == int(job.id))
+            )
+            existing_indices = {int(index) for index in existing_result.scalars().all()}
+            for index, payload in enumerate(payloads):
+                if index in existing_indices:
+                    continue
+                session.add(
+                    TokenImportItem(
+                        job_id=int(job.id),
+                        item_index=index,
+                        status=IMPORT_ITEM_STATUS_QUEUED,
+                        refresh_token_hash=_refresh_token_hash_from_payload(payload),
+                        encrypted_payload=_encrypt_import_payload(payload if isinstance(payload, dict) else {"_raw": payload}),
+                        payload=None,
+                        validated_payload=None,
+                        token_id=None,
+                        action=None,
+                        error_message=None,
+                        validation_ms=None,
+                        publish_ms=None,
+                        import_validate_ms=None,
+                        import_publish_ms=None,
+                        validation_started_at=None,
+                        validation_finished_at=None,
+                        published_at=None,
+                    )
+                )
+            await session.flush()
+    return await _list_token_import_items(job.id)
+
+
 async def _mark_import_item_validating(item_id: int) -> None:
     async with get_import_session() as session:
         async with session.begin():
@@ -745,8 +852,11 @@ async def _mark_import_item_validated(
                 return
             now = utcnow()
             item.status = IMPORT_ITEM_STATUS_VALIDATED
-            item.validated_payload = dict(validated_payload)
+            item.encrypted_payload = _encrypt_import_payload(dict(validated_payload))
+            item.payload = None
+            item.validated_payload = None
             item.validation_ms = max(0, int(validation_ms))
+            item.import_validate_ms = max(0, int(validation_ms))
             item.validation_finished_at = now
             item.error_message = None
             item.updated_at = now
@@ -770,22 +880,31 @@ async def _mark_import_item_failed(
             item.error_message = _summarize_error(error_message)
             if validation_ms is not None:
                 item.validation_ms = max(0, int(validation_ms))
+                item.import_validate_ms = max(0, int(validation_ms))
                 item.validation_finished_at = now
             if publish_ms is not None:
                 item.publish_ms = max(0, int(publish_ms))
+                item.import_publish_ms = max(0, int(publish_ms))
                 item.published_at = now
             item.updated_at = now
             await session.flush()
 
 
-async def _mark_import_item_publishing(item_id: int) -> None:
+async def _mark_import_items_publish_pending(item_ids: Iterable[int]) -> None:
+    ids = tuple(sorted({int(item_id) for item_id in item_ids}))
+    if not ids:
+        return
     async with get_import_session() as session:
         async with session.begin():
-            item = await session.get(TokenImportItem, int(item_id), with_for_update=True)
-            if item is None:
-                return
-            item.status = IMPORT_ITEM_STATUS_PUBLISHING
-            item.updated_at = utcnow()
+            result = await session.execute(
+                select(TokenImportItem)
+                .where(TokenImportItem.id.in_(ids), TokenImportItem.status == IMPORT_ITEM_STATUS_VALIDATED)
+                .with_for_update()
+            )
+            now = utcnow()
+            for item in result.scalars().all():
+                item.status = IMPORT_ITEM_STATUS_PUBLISH_PENDING
+                item.updated_at = now
             await session.flush()
 
 
@@ -806,6 +925,7 @@ async def _mark_import_item_published(
             item.token_id = int(token_id)
             item.action = action
             item.publish_ms = max(0, int(publish_ms))
+            item.import_publish_ms = max(0, int(publish_ms))
             item.published_at = now
             item.error_message = None
             item.updated_at = now
@@ -818,119 +938,6 @@ def _payload_from_staged_item(item: _TokenImportStagedItem) -> Any:
     if "_raw" in item.payload and len(item.payload) == 1:
         return item.payload.get("_raw")
     return dict(item.payload)
-
-
-async def _process_single_token_import_payload(
-    job_id: int,
-    index: int,
-    payload: Any,
-    *,
-    http_client: httpx.AsyncClient,
-    oauth_manager: CodexOAuthManager,
-    response_traffic: ResponseTrafficLike,
-    respect_response_traffic: bool,
-) -> _TokenImportItemResult:
-    yielded_to_response_traffic_count = 0
-    response_traffic_timeout_count = 0
-
-    yielded, timed_out = await _wait_for_response_traffic_turn(
-        job_id=job_id,
-        index=index,
-        response_traffic=response_traffic,
-        respect_response_traffic=respect_response_traffic,
-        phase="upsert",
-    )
-    yielded_to_response_traffic_count += yielded
-    response_traffic_timeout_count += timed_out
-
-    if not isinstance(payload, dict):
-        return _TokenImportItemResult(
-            index=index,
-            category="failed",
-            item={"index": index, "error": "Token payload must be a JSON object"},
-            yielded_to_response_traffic_count=yielded_to_response_traffic_count,
-            response_traffic_timeout_count=response_traffic_timeout_count,
-        )
-
-    try:
-        result = await upsert_token_payload(payload)
-        if result.action in {"created", "updated"} and not result.token.account_id:
-            validation_cooldown_seconds = _import_token_validation_cooldown_seconds()
-            await mark_token_import_validation_pending(
-                result.token.id,
-                "Import validation pending",
-                cooldown_seconds=validation_cooldown_seconds,
-            )
-            yielded, timed_out = await _wait_for_response_traffic_turn(
-                job_id=job_id,
-                index=index,
-                response_traffic=response_traffic,
-                respect_response_traffic=respect_response_traffic,
-                phase="oauth_refresh",
-            )
-            yielded_to_response_traffic_count += yielded
-            response_traffic_timeout_count += timed_out
-            try:
-                await oauth_manager.get_access_token(result.token, http_client, force_refresh=True)
-            except Exception as exc:
-                permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
-                await mark_token_error(
-                    result.token.id,
-                    str(getattr(exc, "detail", exc) or exc),
-                    deactivate=permanent_refresh_failure,
-                    cooldown_seconds=None if permanent_refresh_failure else validation_cooldown_seconds,
-                    clear_access_token=True,
-                )
-                logger.warning(
-                    "Token import could not enrich missing account_id: job_id=%s index=%s token_id=%s",
-                    job_id,
-                    index,
-                    result.token.id,
-                    exc_info=True,
-                )
-                return _TokenImportItemResult(
-                    index=index,
-                    category="failed",
-                    item={
-                        "id": result.token.id,
-                        "email": result.token.email,
-                        "account_id": result.token.account_id,
-                        "index": index,
-                        "error": str(getattr(exc, "detail", exc) or exc),
-                    },
-                    yielded_to_response_traffic_count=yielded_to_response_traffic_count,
-                    response_traffic_timeout_count=response_traffic_timeout_count,
-                )
-        item = {
-            "id": result.token.id,
-            "email": result.token.email,
-            "account_id": result.token.account_id,
-            "index": index,
-        }
-        category = "created"
-        if result.action == "updated":
-            category = "updated"
-        elif result.action != "created":
-            category = "skipped"
-            item = {
-                **item,
-                "reason": "duplicate_refresh_token_history",
-            }
-        return _TokenImportItemResult(
-            index=index,
-            category=category,
-            item=item,
-            yielded_to_response_traffic_count=yielded_to_response_traffic_count,
-            response_traffic_timeout_count=response_traffic_timeout_count,
-        )
-    except Exception as exc:
-        return _TokenImportItemResult(
-            index=index,
-            category="failed",
-            item={"index": index, "error": str(exc)},
-            yielded_to_response_traffic_count=yielded_to_response_traffic_count,
-            response_traffic_timeout_count=response_traffic_timeout_count,
-        )
 
 
 def _build_validated_token_payload(
@@ -1042,64 +1049,91 @@ async def _validate_single_staged_token_import_item(
         )
 
 
-async def _publish_single_staged_token_import_item(
-    item: _TokenImportStagedItem,
-) -> _TokenImportItemResult:
-    payload = item.validated_payload
-    started_at = time.monotonic()
-    if not isinstance(payload, dict):
-        error = "Validated token payload is missing"
-        publish_ms = int((time.monotonic() - started_at) * 1000)
-        await _mark_import_item_failed(item.id, error_message=error, publish_ms=publish_ms)
-        return _TokenImportItemResult(
-            index=item.index,
-            category="failed",
-            item={"index": item.index, "error": error},
-            publish_ms=publish_ms,
-        )
+async def _publish_staged_token_import_items_batch(
+    items: list[_TokenImportStagedItem],
+    *,
+    import_queue_position: str,
+) -> tuple[list[_TokenImportItemResult], TokenSelectionSettings | None]:
+    if not items:
+        return [], None
 
-    await _mark_import_item_publishing(item.id)
+    started_at = time.monotonic()
+    publish_items: list[_TokenImportStagedItem] = []
+    preflight_results: list[_TokenImportItemResult] = []
+    for item in items:
+        if not isinstance(item.validated_payload, dict):
+            error = "Validated token payload is missing"
+            publish_ms = int((time.monotonic() - started_at) * 1000)
+            await _mark_import_item_failed(item.id, error_message=error, publish_ms=publish_ms)
+            preflight_results.append(
+                _TokenImportItemResult(
+                    index=item.index,
+                    category="failed",
+                    item={"index": item.index, "error": error},
+                    publish_ms=publish_ms,
+                )
+            )
+            continue
+        publish_items.append(item)
+
+    if not publish_items:
+        return preflight_results, None
+
+    await _mark_import_items_publish_pending(item.id for item in publish_items)
     try:
-        result = await upsert_token_payload(payload)
+        batch = await publish_token_payload_batch(
+            [dict(item.validated_payload or {}) for item in publish_items],
+            import_queue_position=import_queue_position,
+        )
         publish_ms = int((time.monotonic() - started_at) * 1000)
-        await _mark_import_item_published(
-            item.id,
-            token_id=result.token.id,
-            action=result.action,
-            publish_ms=publish_ms,
-        )
-        item_payload = {
-            "id": result.token.id,
-            "email": result.token.email,
-            "account_id": result.token.account_id,
-            "index": item.index,
-        }
-        if result.action == "created":
-            category = "created"
-        elif result.action == "updated":
-            category = "updated"
-        else:
-            category = "skipped"
+        results = list(preflight_results)
+        for item, upsert in zip(publish_items, batch.results, strict=True):
+            await _mark_import_item_published(
+                item.id,
+                token_id=upsert.token.id,
+                action=upsert.action,
+                publish_ms=publish_ms,
+            )
             item_payload = {
-                **item_payload,
-                "reason": "duplicate_refresh_token_history",
+                "id": upsert.token.id,
+                "email": upsert.token.email,
+                "account_id": upsert.token.account_id,
+                "index": item.index,
             }
-        return _TokenImportItemResult(
-            index=item.index,
-            category=category,
-            item=item_payload,
-            publish_ms=publish_ms,
-        )
+            if upsert.action == "created":
+                category = "created"
+            elif upsert.action == "updated":
+                category = "updated"
+            else:
+                category = "skipped"
+                item_payload = {
+                    **item_payload,
+                    "reason": "duplicate_refresh_token_history",
+                }
+            results.append(
+                _TokenImportItemResult(
+                    index=item.index,
+                    category=category,
+                    item=item_payload,
+                    publish_ms=publish_ms,
+                )
+            )
+        return results, batch.selection_settings
     except Exception as exc:
         error = str(exc)
         publish_ms = int((time.monotonic() - started_at) * 1000)
-        await _mark_import_item_failed(item.id, error_message=error, publish_ms=publish_ms)
-        return _TokenImportItemResult(
-            index=item.index,
-            category="failed",
-            item={"index": item.index, "error": error},
-            publish_ms=publish_ms,
-        )
+        failed_results = list(preflight_results)
+        for item in publish_items:
+            await _mark_import_item_failed(item.id, error_message=error, publish_ms=publish_ms)
+            failed_results.append(
+                _TokenImportItemResult(
+                    index=item.index,
+                    category="failed",
+                    item={"index": item.index, "error": error},
+                    publish_ms=publish_ms,
+                )
+            )
+        return failed_results, None
 
 
 async def _process_staged_token_import_job(
@@ -1108,6 +1142,7 @@ async def _process_staged_token_import_job(
     response_traffic: ResponseTrafficLike,
     http_client: httpx.AsyncClient,
     oauth_manager: CodexOAuthManager,
+    on_token_selection_settings_updated: Callable[[TokenSelectionSettings], Awaitable[None] | None] | None = None,
 ) -> TokenImportJobState | None:
     staged_items = await _list_token_import_items(job.id)
     if not staged_items and not job.payloads:
@@ -1130,17 +1165,7 @@ async def _process_staged_token_import_job(
     response_traffic_timeout_count = int(job.response_traffic_timeout_count or 0)
 
     if not staged_items and job.payloads:
-        staged_items = [
-            _TokenImportStagedItem(
-                id=index + 1,
-                job_id=job.id,
-                index=index,
-                status=IMPORT_ITEM_STATUS_QUEUED,
-                payload=payload if isinstance(payload, dict) else {"_raw": payload},
-                validated_payload=None,
-            )
-            for index, payload in enumerate(job.payloads)
-        ]
+        staged_items = await _materialize_token_import_items_from_payloads(job)
 
     pending_validation = [
         item
@@ -1149,7 +1174,12 @@ async def _process_staged_token_import_job(
         and item.validated_payload is None
         and item.status != IMPORT_ITEM_STATUS_FAILED
     ]
-    pending_publish = [item for item in staged_items if item.status == IMPORT_ITEM_STATUS_VALIDATED and item.validated_payload]
+    pending_publish = [
+        item
+        for item in staged_items
+        if item.status in {IMPORT_ITEM_STATUS_VALIDATED, IMPORT_ITEM_STATUS_PUBLISH_PENDING, IMPORT_ITEM_STATUS_LEGACY_PUBLISHING}
+        and item.validated_payload
+    ]
     failed_items = [item for item in staged_items if item.status == IMPORT_ITEM_STATUS_FAILED]
     completed_indices = {
         int(item.get("index"))
@@ -1206,20 +1236,34 @@ async def _process_staged_token_import_job(
             _append_import_result(result, created=created, updated=updated, skipped=skipped, failed=failed)
 
         staged_items = await _list_token_import_items(job.id)
-        pending_publish = [item for item in staged_items if item.status == IMPORT_ITEM_STATUS_VALIDATED and item.validated_payload]
+        pending_publish = [
+            item
+            for item in staged_items
+            if item.status in {
+                IMPORT_ITEM_STATUS_VALIDATED,
+                IMPORT_ITEM_STATUS_PUBLISH_PENDING,
+                IMPORT_ITEM_STATUS_LEGACY_PUBLISHING,
+            }
+            and item.validated_payload
+        ]
 
     if pending_publish:
-        publish_concurrency = max(1, min(4, len(pending_publish)))
-        semaphore = asyncio.Semaphore(publish_concurrency)
-
-        async def run_publish(item: _TokenImportStagedItem) -> _TokenImportItemResult:
-            async with semaphore:
-                result = await _publish_single_staged_token_import_item(item)
-                return result
-
-        publish_results = await asyncio.gather(*(run_publish(item) for item in pending_publish))
-        for result in publish_results:
-            _append_import_result(result, created=created, updated=updated, skipped=skipped, failed=failed)
+        batch_size = _import_publish_batch_size()
+        flush_interval = _import_publish_flush_interval_seconds()
+        for offset in range(0, len(pending_publish), batch_size):
+            batch_items = pending_publish[offset : offset + batch_size]
+            publish_results, selection = await _publish_staged_token_import_items_batch(
+                batch_items,
+                import_queue_position=job.import_queue_position,
+            )
+            if selection is not None and on_token_selection_settings_updated is not None:
+                update_result = on_token_selection_settings_updated(selection)
+                if inspect.isawaitable(update_result):
+                    await update_result
+            for result in publish_results:
+                _append_import_result(result, created=created, updated=updated, skipped=skipped, failed=failed)
+            if flush_interval > 0 and offset + batch_size < len(pending_publish):
+                await asyncio.sleep(flush_interval)
 
     failed_indices = {
         int(item.get("index"))
@@ -1254,160 +1298,49 @@ async def process_token_import_job(
     *,
     response_traffic: ResponseTrafficLike,
     http_client: httpx.AsyncClient | None = None,
+    on_token_selection_settings_updated: Callable[[TokenSelectionSettings], Awaitable[None] | None] | None = None,
 ) -> TokenImportJobState | None:
     try:
         staged_items = await _list_token_import_items(job.id)
-    except Exception:
-        if not job.payloads:
-            raise
-        logger.exception("Falling back to legacy token import payload processing: job_id=%s", job.id)
-        staged_items = []
-    if staged_items or not job.payloads:
-        oauth_manager = CodexOAuthManager()
-        owns_http_client = False
-        client = http_client
-        if client is None:
-            client = httpx.AsyncClient()
-            owns_http_client = True
-        try:
-            assert client is not None
-            return await _process_staged_token_import_job(
-                job,
-                response_traffic=response_traffic,
-                http_client=client,
-                oauth_manager=oauth_manager,
-            )
-        finally:
-            if owns_http_client:
-                await client.aclose()
-
-    payloads = list(job.payloads)
-    created = _sort_items_by_index(list(job.created))
-    updated = _sort_items_by_index(list(job.updated))
-    skipped = _sort_items_by_index(list(job.skipped))
-    failed = _sort_items_by_index(list(job.failed))
-    yielded_to_response_traffic = int(job.yielded_to_response_traffic_count or 0)
-    response_traffic_timeout_count = int(job.response_traffic_timeout_count or 0)
-    processed_count = max(0, min(int(job.processed_count or 0), len(payloads)))
-    max_concurrency = max(1, min(_import_job_max_concurrency(), len(payloads) - processed_count or 1))
-    progress_flush_every = _import_job_progress_flush_every()
-    progress_flush_interval_seconds = _import_job_progress_flush_interval_seconds()
-    respect_response_traffic = _import_job_respect_response_traffic()
-    pending_tasks: list[asyncio.Task[_TokenImportItemResult]] = []
-    oauth_manager = CodexOAuthManager()
-
-    try:
-        if processed_count < len(payloads):
-            semaphore = asyncio.Semaphore(max_concurrency)
-            last_progress_flush_at = time.monotonic()
-            pending_results_since_flush = 0
-
-            async with httpx.AsyncClient() as http_client:
-                async def run_limited(index: int, payload: Any) -> _TokenImportItemResult:
-                    async with semaphore:
-                        result = await _process_single_token_import_payload(
-                            job.id,
-                            index,
-                            payload,
-                            http_client=http_client,
-                            oauth_manager=oauth_manager,
-                            response_traffic=response_traffic,
-                            respect_response_traffic=respect_response_traffic,
-                        )
-                        if result.response_traffic_timeout_count:
-                            logger.warning(
-                                "Token import job wait timed out while /v1/responses traffic remained active; continuing import: job_id=%s index=%s total_payloads=%s active_responses=%s",
-                                job.id,
-                                index,
-                                len(payloads),
-                                response_traffic.active_responses,
-                            )
-                        return result
-
-                pending_tasks = [
-                    asyncio.create_task(
-                        run_limited(index, payloads[index]),
-                        name=f"oaix-token-import-{job.id}-{index}",
-                    )
-                    for index in range(processed_count, len(payloads))
-                ]
-
-                for task in asyncio.as_completed(pending_tasks):
-                    result = await task
-                    yielded_to_response_traffic += result.yielded_to_response_traffic_count
-                    response_traffic_timeout_count += result.response_traffic_timeout_count
-                    if result.category == "created":
-                        created.append(result.item)
-                    elif result.category == "updated":
-                        updated.append(result.item)
-                    elif result.category == "skipped":
-                        skipped.append(result.item)
-                    else:
-                        failed.append(result.item)
-
-                    processed_count += 1
-                    pending_results_since_flush += 1
-
-                    should_flush_progress = (
-                        processed_count < len(payloads)
-                        and pending_results_since_flush > 0
-                        and (
-                            pending_results_since_flush >= progress_flush_every
-                            or time.monotonic() - last_progress_flush_at >= progress_flush_interval_seconds
-                        )
-                    )
-                    if should_flush_progress:
-                        progress_created, progress_updated, progress_skipped, progress_failed = _build_progress_snapshot(
-                            created=created,
-                            updated=updated,
-                            skipped=skipped,
-                            failed=failed,
-                        )
-                        await update_token_import_job_progress(
-                            job.id,
-                            processed_count=processed_count,
-                            created=progress_created,
-                            updated=progress_updated,
-                            skipped=progress_skipped,
-                            failed=progress_failed,
-                            yielded_to_response_traffic_count=yielded_to_response_traffic,
-                            response_traffic_timeout_count=response_traffic_timeout_count,
-                        )
-                        last_progress_flush_at = time.monotonic()
-                        pending_results_since_flush = 0
-
-        created, updated, skipped, failed = _build_progress_snapshot(
-            created=created,
-            updated=updated,
-            skipped=skipped,
-            failed=failed,
-        )
+        if not staged_items and job.payloads:
+            staged_items = await _materialize_token_import_items_from_payloads(job)
+        if staged_items or not job.payloads:
+            oauth_manager = CodexOAuthManager()
+            owns_http_client = False
+            client = http_client
+            if client is None:
+                client = httpx.AsyncClient()
+                owns_http_client = True
+            try:
+                assert client is not None
+                return await _process_staged_token_import_job(
+                    job,
+                    response_traffic=response_traffic,
+                    http_client=client,
+                    oauth_manager=oauth_manager,
+                    on_token_selection_settings_updated=on_token_selection_settings_updated,
+                )
+            finally:
+                if owns_http_client:
+                    await client.aclose()
 
         return await complete_token_import_job(
             job.id,
-            processed_count=processed_count,
-            created=created,
-            updated=updated,
-            skipped=skipped,
-            failed=failed,
-            yielded_to_response_traffic_count=yielded_to_response_traffic,
-            response_traffic_timeout_count=response_traffic_timeout_count,
+            processed_count=0,
+            created=[],
+            updated=[],
+            skipped=[],
+            failed=[],
+            yielded_to_response_traffic_count=int(job.yielded_to_response_traffic_count or 0),
+            response_traffic_timeout_count=int(job.response_traffic_timeout_count or 0),
         )
     except asyncio.CancelledError:
-        for task in pending_tasks:
-            task.cancel()
-        if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
         await requeue_token_import_job(
             job.id,
             last_error="Import worker interrupted before completion; job requeued to resume.",
         )
         raise
     except Exception as exc:
-        for task in pending_tasks:
-            task.cancel()
-        if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
         logger.exception("Token import job failed unexpectedly: job_id=%s", job.id)
         return await fail_token_import_job(job.id, last_error=str(exc))
 
@@ -1530,12 +1463,14 @@ class TokenImportBackgroundWorker:
                     max(1, min(_import_job_max_concurrency(), job.total_count - job.processed_count or 1)),
                     _import_job_respect_response_traffic(),
                 )
-                result = await process_token_import_job(
-                    job,
-                    response_traffic=self._response_traffic,
-                    http_client=self._http_client,
-                )
-                await self._apply_imported_token_queue_position(job, result)
+                process_signature = inspect.signature(process_token_import_job)
+                process_kwargs: dict[str, Any] = {"response_traffic": self._response_traffic}
+                if "http_client" in process_signature.parameters:
+                    process_kwargs["http_client"] = self._http_client
+                if "on_token_selection_settings_updated" in process_signature.parameters:
+                    process_kwargs["on_token_selection_settings_updated"] = self._publish_token_selection_settings
+                result = await process_token_import_job(job, **process_kwargs)
+                del result
             except asyncio.CancelledError:
                 raise
             except Exception:

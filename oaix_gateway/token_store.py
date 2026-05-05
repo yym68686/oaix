@@ -136,6 +136,12 @@ class TokenUpsertResult:
 
 
 @dataclass(frozen=True)
+class TokenPublishBatchResult:
+    results: tuple[TokenUpsertResult, ...]
+    selection_settings: "TokenSelectionSettings | None" = None
+
+
+@dataclass(frozen=True)
 class TokenHistoryRepairSummary:
     duplicate_group_count: int
     merged_row_count: int
@@ -1347,10 +1353,12 @@ async def _find_existing_token(
     return max((_pick_canonical_token(group) for group in matching_groups), key=lambda item: item.id)
 
 
-async def upsert_token_payload(
+async def _upsert_token_payload_in_session(
+    session,
     token_data_or_json: str | dict[str, Any],
     *,
     source_file: str | None = None,
+    invalidate_cache: bool = True,
 ) -> TokenUpsertResult:
     payload = _load_token_payload(token_data_or_json)
     email = str(payload.get("email") or "").strip() or None
@@ -1362,61 +1370,76 @@ async def upsert_token_payload(
     if recovery is not None and not isinstance(recovery, dict):
         recovery = None
 
+    await _acquire_token_identity_locks(session, refresh_token=refresh_token, account_id=account_id)
+    token = await _find_existing_token(session, refresh_token=refresh_token, account_id=account_id)
+    if token is None:
+        token = CodexToken(
+            email=email,
+            account_id=account_id,
+            id_token=str(payload.get("id_token") or "").strip() or None,
+            access_token=str(payload.get("access_token") or "").strip() or None,
+            refresh_token=refresh_token,
+            refresh_token_aliases=[refresh_token],
+            merged_into_token_id=None,
+            token_type=str(payload.get("type") or "codex").strip() or "codex",
+            last_refresh_at=parse_rfc3339(payload.get("last_refresh")),
+            expires_at=parse_rfc3339(payload.get("expired")),
+            recovery=recovery,
+            raw_payload=payload,
+            plan_type=_extract_plan_type_from_payload(payload),
+            source_file=source_file,
+            is_active=True,
+            cooldown_until=None,
+            last_error=None,
+            updated_at=utcnow(),
+        )
+        session.add(token)
+        await session.flush()
+        if invalidate_cache:
+            invalidate_fill_first_token_cache()
+        return TokenUpsertResult(token=token, action="created")
+
+    token.email = token.email or email
+    token.account_id = token.account_id or account_id
+    token.token_type = str(payload.get("type") or token.token_type or "codex").strip() or token.token_type or "codex"
+    token.source_file = source_file or token.source_file
+    token.refresh_token_aliases = merge_refresh_token_aliases(_token_aliases(token), refresh_token)
+    token.updated_at = utcnow()
+
+    if refresh_token == normalize_refresh_token(token.refresh_token):
+        token.id_token = str(payload.get("id_token") or "").strip() or None
+        token.access_token = str(payload.get("access_token") or "").strip() or None
+        token.last_refresh_at = parse_rfc3339(payload.get("last_refresh"))
+        token.expires_at = parse_rfc3339(payload.get("expired"))
+        token.recovery = recovery
+        token.raw_payload = payload
+        token.plan_type = _extract_plan_type_from_payload(payload) or token.plan_type
+        token.is_active = True
+        token.cooldown_until = None
+        token.last_error = None
+        await session.flush()
+        if invalidate_cache:
+            invalidate_fill_first_token_cache()
+        return TokenUpsertResult(token=token, action="updated")
+
+    await session.flush()
+    if invalidate_cache:
+        invalidate_fill_first_token_cache()
+    return TokenUpsertResult(token=token, action="duplicate")
+
+
+async def upsert_token_payload(
+    token_data_or_json: str | dict[str, Any],
+    *,
+    source_file: str | None = None,
+) -> TokenUpsertResult:
     async with get_session() as session:
         async with session.begin():
-            await _acquire_token_identity_locks(session, refresh_token=refresh_token, account_id=account_id)
-            token = await _find_existing_token(session, refresh_token=refresh_token, account_id=account_id)
-            if token is None:
-                token = CodexToken(
-                    email=email,
-                    account_id=account_id,
-                    id_token=str(payload.get("id_token") or "").strip() or None,
-                    access_token=str(payload.get("access_token") or "").strip() or None,
-                    refresh_token=refresh_token,
-                    refresh_token_aliases=[refresh_token],
-                    merged_into_token_id=None,
-                    token_type=str(payload.get("type") or "codex").strip() or "codex",
-                    last_refresh_at=parse_rfc3339(payload.get("last_refresh")),
-                    expires_at=parse_rfc3339(payload.get("expired")),
-                    recovery=recovery,
-                    raw_payload=payload,
-                    plan_type=_extract_plan_type_from_payload(payload),
-                    source_file=source_file,
-                    is_active=True,
-                    cooldown_until=None,
-                    last_error=None,
-                    updated_at=utcnow(),
-                )
-                session.add(token)
-                await session.flush()
-                invalidate_fill_first_token_cache()
-                return TokenUpsertResult(token=token, action="created")
-
-            token.email = token.email or email
-            token.account_id = token.account_id or account_id
-            token.token_type = str(payload.get("type") or token.token_type or "codex").strip() or token.token_type or "codex"
-            token.source_file = source_file or token.source_file
-            token.refresh_token_aliases = merge_refresh_token_aliases(_token_aliases(token), refresh_token)
-            token.updated_at = utcnow()
-
-            if refresh_token == normalize_refresh_token(token.refresh_token):
-                token.id_token = str(payload.get("id_token") or "").strip() or None
-                token.access_token = str(payload.get("access_token") or "").strip() or None
-                token.last_refresh_at = parse_rfc3339(payload.get("last_refresh"))
-                token.expires_at = parse_rfc3339(payload.get("expired"))
-                token.recovery = recovery
-                token.raw_payload = payload
-                token.plan_type = _extract_plan_type_from_payload(payload) or token.plan_type
-                token.is_active = True
-                token.cooldown_until = None
-                token.last_error = None
-                await session.flush()
-                invalidate_fill_first_token_cache()
-                return TokenUpsertResult(token=token, action="updated")
-
-            await session.flush()
-            invalidate_fill_first_token_cache()
-            return TokenUpsertResult(token=token, action="duplicate")
+            return await _upsert_token_payload_in_session(
+                session,
+                token_data_or_json,
+                source_file=source_file,
+            )
 
 
 async def get_token_selection_settings() -> TokenSelectionSettings:
@@ -1571,58 +1594,107 @@ async def update_token_active_stream_cap_settings(*, active_stream_cap: int) -> 
             return _build_token_selection_settings(setting)
 
 
-async def apply_imported_token_queue_position(
+async def _apply_imported_token_queue_position_in_session(
+    session,
     token_ids: Iterable[int],
     *,
     position: str,
 ) -> TokenSelectionSettings:
     imported_token_ids = normalize_token_selection_order(list(token_ids))
     resolved_position = parse_token_import_queue_position(position)
+    setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY, with_for_update=True)
+    existing_payload = dict(setting.value) if setting is not None and isinstance(setting.value, dict) else {}
+    existing_order = normalize_token_selection_order(existing_payload.get("token_order"))
+    current_result = await session.execute(
+        select(CodexToken.id)
+        .where(*_canonical_token_filters())
+        .order_by(*_token_selection_order_clauses(TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=existing_order))
+    )
+    current_token_ids = [int(token_id) for token_id in current_result.scalars().all()]
+    next_order = merge_imported_token_order(
+        current_token_ids,
+        imported_token_ids,
+        position=resolved_position,
+    )
+    if setting is None:
+        setting = GatewaySetting(
+            key=TOKEN_SELECTION_SETTING_KEY,
+            value={
+                "strategy": DEFAULT_TOKEN_SELECTION_STRATEGY,
+                "token_order": list(next_order),
+                "plan_order_enabled": False,
+                "plan_order": list(DEFAULT_TOKEN_PLAN_ORDER),
+                "active_stream_cap": default_token_active_stream_cap(),
+            },
+            updated_at=utcnow(),
+        )
+        session.add(setting)
+    else:
+        existing_payload["strategy"] = normalize_token_selection_strategy(existing_payload.get("strategy"))
+        existing_payload["token_order"] = list(next_order)
+        existing_payload["plan_order_enabled"] = normalize_token_plan_order_enabled(
+            existing_payload.get("plan_order_enabled")
+        )
+        existing_payload["plan_order"] = list(normalize_token_plan_order(existing_payload.get("plan_order")))
+        existing_payload["active_stream_cap"] = normalize_token_active_stream_cap(
+            existing_payload.get("active_stream_cap"),
+            default=default_token_active_stream_cap(),
+        )
+        setting.value = existing_payload
+        setting.updated_at = utcnow()
+    await session.flush()
+    return _build_token_selection_settings(setting)
+
+
+async def apply_imported_token_queue_position(
+    token_ids: Iterable[int],
+    *,
+    position: str,
+) -> TokenSelectionSettings:
     async with get_session() as session:
         async with session.begin():
-            setting = await session.get(GatewaySetting, TOKEN_SELECTION_SETTING_KEY, with_for_update=True)
-            existing_payload = dict(setting.value) if setting is not None and isinstance(setting.value, dict) else {}
-            existing_order = normalize_token_selection_order(existing_payload.get("token_order"))
-            current_result = await session.execute(
-                select(CodexToken.id)
-                .where(*_canonical_token_filters())
-                .order_by(*_token_selection_order_clauses(TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=existing_order))
+            selection = await _apply_imported_token_queue_position_in_session(
+                session,
+                token_ids,
+                position=position,
             )
-            current_token_ids = [int(token_id) for token_id in current_result.scalars().all()]
-            next_order = merge_imported_token_order(
-                current_token_ids,
-                imported_token_ids,
-                position=resolved_position,
-            )
-            if setting is None:
-                setting = GatewaySetting(
-                    key=TOKEN_SELECTION_SETTING_KEY,
-                    value={
-                        "strategy": DEFAULT_TOKEN_SELECTION_STRATEGY,
-                        "token_order": list(next_order),
-                        "plan_order_enabled": False,
-                        "plan_order": list(DEFAULT_TOKEN_PLAN_ORDER),
-                        "active_stream_cap": default_token_active_stream_cap(),
-                    },
-                    updated_at=utcnow(),
+            invalidate_fill_first_token_cache()
+            return selection
+
+
+async def publish_token_payload_batch(
+    payloads: Iterable[dict[str, Any]],
+    *,
+    import_queue_position: str,
+) -> TokenPublishBatchResult:
+    resolved_payloads = [dict(payload) for payload in payloads]
+    if not resolved_payloads:
+        return TokenPublishBatchResult(results=())
+
+    async with get_session() as session:
+        async with session.begin():
+            results: list[TokenUpsertResult] = []
+            imported_token_ids: list[int] = []
+            for payload in resolved_payloads:
+                result = await _upsert_token_payload_in_session(
+                    session,
+                    payload,
+                    invalidate_cache=False,
                 )
-                session.add(setting)
-            else:
-                existing_payload["strategy"] = normalize_token_selection_strategy(existing_payload.get("strategy"))
-                existing_payload["token_order"] = list(next_order)
-                existing_payload["plan_order_enabled"] = normalize_token_plan_order_enabled(
-                    existing_payload.get("plan_order_enabled")
+                results.append(result)
+                if result.action in {"created", "updated"}:
+                    imported_token_ids.append(int(result.token.id))
+
+            selection: TokenSelectionSettings | None = None
+            if imported_token_ids:
+                selection = await _apply_imported_token_queue_position_in_session(
+                    session,
+                    imported_token_ids,
+                    position=import_queue_position,
                 )
-                existing_payload["plan_order"] = list(normalize_token_plan_order(existing_payload.get("plan_order")))
-                existing_payload["active_stream_cap"] = normalize_token_active_stream_cap(
-                    existing_payload.get("active_stream_cap"),
-                    default=default_token_active_stream_cap(),
-                )
-                setting.value = existing_payload
-                setting.updated_at = utcnow()
             await session.flush()
             invalidate_fill_first_token_cache()
-            return _build_token_selection_settings(setting)
+            return TokenPublishBatchResult(results=tuple(results), selection_settings=selection)
 
 
 async def repair_duplicate_token_histories() -> TokenHistoryRepairSummary:
