@@ -519,6 +519,16 @@ def _drop_single_column_uniques(sync_conn, table_name: str, column_name: str) ->
     sync_conn.execute(text(f'CREATE INDEX IF NOT EXISTS ix_{table_name}_{column_name} ON "{table_name}" ("{column_name}")'))
 
 
+def _execute_ddl_best_effort(sync_conn, statement: str) -> None:
+    try:
+        with sync_conn.begin_nested():
+            sync_conn.execute(text(statement))
+    except Exception:
+        # Optional performance indexes/extensions should not prevent startup on
+        # managed databases with restricted DDL privileges.
+        pass
+
+
 def _run_schema_migrations(sync_conn) -> None:
     inspector = inspect(sync_conn)
     table_names = set(inspector.get_table_names())
@@ -539,6 +549,45 @@ def _run_schema_migrations(sync_conn) -> None:
             text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_merged_into_token_id ON codex_tokens (merged_into_token_id)")
         )
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_plan_type ON codex_tokens (plan_type)"))
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_codex_tokens_pool_snapshot "
+                "ON codex_tokens (token_type, is_active, cooldown_until, id) "
+                "WHERE merged_into_token_id IS NULL AND refresh_token IS NOT NULL"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_codex_tokens_lru_available "
+                "ON codex_tokens (last_used_at, updated_at, id) "
+                "WHERE merged_into_token_id IS NULL AND is_active IS TRUE AND token_type = 'codex' "
+                "AND refresh_token IS NOT NULL"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_codex_tokens_account_lookup "
+                "ON codex_tokens (account_id, id) "
+                "WHERE merged_into_token_id IS NULL"
+            )
+        )
+        if sync_conn.dialect.name == "postgresql":
+            _execute_ddl_best_effort(sync_conn, "CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            _execute_ddl_best_effort(
+                sync_conn,
+                "CREATE INDEX IF NOT EXISTS ix_codex_tokens_search_email_trgm "
+                "ON codex_tokens USING gin (lower(coalesce(email, '')) gin_trgm_ops)",
+            )
+            _execute_ddl_best_effort(
+                sync_conn,
+                "CREATE INDEX IF NOT EXISTS ix_codex_tokens_search_account_trgm "
+                "ON codex_tokens USING gin (lower(coalesce(account_id, '')) gin_trgm_ops)",
+            )
+            _execute_ddl_best_effort(
+                sync_conn,
+                "CREATE INDEX IF NOT EXISTS ix_codex_tokens_search_error_trgm "
+                "ON codex_tokens USING gin (lower(coalesce(last_error, '')) gin_trgm_ops)",
+            )
         _drop_single_column_uniques(sync_conn, "codex_tokens", "account_id")
         _drop_single_column_uniques(sync_conn, "codex_tokens", "email")
 
@@ -590,6 +639,36 @@ def _run_schema_migrations(sync_conn) -> None:
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_token_id ON gateway_request_logs (token_id)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model ON gateway_request_logs (model)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_started_id_desc "
+                "ON gateway_request_logs (started_at DESC, id DESC)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_started_model_name "
+                "ON gateway_request_logs (started_at, model_name)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_started_success "
+                "ON gateway_request_logs (started_at, success)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_token_started "
+                "ON gateway_request_logs (token_id, started_at)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_account_started "
+                "ON gateway_request_logs (account_id, started_at)"
+            )
+        )
 
     if "token_import_jobs" in table_names:
         job_columns = {column["name"] for column in inspector.get_columns("token_import_jobs")}

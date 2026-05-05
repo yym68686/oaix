@@ -58,6 +58,7 @@ from oaix_gateway.api_server import (
     _build_stream_error_event,
     _build_admin_token_items,
     _build_admin_token_quota_items,
+    _claim_next_active_token_from_snapshot,
     _build_upstream_headers,
     _stream_responses_to_chat_completions,
     _stream_upstream_image_response,
@@ -91,6 +92,7 @@ from oaix_gateway.token_import_jobs import (
     IMPORT_ITEM_STATUS_PUBLISHED,
 )
 from oaix_gateway.token_store import (
+    TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenPublishBatchResult,
     TokenSelectionSettings,
@@ -3171,6 +3173,58 @@ def test_fresh_token_pool_snapshot_rejects_stale_snapshot(monkeypatch) -> None:
     spans = timing.snapshot()
     assert spans["token_pool_snapshot_stale_count"] == 1
     assert spans["token_pool_snapshot_age_ms"] > 0
+
+
+def test_token_pool_snapshot_lru_claim_reorders_cached_tokens() -> None:
+    _TOKEN_ACTIVE_REQUESTS.clear()
+    started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    tokens = (
+        SimpleNamespace(
+            id=1,
+            plan_type=None,
+            last_used_at=started_at,
+            updated_at=started_at,
+            merged_into_token_id=None,
+            is_active=True,
+            refresh_token="refresh-1",
+            token_type="codex",
+            cooldown_until=None,
+        ),
+        SimpleNamespace(
+            id=2,
+            plan_type=None,
+            last_used_at=started_at,
+            updated_at=started_at,
+            merged_into_token_id=None,
+            is_active=True,
+            refresh_token="refresh-2",
+            token_type="codex",
+            cooldown_until=None,
+        ),
+    )
+    snapshot = _TokenPoolSnapshot(tokens=tokens, scoped_cooldowns={}, loaded_at=0.0)
+    settings = TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED)
+
+    try:
+        first = _claim_next_active_token_from_snapshot(
+            snapshot,
+            settings,
+            exclude_token_ids=set(),
+            scoped_cooldown_scope=None,
+            timing=None,
+        )
+        second = _claim_next_active_token_from_snapshot(
+            snapshot,
+            settings,
+            exclude_token_ids=set(),
+            scoped_cooldown_scope=None,
+            timing=None,
+        )
+    finally:
+        _TOKEN_ACTIVE_REQUESTS.clear()
+
+    assert first.id == 1
+    assert second.id == 2
 
 
 def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeypatch) -> None:

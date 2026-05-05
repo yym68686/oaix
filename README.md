@@ -35,12 +35,26 @@
 - `CORS_ALLOW_CREDENTIALS`: 是否允许浏览器跨域携带 credentials；默认 `false`
 - `CODEX_BASE_URL`: 上游 Codex responses 地址。默认 `https://chatgpt.com/backend-api/codex/responses`
 - `MAX_REQUEST_ACCOUNT_RETRIES`: 单次请求最多切换多少个 key，默认 `100`
+- `PROXY_MAX_ACTIVE_RESPONSES`: 网关同时处理的 `/v1/responses*` 请求上限，默认 `64`
+- `PROXY_QUEUE_TIMEOUT_SECONDS`: 达到并发上限后排队等待秒数，默认 `1`
+- `TOKEN_POOL_SNAPSHOT_MAX_AGE_SECONDS`: 内存 key 池快照最大复用时间，默认 `10`
 - `IMAGE_REQUEST_MAX_ACCOUNT_RETRIES`: 图片接口单次请求最多切换多少个 key，默认 `8`
 - `IMAGE_INPUT_MAX_PER_REQUEST`: 单次图片请求最多允许多少张输入图片，默认 `249`；达到上游 `input-images per min` 桶大小前直接拒绝超大请求
+- `IMAGE_UPLOAD_MAX_BYTES`: multipart 图片上传单文件最大字节数，默认 `26214400`（25 MiB）
+- `UPSTREAM_NON_STREAM_MAX_RESPONSE_BYTES`: 非流式上游响应聚合最大字节数，默认 `67108864`（64 MiB）
+- `STREAM_CAPTURE_MAX_BYTES`: 流式响应中用于错误/统计解析的最大捕获字节数，默认 `8388608`（8 MiB）；超过后继续透传但停止内存捕获
 - `IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS`: `gpt-image-2` 撞到上游 `input-images` 短速率限制且未返回明确重试时间时的 scoped 冷却秒数，默认 `5`
 - `IMAGE_RATE_LIMIT_MIN_COOLDOWN_SECONDS`: 解析到 `Please try again in ...` 时的最小 scoped 冷却秒数，默认 `1`
 - `DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS`: 429 且没有明确重置时间时的默认冷却秒数，默认 `300`
+- `REQUEST_LOG_WRITE_CONCURRENCY`: 请求日志异步写入并发数，默认 `2`
+- `REQUEST_LOG_WRITE_BATCH_SIZE`: 请求日志异步写入批大小，默认 `50`
+- `REQUEST_LOG_WRITE_QUEUE_MAX_SIZE`: 请求日志写入队列最大长度，默认 `2000`；满队列时会丢弃日志而不阻塞请求
+- `REQUEST_LOG_RETENTION_DAYS`: 请求日志保留天数，默认 `30`；设为 `0` 关闭清理
+- `REQUEST_LOG_CLEANUP_INTERVAL_SECONDS`: 请求日志清理后台任务间隔秒数，默认 `3600`
+- `ADMIN_REQUESTS_CACHE_TTL_SECONDS`: `/admin/requests` 汇总与图表缓存 TTL，默认 `5`
+- `ADMIN_TOKEN_COUNTS_CACHE_TTL_SECONDS`: `/admin/tokens` 统计计数缓存 TTL，默认 `2`
 - `IMPORT_JOB_MAX_CONCURRENCY`: 后台导入 key 的 OAuth 验证最大并发数，默认 `16`
+- `IMPORT_STAGING_INSERT_BATCH_SIZE`: 导入 staging 明细批量写入大小，默认 `1000`
 - `IMPORT_PUBLISH_BATCH_SIZE`: 验证成功后发布到正式 key 池的批大小，默认 `20`
 - `IMPORT_PUBLISH_FLUSH_INTERVAL_SECONDS`: 多批发布之间的间隔秒数，默认 `0.5`
 - `IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC`: 后台导入是否为活跃 `/v1/responses*` 流量让路，默认 `false`；仅建议作为过载保护开关临时开启
@@ -115,11 +129,22 @@ export SERVICE_API_KEYS='change-me'
 export CORS_ALLOW_ORIGINS='https://your-app.example'
 export CODEX_BASE_URL=''
 export IMPORT_JOB_MAX_CONCURRENCY='16'
+export IMPORT_STAGING_INSERT_BATCH_SIZE='1000'
 export IMPORT_PUBLISH_BATCH_SIZE='20'
 export IMPORT_PUBLISH_FLUSH_INTERVAL_SECONDS='0.5'
 export IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC='false'
 export IMPORT_RESPONSE_IDLE_GRACE_SECONDS='0.25'
 export IMPORT_WAIT_TIMEOUT_SECONDS='30'
+export REQUEST_LOG_WRITE_CONCURRENCY='2'
+export REQUEST_LOG_WRITE_BATCH_SIZE='50'
+export REQUEST_LOG_WRITE_QUEUE_MAX_SIZE='2000'
+export REQUEST_LOG_RETENTION_DAYS='30'
+export REQUEST_LOG_CLEANUP_INTERVAL_SECONDS='3600'
+export ADMIN_REQUESTS_CACHE_TTL_SECONDS='5'
+export ADMIN_TOKEN_COUNTS_CACHE_TTL_SECONDS='2'
+export IMAGE_UPLOAD_MAX_BYTES='26214400'
+export UPSTREAM_NON_STREAM_MAX_RESPONSE_BYTES='67108864'
+export STREAM_CAPTURE_MAX_BYTES='8388608'
 export COMPACT_SERVER_ERROR_COOLDOWN_SECONDS='60'
 ```
 

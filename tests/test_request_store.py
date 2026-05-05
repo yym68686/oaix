@@ -29,6 +29,21 @@ def test_build_request_log_summary_stmt_uses_single_aggregate_query() -> None:
     assert sql.count("FROM gateway_request_logs") == 1
 
 
+def test_build_request_log_summary_stmt_can_scope_to_recent_window() -> None:
+    stmt = _build_request_log_summary_stmt(
+        since=datetime(2026, 4, 14, tzinfo=timezone.utc),
+    )
+
+    sql = str(
+        stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "WHERE gateway_request_logs.started_at >= '2026-04-14 00:00:00+00:00'" in sql
+
+
 def test_build_request_model_analytics_stmt_groups_by_subquery_alias() -> None:
     stmt = _build_request_model_analytics_stmt(
         since=datetime(2026, 4, 14, tzinfo=timezone.utc),

@@ -17,7 +17,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -46,6 +46,7 @@ from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
 from .request_store import (
     create_request_log,
+    delete_request_logs_older_than,
     finalize_request_log,
     get_request_log_analytics,
     get_request_costs_by_token,
@@ -514,13 +515,43 @@ class _TokenPoolSnapshot:
     tokens: tuple[Any, ...]
     scoped_cooldowns: dict[tuple[int, str], datetime]
     loaded_at: float
+    ordered_tokens_by_key: dict[tuple[str, tuple[int, ...], bool, tuple[str, ...]], list[Any]] = field(
+        default_factory=dict
+    )
+
+
+def _token_snapshot_order_key(
+    settings: TokenSelectionSettings,
+) -> tuple[str, tuple[int, ...], bool, tuple[str, ...]]:
+    plan_order_enabled = bool(settings.plan_order_enabled)
+    return (
+        settings.strategy,
+        tuple(int(token_id) for token_id in settings.token_order),
+        plan_order_enabled,
+        tuple(settings.plan_order) if plan_order_enabled else (),
+    )
+
+
+def _token_snapshot_order_cache(snapshot: Any) -> dict[tuple[str, tuple[int, ...], bool, tuple[str, ...]], list[Any]]:
+    cache = getattr(snapshot, "ordered_tokens_by_key", None)
+    if isinstance(cache, dict):
+        return cache
+    cache = {}
+    with suppress(Exception):
+        setattr(snapshot, "ordered_tokens_by_key", cache)
+    return cache
 
 
 def _token_plan_sort_value(token_row: Any, settings: TokenSelectionSettings) -> int:
     if not settings.plan_order_enabled:
         return 0
-    plan_order = list(settings.plan_order)
-    plan_map = {plan_type: index for index, plan_type in enumerate(plan_order)}
+    plan_map = {plan_type: index for index, plan_type in enumerate(settings.plan_order)}
+    return _token_plan_sort_value_from_map(token_row, plan_map)
+
+
+def _token_plan_sort_value_from_map(token_row: Any, plan_map: dict[str, int]) -> int:
+    if not plan_map:
+        return 0
     plan_type = str(getattr(token_row, "plan_type", "") or "").strip().lower()
     if plan_type.startswith("chatgpt_"):
         plan_type = plan_type[len("chatgpt_") :]
@@ -570,10 +601,13 @@ def _token_row_matches_plan_filters(
 
 
 def _token_order_sort_value(token_row: Any, settings: TokenSelectionSettings) -> int:
-    order = list(settings.token_order)
-    if not order:
+    order_map = {int(token_id): index for index, token_id in enumerate(settings.token_order)}
+    return _token_order_sort_value_from_map(token_row, order_map)
+
+
+def _token_order_sort_value_from_map(token_row: Any, order_map: dict[int, int]) -> int:
+    if not order_map:
         return int(getattr(token_row, "id", 0) or 0)
-    order_map = {int(token_id): index for index, token_id in enumerate(order)}
     return order_map.get(int(getattr(token_row, "id", 0) or 0), len(order_map))
 
 
@@ -586,25 +620,82 @@ def _datetime_sort_value(value: Any) -> tuple[int, float]:
 
 
 def _token_snapshot_ordered_tokens(snapshot: _TokenPoolSnapshot, settings: TokenSelectionSettings) -> list[Any]:
+    cache_key = _token_snapshot_order_key(settings)
+    order_cache = _token_snapshot_order_cache(snapshot)
+    cached = order_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     tokens = list(snapshot.tokens)
+    plan_map = (
+        {plan_type: index for index, plan_type in enumerate(settings.plan_order)}
+        if settings.plan_order_enabled
+        else {}
+    )
     if settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
-        return sorted(
+        order_map = {int(token_id): index for index, token_id in enumerate(settings.token_order)}
+        ordered = sorted(
             tokens,
             key=lambda token_row: (
-                _token_plan_sort_value(token_row, settings),
-                _token_order_sort_value(token_row, settings),
+                _token_plan_sort_value_from_map(token_row, plan_map),
+                _token_order_sort_value_from_map(token_row, order_map),
                 int(getattr(token_row, "id", 0) or 0),
             ),
         )
-    return sorted(
+        order_cache[cache_key] = ordered
+        return ordered
+
+    ordered = sorted(
         tokens,
         key=lambda token_row: (
-            _token_plan_sort_value(token_row, settings),
+            _token_plan_sort_value_from_map(token_row, plan_map),
             _datetime_sort_value(getattr(token_row, "last_used_at", None)),
             _datetime_sort_value(getattr(token_row, "updated_at", None)),
             int(getattr(token_row, "id", 0) or 0),
         ),
     )
+    order_cache[cache_key] = ordered
+    return ordered
+
+
+def _token_snapshot_mark_token_claimed(
+    snapshot: _TokenPoolSnapshot,
+    settings: TokenSelectionSettings,
+    token_row: Any,
+) -> None:
+    if settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        return
+    cache_key = _token_snapshot_order_key(settings)
+    order_cache = _token_snapshot_order_cache(snapshot)
+    ordered = order_cache.get(cache_key)
+    if not ordered:
+        return
+
+    token_id = int(getattr(token_row, "id", 0) or 0)
+    if token_id <= 0:
+        return
+
+    selected_index: int | None = None
+    for index, candidate in enumerate(ordered):
+        if int(getattr(candidate, "id", 0) or 0) == token_id:
+            selected_index = index
+            break
+    if selected_index is None:
+        return
+
+    selected = ordered.pop(selected_index)
+    plan_map = (
+        {plan_type: index for index, plan_type in enumerate(settings.plan_order)}
+        if settings.plan_order_enabled
+        else {}
+    )
+    selected_plan_rank = _token_plan_sort_value_from_map(selected, plan_map)
+    insert_at = len(ordered)
+    for index, candidate in enumerate(ordered):
+        if _token_plan_sort_value_from_map(candidate, plan_map) > selected_plan_rank:
+            insert_at = index
+            break
+    ordered.insert(insert_at, selected)
 
 
 def _snapshot_scoped_cooldown_active(
@@ -774,6 +865,7 @@ def _claim_next_active_token_from_snapshot(
             continue
         token_row.last_used_at = now
         token_row.updated_at = now
+        _token_snapshot_mark_token_claimed(snapshot, selection_settings, token_row)
         if timing is not None:
             timing.add_ms("claim_token_memory_count", 1)
             timing.set_tag("claim_token_source", "memory")
@@ -1196,6 +1288,27 @@ async def _flush_request_log_write_queue() -> None:
         await asyncio.gather(*list(_REQUEST_LOG_WRITE_DRAINERS), return_exceptions=True)
 
 
+async def _run_request_log_retention_once() -> None:
+    retention_days = _request_log_retention_days()
+    if retention_days <= 0:
+        return
+    cutoff = utcnow() - timedelta(days=retention_days)
+    deleted_count = await delete_request_logs_older_than(cutoff)
+    if deleted_count:
+        logger.info("Deleted old request logs: retention_days=%s deleted=%s", retention_days, deleted_count)
+
+
+async def _request_log_retention_worker() -> None:
+    while True:
+        try:
+            await _run_request_log_retention_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Request log retention cleanup failed")
+        await asyncio.sleep(_request_log_cleanup_interval_seconds())
+
+
 @dataclass
 class _RequestLogHandle:
     request_id: str
@@ -1464,6 +1577,8 @@ class _ProxyStreamCapture:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._text_buffer = ""
         self._sse_scan_start = 0
+        self._captured_bytes = 0
+        self._capture_disabled = False
 
     @property
     def response_payload(self) -> dict[str, Any] | None:
@@ -1482,7 +1597,16 @@ class _ProxyStreamCapture:
         return response_payload if isinstance(response_payload, dict) else None
 
     def feed(self, chunk: bytes) -> None:
-        if not chunk:
+        if not chunk or self._capture_disabled:
+            return
+        self._captured_bytes += len(chunk)
+        if self._captured_bytes > _stream_capture_max_bytes():
+            self._capture_disabled = True
+            self._text_buffer = ""
+            self._response_snapshot.clear()
+            self._output_items_by_index.clear()
+            self._output_items_fallback.clear()
+            logger.info("Stream capture disabled after exceeding %s bytes", _stream_capture_max_bytes())
             return
         try:
             self._text_buffer += self._decoder.decode(chunk)
@@ -2028,6 +2152,18 @@ def _image_input_max_per_request() -> int:
     return _int_env("IMAGE_INPUT_MAX_PER_REQUEST", 249, minimum=1)
 
 
+def _image_upload_max_bytes() -> int:
+    return _int_env("IMAGE_UPLOAD_MAX_BYTES", 25 * 1024 * 1024, minimum=1024)
+
+
+def _upstream_non_stream_max_response_bytes() -> int:
+    return _int_env("UPSTREAM_NON_STREAM_MAX_RESPONSE_BYTES", 64 * 1024 * 1024, minimum=1024 * 1024)
+
+
+def _stream_capture_max_bytes() -> int:
+    return _int_env("STREAM_CAPTURE_MAX_BYTES", 8 * 1024 * 1024, minimum=1024 * 1024)
+
+
 def _image_rate_limit_default_cooldown_seconds() -> int:
     return _int_env("IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS", 5, minimum=1)
 
@@ -2090,6 +2226,22 @@ def _admin_quota_cache_ttl_seconds() -> int:
 
 def _admin_quota_max_concurrency() -> int:
     return _int_env("ADMIN_QUOTA_MAX_CONCURRENCY", 2, minimum=1)
+
+
+def _admin_requests_cache_ttl_seconds() -> float:
+    return _float_env("ADMIN_REQUESTS_CACHE_TTL_SECONDS", 5.0, minimum=0.0)
+
+
+def _admin_token_counts_cache_ttl_seconds() -> float:
+    return _float_env("ADMIN_TOKEN_COUNTS_CACHE_TTL_SECONDS", 2.0, minimum=0.0)
+
+
+def _request_log_retention_days() -> int:
+    return _int_env("REQUEST_LOG_RETENTION_DAYS", 30, minimum=0)
+
+
+def _request_log_cleanup_interval_seconds() -> float:
+    return _float_env("REQUEST_LOG_CLEANUP_INTERVAL_SECONDS", 3600.0, minimum=60.0)
 
 
 def _get_service_api_keys() -> set[str]:
@@ -2951,6 +3103,13 @@ async def _upload_file_to_data_url(upload: UploadFile) -> str:
         except Exception:
             logger.exception("Failed to close uploaded image file")
 
+    max_bytes = _image_upload_max_bytes()
+    if len(payload) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Uploaded image is too large; limit is {max_bytes} bytes",
+        )
+
     media_type = _normalize_optional_text(getattr(upload, "content_type", None))
     if media_type is None:
         media_type = mimetypes.guess_type(getattr(upload, "filename", "") or "")[0] or "application/octet-stream"
@@ -3688,6 +3847,8 @@ async def _collect_responses_json_from_sse(
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
     sse_scan_start = 0
+    total_bytes = 0
+    max_response_bytes = _upstream_non_stream_max_response_bytes()
 
     while True:
         try:
@@ -3697,6 +3858,12 @@ async def _collect_responses_json_from_sse(
                 raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
             break
 
+        total_bytes += len(chunk)
+        if total_bytes > max_response_bytes:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream non-stream response exceeded {max_response_bytes} bytes",
+            )
         text_buffer += decoder.decode(chunk)
 
         while True:
@@ -3782,10 +3949,18 @@ async def _read_response_body_with_first_chunk_time(
 ) -> tuple[bytes, datetime | None]:
     chunks: list[bytes] = []
     first_chunk_at: datetime | None = None
+    total_bytes = 0
+    max_response_bytes = _upstream_non_stream_max_response_bytes()
 
     async for chunk in upstream_iter:
         if chunk and first_chunk_at is None:
             first_chunk_at = utcnow()
+        total_bytes += len(chunk)
+        if total_bytes > max_response_bytes:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream non-stream response exceeded {max_response_bytes} bytes",
+            )
         chunks.append(chunk)
 
     return b"".join(chunks), first_chunk_at
@@ -4508,6 +4683,8 @@ async def _collect_images_api_response_from_sse(
     output_items_by_index: dict[int, dict[str, Any]] = {}
     output_items_fallback: list[dict[str, Any]] = []
     started_at_monotonic = asyncio.get_running_loop().time()
+    total_bytes = 0
+    max_response_bytes = _upstream_non_stream_max_response_bytes()
 
     while True:
         try:
@@ -4526,6 +4703,13 @@ async def _collect_images_api_response_from_sse(
                     detail="Upstream closed stream with an incomplete SSE event",
                 )
             break
+
+        total_bytes += len(chunk)
+        if total_bytes > max_response_bytes:
+            raise _retryable_gateway_http_exception(
+                status_code=502,
+                detail=f"Upstream image response exceeded {max_response_bytes} bytes",
+            )
 
         text_buffer += decoder.decode(chunk)
         while True:
@@ -6774,6 +6958,24 @@ def _parse_admin_token_ids(value: str, *, limit: int = 100) -> tuple[int, ...]:
     return tuple(token_ids)
 
 
+async def _cached_admin_token_counts(app: FastAPI) -> Any:
+    ttl_seconds = _admin_token_counts_cache_ttl_seconds()
+    cache_entry = getattr(app.state, "admin_token_counts_cache", None)
+    now = time.monotonic()
+    if (
+        ttl_seconds > 0
+        and isinstance(cache_entry, tuple)
+        and len(cache_entry) == 2
+        and float(cache_entry[0]) > now
+    ):
+        return cache_entry[1]
+
+    counts = await get_token_counts()
+    if ttl_seconds > 0:
+        app.state.admin_token_counts_cache = (now + ttl_seconds, counts)
+    return counts
+
+
 async def _build_admin_token_items(
     app: FastAPI,
     *,
@@ -6857,6 +7059,37 @@ async def _build_admin_token_items(
         )
         for token_row in token_rows
     ]
+
+
+async def _cached_admin_requests_payload(app: FastAPI, *, limit: int) -> dict[str, Any]:
+    ttl_seconds = _admin_requests_cache_ttl_seconds()
+    cache: dict[int, tuple[float, dict[str, Any]]] = getattr(app.state, "admin_requests_cache", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        app.state.admin_requests_cache = cache
+
+    cache_key = max(1, min(int(limit), 500))
+    now = time.monotonic()
+    cached = cache.get(cache_key)
+    if ttl_seconds > 0 and cached is not None and cached[0] > now:
+        return copy.deepcopy(cached[1])
+
+    summary, analytics, raw_items = await asyncio.gather(
+        get_request_log_summary(hours=24),
+        get_request_log_analytics(hours=24, bucket_minutes=60, top_models=6),
+        list_request_logs(limit=cache_key),
+    )
+    payload = {
+        "summary": asdict(summary),
+        "analytics": asdict(analytics),
+        "items": [asdict(item) for item in raw_items],
+    }
+    if ttl_seconds > 0:
+        cache[cache_key] = (now + ttl_seconds, copy.deepcopy(payload))
+        if len(cache) > 8:
+            for stale_key in sorted(cache, key=lambda key: cache[key][0])[:-8]:
+                cache.pop(stale_key, None)
+    return payload
 
 
 async def _build_admin_token_quota_items(
@@ -6971,6 +7204,10 @@ async def lifespan(app: FastAPI):
         await _refresh_token_pool_snapshot(app)
     except Exception:
         logger.exception("Failed to load token pool snapshot")
+    app.state.request_log_retention_task = asyncio.create_task(
+        _request_log_retention_worker(),
+        name="oaix-request-log-retention",
+    )
 
     async def publish_token_selection_settings(selection: TokenSelectionSettings) -> None:
         _set_current_token_selection_settings(app, selection)
@@ -6988,6 +7225,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        retention_task = getattr(app.state, "request_log_retention_task", None)
+        if isinstance(retention_task, asyncio.Task):
+            retention_task.cancel()
+            await asyncio.gather(retention_task, return_exceptions=True)
         await app.state.token_import_worker.stop()
         await _flush_request_log_write_queue()
         await stop_token_status_write_queue()
@@ -7184,7 +7425,7 @@ def create_app() -> FastAPI:
             batch_token_ids = selected_import_batch.token_ids if selected_import_batch is not None else ()
 
         counts, filtered_counts, plan_counts, filtered_total, token_rows = await asyncio.gather(
-            get_token_counts(),
+            _cached_admin_token_counts(http_request.app),
             get_token_status_counts(search=q, plan_type=plan_type, token_ids=batch_token_ids),
             get_token_plan_counts(search=q, status=status, token_ids=batch_token_ids),
             count_token_rows(search=q, status=status, plan_type=plan_type, token_ids=batch_token_ids),
@@ -7320,19 +7561,10 @@ def create_app() -> FastAPI:
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         try:
-            summary, analytics, raw_items = await asyncio.gather(
-                get_request_log_summary(),
-                get_request_log_analytics(hours=24, bucket_minutes=60, top_models=6),
-                list_request_logs(limit=limit),
-            )
-            items = [asdict(item) for item in raw_items]
+            payload = await _cached_admin_requests_payload(app, limit=limit)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail="Request logs temporarily unavailable") from exc
-        return {
-            "summary": asdict(summary),
-            "analytics": asdict(analytics),
-            "items": items,
-        }
+        return payload
 
     @app.post("/admin/tokens/import", status_code=202)
     async def import_tokens_route(

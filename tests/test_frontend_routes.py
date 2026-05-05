@@ -218,6 +218,16 @@ def test_frontend_dashboard_refresh_does_not_overlap_heavy_admin_requests() -> N
     assert "Promise.all([loadTokens(), loadRequests()])" not in refresh_function
 
 
+def test_frontend_pauses_background_polling_when_tab_is_hidden() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+
+    assert "refreshPendingOnVisible: false" in app_js
+    assert "if (document.hidden)" in app_js
+    assert "state.refreshPendingOnVisible = true" in app_js
+    assert 'document.addEventListener("visibilitychange"' in app_js
+    assert "state.refreshPendingOnVisible = false" in app_js
+
+
 def test_frontend_loads_token_quota_lazily_after_list_render() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     load_tokens_function = app_js.split("async function loadTokens", 1)[1].split("async function goToTokenPage", 1)[0]

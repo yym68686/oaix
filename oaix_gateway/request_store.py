@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from time import perf_counter
 from typing import Any
 
-from sqlalchemy import case, func, select, text
+from sqlalchemy import case, delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .database import CodexToken, GatewayRequestLog, get_read_session, get_request_log_session, utcnow
@@ -177,8 +177,8 @@ def _request_model_label_expr():
     return func.coalesce(GatewayRequestLog.model_name, GatewayRequestLog.model, "未识别模型")
 
 
-def _build_request_log_summary_stmt():
-    return select(
+def _build_request_log_summary_stmt(*, since: datetime | None = None):
+    stmt = select(
         func.count().label("total"),
         func.sum(case((GatewayRequestLog.success.is_(True), 1), else_=0)).label("successful"),
         func.sum(case((GatewayRequestLog.success.is_(False), 1), else_=0)).label("failed"),
@@ -189,6 +189,9 @@ def _build_request_log_summary_stmt():
         func.sum(GatewayRequestLog.total_tokens).label("total_tokens"),
         func.sum(GatewayRequestLog.estimated_cost_usd).label("estimated_cost_usd"),
     ).select_from(GatewayRequestLog)
+    if since is not None:
+        stmt = stmt.where(GatewayRequestLog.started_at >= since)
+    return stmt
 
 
 def _build_request_model_analytics_stmt(*, since: datetime, top_models: int):
@@ -527,9 +530,12 @@ async def upsert_request_logs(
         raise
 
 
-async def get_request_log_summary() -> RequestLogSummary:
+async def get_request_log_summary(*, hours: int | None = None) -> RequestLogSummary:
+    since = None
+    if hours is not None:
+        since = utcnow() - timedelta(hours=max(1, min(int(hours), 24 * 30)))
     async with get_read_session() as session:
-        row = (await session.execute(_build_request_log_summary_stmt())).one()
+        row = (await session.execute(_build_request_log_summary_stmt(since=since))).one()
         (
             total,
             successful,
@@ -707,3 +713,10 @@ async def get_request_log_analytics(*, hours: int = 24, bucket_minutes: int = 60
         buckets=buckets,
         models=models,
     )
+
+
+async def delete_request_logs_older_than(cutoff: datetime) -> int:
+    async with get_request_log_session() as session:
+        async with session.begin():
+            result = await session.execute(delete(GatewayRequestLog).where(GatewayRequestLog.started_at < cutoff))
+            return int(result.rowcount or 0)

@@ -12,6 +12,7 @@ from typing import Any, Iterable, TypeAlias
 
 from sqlalchemy import String, and_, case, cast, delete, func, nullsfirst, nullslast, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.orm import load_only
 
 from .database import (
     CodexToken,
@@ -2495,16 +2496,44 @@ async def list_token_pool_rows() -> list[CodexToken]:
     async with get_read_session() as session:
         result = await session.execute(
             select(CodexToken)
-            .where(*_canonical_token_filters())
+            .options(
+                load_only(
+                    CodexToken.id,
+                    CodexToken.account_id,
+                    CodexToken.email,
+                    CodexToken.id_token,
+                    CodexToken.access_token,
+                    CodexToken.refresh_token,
+                    CodexToken.raw_payload,
+                    CodexToken.plan_type,
+                    CodexToken.token_type,
+                    CodexToken.expires_at,
+                    CodexToken.is_active,
+                    CodexToken.cooldown_until,
+                    CodexToken.last_used_at,
+                    CodexToken.updated_at,
+                    CodexToken.last_error,
+                    CodexToken.merged_into_token_id,
+                )
+            )
+            .where(
+                *_canonical_token_filters(),
+                CodexToken.is_active.is_(True),
+                CodexToken.refresh_token.is_not(None),
+                CodexToken.token_type == "codex",
+            )
             .order_by(CodexToken.id.asc())
         )
         return list(result.scalars().all())
 
 
 async def list_token_pool_scoped_cooldowns() -> list[CodexTokenScopedCooldown]:
+    now = utcnow()
     async with get_read_session() as session:
         result = await session.execute(
-            select(CodexTokenScopedCooldown).order_by(
+            select(CodexTokenScopedCooldown)
+            .where(CodexTokenScopedCooldown.cooldown_until > now)
+            .order_by(
                 CodexTokenScopedCooldown.token_id.asc(),
                 CodexTokenScopedCooldown.scope.asc(),
             )

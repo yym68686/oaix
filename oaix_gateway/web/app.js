@@ -131,6 +131,7 @@ const state = {
   tokenDragTokenId: null,
   importQueuePosition: DEFAULT_IMPORT_QUEUE_POSITION,
   refreshing: false,
+  refreshPendingOnVisible: false,
   probeModel: DEFAULT_PROBE_MODEL,
   themePreference: initialThemePreference,
   resolvedTheme: initialResolvedTheme,
@@ -4061,6 +4062,17 @@ elements.resetImportButton.addEventListener("click", resetImportForm);
 
 refreshDashboard();
 state.timer = window.setInterval(() => {
+  if (document.hidden) {
+    state.refreshPendingOnVisible = true;
+    return;
+  }
   void refreshDashboard({ includeTokens: false });
 }, REFRESH_INTERVAL_MS);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden || !state.refreshPendingOnVisible) {
+    return;
+  }
+  state.refreshPendingOnVisible = false;
+  void refreshDashboard({ includeTokens: false });
+});
 resumeTrackedImportJob();

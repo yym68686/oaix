@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Iterable, Protocol
 
 import httpx
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, insert, or_, select, update
 
 from .database import (
     CodexToken,
@@ -96,6 +96,10 @@ def _import_publish_batch_size() -> int:
 
 def _import_publish_flush_interval_seconds() -> float:
     return _float_env("IMPORT_PUBLISH_FLUSH_INTERVAL_SECONDS", 0.5, minimum=0.0)
+
+
+def _import_staging_insert_batch_size() -> int:
+    return _int_env("IMPORT_STAGING_INSERT_BATCH_SIZE", 1000, minimum=1)
 
 
 def _import_job_respect_response_traffic() -> bool:
@@ -380,28 +384,31 @@ async def create_token_import_job(
             )
             session.add(job)
             await session.flush()
-            for index, payload in enumerate(normalized_payloads):
-                session.add(
-                    TokenImportItem(
-                        job_id=int(job.id),
-                        item_index=index,
-                        status=IMPORT_ITEM_STATUS_QUEUED,
-                        refresh_token_hash=_refresh_token_hash_from_payload(payload),
-                        encrypted_payload=_encrypt_import_payload(payload if isinstance(payload, dict) else {"_raw": payload}),
-                        payload=None,
-                        validated_payload=None,
-                        token_id=None,
-                        action=None,
-                        error_message=None,
-                        validation_ms=None,
-                        publish_ms=None,
-                        import_validate_ms=None,
-                        import_publish_ms=None,
-                        validation_started_at=None,
-                        validation_finished_at=None,
-                        published_at=None,
-                    )
-                )
+            rows = [
+                {
+                    "job_id": int(job.id),
+                    "item_index": index,
+                    "status": IMPORT_ITEM_STATUS_QUEUED,
+                    "refresh_token_hash": _refresh_token_hash_from_payload(payload),
+                    "encrypted_payload": _encrypt_import_payload(payload if isinstance(payload, dict) else {"_raw": payload}),
+                    "payload": None,
+                    "validated_payload": None,
+                    "token_id": None,
+                    "action": None,
+                    "error_message": None,
+                    "validation_ms": None,
+                    "publish_ms": None,
+                    "import_validate_ms": None,
+                    "import_publish_ms": None,
+                    "validation_started_at": None,
+                    "validation_finished_at": None,
+                    "published_at": None,
+                }
+                for index, payload in enumerate(normalized_payloads)
+            ]
+            batch_size = _import_staging_insert_batch_size()
+            for offset in range(0, len(rows), batch_size):
+                await session.execute(insert(TokenImportItem), rows[offset : offset + batch_size])
             await session.flush()
             state = _serialize_job_state(job)
             return TokenImportJobLease(**state.__dict__, payloads=normalized_payloads)
@@ -798,30 +805,32 @@ async def _materialize_token_import_items_from_payloads(job: TokenImportJobLease
                 select(TokenImportItem.item_index).where(TokenImportItem.job_id == int(job.id))
             )
             existing_indices = {int(index) for index in existing_result.scalars().all()}
-            for index, payload in enumerate(payloads):
-                if index in existing_indices:
-                    continue
-                session.add(
-                    TokenImportItem(
-                        job_id=int(job.id),
-                        item_index=index,
-                        status=IMPORT_ITEM_STATUS_QUEUED,
-                        refresh_token_hash=_refresh_token_hash_from_payload(payload),
-                        encrypted_payload=_encrypt_import_payload(payload if isinstance(payload, dict) else {"_raw": payload}),
-                        payload=None,
-                        validated_payload=None,
-                        token_id=None,
-                        action=None,
-                        error_message=None,
-                        validation_ms=None,
-                        publish_ms=None,
-                        import_validate_ms=None,
-                        import_publish_ms=None,
-                        validation_started_at=None,
-                        validation_finished_at=None,
-                        published_at=None,
-                    )
-                )
+            rows = [
+                {
+                    "job_id": int(job.id),
+                    "item_index": index,
+                    "status": IMPORT_ITEM_STATUS_QUEUED,
+                    "refresh_token_hash": _refresh_token_hash_from_payload(payload),
+                    "encrypted_payload": _encrypt_import_payload(payload if isinstance(payload, dict) else {"_raw": payload}),
+                    "payload": None,
+                    "validated_payload": None,
+                    "token_id": None,
+                    "action": None,
+                    "error_message": None,
+                    "validation_ms": None,
+                    "publish_ms": None,
+                    "import_validate_ms": None,
+                    "import_publish_ms": None,
+                    "validation_started_at": None,
+                    "validation_finished_at": None,
+                    "published_at": None,
+                }
+                for index, payload in enumerate(payloads)
+                if index not in existing_indices
+            ]
+            batch_size = _import_staging_insert_batch_size()
+            for offset in range(0, len(rows), batch_size):
+                await session.execute(insert(TokenImportItem), rows[offset : offset + batch_size])
             await session.flush()
     return await _list_token_import_items(job.id)
 
@@ -890,6 +899,9 @@ async def _mark_import_item_failed(
             await session.flush()
 
 
+_ORIGINAL_MARK_IMPORT_ITEM_FAILED = _mark_import_item_failed
+
+
 async def _mark_import_items_publish_pending(item_ids: Iterable[int]) -> None:
     ids = tuple(sorted({int(item_id) for item_id in item_ids}))
     if not ids:
@@ -929,6 +941,88 @@ async def _mark_import_item_published(
             item.published_at = now
             item.error_message = None
             item.updated_at = now
+            await session.flush()
+
+
+_ORIGINAL_MARK_IMPORT_ITEM_PUBLISHED = _mark_import_item_published
+
+
+async def _mark_import_items_published_batch(updates: Iterable[dict[str, Any]]) -> None:
+    rows = [dict(row) for row in updates if row.get("item_id") is not None]
+    if not rows:
+        return
+    if _mark_import_item_published is not _ORIGINAL_MARK_IMPORT_ITEM_PUBLISHED:
+        await asyncio.gather(
+            *(
+                _mark_import_item_published(
+                    int(row["item_id"]),
+                    token_id=int(row["token_id"]),
+                    action=str(row.get("action") or ""),
+                    publish_ms=max(0, int(row.get("publish_ms") or 0)),
+                )
+                for row in rows
+            )
+        )
+        return
+    now = utcnow()
+    async with get_import_session() as session:
+        async with session.begin():
+            for row in rows:
+                await session.execute(
+                    update(TokenImportItem)
+                    .where(TokenImportItem.id == int(row["item_id"]))
+                    .values(
+                        status=IMPORT_ITEM_STATUS_DUPLICATE
+                        if row.get("action") == "duplicate"
+                        else IMPORT_ITEM_STATUS_PUBLISHED,
+                        token_id=int(row["token_id"]),
+                        action=str(row.get("action") or ""),
+                        publish_ms=max(0, int(row.get("publish_ms") or 0)),
+                        import_publish_ms=max(0, int(row.get("publish_ms") or 0)),
+                        published_at=now,
+                        error_message=None,
+                        updated_at=now,
+                    )
+                )
+            await session.flush()
+
+
+async def _mark_import_items_failed_batch(
+    item_ids: Iterable[int],
+    *,
+    error_message: str,
+    publish_ms: int | None = None,
+) -> None:
+    ids = tuple(sorted({int(item_id) for item_id in item_ids}))
+    if not ids:
+        return
+    if _mark_import_item_failed is not _ORIGINAL_MARK_IMPORT_ITEM_FAILED:
+        await asyncio.gather(
+            *(
+                _mark_import_item_failed(
+                    item_id,
+                    error_message=error_message,
+                    publish_ms=publish_ms,
+                )
+                for item_id in ids
+            )
+        )
+        return
+    now = utcnow()
+    values: dict[str, Any] = {
+        "status": IMPORT_ITEM_STATUS_FAILED,
+        "error_message": _summarize_error(error_message),
+        "updated_at": now,
+    }
+    if publish_ms is not None:
+        values.update(
+            publish_ms=max(0, int(publish_ms)),
+            import_publish_ms=max(0, int(publish_ms)),
+            published_at=now,
+        )
+    async with get_import_session() as session:
+        async with session.begin():
+            await session.execute(update(TokenImportItem).where(TokenImportItem.id.in_(ids)).values(**values))
             await session.flush()
 
 
@@ -1087,12 +1181,15 @@ async def _publish_staged_token_import_items_batch(
         )
         publish_ms = int((time.monotonic() - started_at) * 1000)
         results = list(preflight_results)
+        publish_updates: list[dict[str, Any]] = []
         for item, upsert in zip(publish_items, batch.results, strict=True):
-            await _mark_import_item_published(
-                item.id,
-                token_id=upsert.token.id,
-                action=upsert.action,
-                publish_ms=publish_ms,
+            publish_updates.append(
+                {
+                    "item_id": item.id,
+                    "token_id": upsert.token.id,
+                    "action": upsert.action,
+                    "publish_ms": publish_ms,
+                }
             )
             item_payload = {
                 "id": upsert.token.id,
@@ -1118,13 +1215,18 @@ async def _publish_staged_token_import_items_batch(
                     publish_ms=publish_ms,
                 )
             )
+        await _mark_import_items_published_batch(publish_updates)
         return results, batch.selection_settings
     except Exception as exc:
         error = str(exc)
         publish_ms = int((time.monotonic() - started_at) * 1000)
         failed_results = list(preflight_results)
+        await _mark_import_items_failed_batch(
+            (item.id for item in publish_items),
+            error_message=error,
+            publish_ms=publish_ms,
+        )
         for item in publish_items:
-            await _mark_import_item_failed(item.id, error_message=error, publish_ms=publish_ms)
             failed_results.append(
                 _TokenImportItemResult(
                     index=item.index,
