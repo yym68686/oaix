@@ -166,7 +166,9 @@ RESPONSES_STREAM_NETWORK_ERRORS = (
     httpx.RemoteProtocolError,
     httpx.LocalProtocolError,
     httpx.ReadTimeout,
+    httpx.ConnectTimeout,
     httpx.ConnectError,
+    httpx.PoolTimeout,
 )
 DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS = 30.0
 STREAM_KEEPALIVE_PADDING_BYTES = 2048
@@ -688,6 +690,47 @@ def _current_token_pool_snapshot(app: FastAPI) -> _TokenPoolSnapshot | None:
     return snapshot if isinstance(snapshot, _TokenPoolSnapshot) else None
 
 
+def _token_pool_snapshot_max_age_seconds() -> float:
+    return _float_env("TOKEN_POOL_SNAPSHOT_MAX_AGE_SECONDS", 10.0, minimum=0.1)
+
+
+def _token_pool_snapshot_age_seconds(snapshot: _TokenPoolSnapshot) -> float:
+    return max(0.0, time.monotonic() - snapshot.loaded_at)
+
+
+def _token_pool_snapshot_is_fresh(snapshot: _TokenPoolSnapshot) -> bool:
+    return _token_pool_snapshot_age_seconds(snapshot) <= _token_pool_snapshot_max_age_seconds()
+
+
+def _schedule_token_pool_snapshot_refresh(app: FastAPI, *, reason: str) -> None:
+    existing = getattr(app.state, "token_pool_snapshot_refresh_task", None)
+    if isinstance(existing, asyncio.Task) and not existing.done():
+        return
+    try:
+        task = asyncio.create_task(
+            _refresh_token_pool_snapshot_best_effort(app, reason=reason),
+            name="oaix-token-pool-snapshot-refresh",
+        )
+    except RuntimeError:
+        return
+    app.state.token_pool_snapshot_refresh_task = task
+
+
+def _fresh_token_pool_snapshot(app: FastAPI, *, timing: _RequestTimingRecorder | None = None) -> _TokenPoolSnapshot | None:
+    snapshot = _current_token_pool_snapshot(app)
+    if snapshot is None:
+        return None
+    age_seconds = _token_pool_snapshot_age_seconds(snapshot)
+    if timing is not None:
+        timing.set_ms("token_pool_snapshot_age_ms", age_seconds * 1000)
+    if age_seconds <= _token_pool_snapshot_max_age_seconds():
+        return snapshot
+    if timing is not None:
+        timing.add_ms("token_pool_snapshot_stale_count", 1)
+    _schedule_token_pool_snapshot_refresh(app, reason="stale_request_snapshot")
+    return None
+
+
 def _claim_next_active_token_from_snapshot(
     snapshot: _TokenPoolSnapshot,
     selection_settings: TokenSelectionSettings,
@@ -885,11 +928,19 @@ def _request_log_write_batch_size() -> int:
     return _int_env("REQUEST_LOG_WRITE_BATCH_SIZE", 50, minimum=1)
 
 
+def _request_log_write_queue_max_size() -> int:
+    return _int_env("REQUEST_LOG_WRITE_QUEUE_MAX_SIZE", 2000, minimum=1)
+
+
+def _request_log_write_timeout_seconds() -> float:
+    return _float_env("REQUEST_LOG_WRITE_TIMEOUT_SECONDS", 3.0, minimum=0.1)
+
+
 def _request_log_write_queue() -> asyncio.Queue[_RequestLogWriteJob]:
     global _REQUEST_LOG_WRITE_QUEUE, _REQUEST_LOG_WRITE_QUEUE_LOOP, _REQUEST_LOG_WRITE_DRAINERS
     loop = asyncio.get_running_loop()
     if _REQUEST_LOG_WRITE_QUEUE is None or _REQUEST_LOG_WRITE_QUEUE_LOOP is not loop:
-        _REQUEST_LOG_WRITE_QUEUE = asyncio.Queue()
+        _REQUEST_LOG_WRITE_QUEUE = asyncio.Queue(maxsize=_request_log_write_queue_max_size())
         _REQUEST_LOG_WRITE_QUEUE_LOOP = loop
         _REQUEST_LOG_WRITE_DRAINERS = set()
     return _REQUEST_LOG_WRITE_QUEUE
@@ -1039,7 +1090,12 @@ async def _drain_request_log_write_queue(queue: asyncio.Queue[_RequestLogWriteJo
 
         try:
             await asyncio.sleep(0)
-            await _write_request_log_batch(jobs)
+            await asyncio.wait_for(
+                _write_request_log_batch(jobs),
+                timeout=_request_log_write_timeout_seconds(),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Request log write batch timed out; dropping %s queued log job(s)", len(jobs))
         except Exception as exc:
             logger.exception("Request log write batch failed: %s", exc)
         finally:
@@ -1072,9 +1128,63 @@ def _ensure_request_log_write_drainers() -> None:
         task.add_done_callback(_discard_request_log_drainer)
 
 
+_REQUEST_LOG_WRITE_DROPPED = 0
+
+
+def _request_log_job_is_final(job: _RequestLogWriteJob) -> bool:
+    return job.payload.get("status_code") is not None or bool(job.success_hooks)
+
+
+def _drop_queued_request_log_job(queue: asyncio.Queue[_RequestLogWriteJob], *, prefer_start_only: bool) -> bool:
+    if queue.empty():
+        return False
+    held_jobs: list[_RequestLogWriteJob] = []
+    dropped = False
+    try:
+        while True:
+            job = queue.get_nowait()
+            if prefer_start_only and not dropped and _request_log_job_is_final(job):
+                queue.task_done()
+                held_jobs.append(job)
+                continue
+            queue.task_done()
+            dropped = True
+            break
+    except asyncio.QueueEmpty:
+        pass
+    finally:
+        for held_job in held_jobs:
+            try:
+                queue.put_nowait(held_job)
+            except asyncio.QueueFull:
+                pass
+        if not dropped and not prefer_start_only:
+            return False
+    return dropped
+
+
 def _submit_request_log_write(job: _RequestLogWriteJob) -> None:
+    global _REQUEST_LOG_WRITE_DROPPED
     queue = _request_log_write_queue()
-    queue.put_nowait(job)
+    if queue.full():
+        if not _request_log_job_is_final(job):
+            _REQUEST_LOG_WRITE_DROPPED += 1
+            if _REQUEST_LOG_WRITE_DROPPED == 1 or _REQUEST_LOG_WRITE_DROPPED % 100 == 0:
+                logger.warning(
+                    "Request log write queue full; dropped %s start log job(s)",
+                    _REQUEST_LOG_WRITE_DROPPED,
+                )
+            return
+        if not _drop_queued_request_log_job(queue, prefer_start_only=True):
+            _drop_queued_request_log_job(queue, prefer_start_only=False)
+
+    try:
+        queue.put_nowait(job)
+    except asyncio.QueueFull:
+        _REQUEST_LOG_WRITE_DROPPED += 1
+        if _REQUEST_LOG_WRITE_DROPPED == 1 or _REQUEST_LOG_WRITE_DROPPED % 100 == 0:
+            logger.warning("Request log write queue full; dropped %s log job(s)", _REQUEST_LOG_WRITE_DROPPED)
+        return
     _ensure_request_log_write_drainers()
 
 
@@ -1651,6 +1761,86 @@ class ResponseTrafficController:
                 return True
 
 
+class ProxyConcurrencyLease:
+    def __init__(self, limiter: "ProxyConcurrencyLimiter") -> None:
+        self._limiter = limiter
+        self._released = False
+
+    async def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        await self._limiter.release()
+
+
+class ProxyConcurrencyLimiter:
+    def __init__(self, max_active: int) -> None:
+        self.max_active = max(1, int(max_active))
+        self._active = 0
+        self._condition = asyncio.Condition()
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    async def acquire(self, *, timeout_seconds: float) -> ProxyConcurrencyLease:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout_seconds))
+        async with self._condition:
+            while self._active >= self.max_active:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out waiting for proxy concurrency slot")
+                try:
+                    await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError("Timed out waiting for proxy concurrency slot") from exc
+            self._active += 1
+        return ProxyConcurrencyLease(self)
+
+    async def release(self) -> None:
+        async with self._condition:
+            if self._active <= 0:
+                self._active = 0
+            else:
+                self._active -= 1
+            self._condition.notify(1)
+
+
+class UpstreamCircuitBreaker:
+    def __init__(self, *, failure_threshold: int, window_seconds: float, open_seconds: float) -> None:
+        self.failure_threshold = max(1, int(failure_threshold))
+        self.window_seconds = max(0.1, float(window_seconds))
+        self.open_seconds = max(0.1, float(open_seconds))
+        self._failures: deque[float] = deque()
+        self._open_until = 0.0
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        while self._failures and self._failures[0] < cutoff:
+            self._failures.popleft()
+
+    def is_open(self) -> bool:
+        now = time.monotonic()
+        if self._open_until <= now:
+            return False
+        return True
+
+    def retry_after_seconds(self) -> float:
+        return max(0.0, self._open_until - time.monotonic())
+
+    def record_success(self) -> None:
+        self._failures.clear()
+        self._open_until = 0.0
+
+    def record_failure(self) -> None:
+        now = time.monotonic()
+        self._prune(now)
+        self._failures.append(now)
+        if len(self._failures) >= self.failure_threshold:
+            self._open_until = now + self.open_seconds
+
+
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     raw = str(os.getenv(name, "") or "").strip()
     try:
@@ -1675,7 +1865,60 @@ def _csv_env(name: str) -> list[str]:
 
 
 def _max_request_account_retries() -> int:
-    return _int_env("MAX_REQUEST_ACCOUNT_RETRIES", 100, minimum=1)
+    return _int_env("MAX_REQUEST_ACCOUNT_RETRIES", 10, minimum=1)
+
+
+def _transport_error_max_retries() -> int:
+    return _int_env("TRANSPORT_ERROR_MAX_RETRIES", 2, minimum=0)
+
+
+def _upstream_5xx_max_retries() -> int:
+    return _int_env("UPSTREAM_5XX_MAX_RETRIES", 3, minimum=0)
+
+
+def _proxy_max_active_responses() -> int:
+    return _int_env("PROXY_MAX_ACTIVE_RESPONSES", 64, minimum=1)
+
+
+def _proxy_queue_timeout_seconds() -> float:
+    return _float_env("PROXY_QUEUE_TIMEOUT_SECONDS", 1.0, minimum=0.0)
+
+
+def _healthz_db_timeout_seconds() -> float:
+    return _float_env("HEALTHZ_DB_TIMEOUT_SECONDS", 1.0, minimum=0.05)
+
+
+def _upstream_connect_timeout_seconds() -> float:
+    return _float_env("UPSTREAM_CONNECT_TIMEOUT_SECONDS", 5.0, minimum=0.1)
+
+
+def _upstream_write_timeout_seconds() -> float:
+    return _float_env("UPSTREAM_WRITE_TIMEOUT_SECONDS", 10.0, minimum=0.1)
+
+
+def _upstream_pool_timeout_seconds() -> float:
+    return _float_env("UPSTREAM_POOL_TIMEOUT_SECONDS", 2.0, minimum=0.1)
+
+
+def _upstream_http_timeout(*, read: float | None = None) -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=_upstream_connect_timeout_seconds(),
+        read=read,
+        write=_upstream_write_timeout_seconds(),
+        pool=_upstream_pool_timeout_seconds(),
+    )
+
+
+def _upstream_circuit_breaker_failure_threshold() -> int:
+    return _int_env("UPSTREAM_CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5, minimum=1)
+
+
+def _upstream_circuit_breaker_window_seconds() -> float:
+    return _float_env("UPSTREAM_CIRCUIT_BREAKER_WINDOW_SECONDS", 10.0, minimum=0.1)
+
+
+def _upstream_circuit_breaker_open_seconds() -> float:
+    return _float_env("UPSTREAM_CIRCUIT_BREAKER_OPEN_SECONDS", 30.0, minimum=0.1)
 
 
 def _fill_first_token_active_stream_cap() -> int:
@@ -1733,6 +1976,48 @@ def _state_http_client(app: FastAPI, name: str) -> httpx.AsyncClient:
     if isinstance(client, httpx.AsyncClient):
         return client
     return app.state.http_client
+
+
+def _proxy_concurrency_limiter(app: FastAPI) -> ProxyConcurrencyLimiter:
+    limiter = getattr(app.state, "proxy_concurrency", None)
+    max_active = _proxy_max_active_responses()
+    if not isinstance(limiter, ProxyConcurrencyLimiter) or limiter.max_active != max_active:
+        limiter = ProxyConcurrencyLimiter(max_active)
+        app.state.proxy_concurrency = limiter
+    return limiter
+
+
+def _upstream_circuit_breaker(app: FastAPI) -> UpstreamCircuitBreaker:
+    breaker = getattr(app.state, "upstream_circuit_breaker", None)
+    if not isinstance(breaker, UpstreamCircuitBreaker):
+        breaker = UpstreamCircuitBreaker(
+            failure_threshold=_upstream_circuit_breaker_failure_threshold(),
+            window_seconds=_upstream_circuit_breaker_window_seconds(),
+            open_seconds=_upstream_circuit_breaker_open_seconds(),
+        )
+        app.state.upstream_circuit_breaker = breaker
+    return breaker
+
+
+def _upstream_circuit_open_exception(breaker: UpstreamCircuitBreaker) -> HTTPException:
+    retry_after = max(1, int(math.ceil(breaker.retry_after_seconds())))
+    exc = HTTPException(
+        status_code=503,
+        detail=f"Upstream temporarily unavailable; retry after {retry_after}s",
+        headers={"Retry-After": str(retry_after)},
+    )
+    setattr(exc, "retryable", False)
+    return exc
+
+
+def _raise_if_upstream_circuit_open(app: FastAPI) -> None:
+    breaker = _upstream_circuit_breaker(app)
+    if breaker.is_open():
+        raise _upstream_circuit_open_exception(breaker)
+
+
+def _is_upstream_connectivity_exception(exc: Exception) -> bool:
+    return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout))
 
 
 def _image_request_max_account_retries() -> int:
@@ -4631,7 +4916,7 @@ async def _proxy_image_request_with_token(
     )
     upstream_url = _codex_responses_url(compact=False)
     json_payload = json.dumps(image_request.responses_payload, ensure_ascii=False)
-    timeout = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+    timeout = _upstream_http_timeout(read=None)
     non_stream_total_timeout_seconds = _image_non_stream_total_timeout_seconds()
     non_stream_read_timeout_seconds = _image_non_stream_read_timeout_seconds()
     non_stream_disconnect_poll_seconds = _image_non_stream_disconnect_poll_seconds()
@@ -5210,6 +5495,7 @@ def _gpt_image_stream_keepalive_response(
     proxy_call: Callable[[httpx.AsyncClient, str, str | None], Awaitable[ProxyRequestResult]],
     request_log: _RequestLogHandle,
     response_lease: Any,
+    proxy_lease: ProxyConcurrencyLease,
     timing: _RequestTimingRecorder | None,
 ) -> StreamingResponse:
     output_queue: asyncio.Queue[bytes | object] = asyncio.Queue()
@@ -5243,8 +5529,11 @@ def _gpt_image_stream_keepalive_response(
             max_claims = _max_request_account_retries()
             claim_count = 0
             last_error: HTTPException | None = None
+            transport_error_count = 0
+            upstream_5xx_error_count = 0
 
             while attempt_count < max_attempts and claim_count < max_claims:
+                _raise_if_upstream_circuit_open(http_request.app)
                 claim_count += 1
                 token_row = await _await_timed(
                     _claim_next_token_for_model_request(
@@ -5252,7 +5541,7 @@ def _gpt_image_stream_keepalive_response(
                         exclude_token_ids=excluded_token_ids,
                         scoped_cooldown_scope=scoped_cooldown_scope,
                         timing=timing,
-                        token_pool_snapshot=_current_token_pool_snapshot(http_request.app),
+                        token_pool_snapshot=_fresh_token_pool_snapshot(http_request.app, timing=timing),
                         require_non_free_token=require_non_free_token,
                     ),
                     timing=timing,
@@ -5455,6 +5744,7 @@ def _gpt_image_stream_keepalive_response(
                             success_hook=proxy_result.on_success,
                         )
                     await _mark_token_success_with_timing(timing, token_row.id, token_row=token_row)
+                    _upstream_circuit_breaker(http_request.app).record_success()
                     token_observation_first_token_at = (
                         (
                             proxy_result.stream_capture.first_token_at
@@ -5556,7 +5846,14 @@ def _gpt_image_stream_keepalive_response(
                         status_code=status_code,
                         error_text=detail,
                     )
-                    if _should_retry_http_exception(exc) and attempt < max_attempts:
+                    retryable_server_error = _should_retry_http_exception(exc)
+                    if retryable_server_error:
+                        upstream_5xx_error_count += 1
+                    if (
+                        retryable_server_error
+                        and upstream_5xx_error_count <= _upstream_5xx_max_retries()
+                        and attempt < max_attempts
+                    ):
                         excluded_token_ids.add(token_row.id)
                         mark_kwargs: dict[str, Any] = {}
                         if compact_server_error_cooling_time > 0:
@@ -5575,18 +5872,25 @@ def _gpt_image_stream_keepalive_response(
                         last_error = exc
                         continue
 
-                    if _should_retry_http_exception(exc):
+                    if retryable_server_error:
                         await mark_token_error(token_row.id, detail)
 
                     raise
                 except httpx.HTTPError as exc:
                     message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                    if _is_upstream_connectivity_exception(exc):
+                        _upstream_circuit_breaker(http_request.app).record_failure()
+                    transport_error_count += 1
                     compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
                         compact=compact,
                         status_code=500,
                         error_text=message,
                     )
-                    if attempt < max_attempts:
+                    if (
+                        transport_error_count <= _transport_error_max_retries()
+                        and attempt < max_attempts
+                        and not _upstream_circuit_breaker(http_request.app).is_open()
+                    ):
                         excluded_token_ids.add(token_row.id)
                         mark_kwargs: dict[str, Any] = {}
                         if compact_server_error_cooling_time > 0:
@@ -5605,6 +5909,8 @@ def _gpt_image_stream_keepalive_response(
                         last_error = HTTPException(status_code=502, detail=message)
                         continue
                     await mark_token_error(token_row.id, message)
+                    if _upstream_circuit_breaker(http_request.app).is_open():
+                        raise _upstream_circuit_open_exception(_upstream_circuit_breaker(http_request.app)) from exc
                     raise HTTPException(status_code=502, detail=message) from exc
                 finally:
                     _record_selected_token_observation_finish(
@@ -5674,6 +5980,7 @@ def _gpt_image_stream_keepalive_response(
             try:
                 await output_queue.put(queue_done_sentinel)
                 await response_lease.release()
+                await proxy_lease.release()
             finally:
                 if timing_context_token is not None:
                     _REQUEST_TIMING.reset(timing_context_token)
@@ -5717,6 +6024,7 @@ def _gpt_image_stream_keepalive_response(
             )
         finally:
             await response_lease.release()
+            await proxy_lease.release()
 
     return _FinalizingStreamingResponse(
         response_body(),
@@ -5735,9 +6043,22 @@ async def _execute_proxy_request_with_failover(
     proxy_call: Callable[[httpx.AsyncClient, str, str | None], Awaitable[ProxyRequestResult]],
     compact: bool = False,
 ) -> Response:
+    try:
+        proxy_lease = await _proxy_concurrency_limiter(http_request.app).acquire(
+            timeout_seconds=_proxy_queue_timeout_seconds(),
+        )
+    except TimeoutError:
+        retry_after = max(1, int(math.ceil(_proxy_queue_timeout_seconds())))
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Too many active proxy requests; retry later"},
+            headers={"Retry-After": str(retry_after)},
+        )
+
     response_traffic: ResponseTrafficController = http_request.app.state.response_traffic
     response_lease = response_traffic.start_response()
     release_response_traffic = True
+    release_proxy_concurrency = True
     timing = _RequestTimingRecorder()
     request_started_at = utcnow()
     request_log = _RequestLogHandle.start(
@@ -5759,6 +6080,7 @@ async def _execute_proxy_request_with_failover(
         await _record_event_loop_lag(timing)
         if is_stream and _is_responses_image_compat_model(request_model):
             release_response_traffic = False
+            release_proxy_concurrency = False
             return _gpt_image_stream_keepalive_response(
                 http_request,
                 endpoint=endpoint,
@@ -5767,6 +6089,7 @@ async def _execute_proxy_request_with_failover(
                 proxy_call=proxy_call,
                 request_log=request_log,
                 response_lease=response_lease,
+                proxy_lease=proxy_lease,
                 timing=timing,
             )
 
@@ -5784,8 +6107,11 @@ async def _execute_proxy_request_with_failover(
         excluded_token_ids: set[int] = set()
         skipped_free_token_ids: set[int] = set()
         postponed_unknown_plan_tokens: list[Any] = []
+        transport_error_count = 0
+        upstream_5xx_error_count = 0
 
         while attempt_count < max_attempts and claim_count < max_claims:
+            _raise_if_upstream_circuit_open(http_request.app)
             claim_count += 1
             token_row = await _await_timed(
                 _claim_next_token_for_model_request(
@@ -5793,7 +6119,7 @@ async def _execute_proxy_request_with_failover(
                     exclude_token_ids=excluded_token_ids,
                     scoped_cooldown_scope=scoped_cooldown_scope,
                     timing=timing,
-                    token_pool_snapshot=_current_token_pool_snapshot(http_request.app),
+                    token_pool_snapshot=_fresh_token_pool_snapshot(http_request.app, timing=timing),
                     require_non_free_token=require_non_free_token,
                 ),
                 timing=timing,
@@ -5963,6 +6289,7 @@ async def _execute_proxy_request_with_failover(
                                     token_id,
                                     token_row=selected_token_row,
                                 )
+                                _upstream_circuit_breaker(http_request.app).record_success()
                         finally:
                             _record_selected_token_observation_finish(
                                 token_id,
@@ -5978,6 +6305,7 @@ async def _execute_proxy_request_with_failover(
                             )
                             reset_db_timing_recorder(db_timing_context_token)
                             await response_lease.release()
+                            await proxy_lease.release()
 
                     body_iterator = proxy_result.response.body_iterator
                     if _is_responses_image_compat_model(request_model):
@@ -5991,6 +6319,7 @@ async def _execute_proxy_request_with_failover(
                         on_close=on_stream_close_once,
                     )
                     release_response_traffic = False
+                    release_proxy_concurrency = False
                     token_observation_transferred = True
                     return _FinalizingStreamingResponse(
                         body_iterator,
@@ -6001,6 +6330,7 @@ async def _execute_proxy_request_with_failover(
                     )
 
                 await _mark_token_success_with_timing(timing, token_row.id, token_row=token_row)
+                _upstream_circuit_breaker(http_request.app).record_success()
                 token_observation_first_token_at = proxy_result.first_token_at
                 finalized_request_log_id = await _finalize_request_log_with_timing(
                     timing,
@@ -6108,7 +6438,14 @@ async def _execute_proxy_request_with_failover(
                     status_code=status_code,
                     error_text=detail,
                 )
-                if _should_retry_http_exception(exc) and attempt < max_attempts:
+                retryable_server_error = _should_retry_http_exception(exc)
+                if retryable_server_error:
+                    upstream_5xx_error_count += 1
+                if (
+                    retryable_server_error
+                    and upstream_5xx_error_count <= _upstream_5xx_max_retries()
+                    and attempt < max_attempts
+                ):
                     excluded_token_ids.add(token_row.id)
                     mark_kwargs: dict[str, Any] = {}
                     if compact_server_error_cooling_time > 0:
@@ -6130,12 +6467,19 @@ async def _execute_proxy_request_with_failover(
                 raise
             except httpx.HTTPError as exc:
                 message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                if _is_upstream_connectivity_exception(exc):
+                    _upstream_circuit_breaker(http_request.app).record_failure()
+                transport_error_count += 1
                 compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
                     compact=compact,
                     status_code=500,
                     error_text=message,
                 )
-                if attempt < max_attempts:
+                if (
+                    transport_error_count <= _transport_error_max_retries()
+                    and attempt < max_attempts
+                    and not _upstream_circuit_breaker(http_request.app).is_open()
+                ):
                     excluded_token_ids.add(token_row.id)
                     mark_kwargs: dict[str, Any] = {}
                     if compact_server_error_cooling_time > 0:
@@ -6154,17 +6498,20 @@ async def _execute_proxy_request_with_failover(
                     last_error = HTTPException(status_code=502, detail=message)
                     continue
                 await mark_token_error(token_row.id, message)
+                if _upstream_circuit_breaker(http_request.app).is_open():
+                    raise _upstream_circuit_open_exception(_upstream_circuit_breaker(http_request.app)) from exc
                 raise HTTPException(status_code=502, detail=message) from exc
             except Exception as exc:
                 if not _is_retryable_upstream_transport_exception(exc):
                     raise
                 message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                transport_error_count += 1
                 compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
                     compact=compact,
                     status_code=500,
                     error_text=message,
                 )
-                if attempt < max_attempts:
+                if transport_error_count <= _transport_error_max_retries() and attempt < max_attempts:
                     excluded_token_ids.add(token_row.id)
                     mark_kwargs: dict[str, Any] = {}
                     if compact_server_error_cooling_time > 0:
@@ -6247,6 +6594,8 @@ async def _execute_proxy_request_with_failover(
     finally:
         if release_response_traffic:
             await response_lease.release()
+        if release_proxy_concurrency:
+            await proxy_lease.release()
         reset_db_timing_recorder(db_timing_context_token)
         _REQUEST_TIMING.reset(timing_context_token)
 
@@ -6651,6 +7000,12 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="oaix Gateway", version="0.1.0", lifespan=lifespan)
     app.state.response_traffic = ResponseTrafficController()
+    app.state.proxy_concurrency = ProxyConcurrencyLimiter(_proxy_max_active_responses())
+    app.state.upstream_circuit_breaker = UpstreamCircuitBreaker(
+        failure_threshold=_upstream_circuit_breaker_failure_threshold(),
+        window_seconds=_upstream_circuit_breaker_window_seconds(),
+        open_seconds=_upstream_circuit_breaker_open_seconds(),
+    )
     app.state.token_import_worker = None
     app.add_middleware(
         CORSMiddleware,
@@ -6688,14 +7043,58 @@ def create_app() -> FastAPI:
     async def empty_icon() -> Response:
         return Response(status_code=204, headers={"Cache-Control": "public, max-age=86400"})
 
+    @app.get("/livez")
+    async def livez() -> JSONResponse:
+        response_traffic: ResponseTrafficController = app.state.response_traffic
+        proxy_limiter = _proxy_concurrency_limiter(app)
+        upstream_breaker = _upstream_circuit_breaker(app)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "active_responses": response_traffic.active_responses,
+                "active_proxy_requests": proxy_limiter.active,
+                "max_proxy_requests": proxy_limiter.max_active,
+                "upstream_circuit_open": upstream_breaker.is_open(),
+            },
+        )
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
-        counts = await get_token_counts()
+        try:
+            counts = await asyncio.wait_for(
+                get_token_counts(),
+                timeout=_healthz_db_timeout_seconds(),
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "ok": False,
+                    "degraded": True,
+                    "error": "token count query timed out",
+                    "upstream": _codex_responses_url(),
+                    "service_key_protected": bool(_get_service_api_keys()),
+                },
+            )
+        except Exception as exc:
+            logger.exception("Health check token count query failed")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "ok": False,
+                    "degraded": True,
+                    "error": str(exc) or type(exc).__name__,
+                    "upstream": _codex_responses_url(),
+                    "service_key_protected": bool(_get_service_api_keys()),
+                },
+            )
         ok = counts.available > 0
         return JSONResponse(
             status_code=200 if ok else 503,
             content={
                 "ok": ok,
+                "degraded": not ok,
                 "upstream": _codex_responses_url(),
                 "counts": asdict(counts),
                 "service_key_protected": bool(_get_service_api_keys()),
@@ -7301,7 +7700,7 @@ async def _proxy_request_with_token(
                 upstream_url,
                 headers=headers,
                 content=json_payload,
-                timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
+                timeout=_upstream_http_timeout(read=None),
             )
             upstream_response = await _enter_upstream_stream_with_timing(stream_cm)
             if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
@@ -7354,7 +7753,7 @@ async def _proxy_request_with_token(
             upstream_url,
             headers=headers,
             content=json_payload,
-            timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
+            timeout=_upstream_http_timeout(read=None),
         )
         upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
@@ -7403,7 +7802,7 @@ async def _proxy_request_with_token(
             upstream_url,
             headers=headers,
             content=json_payload,
-            timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
+            timeout=_upstream_http_timeout(read=None),
         )
         upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
         try:
@@ -7436,7 +7835,7 @@ async def _proxy_request_with_token(
         upstream_url,
         headers=headers,
         content=json_payload,
-        timeout=httpx.Timeout(connect=30.0, read=compact_headers_timeout, write=30.0, pool=30.0),
+        timeout=_upstream_http_timeout(read=compact_headers_timeout),
     )
     try:
         upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
@@ -7467,7 +7866,7 @@ async def _proxy_request_with_token(
             _codex_responses_url(compact=False),
             headers=fallback_headers,
             content=json.dumps(fallback_payload, ensure_ascii=False),
-            timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
+            timeout=_upstream_http_timeout(read=None),
         )
         fallback_response = await _enter_upstream_stream_with_timing(fallback_stream_cm, compact=False)
         try:

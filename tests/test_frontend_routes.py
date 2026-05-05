@@ -33,6 +33,7 @@ def test_frontend_routes_are_registered() -> None:
     assert "/favicon.ico" in paths
     assert "/apple-touch-icon.png" in paths
     assert "/apple-touch-icon-precomposed.png" in paths
+    assert "/livez" in paths
     assert "/healthz" in paths
     assert "/admin/tokens" in paths
     assert "/admin/tokens/quota" in paths
@@ -67,6 +68,37 @@ def test_frontend_index_includes_token_search_input() -> None:
     assert 'id="token-search-summary"' in response.text
     assert 'id="token-pagination"' in response.text
     assert 'id="token-page-input"' in response.text
+
+
+def test_livez_returns_without_token_count_query(monkeypatch) -> None:
+    async def fail_get_token_counts():
+        raise AssertionError("livez should not query token counts")
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fail_get_token_counts)
+    app = create_app()
+
+    response = asyncio.run(_request(app, "GET", "/livez"))
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+
+def test_healthz_returns_degraded_when_token_count_query_times_out(monkeypatch) -> None:
+    monkeypatch.setenv("HEALTHZ_DB_TIMEOUT_SECONDS", "0.01")
+
+    async def stalled_get_token_counts():
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", stalled_get_token_counts)
+    app = create_app()
+
+    response = asyncio.run(_request(app, "GET", "/healthz"))
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["ok"] is False
+    assert body["degraded"] is True
+    assert body["error"] == "token count query timed out"
 
 
 def test_frontend_index_busts_asset_cache_with_content_hash() -> None:
