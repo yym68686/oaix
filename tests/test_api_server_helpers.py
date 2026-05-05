@@ -1849,6 +1849,48 @@ def test_proxy_stream_capture_extracts_usage_and_model() -> None:
     assert capture.usage_metrics.output_tokens == 5
 
 
+def test_proxy_stream_capture_avoids_completed_payload_build_for_incremental_usage(monkeypatch) -> None:
+    def fail_patch_completed_output(*args, **kwargs):
+        raise AssertionError("completed payload should not be built for incremental events")
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server._patch_completed_output_from_output_items",
+        fail_patch_completed_output,
+    )
+
+    capture = _ProxyStreamCapture()
+    capture.feed(
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","response":{"model":"gpt-5.4-mini","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n'
+    )
+
+    assert capture.model_name == "gpt-5.4-mini"
+    assert capture.usage_metrics is not None
+    assert capture.usage_metrics.total_tokens == 3
+
+
+def test_proxy_stream_capture_finalizes_usage_from_merged_response_snapshot() -> None:
+    capture = _ProxyStreamCapture(initial_model_name="gpt-5.4-mini")
+    capture.feed(
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","response":{"usage":{"input_tokens":10}}}\n\n'
+    )
+    capture.feed(
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","response":{"usage":{"output_tokens":5}}}\n\n'
+    )
+
+    assert capture.usage_metrics is not None
+    assert capture.usage_metrics.total_tokens == 5
+
+    capture.finalize_usage_metrics()
+
+    assert capture.usage_metrics is not None
+    assert capture.usage_metrics.input_tokens == 10
+    assert capture.usage_metrics.output_tokens == 5
+    assert capture.usage_metrics.total_tokens == 15
+
+
 def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request() -> None:
     class DummyStreamingResponse:
         def __init__(self, chunks: list[bytes]) -> None:

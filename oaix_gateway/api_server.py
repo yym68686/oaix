@@ -1572,6 +1572,7 @@ class _ProxyStreamCapture:
         self.error_status_code: int | None = None
         self.error_message: str | None = None
         self._response_snapshot: dict[str, Any] = {}
+        self._response_payload_cache: dict[str, Any] | None = None
         self._output_items_by_index: dict[int, dict[str, Any]] = {}
         self._output_items_fallback: list[dict[str, Any]] = []
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -1582,6 +1583,8 @@ class _ProxyStreamCapture:
 
     @property
     def response_payload(self) -> dict[str, Any] | None:
+        if self._response_payload_cache is not None:
+            return self._response_payload_cache
         if not self._response_snapshot:
             return None
 
@@ -1594,7 +1597,24 @@ class _ProxyStreamCapture:
             output_items_fallback=self._output_items_fallback,
         )
         response_payload = patched.get("response")
-        return response_payload if isinstance(response_payload, dict) else None
+        if not isinstance(response_payload, dict):
+            return None
+        if self.completed:
+            self._response_payload_cache = response_payload
+        return response_payload
+
+    def finalize_usage_metrics(self) -> None:
+        response_payload = self.response_payload
+        if response_payload is not None:
+            self._update_usage_metrics({"response": response_payload})
+
+    def _invalidate_response_payload_cache(self) -> None:
+        self._response_payload_cache = None
+
+    def _update_usage_metrics(self, payload: Any) -> None:
+        usage_metrics = extract_usage_metrics(payload, model_name=self.model_name)
+        if usage_metrics is not None:
+            self.usage_metrics = usage_metrics
 
     def feed(self, chunk: bytes) -> None:
         if not chunk or self._capture_disabled:
@@ -1604,6 +1624,7 @@ class _ProxyStreamCapture:
             self._capture_disabled = True
             self._text_buffer = ""
             self._response_snapshot.clear()
+            self._response_payload_cache = None
             self._output_items_by_index.clear()
             self._output_items_fallback.clear()
             logger.info("Stream capture disabled after exceeding %s bytes", _stream_capture_max_bytes())
@@ -1648,10 +1669,12 @@ class _ProxyStreamCapture:
                         output_items_by_index=self._output_items_by_index,
                         output_items_fallback=self._output_items_fallback,
                     )
+                    self._invalidate_response_payload_cache()
                     continue
 
                 response_obj = event_payload.get("response")
                 if isinstance(response_obj, dict):
+                    self._invalidate_response_payload_cache()
                     if event_type == "response.completed":
                         self.completed = True
                         event_payload = _patch_completed_output_from_output_items(
@@ -1662,10 +1685,10 @@ class _ProxyStreamCapture:
                         response_obj = event_payload.get("response")
                     _merge_mapping(self._response_snapshot, response_obj)
 
-                usage_payload = self.response_payload or event_payload
-                usage_metrics = extract_usage_metrics(usage_payload, model_name=self.model_name)
-                if usage_metrics is not None:
-                    self.usage_metrics = usage_metrics
+                if event_type == "response.completed":
+                    self.finalize_usage_metrics()
+                else:
+                    self._update_usage_metrics(event_payload)
         except Exception:
             logger.exception("Failed to observe streamed response usage")
 
@@ -5616,6 +5639,7 @@ async def _finalize_stream_request_log(
     success_hook: Callable[[int], Awaitable[None]] | None = None,
 ) -> int | None:
     try:
+        stream_capture.finalize_usage_metrics()
         failed = stream_capture.error_message is not None and not stream_capture.completed
         final_status_code = (stream_capture.error_status_code or status_code) if failed else status_code
         return await _finalize_request_log_with_timing(
