@@ -213,8 +213,40 @@ class TokenImportJob(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
+class TokenImportItem(Base):
+    __tablename__ = "token_import_items"
+    __table_args__ = (
+        UniqueConstraint("job_id", "item_index", name="uq_token_import_items_job_index"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("token_import_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    item_index: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
+    refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    validated_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    token_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    action: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    validation_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    publish_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    validation_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    validation_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 _engine = None
 _session_factory = None
+_import_engine = None
+_import_session_factory = None
 _request_log_engine = None
 _request_log_session_factory = None
 _db_timing_recorder: contextvars.ContextVar[object | None] = contextvars.ContextVar(
@@ -305,6 +337,33 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
+def get_import_engine():
+    global _import_engine
+    if _import_engine is None:
+        _import_engine = create_async_engine(
+            normalize_database_url(),
+            pool_size=_int_env("IMPORT_DATABASE_POOL_SIZE", 4, minimum=1),
+            max_overflow=_int_env("IMPORT_DATABASE_MAX_OVERFLOW", 4, minimum=0),
+            pool_timeout=_float_env("IMPORT_DATABASE_POOL_TIMEOUT_SECONDS", 10.0, minimum=1.0),
+            pool_pre_ping=True,
+            pool_reset_on_return="rollback",
+        )
+        _install_pool_checkout_timer(_import_engine, "db_import_pool_checkout_wait_ms")
+    return _import_engine
+
+
+def get_import_session_factory() -> async_sessionmaker[AsyncSession]:
+    global _import_session_factory
+    if _import_session_factory is None:
+        _import_session_factory = async_sessionmaker(
+            get_import_engine(),
+            class_=AsyncSession,
+            autobegin=False,
+            expire_on_commit=False,
+        )
+    return _import_session_factory
+
+
 def get_request_log_engine():
     global _request_log_engine
     if _request_log_engine is None:
@@ -359,6 +418,23 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 @asynccontextmanager
 async def get_read_session() -> AsyncIterator[AsyncSession]:
     async with get_session() as session:
+        async with session.begin():
+            yield session
+
+
+@asynccontextmanager
+async def get_import_session() -> AsyncIterator[AsyncSession]:
+    async with _db_pool_checkout_timer():
+        session = get_import_session_factory()()
+        try:
+            yield session
+        finally:
+            await _close_session(session)
+
+
+@asynccontextmanager
+async def get_import_read_session() -> AsyncIterator[AsyncSession]:
+    async with get_import_session() as session:
         async with session.begin():
             yield session
 
@@ -492,6 +568,35 @@ def _run_schema_migrations(sync_conn) -> None:
             text("CREATE INDEX IF NOT EXISTS ix_token_import_jobs_heartbeat_at ON token_import_jobs (heartbeat_at)")
         )
 
+    if "token_import_items" not in table_names:
+        TokenImportItem.__table__.create(sync_conn, checkfirst=True)
+    sync_conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_token_import_items_job_index "
+            "ON token_import_items (job_id, item_index)"
+        )
+    )
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_token_import_items_job_id ON token_import_items (job_id)"))
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_token_import_items_status ON token_import_items (status)"))
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_token_import_items_item_index ON token_import_items (item_index)"))
+    sync_conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_token_import_items_refresh_token_hash ON token_import_items (refresh_token_hash)")
+    )
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_token_import_items_token_id ON token_import_items (token_id)"))
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_token_import_items_validation_started_at "
+            "ON token_import_items (validation_started_at)"
+        )
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_token_import_items_validation_finished_at "
+            "ON token_import_items (validation_finished_at)"
+        )
+    )
+    sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_token_import_items_published_at ON token_import_items (published_at)"))
+
 
 async def _backfill_token_refresh_aliases() -> None:
     async with get_session() as session:
@@ -524,12 +629,16 @@ async def _backfill_token_refresh_aliases() -> None:
 
 
 async def close_database() -> None:
-    global _engine, _session_factory, _request_log_engine, _request_log_session_factory
+    global _engine, _session_factory, _import_engine, _import_session_factory, _request_log_engine, _request_log_session_factory
     if _engine is not None:
         await _engine.dispose()
+    if _import_engine is not None:
+        await _import_engine.dispose()
     if _request_log_engine is not None:
         await _request_log_engine.dispose()
     _engine = None
     _session_factory = None
+    _import_engine = None
+    _import_session_factory = None
     _request_log_engine = None
     _request_log_session_factory = None

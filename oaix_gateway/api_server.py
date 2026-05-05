@@ -70,6 +70,8 @@ from .token_store import (
     get_token_counts,
     get_token_counts_by_account_ids,
     get_token_plan_counts,
+    list_token_pool_rows,
+    list_token_pool_scoped_cooldowns,
     get_token_selection_settings,
     get_token_status_counts,
     list_token_rows,
@@ -81,6 +83,7 @@ from .token_store import (
     repair_duplicate_token_histories,
     set_token_active_state,
     stop_token_status_write_queue,
+    token_is_runtime_available,
     parse_token_import_queue_position,
     update_token_active_stream_cap_settings,
     update_token_order_settings,
@@ -479,13 +482,201 @@ async def _mark_token_success_with_timing(
     )
 
 
+@dataclass
+class _TokenPoolSnapshot:
+    tokens: tuple[Any, ...]
+    scoped_cooldowns: dict[tuple[int, str], datetime]
+    loaded_at: float
+
+
+def _token_plan_sort_value(token_row: Any, settings: TokenSelectionSettings) -> int:
+    if not settings.plan_order_enabled:
+        return 0
+    plan_order = list(settings.plan_order)
+    plan_map = {plan_type: index for index, plan_type in enumerate(plan_order)}
+    plan_type = str(getattr(token_row, "plan_type", "") or "").strip().lower()
+    if plan_type.startswith("chatgpt_"):
+        plan_type = plan_type[len("chatgpt_") :]
+    return plan_map.get(plan_type, len(plan_map))
+
+
+def _token_order_sort_value(token_row: Any, settings: TokenSelectionSettings) -> int:
+    order = list(settings.token_order)
+    if not order:
+        return int(getattr(token_row, "id", 0) or 0)
+    order_map = {int(token_id): index for index, token_id in enumerate(order)}
+    return order_map.get(int(getattr(token_row, "id", 0) or 0), len(order_map))
+
+
+def _datetime_sort_value(value: Any) -> tuple[int, float]:
+    if value is None:
+        return (0, 0.0)
+    if isinstance(value, datetime):
+        return (1, value.timestamp())
+    return (1, 0.0)
+
+
+def _token_snapshot_ordered_tokens(snapshot: _TokenPoolSnapshot, settings: TokenSelectionSettings) -> list[Any]:
+    tokens = list(snapshot.tokens)
+    if settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        return sorted(
+            tokens,
+            key=lambda token_row: (
+                _token_plan_sort_value(token_row, settings),
+                _token_order_sort_value(token_row, settings),
+                int(getattr(token_row, "id", 0) or 0),
+            ),
+        )
+    return sorted(
+        tokens,
+        key=lambda token_row: (
+            _token_plan_sort_value(token_row, settings),
+            _datetime_sort_value(getattr(token_row, "last_used_at", None)),
+            _datetime_sort_value(getattr(token_row, "updated_at", None)),
+            int(getattr(token_row, "id", 0) or 0),
+        ),
+    )
+
+
+def _snapshot_scoped_cooldown_active(
+    snapshot: _TokenPoolSnapshot,
+    token_id: int,
+    *,
+    scoped_cooldown_scope: str | None,
+    now: datetime,
+) -> bool:
+    if not scoped_cooldown_scope:
+        return False
+    cooldown_until = snapshot.scoped_cooldowns.get((int(token_id), scoped_cooldown_scope))
+    return cooldown_until is not None and cooldown_until > now
+
+
+def _token_snapshot_row_available(
+    token_row: Any,
+    snapshot: _TokenPoolSnapshot,
+    *,
+    scoped_cooldown_scope: str | None,
+    now: datetime,
+) -> bool:
+    if getattr(token_row, "merged_into_token_id", None) is not None:
+        return False
+    if not bool(getattr(token_row, "is_active", False)):
+        return False
+    if not getattr(token_row, "refresh_token", None):
+        return False
+    if str(getattr(token_row, "token_type", "codex") or "codex") != "codex":
+        return False
+    cooldown_until = getattr(token_row, "cooldown_until", None)
+    if cooldown_until is not None and cooldown_until > now:
+        return False
+    token_id = int(getattr(token_row, "id", 0) or 0)
+    if _snapshot_scoped_cooldown_active(
+        snapshot,
+        token_id,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+        now=now,
+    ):
+        return False
+    return token_is_runtime_available(
+        token_row,
+        now=now,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+    )
+
+
+async def _load_token_pool_snapshot() -> _TokenPoolSnapshot:
+    token_rows, cooldown_rows = await asyncio.gather(
+        list_token_pool_rows(),
+        list_token_pool_scoped_cooldowns(),
+    )
+    scoped_cooldowns: dict[tuple[int, str], datetime] = {}
+    for cooldown in cooldown_rows:
+        scope = str(getattr(cooldown, "scope", "") or "").strip()
+        cooldown_until = getattr(cooldown, "cooldown_until", None)
+        if not scope or cooldown_until is None:
+            continue
+        scoped_cooldowns[(int(cooldown.token_id), scope)] = cooldown_until
+    return _TokenPoolSnapshot(
+        tokens=tuple(token_rows),
+        scoped_cooldowns=scoped_cooldowns,
+        loaded_at=time.monotonic(),
+    )
+
+
+async def _refresh_token_pool_snapshot(app: FastAPI) -> _TokenPoolSnapshot:
+    snapshot = await _load_token_pool_snapshot()
+    app.state.token_pool_snapshot = snapshot
+    return snapshot
+
+
+def _current_token_pool_snapshot(app: FastAPI) -> _TokenPoolSnapshot | None:
+    snapshot = getattr(app.state, "token_pool_snapshot", None)
+    return snapshot if isinstance(snapshot, _TokenPoolSnapshot) else None
+
+
+def _claim_next_active_token_from_snapshot(
+    snapshot: _TokenPoolSnapshot,
+    selection_settings: TokenSelectionSettings,
+    *,
+    exclude_token_ids: set[int],
+    scoped_cooldown_scope: str | None,
+    timing: _RequestTimingRecorder | None,
+) -> Any | None:
+    now = utcnow()
+    active_stream_cap = normalize_token_active_stream_cap(selection_settings.active_stream_cap)
+    effective_excluded_ids = set(exclude_token_ids)
+    effective_excluded_ids.update(
+        token_id
+        for token_id, active_count in _TOKEN_ACTIVE_REQUESTS.items()
+        if int(active_count or 0) >= active_stream_cap
+    )
+
+    if timing is not None:
+        timing.set_ms("token_pool_snapshot_age_ms", (time.monotonic() - snapshot.loaded_at) * 1000)
+
+    for token_row in _token_snapshot_ordered_tokens(snapshot, selection_settings):
+        token_id = int(getattr(token_row, "id", 0) or 0)
+        if token_id <= 0 or token_id in effective_excluded_ids:
+            continue
+        if not _token_snapshot_row_available(
+            token_row,
+            snapshot,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            now=now,
+        ):
+            continue
+        if _token_active_stream_count(token_id) >= active_stream_cap:
+            continue
+        token_row.last_used_at = now
+        token_row.updated_at = now
+        if timing is not None:
+            timing.add_ms("claim_token_memory_count", 1)
+        _record_selected_token_observation_start(token_id, timing)
+        return token_row
+    return None
+
+
 async def _claim_next_active_token_for_request(
     selection_settings: TokenSelectionSettings,
     *,
     exclude_token_ids: set[int],
     scoped_cooldown_scope: str | None = None,
     timing: _RequestTimingRecorder | None = None,
+    token_pool_snapshot: _TokenPoolSnapshot | None = None,
 ) -> Any:
+    if token_pool_snapshot is not None:
+        token_row = _claim_next_active_token_from_snapshot(
+            token_pool_snapshot,
+            selection_settings,
+            exclude_token_ids=exclude_token_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            timing=timing,
+        )
+        if token_row is not None:
+            return token_row
+        if timing is not None:
+            timing.add_ms("claim_token_db_fallback_count", 1)
+
     local_excluded_ids: set[int] = set()
     fill_first = selection_settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST
     active_stream_cap = normalize_token_active_stream_cap(selection_settings.active_stream_cap)
@@ -1364,6 +1555,35 @@ def _upstream_http_max_keepalive_connections() -> int:
         minimum=0,
     )
     return min(keepalive_connections, max_connections)
+
+
+def _import_http_max_connections() -> int:
+    return _int_env("IMPORT_HTTP_MAX_CONNECTIONS", 64, minimum=1)
+
+
+def _import_http_max_keepalive_connections() -> int:
+    return min(
+        _int_env("IMPORT_HTTP_MAX_KEEPALIVE_CONNECTIONS", 16, minimum=0),
+        _import_http_max_connections(),
+    )
+
+
+def _admin_http_max_connections() -> int:
+    return _int_env("ADMIN_HTTP_MAX_CONNECTIONS", 32, minimum=1)
+
+
+def _admin_http_max_keepalive_connections() -> int:
+    return min(
+        _int_env("ADMIN_HTTP_MAX_KEEPALIVE_CONNECTIONS", 8, minimum=0),
+        _admin_http_max_connections(),
+    )
+
+
+def _state_http_client(app: FastAPI, name: str) -> httpx.AsyncClient:
+    client = getattr(app.state, name, None)
+    if isinstance(client, httpx.AsyncClient):
+        return client
+    return app.state.http_client
 
 
 def _image_request_max_account_retries() -> int:
@@ -4602,7 +4822,7 @@ async def _probe_token_with_latest_access_token(
     token_row: Any,
     probe_model: str | None = None,
 ) -> dict[str, Any]:
-    client: httpx.AsyncClient = app.state.http_client
+    client: httpx.AsyncClient = _state_http_client(app, "response_http_client")
     oauth_manager: CodexOAuthManager = app.state.oauth_manager
     resolved_probe_model = _normalize_optional_text(probe_model) or _admin_token_probe_model()
     probe_request = ResponsesRequest(
@@ -4852,7 +5072,7 @@ def _gpt_image_stream_keepalive_response(
     async def worker() -> None:
         timing_context_token = _REQUEST_TIMING.set(timing) if timing is not None else None
         db_timing_context_token = set_db_timing_recorder(timing) if timing is not None else None
-        client: httpx.AsyncClient = http_request.app.state.http_client
+        client: httpx.AsyncClient = _state_http_client(http_request.app, "response_http_client")
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
 
@@ -4883,6 +5103,7 @@ def _gpt_image_stream_keepalive_response(
                         exclude_token_ids=excluded_token_ids,
                         scoped_cooldown_scope=scoped_cooldown_scope,
                         timing=timing,
+                        token_pool_snapshot=_current_token_pool_snapshot(http_request.app),
                     ),
                     timing=timing,
                     span_name="claim_token_ms",
@@ -5402,7 +5623,7 @@ async def _execute_proxy_request_with_failover(
         max_attempts = _effective_proxy_max_attempts(endpoint=endpoint)
         max_claims = _max_request_account_retries()
         claim_count = 0
-        client: httpx.AsyncClient = http_request.app.state.http_client
+        client: httpx.AsyncClient = _state_http_client(http_request.app, "response_http_client")
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
         last_error: HTTPException | None = None
@@ -5422,6 +5643,7 @@ async def _execute_proxy_request_with_failover(
                     exclude_token_ids=excluded_token_ids,
                     scoped_cooldown_scope=scoped_cooldown_scope,
                     timing=timing,
+                    token_pool_snapshot=_current_token_pool_snapshot(http_request.app),
                 ),
                 timing=timing,
                 span_name="claim_token_ms",
@@ -6098,7 +6320,7 @@ async def _build_admin_token_items(
             logger.exception("Failed to collect admin token observed cost fallbacks")
     if include_quota and token_rows:
         quota_service: CodexQuotaService = app.state.quota_service
-        client: httpx.AsyncClient = app.state.http_client
+        client: httpx.AsyncClient = _state_http_client(app, "admin_http_client")
         oauth_manager: CodexOAuthManager = app.state.oauth_manager
         effective_account_ids = {
             token_row.id: plan_info_by_id[token_row.id].chatgpt_account_id or token_row.account_id
@@ -6165,7 +6387,7 @@ async def _build_admin_token_quota_items(
     ]
     if quota_token_rows:
         quota_service: CodexQuotaService = app.state.quota_service
-        client: httpx.AsyncClient = app.state.http_client
+        client: httpx.AsyncClient = _state_http_client(app, "admin_http_client")
         oauth_manager: CodexOAuthManager = app.state.oauth_manager
         effective_account_ids = {
             token_row.id: plan_info_by_id[token_row.id].chatgpt_account_id or token_row.account_id
@@ -6210,7 +6432,7 @@ async def lifespan(app: FastAPI):
             list(repair_summary.canonical_ids),
             list(repair_summary.shadow_ids),
         )
-    app.state.http_client = httpx.AsyncClient(
+    app.state.response_http_client = httpx.AsyncClient(
         follow_redirects=True,
         transport=_TimingAsyncHTTPTransport(
             http2=False,
@@ -6218,6 +6440,21 @@ async def lifespan(app: FastAPI):
                 max_connections=_upstream_http_max_connections(),
                 max_keepalive_connections=_upstream_http_max_keepalive_connections(),
             ),
+        ),
+    )
+    app.state.http_client = app.state.response_http_client
+    app.state.import_http_client = httpx.AsyncClient(
+        follow_redirects=True,
+        limits=httpx.Limits(
+            max_connections=_import_http_max_connections(),
+            max_keepalive_connections=_import_http_max_keepalive_connections(),
+        ),
+    )
+    app.state.admin_http_client = httpx.AsyncClient(
+        follow_redirects=True,
+        limits=httpx.Limits(
+            max_connections=_admin_http_max_connections(),
+            max_keepalive_connections=_admin_http_max_keepalive_connections(),
         ),
     )
     app.state.oauth_manager = CodexOAuthManager()
@@ -6230,9 +6467,22 @@ async def lifespan(app: FastAPI):
         await prewarm_fill_first_token_cache(app.state.token_selection_settings)
     except Exception:
         logger.exception("Failed to prewarm fill_first token cache")
+    try:
+        await _refresh_token_pool_snapshot(app)
+    except Exception:
+        logger.exception("Failed to load token pool snapshot")
+
+    async def publish_token_selection_settings(selection: TokenSelectionSettings) -> None:
+        _set_current_token_selection_settings(app, selection)
+        try:
+            await _refresh_token_pool_snapshot(app)
+        except Exception:
+            logger.exception("Failed to refresh token pool snapshot after import publish")
+
     app.state.token_import_worker = TokenImportBackgroundWorker(
         response_traffic=app.state.response_traffic,
-        on_token_selection_settings_updated=lambda selection: _set_current_token_selection_settings(app, selection),
+        http_client=app.state.import_http_client,
+        on_token_selection_settings_updated=publish_token_selection_settings,
     )
     await app.state.token_import_worker.start()
     try:
@@ -6241,7 +6491,9 @@ async def lifespan(app: FastAPI):
         await app.state.token_import_worker.stop()
         await _flush_request_log_write_queue()
         await stop_token_status_write_queue()
-        await app.state.http_client.aclose()
+        await app.state.import_http_client.aclose()
+        await app.state.admin_http_client.aclose()
+        await app.state.response_http_client.aclose()
         await close_database()
 
 

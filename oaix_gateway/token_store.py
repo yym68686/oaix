@@ -283,6 +283,19 @@ def _token_is_runtime_available(
     return True
 
 
+def token_is_runtime_available(
+    token: CodexToken,
+    *,
+    now: datetime,
+    scoped_cooldown_scope: str | None = None,
+) -> bool:
+    return _token_is_runtime_available(
+        token,
+        now=now,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+    )
+
+
 def _runtime_unavailable_token_ids(*, now: datetime, scoped_cooldown_scope: str | None) -> tuple[int, ...]:
     unavailable: set[int] = set()
     for token_id, runtime_state in list(_TOKEN_RUNTIME_STATE.items()):
@@ -2349,6 +2362,27 @@ async def get_token_row(token_id: int) -> CodexToken | None:
                 return token
             current_id = token.merged_into_token_id
     return None
+
+
+async def list_token_pool_rows() -> list[CodexToken]:
+    async with get_read_session() as session:
+        result = await session.execute(
+            select(CodexToken)
+            .where(*_canonical_token_filters())
+            .order_by(CodexToken.id.asc())
+        )
+        return list(result.scalars().all())
+
+
+async def list_token_pool_scoped_cooldowns() -> list[CodexTokenScopedCooldown]:
+    async with get_read_session() as session:
+        result = await session.execute(
+            select(CodexTokenScopedCooldown).order_by(
+                CodexTokenScopedCooldown.token_id.asc(),
+                CodexTokenScopedCooldown.scope.asc(),
+            )
+        )
+        return list(result.scalars().all())
 
 
 async def list_tokens(limit: int = 100, offset: int = 0) -> list[TokenStatus]:
