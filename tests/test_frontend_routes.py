@@ -179,8 +179,11 @@ def test_frontend_supports_import_batch_view() -> None:
     assert 'data-token-view-mode="import_batches"' in index_html
     assert "state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : []" in app_js
     assert "function renderImportBatchList" in app_js
+    assert "function renderImportBatchFailureSection" in app_js
     assert 'params.set("import_batch_id", String(state.selectedImportBatchId))' in app_js
+    assert "data.selected_import_batch?.failed_items" in app_js
     assert "导入批次 #" in app_js
+    assert "失败 Key" in app_js
     assert "data-import-batch-view" in app_js
 
 
@@ -468,6 +471,122 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         "sort": "account",
         "import_batch_id": None,
     }
+
+
+def test_admin_tokens_route_includes_selected_import_batch_failed_items(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+
+    async def fake_get_token_counts():
+        return TokenCounts(total=3, active=2, available=1, cooling=1, disabled=1)
+
+    async def fake_get_token_status_counts(**kwargs):
+        assert kwargs == {"search": "", "plan_type": "all", "token_ids": (7,)}
+        return TokenCounts(total=3, active=2, available=1, cooling=1, disabled=1)
+
+    async def fake_get_token_plan_counts(**kwargs):
+        assert kwargs == {"search": "", "status": "available", "token_ids": (7,)}
+        return TokenPlanCounts(free=1, plus=1, team=1, pro=0, unknown=0)
+
+    async def fake_count_token_rows(**kwargs):
+        assert kwargs == {"search": "", "status": "available", "plan_type": "all", "token_ids": (7,)}
+        return 1
+
+    async def fake_list_token_rows(*, limit, offset, search, status, plan_type, sort, token_ids):
+        assert limit == 10
+        assert offset == 0
+        assert search == ""
+        assert status == "available"
+        assert plan_type == "all"
+        assert sort == "-created_at"
+        assert token_ids == (7,)
+        return [SimpleNamespace(id=7)]
+
+    async def fake_build_admin_token_items(app, *, token_rows, include_quota):
+        del app
+        assert include_quota is False
+        assert [item.id for item in token_rows] == [7]
+        return [{"id": 7, "email": "a@example.com"}]
+
+    async def fake_list_token_import_batch_summaries(*, limit):
+        assert limit == 30
+        submitted_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+        return [
+            TokenImportBatchSummary(
+                id=42,
+                status="completed",
+                import_queue_position="front",
+                total_count=3,
+                processed_count=3,
+                created_count=1,
+                updated_count=0,
+                skipped_count=0,
+                failed_count=2,
+                token_count=1,
+                available=1,
+                cooling=0,
+                disabled=0,
+                missing=0,
+                token_ids=(7,),
+                submitted_at=submitted_at,
+                started_at=submitted_at,
+                finished_at=submitted_at,
+            )
+        ]
+
+    async def fake_list_token_import_batch_failed_items(job_id):
+        assert job_id == 42
+        return [
+            {
+                "index": 1,
+                "status": "failed",
+                "error": "Token payload missing refresh_token",
+                "account_id": "acct-1",
+                "refresh_token_hash": "abcd1234abcd1234",
+            },
+            {
+                "index": 2,
+                "status": "failed",
+                "error": "Quota request failed",
+            },
+        ]
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_status_counts", fake_get_token_status_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_plan_counts", fake_get_token_plan_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.count_token_rows", fake_count_token_rows)
+    monkeypatch.setattr("oaix_gateway.api_server.list_token_rows", fake_list_token_rows)
+    monkeypatch.setattr("oaix_gateway.api_server._build_admin_token_items", fake_build_admin_token_items)
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.list_token_import_batch_summaries",
+        fake_list_token_import_batch_summaries,
+    )
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.list_token_import_batch_failed_items",
+        fake_list_token_import_batch_failed_items,
+    )
+
+    response = asyncio.run(_request(app, "GET", "/admin/tokens?limit=10&offset=0&status=available&import_batch_id=42"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_import_batch"]["id"] == 42
+    assert body["selected_import_batch"]["failed_items"] == [
+        {
+            "index": 1,
+            "status": "failed",
+            "error": "Token payload missing refresh_token",
+            "account_id": "acct-1",
+            "refresh_token_hash": "abcd1234abcd1234",
+        },
+        {
+            "index": 2,
+            "status": "failed",
+            "error": "Quota request failed",
+        },
+    ]
+    assert body["query"]["import_batch_id"] == 42
 
 
 def test_admin_token_quota_route_forwards_requested_ids(monkeypatch) -> None:

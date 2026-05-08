@@ -1946,6 +1946,41 @@ button {
   font-weight: 800;
 }
 
+.import-batch-failures {
+  display: grid;
+  gap: 12px;
+}
+
+.import-batch-failures__header {
+  display: grid;
+  gap: 4px;
+}
+
+.import-batch-failures__header h3,
+.import-batch-failures__header p {
+  margin: 0;
+}
+
+.import-batch-failures__header h3 {
+  font-size: 0.96rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.import-batch-failures__header p {
+  color: var(--ink-soft);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.token-result-list--import-failures {
+  border-color: var(--border-feedback-error);
+}
+
+.token-result--import-failed {
+  background: color-mix(in oklab, var(--disabled) 6%, var(--surface-card));
+}
+
 .token-card__actions {
   display: flex;
   flex-wrap: wrap;

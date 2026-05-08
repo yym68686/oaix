@@ -100,6 +100,7 @@ const state = {
   },
   tokenItems: [],
   tokenImportBatches: [],
+  selectedImportBatchFailedItems: [],
   tokenFilteredCounts: {
     total: 0,
     active: 0,
@@ -1279,10 +1280,15 @@ function buildTokenListNote() {
   const pagination = state.tokenPagination;
   const viewPrefix =
     state.selectedImportBatchId != null ? `导入批次 #${state.selectedImportBatchId}` : "Key Explorer";
+  const failedCount = state.selectedImportBatchId != null ? getImportBatchFailureItems().length : 0;
+  const failureSuffix = failedCount > 0 ? ` · 失败 ${formatInteger(failedCount)} 条` : "";
   if (pagination.total > 0 && pagination.returned > 0) {
-    return `${viewPrefix} · 每页 ${formatInteger(pagination.limit)} 条 · 当前 ${formatInteger(pagination.firstItem)}-${formatInteger(
+    return `${viewPrefix}${failureSuffix} · 每页 ${formatInteger(pagination.limit)} 条 · 当前 ${formatInteger(pagination.firstItem)}-${formatInteger(
       pagination.lastItem,
     )} / ${formatInteger(pagination.total)} · 搜索、筛选、排序均为全局结果`;
+  }
+  if (state.selectedImportBatchId != null && failedCount > 0) {
+    return `${viewPrefix}${failureSuffix} · 没有已入池 key`;
   }
   return TOKEN_LIST_BASE_NOTE;
 }
@@ -2303,6 +2309,100 @@ function renderImportBatchList() {
   `;
 }
 
+function getImportBatchFailureItems() {
+  return Array.isArray(state.selectedImportBatchFailedItems)
+    ? state.selectedImportBatchFailedItems.filter((item) => item && typeof item === "object")
+    : [];
+}
+
+function formatImportBatchFailureLabel(item) {
+  const index = Number(item?.index);
+  return Number.isInteger(index) && index >= 0 ? `导入项 #${formatInteger(index + 1)}` : "导入失败项";
+}
+
+function formatRefreshTokenHashPreview(value) {
+  const text = normalizeWhitespace(value);
+  if (!text) {
+    return "";
+  }
+  return `RT ${text.slice(0, 12)}`;
+}
+
+function buildImportBatchFailureMeta(item) {
+  return Array.from(
+    new Set([
+      normalizeWhitespace(item?.email || ""),
+      normalizeWhitespace(item?.account_id || item?.chatgpt_account_id || ""),
+      normalizeWhitespace(item?.source_file || ""),
+      formatRefreshTokenHashPreview(item?.refresh_token_hash),
+    ].filter(Boolean)),
+  );
+}
+
+function renderImportBatchFailureRow(item) {
+  const label = formatImportBatchFailureLabel(item);
+  const metaParts = buildImportBatchFailureMeta(item);
+  const hashPreview = formatRefreshTokenHashPreview(item?.refresh_token_hash);
+  const rawError = normalizeWhitespace(item?.error || item?.error_message || "");
+  const errorSummary = summarizeTokenError(rawError) || truncateText(rawError, 180) || "导入失败";
+  const metaText = metaParts.length ? metaParts.join(" · ") : "未提供可显示的账号信息";
+  const detailMeta = [label, ...metaParts].filter(Boolean).join(" · ");
+
+  return `
+    <details class="token-result token-result--failed token-result--import-failed" role="listitem">
+      <summary class="token-result__summary">
+        <span class="token-result__identity">
+          <span class="token-result__account">${escapeHtml(label)}</span>
+          <span class="token-result__meta">${escapeHtml(metaText)}</span>
+        </span>
+        <span class="token-result__status" data-label="状态">
+          <span class="status-pill status-pill--failed">导入失败</span>
+          <span class="status-pill status-pill--neutral">未入池</span>
+        </span>
+        <span class="token-result__quota-preview" data-label="配额">
+          <span>无配额</span>
+          <span>无正式 Key</span>
+        </span>
+        <span class="token-result__lifecycle" data-label="失败原因">
+          <span title="${escapeHtml(rawError)}">${escapeHtml(errorSummary)}</span>
+        </span>
+        <span class="token-result__usage" data-label="识别">
+          <span>${escapeHtml(hashPreview || "—")}</span>
+        </span>
+        <span class="token-result__expand" aria-hidden="true">详情</span>
+      </summary>
+      <div class="token-result__details">
+        <div class="token-result__detail-grid token-result__detail-grid--import-failed">
+          <div class="token-card__error" title="${escapeHtml(rawError)}">
+            <span class="token-card__error-label">失败原因</span>
+            <p class="token-card__error-message">${escapeHtml(errorSummary)}</p>
+            <p class="token-card__error-meta">${escapeHtml(detailMeta || label)}</p>
+          </div>
+          <div class="token-result__quiet-note">该条目未通过验证或发布，未进入正式 key 池。</div>
+        </div>
+      </div>
+    </details>
+  `;
+}
+
+function renderImportBatchFailureSection() {
+  const failedItems = getImportBatchFailureItems();
+  if (state.selectedImportBatchId == null || !failedItems.length) {
+    return "";
+  }
+  return `
+    <section class="import-batch-failures" aria-label="导入失败 Key">
+      <div class="import-batch-failures__header">
+        <h3>失败 Key</h3>
+        <p>本批次 ${escapeHtml(formatInteger(failedItems.length))} 条未进入正式池</p>
+      </div>
+      <div class="token-result-list token-result-list--import-failures" role="list" aria-label="导入失败 Key">
+        ${failedItems.map((item) => renderImportBatchFailureRow(item)).join("")}
+      </div>
+    </section>
+  `;
+}
+
 function compareImportBatches(left, right) {
   const leftTime = new Date(left?.submitted_at || 0).getTime();
   const rightTime = new Date(right?.submitted_at || 0).getTime();
@@ -2315,14 +2415,29 @@ function compareImportBatches(left, right) {
 function renderTokenList(items) {
   const list = Array.isArray(items) ? items : [];
   const totalCount = Number(state.tokenPagination.total || list.length || 0);
-  renderTokenSearchSummary(Number(state.tokenFilteredCounts?.total || totalCount), totalCount);
+  const importFailureCount = state.selectedImportBatchId != null ? getImportBatchFailureItems().length : 0;
+  const emptyBatchFailureSummary =
+    state.selectedImportBatchId != null && totalCount === 0 && importFailureCount > 0
+      ? `失败 ${formatInteger(importFailureCount)} 条`
+      : "";
+  renderTokenSearchSummary(Number(state.tokenFilteredCounts?.total || totalCount), totalCount, emptyBatchFailureSummary);
 
   if (state.tokenViewMode === "import_batches") {
     renderImportBatchList();
     return;
   }
 
+  const importFailureSection = renderImportBatchFailureSection();
   if (list.length === 0) {
+    if (importFailureSection) {
+      elements.tokenList.innerHTML = `
+        ${importFailureSection}
+        <article class="empty-state">
+          <p>本批次没有已进入正式池的 key。</p>
+        </article>
+      `;
+      return;
+    }
     const queryParts = [
       normalizeWhitespace(state.tokenSearchTerm) ? `搜索“${normalizeWhitespace(state.tokenSearchTerm)}”` : "",
       state.tokenStatusFilter !== DEFAULT_TOKEN_STATUS_FILTER ? describeTokenStatusFilter(state.tokenStatusFilter) : "",
@@ -2338,6 +2453,7 @@ function renderTokenList(items) {
 
   const workspaceTokenCounts = buildWorkspaceTokenCounts(list);
   elements.tokenList.innerHTML = `
+    ${importFailureSection}
     <div class="token-result-list" role="list" aria-label="Key 查询结果">
       ${list.map((item) => renderTokenResultRow(item, workspaceTokenCounts)).join("")}
     </div>
@@ -2771,6 +2887,10 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     state.tokensLoaded = true;
     state.tokenItems = Array.isArray(data.items) ? data.items.map(markTokenQuotaPending) : [];
     state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : [];
+    state.selectedImportBatchFailedItems =
+      state.selectedImportBatchId != null && Array.isArray(data.selected_import_batch?.failed_items)
+        ? data.selected_import_batch.failed_items
+        : [];
     state.tokenFilteredCounts = data.filtered_counts || data.counts || state.tokenFilteredCounts;
     state.tokenPlanCounts = data.plan_counts || state.tokenPlanCounts;
     const pagination = normalizeTokenPagination(data.pagination || {}, state.tokenItems.length, requestedPage);
@@ -2805,6 +2925,7 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     state.tokensLoaded = true;
     state.tokenItems = [];
     state.tokenImportBatches = [];
+    state.selectedImportBatchFailedItems = [];
     state.tokenFilteredCounts = { total: 0, active: 0, available: 0, cooling: 0, disabled: 0 };
     state.tokenPlanCounts = { free: 0, plus: 0, team: 0, pro: 0, unknown: 0 };
     state.tokenPagination = normalizeTokenPagination({}, 0, 1);
@@ -2914,6 +3035,7 @@ async function setTokenViewMode(mode) {
   if (nextMode === state.tokenViewMode) {
     if (nextMode === "keys" && state.selectedImportBatchId != null) {
       state.selectedImportBatchId = null;
+      state.selectedImportBatchFailedItems = [];
       await loadTokens({ page: 1 });
       return;
     }
@@ -2922,6 +3044,7 @@ async function setTokenViewMode(mode) {
   }
   state.tokenViewMode = nextMode;
   state.selectedImportBatchId = null;
+  state.selectedImportBatchFailedItems = [];
   state.tokenPage = 1;
   renderTokenViewMode(nextMode);
   if (nextMode === "import_batches") {
@@ -2938,6 +3061,7 @@ async function viewImportBatch(batchId) {
     return;
   }
   state.selectedImportBatchId = resolvedBatchId;
+  state.selectedImportBatchFailedItems = [];
   state.tokenViewMode = "keys";
   state.tokenStatusFilter = DEFAULT_TOKEN_STATUS_FILTER;
   state.tokenPlanFilter = AVAILABLE_PLAN_FILTER_ALL;

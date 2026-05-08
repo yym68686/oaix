@@ -174,6 +174,13 @@ class TokenImportBatchSummary:
     finished_at: datetime | None
 
 
+def _safe_optional_text(value: Any, *, max_length: int = 512) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text[:max(1, int(max_length))]
+
+
 @dataclass(frozen=True)
 class _TokenImportItemResult:
     index: int
@@ -743,6 +750,89 @@ def _build_token_import_batch_summary(
         started_at=state.started_at,
         finished_at=state.finished_at,
     )
+
+
+def _safe_import_payload_metadata(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    metadata: dict[str, Any] = {}
+    for key in ("email", "account_id", "chatgpt_account_id", "source_file", "type"):
+        value = _safe_optional_text(payload.get(key))
+        if value is not None:
+            metadata[key] = value
+    return metadata
+
+
+def _serialize_import_batch_failed_item(
+    item: _TokenImportStagedItem,
+    *,
+    refresh_token_hash: str | None = None,
+) -> dict[str, Any]:
+    payload = item.payload if isinstance(item.payload, dict) else item.validated_payload
+    metadata = _safe_import_payload_metadata(payload if isinstance(payload, dict) else None)
+    result: dict[str, Any] = {
+        "index": int(item.index),
+        "status": IMPORT_ITEM_STATUS_FAILED,
+        "error": _safe_optional_text(item.error_message, max_length=4000) or "Token import item failed",
+    }
+    hash_value = _safe_optional_text(refresh_token_hash, max_length=64)
+    if hash_value is not None:
+        result["refresh_token_hash"] = hash_value
+    result.update(metadata)
+    return result
+
+
+def _serialize_legacy_import_batch_failed_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    try:
+        index = int(item.get("index"))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "index": index,
+        "status": IMPORT_ITEM_STATUS_FAILED,
+        "error": _safe_optional_text(item.get("error") or item.get("message"), max_length=4000)
+        or "Token import item failed",
+    }
+
+
+async def list_token_import_batch_failed_items(job_id: int) -> list[dict[str, Any]]:
+    async with get_import_read_session() as session:
+        job_result = await session.execute(
+            select(TokenImportJob.failed_items).where(TokenImportJob.id == int(job_id)).limit(1)
+        )
+        legacy_items = [
+            item
+            for item in (
+                _serialize_legacy_import_batch_failed_item(raw_item)
+                for raw_item in _as_item_list(job_result.scalar_one_or_none())
+            )
+            if item is not None
+        ]
+
+        item_result = await session.execute(
+            select(TokenImportItem)
+            .where(
+                TokenImportItem.job_id == int(job_id),
+                TokenImportItem.status == IMPORT_ITEM_STATUS_FAILED,
+            )
+            .order_by(TokenImportItem.item_index.asc(), TokenImportItem.id.asc())
+        )
+        staged_items = [
+            _serialize_import_batch_failed_item(
+                _serialize_staged_item(item),
+                refresh_token_hash=item.refresh_token_hash,
+            )
+            for item in item_result.scalars().all()
+        ]
+
+    by_index: dict[int, dict[str, Any]] = {}
+    for item in legacy_items:
+        by_index[int(item["index"])] = item
+    for item in staged_items:
+        by_index[int(item["index"])] = {**by_index.get(int(item["index"]), {}), **item}
+    return [by_index[index] for index in sorted(by_index)]
 
 
 async def list_token_import_batch_summaries(limit: int = 30) -> list[TokenImportBatchSummary]:

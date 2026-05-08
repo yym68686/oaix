@@ -61,6 +61,7 @@ from .token_import_jobs import (
     create_token_import_job,
     get_token_import_job,
     job_state_from_lease,
+    list_token_import_batch_failed_items,
     list_token_import_batch_summaries,
 )
 from .token_store import (
@@ -7447,6 +7448,11 @@ def create_app() -> FastAPI:
                 None,
             )
             batch_token_ids = selected_import_batch.token_ids if selected_import_batch is not None else ()
+        selected_import_batch_failed_items = (
+            await list_token_import_batch_failed_items(import_batch_id)
+            if selected_import_batch is not None and import_batch_id is not None
+            else []
+        )
 
         counts, filtered_counts, plan_counts, filtered_total, token_rows = await asyncio.gather(
             _cached_admin_token_counts(http_request.app),
@@ -7470,17 +7476,21 @@ def create_app() -> FastAPI:
         )
         total = max(0, int(filtered_total))
         total_pages = max(1, int(math.ceil(total / limit))) if limit else 1
+        selected_import_batch_payload = (
+            _serialize_token_import_batch_summary(selected_import_batch)
+            if selected_import_batch is not None
+            else None
+        )
+        if selected_import_batch_payload is not None:
+            selected_import_batch_payload["failed_items"] = selected_import_batch_failed_items
+
         return {
             "counts": asdict(counts),
             "filtered_counts": asdict(filtered_counts),
             "plan_counts": asdict(plan_counts),
             "selection": _serialize_token_selection_settings(_current_token_selection_settings(http_request.app)),
             "import_batches": [_serialize_token_import_batch_summary(batch) for batch in import_batches],
-            "selected_import_batch": (
-                _serialize_token_import_batch_summary(selected_import_batch)
-                if selected_import_batch is not None
-                else None
-            ),
+            "selected_import_batch": selected_import_batch_payload,
             "query": {
                 "q": q,
                 "status": status,
