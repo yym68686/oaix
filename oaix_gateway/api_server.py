@@ -2340,7 +2340,6 @@ def _responses_endpoint_path(*, compact: bool = False) -> str:
 
 def _build_upstream_headers(http_request: Request, access_token: str, account_id: str | None, stream: bool) -> dict[str, str]:
     session_id = (http_request.headers.get("Session_id") or "").strip() or str(uuid.uuid4())
-    conversation_id = (http_request.headers.get("Conversation_id") or "").strip() or session_id
 
     headers = {
         "Content-Type": "application/json",
@@ -2349,9 +2348,7 @@ def _build_upstream_headers(http_request: Request, access_token: str, account_id
         "Originator": (http_request.headers.get("Originator") or "codex_cli_rs").strip(),
         "Version": CODEX_CLI_VERSION,
         "Session_id": session_id,
-        "Conversation_id": conversation_id,
-        "User-Agent": (http_request.headers.get("User-Agent") or CODEX_USER_AGENT).strip(),
-        "Connection": "Keep-Alive",
+        "User-Agent": CODEX_USER_AGENT,
         "Accept": "text/event-stream" if stream else "application/json",
     }
     if account_id:

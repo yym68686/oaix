@@ -368,9 +368,11 @@ def test_build_upstream_headers_uses_current_codex_user_agent_default() -> None:
     assert headers["Accept"] == "application/json"
     assert headers["Version"] == "0.125.0"
     assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
+    assert "Conversation_id" not in headers
+    assert "Connection" not in headers
 
 
-def test_build_upstream_headers_overrides_stale_client_codex_version() -> None:
+def test_build_upstream_headers_overrides_stale_client_codex_identity() -> None:
     request = Request(
         {
             "type": "http",
@@ -383,7 +385,7 @@ def test_build_upstream_headers_overrides_stale_client_codex_version() -> None:
     headers = _build_upstream_headers(request, access_token="access-token", account_id=None, stream=True)
 
     assert headers["Version"] == "0.125.0"
-    assert headers["User-Agent"] == "yaak"
+    assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
 
 
 def test_translate_responses_image_compat_payload_injects_image_tool() -> None:
