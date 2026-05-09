@@ -2212,19 +2212,6 @@ def _compact_server_error_cooldown_seconds() -> int:
     return _int_env("COMPACT_SERVER_ERROR_COOLDOWN_SECONDS", 60, minimum=0)
 
 
-def _compact_upstream_headers_timeout_seconds() -> float:
-    return _float_env("COMPACT_UPSTREAM_HEADERS_TIMEOUT_SECONDS", 45.0, minimum=1.0)
-
-
-def _compact_timeout_fallback_enabled() -> bool:
-    return str(os.getenv("COMPACT_TIMEOUT_FALLBACK_ENABLED", "1") or "").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-
-
 def _image_non_stream_total_timeout_seconds() -> float:
     return _float_env("IMAGE_NON_STREAM_TOTAL_TIMEOUT_SECONDS", 600.0, minimum=1.0)
 
@@ -8092,90 +8079,31 @@ async def _proxy_request_with_token(
         finally:
             await stream_cm.__aexit__(None, None, None)
 
-    compact_headers_timeout = _compact_upstream_headers_timeout_seconds()
-    stream_cm = client.stream(
-        "POST",
+    upstream_response = await client.post(
         upstream_url,
         headers=headers,
         content=json_payload,
-        timeout=_upstream_http_timeout(read=compact_headers_timeout),
+        timeout=_upstream_http_timeout(read=None),
     )
-    try:
-        upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
-    except httpx.ReadTimeout as exc:
-        with suppress(Exception):
-            await stream_cm.__aexit__(type(exc), exc, exc.__traceback__)
-        timing = _current_request_timing()
-        if timing is not None:
-            timing.add_ms("upstream_compact_timeout_ms", compact_headers_timeout * 1000)
-        if not _compact_timeout_fallback_enabled():
-            raise HTTPException(
-                status_code=504,
-                detail=f"Upstream compact request timed out waiting for response headers after {compact_headers_timeout:g}s",
-            ) from exc
-        if timing is not None:
-            timing.add_ms("upstream_compact_fallback_count", 1)
-        fallback_payload = dict(payload)
-        fallback_payload["store"] = False
-        fallback_payload["stream"] = True
-        fallback_headers = _build_upstream_headers(
-            http_request,
-            access_token=access_token,
-            account_id=account_id,
-            stream=True,
-        )
-        fallback_stream_cm = client.stream(
-            "POST",
-            _codex_responses_url(compact=False),
-            headers=fallback_headers,
-            content=json.dumps(fallback_payload, ensure_ascii=False),
-            timeout=_upstream_http_timeout(read=None),
-        )
-        fallback_response = await _enter_upstream_stream_with_timing(fallback_stream_cm, compact=False)
-        try:
-            if fallback_response.status_code < 200 or fallback_response.status_code >= 300:
-                raw = await fallback_response.aread()
-                raise _upstream_error_http_exception(fallback_response.status_code, _decode_error_body(raw))
 
-            data, first_token_at = await _collect_responses_json_from_sse(
-                fallback_response.aiter_raw(),
-                model=effective_requested_model,
-            )
-            if response_model_alias is not None:
-                data = _apply_response_model_alias(data, response_model_alias)
-                effective_model_name = response_model_alias
-            else:
-                effective_model_name = _extract_response_model_name(data) or request_data.model
-            return ProxyRequestResult(
-                response=JSONResponse(status_code=fallback_response.status_code, content=data),
-                status_code=fallback_response.status_code,
-                model_name=effective_model_name,
-                first_token_at=first_token_at,
-                usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
-            )
-        finally:
-            await fallback_stream_cm.__aexit__(None, None, None)
-    try:
-        if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
-            raw = await upstream_response.aread()
-            raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
+    if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+        raw = await upstream_response.aread()
+        raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
-        raw, first_token_at = await _read_response_body_with_first_chunk_time(upstream_response.aiter_raw())
-        data = _decode_responses_json_body(raw)
-        if response_model_alias is not None:
-            data = _apply_response_model_alias(data, response_model_alias)
-            effective_model_name = response_model_alias
-        else:
-            effective_model_name = _extract_response_model_name(data) or request_data.model
-        return ProxyRequestResult(
-            response=JSONResponse(status_code=upstream_response.status_code, content=data),
-            status_code=upstream_response.status_code,
-            model_name=effective_model_name,
-            first_token_at=first_token_at,
-            usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
-        )
-    finally:
-        await stream_cm.__aexit__(None, None, None)
+    raw = await upstream_response.aread()
+    data = _decode_responses_json_body(raw)
+    if response_model_alias is not None:
+        data = _apply_response_model_alias(data, response_model_alias)
+        effective_model_name = response_model_alias
+    else:
+        effective_model_name = _extract_response_model_name(data) or request_data.model
+    return ProxyRequestResult(
+        response=JSONResponse(status_code=upstream_response.status_code, content=data),
+        status_code=upstream_response.status_code,
+        model_name=effective_model_name,
+        first_token_at=None,
+        usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
+    )
 
 
 async def _proxy_chat_completions_with_token(

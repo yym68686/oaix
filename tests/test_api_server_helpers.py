@@ -2099,71 +2099,43 @@ def test_proxy_request_with_token_auto_translates_gpt_image_responses_request() 
     assert body["output"][0]["result"] == "img-b64"
 
 
-def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_upstream_stream() -> None:
-    class DummyStreamingResponse:
-        def __init__(self, chunks: list[bytes]) -> None:
-            self.status_code = 200
-            self._chunks = chunks
-
-        def aiter_raw(self) -> AsyncIterator[bytes]:
-            async def iterator() -> AsyncIterator[bytes]:
-                for chunk in self._chunks:
-                    yield chunk
-
-            return iterator()
-
-        async def aread(self) -> bytes:
-            return b"".join(self._chunks)
-
-    class DummyStreamContext:
-        def __init__(self, response: DummyStreamingResponse) -> None:
-            self._response = response
-
-        async def __aenter__(self) -> DummyStreamingResponse:
-            return self._response
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
+def test_proxy_request_with_token_for_compact_non_stream_request_posts_without_forcing_upstream_stream() -> None:
     class DummyClient:
         def __init__(self) -> None:
             self.stream_calls: list[dict[str, object]] = []
+            self.post_calls: list[dict[str, object]] = []
 
         def stream(self, method, url, headers, content, timeout):
-            self.stream_calls.append(
+            raise AssertionError("compact non-stream requests should not call client.stream")
+
+        async def post(self, url, headers, content, timeout):
+            self.post_calls.append(
                 {
-                    "method": method,
                     "url": url,
                     "headers": headers,
                     "content": content,
                     "timeout": timeout,
                 }
             )
-            response = DummyStreamingResponse(
-                [
-                    json.dumps(
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "id": "resp_compact_123",
+                    "model": "gpt-5.4-compact",
+                    "status": "completed",
+                    "output": [
                         {
-                            "id": "resp_compact_123",
-                            "model": "gpt-5.4-compact",
-                            "status": "completed",
-                            "output": [
+                            "content": [
                                 {
-                                    "content": [
-                                        {
-                                            "type": "output_text",
-                                            "text": "hello compact",
-                                        }
-                                    ]
+                                    "type": "output_text",
+                                    "text": "hello compact",
                                 }
-                            ],
+                            ]
                         }
-                    ).encode("utf-8")
-                ]
+                    ],
+                },
             )
-            return DummyStreamContext(response)
-
-        async def post(self, *args, **kwargs):
-            raise AssertionError("compact non-stream requests should not call client.post")
 
     request = Request(
         {
@@ -2192,14 +2164,16 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
         )
     )
 
-    assert len(client.stream_calls) == 1
-    stream_call = client.stream_calls[0]
-    assert stream_call["headers"]["Accept"] == "application/json"
-    upstream_payload = json.loads(stream_call["content"])
+    assert client.stream_calls == []
+    assert len(client.post_calls) == 1
+    post_call = client.post_calls[0]
+    assert post_call["url"] == "https://chatgpt.com/backend-api/codex/responses/compact"
+    assert post_call["headers"]["Accept"] == "application/json"
+    upstream_payload = json.loads(post_call["content"])
     assert "stream" not in upstream_payload
     assert "store" not in upstream_payload
-    assert stream_call["timeout"].read == 45.0
-    assert result.first_token_at is not None
+    assert post_call["timeout"].read is None
+    assert result.first_token_at is None
     assert result.status_code == 200
     assert result.model_name == "gpt-5.4-compact"
     assert result.usage_metrics is None
@@ -2210,61 +2184,25 @@ def test_proxy_request_with_token_for_compact_non_stream_request_does_not_force_
     assert body["output"][0]["content"][0]["text"] == "hello compact"
 
 
-def test_proxy_request_with_token_compact_timeout_fallback_sets_store_false() -> None:
-    class DummyStreamingResponse:
-        def __init__(self, chunks: list[bytes]) -> None:
-            self.status_code = 200
-            self._chunks = chunks
-
-        def aiter_raw(self) -> AsyncIterator[bytes]:
-            async def iterator() -> AsyncIterator[bytes]:
-                for chunk in self._chunks:
-                    yield chunk
-
-            return iterator()
-
-        async def aread(self) -> bytes:
-            return b"".join(self._chunks)
-
-    class DummyStreamContext:
-        def __init__(self, response: DummyStreamingResponse | None = None, *, raise_timeout: bool = False) -> None:
-            self._response = response
-            self._raise_timeout = raise_timeout
-
-        async def __aenter__(self) -> DummyStreamingResponse:
-            if self._raise_timeout:
-                raise httpx.ReadTimeout("compact timed out")
-            assert self._response is not None
-            return self._response
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
+def test_proxy_request_with_token_compact_non_stream_timeout_does_not_fallback() -> None:
     class DummyClient:
         def __init__(self) -> None:
             self.stream_calls: list[dict[str, object]] = []
+            self.post_calls: list[dict[str, object]] = []
 
         def stream(self, method, url, headers, content, timeout):
-            self.stream_calls.append(
+            raise AssertionError("compact non-stream requests should not call client.stream")
+
+        async def post(self, url, headers, content, timeout):
+            self.post_calls.append(
                 {
-                    "method": method,
                     "url": url,
                     "headers": headers,
                     "content": content,
                     "timeout": timeout,
                 }
             )
-            if len(self.stream_calls) == 1:
-                return DummyStreamContext(raise_timeout=True)
-            return DummyStreamContext(
-                DummyStreamingResponse(
-                    [
-                        b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_fallback","status":"in_progress","model":"gpt-5.4"}}\n\n',
-                        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_fallback","status":"completed","model":"gpt-5.4","output":[{"content":[{"type":"output_text","text":"fallback ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n',
-                        b"data: [DONE]\n\n",
-                    ]
-                )
-            )
+            raise httpx.ReadTimeout("compact timed out", request=httpx.Request("POST", url))
 
     request = Request(
         {
@@ -2282,28 +2220,23 @@ def test_proxy_request_with_token_compact_timeout_fallback_sets_store_false() ->
     )
 
     client = DummyClient()
-    result = asyncio.run(
-        _proxy_request_with_token(
-            client,
-            request,
-            request_data,
-            access_token="access-token",
-            account_id="account-1",
-            compact=True,
+    with pytest.raises(httpx.ReadTimeout):
+        asyncio.run(
+            _proxy_request_with_token(
+                client,
+                request,
+                request_data,
+                access_token="access-token",
+                account_id="account-1",
+                compact=True,
+            )
         )
-    )
 
-    assert len(client.stream_calls) == 2
-    compact_payload = json.loads(client.stream_calls[0]["content"])
-    fallback_payload = json.loads(client.stream_calls[1]["content"])
+    assert client.stream_calls == []
+    assert len(client.post_calls) == 1
+    compact_payload = json.loads(client.post_calls[0]["content"])
     assert "store" not in compact_payload
     assert "stream" not in compact_payload
-    assert fallback_payload["store"] is False
-    assert fallback_payload["stream"] is True
-    assert result.status_code == 200
-    assert result.model_name == "gpt-5.4"
-    assert result.usage_metrics is not None
-    assert result.usage_metrics.total_tokens == 3
 
 
 def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias() -> None:
