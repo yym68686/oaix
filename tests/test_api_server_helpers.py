@@ -3387,6 +3387,158 @@ def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monk
     assert finalized[0]["token_id"] == 32
 
 
+def test_execute_proxy_request_with_failover_disables_app_session_terminated_and_retries(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+    refresh_failure_detail = (
+        'Codex token refresh failed: status 400: {"error":{"message":"Your session has ended. '
+        'Please log in again.","type":"invalid_request_error","param":null,'
+        '"code":"app_session_terminated"}}'
+    )
+
+    class DummyOAuthManager:
+        def __init__(self) -> None:
+            self.invalidated: list[int] = []
+
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            if token_row.id == 41:
+                raise HTTPException(status_code=400, detail=refresh_failure_detail)
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            self.invalidated.append(token_id)
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    first_token = CodexToken(
+        id=41,
+        account_id="acct_41",
+        refresh_token="refresh-41",
+        token_type="codex",
+        is_active=True,
+    )
+    second_token = CodexToken(
+        id=42,
+        account_id="acct_42",
+        refresh_token="refresh-42",
+        token_type="codex",
+        is_active=True,
+        last_error="previous error",
+    )
+    claim_calls: list[tuple[int, ...]] = []
+    mark_error_calls: list[dict[str, object]] = []
+    mark_success_calls: list[int] = []
+    proxy_calls: list[tuple[str, str | None]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if first_token.id not in excluded:
+            return first_token
+        if second_token.id not in excluded:
+            return second_token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=141)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        mark_error_calls.append(
+            {
+                "token_id": token_id,
+                "message": message,
+                "deactivate": deactivate,
+                "cooldown_seconds": cooldown_seconds,
+                "clear_access_token": clear_access_token,
+            }
+        )
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        proxy_calls.append((access_token, account_id))
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-5",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    assert response.status_code == 200
+    assert app.state.oauth_manager.invalidated == [41]
+    assert claim_calls == [(), (41,)]
+    assert mark_error_calls == [
+        {
+            "token_id": 41,
+            "message": refresh_failure_detail,
+            "deactivate": True,
+            "cooldown_seconds": None,
+            "clear_access_token": True,
+        }
+    ]
+    assert proxy_calls == [("access-token-42", "acct_42")]
+    assert mark_success_calls == [42]
+    assert finalized[0]["attempt_count"] == 2
+    assert finalized[0]["token_id"] == 42
+
+
 def test_execute_proxy_request_with_failover_scopes_gpt_image_input_rate_limit(monkeypatch) -> None:
     app = SimpleNamespace(
         state=SimpleNamespace(
@@ -7335,6 +7487,104 @@ def test_probe_token_with_latest_access_token_reactivates_on_success(monkeypatch
     assert result["status_code"] == 200
     assert result["probe_model"] == "gpt-5.5"
     assert "已标记为可用" in result["message"]
+
+
+def test_probe_token_with_latest_access_token_disables_app_session_terminated(monkeypatch) -> None:
+    app = SimpleNamespace(state=SimpleNamespace(http_client=object(), oauth_manager=None))
+    token_row = CodexToken(
+        id=9,
+        account_id="acct_789",
+        refresh_token="refresh-token",
+        is_active=True,
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/admin/tokens/9/probe",
+            "headers": [],
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    refresh_failure_detail = (
+        'Codex token refresh failed: status 400: {"error":{"message":"Your session has ended. '
+        'Please log in again.","type":"invalid_request_error","param":null,'
+        '"code":"app_session_terminated"}}'
+    )
+    calls: dict[str, object] = {}
+
+    class DummyOAuthManager:
+        def __init__(self) -> None:
+            self.invalidated: list[int] = []
+
+        async def get_access_token(
+            self,
+            token,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            calls["oauth"] = {
+                "token_id": token.id,
+                "force_refresh": force_refresh,
+                "reactivate_on_refresh": reactivate_on_refresh,
+            }
+            raise HTTPException(status_code=400, detail=refresh_failure_detail)
+
+        def invalidate(self, token_id: int) -> None:
+            self.invalidated.append(token_id)
+
+    app.state.oauth_manager = DummyOAuthManager()
+
+    async def fake_proxy_request_with_token(*args, **kwargs):
+        raise AssertionError("proxy should not run when access-token refresh fails")
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        calls["error"] = {
+            "token_id": token_id,
+            "message": message,
+            "deactivate": deactivate,
+            "cooldown_seconds": cooldown_seconds,
+            "clear_access_token": clear_access_token,
+        }
+
+    monkeypatch.setattr("oaix_gateway.api_server._proxy_request_with_token", fake_proxy_request_with_token)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    result = asyncio.run(
+        _probe_token_with_latest_access_token(
+            app,
+            http_request=request,
+            token_row=token_row,
+        )
+    )
+
+    assert calls["oauth"] == {
+        "token_id": 9,
+        "force_refresh": True,
+        "reactivate_on_refresh": False,
+    }
+    assert app.state.oauth_manager.invalidated == [9]
+    assert calls["error"] == {
+        "token_id": 9,
+        "message": refresh_failure_detail,
+        "deactivate": True,
+        "cooldown_seconds": None,
+        "clear_access_token": True,
+    }
+    assert result["outcome"] == "disabled"
+    assert result["status_code"] == 400
+    assert "已标记为禁用" in result["message"]
+    assert "未得出结论" not in result["message"]
 
 
 def test_probe_token_with_latest_access_token_keeps_disabled_on_auth_failure(monkeypatch) -> None:

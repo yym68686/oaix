@@ -5384,6 +5384,10 @@ def _should_record_http_exception_token_error(exc: HTTPException) -> bool:
     return bool(getattr(exc, "record_token_error", False))
 
 
+def _sanitized_permanent_refresh_failure_detail() -> str:
+    return "Codex refresh token is no longer valid; the key was disabled and failover was attempted."
+
+
 def _is_retryable_upstream_transport_exception(exc: Exception) -> bool:
     if isinstance(exc, httpx.HTTPError):
         return True
@@ -5807,8 +5811,17 @@ def _gpt_image_stream_keepalive_response(
                         deactivate=permanent_refresh_failure,
                         clear_access_token=True,
                     )
-                    if exc.status_code in (401, 403):
-                        last_error = exc
+                    if permanent_refresh_failure or exc.status_code in (401, 403):
+                        if permanent_refresh_failure:
+                            excluded_token_ids.add(token_row.id)
+                        last_error = (
+                            HTTPException(
+                                status_code=503,
+                                detail=_sanitized_permanent_refresh_failure_detail(),
+                            )
+                            if permanent_refresh_failure
+                            else exc
+                        )
                         _record_selected_token_observation_finish(
                             token_row.id,
                             started_at=request_log.started_at,
@@ -6379,8 +6392,17 @@ async def _execute_proxy_request_with_failover(
                     deactivate=permanent_refresh_failure,
                     clear_access_token=True,
                 )
-                if exc.status_code in (401, 403):
-                    last_error = exc
+                if permanent_refresh_failure or exc.status_code in (401, 403):
+                    if permanent_refresh_failure:
+                        excluded_token_ids.add(token_row.id)
+                    last_error = (
+                        HTTPException(
+                            status_code=503,
+                            detail=_sanitized_permanent_refresh_failure_detail(),
+                        )
+                        if permanent_refresh_failure
+                        else exc
+                    )
                     _record_selected_token_observation_finish(
                         token_row.id,
                         started_at=request_started_at,

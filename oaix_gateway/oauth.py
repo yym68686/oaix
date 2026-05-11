@@ -22,6 +22,8 @@ PERMANENT_REFRESH_TOKEN_ERROR_CODES = frozenset(
         "refresh_token_not_found",
         "refresh_token_reused",
         "refresh_token_revoked",
+        "app_session_terminated",
+        "session_terminated",
         "token_expired",
         "token_revoked",
     }
@@ -30,10 +32,13 @@ PERMANENT_REFRESH_TOKEN_MESSAGE_MARKERS = (
     "already been used to generate a new access token",
     "invalid refresh token",
     "please try signing in again",
+    "please log in again",
     "refresh token expired",
     "refresh token is invalid",
     "refresh token not found",
     "refresh token revoked",
+    "session has ended",
+    "your session has ended",
 )
 
 logger = logging.getLogger("oaix.gateway")
@@ -111,7 +116,11 @@ def is_permanently_invalid_refresh_token_error(error: Any) -> bool:
     haystack = " ".join(haystack_parts).lower()
     if not haystack:
         return False
-    if "refresh token" not in haystack and "invalid_grant" not in haystack:
+    if (
+        "refresh token" not in haystack
+        and "invalid_grant" not in haystack
+        and "codex token refresh failed" not in haystack
+    ):
         return False
     return any(marker in haystack for marker in PERMANENT_REFRESH_TOKEN_MESSAGE_MARKERS)
 

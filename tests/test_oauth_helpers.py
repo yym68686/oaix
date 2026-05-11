@@ -32,6 +32,19 @@ def test_detects_invalid_grant_refresh_token_error_from_mapping() -> None:
     assert is_permanently_invalid_refresh_token_error(exc) is True
 
 
+def test_detects_app_session_terminated_refresh_error() -> None:
+    exc = HTTPException(
+        status_code=400,
+        detail=(
+            'Codex token refresh failed: status 400: {"error":{"message":"Your session has ended. '
+            'Please log in again.","type":"invalid_request_error","param":null,'
+            '"code":"app_session_terminated"}}'
+        ),
+    )
+
+    assert is_permanently_invalid_refresh_token_error(exc) is True
+
+
 def test_ignores_non_refresh_token_errors() -> None:
     exc = HTTPException(status_code=502, detail="Upstream request failed: ReadTimeout")
 
