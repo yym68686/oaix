@@ -95,6 +95,7 @@ from .token_store import (
     repair_duplicate_token_histories,
     set_token_active_state,
     stop_token_status_write_queue,
+    is_access_token_only_refresh_token,
     token_is_runtime_available,
     parse_token_import_queue_position,
     update_token_active_stream_cap_settings,
@@ -5385,7 +5386,7 @@ def _should_record_http_exception_token_error(exc: HTTPException) -> bool:
 
 
 def _sanitized_permanent_refresh_failure_detail() -> str:
-    return "Codex refresh token is no longer valid; the key was disabled and failover was attempted."
+    return "Codex token credentials are no longer valid; the key was disabled and failover was attempted."
 
 
 def _is_retryable_upstream_transport_exception(exc: Exception) -> bool:
@@ -6011,10 +6012,13 @@ def _gpt_image_stream_keepalive_response(
                         await mark_token_error(token_row.id, detail)
 
                     permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
-                    auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
+                    auth_failed_after_refresh = status_code in (401, 403) and (
+                        access_token_refreshed or is_access_token_only_refresh_token(token_row.refresh_token)
+                    )
 
                     if permanently_disabled or auth_failed_after_refresh:
                         oauth_manager.invalidate(token_row.id)
+                        excluded_token_ids.add(token_row.id)
                         await mark_token_error(
                             token_row.id,
                             detail,
@@ -6612,10 +6616,13 @@ async def _execute_proxy_request_with_failover(
                     await mark_token_error(token_row.id, detail)
 
                 permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
-                auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
+                auth_failed_after_refresh = status_code in (401, 403) and (
+                    access_token_refreshed or is_access_token_only_refresh_token(token_row.refresh_token)
+                )
 
                 if permanently_disabled or auth_failed_after_refresh:
                     oauth_manager.invalidate(token_row.id)
+                    excluded_token_ids.add(token_row.id)
                     await mark_token_error(
                         token_row.id,
                         detail,

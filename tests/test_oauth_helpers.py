@@ -5,6 +5,7 @@ from fastapi import HTTPException
 
 from oaix_gateway.database import CodexToken
 from oaix_gateway.oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
+from oaix_gateway.token_store import ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX
 
 
 def test_detects_refresh_token_reused_error() -> None:
@@ -49,6 +50,64 @@ def test_ignores_non_refresh_token_errors() -> None:
     exc = HTTPException(status_code=502, detail="Upstream request failed: ReadTimeout")
 
     assert is_permanently_invalid_refresh_token_error(exc) is False
+
+
+def test_detects_expired_access_token_without_refresh_token() -> None:
+    exc = HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "code": "access_token_expired",
+                "message": "Access token expired and no refresh_token is available",
+            }
+        },
+    )
+
+    assert is_permanently_invalid_refresh_token_error(exc) is True
+
+
+def test_get_access_token_uses_access_token_only_without_force_refresh(monkeypatch) -> None:
+    async def fake_refresh_codex_access_token(self, client, refresh_token: str) -> dict[str, object]:
+        raise AssertionError("access-token-only rows must not be refreshed")
+
+    async def fake_update_token_refresh_state(*args, **kwargs) -> None:
+        raise AssertionError("access-token-only rows should not persist refresh state")
+
+    monkeypatch.setattr(CodexOAuthManager, "_refresh_codex_access_token", fake_refresh_codex_access_token)
+    monkeypatch.setattr("oaix_gateway.oauth.update_token_refresh_state", fake_update_token_refresh_state)
+
+    manager = CodexOAuthManager()
+    token = CodexToken(
+        id=16,
+        refresh_token=f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}account:acct_access_only",
+        access_token="cached-access-token",
+        is_active=True,
+    )
+    token.expires_at = datetime.now(timezone.utc) + timedelta(minutes=20)
+
+    access_token, refreshed = asyncio.run(manager.get_access_token(token, object(), force_refresh=True))
+
+    assert access_token == "cached-access-token"
+    assert refreshed is False
+
+
+def test_get_access_token_disables_expired_access_token_only_rows() -> None:
+    manager = CodexOAuthManager()
+    token = CodexToken(
+        id=19,
+        refresh_token=f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}account:acct_expired_access",
+        access_token="expired-access-token",
+        is_active=True,
+    )
+    token.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    try:
+        asyncio.run(manager.get_access_token(token, object()))
+    except HTTPException as exc:
+        assert exc.status_code == 401
+        assert is_permanently_invalid_refresh_token_error(exc) is True
+    else:
+        raise AssertionError("expected expired access-token-only row to fail")
 
 
 def test_get_access_token_force_refresh_bypasses_cached_token(monkeypatch) -> None:

@@ -9,6 +9,8 @@ from sqlalchemy.dialects import postgresql
 
 from oaix_gateway.database import CodexToken
 from oaix_gateway.token_store import (
+    ACCESS_TOKEN_ONLY_EXPIRED_ERROR,
+    ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenHistoryRepairSummary,
     TokenSelectionSettings,
@@ -21,6 +23,7 @@ from oaix_gateway.token_store import (
     _merge_duplicate_token_rows,
     claim_next_active_token,
     extract_token_account_id_from_payload,
+    normalize_token_payload_for_storage,
     invalidate_fill_first_token_cache,
     list_token_rows,
     prewarm_fill_first_token_cache,
@@ -125,6 +128,55 @@ def test_extract_token_account_id_from_id_token_claims() -> None:
     )
 
     assert extract_token_account_id_from_payload({"refresh_token": "rt", "id_token": id_token}) == "acct_from_id_token"
+
+
+def test_extract_token_account_id_from_access_token_claims() -> None:
+    access_token = _unsigned_jwt(
+        {
+            "aud": ["https://api.openai.com/v1"],
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_from_access_token",
+            },
+        }
+    )
+
+    assert extract_token_account_id_from_payload({"access_token": access_token}) == "acct_from_access_token"
+
+
+def test_normalize_access_token_only_payload_adds_sentinel_refresh_token() -> None:
+    access_token = _unsigned_jwt(
+        {
+            "aud": ["https://api.openai.com/v1"],
+            "exp": int(time.time()) + 3600,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_access_only",
+                "chatgpt_plan_type": "plus",
+            },
+        }
+    )
+
+    payload = normalize_token_payload_for_storage({"access_token": access_token, "type": "codex"})
+
+    assert payload["refresh_token"] == f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}account:acct_access_only"
+    assert payload["token_source"] == "access_token"
+    assert payload["expired"].endswith("+00:00")
+
+
+def test_normalize_expired_access_token_only_payload_disables_token() -> None:
+    access_token = _unsigned_jwt(
+        {
+            "aud": ["https://api.openai.com/v1"],
+            "exp": int(time.time()) - 60,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_expired_access",
+            },
+        }
+    )
+
+    payload = normalize_token_payload_for_storage({"access_token": access_token, "type": "codex"})
+
+    assert payload["is_active"] is False
+    assert payload["last_error"] == ACCESS_TOKEN_ONLY_EXPIRED_ERROR
 
 
 def test_build_token_counts_stmt_uses_single_aggregate_query() -> None:

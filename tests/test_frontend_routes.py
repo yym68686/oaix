@@ -201,14 +201,14 @@ def test_frontend_import_panel_supports_queue_position_switch() -> None:
     assert "import_queue_position: state.importQueuePosition" in import_function
 
 
-def test_frontend_import_panel_supports_refresh_token_only_lines() -> None:
+def test_frontend_import_panel_supports_refresh_and_access_token_only_lines() -> None:
     index_html = (WEB_DIR / "index.html").read_text()
     app_js = (WEB_DIR / "app.js").read_text()
     parse_function = app_js.split("function parseAccountRefreshLines", 1)[1].split("function parseImportText", 1)[0]
 
-    assert "每行 refresh_token" in index_html
-    assert "应为 refresh_token 或 account_id,refresh_token" in parse_function
-    assert "refresh_token: line.trim()" in parse_function
+    assert "每行 access_token / refresh_token" in index_html
+    assert "应为 access_token、refresh_token 或 account_id,refresh_token" in parse_function
+    assert 'isLikelyAccessToken(token) ? "access_token" : "refresh_token"' in parse_function
     assert "account_id: accountId" in parse_function
 
 

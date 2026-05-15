@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -92,12 +93,21 @@ from oaix_gateway.token_import_jobs import (
     IMPORT_ITEM_STATUS_PUBLISHED,
 )
 from oaix_gateway.token_store import (
+    ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX,
     TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenPublishBatchResult,
     TokenSelectionSettings,
     TokenUpsertResult,
 )
+
+
+def _unsigned_jwt(payload: dict) -> str:
+    def encode(part: dict) -> str:
+        raw = json.dumps(part, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{encode({'alg': 'none'})}.{encode(payload)}."
 
 
 @pytest.mark.parametrize("separator", ["\n\n", "\r\n\n", "\n\r\n", "\r\n\r\n"])
@@ -3539,6 +3549,150 @@ def test_execute_proxy_request_with_failover_disables_app_session_terminated_and
     assert finalized[0]["token_id"] == 42
 
 
+def test_execute_proxy_request_with_failover_disables_access_token_only_auth_failure(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        def __init__(self) -> None:
+            self.invalidated: list[int] = []
+
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            self.invalidated.append(token_id)
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    access_only_token = CodexToken(
+        id=51,
+        account_id="acct_51",
+        refresh_token=f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}account:acct_51",
+        token_type="codex",
+        is_active=True,
+    )
+    fallback_token = CodexToken(
+        id=52,
+        account_id="acct_52",
+        refresh_token="refresh-52",
+        token_type="codex",
+        is_active=True,
+        last_error="previous error",
+    )
+    claim_calls: list[tuple[int, ...]] = []
+    mark_error_calls: list[dict[str, object]] = []
+    mark_success_calls: list[int] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if access_only_token.id not in excluded:
+            return access_only_token
+        if fallback_token.id not in excluded:
+            return fallback_token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=151)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        mark_error_calls.append(
+            {
+                "token_id": token_id,
+                "message": message,
+                "deactivate": deactivate,
+                "cooldown_seconds": cooldown_seconds,
+                "clear_access_token": clear_access_token,
+            }
+        )
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        if account_id == "acct_51":
+            raise HTTPException(status_code=401, detail='{"error":{"code":"invalid_token"}}')
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-5",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    assert response.status_code == 200
+    assert app.state.oauth_manager.invalidated == [51]
+    assert claim_calls == [(), (51,)]
+    assert mark_error_calls == [
+        {
+            "token_id": 51,
+            "message": '{"error":{"code":"invalid_token"}}',
+            "deactivate": True,
+            "cooldown_seconds": None,
+            "clear_access_token": True,
+        }
+    ]
+    assert mark_success_calls == [52]
+    assert finalized[0]["attempt_count"] == 2
+    assert finalized[0]["token_id"] == 52
+
+
 def test_execute_proxy_request_with_failover_scopes_gpt_image_input_rate_limit(monkeypatch) -> None:
     app = SimpleNamespace(
         state=SimpleNamespace(
@@ -6654,6 +6808,129 @@ def test_process_token_import_job_enriches_missing_account_id(monkeypatch) -> No
 
     assert completed["processed_count"] == 1
     assert completed["created"] == [{"id": 41, "email": None, "account_id": "acct_from_refresh", "index": 0}]
+    assert completed["failed"] == []
+    assert result is not None
+    assert result.created_count == 1
+
+
+def test_process_token_import_job_accepts_access_token_only(monkeypatch) -> None:
+    completed: dict[str, object] = {}
+    access_token = _unsigned_jwt(
+        {
+            "aud": ["https://api.openai.com/v1"],
+            "exp": int(datetime.now(timezone.utc).timestamp()) + 3600,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_access_import",
+                "chatgpt_plan_type": "plus",
+            },
+        }
+    )
+
+    class IdleResponseTraffic:
+        active_responses = 0
+
+        async def wait_for_import_turn(self, *, timeout_seconds=None) -> bool:
+            return False
+
+    async def fake_refresh_codex_access_token(self, client, refresh_token: str) -> dict[str, object]:
+        raise AssertionError("access_token-only imports must not refresh")
+
+    async def fake_publish_token_payload_batch(payloads, *, import_queue_position: str) -> TokenPublishBatchResult:
+        assert import_queue_position == "front"
+        payload = list(payloads)[0]
+        assert payload["access_token"] == access_token
+        assert payload["refresh_token"] == f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}account:acct_access_import"
+        assert payload["token_source"] == "access_token"
+        assert payload["expired"].endswith("+00:00")
+        token = CodexToken(
+            id=42,
+            email=None,
+            account_id="acct_access_import",
+            refresh_token=payload["refresh_token"],
+            token_type="codex",
+            is_active=True,
+        )
+        return TokenPublishBatchResult(results=(TokenUpsertResult(token=token, action="created"),))
+
+    async def fake_complete_token_import_job(
+        job_id: int,
+        *,
+        processed_count: int,
+        created: list[dict[str, object]],
+        updated: list[dict[str, object]],
+        skipped: list[dict[str, object]],
+        failed: list[dict[str, object]],
+        yielded_to_response_traffic_count: int,
+        response_traffic_timeout_count: int,
+    ) -> TokenImportJobState:
+        completed.update(
+            {
+                "processed_count": processed_count,
+                "created": list(created),
+                "updated": list(updated),
+                "skipped": list(skipped),
+                "failed": list(failed),
+            }
+        )
+        return TokenImportJobState(
+            id=job_id,
+            status=IMPORT_JOB_STATUS_COMPLETED,
+            import_queue_position="front",
+            total_count=1,
+            processed_count=processed_count,
+            created_count=len(created),
+            updated_count=len(updated),
+            skipped_count=len(skipped),
+            failed_count=len(failed),
+            yielded_to_response_traffic_count=yielded_to_response_traffic_count,
+            response_traffic_timeout_count=response_traffic_timeout_count,
+            created=list(created),
+            updated=list(updated),
+            skipped=list(skipped),
+            failed=list(failed),
+            submitted_at=None,
+            started_at=None,
+            heartbeat_at=None,
+            finished_at=None,
+            last_error=None,
+        )
+
+    _install_staged_import_fakes(monkeypatch, 97, [{"access_token": access_token}])
+    monkeypatch.setattr(
+        "oaix_gateway.token_import_jobs.CodexOAuthManager._refresh_codex_access_token",
+        fake_refresh_codex_access_token,
+    )
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.publish_token_payload_batch", fake_publish_token_payload_batch)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.complete_token_import_job", fake_complete_token_import_job)
+
+    job = TokenImportJobLease(
+        id=97,
+        status=IMPORT_JOB_STATUS_RUNNING,
+        import_queue_position="front",
+        total_count=1,
+        processed_count=0,
+        created_count=0,
+        updated_count=0,
+        skipped_count=0,
+        failed_count=0,
+        yielded_to_response_traffic_count=0,
+        response_traffic_timeout_count=0,
+        created=[],
+        updated=[],
+        skipped=[],
+        failed=[],
+        submitted_at=None,
+        started_at=None,
+        heartbeat_at=None,
+        finished_at=None,
+        last_error=None,
+        payloads=[{"access_token": access_token}],
+    )
+
+    result = asyncio.run(process_token_import_job(job, response_traffic=IdleResponseTraffic()))
+
+    assert completed["processed_count"] == 1
+    assert completed["created"] == [{"id": 42, "email": None, "account_id": "acct_access_import", "index": 0}]
     assert completed["failed"] == []
     assert result is not None
     assert result.created_count == 1

@@ -32,6 +32,7 @@ from .token_store import (
     DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
     TokenSelectionSettings,
     apply_imported_token_queue_position,
+    normalize_token_payload_for_storage,
     normalize_token_import_queue_position,
     publish_token_payload_batch,
 )
@@ -1189,13 +1190,29 @@ async def _validate_single_staged_token_import_item(
 
     refresh_token = normalize_refresh_token(payload.get("refresh_token"))
     if refresh_token is None:
-        error = "Token payload missing refresh_token"
+        try:
+            validated_payload = normalize_token_payload_for_storage(payload)
+        except Exception as exc:
+            error = str(exc)
+            validation_ms = int((time.monotonic() - started_at) * 1000)
+            await _mark_import_item_failed(item.id, error_message=error, validation_ms=validation_ms)
+            return _TokenImportItemResult(
+                index=item.index,
+                category="failed",
+                item={"index": item.index, "error": error},
+                validate_ms=validation_ms,
+            )
+
         validation_ms = int((time.monotonic() - started_at) * 1000)
-        await _mark_import_item_failed(item.id, error_message=error, validation_ms=validation_ms)
+        await _mark_import_item_validated(
+            item.id,
+            validated_payload=validated_payload,
+            validation_ms=validation_ms,
+        )
         return _TokenImportItemResult(
             index=item.index,
-            category="failed",
-            item={"index": item.index, "error": error},
+            category="validated",
+            item={"index": item.index},
             validate_ms=validation_ms,
         )
 

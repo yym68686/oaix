@@ -189,7 +189,15 @@ account_id_2,refresh_token_2
 account_id_3,refresh_token_3
 ```
 
-粘贴后会自动解析成导入批次；导入接口只写入 `token_import_items` staging 区，不会直接写入正式 `codex_tokens` 池。后台导入 worker 会先高并发刷新 OAuth 并提取 `account_id`、`email`、`plan_type`、`access_token` 和过期时间；只有验证成功的 item 才会按小批短事务发布到正式池。验证失败的 refresh token 会停留在 staging 失败状态，正常 `/v1/responses` 请求不会命中这些未验证 token。
+如果只有 JWT 格式的 access token，也可以直接每行粘贴一个：
+
+```text
+access_token_1
+access_token_2
+access_token_3
+```
+
+粘贴后会自动解析成导入批次；导入接口只写入 `token_import_items` staging 区，不会直接写入正式 `codex_tokens` 池。后台导入 worker 会先高并发验证：带 `refresh_token` 的 item 会刷新 OAuth 并提取 `account_id`、`email`、`plan_type`、`access_token` 和过期时间；只有 `access_token` 的 item 会解码 JWT 提取账号、套餐和过期时间，不会尝试刷新。验证成功的 item 会按小批短事务发布到正式池；验证失败的 refresh token 会停留在 staging 失败状态，正常 `/v1/responses` 请求不会命中这些未验证 token。
 
 导入去重规则：
 
@@ -230,4 +238,5 @@ account_id_3,refresh_token_3
 - 如果上游返回 `429` 且 `error.type=usage_limit_reached`，会按 `resets_in_seconds` 或 `resets_at` 冷却当前 key，然后自动重试下一个 key
 - 如果上游返回 `402 {"detail":{"code":"deactivated_workspace"}}` 或 `401` 且 `error.code=account_deactivated`，会永久停用该 key
 - 如果 refresh token 明确已经失效，例如 `refresh_token_reused` / `invalid_grant` / “Please try signing in again”，网关会清空 access token 并永久停用该 key
+- 如果 key 是 access-token-only，网关不会刷新；JWT 过期或上游返回 `401/403` 时会清空 access token 并永久停用该 key
 - 如果上游返回普通 `401/403`，会清空当前 access token，并尝试刷新/切换下一个 key

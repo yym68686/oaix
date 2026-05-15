@@ -88,6 +88,8 @@ DEFAULT_TOKEN_STATUS_WRITE_LOCK_TIMEOUT_MS = 250
 MIN_TOKEN_ACTIVE_STREAM_CAP = 1
 MAX_TOKEN_ACTIVE_STREAM_CAP = 10
 DEFAULT_TOKEN_ACTIVE_STREAM_CAP = 10
+ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX = "__oaix_access_token_only__:"
+ACCESS_TOKEN_ONLY_EXPIRED_ERROR = "Access token expired and no refresh_token is available"
 
 
 @dataclass(frozen=True)
@@ -670,6 +672,42 @@ def _parse_mapping_or_jwt(value: Any) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _parse_epoch_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    if seconds > 10_000_000_000:
+        seconds /= 1000
+    try:
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def is_access_token_only_refresh_token(value: Any) -> bool:
+    return str(value or "").startswith(ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX)
+
+
+def _access_token_only_identity_key(payload: dict[str, Any], access_token: str) -> str:
+    account_id = extract_token_account_id_from_payload(payload)
+    if account_id:
+        return f"account:{account_id}"
+    digest = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    return f"access:{digest}"
+
+
+def build_access_token_only_refresh_token(payload: dict[str, Any], access_token: str | None = None) -> str:
+    resolved_access_token = str(access_token or payload.get("access_token") or "").strip()
+    if not resolved_access_token:
+        raise ValueError("Token payload missing refresh_token or access_token")
+    return f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}{_access_token_only_identity_key(payload, resolved_access_token)}"
+
+
 def extract_token_account_id_from_payload(payload: dict[str, Any]) -> str | None:
     def account_id_from_mapping(mapping: dict[str, Any]) -> str | None:
         direct = str(mapping.get("account_id") or mapping.get("chatgpt_account_id") or "").strip()
@@ -691,7 +729,13 @@ def extract_token_account_id_from_payload(payload: dict[str, Any]) -> str | None
 
     id_token_payload = _parse_mapping_or_jwt(payload.get("id_token"))
     if isinstance(id_token_payload, dict):
-        return account_id_from_mapping(id_token_payload)
+        id_token_account_id = account_id_from_mapping(id_token_payload)
+        if id_token_account_id is not None:
+            return id_token_account_id
+
+    access_token_payload = _parse_mapping_or_jwt(payload.get("access_token"))
+    if isinstance(access_token_payload, dict):
+        return account_id_from_mapping(access_token_payload)
 
     return None
 
@@ -719,6 +763,37 @@ def _extract_plan_type_from_payload(payload: dict[str, Any]) -> str | None:
         return _normalize_plan_type(
             id_token_payload.get("chatgpt_plan_type") or id_token_payload.get("plan_type")
         )
+
+    access_token_payload = _parse_mapping_or_jwt(payload.get("access_token"))
+    if isinstance(access_token_payload, dict):
+        auth_mapping = access_token_payload.get("https://api.openai.com/auth")
+        if isinstance(auth_mapping, dict):
+            normalized = _normalize_plan_type(
+                auth_mapping.get("chatgpt_plan_type") or auth_mapping.get("plan_type")
+            )
+            if normalized is not None:
+                return normalized
+        return _normalize_plan_type(
+            access_token_payload.get("chatgpt_plan_type") or access_token_payload.get("plan_type")
+        )
+
+    return None
+
+
+def extract_token_expiration_from_payload(payload: dict[str, Any]) -> datetime | None:
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("expired", "expires_at"):
+        parsed = parse_rfc3339(payload.get(key))
+        if parsed is not None:
+            return parsed
+
+    access_token_payload = _parse_mapping_or_jwt(payload.get("access_token"))
+    if isinstance(access_token_payload, dict):
+        parsed = _parse_epoch_datetime(access_token_payload.get("exp"))
+        if parsed is not None:
+            return parsed
 
     return None
 
@@ -1002,17 +1077,45 @@ def merge_imported_token_order(
     return tuple([*imported_order, *remaining_order])
 
 
-def _load_token_payload(token_data_or_json: str | dict[str, Any]) -> dict[str, Any]:
+def _payload_bool(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on", "active", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "inactive", "disabled"}:
+        return False
+    return default
+
+
+def normalize_token_payload_for_storage(token_data_or_json: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(token_data_or_json, dict):
-        payload = token_data_or_json
+        payload = dict(token_data_or_json)
     else:
         payload = json.loads(token_data_or_json)
     if not isinstance(payload, dict):
         raise ValueError("Token payload must be a JSON object")
-    refresh_token = str(payload.get("refresh_token") or "").strip()
-    if not refresh_token:
-        raise ValueError("Token payload missing refresh_token")
+    payload = dict(payload)
+    refresh_token = normalize_refresh_token(payload.get("refresh_token"))
+    access_token = str(payload.get("access_token") or "").strip()
+    if refresh_token is None:
+        if not access_token:
+            raise ValueError("Token payload missing refresh_token or access_token")
+        refresh_token = build_access_token_only_refresh_token(payload, access_token)
+        payload["refresh_token"] = refresh_token
+        payload.setdefault("token_source", "access_token")
+
+    expires_at = extract_token_expiration_from_payload(payload)
+    if expires_at is not None and not str(payload.get("expired") or "").strip():
+        payload["expired"] = expires_at.isoformat()
+    if is_access_token_only_refresh_token(refresh_token) and expires_at is not None and expires_at <= utcnow():
+        payload["is_active"] = False
+        payload.setdefault("last_error", ACCESS_TOKEN_ONLY_EXPIRED_ERROR)
     return payload
+
+
+def _load_token_payload(token_data_or_json: str | dict[str, Any]) -> dict[str, Any]:
+    return normalize_token_payload_for_storage(token_data_or_json)
 
 
 def _available_token_filters(
@@ -1393,10 +1496,13 @@ async def _upsert_token_payload_in_session(
     account_id = extract_token_account_id_from_payload(payload)
     refresh_token = normalize_refresh_token(payload.get("refresh_token"))
     if refresh_token is None:
-        raise ValueError("Token payload missing refresh_token")
+        raise ValueError("Token payload missing refresh_token or access_token")
     recovery = payload.get("recovery")
     if recovery is not None and not isinstance(recovery, dict):
         recovery = None
+    is_active = _payload_bool(payload.get("is_active"), default=True)
+    payload_last_error = str(payload.get("last_error") or "").strip() or None
+    expires_at = extract_token_expiration_from_payload(payload)
 
     await _acquire_token_identity_locks(session, refresh_token=refresh_token, account_id=account_id)
     token = await _find_existing_token(session, refresh_token=refresh_token, account_id=account_id)
@@ -1411,14 +1517,14 @@ async def _upsert_token_payload_in_session(
             merged_into_token_id=None,
             token_type=str(payload.get("type") or "codex").strip() or "codex",
             last_refresh_at=parse_rfc3339(payload.get("last_refresh")),
-            expires_at=parse_rfc3339(payload.get("expired")),
+            expires_at=expires_at,
             recovery=recovery,
             raw_payload=payload,
             plan_type=_extract_plan_type_from_payload(payload),
             source_file=source_file,
-            is_active=True,
+            is_active=is_active,
             cooldown_until=None,
-            last_error=None,
+            last_error=None if is_active else payload_last_error,
             updated_at=utcnow(),
         )
         session.add(token)
@@ -1438,13 +1544,13 @@ async def _upsert_token_payload_in_session(
         token.id_token = str(payload.get("id_token") or "").strip() or None
         token.access_token = str(payload.get("access_token") or "").strip() or None
         token.last_refresh_at = parse_rfc3339(payload.get("last_refresh"))
-        token.expires_at = parse_rfc3339(payload.get("expired"))
+        token.expires_at = expires_at
         token.recovery = recovery
         token.raw_payload = payload
         token.plan_type = _extract_plan_type_from_payload(payload) or token.plan_type
-        token.is_active = True
+        token.is_active = is_active
         token.cooldown_until = None
-        token.last_error = None
+        token.last_error = None if is_active else payload_last_error
         await session.flush()
         if invalidate_cache:
             invalidate_fill_first_token_cache()

@@ -8,7 +8,13 @@ import httpx
 from fastapi import HTTPException
 
 from .database import CodexToken
-from .token_store import extract_token_account_id_from_payload, get_token_row, update_token_refresh_state
+from .token_store import (
+    ACCESS_TOKEN_ONLY_EXPIRED_ERROR,
+    extract_token_account_id_from_payload,
+    get_token_row,
+    is_access_token_only_refresh_token,
+    update_token_refresh_state,
+)
 
 
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -26,6 +32,13 @@ PERMANENT_REFRESH_TOKEN_ERROR_CODES = frozenset(
         "session_terminated",
         "token_expired",
         "token_revoked",
+    }
+)
+PERMANENT_NON_REFRESHABLE_ACCESS_TOKEN_ERROR_CODES = frozenset(
+    {
+        "access_token_expired",
+        "access_token_missing",
+        "non_refreshable_access_token_expired",
     }
 )
 PERMANENT_REFRESH_TOKEN_MESSAGE_MARKERS = (
@@ -96,6 +109,8 @@ def is_permanently_invalid_refresh_token_error(error: Any) -> bool:
         )
         if error_code and error_code.lower() in PERMANENT_REFRESH_TOKEN_ERROR_CODES:
             return True
+        if error_code and error_code.lower() in PERMANENT_NON_REFRESHABLE_ACCESS_TOKEN_ERROR_CODES:
+            return True
 
     haystack_parts: list[str] = []
     raw_detail = _normalize_optional_text(detail)
@@ -116,6 +131,13 @@ def is_permanently_invalid_refresh_token_error(error: Any) -> bool:
     haystack = " ".join(haystack_parts).lower()
     if not haystack:
         return False
+    if "access token" in haystack and (
+        "no refresh_token" in haystack
+        or "no refresh token" in haystack
+        or "non-refreshable" in haystack
+        or "non refreshable" in haystack
+    ):
+        return True
     if (
         "refresh token" not in haystack
         and "invalid_grant" not in haystack
@@ -123,6 +145,18 @@ def is_permanently_invalid_refresh_token_error(error: Any) -> bool:
     ):
         return False
     return any(marker in haystack for marker in PERMANENT_REFRESH_TOKEN_MESSAGE_MARKERS)
+
+
+def _non_refreshable_access_token_exception(detail: str = ACCESS_TOKEN_ONLY_EXPIRED_ERROR) -> HTTPException:
+    return HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "code": "access_token_expired",
+                "message": detail,
+            }
+        },
+    )
 
 
 class CodexOAuthManager:
@@ -233,7 +267,22 @@ class CodexOAuthManager:
     ) -> tuple[str, bool]:
         lock = self._lock_for(token_row.id)
         async with lock:
+            access_token_only = is_access_token_only_refresh_token(token_row.refresh_token)
             cache_entry = self._cache.get(token_row.id) or {}
+            if access_token_only:
+                if self._access_token_is_valid(cache_entry.get("access_token"), cache_entry.get("expires_at")):
+                    return str(cache_entry["access_token"]), False
+
+                if self._access_token_is_valid(token_row.access_token, token_row.expires_at):
+                    self._cache[token_row.id] = {
+                        "access_token": token_row.access_token,
+                        "refresh_token": token_row.refresh_token,
+                        "expires_at": token_row.expires_at,
+                    }
+                    return str(token_row.access_token), False
+
+                raise _non_refreshable_access_token_exception()
+
             if not force_refresh and self._access_token_is_valid(cache_entry.get("access_token"), cache_entry.get("expires_at")):
                 return str(cache_entry["access_token"]), False
 

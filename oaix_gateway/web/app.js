@@ -3703,6 +3703,35 @@ function collectLogicalKeyLines(text) {
   return logicalLines;
 }
 
+function decodeJwtPayload(token) {
+  const parts = String(token || "").trim().split(".");
+  if (parts.length < 2) {
+    return null;
+  }
+  try {
+    const normalized = parts[1].replaceAll("-", "+").replaceAll("_", "/");
+    const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
+function isLikelyAccessToken(token) {
+  const payload = decodeJwtPayload(token);
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+  const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  return (
+    audiences.some((audience) => String(audience || "").includes("api.openai.com/v1")) ||
+    payload.iss === "https://auth.openai.com" ||
+    Boolean(payload["https://api.openai.com/auth"])
+  );
+}
+
 function parseAccountRefreshLines(text, sourceLabel) {
   const payloads = [];
   const lines = collectLogicalKeyLines(text);
@@ -3710,15 +3739,16 @@ function parseAccountRefreshLines(text, sourceLabel) {
   lines.forEach((line, index) => {
     const commaIndex = line.indexOf(",");
     if (commaIndex === -1) {
+      const token = line.trim();
       payloads.push({
-        refresh_token: line.trim(),
+        [isLikelyAccessToken(token) ? "access_token" : "refresh_token"]: token,
         type: "codex",
       });
       return;
     }
 
     if (commaIndex <= 0 || commaIndex === line.length - 1) {
-      throw new Error(`${sourceLabel} 第 ${index + 1} 条记录格式错误，应为 refresh_token 或 account_id,refresh_token`);
+      throw new Error(`${sourceLabel} 第 ${index + 1} 条记录格式错误，应为 access_token、refresh_token 或 account_id,refresh_token`);
     }
 
     const accountId = line.slice(0, commaIndex).trim();
