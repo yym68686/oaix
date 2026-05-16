@@ -110,6 +110,7 @@ logger = logging.getLogger("oaix.gateway")
 _ORIGINAL_CREATE_REQUEST_LOG = create_request_log
 _ORIGINAL_FINALIZE_REQUEST_LOG = finalize_request_log
 WEB_DIR = Path(__file__).resolve().parent / "web"
+WEB_VERSION_TZ = timezone(timedelta(hours=8), name="UTC+8")
 ADMIN_TOKEN_PROBE_INPUT = "say test"
 DEFAULT_IMAGES_MAIN_MODEL = "gpt-5.5"
 DEFAULT_IMAGES_TOOL_MODEL = "gpt-image-2"
@@ -1457,6 +1458,29 @@ def _web_asset_version(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
     except OSError:
         return "dev"
+
+
+def _web_bundle_version_hash() -> str:
+    digest = hashlib.sha256()
+    for path in (WEB_DIR / "index.html", WEB_DIR / "styles.css", WEB_DIR / "app.js"):
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            continue
+    return digest.hexdigest()[:12]
+
+
+def _web_bundle_version_time() -> str:
+    mtimes: list[float] = []
+    for path in (WEB_DIR / "index.html", WEB_DIR / "styles.css", WEB_DIR / "app.js"):
+        try:
+            mtimes.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    if not mtimes:
+        return "dev"
+    version_time = datetime.fromtimestamp(max(mtimes), tz=timezone.utc).astimezone(WEB_VERSION_TZ)
+    return version_time.strftime("%Y-%m-%d %H:%M:%S UTC+8")
 
 
 RESPONSES_FAILURE_STATUS_BY_TYPE = {
@@ -7322,8 +7346,12 @@ def create_app() -> FastAPI:
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
         css_version = _web_asset_version(WEB_DIR / "styles.css")
         js_version = _web_asset_version(WEB_DIR / "app.js")
+        web_version_hash = _web_bundle_version_hash()
+        web_version_time = _web_bundle_version_time()
         html = html.replace("/assets/styles.css", f"/assets/styles.css?v={css_version}")
         html = html.replace("/assets/app.js", f"/assets/app.js?v={js_version}")
+        html = html.replace("__OAIX_WEB_VERSION_HASH__", web_version_hash)
+        html = html.replace("__OAIX_WEB_VERSION_TIME__", web_version_time)
         return HTMLResponse(
             content=html,
             headers={"Cache-Control": "no-store, max-age=0"},

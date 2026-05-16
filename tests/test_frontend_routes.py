@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -115,11 +115,26 @@ def test_frontend_index_busts_asset_cache_with_content_hash() -> None:
 
     css_version = hashlib.sha256((WEB_DIR / "styles.css").read_bytes()).hexdigest()[:12]
     js_version = hashlib.sha256((WEB_DIR / "app.js").read_bytes()).hexdigest()[:12]
+    bundle_digest = hashlib.sha256()
+    bundle_mtime = 0.0
+    for filename in ("index.html", "styles.css", "app.js"):
+        path = WEB_DIR / filename
+        bundle_digest.update(path.read_bytes())
+        bundle_mtime = max(bundle_mtime, path.stat().st_mtime)
+    bundle_version_hash = bundle_digest.hexdigest()[:12]
+    bundle_version_time = (
+        datetime.fromtimestamp(bundle_mtime, tz=timezone.utc)
+        .astimezone(timezone(timedelta(hours=8), name="UTC+8"))
+        .strftime("%Y-%m-%d %H:%M:%S UTC+8")
+    )
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert f'/assets/styles.css?v={css_version}' in response.text
     assert f'/assets/app.js?v={js_version}' in response.text
+    assert f'title="资源版本 {bundle_version_hash}"' in response.text
+    assert f"前端版本 {bundle_version_time}" in response.text
+    assert "__OAIX_WEB_VERSION_" not in response.text
 
 
 def test_browser_icon_routes_do_not_404() -> None:
