@@ -54,3 +54,21 @@ def test_resolve_model_pricing_aliases_compact_to_mini() -> None:
     assert pricing_model == "gpt-5.4-mini"
     assert pricing is not None
     assert pricing.output_per_million_usd > 0
+
+
+def test_resolve_model_pricing_supports_gpt_5_5() -> None:
+    pricing_model, pricing = resolve_model_pricing("gpt-5.5")
+
+    assert pricing_model == "gpt-5.5"
+    assert pricing is not None
+    assert pricing.input_per_million_usd == 5.0
+    assert pricing.cached_input_per_million_usd == 0.5
+    assert pricing.output_per_million_usd == 30.0
+
+
+def test_resolve_model_pricing_falls_back_to_gpt_5_5_family() -> None:
+    pricing_model, pricing = resolve_model_pricing("gpt-5.5-2026-05-01")
+
+    assert pricing_model == "gpt-5.5"
+    assert pricing is not None
+    assert pricing.output_per_million_usd == 30.0

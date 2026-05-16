@@ -316,6 +316,48 @@ def test_sanitize_codex_payload_removes_unsupported_fields() -> None:
     }
 
 
+def test_sanitize_codex_payload_removes_reasoning_content_recursively() -> None:
+    payload = {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "reasoning_content": "hidden",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "hello",
+                        "metadata": {"reasoning_content": "nested"},
+                    }
+                ],
+            }
+        ],
+        "reasoning_content": "top-level",
+    }
+
+    sanitized = _sanitize_codex_payload(payload)
+
+    assert sanitized == {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "hello",
+                        "metadata": {},
+                    }
+                ],
+            }
+        ],
+        "store": False,
+        "instructions": "",
+    }
+
+
 def test_sanitize_codex_payload_compact_strips_store() -> None:
     payload = {
         "model": "gpt-4.1",
@@ -1965,8 +2007,9 @@ def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request(
     )
     request_data = ResponsesRequest(
         model="gpt-5.4",
-        input=[{"role": "user", "content": "hello"}],
+        input=[{"role": "user", "content": "hello", "reasoning_content": "hidden"}],
         stream=False,
+        reasoning_content="top-level",
     )
 
     client = DummyClient()
@@ -1984,6 +2027,7 @@ def test_proxy_request_with_token_forces_upstream_stream_for_non_stream_request(
     stream_call = client.stream_calls[0]
     assert stream_call["headers"]["Accept"] == "text/event-stream"
     upstream_payload = json.loads(stream_call["content"])
+    assert "reasoning_content" not in stream_call["content"]
     assert upstream_payload["stream"] is True
     assert upstream_payload["store"] is False
     assert result.first_token_at is not None

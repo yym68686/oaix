@@ -2350,6 +2350,7 @@ def _sanitize_codex_payload(
     compact: bool = False,
     preserve_previous_response_id: bool = False,
 ) -> dict[str, Any]:
+    _remove_reasoning_content_fields(payload)
     payload.pop("max_output_tokens", None)
     payload.pop("response_format", None)
     if not preserve_previous_response_id:
@@ -2362,6 +2363,18 @@ def _sanitize_codex_payload(
         payload["store"] = False
     payload.setdefault("instructions", "")
     return payload
+
+
+def _remove_reasoning_content_fields(value: Any) -> None:
+    if isinstance(value, dict):
+        value.pop("reasoning_content", None)
+        for nested_value in value.values():
+            _remove_reasoning_content_fields(nested_value)
+        return
+
+    if isinstance(value, (list, tuple)):
+        for nested_value in value:
+            _remove_reasoning_content_fields(nested_value)
 
 
 def _admin_token_probe_model() -> str:

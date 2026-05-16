@@ -23,6 +23,7 @@ class UsageMetrics:
 
 
 DEFAULT_MODEL_PRICING: dict[str, ModelPricing] = {
+    "gpt-5.5": ModelPricing(input_per_million_usd=5.0, cached_input_per_million_usd=0.5, output_per_million_usd=30.0),
     "gpt-5": ModelPricing(input_per_million_usd=1.25, cached_input_per_million_usd=0.125, output_per_million_usd=10.0),
     "gpt-5-mini": ModelPricing(input_per_million_usd=0.25, cached_input_per_million_usd=0.025, output_per_million_usd=2.0),
     "gpt-5-nano": ModelPricing(input_per_million_usd=0.05, cached_input_per_million_usd=0.005, output_per_million_usd=0.4),
@@ -123,7 +124,7 @@ def resolve_model_pricing(model_name: str | None) -> tuple[str | None, ModelPric
             if pricing is not None:
                 return family_name, pricing
 
-    for family_name in ("gpt-5.4", "gpt-5"):
+    for family_name in ("gpt-5.5", "gpt-5.4", "gpt-5"):
         if normalized.startswith(family_name):
             pricing = env_pricing.get(family_name) or DEFAULT_MODEL_PRICING.get(family_name)
             if pricing is not None:
