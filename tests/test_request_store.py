@@ -1,7 +1,9 @@
+import asyncio
 from datetime import datetime, timezone
 
 from sqlalchemy.dialects import postgresql
 
+from oaix_gateway.database import GatewayRequestLog
 from oaix_gateway.request_store import (
     _build_request_bucket_analytics_stmt,
     _build_request_log_summary_stmt,
@@ -10,6 +12,7 @@ from oaix_gateway.request_store import (
     _build_request_model_analytics_stmt,
     _normalize_request_account_ids,
     _normalize_request_token_ids,
+    _upsert_request_logs_portable,
 )
 
 
@@ -116,3 +119,137 @@ def test_build_request_token_costs_stmt_groups_by_canonical_token_id() -> None:
     assert "JOIN codex_tokens ON gateway_request_logs.token_id = codex_tokens.id" in sql
     assert "coalesce(codex_tokens.merged_into_token_id, codex_tokens.id)" in sql
     assert "IN (7, 8)" in sql
+
+
+def test_upsert_request_logs_portable_prefetches_existing_rows_once(monkeypatch) -> None:
+    class _FakeScalarResult:
+        def __init__(self, rows) -> None:
+            self._rows = rows
+
+        def all(self):
+            return list(self._rows)
+
+        def first(self):
+            return self._rows[0] if self._rows else None
+
+    class _FakeResult:
+        def __init__(self, rows) -> None:
+            self._rows = rows
+
+        def scalars(self) -> _FakeScalarResult:
+            return _FakeScalarResult(self._rows)
+
+    class _FakeTransaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.executed_statements: list[str] = []
+            self.added: list[GatewayRequestLog] = []
+            self.flush_count = 0
+            self._next_id = 101
+
+        def begin(self) -> _FakeTransaction:
+            return _FakeTransaction()
+
+        async def execute(self, stmt) -> _FakeResult:
+            self.executed_statements.append(
+                str(
+                    stmt.compile(
+                        dialect=postgresql.dialect(),
+                        compile_kwargs={"literal_binds": True},
+                    )
+                )
+            )
+            return _FakeResult(
+                [
+                    GatewayRequestLog(
+                        id=77,
+                        request_id="existing",
+                        endpoint="/v1/responses",
+                        is_stream=False,
+                        attempt_count=1,
+                    )
+                ]
+            )
+
+        def add(self, item: GatewayRequestLog) -> None:
+            self.added.append(item)
+
+        async def flush(self) -> None:
+            self.flush_count += 1
+            for item in self.added:
+                if item.id is None:
+                    item.id = self._next_id
+                    self._next_id += 1
+
+    fake_session = _FakeSession()
+
+    def fake_get_request_log_session():
+        class _Ctx:
+            async def __aenter__(self_inner):
+                return fake_session
+
+            async def __aexit__(self_inner, exc_type, exc, tb):
+                return False
+
+        return _Ctx()
+
+    monkeypatch.setattr("oaix_gateway.request_store.get_request_log_session", fake_get_request_log_session)
+
+    base_values = {
+        "model": None,
+        "model_name": None,
+        "client_ip": None,
+        "user_agent": None,
+        "finished_at": None,
+        "first_token_at": None,
+        "ttft_ms": None,
+        "duration_ms": None,
+        "token_id": None,
+        "account_id": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "total_tokens": None,
+        "estimated_cost_usd": None,
+        "timing_spans": None,
+        "error_message": None,
+    }
+
+    result = asyncio.run(
+        _upsert_request_logs_portable(
+            [
+                {
+                    **base_values,
+                    "request_id": "existing",
+                    "endpoint": "/v1/responses",
+                    "is_stream": False,
+                    "status_code": 200,
+                    "success": True,
+                    "attempt_count": 1,
+                    "started_at": datetime(2026, 4, 14, tzinfo=timezone.utc),
+                },
+                {
+                    **base_values,
+                    "request_id": "new",
+                    "endpoint": "/v1/responses",
+                    "is_stream": True,
+                    "status_code": 500,
+                    "success": False,
+                    "attempt_count": 2,
+                    "started_at": datetime(2026, 4, 14, tzinfo=timezone.utc),
+                },
+            ]
+        )
+    )
+
+    assert len(fake_session.executed_statements) == 1
+    assert "WHERE gateway_request_logs.request_id IN ('existing', 'new')" in fake_session.executed_statements[0]
+    assert fake_session.flush_count == 1
+    assert [item["request_id"] for item in result] == ["existing", "new"]
+    assert result[0]["id"] == 77
+    assert result[1]["id"] == 101

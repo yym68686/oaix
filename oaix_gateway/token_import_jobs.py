@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Iterable, Protocol
 
 import httpx
-from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy import and_, case, insert, or_, select, update
 
 from .database import (
     CodexToken,
@@ -1039,8 +1039,12 @@ _ORIGINAL_MARK_IMPORT_ITEM_PUBLISHED = _mark_import_item_published
 
 
 async def _mark_import_items_published_batch(updates: Iterable[dict[str, Any]]) -> None:
-    rows = [dict(row) for row in updates if row.get("item_id") is not None]
-    if not rows:
+    rows_by_id: dict[int, dict[str, Any]] = {}
+    for row in updates:
+        if row.get("item_id") is None:
+            continue
+        rows_by_id[int(row["item_id"])] = dict(row)
+    if not rows_by_id:
         return
     if _mark_import_item_published is not _ORIGINAL_MARK_IMPORT_ITEM_PUBLISHED:
         await asyncio.gather(
@@ -1051,30 +1055,40 @@ async def _mark_import_items_published_batch(updates: Iterable[dict[str, Any]]) 
                     action=str(row.get("action") or ""),
                     publish_ms=max(0, int(row.get("publish_ms") or 0)),
                 )
-                for row in rows
+                for row in rows_by_id.values()
             )
         )
         return
     now = utcnow()
+    ids = tuple(sorted(rows_by_id))
+    status_by_id = {
+        item_id: IMPORT_ITEM_STATUS_DUPLICATE
+        if rows_by_id[item_id].get("action") == "duplicate"
+        else IMPORT_ITEM_STATUS_PUBLISHED
+        for item_id in ids
+    }
+    token_id_by_id = {item_id: int(rows_by_id[item_id]["token_id"]) for item_id in ids}
+    action_by_id = {item_id: str(rows_by_id[item_id].get("action") or "") for item_id in ids}
+    publish_ms_by_id = {
+        item_id: max(0, int(rows_by_id[item_id].get("publish_ms") or 0))
+        for item_id in ids
+    }
     async with get_import_session() as session:
         async with session.begin():
-            for row in rows:
-                await session.execute(
-                    update(TokenImportItem)
-                    .where(TokenImportItem.id == int(row["item_id"]))
-                    .values(
-                        status=IMPORT_ITEM_STATUS_DUPLICATE
-                        if row.get("action") == "duplicate"
-                        else IMPORT_ITEM_STATUS_PUBLISHED,
-                        token_id=int(row["token_id"]),
-                        action=str(row.get("action") or ""),
-                        publish_ms=max(0, int(row.get("publish_ms") or 0)),
-                        import_publish_ms=max(0, int(row.get("publish_ms") or 0)),
-                        published_at=now,
-                        error_message=None,
-                        updated_at=now,
-                    )
+            await session.execute(
+                update(TokenImportItem)
+                .where(TokenImportItem.id.in_(ids))
+                .values(
+                    status=case(status_by_id, value=TokenImportItem.id),
+                    token_id=case(token_id_by_id, value=TokenImportItem.id),
+                    action=case(action_by_id, value=TokenImportItem.id),
+                    publish_ms=case(publish_ms_by_id, value=TokenImportItem.id),
+                    import_publish_ms=case(publish_ms_by_id, value=TokenImportItem.id),
+                    published_at=now,
+                    error_message=None,
+                    updated_at=now,
                 )
+            )
             await session.flush()
 
 
@@ -1282,9 +1296,13 @@ async def _publish_staged_token_import_items_batch(
 
     await _mark_import_items_publish_pending(item.id for item in publish_items)
     try:
+        batch_signature = inspect.signature(publish_token_payload_batch)
+        publish_kwargs: dict[str, Any] = {"import_queue_position": import_queue_position}
+        if "apply_queue_position" in batch_signature.parameters:
+            publish_kwargs["apply_queue_position"] = False
         batch = await publish_token_payload_batch(
             [dict(item.validated_payload or {}) for item in publish_items],
-            import_queue_position=import_queue_position,
+            **publish_kwargs,
         )
         publish_ms = int((time.monotonic() - started_at) * 1000)
         results = list(preflight_results)
@@ -1679,7 +1697,7 @@ class TokenImportBackgroundWorker:
                 if "on_token_selection_settings_updated" in process_signature.parameters:
                     process_kwargs["on_token_selection_settings_updated"] = self._publish_token_selection_settings
                 result = await process_token_import_job(job, **process_kwargs)
-                del result
+                await self._apply_imported_token_queue_position(job, result)
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -820,7 +820,7 @@ def _pick_canonical_token(tokens: list[CodexToken]) -> CodexToken:
 
 
 def _pick_latest_value(tokens: list[CodexToken], attribute: str) -> Any | None:
-    for token in sorted(tokens, key=_token_history_rank, reverse=True):
+    for token in tokens:
         value = _non_empty_value(getattr(token, attribute, None))
         if value is not None:
             return value
@@ -856,19 +856,20 @@ def _merge_duplicate_token_rows(
     merged_at = now or utcnow()
     canonical = _pick_canonical_token(tokens)
     shadows = [token for token in tokens if token.id != canonical.id]
+    tokens_by_recency = sorted(tokens, key=_token_history_rank, reverse=True)
     merged_aliases: list[str] = []
     for token in tokens:
         merged_aliases = merge_refresh_token_aliases(merged_aliases, *_token_aliases(token))
 
     canonical.refresh_token_aliases = merged_aliases
     canonical.merged_into_token_id = None
-    canonical.email = canonical.email or _pick_latest_value(tokens, "email")
-    canonical.account_id = canonical.account_id or _pick_latest_value(tokens, "account_id")
-    canonical.id_token = canonical.id_token or _pick_latest_value(tokens, "id_token")
-    canonical.source_file = canonical.source_file or _pick_latest_value(tokens, "source_file")
-    canonical.recovery = canonical.recovery or _pick_latest_value(tokens, "recovery")
-    canonical.raw_payload = canonical.raw_payload or _pick_latest_value(tokens, "raw_payload")
-    canonical.token_type = canonical.token_type or _pick_latest_value(tokens, "token_type") or "codex"
+    canonical.email = canonical.email or _pick_latest_value(tokens_by_recency, "email")
+    canonical.account_id = canonical.account_id or _pick_latest_value(tokens_by_recency, "account_id")
+    canonical.id_token = canonical.id_token or _pick_latest_value(tokens_by_recency, "id_token")
+    canonical.source_file = canonical.source_file or _pick_latest_value(tokens_by_recency, "source_file")
+    canonical.recovery = canonical.recovery or _pick_latest_value(tokens_by_recency, "recovery")
+    canonical.raw_payload = canonical.raw_payload or _pick_latest_value(tokens_by_recency, "raw_payload")
+    canonical.token_type = canonical.token_type or _pick_latest_value(tokens_by_recency, "token_type") or "codex"
 
     canonical.last_refresh_at = max(
         (token.last_refresh_at for token in tokens if token.last_refresh_at is not None),
@@ -1368,8 +1369,73 @@ def _token_aliases(token: CodexToken) -> list[str]:
     return collect_refresh_token_aliases(token.refresh_token_aliases, token.refresh_token, token.raw_payload)
 
 
+class _TokenHistoryLookup:
+    def __init__(self, tokens: Iterable[CodexToken]) -> None:
+        self._exact_matches: dict[str, list[CodexToken]] = {}
+        self._groups_by_alias: dict[str, list[list[CodexToken]]] = {}
+        self._group_by_token_object_id: dict[int, list[CodexToken]] = {}
+
+        token_list = list(tokens)
+        groups = group_rows_by_refresh_token_history(token_list, alias_getter=_token_aliases)
+        for group in groups:
+            self._register_group(group)
+
+    def _register_group(self, group: list[CodexToken]) -> None:
+        for token in group:
+            self._group_by_token_object_id[id(token)] = group
+            refresh_token = normalize_refresh_token(token.refresh_token)
+            if refresh_token is not None:
+                exact_matches = self._exact_matches.setdefault(refresh_token, [])
+                if token not in exact_matches:
+                    exact_matches.append(token)
+            self.refresh_token_aliases(token)
+
+    def add_token(self, token: CodexToken) -> None:
+        self._register_group([token])
+
+    def refresh_token_aliases(self, token: CodexToken) -> None:
+        group = self._group_by_token_object_id.get(id(token))
+        if group is None:
+            return
+        for alias in _token_aliases(token):
+            groups = self._groups_by_alias.setdefault(alias, [])
+            if all(existing_group is not group for existing_group in groups):
+                groups.append(group)
+
+    def find(self, *, refresh_token: str, account_id: str | None) -> CodexToken | None:
+        exact_matches = sorted(
+            self._exact_matches.get(refresh_token, ()),
+            key=lambda item: item.id,
+            reverse=True,
+        )
+        token = _pick_preferred_token(exact_matches, account_id=account_id)
+        if token is not None:
+            return token
+
+        matching_groups = self._groups_by_alias.get(refresh_token, ())
+        if not matching_groups:
+            return None
+
+        preferred_matches = [
+            _pick_canonical_token(group)
+            for group in matching_groups
+            if account_id and any(token_row.account_id == account_id for token_row in group)
+        ]
+        if preferred_matches:
+            return max(preferred_matches, key=lambda item: item.id)
+        return max((_pick_canonical_token(group) for group in matching_groups), key=lambda item: item.id)
+
+
 def _normalize_token_account_ids(account_ids: list[str] | set[str] | tuple[str, ...]) -> list[str]:
     return sorted({str(value or "").strip() for value in account_ids if str(value or "").strip()})
+
+
+def _token_identity_lock_keys(*, refresh_token: str, account_id: str | None) -> tuple[str, ...]:
+    lock_keys = [f"{TOKEN_IDENTITY_LOCK_NAMESPACE}:refresh:{refresh_token}"]
+    normalized_account_id = str(account_id or "").strip()
+    if normalized_account_id:
+        lock_keys.append(f"{TOKEN_IDENTITY_LOCK_NAMESPACE}:account:{normalized_account_id}")
+    return tuple(lock_keys)
 
 
 async def _acquire_token_identity_locks(
@@ -1378,12 +1444,20 @@ async def _acquire_token_identity_locks(
     refresh_token: str,
     account_id: str | None,
 ) -> None:
-    lock_keys = [f"{TOKEN_IDENTITY_LOCK_NAMESPACE}:refresh:{refresh_token}"]
-    normalized_account_id = str(account_id or "").strip()
-    if normalized_account_id:
-        lock_keys.append(f"{TOKEN_IDENTITY_LOCK_NAMESPACE}:account:{normalized_account_id}")
+    for lock_key in sorted(set(_token_identity_lock_keys(refresh_token=refresh_token, account_id=account_id))):
+        await _acquire_postgres_transaction_lock(session, lock_key=lock_key)
 
-    for lock_key in sorted(set(lock_keys)):
+
+async def _acquire_token_identity_locks_for_batch(
+    session,
+    identities: Iterable[tuple[str, str | None]],
+) -> None:
+    lock_keys = {
+        lock_key
+        for refresh_token, account_id in identities
+        for lock_key in _token_identity_lock_keys(refresh_token=refresh_token, account_id=account_id)
+    }
+    for lock_key in sorted(lock_keys):
         await _acquire_postgres_transaction_lock(session, lock_key=lock_key)
 
 
@@ -1451,7 +1525,11 @@ async def _find_existing_token(
     *,
     refresh_token: str,
     account_id: str | None,
+    history_lookup: _TokenHistoryLookup | None = None,
 ) -> CodexToken | None:
+    if history_lookup is not None:
+        return history_lookup.find(refresh_token=refresh_token, account_id=account_id)
+
     exact_result = await session.execute(
         select(CodexToken)
         .where(*_canonical_token_filters(), CodexToken.refresh_token == refresh_token)
@@ -1484,12 +1562,21 @@ async def _find_existing_token(
     return max((_pick_canonical_token(group) for group in matching_groups), key=lambda item: item.id)
 
 
+async def _load_token_history_lookup(session) -> _TokenHistoryLookup:
+    canonical_result = await session.execute(
+        select(CodexToken).where(*_canonical_token_filters()).order_by(CodexToken.id.desc())
+    )
+    return _TokenHistoryLookup(canonical_result.scalars().all())
+
+
 async def _upsert_token_payload_in_session(
     session,
     token_data_or_json: str | dict[str, Any],
     *,
     source_file: str | None = None,
     invalidate_cache: bool = True,
+    history_lookup: _TokenHistoryLookup | None = None,
+    acquire_identity_lock: bool = True,
 ) -> TokenUpsertResult:
     payload = _load_token_payload(token_data_or_json)
     email = str(payload.get("email") or "").strip() or None
@@ -1504,8 +1591,14 @@ async def _upsert_token_payload_in_session(
     payload_last_error = str(payload.get("last_error") or "").strip() or None
     expires_at = extract_token_expiration_from_payload(payload)
 
-    await _acquire_token_identity_locks(session, refresh_token=refresh_token, account_id=account_id)
-    token = await _find_existing_token(session, refresh_token=refresh_token, account_id=account_id)
+    if acquire_identity_lock:
+        await _acquire_token_identity_locks(session, refresh_token=refresh_token, account_id=account_id)
+    token = await _find_existing_token(
+        session,
+        refresh_token=refresh_token,
+        account_id=account_id,
+        history_lookup=history_lookup,
+    )
     if token is None:
         token = CodexToken(
             email=email,
@@ -1529,6 +1622,8 @@ async def _upsert_token_payload_in_session(
         )
         session.add(token)
         await session.flush()
+        if history_lookup is not None:
+            history_lookup.add_token(token)
         if invalidate_cache:
             invalidate_fill_first_token_cache()
         return TokenUpsertResult(token=token, action="created")
@@ -1538,6 +1633,8 @@ async def _upsert_token_payload_in_session(
     token.token_type = str(payload.get("type") or token.token_type or "codex").strip() or token.token_type or "codex"
     token.source_file = source_file or token.source_file
     token.refresh_token_aliases = merge_refresh_token_aliases(_token_aliases(token), refresh_token)
+    if history_lookup is not None:
+        history_lookup.refresh_token_aliases(token)
     token.updated_at = utcnow()
 
     if refresh_token == normalize_refresh_token(token.refresh_token):
@@ -1800,13 +1897,22 @@ async def publish_token_payload_batch(
     payloads: Iterable[dict[str, Any]],
     *,
     import_queue_position: str,
+    apply_queue_position: bool = True,
 ) -> TokenPublishBatchResult:
-    resolved_payloads = [dict(payload) for payload in payloads]
+    resolved_payloads = [_load_token_payload(dict(payload)) for payload in payloads]
     if not resolved_payloads:
         return TokenPublishBatchResult(results=())
 
     async with get_session() as session:
         async with session.begin():
+            identities: list[tuple[str, str | None]] = []
+            for payload in resolved_payloads:
+                refresh_token = normalize_refresh_token(payload.get("refresh_token"))
+                if refresh_token is None:
+                    raise ValueError("Token payload missing refresh_token or access_token")
+                identities.append((refresh_token, extract_token_account_id_from_payload(payload)))
+            await _acquire_token_identity_locks_for_batch(session, identities)
+            history_lookup = await _load_token_history_lookup(session)
             results: list[TokenUpsertResult] = []
             imported_token_ids: list[int] = []
             for payload in resolved_payloads:
@@ -1814,13 +1920,15 @@ async def publish_token_payload_batch(
                     session,
                     payload,
                     invalidate_cache=False,
+                    history_lookup=history_lookup,
+                    acquire_identity_lock=False,
                 )
                 results.append(result)
                 if result.action in {"created", "updated"}:
                     imported_token_ids.append(int(result.token.id))
 
             selection: TokenSelectionSettings | None = None
-            if imported_token_ids:
+            if apply_queue_position and imported_token_ids:
                 selection = await _apply_imported_token_queue_position_in_session(
                     session,
                     imported_token_ids,

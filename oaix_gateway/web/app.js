@@ -31,6 +31,7 @@ const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 const IMPORT_QUEUE_POSITION_OPTIONS = new Set(["front", "back"]);
 const DEFAULT_IMPORT_QUEUE_POSITION = "front";
 const TOKEN_QUERY_DEBOUNCE_MS = 240;
+const TOKEN_QUOTA_RETRY_DELAY_MS = 1200;
 const TOKEN_ACTIVE_STREAM_CAP_MIN = 1;
 const TOKEN_ACTIVE_STREAM_CAP_MAX = 10;
 const DEFAULT_TOKEN_ACTIVE_STREAM_CAP = 10;
@@ -88,6 +89,7 @@ const state = {
   tokenListRequestSeq: 0,
   tokenQuotaAbortController: null,
   tokenQuotaRequestSeq: 0,
+  tokenQuotaRetryTimer: null,
   tokenPagination: {
     total: 0,
     limit: TOKEN_PAGE_SIZE,
@@ -2723,6 +2725,30 @@ function abortTokenQuotaRequest() {
     state.tokenQuotaAbortController.abort();
     state.tokenQuotaAbortController = null;
   }
+  if (state.tokenQuotaRetryTimer) {
+    window.clearTimeout(state.tokenQuotaRetryTimer);
+    state.tokenQuotaRetryTimer = null;
+  }
+}
+
+function scheduleTokenQuotaRetry(tokenIds, { listRequestSeq = state.tokenListRequestSeq } = {}) {
+  const resolvedIds = Array.from(
+    new Set(
+      (Array.isArray(tokenIds) ? tokenIds : [])
+        .map((id) => Number(id))
+        .filter((id) => Number.isFinite(id) && id > 0),
+    ),
+  );
+  if (!resolvedIds.length || listRequestSeq !== state.tokenListRequestSeq) {
+    return;
+  }
+  if (state.tokenQuotaRetryTimer) {
+    window.clearTimeout(state.tokenQuotaRetryTimer);
+  }
+  state.tokenQuotaRetryTimer = window.setTimeout(() => {
+    state.tokenQuotaRetryTimer = null;
+    void loadTokenQuotas(resolvedIds, { listRequestSeq });
+  }, TOKEN_QUOTA_RETRY_DELAY_MS);
 }
 
 function markTokenQuotaPending(item) {
@@ -2832,6 +2858,9 @@ async function loadTokenQuotas(tokenIds, { listRequestSeq = state.tokenListReque
       return item;
     });
     renderTokenList(state.tokenItems);
+    if (Array.isArray(data.refresh_pending_ids) && data.refresh_pending_ids.length) {
+      scheduleTokenQuotaRetry(data.refresh_pending_ids, { listRequestSeq });
+    }
   } catch (error) {
     if (isAbortError(error) || quotaRequestSeq !== state.tokenQuotaRequestSeq || listRequestSeq !== state.tokenListRequestSeq) {
       return;

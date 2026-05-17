@@ -91,6 +91,7 @@ from oaix_gateway.token_import_jobs import (
     IMPORT_ITEM_STATUS_FAILED,
     IMPORT_ITEM_STATUS_PUBLISH_PENDING,
     IMPORT_ITEM_STATUS_PUBLISHED,
+    _mark_import_items_published_batch,
 )
 from oaix_gateway.token_store import (
     ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX,
@@ -6741,6 +6742,53 @@ def _install_staged_import_fakes(monkeypatch, job_id: int, payloads: list[object
     )
     monkeypatch.setattr("oaix_gateway.token_import_jobs._mark_import_item_published", fake_mark_import_item_published)
     return staged_items
+
+
+def test_mark_import_items_published_batch_uses_single_update(monkeypatch) -> None:
+    class _FakeTransaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+            self.flush_count = 0
+
+        def begin(self) -> _FakeTransaction:
+            return _FakeTransaction()
+
+        async def execute(self, stmt):
+            self.statements.append(str(stmt.compile(compile_kwargs={"literal_binds": True})))
+            return SimpleNamespace()
+
+        async def flush(self) -> None:
+            self.flush_count += 1
+
+    fake_session = _FakeSession()
+
+    @asynccontextmanager
+    async def fake_get_import_session():
+        yield fake_session
+
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.get_import_session", fake_get_import_session)
+
+    asyncio.run(
+        _mark_import_items_published_batch(
+            [
+                {"item_id": 1, "token_id": 10, "action": "created", "publish_ms": 12},
+                {"item_id": 2, "token_id": 11, "action": "duplicate", "publish_ms": 34},
+            ]
+        )
+    )
+
+    assert fake_session.flush_count == 1
+    assert len(fake_session.statements) == 1
+    assert "UPDATE token_import_items SET" in fake_session.statements[0]
+    assert "CASE token_import_items.id" in fake_session.statements[0]
+    assert "WHERE token_import_items.id IN (1, 2)" in fake_session.statements[0]
 
 
 def test_process_token_import_job_enriches_missing_account_id(monkeypatch) -> None:

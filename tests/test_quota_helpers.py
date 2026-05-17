@@ -9,6 +9,7 @@ from oaix_gateway.database import CodexToken
 from oaix_gateway.quota import (
     CodexQuotaService,
     CodexQuotaSnapshot,
+    _CachedQuotaSnapshot,
     WHAM_USER_AGENT,
     extract_codex_plan_info,
     parse_codex_quota_payload,
@@ -263,6 +264,54 @@ def test_quota_service_limits_full_snapshot_fetch_concurrency(monkeypatch) -> No
 
     assert set(snapshots) == {1, 2, 3, 4, 5, 6}
     assert max_active == 2
+
+
+def test_quota_service_prefers_fresh_cache_before_fetch(monkeypatch) -> None:
+    fetch_calls: list[int] = []
+
+    async def fake_fetch_snapshot(self, token_row, *, client, oauth_manager, account_id):
+        del client, oauth_manager, account_id
+        fetch_calls.append(token_row.id)
+        return CodexQuotaSnapshot(
+            fetched_at=datetime.now(timezone.utc),
+            error=None,
+            plan_type="plus",
+            windows=[],
+        )
+
+    monkeypatch.setattr("oaix_gateway.quota.CodexQuotaService._fetch_snapshot", fake_fetch_snapshot)
+
+    service = CodexQuotaService(ttl_seconds=60, concurrency=1)
+    token_row = CodexToken(
+        id=33,
+        account_id="acct_33",
+        refresh_token="rt_33",
+        token_type="codex",
+        is_active=True,
+    )
+    cached_snapshot = CodexQuotaSnapshot(
+        fetched_at=datetime.now(timezone.utc),
+        error=None,
+        plan_type="pro",
+        windows=[],
+    )
+    service._cache[33] = _CachedQuotaSnapshot(
+        snapshot=cached_snapshot,
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+    )
+
+    async def runner():
+        return await service.get_many(
+            [token_row],
+            client=object(),
+            oauth_manager=object(),
+            account_ids={33: "acct_33"},
+        )
+
+    snapshots = asyncio.run(runner())
+
+    assert fetch_calls == []
+    assert snapshots[33].plan_type == "pro"
 
 
 def test_quota_service_returns_snapshot_when_plan_type_persist_fails(monkeypatch) -> None:

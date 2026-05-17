@@ -14,6 +14,7 @@ from oaix_gateway.token_store import (
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenHistoryRepairSummary,
     TokenSelectionSettings,
+    TokenUpsertResult,
     _FILL_FIRST_TOKEN_CACHE,
     _FILL_FIRST_TOKEN_REFRESH_TASKS,
     _FillFirstTokenCacheEntry,
@@ -27,6 +28,7 @@ from oaix_gateway.token_store import (
     invalidate_fill_first_token_cache,
     list_token_rows,
     prewarm_fill_first_token_cache,
+    publish_token_payload_batch,
     repair_duplicate_token_histories,
     set_token_active_state,
     update_token_refresh_state,
@@ -193,6 +195,68 @@ def test_build_token_counts_stmt_uses_single_aggregate_query() -> None:
     assert "sum(CASE WHEN (codex_tokens.is_active IS true)" in sql
     assert "codex_tokens.type = 'codex'" in sql
     assert sql.count("FROM codex_tokens") == 1
+
+
+def test_publish_token_payload_batch_uses_one_history_lookup_and_can_defer_queue(monkeypatch) -> None:
+    calls: dict[str, object] = {"locks": 0, "lookups": 0, "queue": 0, "identities": ()}
+    history_lookup = object()
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield _FakeSession()
+
+    async def fake_acquire_locks(session, identities) -> None:
+        del session
+        calls["locks"] = int(calls["locks"]) + 1
+        calls["identities"] = tuple(identities)
+
+    async def fake_load_lookup(session):
+        del session
+        calls["lookups"] = int(calls["lookups"]) + 1
+        return history_lookup
+
+    async def fake_upsert(session, payload, *, invalidate_cache, history_lookup: object, acquire_identity_lock: bool):
+        del session, invalidate_cache
+        assert history_lookup is calls["history_lookup"]
+        assert acquire_identity_lock is False
+        token_id = 40 + len(calls.setdefault("upserts", []))
+        calls["upserts"].append(payload["refresh_token"])
+        return TokenUpsertResult(
+            token=CodexToken(id=token_id, refresh_token=payload["refresh_token"], token_type="codex"),
+            action="created",
+        )
+
+    async def fake_apply_queue_position(session, token_ids, *, position: str) -> TokenSelectionSettings:
+        del session, token_ids, position
+        calls["queue"] = int(calls["queue"]) + 1
+        return TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, token_order=(41, 42))
+
+    calls["history_lookup"] = history_lookup
+    monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
+    monkeypatch.setattr("oaix_gateway.token_store._acquire_token_identity_locks_for_batch", fake_acquire_locks)
+    monkeypatch.setattr("oaix_gateway.token_store._load_token_history_lookup", fake_load_lookup)
+    monkeypatch.setattr("oaix_gateway.token_store._upsert_token_payload_in_session", fake_upsert)
+    monkeypatch.setattr(
+        "oaix_gateway.token_store._apply_imported_token_queue_position_in_session",
+        fake_apply_queue_position,
+    )
+
+    result = asyncio.run(
+        publish_token_payload_batch(
+            [
+                {"refresh_token": " rt-1 ", "account_id": "acct-1"},
+                {"refresh_token": "rt-2", "account_id": "acct-2"},
+            ],
+            import_queue_position="front",
+            apply_queue_position=False,
+        )
+    )
+
+    assert calls["locks"] == 1
+    assert calls["lookups"] == 1
+    assert calls["queue"] == 0
+    assert calls["identities"] == (("rt-1", "acct-1"), ("rt-2", "acct-2"))
+    assert [item.token.id for item in result.results] == [40, 41]
 
 
 def test_list_token_rows_applies_limit_and_offset(monkeypatch) -> None:

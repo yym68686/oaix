@@ -408,28 +408,33 @@ def _merge_request_log_payload(item: GatewayRequestLog, values: dict[str, Any]) 
 
 
 async def _upsert_request_logs_portable(values_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
+    results: list[tuple[str, GatewayRequestLog]] = []
     async with get_request_log_session() as session:
         async with session.begin():
+            request_ids = [str(values["request_id"]) for values in values_list]
+            existing_result = await session.execute(
+                select(GatewayRequestLog).where(GatewayRequestLog.request_id.in_(request_ids))
+            )
+            existing_by_request_id = {item.request_id: item for item in existing_result.scalars().all()}
             for values in values_list:
-                result = await session.execute(
-                    select(GatewayRequestLog).where(GatewayRequestLog.request_id == values["request_id"]).limit(1)
-                )
-                item = result.scalars().first()
+                request_id = str(values["request_id"])
+                item = existing_by_request_id.get(request_id)
                 if item is None:
                     item = GatewayRequestLog(**values)
                     session.add(item)
-                    await session.flush()
+                    existing_by_request_id[request_id] = item
                 else:
                     _merge_request_log_payload(item, values)
-                results.append(
-                    {
-                        "request_id": item.request_id,
-                        "id": item.id,
-                        "timing_spans": item.timing_spans,
-                    }
-                )
-    return results
+                results.append((request_id, item))
+            await session.flush()
+    return [
+        {
+            "request_id": request_id,
+            "id": item.id,
+            "timing_spans": item.timing_spans,
+        }
+        for request_id, item in results
+    ]
 
 
 def _timing_snapshot(timing_recorder: Any | None) -> dict[str, Any] | None:

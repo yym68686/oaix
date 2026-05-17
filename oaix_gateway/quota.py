@@ -452,8 +452,14 @@ class CodexQuotaService:
             return None
         return cached.snapshot
 
-    def get_cached_snapshot(self, token_id: int) -> CodexQuotaSnapshot | None:
-        return self._fresh_cached_snapshot(token_id)
+    def has_fresh_cached_snapshot(self, token_id: int) -> bool:
+        return self._fresh_cached_snapshot(token_id) is not None
+
+    def get_cached_snapshot(self, token_id: int, *, include_stale: bool = False) -> CodexQuotaSnapshot | None:
+        if not include_stale:
+            return self._fresh_cached_snapshot(token_id)
+        cached = self._cache.get(token_id)
+        return cached.snapshot if cached is not None else None
 
     async def get_snapshot(
         self,

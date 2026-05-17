@@ -2264,6 +2264,14 @@ def _admin_quota_max_concurrency() -> int:
     return _int_env("ADMIN_QUOTA_MAX_CONCURRENCY", 2, minimum=1)
 
 
+def _admin_quota_sync_refresh_limit() -> int:
+    return _int_env("ADMIN_QUOTA_SYNC_REFRESH_LIMIT", 12, minimum=0)
+
+
+def _admin_quota_background_refresh_limit() -> int:
+    return _int_env("ADMIN_QUOTA_BACKGROUND_REFRESH_LIMIT", 100, minimum=1)
+
+
 def _admin_requests_cache_ttl_seconds() -> float:
     return _float_env("ADMIN_REQUESTS_CACHE_TTL_SECONDS", 5.0, minimum=0.0)
 
@@ -7051,6 +7059,139 @@ async def _cached_admin_token_counts(app: FastAPI) -> Any:
     return counts
 
 
+def _admin_quota_refresh_tasks(app: FastAPI) -> dict[int, asyncio.Task[None]]:
+    tasks = getattr(app.state, "admin_quota_refresh_tasks", None)
+    if not isinstance(tasks, dict):
+        tasks = {}
+        app.state.admin_quota_refresh_tasks = tasks
+    return tasks
+
+
+def _schedule_admin_quota_refresh(
+    app: FastAPI,
+    token_rows: list[Any],
+    *,
+    account_ids: dict[int, str | None],
+) -> tuple[int, ...]:
+    if not token_rows:
+        return ()
+
+    task_map = _admin_quota_refresh_tasks(app)
+    pending_rows = [token_row for token_row in token_rows if int(token_row.id) not in task_map]
+    if not pending_rows:
+        return ()
+
+    batch = pending_rows[: _admin_quota_background_refresh_limit()]
+    if not batch:
+        return ()
+
+    token_ids = tuple(int(token_row.id) for token_row in batch)
+    quota_service: CodexQuotaService = app.state.quota_service
+    client: httpx.AsyncClient = _state_http_client(app, "admin_http_client")
+    oauth_manager: CodexOAuthManager = app.state.oauth_manager
+
+    async def refresh() -> None:
+        try:
+            await quota_service.get_many(
+                batch,
+                client=client,
+                oauth_manager=oauth_manager,
+                account_ids=account_ids,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to refresh admin token quota snapshots in background")
+        finally:
+            for token_id in token_ids:
+                task_map.pop(token_id, None)
+
+    task = asyncio.create_task(refresh(), name="oaix-admin-quota-refresh")
+    for token_id in token_ids:
+        task_map[token_id] = task
+    return token_ids
+
+
+async def _collect_admin_token_quota_snapshots(
+    app: FastAPI,
+    *,
+    token_rows: list[Any],
+) -> tuple[dict[int, CodexQuotaSnapshot], tuple[int, ...]]:
+    if not token_rows:
+        return {}, ()
+
+    quota_service: CodexQuotaService = app.state.quota_service
+    client: httpx.AsyncClient = _state_http_client(app, "admin_http_client")
+    oauth_manager: CodexOAuthManager = app.state.oauth_manager
+    effective_account_ids = {
+        token_row.id: (
+            extract_codex_plan_info(
+                token_row.id_token,
+                account_id=token_row.account_id,
+                raw_payload=token_row.raw_payload,
+            ).chatgpt_account_id
+            or token_row.account_id
+        )
+        for token_row in token_rows
+    }
+
+    quota_by_id: dict[int, CodexQuotaSnapshot] = {}
+    get_cached_snapshot = getattr(quota_service, "get_cached_snapshot", None)
+    has_fresh_cached_snapshot = getattr(quota_service, "has_fresh_cached_snapshot", None)
+    if not callable(get_cached_snapshot) or not callable(has_fresh_cached_snapshot):
+        return (
+            await quota_service.get_many(
+                token_rows,
+                client=client,
+                oauth_manager=oauth_manager,
+                account_ids=effective_account_ids,
+            ),
+            (),
+        )
+
+    refresh_rows: list[Any] = []
+    pending_ids: list[int] = []
+    inflight_refresh_ids = set(_admin_quota_refresh_tasks(app))
+    for token_row in token_rows:
+        token_id = int(token_row.id)
+        cached_snapshot = get_cached_snapshot(token_id, include_stale=True)
+        if cached_snapshot is not None:
+            quota_by_id[token_id] = cached_snapshot
+        if has_fresh_cached_snapshot(token_id):
+            continue
+        if token_id in inflight_refresh_ids:
+            pending_ids.append(token_id)
+            continue
+        if token_id not in inflight_refresh_ids:
+            refresh_rows.append(token_row)
+
+    sync_refresh_limit = _admin_quota_sync_refresh_limit()
+    sync_rows = refresh_rows[:sync_refresh_limit]
+    background_rows = refresh_rows[sync_refresh_limit:]
+
+    if sync_rows:
+        try:
+            quota_by_id.update(
+                await quota_service.get_many(
+                    sync_rows,
+                    client=client,
+                    oauth_manager=oauth_manager,
+                    account_ids=effective_account_ids,
+                )
+            )
+        except Exception:
+            logger.exception("Failed to collect admin token quota snapshots")
+
+    pending_ids.extend(
+        _schedule_admin_quota_refresh(
+            app,
+            background_rows,
+            account_ids=effective_account_ids,
+        )
+    )
+    return quota_by_id, tuple(dict.fromkeys(pending_ids))
+
+
 async def _build_admin_token_items(
     app: FastAPI,
     *,
@@ -7096,28 +7237,13 @@ async def _build_admin_token_items(
         except Exception:
             logger.exception("Failed to collect admin token observed cost fallbacks")
     if include_quota and token_rows:
-        quota_service: CodexQuotaService = app.state.quota_service
-        client: httpx.AsyncClient = _state_http_client(app, "admin_http_client")
-        oauth_manager: CodexOAuthManager = app.state.oauth_manager
-        effective_account_ids = {
-            token_row.id: plan_info_by_id[token_row.id].chatgpt_account_id or token_row.account_id
-            for token_row in token_rows
-        }
         quota_token_rows = [
             token_row
             for token_row in token_rows
             if bool(getattr(token_row, "is_active", False))
             and _normalize_optional_text(getattr(token_row, "refresh_token", None)) is not None
         ]
-        try:
-            quota_by_id = await quota_service.get_many(
-                quota_token_rows,
-                client=client,
-                oauth_manager=oauth_manager,
-                account_ids=effective_account_ids,
-            )
-        except Exception:
-            logger.exception("Failed to collect admin token quota snapshots")
+        quota_by_id, _ = await _collect_admin_token_quota_snapshots(app, token_rows=quota_token_rows)
 
     return [
         _serialize_admin_token_item(
@@ -7186,30 +7312,17 @@ async def _build_admin_token_quota_items(
         )
         for token_row in token_rows
     }
-    quota_by_id: dict[int, CodexQuotaSnapshot] = {}
     quota_token_rows = [
         token_row
         for token_row in token_rows
         if bool(getattr(token_row, "is_active", False))
         and _normalize_optional_text(getattr(token_row, "refresh_token", None)) is not None
     ]
+    quota_by_id: dict[int, CodexQuotaSnapshot] = {}
+    refresh_pending_ids: tuple[int, ...] = ()
     if quota_token_rows:
-        quota_service: CodexQuotaService = app.state.quota_service
-        client: httpx.AsyncClient = _state_http_client(app, "admin_http_client")
-        oauth_manager: CodexOAuthManager = app.state.oauth_manager
-        effective_account_ids = {
-            token_row.id: plan_info_by_id[token_row.id].chatgpt_account_id or token_row.account_id
-            for token_row in token_rows
-        }
-        try:
-            quota_by_id = await quota_service.get_many(
-                quota_token_rows,
-                client=client,
-                oauth_manager=oauth_manager,
-                account_ids=effective_account_ids,
-            )
-        except Exception:
-            logger.exception("Failed to collect admin token quota snapshots")
+        quota_by_id, refresh_pending_ids = await _collect_admin_token_quota_snapshots(app, token_rows=quota_token_rows)
+    app.state.admin_token_quota_refresh_pending_ids = refresh_pending_ids
 
     return [
         {
@@ -7300,6 +7413,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        quota_refresh_tasks = set(_admin_quota_refresh_tasks(app).values())
+        for task in quota_refresh_tasks:
+            task.cancel()
+        if quota_refresh_tasks:
+            await asyncio.gather(*quota_refresh_tasks, return_exceptions=True)
         retention_task = getattr(app.state, "request_log_retention_task", None)
         if isinstance(retention_task, asyncio.Task):
             retention_task.cancel()
@@ -7584,7 +7702,13 @@ def create_app() -> FastAPI:
             token_ids=token_ids,
         )
         items = await _build_admin_token_quota_items(http_request.app, token_rows=token_rows)
-        return {"items": items}
+        refresh_pending_ids = getattr(http_request.app.state, "admin_token_quota_refresh_pending_ids", ())
+        requested_token_ids = {int(row.id) for row in token_rows}
+        response = {"items": items}
+        pending_ids = [int(token_id) for token_id in refresh_pending_ids if int(token_id) in requested_token_ids]
+        if pending_ids:
+            response["refresh_pending_ids"] = pending_ids
+        return response
 
     @app.post("/admin/tokens/{token_id}/activation")
     async def update_token_activation_route(
