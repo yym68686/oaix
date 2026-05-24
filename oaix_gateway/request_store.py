@@ -31,9 +31,13 @@ class RequestLogItem:
     duration_ms: int | None
     timing_spans: dict[str, Any] | None
     input_tokens: int | None
+    cached_input_tokens: int | None
     output_tokens: int | None
     total_tokens: int | None
     estimated_cost_usd: float | None
+    prompt_cache_key_hash: str | None
+    cache_affinity_result: str | None
+    cache_affinity_lane_index: int | None
     error_message: str | None
 
 
@@ -284,9 +288,13 @@ async def finalize_request_log(
     account_id: str | None = None,
     model_name: str | None = None,
     input_tokens: int | None = None,
+    cached_input_tokens: int | None = None,
     output_tokens: int | None = None,
     total_tokens: int | None = None,
     estimated_cost_usd: float | None = None,
+    prompt_cache_key_hash: str | None = None,
+    cache_affinity_result: str | None = None,
+    cache_affinity_lane_index: int | None = None,
     timing_spans: dict[str, Any] | None = None,
     error_message: str | None = None,
 ) -> dict[str, Any] | None:
@@ -313,11 +321,22 @@ async def finalize_request_log(
             item.account_id = account_id or item.account_id
             item.model_name = model_name or item.model_name or item.model
             item.input_tokens = _int_or_zero(input_tokens) if input_tokens is not None else item.input_tokens
+            item.cached_input_tokens = (
+                _int_or_zero(cached_input_tokens) if cached_input_tokens is not None else item.cached_input_tokens
+            )
             item.output_tokens = _int_or_zero(output_tokens) if output_tokens is not None else item.output_tokens
             item.total_tokens = _int_or_zero(total_tokens) if total_tokens is not None else item.total_tokens
             item.estimated_cost_usd = (
                 _round_cost(estimated_cost_usd) if estimated_cost_usd is not None else item.estimated_cost_usd
             )
+            item.prompt_cache_key_hash = (
+                str(prompt_cache_key_hash or "").strip()[:64] or item.prompt_cache_key_hash
+            )
+            item.cache_affinity_result = (
+                str(cache_affinity_result or "").strip()[:64] or item.cache_affinity_result
+            )
+            if cache_affinity_lane_index is not None:
+                item.cache_affinity_lane_index = _int_or_zero(cache_affinity_lane_index)
             if resolved_timing_spans is not None:
                 resolved_timing_spans["finalize_ms"] = max(0, int((perf_counter() - finalize_started) * 1000))
                 item.timing_spans = resolved_timing_spans
@@ -368,10 +387,20 @@ def _request_log_payload_values(payload: dict[str, Any]) -> dict[str, Any]:
         "duration_ms": _ms_between(started_at, finished_at),
         "timing_spans": timing_spans,
         "input_tokens": _int_or_zero(payload.get("input_tokens")) if payload.get("input_tokens") is not None else None,
+        "cached_input_tokens": (
+            _int_or_zero(payload.get("cached_input_tokens")) if payload.get("cached_input_tokens") is not None else None
+        ),
         "output_tokens": _int_or_zero(payload.get("output_tokens")) if payload.get("output_tokens") is not None else None,
         "total_tokens": _int_or_zero(payload.get("total_tokens")) if payload.get("total_tokens") is not None else None,
         "estimated_cost_usd": (
             _round_cost(payload.get("estimated_cost_usd")) if payload.get("estimated_cost_usd") is not None else None
+        ),
+        "prompt_cache_key_hash": str(payload.get("prompt_cache_key_hash") or "").strip()[:64] or None,
+        "cache_affinity_result": str(payload.get("cache_affinity_result") or "").strip()[:64] or None,
+        "cache_affinity_lane_index": (
+            _int_or_zero(payload.get("cache_affinity_lane_index"))
+            if payload.get("cache_affinity_lane_index") is not None
+            else None
         ),
         "error_message": error_message,
     }
@@ -398,10 +427,20 @@ def _merge_request_log_payload(item: GatewayRequestLog, values: dict[str, Any]) 
         item.account_id = values["account_id"] or item.account_id
         item.model_name = values["model_name"] or item.model_name or item.model
         item.input_tokens = values["input_tokens"] if values["input_tokens"] is not None else item.input_tokens
+        cached_input_tokens = values.get("cached_input_tokens")
+        item.cached_input_tokens = cached_input_tokens if cached_input_tokens is not None else item.cached_input_tokens
         item.output_tokens = values["output_tokens"] if values["output_tokens"] is not None else item.output_tokens
         item.total_tokens = values["total_tokens"] if values["total_tokens"] is not None else item.total_tokens
         item.estimated_cost_usd = (
             values["estimated_cost_usd"] if values["estimated_cost_usd"] is not None else item.estimated_cost_usd
+        )
+        item.prompt_cache_key_hash = values.get("prompt_cache_key_hash") or item.prompt_cache_key_hash
+        item.cache_affinity_result = values.get("cache_affinity_result") or item.cache_affinity_result
+        cache_affinity_lane_index = values.get("cache_affinity_lane_index")
+        item.cache_affinity_lane_index = (
+            cache_affinity_lane_index
+            if cache_affinity_lane_index is not None
+            else item.cache_affinity_lane_index
         )
         item.timing_spans = values["timing_spans"] or item.timing_spans
         item.error_message = values["error_message"]
@@ -502,9 +541,25 @@ async def upsert_request_logs(
                     "token_id": func.coalesce(excluded.token_id, GatewayRequestLog.token_id),
                     "account_id": func.coalesce(excluded.account_id, GatewayRequestLog.account_id),
                     "input_tokens": func.coalesce(excluded.input_tokens, GatewayRequestLog.input_tokens),
+                    "cached_input_tokens": func.coalesce(
+                        excluded.cached_input_tokens,
+                        GatewayRequestLog.cached_input_tokens,
+                    ),
                     "output_tokens": func.coalesce(excluded.output_tokens, GatewayRequestLog.output_tokens),
                     "total_tokens": func.coalesce(excluded.total_tokens, GatewayRequestLog.total_tokens),
                     "estimated_cost_usd": func.coalesce(excluded.estimated_cost_usd, GatewayRequestLog.estimated_cost_usd),
+                    "prompt_cache_key_hash": func.coalesce(
+                        excluded.prompt_cache_key_hash,
+                        GatewayRequestLog.prompt_cache_key_hash,
+                    ),
+                    "cache_affinity_result": func.coalesce(
+                        excluded.cache_affinity_result,
+                        GatewayRequestLog.cache_affinity_result,
+                    ),
+                    "cache_affinity_lane_index": func.coalesce(
+                        excluded.cache_affinity_lane_index,
+                        GatewayRequestLog.cache_affinity_lane_index,
+                    ),
                     "timing_spans": func.coalesce(excluded.timing_spans, GatewayRequestLog.timing_spans),
                     "error_message": func.coalesce(excluded.error_message, GatewayRequestLog.error_message),
                 }
@@ -596,11 +651,15 @@ async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
                 duration_ms=item.duration_ms,
                 timing_spans=item.timing_spans if isinstance(item.timing_spans, dict) else None,
                 input_tokens=item.input_tokens,
+                cached_input_tokens=item.cached_input_tokens,
                 output_tokens=item.output_tokens,
                 total_tokens=item.total_tokens,
                 estimated_cost_usd=_round_cost(_float_or_zero(item.estimated_cost_usd))
                 if item.estimated_cost_usd is not None
                 else None,
+                prompt_cache_key_hash=item.prompt_cache_key_hash,
+                cache_affinity_result=item.cache_affinity_result,
+                cache_affinity_lane_index=item.cache_affinity_lane_index,
                 error_message=item.error_message,
             )
             for item in items

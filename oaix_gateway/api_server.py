@@ -13,7 +13,7 @@ import os
 import re
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict, dataclass, field
@@ -43,6 +43,17 @@ from .database import (
     utcnow,
 )
 from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
+from .prompt_cache import (
+    client_scope_hash,
+    derive_chat_prompt_cache_key,
+    derive_responses_prompt_cache_key,
+    deterministic_uuid,
+    extract_previous_response_id,
+    extract_prompt_cache_key,
+    normalize_seed_json,
+    prompt_cache_key_hash,
+    short_hash,
+)
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
 from .request_store import (
     create_request_log,
@@ -147,6 +158,7 @@ CHAT_COMPLETIONS_RESPONSES_PASSTHROUGH_FIELDS = frozenset(
         "store",
         "metadata",
         "previous_response_id",
+        "prompt_cache_key",
         "size",
         "quality",
         "background",
@@ -1002,6 +1014,487 @@ async def _claim_next_token_for_model_request(
     )
 
 
+def _prompt_cache_lane_store(app: FastAPI) -> OrderedDict[str, "_PromptCacheLaneState"]:
+    store = getattr(app.state, "prompt_cache_affinity_lanes", None)
+    if not isinstance(store, OrderedDict):
+        store = OrderedDict()
+        app.state.prompt_cache_affinity_lanes = store
+    return store
+
+
+def _prompt_cache_response_store(app: FastAPI) -> OrderedDict[str, "_PromptCacheResponseBinding"]:
+    store = getattr(app.state, "prompt_cache_response_bindings", None)
+    if not isinstance(store, OrderedDict):
+        store = OrderedDict()
+        app.state.prompt_cache_response_bindings = store
+    return store
+
+
+def _prompt_cache_prune_store(app: FastAPI) -> None:
+    now = time.monotonic()
+    lane_store = _prompt_cache_lane_store(app)
+    lane_ttl = _prompt_cache_lane_ttl_seconds()
+    for key in list(lane_store.keys()):
+        state = lane_store[key]
+        if now - state.last_seen_at > lane_ttl:
+            lane_store.pop(key, None)
+    while len(lane_store) > _prompt_cache_max_entries():
+        lane_store.popitem(last=False)
+
+    response_store = _prompt_cache_response_store(app)
+    for response_id in list(response_store.keys()):
+        binding = response_store[response_id]
+        if binding.expires_at <= now:
+            response_store.pop(response_id, None)
+    while len(response_store) > _prompt_cache_response_max_entries():
+        response_store.popitem(last=False)
+
+
+def _prompt_cache_bind_lane(
+    app: FastAPI,
+    context: "_PromptCacheRequestContext | None",
+    token_id: int,
+    *,
+    prefer_primary: bool = False,
+) -> int | None:
+    if context is None or not context.affinity_key or token_id <= 0 or not _prompt_cache_affinity_enabled():
+        return None
+    _prompt_cache_prune_store(app)
+    store = _prompt_cache_lane_store(app)
+    state = store.get(context.affinity_key)
+    if state is None:
+        state = _PromptCacheLaneState(primary_token_id=token_id, lanes=[token_id])
+        store[context.affinity_key] = state
+        return 0
+
+    state.last_seen_at = time.monotonic()
+    store.move_to_end(context.affinity_key)
+    if state.primary_token_id is None or (prefer_primary and _prompt_cache_rebind_primary_enabled()):
+        state.primary_token_id = token_id
+    if token_id not in state.lanes:
+        if len(state.lanes) < _prompt_cache_max_lanes_per_key():
+            state.lanes.append(token_id)
+        else:
+            return None
+    try:
+        return state.lanes.index(token_id)
+    except ValueError:
+        return None
+
+
+def _prompt_cache_remove_token(app: FastAPI, token_id: int) -> None:
+    try:
+        resolved_token_id = int(token_id)
+    except (TypeError, ValueError):
+        return
+    if resolved_token_id <= 0:
+        return
+    for key, state in list(_prompt_cache_lane_store(app).items()):
+        if resolved_token_id not in state.lanes and state.primary_token_id != resolved_token_id:
+            continue
+        state.lanes = [lane_id for lane_id in state.lanes if lane_id != resolved_token_id]
+        if state.primary_token_id == resolved_token_id:
+            state.primary_token_id = state.lanes[0] if state.lanes else None
+        state.last_seen_at = time.monotonic()
+        if not state.lanes:
+            _prompt_cache_lane_store(app).pop(key, None)
+
+
+def _prompt_cache_bind_response(
+    app: FastAPI,
+    response_id: str | None,
+    token_id: int,
+) -> None:
+    normalized = _normalize_optional_text(response_id)
+    if normalized is None:
+        return
+    try:
+        resolved_token_id = int(token_id)
+    except (TypeError, ValueError):
+        return
+    if resolved_token_id <= 0:
+        return
+    _prompt_cache_prune_store(app)
+    store = _prompt_cache_response_store(app)
+    store[normalized] = _PromptCacheResponseBinding(
+        token_id=resolved_token_id,
+        expires_at=time.monotonic() + _prompt_cache_response_ttl_seconds(),
+    )
+    store.move_to_end(normalized)
+
+
+def _prompt_cache_response_owner(app: FastAPI, response_id: str | None) -> int | None:
+    normalized = _normalize_optional_text(response_id)
+    if normalized is None:
+        return None
+    _prompt_cache_prune_store(app)
+    binding = _prompt_cache_response_store(app).get(normalized)
+    if binding is None:
+        return None
+    if binding.expires_at <= time.monotonic():
+        _prompt_cache_response_store(app).pop(normalized, None)
+        return None
+    return binding.token_id
+
+
+def _prompt_cache_snapshot_token(snapshot: _TokenPoolSnapshot | None, token_id: int) -> Any | None:
+    if snapshot is None:
+        return None
+    for token_row in snapshot.tokens:
+        if int(getattr(token_row, "id", 0) or 0) == int(token_id):
+            return token_row
+    return None
+
+
+def _prompt_cache_token_available(
+    token_row: Any,
+    snapshot: _TokenPoolSnapshot,
+    *,
+    scoped_cooldown_scope: str | None,
+    include_plan_types: Iterable[str] | None,
+    exclude_plan_types: Iterable[str] | None,
+) -> bool:
+    if not _token_row_matches_plan_filters(
+        token_row,
+        include_plan_types=include_plan_types,
+        exclude_plan_types=exclude_plan_types,
+    ):
+        return False
+    return _token_snapshot_row_available(
+        token_row,
+        snapshot,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+        now=utcnow(),
+    )
+
+
+async def _prompt_cache_wait_for_token_slot(token_id: int, active_stream_cap: int, wait_ms: int) -> bool:
+    if _token_active_stream_count(token_id) < active_stream_cap:
+        return True
+    if wait_ms <= 0:
+        return False
+    deadline = time.monotonic() + (wait_ms / 1000.0)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+        if _token_active_stream_count(token_id) < active_stream_cap:
+            return True
+    return _token_active_stream_count(token_id) < active_stream_cap
+
+
+def _prompt_cache_rendezvous_score(affinity_key: str, token_id: int) -> int:
+    digest = hashlib.blake2b(f"{affinity_key}:{token_id}".encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=False)
+
+
+def _prompt_cache_recent_ttft_p90(token_id: int) -> int:
+    recent = list(_TOKEN_RECENT_TTFT_MS.get(token_id) or ())
+    return _percentile(recent, 90) if recent else 0
+
+
+def _prompt_cache_candidate_sort_key(
+    *,
+    affinity_key: str,
+    token_row: Any,
+) -> tuple[int, int, int]:
+    token_id = int(getattr(token_row, "id", 0) or 0)
+    return (
+        _token_active_stream_count(token_id),
+        _prompt_cache_recent_ttft_p90(token_id),
+        -_prompt_cache_rendezvous_score(affinity_key, token_id),
+    )
+
+
+async def _prompt_cache_claim_specific_token(
+    snapshot: _TokenPoolSnapshot,
+    selection_settings: TokenSelectionSettings,
+    *,
+    token_id: int,
+    exclude_token_ids: set[int],
+    scoped_cooldown_scope: str | None,
+    timing: _RequestTimingRecorder | None,
+    wait_ms: int,
+    include_plan_types: Iterable[str] | None = None,
+    exclude_plan_types: Iterable[str] | None = None,
+) -> Any | None:
+    if token_id <= 0 or token_id in exclude_token_ids:
+        return None
+    token_row = _prompt_cache_snapshot_token(snapshot, token_id)
+    if token_row is None:
+        return None
+    if not _prompt_cache_token_available(
+        token_row,
+        snapshot,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+        include_plan_types=include_plan_types,
+        exclude_plan_types=exclude_plan_types,
+    ):
+        return None
+    active_stream_cap = normalize_token_active_stream_cap(selection_settings.active_stream_cap)
+    if not await _prompt_cache_wait_for_token_slot(token_id, active_stream_cap, wait_ms):
+        return None
+    if not _prompt_cache_token_available(
+        token_row,
+        snapshot,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+        include_plan_types=include_plan_types,
+        exclude_plan_types=exclude_plan_types,
+    ):
+        return None
+    if _token_active_stream_count(token_id) >= active_stream_cap:
+        return None
+    now = utcnow()
+    token_row.last_used_at = now
+    token_row.updated_at = now
+    _token_snapshot_mark_token_claimed(snapshot, selection_settings, token_row)
+    _record_selected_token_observation_start(token_id, timing)
+    return token_row
+
+
+def _prompt_cache_lane_candidates(
+    snapshot: _TokenPoolSnapshot,
+    selection_settings: TokenSelectionSettings,
+    *,
+    affinity_key: str,
+    token_ids: Iterable[int],
+    exclude_token_ids: set[int],
+    scoped_cooldown_scope: str | None,
+    include_plan_types: Iterable[str] | None = None,
+    exclude_plan_types: Iterable[str] | None = None,
+) -> list[Any]:
+    active_stream_cap = normalize_token_active_stream_cap(selection_settings.active_stream_cap)
+    candidates: list[Any] = []
+    seen: set[int] = set()
+    for raw_token_id in token_ids:
+        try:
+            token_id = int(raw_token_id)
+        except (TypeError, ValueError):
+            continue
+        if token_id <= 0 or token_id in seen or token_id in exclude_token_ids:
+            continue
+        seen.add(token_id)
+        if _token_active_stream_count(token_id) >= active_stream_cap:
+            continue
+        token_row = _prompt_cache_snapshot_token(snapshot, token_id)
+        if token_row is None:
+            continue
+        if not _prompt_cache_token_available(
+            token_row,
+            snapshot,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        ):
+            continue
+        candidates.append(token_row)
+    return sorted(
+        candidates,
+        key=lambda token_row: _prompt_cache_candidate_sort_key(
+            affinity_key=affinity_key,
+            token_row=token_row,
+        ),
+    )
+
+
+def _prompt_cache_new_lane_candidates(
+    snapshot: _TokenPoolSnapshot,
+    selection_settings: TokenSelectionSettings,
+    *,
+    affinity_key: str,
+    existing_lanes: Iterable[int],
+    exclude_token_ids: set[int],
+    scoped_cooldown_scope: str | None,
+    include_plan_types: Iterable[str] | None = None,
+    exclude_plan_types: Iterable[str] | None = None,
+) -> list[Any]:
+    existing = {int(token_id) for token_id in existing_lanes if int(token_id or 0) > 0}
+    active_stream_cap = normalize_token_active_stream_cap(selection_settings.active_stream_cap)
+    candidates: list[Any] = []
+    for token_row in snapshot.tokens:
+        token_id = int(getattr(token_row, "id", 0) or 0)
+        if token_id <= 0 or token_id in existing or token_id in exclude_token_ids:
+            continue
+        if _token_active_stream_count(token_id) >= active_stream_cap:
+            continue
+        if not _prompt_cache_token_available(
+            token_row,
+            snapshot,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        ):
+            continue
+        candidates.append(token_row)
+    return sorted(
+        candidates,
+        key=lambda token_row: _prompt_cache_candidate_sort_key(
+            affinity_key=affinity_key,
+            token_row=token_row,
+        ),
+    )
+
+
+async def _claim_prompt_cache_affinity_token(
+    app: FastAPI,
+    selection_settings: TokenSelectionSettings,
+    *,
+    prompt_cache_context: "_PromptCacheRequestContext | None",
+    exclude_token_ids: set[int],
+    scoped_cooldown_scope: str | None,
+    timing: _RequestTimingRecorder | None,
+    token_pool_snapshot: _TokenPoolSnapshot | None,
+    require_non_free_token: bool,
+) -> "_PromptCacheClaim | None":
+    if prompt_cache_context is None or not _prompt_cache_affinity_enabled():
+        return None
+    snapshot = token_pool_snapshot or _current_token_pool_snapshot(app)
+    if snapshot is None:
+        return None
+
+    include_plan_types = KNOWN_NON_FREE_TOKEN_PLAN_TYPES if require_non_free_token else None
+    exclude_plan_types = None
+    if timing is not None:
+        if prompt_cache_context.prompt_cache_key_hash:
+            timing.set_tag("prompt_cache_key_hash", prompt_cache_context.prompt_cache_key_hash)
+        timing.set_tag("prompt_cache_source", prompt_cache_context.source)
+
+    previous_owner_id = _prompt_cache_response_owner(app, prompt_cache_context.previous_response_id)
+    if previous_owner_id is not None:
+        token_row = await _prompt_cache_claim_specific_token(
+            snapshot,
+            selection_settings,
+            token_id=previous_owner_id,
+            exclude_token_ids=exclude_token_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            timing=timing,
+            wait_ms=_prompt_cache_previous_owner_wait_ms(),
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        )
+        if token_row is not None:
+            lane_index = _prompt_cache_bind_lane(app, prompt_cache_context, previous_owner_id, prefer_primary=True)
+            return _PromptCacheClaim(token_row=token_row, result="previous_owner_hit", lane_index=lane_index)
+        if _prompt_cache_previous_strict_enabled():
+            if timing is not None:
+                timing.set_tag("cache_affinity_result", "previous_owner_busy")
+            return None
+
+    affinity_key = prompt_cache_context.affinity_key
+    if not affinity_key:
+        return None
+
+    _prompt_cache_prune_store(app)
+    store = _prompt_cache_lane_store(app)
+    state = store.get(affinity_key)
+    if state is None:
+        state = _PromptCacheLaneState()
+        store[affinity_key] = state
+    state.last_seen_at = time.monotonic()
+    store.move_to_end(affinity_key)
+
+    primary_id = state.primary_token_id or (state.lanes[0] if state.lanes else None)
+    if primary_id is not None:
+        token_row = await _prompt_cache_claim_specific_token(
+            snapshot,
+            selection_settings,
+            token_id=primary_id,
+            exclude_token_ids=exclude_token_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            timing=timing,
+            wait_ms=_prompt_cache_primary_wait_ms(),
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        )
+        if token_row is not None:
+            lane_index = _prompt_cache_bind_lane(app, prompt_cache_context, int(primary_id), prefer_primary=True)
+            return _PromptCacheClaim(token_row=token_row, result="primary_hit", lane_index=lane_index)
+
+    secondary_ids = [token_id for token_id in state.lanes if token_id != primary_id]
+    for token_row in _prompt_cache_lane_candidates(
+        snapshot,
+        selection_settings,
+        affinity_key=affinity_key,
+        token_ids=secondary_ids,
+        exclude_token_ids=exclude_token_ids,
+        scoped_cooldown_scope=scoped_cooldown_scope,
+        include_plan_types=include_plan_types,
+        exclude_plan_types=exclude_plan_types,
+    ):
+        token_id = int(getattr(token_row, "id", 0) or 0)
+        claimed = await _prompt_cache_claim_specific_token(
+            snapshot,
+            selection_settings,
+            token_id=token_id,
+            exclude_token_ids=exclude_token_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            timing=timing,
+            wait_ms=0,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        )
+        if claimed is not None:
+            lane_index = _prompt_cache_bind_lane(app, prompt_cache_context, token_id)
+            return _PromptCacheClaim(token_row=claimed, result="lane_hit", lane_index=lane_index)
+
+    if len(state.lanes) < _prompt_cache_max_lanes_per_key():
+        for token_row in _prompt_cache_new_lane_candidates(
+            snapshot,
+            selection_settings,
+            affinity_key=affinity_key,
+            existing_lanes=state.lanes,
+            exclude_token_ids=exclude_token_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        ):
+            token_id = int(getattr(token_row, "id", 0) or 0)
+            claimed = await _prompt_cache_claim_specific_token(
+                snapshot,
+                selection_settings,
+                token_id=token_id,
+                exclude_token_ids=exclude_token_ids,
+                scoped_cooldown_scope=scoped_cooldown_scope,
+                timing=timing,
+                wait_ms=0,
+                include_plan_types=include_plan_types,
+                exclude_plan_types=exclude_plan_types,
+            )
+            if claimed is not None:
+                lane_index = _prompt_cache_bind_lane(app, prompt_cache_context, token_id)
+                return _PromptCacheClaim(token_row=claimed, result="lane_created", lane_index=lane_index)
+
+    if _prompt_cache_lane_wait_ms() > 0:
+        await asyncio.sleep(_prompt_cache_lane_wait_ms() / 1000.0)
+        for token_row in _prompt_cache_lane_candidates(
+            snapshot,
+            selection_settings,
+            affinity_key=affinity_key,
+            token_ids=state.lanes,
+            exclude_token_ids=exclude_token_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        ):
+            token_id = int(getattr(token_row, "id", 0) or 0)
+            claimed = await _prompt_cache_claim_specific_token(
+                snapshot,
+                selection_settings,
+                token_id=token_id,
+                exclude_token_ids=exclude_token_ids,
+                scoped_cooldown_scope=scoped_cooldown_scope,
+                timing=timing,
+                wait_ms=0,
+                include_plan_types=include_plan_types,
+                exclude_plan_types=exclude_plan_types,
+            )
+            if claimed is not None:
+                lane_index = _prompt_cache_bind_lane(app, prompt_cache_context, token_id)
+                return _PromptCacheClaim(token_row=claimed, result="lane_hit_after_wait", lane_index=lane_index)
+
+    if timing is not None:
+        timing.set_tag("cache_affinity_result", "global_fallback")
+    return None
+
+
 @dataclass
 class _RequestLogWriteJob:
     payload: dict[str, Any]
@@ -1104,9 +1597,13 @@ async def _write_request_log_batch_legacy(jobs: list[_RequestLogWriteJob]) -> No
             "account_id",
             "model_name",
             "input_tokens",
+            "cached_input_tokens",
             "output_tokens",
             "total_tokens",
             "estimated_cost_usd",
+            "prompt_cache_key_hash",
+            "cache_affinity_result",
+            "cache_affinity_lane_index",
             "timing_spans",
             "error_message",
         }
@@ -1545,6 +2042,41 @@ class ProxyRequestResult:
     usage_metrics: UsageMetrics | None = None
     on_success: Callable[[int], Awaitable[None]] | None = None
     stream_capture: "_ProxyStreamCapture | None" = None
+    response_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _PromptCacheRequestContext:
+    endpoint: str
+    model: str | None
+    compact: bool
+    previous_response_id: str | None
+    prompt_cache_key: str | None
+    prompt_cache_key_hash: str | None
+    affinity_key: str | None
+    client_scope: str
+    source: str
+
+
+@dataclass
+class _PromptCacheLaneState:
+    primary_token_id: int | None = None
+    lanes: list[int] = field(default_factory=list)
+    created_at: float = field(default_factory=time.monotonic)
+    last_seen_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class _PromptCacheResponseBinding:
+    token_id: int
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class _PromptCacheClaim:
+    token_row: Any
+    result: str
+    lane_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -2358,8 +2890,19 @@ def _responses_endpoint_path(*, compact: bool = False) -> str:
     return "/v1/responses"
 
 
-def _build_upstream_headers(http_request: Request, access_token: str, account_id: str | None, stream: bool) -> dict[str, str]:
-    session_id = (http_request.headers.get("Session_id") or "").strip() or str(uuid.uuid4())
+def _build_upstream_headers(
+    http_request: Request,
+    access_token: str,
+    account_id: str | None,
+    stream: bool,
+    *,
+    prompt_cache_context: _PromptCacheRequestContext | None = None,
+) -> dict[str, str]:
+    session_id = (
+        (http_request.headers.get("Session_id") or "").strip()
+        or _prompt_cache_session_uuid(prompt_cache_context)
+        or str(uuid.uuid4())
+    )
 
     headers = {
         "Content-Type": "application/json",
@@ -2432,6 +2975,185 @@ def _mapping_get(payload: Any, *keys: str) -> Any | None:
 def _normalize_optional_text(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    return _coerce_bool(os.getenv(name), default)
+
+
+def _prompt_cache_affinity_enabled() -> bool:
+    return _bool_env("PROMPT_CACHE_AFFINITY_ENABLED", True)
+
+
+def _prompt_cache_auto_key_enabled() -> bool:
+    return _bool_env("PROMPT_CACHE_AUTO_KEY_ENABLED", True)
+
+
+def _prompt_cache_max_lanes_per_key() -> int:
+    return _int_env("PROMPT_CACHE_MAX_LANES_PER_KEY", 3, minimum=1)
+
+
+def _prompt_cache_primary_wait_ms() -> int:
+    return _int_env("PROMPT_CACHE_PRIMARY_WAIT_MS", 500, minimum=0)
+
+
+def _prompt_cache_lane_wait_ms() -> int:
+    return _int_env("PROMPT_CACHE_LANE_WAIT_MS", 100, minimum=0)
+
+
+def _prompt_cache_previous_owner_wait_ms() -> int:
+    return _int_env("PROMPT_CACHE_PREVIOUS_OWNER_WAIT_MS", 800, minimum=0)
+
+
+def _prompt_cache_global_fallback_enabled() -> bool:
+    return _bool_env("PROMPT_CACHE_GLOBAL_FALLBACK_ENABLED", True)
+
+
+def _prompt_cache_rebind_primary_enabled() -> bool:
+    return _bool_env("PROMPT_CACHE_REBIND_PRIMARY", False)
+
+
+def _prompt_cache_previous_replay_fallback_enabled() -> bool:
+    return _bool_env("PROMPT_CACHE_PREVIOUS_REPLAY_FALLBACK_ENABLED", False)
+
+
+def _prompt_cache_previous_strict_enabled() -> bool:
+    explicit = os.getenv("PROMPT_CACHE_PREVIOUS_STRICT_ENABLED")
+    if explicit is not None:
+        return _coerce_bool(explicit, True)
+    return not _prompt_cache_previous_replay_fallback_enabled()
+
+
+def _prompt_cache_lane_ttl_seconds() -> float:
+    return _float_env("PROMPT_CACHE_LANE_TTL_SECONDS", 3600.0, minimum=60.0)
+
+
+def _prompt_cache_response_ttl_seconds() -> float:
+    return _float_env("PROMPT_CACHE_RESPONSE_TTL_SECONDS", 86400.0, minimum=60.0)
+
+
+def _prompt_cache_max_entries() -> int:
+    return _int_env("PROMPT_CACHE_MAX_ENTRIES", 10000, minimum=100)
+
+
+def _prompt_cache_response_max_entries() -> int:
+    return _int_env("PROMPT_CACHE_RESPONSE_MAX_ENTRIES", 20000, minimum=100)
+
+
+def _build_prompt_cache_affinity_key(
+    *,
+    endpoint: str,
+    model: str | None,
+    compact: bool,
+    client_scope: str,
+    prompt_key_hash: str,
+) -> str:
+    payload = {
+        "endpoint": endpoint,
+        "model": model,
+        "compact": bool(compact),
+        "client": client_scope,
+        "prompt": prompt_key_hash,
+    }
+    return short_hash(normalize_seed_json(payload), length=32)
+
+
+def _build_prompt_cache_request_context(
+    http_request: Request,
+    *,
+    endpoint: str,
+    request_model: str | None,
+    raw_payload: dict[str, Any],
+    compact: bool = False,
+) -> _PromptCacheRequestContext | None:
+    if not _prompt_cache_affinity_enabled():
+        return None
+
+    previous_response_id = extract_previous_response_id(raw_payload)
+    explicit_key = extract_prompt_cache_key(raw_payload)
+    prompt_cache_key = explicit_key
+    source = "explicit" if explicit_key else "none"
+    if prompt_cache_key is None and _prompt_cache_auto_key_enabled():
+        if endpoint == "/v1/chat/completions":
+            prompt_cache_key = derive_chat_prompt_cache_key(raw_payload)
+            source = "derived_chat" if prompt_cache_key else "none"
+        elif endpoint in {"/v1/responses", "/v1/responses/compact"}:
+            prompt_cache_key = derive_responses_prompt_cache_key(raw_payload)
+            source = "derived_responses" if prompt_cache_key else "none"
+
+    key_hash = prompt_cache_key_hash(prompt_cache_key) if prompt_cache_key else None
+    client_scope = client_scope_hash(http_request.headers)
+    affinity_key = (
+        _build_prompt_cache_affinity_key(
+            endpoint=endpoint,
+            model=request_model or _normalize_optional_text(raw_payload.get("model")),
+            compact=compact,
+            client_scope=client_scope,
+            prompt_key_hash=key_hash,
+        )
+        if key_hash
+        else None
+    )
+    if previous_response_id is None and prompt_cache_key is None:
+        return None
+    return _PromptCacheRequestContext(
+        endpoint=endpoint,
+        model=request_model or _normalize_optional_text(raw_payload.get("model")),
+        compact=compact,
+        previous_response_id=previous_response_id,
+        prompt_cache_key=prompt_cache_key,
+        prompt_cache_key_hash=key_hash,
+        affinity_key=affinity_key,
+        client_scope=client_scope,
+        source=source,
+    )
+
+
+def _apply_prompt_cache_context_to_payload(
+    payload: dict[str, Any],
+    context: _PromptCacheRequestContext | None,
+) -> dict[str, Any]:
+    if context is not None and context.prompt_cache_key:
+        payload["prompt_cache_key"] = context.prompt_cache_key
+    return payload
+
+
+def _prompt_cache_session_uuid(context: _PromptCacheRequestContext | None) -> str | None:
+    if context is None:
+        return None
+    seed = context.prompt_cache_key or context.affinity_key
+    if not seed:
+        return None
+    return deterministic_uuid(f"{context.client_scope}:{seed}")
+
+
+def _extract_response_id_from_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    candidates = (
+        payload.get("id"),
+        payload.get("response", {}).get("id") if isinstance(payload.get("response"), dict) else None,
+    )
+    for candidate in candidates:
+        text = _normalize_optional_text(candidate)
+        if text:
+            return text
+    return None
+
+
+def _prompt_cache_finalize_kwargs(
+    context: _PromptCacheRequestContext | None,
+    *,
+    affinity_result: str | None = None,
+    lane_index: int | None = None,
+) -> dict[str, Any]:
+    if context is None:
+        return {}
+    return {
+        "prompt_cache_key_hash": context.prompt_cache_key_hash,
+        "cache_affinity_result": affinity_result,
+        "cache_affinity_lane_index": lane_index,
+    }
 
 
 def _normalize_image_response_format(value: Any) -> str:
@@ -5462,8 +6184,40 @@ def _usage_finalize_kwargs(usage_metrics: UsageMetrics | None) -> dict[str, Any]
         "input_tokens": usage_metrics.input_tokens,
         "output_tokens": usage_metrics.output_tokens,
         "total_tokens": usage_metrics.total_tokens,
+        "cached_input_tokens": usage_metrics.cached_input_tokens,
         "estimated_cost_usd": usage_metrics.estimated_cost_usd,
     }
+
+
+def _response_id_from_proxy_result(proxy_result: ProxyRequestResult) -> str | None:
+    if proxy_result.response_id:
+        return proxy_result.response_id
+    if proxy_result.stream_capture is not None:
+        return _extract_response_id_from_payload(proxy_result.stream_capture.response_payload)
+    body = getattr(proxy_result.response, "body", None)
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        return _extract_response_id_from_payload(payload)
+    return None
+
+
+async def _record_prompt_cache_success(
+    app: FastAPI,
+    *,
+    prompt_cache_context: _PromptCacheRequestContext | None,
+    token_id: int,
+    proxy_result: ProxyRequestResult,
+) -> None:
+    if prompt_cache_context is None:
+        return
+    try:
+        _prompt_cache_bind_lane(app, prompt_cache_context, int(token_id))
+        _prompt_cache_bind_response(app, _response_id_from_proxy_result(proxy_result), int(token_id))
+    except Exception:
+        logger.exception("Failed to update prompt cache affinity state")
 
 
 async def _finalize_cancelled_request_log(
@@ -5672,6 +6426,7 @@ async def _finalize_stream_request_log(
     stream_capture: _ProxyStreamCapture,
     timing: _RequestTimingRecorder | None = None,
     success_hook: Callable[[int], Awaitable[None]] | None = None,
+    extra_finalize_kwargs: dict[str, Any] | None = None,
 ) -> int | None:
     try:
         stream_capture.finalize_usage_metrics()
@@ -5691,6 +6446,7 @@ async def _finalize_stream_request_log(
             model_name=stream_capture.model_name or fallback_model_name,
             error_message=stream_capture.error_message if failed else None,
             **_usage_finalize_kwargs(stream_capture.usage_metrics),
+            **(extra_finalize_kwargs or {}),
         )
     except Exception:
         logger.exception("Failed to finalize streamed request log")
@@ -6297,6 +7053,7 @@ async def _execute_proxy_request_with_failover(
     is_stream: bool,
     proxy_call: Callable[[httpx.AsyncClient, str, str | None], Awaitable[ProxyRequestResult]],
     compact: bool = False,
+    prompt_cache_context: _PromptCacheRequestContext | None = None,
 ) -> Response:
     try:
         proxy_lease = await _proxy_concurrency_limiter(http_request.app).acquire(
@@ -6364,23 +7121,71 @@ async def _execute_proxy_request_with_failover(
         postponed_unknown_plan_tokens: list[Any] = []
         transport_error_count = 0
         upstream_5xx_error_count = 0
+        last_affinity_result: str | None = None
+        last_affinity_lane_index: int | None = None
+
+        def prompt_cache_log_kwargs() -> dict[str, Any]:
+            return _prompt_cache_finalize_kwargs(
+                prompt_cache_context,
+                affinity_result=last_affinity_result,
+                lane_index=last_affinity_lane_index,
+            )
 
         while attempt_count < max_attempts and claim_count < max_claims:
             _raise_if_upstream_circuit_open(http_request.app)
             claim_count += 1
-            token_row = await _await_timed(
-                _claim_next_token_for_model_request(
+            token_pool_snapshot = _fresh_token_pool_snapshot(http_request.app, timing=timing)
+            affinity_claim = await _await_timed(
+                _claim_prompt_cache_affinity_token(
+                    http_request.app,
                     selection_settings,
+                    prompt_cache_context=prompt_cache_context,
                     exclude_token_ids=excluded_token_ids,
                     scoped_cooldown_scope=scoped_cooldown_scope,
                     timing=timing,
-                    token_pool_snapshot=_fresh_token_pool_snapshot(http_request.app, timing=timing),
+                    token_pool_snapshot=token_pool_snapshot,
                     require_non_free_token=require_non_free_token,
                 ),
                 timing=timing,
-                span_name="claim_token_ms",
-                db_wait=True,
+                span_name="claim_prompt_cache_affinity_ms",
+                db_wait=False,
             )
+            if affinity_claim is not None:
+                token_row = affinity_claim.token_row
+                last_affinity_result = affinity_claim.result
+                last_affinity_lane_index = affinity_claim.lane_index
+                if timing is not None:
+                    timing.set_tag("cache_affinity_result", affinity_claim.result)
+                    if affinity_claim.lane_index is not None:
+                        timing.set_ms("cache_affinity_lane_index", affinity_claim.lane_index)
+            elif (
+                prompt_cache_context is not None
+                and prompt_cache_context.previous_response_id
+                and _prompt_cache_previous_strict_enabled()
+                and _prompt_cache_response_owner(http_request.app, prompt_cache_context.previous_response_id) is not None
+            ):
+                last_affinity_result = "previous_owner_busy"
+                last_affinity_lane_index = None
+                raise HTTPException(status_code=429, detail="previous_response_busy")
+            else:
+                if prompt_cache_context is not None and prompt_cache_context.affinity_key and not _prompt_cache_global_fallback_enabled():
+                    raise HTTPException(status_code=429, detail="Prompt cache affinity lanes are busy")
+                if prompt_cache_context is not None and prompt_cache_context.affinity_key:
+                    last_affinity_result = "global_fallback"
+                    last_affinity_lane_index = None
+                token_row = await _await_timed(
+                    _claim_next_token_for_model_request(
+                        selection_settings,
+                        exclude_token_ids=excluded_token_ids,
+                        scoped_cooldown_scope=scoped_cooldown_scope,
+                        timing=timing,
+                        token_pool_snapshot=token_pool_snapshot,
+                        require_non_free_token=require_non_free_token,
+                    ),
+                    timing=timing,
+                    span_name="claim_token_ms",
+                    db_wait=True,
+                )
             using_postponed_unknown_plan = False
             if token_row is None:
                 if require_non_free_token and postponed_unknown_plan_tokens:
@@ -6395,6 +7200,7 @@ async def _execute_proxy_request_with_failover(
                 if effective_plan_type == "free":
                     excluded_token_ids.add(token_row.id)
                     skipped_free_token_ids.add(token_row.id)
+                    _prompt_cache_remove_token(http_request.app, token_row.id)
                     logger.info(
                         "Skipping free-plan Codex token for %s request: token_id=%s account_id=%s",
                         restricted_model_label,
@@ -6424,6 +7230,21 @@ async def _execute_proxy_request_with_failover(
                     )
                     continue
 
+            if prompt_cache_context is not None and prompt_cache_context.affinity_key:
+                bound_lane_index = _prompt_cache_bind_lane(
+                    http_request.app,
+                    prompt_cache_context,
+                    int(token_row.id),
+                    prefer_primary=last_affinity_result in {"previous_owner_hit", "primary_hit"},
+                )
+                if last_affinity_lane_index is None:
+                    last_affinity_lane_index = bound_lane_index
+                if timing is not None:
+                    if last_affinity_result:
+                        timing.set_tag("cache_affinity_result", last_affinity_result)
+                    if last_affinity_lane_index is not None:
+                        timing.set_ms("cache_affinity_lane_index", last_affinity_lane_index)
+
             attempt_count += 1
             attempt = attempt_count
             last_token_id = token_row.id
@@ -6444,6 +7265,7 @@ async def _execute_proxy_request_with_failover(
                 if permanent_refresh_failure or exc.status_code in (401, 403):
                     if permanent_refresh_failure:
                         excluded_token_ids.add(token_row.id)
+                        _prompt_cache_remove_token(http_request.app, token_row.id)
                     last_error = (
                         HTTPException(
                             status_code=503,
@@ -6512,6 +7334,7 @@ async def _execute_proxy_request_with_failover(
                                         or proxied_result.model_name
                                     ),
                                     error_message="Client disconnected",
+                                    **prompt_cache_log_kwargs(),
                                 )
                             elif proxied_result.stream_capture is not None:
                                 finalized_request_log_id = await _finalize_stream_request_log(
@@ -6525,6 +7348,7 @@ async def _execute_proxy_request_with_failover(
                                     stream_capture=proxied_result.stream_capture,
                                     timing=timing,
                                     success_hook=proxied_result.on_success,
+                                    extra_finalize_kwargs=prompt_cache_log_kwargs(),
                                 )
                             else:
                                 finalized_request_log_id = await _finalize_request_log_with_timing(
@@ -6539,6 +7363,7 @@ async def _execute_proxy_request_with_failover(
                                     token_id=token_id,
                                     account_id=proxied_account_id,
                                     model_name=proxied_result.model_name,
+                                    **prompt_cache_log_kwargs(),
                                 )
                             if (
                                 not disconnected_before_completion
@@ -6548,6 +7373,12 @@ async def _execute_proxy_request_with_failover(
                                     or proxied_result.stream_capture.completed
                                 )
                             ):
+                                await _record_prompt_cache_success(
+                                    http_request.app,
+                                    prompt_cache_context=prompt_cache_context,
+                                    token_id=token_id,
+                                    proxy_result=proxied_result,
+                                )
                                 await _mark_token_success_with_timing(
                                     timing,
                                     token_id,
@@ -6609,6 +7440,13 @@ async def _execute_proxy_request_with_failover(
                     account_id=token_row.account_id,
                     model_name=proxy_result.model_name,
                     **_usage_finalize_kwargs(proxy_result.usage_metrics),
+                    **prompt_cache_log_kwargs(),
+                )
+                await _record_prompt_cache_success(
+                    http_request.app,
+                    prompt_cache_context=prompt_cache_context,
+                    token_id=token_row.id,
+                    proxy_result=proxy_result,
                 )
                 return proxy_result.response
             except HTTPException as exc:
@@ -6622,6 +7460,7 @@ async def _execute_proxy_request_with_failover(
                         detail,
                         cooldown_seconds=cooldown_seconds,
                     )
+                    _prompt_cache_remove_token(http_request.app, token_row.id)
                     logger.info(
                         "Codex account cooled down: token_id=%s account_id=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
@@ -6645,6 +7484,7 @@ async def _execute_proxy_request_with_failover(
                         detail,
                         cooldown_seconds=image_cooldown_seconds,
                     )
+                    _prompt_cache_remove_token(http_request.app, token_row.id)
                     logger.info(
                         "Codex image bucket cooled down: token_id=%s account_id=%s scope=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
@@ -6668,6 +7508,7 @@ async def _execute_proxy_request_with_failover(
                 if permanently_disabled or auth_failed_after_refresh:
                     oauth_manager.invalidate(token_row.id)
                     excluded_token_ids.add(token_row.id)
+                    _prompt_cache_remove_token(http_request.app, token_row.id)
                     await mark_token_error(
                         token_row.id,
                         detail,
@@ -6718,6 +7559,8 @@ async def _execute_proxy_request_with_failover(
                     if compact_server_error_cooling_time > 0:
                         mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
                     await mark_token_error(token_row.id, detail, **mark_kwargs)
+                    if compact_server_error_cooling_time > 0:
+                        _prompt_cache_remove_token(http_request.app, token_row.id)
                     logger.info(
                         "Codex upstream server error before response commit: token_id=%s account_id=%s status=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
@@ -6752,6 +7595,8 @@ async def _execute_proxy_request_with_failover(
                     if compact_server_error_cooling_time > 0:
                         mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
                     await mark_token_error(token_row.id, message, **mark_kwargs)
+                    if compact_server_error_cooling_time > 0:
+                        _prompt_cache_remove_token(http_request.app, token_row.id)
                     logger.info(
                         "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
@@ -6784,6 +7629,8 @@ async def _execute_proxy_request_with_failover(
                     if compact_server_error_cooling_time > 0:
                         mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
                     await mark_token_error(token_row.id, message, **mark_kwargs)
+                    if compact_server_error_cooling_time > 0:
+                        _prompt_cache_remove_token(http_request.app, token_row.id)
                     logger.info(
                         "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
@@ -6830,6 +7677,7 @@ async def _execute_proxy_request_with_failover(
             account_id=last_account_id,
             error_message="Client disconnected",
             timing=timing,
+            **prompt_cache_log_kwargs(),
         )
         raise
     except HTTPException as exc:
@@ -6843,6 +7691,7 @@ async def _execute_proxy_request_with_failover(
             token_id=last_token_id,
             account_id=last_account_id,
             error_message=str(getattr(exc, "detail", "") or exc),
+            **prompt_cache_log_kwargs(),
         )
         raise
     except Exception as exc:
@@ -6856,6 +7705,7 @@ async def _execute_proxy_request_with_failover(
             token_id=last_token_id,
             account_id=last_account_id,
             error_message=str(exc),
+            **prompt_cache_log_kwargs(),
         )
         raise
     finally:
@@ -7440,6 +8290,8 @@ def create_app() -> FastAPI:
         window_seconds=_upstream_circuit_breaker_window_seconds(),
         open_seconds=_upstream_circuit_breaker_open_seconds(),
     )
+    app.state.prompt_cache_affinity_lanes = OrderedDict()
+    app.state.prompt_cache_response_bindings = OrderedDict()
     app.state.token_import_worker = None
     app.add_middleware(
         CORSMiddleware,
@@ -7834,6 +8686,13 @@ def create_app() -> FastAPI:
         request_data: ChatCompletionsRequest,
         _: None = Depends(verify_service_api_key),
     ) -> Response:
+        prompt_cache_context = _build_prompt_cache_request_context(
+            http_request,
+            endpoint="/v1/chat/completions",
+            request_model=request_data.model,
+            raw_payload=request_data.model_dump(exclude_unset=True),
+        )
+
         async def proxy_call(
             client: httpx.AsyncClient,
             access_token: str,
@@ -7845,6 +8704,7 @@ def create_app() -> FastAPI:
                 request_data,
                 access_token=access_token,
                 account_id=account_id,
+                prompt_cache_context=prompt_cache_context,
             )
 
         return await _execute_proxy_request_with_failover(
@@ -7853,6 +8713,7 @@ def create_app() -> FastAPI:
             request_model=request_data.model,
             is_stream=bool(request_data.stream),
             proxy_call=proxy_call,
+            prompt_cache_context=prompt_cache_context,
         )
 
     @app.post("/v1/responses")
@@ -7878,6 +8739,14 @@ def create_app() -> FastAPI:
         compact: bool,
     ) -> Response:
         endpoint = _responses_endpoint_path(compact=compact)
+        prompt_cache_context = _build_prompt_cache_request_context(
+            http_request,
+            endpoint=endpoint,
+            request_model=request_data.model,
+            raw_payload=request_data.model_dump(exclude_unset=True),
+            compact=compact,
+        )
+
         async def proxy_call(
             client: httpx.AsyncClient,
             access_token: str,
@@ -7890,6 +8759,7 @@ def create_app() -> FastAPI:
                 access_token=access_token,
                 account_id=account_id,
                 compact=compact,
+                prompt_cache_context=prompt_cache_context,
             )
 
         return await _execute_proxy_request_with_failover(
@@ -7899,6 +8769,7 @@ def create_app() -> FastAPI:
             is_stream=bool(request_data.stream),
             proxy_call=proxy_call,
             compact=compact,
+            prompt_cache_context=prompt_cache_context,
         )
 
     @app.post("/v1/images/generations")
@@ -8103,6 +8974,7 @@ async def _proxy_request_with_token(
     access_token: str,
     account_id: str | None,
     compact: bool = False,
+    prompt_cache_context: _PromptCacheRequestContext | None = None,
 ) -> ProxyRequestResult:
     downstream_stream = bool(request_data.stream)
     upstream_stream = downstream_stream or not compact
@@ -8117,6 +8989,7 @@ async def _proxy_request_with_token(
         compact=compact,
         preserve_previous_response_id=response_model_alias is not None,
     )
+    _apply_prompt_cache_context_to_payload(payload, prompt_cache_context)
     if compact and not downstream_stream:
         payload.pop("stream", None)
     elif not downstream_stream:
@@ -8127,6 +9000,7 @@ async def _proxy_request_with_token(
         access_token=access_token,
         account_id=account_id,
         stream=upstream_stream,
+        prompt_cache_context=prompt_cache_context,
     )
     upstream_url = _codex_responses_url(compact=compact)
     json_payload = json.dumps(payload, ensure_ascii=False)
@@ -8269,6 +9143,7 @@ async def _proxy_request_with_token(
                 model_name=effective_model_name,
                 first_token_at=first_token_at,
                 usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
+                response_id=_extract_response_id_from_payload(data),
             )
         finally:
             await stream_cm.__aexit__(None, None, None)
@@ -8297,6 +9172,7 @@ async def _proxy_request_with_token(
         model_name=effective_model_name,
         first_token_at=None,
         usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
+        response_id=_extract_response_id_from_payload(data),
     )
 
 
@@ -8307,6 +9183,7 @@ async def _proxy_chat_completions_with_token(
     *,
     access_token: str,
     account_id: str | None,
+    prompt_cache_context: _PromptCacheRequestContext | None = None,
 ) -> ProxyRequestResult:
     include_usage = _chat_completion_stream_include_usage(request_data)
     responses_request = await _chat_completions_request_to_responses_request(
@@ -8321,6 +9198,7 @@ async def _proxy_chat_completions_with_token(
         access_token=access_token,
         account_id=account_id,
         compact=False,
+        prompt_cache_context=prompt_cache_context,
     )
 
     if isinstance(proxy_result.response, StreamingResponse):
@@ -8351,6 +9229,7 @@ async def _proxy_chat_completions_with_token(
             usage_metrics=proxy_result.usage_metrics,
             on_success=checkpoint_callback,
             stream_capture=proxy_result.stream_capture,
+            response_id=proxy_result.response_id,
         )
 
     body = getattr(proxy_result.response, "body", b"{}")
@@ -8382,6 +9261,7 @@ async def _proxy_chat_completions_with_token(
         first_token_at=proxy_result.first_token_at,
         usage_metrics=proxy_result.usage_metrics,
         on_success=checkpoint_callback,
+        response_id=proxy_result.response_id,
     )
 
 

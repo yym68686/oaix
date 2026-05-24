@@ -140,9 +140,13 @@ class GatewayRequestLog(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     timing_spans: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cached_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     estimated_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    prompt_cache_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    cache_affinity_result: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    cache_affinity_lane_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -628,17 +632,37 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN token_id INTEGER"))
         if "input_tokens" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN input_tokens INTEGER"))
+        if "cached_input_tokens" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN cached_input_tokens INTEGER"))
         if "output_tokens" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN output_tokens INTEGER"))
         if "total_tokens" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN total_tokens INTEGER"))
         if "estimated_cost_usd" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN estimated_cost_usd DOUBLE PRECISION"))
+        if "prompt_cache_key_hash" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN prompt_cache_key_hash VARCHAR(64)"))
+        if "cache_affinity_result" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN cache_affinity_result VARCHAR(64)"))
+        if "cache_affinity_lane_index" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN cache_affinity_lane_index INTEGER"))
         if "timing_spans" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN timing_spans JSON"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_token_id ON gateway_request_logs (token_id)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model ON gateway_request_logs (model)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_prompt_cache_key_hash "
+                "ON gateway_request_logs (prompt_cache_key_hash)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_cache_affinity_result "
+                "ON gateway_request_logs (cache_affinity_result)"
+            )
+        )
         sync_conn.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_started_id_desc "

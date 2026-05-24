@@ -38,6 +38,16 @@
 - `PROXY_MAX_ACTIVE_RESPONSES`: 网关同时处理的 `/v1/responses*` 请求上限，默认 `64`
 - `PROXY_QUEUE_TIMEOUT_SECONDS`: 达到并发上限后排队等待秒数，默认 `1`
 - `TOKEN_POOL_SNAPSHOT_MAX_AGE_SECONDS`: 内存 key 池快照最大复用时间，默认 `10`
+- `PROMPT_CACHE_AFFINITY_ENABLED`: 是否启用 prompt cache 亲和调度，默认 `true`
+- `PROMPT_CACHE_AUTO_KEY_ENABLED`: 请求未带 `prompt_cache_key` 时是否自动从稳定上下文派生，默认 `true`
+- `PROMPT_CACHE_MAX_LANES_PER_KEY`: 每个 cache key 最多绑定多少个 key lane，默认 `3`
+- `PROMPT_CACHE_PRIMARY_WAIT_MS`: primary lane 满载时最多短等毫秒数，默认 `500`
+- `PROMPT_CACHE_LANE_WAIT_MS`: 所有已绑定 lane 满载时的二次短等毫秒数，默认 `100`
+- `PROMPT_CACHE_GLOBAL_FALLBACK_ENABLED`: lanes 都不可用时是否允许走全局低负载 key，默认 `true`
+- `PROMPT_CACHE_PREVIOUS_OWNER_WAIT_MS`: `previous_response_id` owner key 满载时最多短等毫秒数，默认 `800`
+- `PROMPT_CACHE_PREVIOUS_REPLAY_FALLBACK_ENABLED`: owner 忙时是否允许 `previous_response_id` 请求 fallback 到 prompt cache lanes，仅在调用方已保证 stateless replay 时开启，默认 `false`
+- `PROMPT_CACHE_REBIND_PRIMARY`: spillover 是否覆盖 primary lane，默认 `false`
+- `PROMPT_CACHE_LANE_TTL_SECONDS`: cache key lane 状态空闲保留秒数，默认 `3600`
 - `IMAGE_REQUEST_MAX_ACCOUNT_RETRIES`: 图片接口单次请求最多切换多少个 key，默认 `8`
 - `IMAGE_INPUT_MAX_PER_REQUEST`: 单次图片请求最多允许多少张输入图片，默认 `249`；达到上游 `input-images per min` 桶大小前直接拒绝超大请求
 - `IMAGE_UPLOAD_MAX_BYTES`: multipart 图片上传单文件最大字节数，默认 `26214400`（25 MiB）
@@ -128,6 +138,16 @@ export POSTGRES_PASSWORD='oaix_password'
 export SERVICE_API_KEYS='change-me'
 export CORS_ALLOW_ORIGINS='https://your-app.example'
 export CODEX_BASE_URL=''
+export PROMPT_CACHE_AFFINITY_ENABLED='true'
+export PROMPT_CACHE_AUTO_KEY_ENABLED='true'
+export PROMPT_CACHE_MAX_LANES_PER_KEY='3'
+export PROMPT_CACHE_PRIMARY_WAIT_MS='500'
+export PROMPT_CACHE_LANE_WAIT_MS='100'
+export PROMPT_CACHE_GLOBAL_FALLBACK_ENABLED='true'
+export PROMPT_CACHE_PREVIOUS_OWNER_WAIT_MS='800'
+export PROMPT_CACHE_PREVIOUS_REPLAY_FALLBACK_ENABLED='false'
+export PROMPT_CACHE_REBIND_PRIMARY='false'
+export PROMPT_CACHE_LANE_TTL_SECONDS='3600'
 export IMPORT_JOB_MAX_CONCURRENCY='16'
 export IMPORT_STAGING_INSERT_BATCH_SIZE='1000'
 export IMPORT_PUBLISH_BATCH_SIZE='20'

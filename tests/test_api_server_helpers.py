@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -60,7 +61,13 @@ from oaix_gateway.api_server import (
     _build_admin_token_items,
     _build_admin_token_quota_items,
     _claim_next_active_token_from_snapshot,
+    _claim_prompt_cache_affinity_token,
+    _apply_prompt_cache_context_to_payload,
+    _build_prompt_cache_request_context,
     _build_upstream_headers,
+    _prompt_cache_bind_lane,
+    _prompt_cache_bind_response,
+    _prompt_cache_response_owner,
     _stream_responses_to_chat_completions,
     _stream_upstream_image_response,
     _stream_upstream_response,
@@ -109,6 +116,32 @@ def _unsigned_jwt(payload: dict) -> str:
         return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
     return f"{encode({'alg': 'none'})}.{encode(payload)}."
+
+
+def _prompt_cache_test_app() -> SimpleNamespace:
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            prompt_cache_affinity_lanes=OrderedDict(),
+            prompt_cache_response_bindings=OrderedDict(),
+        )
+    )
+
+
+def _prompt_cache_token_row(token_id: int, *, plan_type: str | None = "plus") -> SimpleNamespace:
+    return SimpleNamespace(
+        id=token_id,
+        account_id=f"acct-{token_id}",
+        plan_type=plan_type,
+        raw_payload={},
+        id_token=None,
+        refresh_token=f"refresh-{token_id}",
+        token_type="codex",
+        is_active=True,
+        cooldown_until=None,
+        merged_into_token_id=None,
+        last_used_at=None,
+        updated_at=None,
+    )
 
 
 @pytest.mark.parametrize("separator", ["\n\n", "\r\n\n", "\n\r\n", "\r\n\r\n"])
@@ -439,6 +472,65 @@ def test_build_upstream_headers_overrides_stale_client_codex_identity() -> None:
 
     assert headers["Version"] == "0.125.0"
     assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
+
+
+def test_prompt_cache_context_injects_key_and_stable_session_id() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"authorization", b"Bearer client-a")],
+        }
+    )
+    raw_payload = {
+        "model": "gpt-5.4",
+        "instructions": "You are a terse coding assistant.",
+        "input": [{"role": "user", "content": "Explain the build."}],
+    }
+
+    context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload=raw_payload,
+    )
+
+    assert context is not None
+    assert context.prompt_cache_key is not None
+    assert context.prompt_cache_key_hash is not None
+    upstream_payload = dict(raw_payload)
+    _apply_prompt_cache_context_to_payload(upstream_payload, context)
+    assert upstream_payload["prompt_cache_key"] == context.prompt_cache_key
+
+    headers_a = _build_upstream_headers(
+        request,
+        access_token="access-token",
+        account_id="account-1",
+        stream=False,
+        prompt_cache_context=context,
+    )
+    headers_b = _build_upstream_headers(
+        request,
+        access_token="access-token",
+        account_id="account-1",
+        stream=False,
+        prompt_cache_context=context,
+    )
+    assert headers_a["Session_id"] == headers_b["Session_id"]
+
+
+def test_chat_completions_request_to_responses_request_preserves_prompt_cache_key() -> None:
+    request_data = ChatCompletionsRequest(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "Summarize this file."}],
+        prompt_cache_key="explicit-cache-key",
+    )
+
+    responses_request = asyncio.run(_chat_completions_request_to_responses_request(request_data))
+    payload = responses_request.model_dump(exclude_unset=True)
+
+    assert payload["prompt_cache_key"] == "explicit-cache-key"
 
 
 def test_translate_responses_image_compat_payload_injects_image_tool() -> None:
@@ -1832,6 +1924,173 @@ def test_claim_next_token_for_model_request_returns_none_when_snapshot_has_only_
 
     assert result is None
     assert _TOKEN_ACTIVE_REQUESTS == {}
+
+
+def test_prompt_cache_affinity_creates_secondary_lane_when_primary_is_full(monkeypatch) -> None:
+    monkeypatch.setenv("PROMPT_CACHE_PRIMARY_WAIT_MS", "0")
+    monkeypatch.setenv("PROMPT_CACHE_LANE_WAIT_MS", "0")
+    monkeypatch.setenv("PROMPT_CACHE_MAX_LANES_PER_KEY", "3")
+    app = _prompt_cache_test_app()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"authorization", b"Bearer client-a")],
+        }
+    )
+    context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload={
+            "model": "gpt-5.4",
+            "input": "hello",
+            "prompt_cache_key": "cache-key-a",
+        },
+    )
+    assert context is not None
+    _prompt_cache_bind_lane(app, context, 1, prefer_primary=True)
+
+    snapshot = _TokenPoolSnapshot(
+        tokens=(_prompt_cache_token_row(1), _prompt_cache_token_row(2)),
+        scoped_cooldowns={},
+        loaded_at=0.0,
+    )
+    settings = TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, active_stream_cap=1)
+
+    try:
+        _TOKEN_ACTIVE_REQUESTS.clear()
+        _TOKEN_ACTIVE_REQUESTS[1] = 1
+        claim = asyncio.run(
+            _claim_prompt_cache_affinity_token(
+                app,
+                settings,
+                prompt_cache_context=context,
+                exclude_token_ids=set(),
+                scoped_cooldown_scope=None,
+                timing=_RequestTimingRecorder(),
+                token_pool_snapshot=snapshot,
+                require_non_free_token=False,
+            )
+        )
+    finally:
+        _TOKEN_ACTIVE_REQUESTS.clear()
+
+    assert claim is not None
+    assert claim.token_row.id == 2
+    assert claim.result == "lane_created"
+    assert claim.lane_index == 1
+
+
+def test_prompt_cache_affinity_prefers_previous_response_owner(monkeypatch) -> None:
+    monkeypatch.setenv("PROMPT_CACHE_PREVIOUS_OWNER_WAIT_MS", "0")
+    app = _prompt_cache_test_app()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"authorization", b"Bearer client-a")],
+        }
+    )
+    context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload={
+            "model": "gpt-5.4",
+            "input": "next",
+            "previous_response_id": "resp_owner_1",
+            "prompt_cache_key": "cache-key-a",
+        },
+    )
+    assert context is not None
+    _prompt_cache_bind_response(app, "resp_owner_1", 2)
+
+    snapshot = _TokenPoolSnapshot(
+        tokens=(_prompt_cache_token_row(1), _prompt_cache_token_row(2)),
+        scoped_cooldowns={},
+        loaded_at=0.0,
+    )
+
+    try:
+        _TOKEN_ACTIVE_REQUESTS.clear()
+        claim = asyncio.run(
+            _claim_prompt_cache_affinity_token(
+                app,
+                TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, active_stream_cap=1),
+                prompt_cache_context=context,
+                exclude_token_ids=set(),
+                scoped_cooldown_scope=None,
+                timing=_RequestTimingRecorder(),
+                token_pool_snapshot=snapshot,
+                require_non_free_token=False,
+            )
+        )
+    finally:
+        _TOKEN_ACTIVE_REQUESTS.clear()
+
+    assert claim is not None
+    assert claim.token_row.id == 2
+    assert claim.result == "previous_owner_hit"
+    assert _prompt_cache_response_owner(app, "resp_owner_1") == 2
+
+
+def test_prompt_cache_previous_response_owner_busy_is_strict_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("PROMPT_CACHE_PREVIOUS_OWNER_WAIT_MS", "0")
+    monkeypatch.setenv("PROMPT_CACHE_PRIMARY_WAIT_MS", "0")
+    monkeypatch.setenv("PROMPT_CACHE_LANE_WAIT_MS", "0")
+    monkeypatch.delenv("PROMPT_CACHE_PREVIOUS_STRICT_ENABLED", raising=False)
+    monkeypatch.delenv("PROMPT_CACHE_PREVIOUS_REPLAY_FALLBACK_ENABLED", raising=False)
+    app = _prompt_cache_test_app()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"authorization", b"Bearer client-a")],
+        }
+    )
+    context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload={
+            "model": "gpt-5.4",
+            "input": "next",
+            "previous_response_id": "resp_busy_1",
+            "prompt_cache_key": "cache-key-a",
+        },
+    )
+    assert context is not None
+    _prompt_cache_bind_response(app, "resp_busy_1", 1)
+    _prompt_cache_bind_lane(app, context, 2)
+    snapshot = _TokenPoolSnapshot(
+        tokens=(_prompt_cache_token_row(1), _prompt_cache_token_row(2)),
+        scoped_cooldowns={},
+        loaded_at=0.0,
+    )
+
+    try:
+        _TOKEN_ACTIVE_REQUESTS.clear()
+        _TOKEN_ACTIVE_REQUESTS[1] = 1
+        claim = asyncio.run(
+            _claim_prompt_cache_affinity_token(
+                app,
+                TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_FILL_FIRST, active_stream_cap=1),
+                prompt_cache_context=context,
+                exclude_token_ids=set(),
+                scoped_cooldown_scope=None,
+                timing=_RequestTimingRecorder(),
+                token_pool_snapshot=snapshot,
+                require_non_free_token=False,
+            )
+        )
+    finally:
+        _TOKEN_ACTIVE_REQUESTS.clear()
+
+    assert claim is None
 
 
 def test_upstream_http_pool_size_is_configurable(monkeypatch) -> None:
