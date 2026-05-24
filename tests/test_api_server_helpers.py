@@ -69,6 +69,7 @@ from oaix_gateway.api_server import (
     _prompt_cache_bind_response,
     _prompt_cache_finalize_kwargs,
     _prompt_cache_response_owner,
+    _prompt_cache_session_context,
     _stream_responses_to_chat_completions,
     _stream_upstream_image_response,
     _stream_upstream_response,
@@ -520,6 +521,77 @@ def test_prompt_cache_context_injects_key_and_stable_session_id() -> None:
         prompt_cache_context=context,
     )
     assert headers_a["Session_id"] == headers_b["Session_id"]
+
+
+def test_prompt_cache_session_id_prefers_stable_prompt_cache_over_header(monkeypatch) -> None:
+    monkeypatch.delenv("PROMPT_CACHE_SESSION_ID_MODE", raising=False)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [
+                (b"authorization", b"Bearer client-a"),
+                (b"session_id", b"client-session-a"),
+            ],
+        }
+    )
+    raw_payload = {
+        "model": "gpt-5.4",
+        "instructions": "You are a terse coding assistant.",
+        "input": [{"role": "user", "content": "Explain the build."}],
+    }
+
+    context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload=raw_payload,
+    )
+
+    session_id, source = _prompt_cache_session_context(request, context)
+    assert source == "prompt_cache"
+    assert session_id != "client-session-a"
+
+    headers = _build_upstream_headers(
+        request,
+        access_token="access-token",
+        account_id="account-1",
+        stream=False,
+        prompt_cache_context=context,
+    )
+    assert headers["Session_id"] == session_id
+
+
+def test_prompt_cache_session_id_can_prefer_header(monkeypatch) -> None:
+    monkeypatch.setenv("PROMPT_CACHE_SESSION_ID_MODE", "header")
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [
+                (b"authorization", b"Bearer client-a"),
+                (b"session_id", b"client-session-a"),
+            ],
+        }
+    )
+    raw_payload = {
+        "model": "gpt-5.4",
+        "instructions": "You are a terse coding assistant.",
+        "input": [{"role": "user", "content": "Explain the build."}],
+    }
+
+    context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload=raw_payload,
+    )
+
+    session_id, source = _prompt_cache_session_context(request, context)
+    assert source == "header"
+    assert session_id == "client-session-a"
 
 
 def test_prompt_cache_trace_separates_template_and_dynamic_hashes() -> None:

@@ -3061,6 +3061,11 @@ def _prompt_cache_previous_strict_enabled() -> bool:
     return not _prompt_cache_previous_replay_fallback_enabled()
 
 
+def _prompt_cache_session_prefer_header() -> bool:
+    value = str(os.getenv("PROMPT_CACHE_SESSION_ID_MODE") or "").strip().lower()
+    return value in {"header", "prefer_header", "client", "client_header"}
+
+
 def _prompt_cache_lane_ttl_seconds() -> float:
     return _float_env("PROMPT_CACHE_LANE_TTL_SECONDS", 3600.0, minimum=60.0)
 
@@ -3100,10 +3105,11 @@ def _prompt_cache_session_context(
     prompt_cache_context: _PromptCacheRequestContext | None,
 ) -> tuple[str, str]:
     explicit_session_id = (http_request.headers.get("Session_id") or "").strip()
-    if explicit_session_id:
+    prompt_session_id = _prompt_cache_session_uuid(prompt_cache_context)
+
+    if explicit_session_id and (prompt_session_id is None or _prompt_cache_session_prefer_header()):
         return explicit_session_id, "header"
 
-    prompt_session_id = _prompt_cache_session_uuid(prompt_cache_context)
     if prompt_session_id:
         return prompt_session_id, "prompt_cache"
 

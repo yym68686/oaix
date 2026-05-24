@@ -44,6 +44,7 @@
 - `PROMPT_CACHE_PRIMARY_WAIT_MS`: primary lane 满载时最多短等毫秒数，默认 `500`
 - `PROMPT_CACHE_LANE_WAIT_MS`: 所有已绑定 lane 满载时的二次短等毫秒数，默认 `100`
 - `PROMPT_CACHE_GLOBAL_FALLBACK_ENABLED`: lanes 都不可用时是否允许走全局低负载 key，默认 `true`
+- `PROMPT_CACHE_SESSION_ID_MODE`: prompt cache 请求的上游 `Session_id` 选择策略，默认使用由 cache key 派生的稳定值；设为 `header` 可恢复优先透传客户端 header
 - `PROMPT_CACHE_PREVIOUS_OWNER_WAIT_MS`: `previous_response_id` owner key 满载时最多短等毫秒数，默认 `800`
 - `PROMPT_CACHE_PREVIOUS_REPLAY_FALLBACK_ENABLED`: owner 忙时是否允许 `previous_response_id` 请求 fallback 到 prompt cache lanes，仅在调用方已保证 stateless replay 时开启，默认 `false`
 - `PROMPT_CACHE_REBIND_PRIMARY`: spillover 是否覆盖 primary lane，默认 `false`
