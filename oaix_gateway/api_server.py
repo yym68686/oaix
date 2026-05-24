@@ -3090,14 +3090,21 @@ def _build_prompt_cache_affinity_key(
     client_scope: str,
     prompt_key_hash: str,
 ) -> str:
+    affinity_endpoint, affinity_compact = _prompt_cache_affinity_family(endpoint=endpoint, compact=compact)
     payload = {
-        "endpoint": endpoint,
+        "endpoint": affinity_endpoint,
         "model": model,
-        "compact": bool(compact),
+        "compact": affinity_compact,
         "client": client_scope,
         "prompt": prompt_key_hash,
     }
     return short_hash(normalize_seed_json(payload), length=32)
+
+
+def _prompt_cache_affinity_family(*, endpoint: str, compact: bool) -> tuple[str, bool]:
+    if endpoint in {"/v1/responses", "/v1/responses/compact"}:
+        return "/v1/responses", False
+    return endpoint, bool(compact)
 
 
 def _prompt_cache_session_context(

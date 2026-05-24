@@ -594,6 +594,53 @@ def test_prompt_cache_session_id_can_prefer_header(monkeypatch) -> None:
     assert session_id == "client-session-a"
 
 
+def test_prompt_cache_responses_and_compact_share_affinity_family() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"authorization", b"Bearer client-a")],
+        }
+    )
+    raw_payload = {
+        "model": "gpt-5.4",
+        "instructions": "You are a terse coding assistant.",
+        "input": [{"role": "user", "content": "Explain the build."}],
+        "tools": [{"type": "function", "name": "inspect_build"}],
+    }
+
+    responses_context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload=raw_payload,
+        compact=False,
+    )
+    compact_context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses/compact",
+        request_model="gpt-5.4",
+        raw_payload=raw_payload,
+        compact=True,
+    )
+
+    assert responses_context is not None
+    assert compact_context is not None
+    assert responses_context.endpoint == "/v1/responses"
+    assert compact_context.endpoint == "/v1/responses/compact"
+    assert responses_context.compact is False
+    assert compact_context.compact is True
+    assert responses_context.prompt_cache_key_hash == compact_context.prompt_cache_key_hash
+    assert responses_context.affinity_key == compact_context.affinity_key
+
+    responses_session_id, responses_session_source = _prompt_cache_session_context(request, responses_context)
+    compact_session_id, compact_session_source = _prompt_cache_session_context(request, compact_context)
+    assert responses_session_source == "prompt_cache"
+    assert compact_session_source == "prompt_cache"
+    assert responses_session_id == compact_session_id
+
+
 def test_prompt_cache_trace_separates_template_and_dynamic_hashes() -> None:
     request = Request(
         {
