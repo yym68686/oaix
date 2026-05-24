@@ -35,9 +35,22 @@ class RequestLogItem:
     output_tokens: int | None
     total_tokens: int | None
     estimated_cost_usd: float | None
+    request_payload_hash: str | None
+    upstream_payload_hash: str | None
+    prompt_template_hash: str | None
+    prompt_dynamic_hash: str | None
+    prompt_cache_source: str | None
     prompt_cache_key_hash: str | None
+    prompt_cache_retention_requested: str | None
+    prompt_cache_retention_sent: str | None
+    session_id_hash: str | None
+    session_id_source: str | None
+    previous_response_id_hash: str | None
+    upstream_response_id: str | None
+    cache_hit_ratio: float | None
     cache_affinity_result: str | None
     cache_affinity_lane_index: int | None
+    prompt_cache_trace: dict[str, Any] | None
     error_message: str | None
 
 
@@ -58,6 +71,18 @@ def _ms_between(started_at: datetime | None, ended_at: datetime | None) -> int |
     if started_at is None or ended_at is None:
         return None
     return max(0, int((ended_at - started_at).total_seconds() * 1000))
+
+
+def _cache_hit_ratio(input_tokens: int | None, cached_input_tokens: int | None) -> float | None:
+    try:
+        resolved_input_tokens = int(input_tokens)
+        resolved_cached_input_tokens = int(cached_input_tokens)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if resolved_input_tokens <= 0:
+        return None
+    ratio = float(resolved_cached_input_tokens) / float(resolved_input_tokens)
+    return max(0.0, min(1.0, ratio))
 
 
 def _normalize_timing_spans(timing_spans: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -257,6 +282,22 @@ async def create_request_log(
     started_at: datetime | None = None,
     client_ip: str | None = None,
     user_agent: str | None = None,
+    request_payload_hash: str | None = None,
+    upstream_payload_hash: str | None = None,
+    prompt_template_hash: str | None = None,
+    prompt_dynamic_hash: str | None = None,
+    prompt_cache_source: str | None = None,
+    prompt_cache_key_hash: str | None = None,
+    prompt_cache_retention_requested: str | None = None,
+    prompt_cache_retention_sent: str | None = None,
+    session_id_hash: str | None = None,
+    session_id_source: str | None = None,
+    previous_response_id_hash: str | None = None,
+    upstream_response_id: str | None = None,
+    cache_hit_ratio: float | None = None,
+    cache_affinity_result: str | None = None,
+    cache_affinity_lane_index: int | None = None,
+    prompt_cache_trace: dict[str, Any] | None = None,
 ) -> GatewayRequestLog:
     started_at = started_at or utcnow()
     async with get_request_log_session() as session:
@@ -270,6 +311,22 @@ async def create_request_log(
                 started_at=started_at,
                 client_ip=client_ip,
                 user_agent=user_agent,
+                request_payload_hash=request_payload_hash,
+                upstream_payload_hash=upstream_payload_hash,
+                prompt_template_hash=prompt_template_hash,
+                prompt_dynamic_hash=prompt_dynamic_hash,
+                prompt_cache_source=prompt_cache_source,
+                prompt_cache_key_hash=prompt_cache_key_hash,
+                prompt_cache_retention_requested=prompt_cache_retention_requested,
+                prompt_cache_retention_sent=prompt_cache_retention_sent,
+                session_id_hash=session_id_hash,
+                session_id_source=session_id_source,
+                previous_response_id_hash=previous_response_id_hash,
+                upstream_response_id=upstream_response_id,
+                cache_hit_ratio=cache_hit_ratio,
+                cache_affinity_result=cache_affinity_result,
+                cache_affinity_lane_index=cache_affinity_lane_index,
+                prompt_cache_trace=prompt_cache_trace,
             )
             session.add(item)
             await session.flush()
@@ -292,9 +349,22 @@ async def finalize_request_log(
     output_tokens: int | None = None,
     total_tokens: int | None = None,
     estimated_cost_usd: float | None = None,
+    request_payload_hash: str | None = None,
+    upstream_payload_hash: str | None = None,
+    prompt_template_hash: str | None = None,
+    prompt_dynamic_hash: str | None = None,
+    prompt_cache_source: str | None = None,
     prompt_cache_key_hash: str | None = None,
+    prompt_cache_retention_requested: str | None = None,
+    prompt_cache_retention_sent: str | None = None,
+    session_id_hash: str | None = None,
+    session_id_source: str | None = None,
+    previous_response_id_hash: str | None = None,
+    upstream_response_id: str | None = None,
+    cache_hit_ratio: float | None = None,
     cache_affinity_result: str | None = None,
     cache_affinity_lane_index: int | None = None,
+    prompt_cache_trace: dict[str, Any] | None = None,
     timing_spans: dict[str, Any] | None = None,
     error_message: str | None = None,
 ) -> dict[str, Any] | None:
@@ -329,14 +399,40 @@ async def finalize_request_log(
             item.estimated_cost_usd = (
                 _round_cost(estimated_cost_usd) if estimated_cost_usd is not None else item.estimated_cost_usd
             )
+            item.request_payload_hash = str(request_payload_hash or "").strip()[:64] or item.request_payload_hash
+            item.upstream_payload_hash = str(upstream_payload_hash or "").strip()[:64] or item.upstream_payload_hash
+            item.prompt_template_hash = str(prompt_template_hash or "").strip()[:64] or item.prompt_template_hash
+            item.prompt_dynamic_hash = str(prompt_dynamic_hash or "").strip()[:64] or item.prompt_dynamic_hash
+            item.prompt_cache_source = str(prompt_cache_source or "").strip()[:64] or item.prompt_cache_source
             item.prompt_cache_key_hash = (
                 str(prompt_cache_key_hash or "").strip()[:64] or item.prompt_cache_key_hash
             )
+            item.prompt_cache_retention_requested = (
+                str(prompt_cache_retention_requested or "").strip()[:32] or item.prompt_cache_retention_requested
+            )
+            item.prompt_cache_retention_sent = (
+                str(prompt_cache_retention_sent or "").strip()[:32] or item.prompt_cache_retention_sent
+            )
+            item.session_id_hash = str(session_id_hash or "").strip()[:64] or item.session_id_hash
+            item.session_id_source = str(session_id_source or "").strip()[:32] or item.session_id_source
+            item.previous_response_id_hash = (
+                str(previous_response_id_hash or "").strip()[:64] or item.previous_response_id_hash
+            )
+            item.upstream_response_id = str(upstream_response_id or "").strip()[:128] or item.upstream_response_id
+            if cache_hit_ratio is not None:
+                try:
+                    item.cache_hit_ratio = max(0.0, min(1.0, float(cache_hit_ratio)))
+                except (TypeError, ValueError):
+                    pass
+            if item.cache_hit_ratio is None:
+                item.cache_hit_ratio = _cache_hit_ratio(item.input_tokens, item.cached_input_tokens)
             item.cache_affinity_result = (
                 str(cache_affinity_result or "").strip()[:64] or item.cache_affinity_result
             )
             if cache_affinity_lane_index is not None:
                 item.cache_affinity_lane_index = _int_or_zero(cache_affinity_lane_index)
+            if prompt_cache_trace is not None:
+                item.prompt_cache_trace = prompt_cache_trace
             if resolved_timing_spans is not None:
                 resolved_timing_spans["finalize_ms"] = max(0, int((perf_counter() - finalize_started) * 1000))
                 item.timing_spans = resolved_timing_spans
@@ -351,6 +447,12 @@ def _request_log_payload_values(payload: dict[str, Any]) -> dict[str, Any]:
     model = payload.get("model")
     model_name = payload.get("model_name") or model
     timing_spans = _normalize_timing_spans(payload.get("timing_spans"))
+    prompt_cache_trace = payload.get("prompt_cache_trace") if isinstance(payload.get("prompt_cache_trace"), dict) else None
+    trace = prompt_cache_trace or {}
+    prompt_trace = trace.get("prompt") if isinstance(trace.get("prompt"), dict) else {}
+    route_trace = trace.get("route") if isinstance(trace.get("route"), dict) else {}
+    usage_trace = trace.get("usage") if isinstance(trace.get("usage"), dict) else {}
+    response_trace = trace.get("response") if isinstance(trace.get("response"), dict) else {}
     error_message = str(payload.get("error_message") or "").strip()[:4000] or None
     status_code = payload.get("status_code")
     try:
@@ -395,13 +497,40 @@ def _request_log_payload_values(payload: dict[str, Any]) -> dict[str, Any]:
         "estimated_cost_usd": (
             _round_cost(payload.get("estimated_cost_usd")) if payload.get("estimated_cost_usd") is not None else None
         ),
-        "prompt_cache_key_hash": str(payload.get("prompt_cache_key_hash") or "").strip()[:64] or None,
-        "cache_affinity_result": str(payload.get("cache_affinity_result") or "").strip()[:64] or None,
+        "request_payload_hash": str(payload.get("request_payload_hash") or trace.get("request_payload_hash") or "").strip()[:64] or None,
+        "upstream_payload_hash": str(payload.get("upstream_payload_hash") or trace.get("upstream_payload_hash") or "").strip()[:64] or None,
+        "prompt_template_hash": str(payload.get("prompt_template_hash") or prompt_trace.get("template_hash") or "").strip()[:64] or None,
+        "prompt_dynamic_hash": str(payload.get("prompt_dynamic_hash") or prompt_trace.get("dynamic_hash") or "").strip()[:64] or None,
+        "prompt_cache_source": str(payload.get("prompt_cache_source") or trace.get("prompt_cache_key_source") or "").strip()[:64] or None,
+        "prompt_cache_key_hash": str(payload.get("prompt_cache_key_hash") or trace.get("prompt_cache_key_hash") or "").strip()[:64] or None,
+        "prompt_cache_retention_requested": (
+            str(payload.get("prompt_cache_retention_requested") or trace.get("prompt_cache_retention_requested") or "").strip()[:32] or None
+        ),
+        "prompt_cache_retention_sent": str(payload.get("prompt_cache_retention_sent") or trace.get("prompt_cache_retention_sent") or "").strip()[:32] or None,
+        "session_id_hash": str(payload.get("session_id_hash") or trace.get("session_id_hash") or "").strip()[:64] or None,
+        "session_id_source": str(payload.get("session_id_source") or trace.get("session_id_source") or "").strip()[:32] or None,
+        "previous_response_id_hash": str(payload.get("previous_response_id_hash") or trace.get("previous_response_id_hash") or "").strip()[:64] or None,
+        "upstream_response_id": str(payload.get("upstream_response_id") or response_trace.get("response_id") or "").strip()[:128] or None,
+        "cache_hit_ratio": (
+            _float_or_zero(payload.get("cache_hit_ratio"))
+            if payload.get("cache_hit_ratio") is not None
+            else (
+                _float_or_zero(usage_trace.get("cache_hit_ratio"))
+                if usage_trace.get("cache_hit_ratio") is not None
+                else _cache_hit_ratio(payload.get("input_tokens"), payload.get("cached_input_tokens"))
+            )
+        ),
+        "cache_affinity_result": str(payload.get("cache_affinity_result") or route_trace.get("cache_affinity_result") or "").strip()[:64] or None,
         "cache_affinity_lane_index": (
             _int_or_zero(payload.get("cache_affinity_lane_index"))
             if payload.get("cache_affinity_lane_index") is not None
-            else None
+            else (
+                _int_or_zero(route_trace.get("cache_affinity_lane_index"))
+                if route_trace.get("cache_affinity_lane_index") is not None
+                else None
+            )
         ),
+        "prompt_cache_trace": prompt_cache_trace,
         "error_message": error_message,
     }
 
@@ -434,7 +563,22 @@ def _merge_request_log_payload(item: GatewayRequestLog, values: dict[str, Any]) 
         item.estimated_cost_usd = (
             values["estimated_cost_usd"] if values["estimated_cost_usd"] is not None else item.estimated_cost_usd
         )
+        item.request_payload_hash = values.get("request_payload_hash") or item.request_payload_hash
+        item.upstream_payload_hash = values.get("upstream_payload_hash") or item.upstream_payload_hash
+        item.prompt_template_hash = values.get("prompt_template_hash") or item.prompt_template_hash
+        item.prompt_dynamic_hash = values.get("prompt_dynamic_hash") or item.prompt_dynamic_hash
+        item.prompt_cache_source = values.get("prompt_cache_source") or item.prompt_cache_source
         item.prompt_cache_key_hash = values.get("prompt_cache_key_hash") or item.prompt_cache_key_hash
+        item.prompt_cache_retention_requested = (
+            values.get("prompt_cache_retention_requested") or item.prompt_cache_retention_requested
+        )
+        item.prompt_cache_retention_sent = values.get("prompt_cache_retention_sent") or item.prompt_cache_retention_sent
+        item.session_id_hash = values.get("session_id_hash") or item.session_id_hash
+        item.session_id_source = values.get("session_id_source") or item.session_id_source
+        item.previous_response_id_hash = values.get("previous_response_id_hash") or item.previous_response_id_hash
+        item.upstream_response_id = values.get("upstream_response_id") or item.upstream_response_id
+        cache_hit_ratio = values.get("cache_hit_ratio")
+        item.cache_hit_ratio = cache_hit_ratio if cache_hit_ratio is not None else item.cache_hit_ratio
         item.cache_affinity_result = values.get("cache_affinity_result") or item.cache_affinity_result
         cache_affinity_lane_index = values.get("cache_affinity_lane_index")
         item.cache_affinity_lane_index = (
@@ -442,6 +586,7 @@ def _merge_request_log_payload(item: GatewayRequestLog, values: dict[str, Any]) 
             if cache_affinity_lane_index is not None
             else item.cache_affinity_lane_index
         )
+        item.prompt_cache_trace = values.get("prompt_cache_trace") or item.prompt_cache_trace
         item.timing_spans = values["timing_spans"] or item.timing_spans
         item.error_message = values["error_message"]
 
@@ -548,10 +693,49 @@ async def upsert_request_logs(
                     "output_tokens": func.coalesce(excluded.output_tokens, GatewayRequestLog.output_tokens),
                     "total_tokens": func.coalesce(excluded.total_tokens, GatewayRequestLog.total_tokens),
                     "estimated_cost_usd": func.coalesce(excluded.estimated_cost_usd, GatewayRequestLog.estimated_cost_usd),
+                    "request_payload_hash": func.coalesce(
+                        excluded.request_payload_hash,
+                        GatewayRequestLog.request_payload_hash,
+                    ),
+                    "upstream_payload_hash": func.coalesce(
+                        excluded.upstream_payload_hash,
+                        GatewayRequestLog.upstream_payload_hash,
+                    ),
+                    "prompt_template_hash": func.coalesce(
+                        excluded.prompt_template_hash,
+                        GatewayRequestLog.prompt_template_hash,
+                    ),
+                    "prompt_dynamic_hash": func.coalesce(
+                        excluded.prompt_dynamic_hash,
+                        GatewayRequestLog.prompt_dynamic_hash,
+                    ),
+                    "prompt_cache_source": func.coalesce(
+                        excluded.prompt_cache_source,
+                        GatewayRequestLog.prompt_cache_source,
+                    ),
                     "prompt_cache_key_hash": func.coalesce(
                         excluded.prompt_cache_key_hash,
                         GatewayRequestLog.prompt_cache_key_hash,
                     ),
+                    "prompt_cache_retention_requested": func.coalesce(
+                        excluded.prompt_cache_retention_requested,
+                        GatewayRequestLog.prompt_cache_retention_requested,
+                    ),
+                    "prompt_cache_retention_sent": func.coalesce(
+                        excluded.prompt_cache_retention_sent,
+                        GatewayRequestLog.prompt_cache_retention_sent,
+                    ),
+                    "session_id_hash": func.coalesce(excluded.session_id_hash, GatewayRequestLog.session_id_hash),
+                    "session_id_source": func.coalesce(excluded.session_id_source, GatewayRequestLog.session_id_source),
+                    "previous_response_id_hash": func.coalesce(
+                        excluded.previous_response_id_hash,
+                        GatewayRequestLog.previous_response_id_hash,
+                    ),
+                    "upstream_response_id": func.coalesce(
+                        excluded.upstream_response_id,
+                        GatewayRequestLog.upstream_response_id,
+                    ),
+                    "cache_hit_ratio": func.coalesce(excluded.cache_hit_ratio, GatewayRequestLog.cache_hit_ratio),
                     "cache_affinity_result": func.coalesce(
                         excluded.cache_affinity_result,
                         GatewayRequestLog.cache_affinity_result,
@@ -559,6 +743,10 @@ async def upsert_request_logs(
                     "cache_affinity_lane_index": func.coalesce(
                         excluded.cache_affinity_lane_index,
                         GatewayRequestLog.cache_affinity_lane_index,
+                    ),
+                    "prompt_cache_trace": func.coalesce(
+                        excluded.prompt_cache_trace,
+                        GatewayRequestLog.prompt_cache_trace,
                     ),
                     "timing_spans": func.coalesce(excluded.timing_spans, GatewayRequestLog.timing_spans),
                     "error_message": func.coalesce(excluded.error_message, GatewayRequestLog.error_message),
@@ -657,9 +845,22 @@ async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
                 estimated_cost_usd=_round_cost(_float_or_zero(item.estimated_cost_usd))
                 if item.estimated_cost_usd is not None
                 else None,
+                request_payload_hash=item.request_payload_hash,
+                upstream_payload_hash=item.upstream_payload_hash,
+                prompt_template_hash=item.prompt_template_hash,
+                prompt_dynamic_hash=item.prompt_dynamic_hash,
+                prompt_cache_source=item.prompt_cache_source,
                 prompt_cache_key_hash=item.prompt_cache_key_hash,
+                prompt_cache_retention_requested=item.prompt_cache_retention_requested,
+                prompt_cache_retention_sent=item.prompt_cache_retention_sent,
+                session_id_hash=item.session_id_hash,
+                session_id_source=item.session_id_source,
+                previous_response_id_hash=item.previous_response_id_hash,
+                upstream_response_id=item.upstream_response_id,
+                cache_hit_ratio=item.cache_hit_ratio,
                 cache_affinity_result=item.cache_affinity_result,
                 cache_affinity_lane_index=item.cache_affinity_lane_index,
+                prompt_cache_trace=item.prompt_cache_trace if isinstance(item.prompt_cache_trace, dict) else None,
                 error_message=item.error_message,
             )
             for item in items

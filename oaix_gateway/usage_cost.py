@@ -21,6 +21,12 @@ class UsageMetrics:
     estimated_cost_usd: float | None = None
     pricing_model: str | None = None
 
+    @property
+    def cache_hit_ratio(self) -> float | None:
+        if self.input_tokens <= 0:
+            return None
+        return max(0.0, min(1.0, float(self.cached_input_tokens) / float(self.input_tokens)))
+
 
 DEFAULT_MODEL_PRICING: dict[str, ModelPricing] = {
     "gpt-5.5": ModelPricing(input_per_million_usd=5.0, cached_input_per_million_usd=0.5, output_per_million_usd=30.0),

@@ -43,6 +43,7 @@ from .database import (
     utcnow,
 )
 from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
+from .prompt_observability import build_prompt_cache_trace
 from .prompt_cache import (
     client_scope_hash,
     derive_chat_prompt_cache_key,
@@ -1570,6 +1571,24 @@ async def _write_request_log_batch_legacy(jobs: list[_RequestLogWriteJob]) -> No
         if owner is None:
             continue
         if owner._request_log_id is None:
+            start_keys = {
+                "request_payload_hash",
+                "upstream_payload_hash",
+                "prompt_template_hash",
+                "prompt_dynamic_hash",
+                "prompt_cache_source",
+                "prompt_cache_key_hash",
+                "prompt_cache_retention_requested",
+                "prompt_cache_retention_sent",
+                "session_id_hash",
+                "session_id_source",
+                "previous_response_id_hash",
+                "upstream_response_id",
+                "cache_hit_ratio",
+                "cache_affinity_result",
+                "cache_affinity_lane_index",
+                "prompt_cache_trace",
+            }
             item = await create_request_log(
                 request_id=owner.request_id,
                 endpoint=owner.endpoint,
@@ -1578,6 +1597,7 @@ async def _write_request_log_batch_legacy(jobs: list[_RequestLogWriteJob]) -> No
                 started_at=owner.started_at,
                 client_ip=owner.client_ip,
                 user_agent=owner.user_agent,
+                **{key: payload.get(key) for key in start_keys},
             )
             owner._request_log_id = int(item.id)
 
@@ -1601,9 +1621,22 @@ async def _write_request_log_batch_legacy(jobs: list[_RequestLogWriteJob]) -> No
             "output_tokens",
             "total_tokens",
             "estimated_cost_usd",
+            "request_payload_hash",
+            "upstream_payload_hash",
+            "prompt_template_hash",
+            "prompt_dynamic_hash",
+            "prompt_cache_source",
             "prompt_cache_key_hash",
+            "prompt_cache_retention_requested",
+            "prompt_cache_retention_sent",
+            "session_id_hash",
+            "session_id_source",
+            "previous_response_id_hash",
+            "upstream_response_id",
+            "cache_hit_ratio",
             "cache_affinity_result",
             "cache_affinity_lane_index",
+            "prompt_cache_trace",
             "timing_spans",
             "error_message",
         }
@@ -1819,6 +1852,7 @@ class _RequestLogHandle:
     client_ip: str | None
     user_agent: str | None
     timing: _RequestTimingRecorder
+    prompt_cache_trace: dict[str, Any] | None = None
     _request_log_id: int | None = None
     _finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _finalized: bool = False
@@ -1835,6 +1869,7 @@ class _RequestLogHandle:
         client_ip: str | None,
         user_agent: str | None,
         timing: _RequestTimingRecorder,
+        prompt_cache_trace: dict[str, Any] | None = None,
     ) -> "_RequestLogHandle":
         handle = cls(
             request_id=str(uuid.uuid4()),
@@ -1845,6 +1880,7 @@ class _RequestLogHandle:
             client_ip=client_ip,
             user_agent=user_agent,
             timing=timing,
+            prompt_cache_trace=prompt_cache_trace if isinstance(prompt_cache_trace, dict) else None,
         )
         handle._enqueue_start()
         return handle
@@ -1859,6 +1895,7 @@ class _RequestLogHandle:
             "started_at": self.started_at,
             "client_ip": self.client_ip,
             "user_agent": self.user_agent,
+            "prompt_cache_trace": copy.deepcopy(self.prompt_cache_trace) if self.prompt_cache_trace is not None else None,
         }
 
     def _enqueue_start(self) -> None:
@@ -2056,6 +2093,7 @@ class _PromptCacheRequestContext:
     affinity_key: str | None
     client_scope: str
     source: str
+    raw_payload: dict[str, Any] | None = None
 
 
 @dataclass
@@ -2897,12 +2935,11 @@ def _build_upstream_headers(
     stream: bool,
     *,
     prompt_cache_context: _PromptCacheRequestContext | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
-    session_id = (
-        (http_request.headers.get("Session_id") or "").strip()
-        or _prompt_cache_session_uuid(prompt_cache_context)
-        or str(uuid.uuid4())
-    )
+    resolved_session_id = session_id
+    if not resolved_session_id:
+        resolved_session_id, _ = _prompt_cache_session_context(http_request, prompt_cache_context)
 
     headers = {
         "Content-Type": "application/json",
@@ -2910,7 +2947,7 @@ def _build_upstream_headers(
         "Openai-Beta": (http_request.headers.get("Openai-Beta") or "responses=experimental").strip(),
         "Originator": (http_request.headers.get("Originator") or "codex_cli_rs").strip(),
         "Version": CODEX_CLI_VERSION,
-        "Session_id": session_id,
+        "Session_id": resolved_session_id,
         "User-Agent": CODEX_USER_AGENT,
         "Accept": "text/event-stream" if stream else "application/json",
     }
@@ -3058,6 +3095,31 @@ def _build_prompt_cache_affinity_key(
     return short_hash(normalize_seed_json(payload), length=32)
 
 
+def _prompt_cache_session_context(
+    http_request: Request,
+    prompt_cache_context: _PromptCacheRequestContext | None,
+) -> tuple[str, str]:
+    explicit_session_id = (http_request.headers.get("Session_id") or "").strip()
+    if explicit_session_id:
+        return explicit_session_id, "header"
+
+    prompt_session_id = _prompt_cache_session_uuid(prompt_cache_context)
+    if prompt_session_id:
+        return prompt_session_id, "prompt_cache"
+
+    return str(uuid.uuid4()), "generated"
+
+
+def _prompt_cache_lane_count(app: FastAPI, prompt_cache_context: _PromptCacheRequestContext | None) -> int | None:
+    if prompt_cache_context is None or not prompt_cache_context.affinity_key:
+        return None
+    store = _prompt_cache_lane_store(app)
+    state = store.get(prompt_cache_context.affinity_key)
+    if state is None:
+        return None
+    return len(state.lanes)
+
+
 def _build_prompt_cache_request_context(
     http_request: Request,
     *,
@@ -3106,6 +3168,7 @@ def _build_prompt_cache_request_context(
         affinity_key=affinity_key,
         client_scope=client_scope,
         source=source,
+        raw_payload=copy.deepcopy(raw_payload) if isinstance(raw_payload, dict) else None,
     )
 
 
@@ -3127,6 +3190,60 @@ def _prompt_cache_session_uuid(context: _PromptCacheRequestContext | None) -> st
     return deterministic_uuid(f"{context.client_scope}:{seed}")
 
 
+def _prompt_cache_update_runtime_trace_fields(
+    trace: dict[str, Any] | None,
+    *,
+    session_id: str | None = None,
+    session_id_source: str | None = None,
+    upstream_response_id: str | None = None,
+    status_code: int | None = None,
+    usage_metrics: UsageMetrics | None = None,
+    cache_affinity_result: str | None = None,
+    cache_affinity_lane_index: int | None = None,
+    cache_affinity_lane_count: int | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(trace, dict):
+        return None
+
+    if session_id is not None:
+        trace["session_id_hash"] = short_hash(session_id, length=64)
+    if session_id_source is not None:
+        trace["session_id_source"] = session_id_source
+
+    route = trace.get("route")
+    if not isinstance(route, dict):
+        route = {}
+        trace["route"] = route
+    if cache_affinity_result is not None:
+        route["cache_affinity_result"] = cache_affinity_result
+    if cache_affinity_lane_index is not None:
+        route["cache_affinity_lane_index"] = cache_affinity_lane_index
+    if cache_affinity_lane_count is not None:
+        route["cache_affinity_lane_count"] = cache_affinity_lane_count
+
+    usage = trace.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+        trace["usage"] = usage
+    if usage_metrics is not None:
+        usage["input_tokens"] = usage_metrics.input_tokens
+        usage["cached_input_tokens"] = usage_metrics.cached_input_tokens
+        usage["output_tokens"] = usage_metrics.output_tokens
+        usage["total_tokens"] = usage_metrics.total_tokens
+        usage["cache_hit_ratio"] = usage_metrics.cache_hit_ratio
+
+    response = trace.get("response")
+    if not isinstance(response, dict):
+        response = {}
+        trace["response"] = response
+    if upstream_response_id is not None:
+        response["response_id"] = upstream_response_id
+    if status_code is not None:
+        response["status_code"] = status_code
+
+    return trace
+
+
 def _extract_response_id_from_payload(payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return None
@@ -3144,15 +3261,46 @@ def _extract_response_id_from_payload(payload: Any) -> str | None:
 def _prompt_cache_finalize_kwargs(
     context: _PromptCacheRequestContext | None,
     *,
+    app: FastAPI | None = None,
+    prompt_cache_trace: dict[str, Any] | None = None,
     affinity_result: str | None = None,
     lane_index: int | None = None,
+    status_code: int | None = None,
+    usage_metrics: UsageMetrics | None = None,
+    upstream_response_id: str | None = None,
 ) -> dict[str, Any]:
     if context is None:
         return {}
+    trace = prompt_cache_trace if isinstance(prompt_cache_trace, dict) else {}
+    route = trace.get("route") if isinstance(trace.get("route"), dict) else {}
+    response = trace.get("response") if isinstance(trace.get("response"), dict) else {}
+    usage = trace.get("usage") if isinstance(trace.get("usage"), dict) else {}
+    prompt = trace.get("prompt") if isinstance(trace.get("prompt"), dict) else {}
+    if not usage and usage_metrics is not None:
+        usage = {
+            "input_tokens": usage_metrics.input_tokens,
+            "cached_input_tokens": usage_metrics.cached_input_tokens,
+            "output_tokens": usage_metrics.output_tokens,
+            "total_tokens": usage_metrics.total_tokens,
+            "cache_hit_ratio": usage_metrics.cache_hit_ratio,
+        }
     return {
+        "request_payload_hash": trace.get("request_payload_hash"),
+        "upstream_payload_hash": trace.get("upstream_payload_hash"),
+        "prompt_template_hash": prompt.get("template_hash"),
+        "prompt_dynamic_hash": prompt.get("dynamic_hash"),
+        "prompt_cache_source": context.source,
         "prompt_cache_key_hash": context.prompt_cache_key_hash,
-        "cache_affinity_result": affinity_result,
-        "cache_affinity_lane_index": lane_index,
+        "prompt_cache_retention_requested": trace.get("prompt_cache_retention_requested"),
+        "prompt_cache_retention_sent": trace.get("prompt_cache_retention_sent"),
+        "session_id_hash": trace.get("session_id_hash"),
+        "session_id_source": trace.get("session_id_source"),
+        "previous_response_id_hash": trace.get("previous_response_id_hash"),
+        "upstream_response_id": upstream_response_id or response.get("response_id"),
+        "cache_hit_ratio": usage.get("cache_hit_ratio"),
+        "cache_affinity_result": affinity_result or route.get("cache_affinity_result"),
+        "cache_affinity_lane_index": lane_index if lane_index is not None else route.get("cache_affinity_lane_index"),
+        "prompt_cache_trace": trace,
     }
 
 
@@ -6190,11 +6338,13 @@ def _usage_finalize_kwargs(usage_metrics: UsageMetrics | None) -> dict[str, Any]
 
 
 def _response_id_from_proxy_result(proxy_result: ProxyRequestResult) -> str | None:
-    if proxy_result.response_id:
-        return proxy_result.response_id
-    if proxy_result.stream_capture is not None:
-        return _extract_response_id_from_payload(proxy_result.stream_capture.response_payload)
-    body = getattr(proxy_result.response, "body", None)
+    response_id = _normalize_optional_text(getattr(proxy_result, "response_id", None))
+    if response_id:
+        return response_id
+    stream_capture = getattr(proxy_result, "stream_capture", None)
+    if stream_capture is not None:
+        return _extract_response_id_from_payload(stream_capture.response_payload)
+    body = getattr(getattr(proxy_result, "response", None), "body", None)
     if isinstance(body, (bytes, bytearray)):
         try:
             payload = json.loads(body)
@@ -7054,6 +7204,9 @@ async def _execute_proxy_request_with_failover(
     proxy_call: Callable[[httpx.AsyncClient, str, str | None], Awaitable[ProxyRequestResult]],
     compact: bool = False,
     prompt_cache_context: _PromptCacheRequestContext | None = None,
+    prompt_cache_trace: dict[str, Any] | None = None,
+    session_id: str | None = None,
+    session_id_source: str | None = None,
 ) -> Response:
     try:
         proxy_lease = await _proxy_concurrency_limiter(http_request.app).acquire(
@@ -7081,6 +7234,7 @@ async def _execute_proxy_request_with_failover(
         client_ip=http_request.client.host if http_request.client is not None else None,
         user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
         timing=timing,
+        prompt_cache_trace=prompt_cache_trace if isinstance(prompt_cache_trace, dict) else None,
     )
     attempt_count = 0
     last_token_id: int | None = None
@@ -7124,11 +7278,39 @@ async def _execute_proxy_request_with_failover(
         last_affinity_result: str | None = None
         last_affinity_lane_index: int | None = None
 
-        def prompt_cache_log_kwargs() -> dict[str, Any]:
+        def prompt_cache_log_kwargs(
+            proxy_result: ProxyRequestResult | None = None,
+            *,
+            status_code: int | None = None,
+        ) -> dict[str, Any]:
+            trace = request_log.prompt_cache_trace if isinstance(request_log.prompt_cache_trace, dict) else None
+            usage_metrics = getattr(proxy_result, "usage_metrics", None) if proxy_result is not None else None
+            stream_capture = getattr(proxy_result, "stream_capture", None) if proxy_result is not None else None
+            if stream_capture is not None:
+                stream_capture.finalize_usage_metrics()
+                usage_metrics = stream_capture.usage_metrics or usage_metrics
+            upstream_response_id = _response_id_from_proxy_result(proxy_result) if proxy_result is not None else None
+            _prompt_cache_update_runtime_trace_fields(
+                trace,
+                session_id=session_id,
+                session_id_source=session_id_source,
+                upstream_response_id=upstream_response_id,
+                status_code=status_code
+                if status_code is not None
+                else (getattr(proxy_result, "status_code", None) if proxy_result is not None else None),
+                usage_metrics=usage_metrics,
+                cache_affinity_result=last_affinity_result,
+                cache_affinity_lane_index=last_affinity_lane_index,
+                cache_affinity_lane_count=_prompt_cache_lane_count(http_request.app, prompt_cache_context),
+            )
             return _prompt_cache_finalize_kwargs(
                 prompt_cache_context,
+                prompt_cache_trace=trace,
                 affinity_result=last_affinity_result,
                 lane_index=last_affinity_lane_index,
+                status_code=status_code,
+                usage_metrics=usage_metrics,
+                upstream_response_id=upstream_response_id,
             )
 
         while attempt_count < max_attempts and claim_count < max_claims:
@@ -7334,7 +7516,7 @@ async def _execute_proxy_request_with_failover(
                                         or proxied_result.model_name
                                     ),
                                     error_message="Client disconnected",
-                                    **prompt_cache_log_kwargs(),
+                                    **prompt_cache_log_kwargs(proxied_result, status_code=499),
                                 )
                             elif proxied_result.stream_capture is not None:
                                 finalized_request_log_id = await _finalize_stream_request_log(
@@ -7348,7 +7530,10 @@ async def _execute_proxy_request_with_failover(
                                     stream_capture=proxied_result.stream_capture,
                                     timing=timing,
                                     success_hook=proxied_result.on_success,
-                                    extra_finalize_kwargs=prompt_cache_log_kwargs(),
+                                    extra_finalize_kwargs=prompt_cache_log_kwargs(
+                                        proxied_result,
+                                        status_code=proxied_result.status_code,
+                                    ),
                                 )
                             else:
                                 finalized_request_log_id = await _finalize_request_log_with_timing(
@@ -7363,7 +7548,7 @@ async def _execute_proxy_request_with_failover(
                                     token_id=token_id,
                                     account_id=proxied_account_id,
                                     model_name=proxied_result.model_name,
-                                    **prompt_cache_log_kwargs(),
+                                    **prompt_cache_log_kwargs(proxied_result, status_code=proxied_result.status_code),
                                 )
                             if (
                                 not disconnected_before_completion
@@ -7440,7 +7625,7 @@ async def _execute_proxy_request_with_failover(
                     account_id=token_row.account_id,
                     model_name=proxy_result.model_name,
                     **_usage_finalize_kwargs(proxy_result.usage_metrics),
-                    **prompt_cache_log_kwargs(),
+                    **prompt_cache_log_kwargs(proxy_result, status_code=proxy_result.status_code),
                 )
                 await _record_prompt_cache_success(
                     http_request.app,
@@ -7677,7 +7862,7 @@ async def _execute_proxy_request_with_failover(
             account_id=last_account_id,
             error_message="Client disconnected",
             timing=timing,
-            **prompt_cache_log_kwargs(),
+            **prompt_cache_log_kwargs(status_code=499),
         )
         raise
     except HTTPException as exc:
@@ -7691,7 +7876,7 @@ async def _execute_proxy_request_with_failover(
             token_id=last_token_id,
             account_id=last_account_id,
             error_message=str(getattr(exc, "detail", "") or exc),
-            **prompt_cache_log_kwargs(),
+            **prompt_cache_log_kwargs(status_code=getattr(exc, "status_code", 500)),
         )
         raise
     except Exception as exc:
@@ -7705,7 +7890,7 @@ async def _execute_proxy_request_with_failover(
             token_id=last_token_id,
             account_id=last_account_id,
             error_message=str(exc),
-            **prompt_cache_log_kwargs(),
+            **prompt_cache_log_kwargs(status_code=500),
         )
         raise
     finally:
@@ -8686,11 +8871,31 @@ def create_app() -> FastAPI:
         request_data: ChatCompletionsRequest,
         _: None = Depends(verify_service_api_key),
     ) -> Response:
+        raw_payload = request_data.model_dump(exclude_unset=True)
         prompt_cache_context = _build_prompt_cache_request_context(
             http_request,
             endpoint="/v1/chat/completions",
             request_model=request_data.model,
-            raw_payload=request_data.model_dump(exclude_unset=True),
+            raw_payload=raw_payload,
+        )
+        session_id, session_id_source = (
+            _prompt_cache_session_context(http_request, prompt_cache_context)
+            if prompt_cache_context is not None
+            else (None, None)
+        )
+        prompt_cache_trace = (
+            build_prompt_cache_trace(
+                endpoint="/v1/chat/completions",
+                model=request_data.model,
+                compact=False,
+                raw_payload=raw_payload,
+                upstream_payload=copy.deepcopy(raw_payload),
+                prompt_cache_context=prompt_cache_context,
+                session_id=session_id,
+                session_id_source=session_id_source,
+            )
+            if prompt_cache_context is not None
+            else None
         )
 
         async def proxy_call(
@@ -8705,6 +8910,9 @@ def create_app() -> FastAPI:
                 access_token=access_token,
                 account_id=account_id,
                 prompt_cache_context=prompt_cache_context,
+                session_id=session_id,
+                session_id_source=session_id_source,
+                prompt_cache_trace=prompt_cache_trace,
             )
 
         return await _execute_proxy_request_with_failover(
@@ -8714,6 +8922,9 @@ def create_app() -> FastAPI:
             is_stream=bool(request_data.stream),
             proxy_call=proxy_call,
             prompt_cache_context=prompt_cache_context,
+            prompt_cache_trace=prompt_cache_trace,
+            session_id=session_id,
+            session_id_source=session_id_source,
         )
 
     @app.post("/v1/responses")
@@ -8739,12 +8950,32 @@ def create_app() -> FastAPI:
         compact: bool,
     ) -> Response:
         endpoint = _responses_endpoint_path(compact=compact)
+        raw_payload = request_data.model_dump(exclude_unset=True)
         prompt_cache_context = _build_prompt_cache_request_context(
             http_request,
             endpoint=endpoint,
             request_model=request_data.model,
-            raw_payload=request_data.model_dump(exclude_unset=True),
+            raw_payload=raw_payload,
             compact=compact,
+        )
+        session_id, session_id_source = (
+            _prompt_cache_session_context(http_request, prompt_cache_context)
+            if prompt_cache_context is not None
+            else (None, None)
+        )
+        prompt_cache_trace = (
+            build_prompt_cache_trace(
+                endpoint=endpoint,
+                model=request_data.model,
+                compact=compact,
+                raw_payload=raw_payload,
+                upstream_payload=copy.deepcopy(raw_payload),
+                prompt_cache_context=prompt_cache_context,
+                session_id=session_id,
+                session_id_source=session_id_source,
+            )
+            if prompt_cache_context is not None
+            else None
         )
 
         async def proxy_call(
@@ -8760,6 +8991,9 @@ def create_app() -> FastAPI:
                 account_id=account_id,
                 compact=compact,
                 prompt_cache_context=prompt_cache_context,
+                session_id=session_id,
+                session_id_source=session_id_source,
+                prompt_cache_trace=prompt_cache_trace,
             )
 
         return await _execute_proxy_request_with_failover(
@@ -8770,6 +9004,9 @@ def create_app() -> FastAPI:
             proxy_call=proxy_call,
             compact=compact,
             prompt_cache_context=prompt_cache_context,
+            prompt_cache_trace=prompt_cache_trace,
+            session_id=session_id,
+            session_id_source=session_id_source,
         )
 
     @app.post("/v1/images/generations")
@@ -8975,6 +9212,9 @@ async def _proxy_request_with_token(
     account_id: str | None,
     compact: bool = False,
     prompt_cache_context: _PromptCacheRequestContext | None = None,
+    session_id: str | None = None,
+    session_id_source: str | None = None,
+    prompt_cache_trace: dict[str, Any] | None = None,
 ) -> ProxyRequestResult:
     downstream_stream = bool(request_data.stream)
     upstream_stream = downstream_stream or not compact
@@ -8995,13 +9235,42 @@ async def _proxy_request_with_token(
     elif not downstream_stream:
         payload["stream"] = True
 
+    resolved_session_id = session_id
+    resolved_session_id_source = session_id_source
+    if not resolved_session_id or not resolved_session_id_source:
+        resolved_session_id, resolved_session_id_source = _prompt_cache_session_context(
+            http_request,
+            prompt_cache_context,
+        )
+
     headers = _build_upstream_headers(
         http_request,
         access_token=access_token,
         account_id=account_id,
         stream=upstream_stream,
         prompt_cache_context=prompt_cache_context,
+        session_id=resolved_session_id,
     )
+    if isinstance(prompt_cache_trace, dict):
+        prompt_cache_trace.clear()
+        prompt_cache_trace.update(
+            build_prompt_cache_trace(
+                endpoint=prompt_cache_context.endpoint
+                if prompt_cache_context is not None
+                else _responses_endpoint_path(compact=compact),
+                model=prompt_cache_context.model if prompt_cache_context is not None else effective_requested_model,
+                compact=compact,
+                raw_payload=(
+                    prompt_cache_context.raw_payload
+                    if prompt_cache_context is not None and prompt_cache_context.raw_payload is not None
+                    else raw_payload
+                ),
+                upstream_payload=payload,
+                prompt_cache_context=prompt_cache_context,
+                session_id=resolved_session_id,
+                session_id_source=resolved_session_id_source,
+            )
+        )
     upstream_url = _codex_responses_url(compact=compact)
     json_payload = json.dumps(payload, ensure_ascii=False)
 
@@ -9050,6 +9319,12 @@ async def _proxy_request_with_token(
             ):
                 yield chunk
 
+        _prompt_cache_update_runtime_trace_fields(
+            prompt_cache_trace,
+            session_id=resolved_session_id,
+            session_id_source=resolved_session_id_source,
+            status_code=200,
+        )
         return ProxyRequestResult(
             response=StreamingResponse(
                 _wrap_sse_stream_with_initial_keepalive(
@@ -9096,6 +9371,12 @@ async def _proxy_request_with_token(
             initial_first_token_at=initial_first_token_at,
         )
 
+        _prompt_cache_update_runtime_trace_fields(
+            prompt_cache_trace,
+            session_id=resolved_session_id,
+            session_id_source=resolved_session_id_source,
+            status_code=upstream_response.status_code,
+        )
         return ProxyRequestResult(
             response=StreamingResponse(
                 _stream_upstream_response(
@@ -9137,12 +9418,21 @@ async def _proxy_request_with_token(
                 effective_model_name = response_model_alias
             else:
                 effective_model_name = _extract_response_model_name(data) or request_data.model
+            usage_metrics = extract_usage_metrics(data, model_name=effective_model_name)
+            _prompt_cache_update_runtime_trace_fields(
+                prompt_cache_trace,
+                session_id=resolved_session_id,
+                session_id_source=resolved_session_id_source,
+                upstream_response_id=_extract_response_id_from_payload(data),
+                status_code=upstream_response.status_code,
+                usage_metrics=usage_metrics,
+            )
             return ProxyRequestResult(
                 response=JSONResponse(status_code=upstream_response.status_code, content=data),
                 status_code=upstream_response.status_code,
                 model_name=effective_model_name,
                 first_token_at=first_token_at,
-                usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
+                usage_metrics=usage_metrics,
                 response_id=_extract_response_id_from_payload(data),
             )
         finally:
@@ -9166,12 +9456,21 @@ async def _proxy_request_with_token(
         effective_model_name = response_model_alias
     else:
         effective_model_name = _extract_response_model_name(data) or request_data.model
+    usage_metrics = extract_usage_metrics(data, model_name=effective_model_name)
+    _prompt_cache_update_runtime_trace_fields(
+        prompt_cache_trace,
+        session_id=resolved_session_id,
+        session_id_source=resolved_session_id_source,
+        upstream_response_id=_extract_response_id_from_payload(data),
+        status_code=upstream_response.status_code,
+        usage_metrics=usage_metrics,
+    )
     return ProxyRequestResult(
         response=JSONResponse(status_code=upstream_response.status_code, content=data),
         status_code=upstream_response.status_code,
         model_name=effective_model_name,
         first_token_at=None,
-        usage_metrics=extract_usage_metrics(data, model_name=effective_model_name),
+        usage_metrics=usage_metrics,
         response_id=_extract_response_id_from_payload(data),
     )
 
@@ -9184,6 +9483,9 @@ async def _proxy_chat_completions_with_token(
     access_token: str,
     account_id: str | None,
     prompt_cache_context: _PromptCacheRequestContext | None = None,
+    session_id: str | None = None,
+    session_id_source: str | None = None,
+    prompt_cache_trace: dict[str, Any] | None = None,
 ) -> ProxyRequestResult:
     include_usage = _chat_completion_stream_include_usage(request_data)
     responses_request = await _chat_completions_request_to_responses_request(
@@ -9199,6 +9501,9 @@ async def _proxy_chat_completions_with_token(
         account_id=account_id,
         compact=False,
         prompt_cache_context=prompt_cache_context,
+        session_id=session_id,
+        session_id_source=session_id_source,
+        prompt_cache_trace=prompt_cache_trace,
     )
 
     if isinstance(proxy_result.response, StreamingResponse):

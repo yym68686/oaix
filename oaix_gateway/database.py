@@ -144,9 +144,22 @@ class GatewayRequestLog(Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     estimated_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    request_payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    upstream_payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    prompt_template_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    prompt_dynamic_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    prompt_cache_source: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     prompt_cache_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    prompt_cache_retention_requested: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    prompt_cache_retention_sent: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    session_id_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    session_id_source: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    previous_response_id_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    upstream_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    cache_hit_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
     cache_affinity_result: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     cache_affinity_lane_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    prompt_cache_trace: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -640,12 +653,38 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN total_tokens INTEGER"))
         if "estimated_cost_usd" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN estimated_cost_usd DOUBLE PRECISION"))
+        if "request_payload_hash" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN request_payload_hash VARCHAR(64)"))
+        if "upstream_payload_hash" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN upstream_payload_hash VARCHAR(64)"))
+        if "prompt_template_hash" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN prompt_template_hash VARCHAR(64)"))
+        if "prompt_dynamic_hash" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN prompt_dynamic_hash VARCHAR(64)"))
+        if "prompt_cache_source" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN prompt_cache_source VARCHAR(64)"))
         if "prompt_cache_key_hash" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN prompt_cache_key_hash VARCHAR(64)"))
+        if "prompt_cache_retention_requested" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN prompt_cache_retention_requested VARCHAR(32)"))
+        if "prompt_cache_retention_sent" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN prompt_cache_retention_sent VARCHAR(32)"))
+        if "session_id_hash" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN session_id_hash VARCHAR(64)"))
+        if "session_id_source" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN session_id_source VARCHAR(32)"))
+        if "previous_response_id_hash" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN previous_response_id_hash VARCHAR(64)"))
+        if "upstream_response_id" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN upstream_response_id VARCHAR(128)"))
+        if "cache_hit_ratio" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN cache_hit_ratio DOUBLE PRECISION"))
         if "cache_affinity_result" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN cache_affinity_result VARCHAR(64)"))
         if "cache_affinity_lane_index" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN cache_affinity_lane_index INTEGER"))
+        if "prompt_cache_trace" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN prompt_cache_trace JSON"))
         if "timing_spans" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN timing_spans JSON"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_token_id ON gateway_request_logs (token_id)"))
@@ -653,8 +692,56 @@ def _run_schema_migrations(sync_conn) -> None:
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))
         sync_conn.execute(
             text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_request_payload_hash "
+                "ON gateway_request_logs (request_payload_hash)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_upstream_payload_hash "
+                "ON gateway_request_logs (upstream_payload_hash)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_prompt_template_hash "
+                "ON gateway_request_logs (prompt_template_hash)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_prompt_dynamic_hash "
+                "ON gateway_request_logs (prompt_dynamic_hash)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_prompt_cache_source "
+                "ON gateway_request_logs (prompt_cache_source)"
+            )
+        )
+        sync_conn.execute(
+            text(
                 "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_prompt_cache_key_hash "
                 "ON gateway_request_logs (prompt_cache_key_hash)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_session_id_hash "
+                "ON gateway_request_logs (session_id_hash)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_previous_response_id_hash "
+                "ON gateway_request_logs (previous_response_id_hash)"
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_upstream_response_id "
+                "ON gateway_request_logs (upstream_response_id)"
             )
         )
         sync_conn.execute(

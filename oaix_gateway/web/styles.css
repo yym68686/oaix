@@ -1538,13 +1538,14 @@ button {
 
 .request-panel__body {
   --table-columns:
-    minmax(120px, 0.82fr)
-    minmax(0, 1.08fr)
-    minmax(0, 0.9fr)
-    minmax(94px, 0.56fr)
-    minmax(104px, 0.72fr)
-    minmax(88px, 0.6fr)
-    minmax(0, 1.2fr);
+    minmax(120px, 0.76fr)
+    minmax(0, 0.94fr)
+    minmax(0, 0.78fr)
+    minmax(184px, 1.16fr)
+    minmax(94px, 0.5fr)
+    minmax(104px, 0.62fr)
+    minmax(88px, 0.52fr)
+    minmax(0, 1.04fr);
   overflow: hidden;
   border-radius: calc(var(--radius-xl) - 10px);
   border: 1px solid var(--border-strong);
@@ -2193,6 +2194,7 @@ button {
 .request-row__meta,
 .request-row__model,
 .request-row__endpoint,
+.request-row__cache,
 .request-row__status,
 .request-row__time,
 .request-row__error {
@@ -2213,6 +2215,29 @@ button {
   line-height: 1.45;
   word-break: break-word;
   color: var(--ink);
+}
+
+.request-row__cache {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.request-row__cache-line {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.request-row__cache-line--strong {
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.request-row__cache-line--hash {
+  font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem;
 }
 
 .status-pill {
@@ -3109,6 +3134,7 @@ button {
   .token-result__usage::before,
   .request-row__model::before,
   .request-row__endpoint::before,
+  .request-row__cache::before,
   .request-row__status::before,
   .request-row__time::before,
   .request-row__error::before {
@@ -3132,6 +3158,7 @@ button {
   .token-result__usage[data-label]::before,
   .request-row__model[data-label]::before,
   .request-row__endpoint[data-label]::before,
+  .request-row__cache[data-label]::before,
   .request-row__status[data-label]::before,
   .request-row__time[data-label]::before,
   .request-row__error[data-label]::before {

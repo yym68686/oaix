@@ -67,6 +67,7 @@ from oaix_gateway.api_server import (
     _build_upstream_headers,
     _prompt_cache_bind_lane,
     _prompt_cache_bind_response,
+    _prompt_cache_finalize_kwargs,
     _prompt_cache_response_owner,
     _stream_responses_to_chat_completions,
     _stream_upstream_image_response,
@@ -83,6 +84,7 @@ from oaix_gateway.api_server import (
     create_app,
 )
 from oaix_gateway.database import ChatImageCheckpoint, ChatImageCheckpointImage, CodexToken, GatewayRequestLog
+from oaix_gateway.prompt_observability import build_prompt_cache_trace
 from oaix_gateway.quota import CodexPlanInfo, CodexQuotaSnapshot
 from oaix_gateway.token_import_jobs import (
     IMPORT_JOB_STATUS_COMPLETED,
@@ -518,6 +520,135 @@ def test_prompt_cache_context_injects_key_and_stable_session_id() -> None:
         prompt_cache_context=context,
     )
     assert headers_a["Session_id"] == headers_b["Session_id"]
+
+
+def test_prompt_cache_trace_separates_template_and_dynamic_hashes() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"authorization", b"Bearer client-a")],
+        }
+    )
+    raw_payload_a = {
+        "model": "gpt-5.4",
+        "instructions": "You are a terse coding assistant.",
+        "input": [{"role": "user", "content": "Explain the build."}],
+        "prompt_cache_retention": "ephemeral",
+    }
+    raw_payload_b = {
+        **raw_payload_a,
+        "input": [{"role": "user", "content": "Explain the deploy."}],
+    }
+    context_a = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload=raw_payload_a,
+    )
+    context_b = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload=raw_payload_b,
+    )
+    upstream_payload_a = dict(raw_payload_a)
+    upstream_payload_a.pop("prompt_cache_retention", None)
+    upstream_payload_b = dict(raw_payload_b)
+    upstream_payload_b.pop("prompt_cache_retention", None)
+
+    trace_a = build_prompt_cache_trace(
+        endpoint="/v1/responses",
+        model="gpt-5.4",
+        raw_payload=raw_payload_a,
+        upstream_payload=upstream_payload_a,
+        prompt_cache_context=context_a,
+        session_id="session-a",
+        session_id_source="prompt_cache",
+        input_tokens=100,
+        cached_input_tokens=80,
+        status_code=200,
+    )
+    trace_b = build_prompt_cache_trace(
+        endpoint="/v1/responses",
+        model="gpt-5.4",
+        raw_payload=raw_payload_b,
+        upstream_payload=upstream_payload_b,
+        prompt_cache_context=context_b,
+        session_id="session-b",
+        session_id_source="prompt_cache",
+    )
+
+    assert trace_a["request_payload_hash"] != trace_b["request_payload_hash"]
+    assert trace_a["prompt"]["template_hash"] == trace_b["prompt"]["template_hash"]
+    assert trace_a["prompt"]["dynamic_hash"] != trace_b["prompt"]["dynamic_hash"]
+    assert trace_a["prompt_cache_retention_requested"] == "ephemeral"
+    assert trace_a["prompt_cache_retention_sent"] is None
+    assert trace_a["usage"]["cache_hit_ratio"] == 0.8
+
+
+def test_prompt_cache_finalize_kwargs_extracts_trace_fields() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"authorization", b"Bearer client-a")],
+        }
+    )
+    raw_payload = {
+        "model": "gpt-5.4",
+        "instructions": "You are a terse coding assistant.",
+        "input": [{"role": "user", "content": "Explain the build."}],
+    }
+    context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.4",
+        raw_payload=raw_payload,
+    )
+    assert context is not None
+    upstream_payload = dict(raw_payload)
+    _apply_prompt_cache_context_to_payload(upstream_payload, context)
+    trace = build_prompt_cache_trace(
+        endpoint="/v1/responses",
+        model="gpt-5.4",
+        raw_payload=raw_payload,
+        upstream_payload=upstream_payload,
+        prompt_cache_context=context,
+        session_id="session-a",
+        session_id_source="prompt_cache",
+        upstream_response_id="resp_trace_1",
+        cache_affinity_result="primary_hit",
+        cache_affinity_lane_index=0,
+        cache_affinity_lane_count=2,
+        input_tokens=200,
+        cached_input_tokens=180,
+        output_tokens=12,
+        total_tokens=212,
+        status_code=200,
+    )
+
+    kwargs = _prompt_cache_finalize_kwargs(
+        context,
+        prompt_cache_trace=trace,
+        affinity_result="primary_hit",
+        lane_index=0,
+        upstream_response_id="resp_trace_1",
+    )
+
+    assert kwargs["request_payload_hash"] == trace["request_payload_hash"]
+    assert kwargs["upstream_payload_hash"] == trace["upstream_payload_hash"]
+    assert kwargs["prompt_template_hash"] == trace["prompt"]["template_hash"]
+    assert kwargs["prompt_dynamic_hash"] == trace["prompt"]["dynamic_hash"]
+    assert kwargs["prompt_cache_key_hash"] == context.prompt_cache_key_hash
+    assert kwargs["session_id_hash"] == trace["session_id_hash"]
+    assert kwargs["upstream_response_id"] == "resp_trace_1"
+    assert kwargs["cache_hit_ratio"] == 0.9
+    assert kwargs["cache_affinity_result"] == "primary_hit"
+    assert kwargs["cache_affinity_lane_index"] == 0
+    assert kwargs["prompt_cache_trace"]["route"]["cache_affinity_lane_count"] == 2
 
 
 def test_chat_completions_request_to_responses_request_preserves_prompt_cache_key() -> None:
@@ -8459,7 +8590,16 @@ def test_build_admin_token_quota_items_skips_inactive_tokens_for_quota_fetch() -
 
 
 def test_gateway_request_log_token_index_is_declared() -> None:
-    assert "ix_gateway_request_logs_token_id" in {index.name for index in GatewayRequestLog.__table__.indexes}
+    indexes = {index.name for index in GatewayRequestLog.__table__.indexes}
+
+    assert "ix_gateway_request_logs_token_id" in indexes
+    assert "ix_gateway_request_logs_request_payload_hash" in indexes
+    assert "ix_gateway_request_logs_upstream_payload_hash" in indexes
+    assert "ix_gateway_request_logs_prompt_template_hash" in indexes
+    assert "ix_gateway_request_logs_prompt_dynamic_hash" in indexes
+    assert "ix_gateway_request_logs_session_id_hash" in indexes
+    assert "ix_gateway_request_logs_previous_response_id_hash" in indexes
+    assert "ix_gateway_request_logs_upstream_response_id" in indexes
 
 
 def test_chat_image_checkpoint_indexes_are_declared() -> None:
