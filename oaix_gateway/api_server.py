@@ -30,6 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import SQLAlchemyError
+from types import SimpleNamespace
 from starlette.datastructures import UploadFile
 from .chat_image_store import create_chat_image_checkpoint, resolve_chat_image_output_items
 from .codex_constants import CODEX_CLI_VERSION, CODEX_USER_AGENT
@@ -176,6 +177,7 @@ RESPONSES_STREAM_PREFLIGHT_EVENTS = frozenset(
         "response.created",
         "response.in_progress",
         "response.queued",
+        "keepalive",
     }
 )
 RESPONSES_STREAM_NETWORK_ERRORS = (
@@ -5492,6 +5494,9 @@ async def _stream_responses_to_chat_completions(
                         yield raw_event.encode("utf-8") + b"\n\n"
                     continue
 
+                if event_type == "keepalive":
+                    continue
+
                 if isinstance(event_payload, dict):
                     response_id = _chat_completion_response_id(event_payload)
                     created_at = _chat_completion_created_at(event_payload)
@@ -5711,6 +5716,18 @@ async def _collect_images_api_response_from_sse(
 def _encode_sse_event(event_name: str, payload: dict[str, Any]) -> bytes:
     prefix = f"event: {event_name}\n".encode("utf-8") if event_name else b""
     return prefix + b"data: " + json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n\n"
+
+
+def _build_stream_keepalive_event(sequence_number: int = 0) -> bytes:
+    payload = json.dumps(
+        {
+            "type": "keepalive",
+            "sequence_number": sequence_number,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return b"event: keepalive\n" + b"data: " + payload + b"\n\n"
 
 
 def _build_stream_error_event(status_code: int, message: str) -> bytes:
@@ -7169,6 +7186,826 @@ def _gpt_image_stream_keepalive_response(
             # Commit an initial SSE comment immediately so downstream proxies/CDNs
             # don't wait for the first upstream model event before forwarding body bytes.
             yield STREAM_KEEPALIVE_COMMENT
+            while True:
+                item = await output_queue.get()
+                if item is queue_done_sentinel:
+                    break
+                if isinstance(item, bytes):
+                    yield item
+        finally:
+            if not worker_task.done():
+                worker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker_task
+
+    async def on_response_close_before_body_start() -> None:
+        if response_body_started:
+            return
+        try:
+            await _finalize_cancelled_request_log(
+                request_log,
+                status_code=499,
+                success=False,
+                attempt_count=0,
+                finished_at=utcnow(),
+                token_id=None,
+                account_id=None,
+                error_message="Client disconnected",
+                timing=timing,
+            )
+        finally:
+            await response_lease.release()
+            await proxy_lease.release()
+
+    return _FinalizingStreamingResponse(
+        response_body(),
+        on_close=on_response_close_before_body_start,
+        media_type="text/event-stream",
+        headers=_sse_response_headers(),
+    )
+
+
+async def _responses_stream_keepalive_response(
+    http_request: Request,
+    *,
+    endpoint: str,
+    request_model: str | None,
+    compact: bool,
+    request_data: ResponsesRequest,
+    prompt_cache_context: _PromptCacheRequestContext | None = None,
+    session_id: str | None = None,
+    session_id_source: str | None = None,
+    prompt_cache_trace: dict[str, Any] | None = None,
+) -> Response:
+    try:
+        proxy_lease = await _proxy_concurrency_limiter(http_request.app).acquire(
+            timeout_seconds=_proxy_queue_timeout_seconds(),
+        )
+    except TimeoutError:
+        retry_after = max(1, int(math.ceil(_proxy_queue_timeout_seconds())))
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Too many active proxy requests; retry later"},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    response_traffic: ResponseTrafficController = http_request.app.state.response_traffic
+    response_lease = response_traffic.start_response()
+    timing = _RequestTimingRecorder()
+    request_started_at = utcnow()
+    request_log = _RequestLogHandle.start(
+        endpoint=endpoint,
+        model=request_model,
+        is_stream=True,
+        started_at=request_started_at,
+        client_ip=http_request.client.host if http_request.client is not None else None,
+        user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
+        timing=timing,
+        prompt_cache_trace=prompt_cache_trace if isinstance(prompt_cache_trace, dict) else None,
+    )
+
+    raw_payload = request_data.model_dump(exclude_unset=True)
+    payload = _sanitize_codex_payload(
+        copy.deepcopy(raw_payload),
+        compact=compact,
+        preserve_previous_response_id=False,
+    )
+    _apply_prompt_cache_context_to_payload(payload, prompt_cache_context)
+    payload["stream"] = True
+    json_payload = json.dumps(payload, ensure_ascii=False)
+
+    resolved_session_id = session_id
+    resolved_session_id_source = session_id_source
+    if not resolved_session_id or not resolved_session_id_source:
+        resolved_session_id, resolved_session_id_source = _prompt_cache_session_context(
+            http_request,
+            prompt_cache_context,
+        )
+
+    if isinstance(prompt_cache_trace, dict):
+        prompt_cache_trace.clear()
+        prompt_cache_trace.update(
+            build_prompt_cache_trace(
+                endpoint=endpoint,
+                model=request_data.model,
+                compact=compact,
+                raw_payload=raw_payload,
+                upstream_payload=payload,
+                prompt_cache_context=prompt_cache_context,
+                session_id=resolved_session_id,
+                session_id_source=resolved_session_id_source,
+            )
+        )
+
+    attempt_count = 0
+    last_token_id: int | None = None
+    last_account_id: str | None = None
+    stream_finalized = False
+    restricted_model_name = _non_free_only_codex_model_name(request_model)
+    require_non_free_token = restricted_model_name is not None
+    restricted_model_label = restricted_model_name or "requested"
+    scoped_cooldown_scope = _image_rate_limit_scoped_cooldown_scope(request_model)
+    skipped_free_token_ids: set[int] = set()
+    excluded_token_ids: set[int] = set()
+    postponed_unknown_plan_tokens: list[Any] = []
+    typed_keepalive_sent = False
+    last_affinity_result: str | None = None
+    last_affinity_lane_index: int | None = None
+    output_queue: asyncio.Queue[bytes | object] = asyncio.Queue()
+    response_body_started = False
+
+    def prompt_cache_log_kwargs(
+        stream_capture: _ProxyStreamCapture | None = None,
+        *,
+        status_code: int | None = None,
+    ) -> dict[str, Any]:
+        trace = request_log.prompt_cache_trace if isinstance(request_log.prompt_cache_trace, dict) else None
+        usage_metrics = getattr(stream_capture, "usage_metrics", None) if stream_capture is not None else None
+        upstream_response_id = None
+        if stream_capture is not None:
+            stream_capture.finalize_usage_metrics()
+            usage_metrics = stream_capture.usage_metrics or usage_metrics
+            upstream_response_id = _extract_response_id_from_payload(stream_capture.response_payload)
+        _prompt_cache_update_runtime_trace_fields(
+            trace,
+            session_id=resolved_session_id,
+            session_id_source=resolved_session_id_source,
+            upstream_response_id=upstream_response_id,
+            status_code=status_code,
+            usage_metrics=usage_metrics,
+            cache_affinity_result=last_affinity_result,
+            cache_affinity_lane_index=last_affinity_lane_index,
+            cache_affinity_lane_count=_prompt_cache_lane_count(http_request.app, prompt_cache_context),
+        )
+        return _prompt_cache_finalize_kwargs(
+            prompt_cache_context,
+            prompt_cache_trace=trace,
+            affinity_result=last_affinity_result,
+            lane_index=last_affinity_lane_index,
+            status_code=status_code,
+            usage_metrics=usage_metrics,
+            upstream_response_id=upstream_response_id,
+        )
+
+    async def worker(output_queue: asyncio.Queue[bytes | object], queue_done_sentinel: object) -> None:
+        nonlocal attempt_count, last_token_id, last_account_id, stream_finalized, typed_keepalive_sent
+        nonlocal last_affinity_result, last_affinity_lane_index
+        last_error: HTTPException | None = None
+        transport_error_count = 0
+        upstream_5xx_error_count = 0
+        client: httpx.AsyncClient = _state_http_client(http_request.app, "response_http_client")
+        oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
+        selection_settings = _current_token_selection_settings(http_request.app)
+        timing_context_token = _REQUEST_TIMING.set(timing)
+        db_timing_context_token = set_db_timing_recorder(timing)
+
+        async def finalize_success(
+            *,
+            token_row: Any,
+            stream_capture: _ProxyStreamCapture,
+            attempt: int,
+        ) -> None:
+            nonlocal stream_finalized
+            await _finalize_stream_request_log(
+                request_log_ref=request_log,
+                status_code=200,
+                attempt_count=attempt,
+                token_id=token_row.id,
+                account_id=token_row.account_id,
+                fallback_model_name=stream_capture.model_name or request_model,
+                fallback_first_token_at=stream_capture.first_token_at,
+                stream_capture=stream_capture,
+                timing=timing,
+                success_hook=None,
+                extra_finalize_kwargs=prompt_cache_log_kwargs(stream_capture, status_code=200),
+            )
+            await _record_prompt_cache_success(
+                http_request.app,
+                prompt_cache_context=prompt_cache_context,
+                token_id=token_row.id,
+                proxy_result=SimpleNamespace(
+                    response_id=_extract_response_id_from_payload(stream_capture.response_payload),
+                    stream_capture=stream_capture,
+                ),
+            )
+            await _mark_token_success_with_timing(
+                timing,
+                token_row.id,
+                token_row=token_row,
+            )
+            _upstream_circuit_breaker(http_request.app).record_success()
+            stream_finalized = True
+
+        async def finalize_failure(
+            *,
+            token_row: Any,
+            attempt: int,
+            stream_capture: _ProxyStreamCapture | None,
+            status_code: int,
+            detail: str,
+        ) -> None:
+            nonlocal stream_finalized
+            await _finalize_request_log_with_timing(
+                timing,
+                request_log,
+                status_code=status_code,
+                success=False,
+                attempt_count=attempt,
+                finished_at=utcnow(),
+                first_token_at=(
+                    stream_capture.first_token_at if stream_capture is not None else None
+                ),
+                token_id=token_row.id,
+                account_id=token_row.account_id,
+                model_name=(
+                    stream_capture.model_name if stream_capture is not None else request_model
+                ),
+                error_message=detail,
+                **prompt_cache_log_kwargs(stream_capture, status_code=status_code),
+            )
+            stream_finalized = True
+
+        try:
+            await _record_event_loop_lag(timing)
+            max_attempts = _effective_proxy_max_attempts(endpoint=endpoint)
+            max_claims = _max_request_account_retries()
+            claim_count = 0
+
+            while attempt_count < max_attempts and claim_count < max_claims:
+                _raise_if_upstream_circuit_open(http_request.app)
+                claim_count += 1
+                token_pool_snapshot = _fresh_token_pool_snapshot(http_request.app, timing=timing)
+                affinity_claim = await _await_timed(
+                    _claim_prompt_cache_affinity_token(
+                        http_request.app,
+                        selection_settings,
+                        prompt_cache_context=prompt_cache_context,
+                        exclude_token_ids=excluded_token_ids,
+                        scoped_cooldown_scope=scoped_cooldown_scope,
+                        timing=timing,
+                        token_pool_snapshot=token_pool_snapshot,
+                        require_non_free_token=require_non_free_token,
+                    ),
+                    timing=timing,
+                    span_name="claim_prompt_cache_affinity_ms",
+                    db_wait=False,
+                )
+                if affinity_claim is not None:
+                    token_row = affinity_claim.token_row
+                    last_affinity_result = affinity_claim.result
+                    last_affinity_lane_index = affinity_claim.lane_index
+                    if timing is not None:
+                        timing.set_tag("cache_affinity_result", affinity_claim.result)
+                        if affinity_claim.lane_index is not None:
+                            timing.set_ms("cache_affinity_lane_index", affinity_claim.lane_index)
+                elif (
+                    prompt_cache_context is not None
+                    and prompt_cache_context.previous_response_id
+                    and _prompt_cache_previous_strict_enabled()
+                    and _prompt_cache_response_owner(http_request.app, prompt_cache_context.previous_response_id)
+                    is not None
+                ):
+                    last_affinity_result = "previous_owner_busy"
+                    last_affinity_lane_index = None
+                    raise HTTPException(status_code=429, detail="previous_response_busy")
+                else:
+                    if prompt_cache_context is not None and prompt_cache_context.affinity_key and not _prompt_cache_global_fallback_enabled():
+                        raise HTTPException(status_code=429, detail="Prompt cache affinity lanes are busy")
+                    if prompt_cache_context is not None and prompt_cache_context.affinity_key:
+                        last_affinity_result = "global_fallback"
+                        last_affinity_lane_index = None
+                    token_row = await _await_timed(
+                        _claim_next_token_for_model_request(
+                            selection_settings,
+                            exclude_token_ids=excluded_token_ids,
+                            scoped_cooldown_scope=scoped_cooldown_scope,
+                            timing=timing,
+                            token_pool_snapshot=token_pool_snapshot,
+                            require_non_free_token=require_non_free_token,
+                        ),
+                        timing=timing,
+                        span_name="claim_token_ms",
+                        db_wait=True,
+                    )
+
+                using_postponed_unknown_plan = False
+                if token_row is None:
+                    if require_non_free_token and postponed_unknown_plan_tokens:
+                        token_row = postponed_unknown_plan_tokens.pop(0)
+                        using_postponed_unknown_plan = True
+                        _record_selected_token_observation_start(token_row.id, timing)
+                    else:
+                        break
+
+                if require_non_free_token:
+                    effective_plan_type = await _effective_token_plan_type(http_request, token_row)
+                    if effective_plan_type == "free":
+                        excluded_token_ids.add(token_row.id)
+                        skipped_free_token_ids.add(token_row.id)
+                        _record_selected_token_observation_finish(
+                            token_row.id,
+                            started_at=request_started_at,
+                            first_token_at=None,
+                        )
+                        continue
+                    if effective_plan_type is None and not using_postponed_unknown_plan:
+                        excluded_token_ids.add(token_row.id)
+                        postponed_unknown_plan_tokens.append(token_row)
+                        _record_selected_token_observation_finish(
+                            token_row.id,
+                            started_at=request_started_at,
+                            first_token_at=None,
+                        )
+                        continue
+
+                if prompt_cache_context is not None and prompt_cache_context.affinity_key:
+                    bound_lane_index = _prompt_cache_bind_lane(
+                        http_request.app,
+                        prompt_cache_context,
+                        int(token_row.id),
+                        prefer_primary=last_affinity_result in {"previous_owner_hit", "primary_hit"},
+                    )
+                    if last_affinity_lane_index is None:
+                        last_affinity_lane_index = bound_lane_index
+                    if timing is not None:
+                        if last_affinity_result:
+                            timing.set_tag("cache_affinity_result", last_affinity_result)
+                        if last_affinity_lane_index is not None:
+                            timing.set_ms("cache_affinity_lane_index", last_affinity_lane_index)
+
+                attempt_count += 1
+                attempt = attempt_count
+                last_token_id = token_row.id
+                last_account_id = token_row.account_id
+
+                try:
+                    with timing.measure("oauth_ms") if timing is not None else suppress():
+                        access_token, access_token_refreshed = await oauth_manager.get_access_token(
+                            token_row,
+                            client,
+                        )
+                except HTTPException as exc:
+                    oauth_manager.invalidate(token_row.id)
+                    permanent_refresh_failure = is_permanently_invalid_refresh_token_error(exc)
+                    await mark_token_error(
+                        token_row.id,
+                        str(exc.detail),
+                        deactivate=permanent_refresh_failure,
+                        clear_access_token=True,
+                    )
+                    if permanent_refresh_failure or exc.status_code in (401, 403):
+                        if permanent_refresh_failure:
+                            excluded_token_ids.add(token_row.id)
+                        last_error = (
+                            HTTPException(
+                                status_code=503,
+                                detail=_sanitized_permanent_refresh_failure_detail(),
+                            )
+                            if permanent_refresh_failure
+                            else exc
+                        )
+                        _record_selected_token_observation_finish(
+                            token_row.id,
+                            started_at=request_started_at,
+                            first_token_at=None,
+                        )
+                        continue
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_started_at,
+                        first_token_at=None,
+                    )
+                    raise
+                except BaseException:
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_started_at,
+                        first_token_at=None,
+                    )
+                    raise
+
+                token_observation_first_token_at: datetime | None = None
+                stream_cm = None
+                try:
+                    headers = _build_upstream_headers(
+                        http_request,
+                        access_token=access_token,
+                        account_id=token_row.account_id,
+                        stream=True,
+                        prompt_cache_context=prompt_cache_context,
+                        session_id=resolved_session_id,
+                    )
+                    stream_cm = client.stream(
+                        "POST",
+                        _codex_responses_url(compact=compact),
+                        headers=headers,
+                        content=json_payload,
+                        timeout=_upstream_http_timeout(read=None),
+                    )
+                    upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
+                    if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+                        try:
+                            raw = await upstream_response.aread()
+                        finally:
+                            await stream_cm.__aexit__(None, None, None)
+                            stream_cm = None
+                        raise _upstream_error_http_exception(
+                            upstream_response.status_code,
+                            _decode_error_body(raw),
+                        )
+
+                    upstream_iter = upstream_response.aiter_raw()
+                    stream_capture = _ProxyStreamCapture(
+                        initial_model_name=request_model,
+                        initial_first_token_at=None,
+                    )
+                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                    text_buffer = ""
+                    sse_scan_start = 0
+                    buffered_chunks: list[bytes] = []
+                    stream_committed = False
+
+                    try:
+                        while not stream_committed:
+                            try:
+                                chunk = await upstream_iter.__anext__()
+                            except StopAsyncIteration as exc:
+                                if not buffered_chunks:
+                                    raise HTTPException(
+                                        status_code=502,
+                                        detail="Upstream closed stream without data",
+                                    ) from exc
+                                if text_buffer.strip():
+                                    raise HTTPException(
+                                        status_code=502,
+                                        detail="Upstream closed stream with an incomplete SSE event",
+                                    ) from exc
+                                raise HTTPException(
+                                    status_code=502,
+                                    detail="Upstream closed stream without producing a response",
+                                ) from exc
+
+                            stream_capture.feed(chunk)
+                            buffered_chunks.append(chunk)
+                            text_buffer += decoder.decode(chunk)
+
+                            while True:
+                                raw_event, text_buffer, sse_scan_start = _pop_sse_event_from_buffer(
+                                    text_buffer,
+                                    sse_scan_start,
+                                )
+                                if raw_event is None:
+                                    break
+
+                                if not raw_event.strip():
+                                    continue
+
+                                event_type, event_payload = _extract_responses_stream_event(raw_event)
+                                if event_type == "[DONE]":
+                                    raise HTTPException(
+                                        status_code=502,
+                                        detail="Upstream closed stream without producing a response",
+                                    )
+
+                                semantic_failure = _responses_failure_http_exception(event_payload)
+                                if semantic_failure is not None:
+                                    raise semantic_failure
+
+                                if event_type == "response.created" and not typed_keepalive_sent:
+                                    await output_queue.put(_build_stream_keepalive_event())
+                                    typed_keepalive_sent = True
+
+                                if event_type and event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
+                                    stream_committed = True
+                                    break
+
+                            if stream_committed:
+                                for buffered_chunk in buffered_chunks:
+                                    await output_queue.put(buffered_chunk)
+                                buffered_chunks.clear()
+
+                        async for chunk in upstream_iter:
+                            stream_capture.feed(chunk)
+                            await output_queue.put(chunk)
+                    except RESPONSES_STREAM_NETWORK_ERRORS as exc:
+                        if stream_committed:
+                            error_event = _build_stream_error_event(
+                                502,
+                                f"Upstream stream aborted before completion: {type(exc).__name__}: {str(exc) or type(exc).__name__}",
+                            )
+                            stream_capture.feed(error_event)
+                            await output_queue.put(error_event)
+                            await output_queue.put(b"data: [DONE]\n\n")
+                            await finalize_failure(
+                                token_row=token_row,
+                                attempt=attempt,
+                                stream_capture=stream_capture,
+                                status_code=502,
+                                detail=(
+                                    f"Upstream stream aborted before completion: {type(exc).__name__}: {str(exc) or type(exc).__name__}"
+                                ),
+                            )
+                            await mark_token_error(token_row.id, stream_capture.error_message or str(exc))
+                            token_observation_first_token_at = stream_capture.first_token_at
+                            stream_finalized = True
+                            return
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Upstream request failed: {type(exc).__name__}: {exc}",
+                        ) from exc
+
+                    token_observation_first_token_at = stream_capture.first_token_at
+                    await finalize_success(
+                        token_row=token_row,
+                        stream_capture=stream_capture,
+                        attempt=attempt,
+                    )
+                    stream_finalized = True
+                    return
+                except HTTPException as exc:
+                    status_code = getattr(exc, "status_code", 500)
+                    detail = str(getattr(exc, "detail", "") or exc)
+                    cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
+
+                    if cooldown_seconds is not None:
+                        await mark_token_error(
+                            token_row.id,
+                            detail,
+                            cooldown_seconds=cooldown_seconds,
+                        )
+                        last_error = exc
+                        continue
+
+                    image_cooldown_seconds = _extract_image_rate_limit_cooldown_seconds(
+                        status_code,
+                        detail,
+                        request_model=request_model,
+                    )
+                    if image_cooldown_seconds is not None and scoped_cooldown_scope is not None:
+                        await mark_token_scoped_cooldown(
+                            token_row.id,
+                            scoped_cooldown_scope,
+                            detail,
+                            cooldown_seconds=image_cooldown_seconds,
+                        )
+                        last_error = exc
+                        continue
+
+                    if _should_record_http_exception_token_error(exc):
+                        await mark_token_error(token_row.id, detail)
+
+                    permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
+                    auth_failed_after_refresh = status_code in (401, 403) and (
+                        access_token_refreshed or is_access_token_only_refresh_token(token_row.refresh_token)
+                    )
+
+                    if permanently_disabled or auth_failed_after_refresh:
+                        oauth_manager.invalidate(token_row.id)
+                        excluded_token_ids.add(token_row.id)
+                        await mark_token_error(
+                            token_row.id,
+                            detail,
+                            deactivate=True,
+                            clear_access_token=True,
+                        )
+                        last_error = exc
+                        continue
+
+                    if status_code in (401, 403):
+                        oauth_manager.invalidate(token_row.id)
+                        await mark_token_error(token_row.id, detail, clear_access_token=True)
+                        last_error = exc
+                        continue
+
+                    compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                        compact=compact,
+                        status_code=status_code,
+                        error_text=detail,
+                    )
+                    retryable_server_error = _should_retry_http_exception(exc)
+                    if retryable_server_error:
+                        upstream_5xx_error_count += 1
+                    if (
+                        retryable_server_error
+                        and upstream_5xx_error_count <= _upstream_5xx_max_retries()
+                        and attempt < max_attempts
+                    ):
+                        excluded_token_ids.add(token_row.id)
+                        mark_kwargs: dict[str, Any] = {}
+                        if compact_server_error_cooling_time > 0:
+                            mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                        await mark_token_error(token_row.id, detail, **mark_kwargs)
+                        if compact_server_error_cooling_time > 0:
+                            _prompt_cache_remove_token(http_request.app, token_row.id)
+                        last_error = exc
+                        continue
+
+                    if retryable_server_error:
+                        await mark_token_error(token_row.id, detail)
+
+                    await finalize_failure(
+                        token_row=token_row,
+                        attempt=attempt,
+                        stream_capture=None,
+                        status_code=status_code,
+                        detail=detail,
+                    )
+                    stream_finalized = True
+                    return
+                except httpx.HTTPError as exc:
+                    message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                    if _is_upstream_connectivity_exception(exc):
+                        _upstream_circuit_breaker(http_request.app).record_failure()
+                    transport_error_count += 1
+                    compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                        compact=compact,
+                        status_code=500,
+                        error_text=message,
+                    )
+                    if (
+                        transport_error_count <= _transport_error_max_retries()
+                        and attempt < max_attempts
+                        and not _upstream_circuit_breaker(http_request.app).is_open()
+                    ):
+                        excluded_token_ids.add(token_row.id)
+                        mark_kwargs: dict[str, Any] = {}
+                        if compact_server_error_cooling_time > 0:
+                            mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                        await mark_token_error(token_row.id, message, **mark_kwargs)
+                        if compact_server_error_cooling_time > 0:
+                            _prompt_cache_remove_token(http_request.app, token_row.id)
+                        last_error = HTTPException(status_code=502, detail=message)
+                        continue
+                    await mark_token_error(token_row.id, message)
+                    if _upstream_circuit_breaker(http_request.app).is_open():
+                        raise _upstream_circuit_open_exception(_upstream_circuit_breaker(http_request.app)) from exc
+                    await finalize_failure(
+                        token_row=token_row,
+                        attempt=attempt,
+                        stream_capture=None,
+                        status_code=502,
+                        detail=message,
+                    )
+                    stream_finalized = True
+                    return
+                except Exception as exc:
+                    if not _is_retryable_upstream_transport_exception(exc):
+                        raise
+                    message = f"Upstream request failed: {type(exc).__name__}: {exc}"
+                    transport_error_count += 1
+                    compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
+                        compact=compact,
+                        status_code=500,
+                        error_text=message,
+                    )
+                    if transport_error_count <= _transport_error_max_retries() and attempt < max_attempts:
+                        excluded_token_ids.add(token_row.id)
+                        mark_kwargs: dict[str, Any] = {}
+                        if compact_server_error_cooling_time > 0:
+                            mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
+                        await mark_token_error(token_row.id, message, **mark_kwargs)
+                        if compact_server_error_cooling_time > 0:
+                            _prompt_cache_remove_token(http_request.app, token_row.id)
+                        last_error = HTTPException(status_code=502, detail=message)
+                        continue
+                    await mark_token_error(token_row.id, message)
+                    await finalize_failure(
+                        token_row=token_row,
+                        attempt=attempt,
+                        stream_capture=None,
+                        status_code=502,
+                        detail=message,
+                    )
+                    stream_finalized = True
+                    return
+                finally:
+                    if stream_cm is not None:
+                        await stream_cm.__aexit__(None, None, None)
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_started_at,
+                        first_token_at=token_observation_first_token_at,
+                    )
+
+            if last_error is not None:
+                await output_queue.put(
+                    _build_stream_error_event(
+                        getattr(last_error, "status_code", 500),
+                        str(getattr(last_error, "detail", "") or last_error),
+                    )
+                )
+                await output_queue.put(b"data: [DONE]\n\n")
+                await _finalize_request_log_with_timing(
+                    timing,
+                    request_log,
+                    status_code=getattr(last_error, "status_code", 500),
+                    success=False,
+                    attempt_count=attempt_count,
+                    finished_at=utcnow(),
+                    token_id=last_token_id,
+                    account_id=last_account_id,
+                    error_message=str(getattr(last_error, "detail", "") or last_error),
+                    **prompt_cache_log_kwargs(status_code=getattr(last_error, "status_code", 500)),
+                )
+                stream_finalized = True
+                return
+
+            if require_non_free_token and skipped_free_token_ids:
+                detail = _non_free_codex_token_unavailable_detail(restricted_model_label)
+                await output_queue.put(_build_stream_error_event(503, detail))
+                await output_queue.put(b"data: [DONE]\n\n")
+                await _finalize_request_log_with_timing(
+                    timing,
+                    request_log,
+                    status_code=503,
+                    success=False,
+                    attempt_count=attempt_count,
+                    finished_at=utcnow(),
+                    token_id=last_token_id,
+                    account_id=last_account_id,
+                    error_message=detail,
+                    **prompt_cache_log_kwargs(status_code=503),
+                )
+                stream_finalized = True
+                return
+
+            detail = "No available Codex token could satisfy this request"
+            await output_queue.put(_build_stream_error_event(503, detail))
+            await output_queue.put(b"data: [DONE]\n\n")
+            await _finalize_request_log_with_timing(
+                timing,
+                request_log,
+                status_code=503,
+                success=False,
+                attempt_count=attempt_count,
+                finished_at=utcnow(),
+                token_id=last_token_id,
+                account_id=last_account_id,
+                error_message=detail,
+                **prompt_cache_log_kwargs(status_code=503),
+            )
+            stream_finalized = True
+        except asyncio.CancelledError:
+            if not stream_finalized:
+                await _finalize_cancelled_request_log(
+                    request_log,
+                    status_code=499,
+                    success=False,
+                    attempt_count=attempt_count,
+                    finished_at=utcnow(),
+                    token_id=last_token_id,
+                    account_id=last_account_id,
+                    error_message="Client disconnected",
+                    timing=timing,
+                )
+            raise
+        except HTTPException as exc:
+            if not stream_finalized:
+                await _finalize_request_log_with_timing(
+                    timing,
+                    request_log,
+                    status_code=getattr(exc, "status_code", 500),
+                    success=False,
+                    attempt_count=attempt_count,
+                    finished_at=utcnow(),
+                    token_id=last_token_id,
+                    account_id=last_account_id,
+                    error_message=str(getattr(exc, "detail", "") or exc),
+                )
+            await output_queue.put(_build_stream_error_event(getattr(exc, "status_code", 500), str(getattr(exc, "detail", "") or exc)))
+            await output_queue.put(b"data: [DONE]\n\n")
+        except Exception as exc:
+            if not stream_finalized:
+                await _finalize_request_log_with_timing(
+                    timing,
+                    request_log,
+                    status_code=500,
+                    success=False,
+                    attempt_count=attempt_count,
+                    finished_at=utcnow(),
+                    token_id=last_token_id,
+                    account_id=last_account_id,
+                    error_message=str(exc),
+                )
+            await output_queue.put(_build_stream_error_event(500, str(exc) or type(exc).__name__))
+            await output_queue.put(b"data: [DONE]\n\n")
+        finally:
+            try:
+                await output_queue.put(queue_done_sentinel)
+                await response_lease.release()
+                await proxy_lease.release()
+            finally:
+                if timing_context_token is not None:
+                    _REQUEST_TIMING.reset(timing_context_token)
+                if db_timing_context_token is not None:
+                    reset_db_timing_recorder(db_timing_context_token)
+
+    async def response_body() -> AsyncGenerator[bytes, None]:
+        nonlocal response_body_started
+        response_body_started = True
+        queue_done_sentinel = object()
+        worker_task = asyncio.create_task(worker(output_queue, queue_done_sentinel))
+        try:
             while True:
                 item = await output_queue.get()
                 if item is queue_done_sentinel:
@@ -8990,6 +9827,19 @@ def create_app() -> FastAPI:
             if prompt_cache_context is not None
             else None
         )
+
+        if bool(request_data.stream) and not _is_responses_image_compat_model(request_data.model):
+            return await _responses_stream_keepalive_response(
+                http_request,
+                endpoint=endpoint,
+                request_model=request_data.model,
+                compact=compact,
+                request_data=request_data,
+                prompt_cache_context=prompt_cache_context,
+                session_id=session_id,
+                session_id_source=session_id_source,
+                prompt_cache_trace=prompt_cache_trace,
+            )
 
         async def proxy_call(
             client: httpx.AsyncClient,

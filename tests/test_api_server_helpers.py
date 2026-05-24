@@ -70,6 +70,7 @@ from oaix_gateway.api_server import (
     _prompt_cache_finalize_kwargs,
     _prompt_cache_response_owner,
     _prompt_cache_session_context,
+    _responses_stream_keepalive_response,
     _stream_responses_to_chat_completions,
     _stream_upstream_image_response,
     _stream_upstream_response,
@@ -1407,6 +1408,28 @@ def test_stream_responses_to_chat_completions_forwards_keepalive_comment() -> No
     body = asyncio.run(collect())
 
     assert ": keepalive" in body
+    assert '"content": "hello"' in body
+    assert "data: [DONE]" in body
+
+
+def test_stream_responses_to_chat_completions_skips_typed_keepalive_event() -> None:
+    async def upstream() -> AsyncIterator[bytes]:
+        yield b'event: keepalive\ndata: {"type":"keepalive","sequence_number":0}\n\n'
+        yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    async def collect() -> str:
+        chunks: list[bytes] = []
+        async for chunk in _stream_responses_to_chat_completions(
+            upstream(),
+            request_model="gpt-image-2",
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(collect())
+
+    assert "event: keepalive" not in body
     assert '"content": "hello"' in body
     assert "data: [DONE]" in body
 
@@ -2982,6 +3005,235 @@ def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias_after_pr
 
     assert body.startswith(": keepalive")
     assert '"model": "gpt-image-2"' in body
+
+
+def test_responses_stream_keepalive_response_emits_typed_keepalive_once_and_retries_before_commit(
+    monkeypatch,
+) -> None:
+    class DummyStreamingResponse:
+        def __init__(self, chunks: list[bytes], error: Exception | None = None) -> None:
+            self.status_code = 200
+            self._chunks = chunks
+            self._error = error
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+                if self._error is not None:
+                    raise self._error
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b"".join(self._chunks)
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse, client: "DummyClient") -> None:
+            self._response = response
+            self._client = client
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self._client.closed_calls += 1
+            return None
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+            self.closed_calls = 0
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                    "timeout": timeout,
+                }
+            )
+            attempt = len(self.stream_calls)
+            if attempt == 1:
+                response = DummyStreamingResponse(
+                    [
+                        b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_attempt_1","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
+                    ],
+                    error=httpx.ReadError("boom"),
+                )
+            else:
+                response = DummyStreamingResponse(
+                    [
+                        b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_attempt_2","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
+                        b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+                        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_attempt_2","status":"completed","model":"gpt-5.4-mini","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+                        b"data: [DONE]\n\n",
+                    ]
+                )
+            return DummyStreamContext(response, self)
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            return None
+
+    client = DummyClient()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=client,
+            oauth_manager=DummyOAuthManager(),
+        )
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4-mini",
+        input=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+    token_rows = [
+        SimpleNamespace(id=11, account_id="acct_1", refresh_token="refresh-1"),
+        SimpleNamespace(id=12, account_id="acct_2", refresh_token="refresh-2"),
+    ]
+    claim_calls: list[int] = []
+    error_calls: list[tuple[int, str]] = []
+    success_calls: list[int] = []
+
+    async def fake_claim_prompt_cache_affinity_token(*args, **kwargs):
+        index = len(claim_calls)
+        if index >= len(token_rows):
+            return None
+        token_row = token_rows[index]
+        claim_calls.append(token_row.id)
+        return SimpleNamespace(token_row=token_row, result="primary_hit", lane_index=index)
+
+    async def fake_mark_token_error(token_id: int, detail: str, **kwargs) -> None:
+        error_calls.append((token_id, detail))
+
+    async def fake_mark_token_success_with_timing(timing, token_id: int, *, token_row=None) -> None:
+        success_calls.append(token_id)
+
+    async def unexpected_fallback_token_claim(*args, **kwargs):
+        raise AssertionError("unexpected fallback token claim")
+
+    monkeypatch.setattr("oaix_gateway.api_server._submit_request_log_write", lambda job: None)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_prompt_cache_affinity_token", fake_claim_prompt_cache_affinity_token)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server._mark_token_success_with_timing", fake_mark_token_success_with_timing)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_next_token_for_model_request", unexpected_fallback_token_claim)
+
+    async def run_stream() -> tuple[object, str]:
+        result = await _responses_stream_keepalive_response(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.4-mini",
+            compact=False,
+            request_data=request_data,
+        )
+        chunks: list[bytes] = []
+        async for chunk in result.body_iterator:
+            chunks.append(chunk)
+        return result, b"".join(chunks).decode("utf-8")
+
+    result, body = asyncio.run(run_stream())
+
+    assert result.status_code == 200
+    assert body.startswith('event: keepalive\ndata: {"type":"keepalive","sequence_number":0}\n\n')
+    assert body.count("event: keepalive") == 1
+    assert "resp_attempt_1" not in body
+    assert "resp_attempt_2" in body
+    assert '"text":"hello"' in body.replace(" ", "")
+    assert body.rstrip().endswith("data: [DONE]")
+    assert client.stream_calls[0]["method"] == "POST"
+    assert len(client.stream_calls) == 2
+    assert client.closed_calls == 2
+    assert claim_calls == [11, 12]
+    assert error_calls and error_calls[0][0] == 11
+    assert success_calls == [12]
+
+
+def test_responses_route_uses_keepalive_stream_helper_for_non_image_stream_requests(monkeypatch) -> None:
+    app = create_app()
+    captured: dict[str, object] = {}
+
+    async def fake_keepalive_response(
+        http_request,
+        *,
+        endpoint: str,
+        request_model: str | None,
+        compact: bool,
+        request_data: ResponsesRequest,
+        prompt_cache_context=None,
+        session_id=None,
+        session_id_source=None,
+        prompt_cache_trace=None,
+    ) -> JSONResponse:
+        captured.update(
+            {
+                "endpoint": endpoint,
+                "request_model": request_model,
+                "compact": compact,
+                "stream": request_data.stream,
+            }
+        )
+        return JSONResponse({"ok": True})
+
+    async def unexpected_execute_proxy_request_with_failover(*args, **kwargs):
+        raise AssertionError("unexpected failover path")
+
+    monkeypatch.setattr("oaix_gateway.api_server._responses_stream_keepalive_response", fake_keepalive_response)
+    monkeypatch.setattr("oaix_gateway.api_server._execute_proxy_request_with_failover", unexpected_execute_proxy_request_with_failover)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"content-type", b"application/json"), (b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {
+            "type": "http.request",
+            "body": b'{"model":"gpt-5.4-mini","input":"hello","stream":true}',
+            "more_body": False,
+        },
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4-mini",
+        input="hello",
+        stream=True,
+    )
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/v1/responses" and "POST" in getattr(route, "methods", set())
+    )
+
+    result = asyncio.run(route.endpoint(request, request_data))
+
+    assert captured == {
+        "endpoint": "/v1/responses",
+        "request_model": "gpt-5.4-mini",
+        "compact": False,
+        "stream": True,
+    }
+    assert isinstance(result, JSONResponse)
+    assert json.loads(result.body) == {"ok": True}
 
 
 def test_stream_upstream_image_response_synthesizes_completed_event_from_output_item_done() -> None:
