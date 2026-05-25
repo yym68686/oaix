@@ -335,8 +335,18 @@ def test_extract_image_rate_limit_cooldown_from_retry_after_milliseconds(monkeyp
 def test_detects_permanent_disable_errors() -> None:
     payload_402 = json.dumps({"detail": {"code": "deactivated_workspace"}})
     payload_401 = json.dumps({"error": {"code": "account_deactivated"}})
+    payload_token_invalidated = json.dumps(
+        {
+            "error": {
+                "message": "Your authentication token has been invalidated. Please try signing in again.",
+                "type": "invalid_request_error",
+                "code": "token_invalidated",
+            }
+        }
+    )
     assert _is_permanent_account_disable_error(402, payload_402) is True
     assert _is_permanent_account_disable_error(401, payload_401) is True
+    assert _is_permanent_account_disable_error(401, payload_token_invalidated) is True
 
 
 def test_request_requires_non_free_codex_token_only_for_image_tool_model() -> None:
@@ -4595,6 +4605,309 @@ def test_execute_proxy_request_with_failover_disables_access_token_only_auth_fai
     assert mark_success_calls == [52]
     assert finalized[0]["attempt_count"] == 2
     assert finalized[0]["token_id"] == 52
+
+
+def test_execute_proxy_request_with_failover_switches_key_after_refreshable_auth_failure(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        def __init__(self) -> None:
+            self.invalidated: list[int] = []
+
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            self.invalidated.append(token_id)
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    first_token = CodexToken(
+        id=61,
+        account_id="acct_61",
+        refresh_token="refresh-61",
+        access_token="stale-access-token",
+        expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+        token_type="codex",
+        is_active=True,
+    )
+    second_token = CodexToken(
+        id=62,
+        account_id="acct_62",
+        refresh_token="refresh-62",
+        token_type="codex",
+        is_active=True,
+        last_error="previous error",
+    )
+    claim_calls: list[tuple[int, ...]] = []
+    mark_error_calls: list[dict[str, object]] = []
+    mark_success_calls: list[int] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if first_token.id not in excluded:
+            return first_token
+        if second_token.id not in excluded:
+            return second_token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=161)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        mark_error_calls.append(
+            {
+                "token_id": token_id,
+                "message": message,
+                "deactivate": deactivate,
+                "cooldown_seconds": cooldown_seconds,
+                "clear_access_token": clear_access_token,
+            }
+        )
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        if account_id == "acct_61":
+            raise HTTPException(status_code=401, detail='{"error":{"code":"invalid_token"}}')
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-5",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    assert response.status_code == 200
+    assert app.state.oauth_manager.invalidated == [61]
+    assert claim_calls == [(), (61,)]
+    assert first_token.access_token is None
+    assert first_token.expires_at is None
+    assert mark_error_calls == [
+        {
+            "token_id": 61,
+            "message": '{"error":{"code":"invalid_token"}}',
+            "deactivate": False,
+            "cooldown_seconds": None,
+            "clear_access_token": True,
+        }
+    ]
+    assert mark_success_calls == [62]
+    assert finalized[0]["attempt_count"] == 2
+    assert finalized[0]["token_id"] == 62
+
+
+def test_execute_proxy_request_with_failover_disables_token_invalidated_and_retries(monkeypatch) -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        def __init__(self) -> None:
+            self.invalidated: list[int] = []
+
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            self.invalidated.append(token_id)
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    first_token = CodexToken(
+        id=71,
+        account_id="acct_71",
+        refresh_token="refresh-71",
+        token_type="codex",
+        is_active=True,
+    )
+    second_token = CodexToken(
+        id=72,
+        account_id="acct_72",
+        refresh_token="refresh-72",
+        token_type="codex",
+        is_active=True,
+        last_error="previous error",
+    )
+    token_invalidated_detail = json.dumps(
+        {
+            "error": {
+                "message": "Your authentication token has been invalidated. Please try signing in again.",
+                "type": "invalid_request_error",
+                "code": "token_invalidated",
+                "param": None,
+            },
+            "status": 401,
+        }
+    )
+    claim_calls: list[tuple[int, ...]] = []
+    mark_error_calls: list[dict[str, object]] = []
+    mark_success_calls: list[int] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_get_token_counts():
+        return SimpleNamespace(available=2)
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(excluded)
+        if first_token.id not in excluded:
+            return first_token
+        if second_token.id not in excluded:
+            return second_token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=171)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_error(
+        token_id: int,
+        message: str,
+        *,
+        deactivate: bool = False,
+        cooldown_seconds: int | None = None,
+        clear_access_token: bool = False,
+    ) -> None:
+        mark_error_calls.append(
+            {
+                "token_id": token_id,
+                "message": message,
+                "deactivate": deactivate,
+                "cooldown_seconds": cooldown_seconds,
+                "clear_access_token": clear_access_token,
+            }
+        )
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        if account_id == "acct_71":
+            raise HTTPException(status_code=401, detail=token_invalidated_detail)
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-5",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+        )
+    )
+
+    assert response.status_code == 200
+    assert app.state.oauth_manager.invalidated == [71]
+    assert claim_calls == [(), (71,)]
+    assert mark_error_calls == [
+        {
+            "token_id": 71,
+            "message": token_invalidated_detail,
+            "deactivate": True,
+            "cooldown_seconds": None,
+            "clear_access_token": True,
+        }
+    ]
+    assert mark_success_calls == [72]
+    assert finalized[0]["attempt_count"] == 2
+    assert finalized[0]["token_id"] == 72
 
 
 def test_execute_proxy_request_with_failover_scopes_gpt_image_input_rate_limit(monkeypatch) -> None:

@@ -1213,6 +1213,28 @@ def _prompt_cache_remove_token(app: FastAPI, token_id: int) -> None:
             _prompt_cache_lane_store(app).pop(key, None)
 
 
+def _clear_token_row_access_token_for_retry(token_row: Any) -> None:
+    for attribute_name in ("access_token", "expires_at"):
+        with suppress(Exception):
+            setattr(token_row, attribute_name, None)
+
+
+def _exclude_auth_failed_token_for_request(
+    excluded_token_ids: set[int],
+    token_row: Any,
+    *,
+    app: FastAPI | None = None,
+) -> None:
+    try:
+        token_id = int(token_row.id)
+    except (AttributeError, TypeError, ValueError):
+        return
+    excluded_token_ids.add(token_id)
+    _clear_token_row_access_token_for_retry(token_row)
+    if app is not None:
+        _prompt_cache_remove_token(app, token_id)
+
+
 def _prompt_cache_bind_response(
     app: FastAPI,
     response_id: str | None,
@@ -6699,10 +6721,7 @@ def _is_permanent_account_disable_error(status_code: int, error_text: str) -> bo
     if status_code not in (401, 402):
         return False
 
-    try:
-        payload = json.loads(error_text)
-    except Exception:
-        return False
+    payload = _load_error_mapping(error_text)
     if not isinstance(payload, dict):
         return False
 
@@ -6713,12 +6732,14 @@ def _is_permanent_account_disable_error(status_code: int, error_text: str) -> bo
             if detail_code == "deactivated_workspace":
                 return True
 
-    if status_code == 401:
-        error = payload.get("error")
-        if isinstance(error, dict):
-            error_code = str(error.get("code") or "").strip()
-            if error_code == "account_deactivated":
-                return True
+    error = _extract_error_object(error_text) if status_code == 401 else None
+    if isinstance(error, dict):
+        error_code = str(error.get("code") or "").strip().lower()
+        if error_code in {"account_deactivated", "token_invalidated"}:
+            return True
+        error_message = str(error.get("message") or "").strip().lower()
+        if "authentication token has been invalidated" in error_message and "signing in again" in error_message:
+            return True
 
     return False
 
@@ -7240,8 +7261,7 @@ def _gpt_image_stream_keepalive_response(
                         clear_access_token=True,
                     )
                     if permanent_refresh_failure or exc.status_code in (401, 403):
-                        if permanent_refresh_failure:
-                            excluded_token_ids.add(token_row.id)
+                        _exclude_auth_failed_token_for_request(excluded_token_ids, token_row)
                         last_error = (
                             HTTPException(
                                 status_code=503,
@@ -7445,7 +7465,7 @@ def _gpt_image_stream_keepalive_response(
 
                     if permanently_disabled or auth_failed_after_refresh:
                         oauth_manager.invalidate(token_row.id)
-                        excluded_token_ids.add(token_row.id)
+                        _exclude_auth_failed_token_for_request(excluded_token_ids, token_row)
                         await mark_token_error(
                             token_row.id,
                             detail,
@@ -7466,6 +7486,7 @@ def _gpt_image_stream_keepalive_response(
 
                     if status_code in (401, 403):
                         oauth_manager.invalidate(token_row.id)
+                        _exclude_auth_failed_token_for_request(excluded_token_ids, token_row)
                         await mark_token_error(token_row.id, detail, clear_access_token=True)
                         logger.warning(
                             "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
@@ -8031,8 +8052,11 @@ async def _responses_stream_keepalive_response(
                         clear_access_token=True,
                     )
                     if permanent_refresh_failure or exc.status_code in (401, 403):
-                        if permanent_refresh_failure:
-                            excluded_token_ids.add(token_row.id)
+                        _exclude_auth_failed_token_for_request(
+                            excluded_token_ids,
+                            token_row,
+                            app=http_request.app,
+                        )
                         last_error = (
                             HTTPException(
                                 status_code=503,
@@ -8239,7 +8263,11 @@ async def _responses_stream_keepalive_response(
 
                     if permanently_disabled or auth_failed_after_refresh:
                         oauth_manager.invalidate(token_row.id)
-                        excluded_token_ids.add(token_row.id)
+                        _exclude_auth_failed_token_for_request(
+                            excluded_token_ids,
+                            token_row,
+                            app=http_request.app,
+                        )
                         await mark_token_error(
                             token_row.id,
                             detail,
@@ -8251,6 +8279,11 @@ async def _responses_stream_keepalive_response(
 
                     if status_code in (401, 403):
                         oauth_manager.invalidate(token_row.id)
+                        _exclude_auth_failed_token_for_request(
+                            excluded_token_ids,
+                            token_row,
+                            app=http_request.app,
+                        )
                         await mark_token_error(token_row.id, detail, clear_access_token=True)
                         last_error = exc
                         continue
@@ -8803,9 +8836,11 @@ async def _execute_proxy_request_with_failover(
                     clear_access_token=True,
                 )
                 if permanent_refresh_failure or exc.status_code in (401, 403):
-                    if permanent_refresh_failure:
-                        excluded_token_ids.add(token_row.id)
-                        _prompt_cache_remove_token(http_request.app, token_row.id)
+                    _exclude_auth_failed_token_for_request(
+                        excluded_token_ids,
+                        token_row,
+                        app=http_request.app,
+                    )
                     last_error = (
                         HTTPException(
                             status_code=503,
@@ -9051,8 +9086,11 @@ async def _execute_proxy_request_with_failover(
 
                 if permanently_disabled or auth_failed_after_refresh:
                     oauth_manager.invalidate(token_row.id)
-                    excluded_token_ids.add(token_row.id)
-                    _prompt_cache_remove_token(http_request.app, token_row.id)
+                    _exclude_auth_failed_token_for_request(
+                        excluded_token_ids,
+                        token_row,
+                        app=http_request.app,
+                    )
                     await mark_token_error(
                         token_row.id,
                         detail,
@@ -9073,6 +9111,11 @@ async def _execute_proxy_request_with_failover(
 
                 if status_code in (401, 403):
                     oauth_manager.invalidate(token_row.id)
+                    _exclude_auth_failed_token_for_request(
+                        excluded_token_ids,
+                        token_row,
+                        app=http_request.app,
+                    )
                     await mark_token_error(token_row.id, detail, clear_access_token=True)
                     logger.warning(
                         "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
