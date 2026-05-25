@@ -3790,9 +3790,123 @@ async function refreshDashboard({ includeTokens = true } = {}) {
   }
 }
 
+function normalizeImportString(value) {
+  return String(value || "").trim();
+}
+
+function firstImportString(...values) {
+  for (const value of values) {
+    const normalized = normalizeImportString(value);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function normalizeImportExpiration(value) {
+  const raw = normalizeImportString(value);
+  if (!raw) {
+    return "";
+  }
+
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    const milliseconds = numeric > 10_000_000_000 ? numeric : numeric * 1000;
+    const date = new Date(milliseconds);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toISOString();
+    }
+  }
+
+  return raw;
+}
+
+function normalizeSub2apiAccount(account, index) {
+  if (!account || typeof account !== "object") {
+    throw new Error(`sub2api accounts 第 ${index + 1} 个账号格式错误`);
+  }
+
+  const platform = normalizeImportString(account.platform).toLowerCase();
+  if (platform && platform !== "openai") {
+    return [];
+  }
+
+  const credentials = account.credentials && typeof account.credentials === "object" ? account.credentials : {};
+  const extra = account.extra && typeof account.extra === "object" ? account.extra : {};
+  const refreshToken = firstImportString(credentials.refresh_token, account.refresh_token);
+  const accessToken = firstImportString(credentials.access_token, account.access_token);
+  if (!refreshToken && !accessToken) {
+    throw new Error(
+      `sub2api accounts 第 ${index + 1} 个账号缺少 credentials.refresh_token 或 credentials.access_token`,
+    );
+  }
+
+  const payload = {
+    ...credentials,
+    type: "codex",
+    token_source: "sub2api",
+  };
+  if (refreshToken) {
+    payload.refresh_token = refreshToken;
+  }
+  if (accessToken) {
+    payload.access_token = accessToken;
+  }
+
+  const accountId = firstImportString(
+    credentials.chatgpt_account_id,
+    credentials.account_id,
+    account.chatgpt_account_id,
+    account.account_id,
+  );
+  if (accountId) {
+    payload.account_id = accountId;
+    payload.chatgpt_account_id = accountId;
+  }
+
+  const email = firstImportString(credentials.email, account.email, extra.email, account.name);
+  if (email) {
+    payload.email = email;
+  }
+
+  const planType = firstImportString(credentials.plan_type, account.plan_type);
+  if (planType) {
+    payload.plan_type = planType;
+  }
+
+  const expiresAt = normalizeImportExpiration(
+    firstImportString(credentials.expired, credentials.expires_at, account.expired, account.expires_at),
+  );
+  if (expiresAt) {
+    payload.expired = expiresAt;
+  }
+
+  return [payload];
+}
+
+function normalizeSub2apiPayload(raw) {
+  const accounts = Array.isArray(raw?.accounts) ? raw.accounts : [];
+  if (!accounts.length) {
+    throw new Error("sub2api JSON 未找到 accounts 账号列表");
+  }
+  const payloads = accounts.flatMap((account, index) => normalizeSub2apiAccount(account, index));
+  if (!payloads.length) {
+    throw new Error("sub2api JSON 未找到可导入的 OpenAI 账号");
+  }
+  return payloads;
+}
+
+function isSub2apiPayload(raw) {
+  return raw && typeof raw === "object" && raw.type === "sub2api-data" && Array.isArray(raw.accounts);
+}
+
 function normalizePayload(raw) {
   if (Array.isArray(raw)) {
     return raw.flatMap(normalizePayload);
+  }
+  if (isSub2apiPayload(raw)) {
+    return normalizeSub2apiPayload(raw);
   }
   if (raw && typeof raw === "object" && Array.isArray(raw.tokens)) {
     return raw.tokens.flatMap(normalizePayload);

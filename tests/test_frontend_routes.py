@@ -227,6 +227,24 @@ def test_frontend_import_panel_supports_refresh_and_access_token_only_lines() ->
     assert "account_id: accountId" in parse_function
 
 
+def test_frontend_import_panel_supports_sub2api_export_json() -> None:
+    index_html = (WEB_DIR / "index.html").read_text()
+    app_js = (WEB_DIR / "app.js").read_text()
+    normalize_function = app_js.split("function normalizeSub2apiAccount", 1)[1].split(
+        "function collectLogicalKeyLines",
+        1,
+    )[0]
+
+    assert "sub2api 导出 JSON" in index_html
+    assert 'raw.type === "sub2api-data"' in normalize_function
+    assert "Array.isArray(raw.accounts)" in normalize_function
+    assert 'type: "codex"' in normalize_function
+    assert 'token_source: "sub2api"' in normalize_function
+    assert "payloads = accounts.flatMap" in normalize_function
+    assert "payload.account_id = accountId" in normalize_function
+    assert "payload.expired = expiresAt" in normalize_function
+
+
 def test_frontend_dashboard_refresh_does_not_overlap_heavy_admin_requests() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     refresh_function = app_js.split("async function refreshDashboard", 1)[1].split("function splitTokenInputLines", 1)[0]
