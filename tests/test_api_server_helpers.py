@@ -23,6 +23,7 @@ from oaix_gateway.api_server import (
     _RequestLogWriteJob,
     _RequestTimingRecorder,
     _AsyncioSocketSendWarningFilter,
+    _FinalizingStreamingResponse,
     _SSEProxyStreamingResponse,
     _TOKEN_ACTIVE_REQUESTS,
     _chat_completions_request_to_responses_request,
@@ -43,6 +44,9 @@ from oaix_gateway.api_server import (
     _extract_usage_limit_cooldown_seconds,
     _get_compact_codex_server_error_cooling_time,
     _is_permanent_account_disable_error,
+    _is_upstream_connectivity_exception,
+    _is_local_upstream_pool_timeout,
+    _max_request_account_retries,
     _normalize_responses_compact_upstream_url,
     _proxy_request_with_token,
     _prime_responses_upstream_stream,
@@ -78,6 +82,12 @@ from oaix_gateway.api_server import (
     _serialize_admin_token_item,
     _sanitize_codex_payload,
     _should_retry_upstream_server_error,
+    _should_record_upstream_circuit_failure,
+    _request_log_start_write_enabled,
+    _request_log_write_batch_size,
+    _request_log_write_concurrency,
+    _request_log_write_queue_max_size,
+    _upstream_http_shard_count,
     _translate_responses_image_compat_payload,
     _upstream_error_http_exception,
     _wrap_streaming_body_iterator,
@@ -2369,9 +2379,41 @@ def test_prompt_cache_previous_response_owner_busy_is_strict_by_default(monkeypa
 def test_upstream_http_pool_size_is_configurable(monkeypatch) -> None:
     monkeypatch.setenv("UPSTREAM_HTTP_MAX_CONNECTIONS", "512")
     monkeypatch.setenv("UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS", "128")
+    monkeypatch.setenv("UPSTREAM_HTTP_SHARD_COUNT", "16")
 
     assert _upstream_http_max_connections() == 512
     assert _upstream_http_max_keepalive_connections() == 128
+    assert _upstream_http_shard_count() == 16
+
+
+def test_pool_timeout_is_local_overload_not_upstream_connectivity() -> None:
+    exc = httpx.PoolTimeout("pool exhausted")
+
+    assert _is_local_upstream_pool_timeout(exc) is True
+    assert _is_upstream_connectivity_exception(exc) is False
+    assert _should_record_upstream_circuit_failure(exc) is False
+    assert _should_record_upstream_circuit_failure(httpx.ConnectTimeout("connect")) is True
+
+
+def test_max_request_account_retries_is_capped(monkeypatch) -> None:
+    monkeypatch.setenv("MAX_REQUEST_ACCOUNT_RETRIES", "100")
+    monkeypatch.setenv("MAX_EFFECTIVE_REQUEST_ACCOUNT_RETRIES", "8")
+
+    assert _max_request_account_retries() == 8
+
+
+def test_request_log_and_pool_defaults_target_high_rpm(monkeypatch) -> None:
+    monkeypatch.delenv("REQUEST_LOG_WRITE_START_ENABLED", raising=False)
+    monkeypatch.delenv("REQUEST_LOG_WRITE_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("REQUEST_LOG_WRITE_CONCURRENCY", raising=False)
+    monkeypatch.delenv("REQUEST_LOG_WRITE_QUEUE_MAX_SIZE", raising=False)
+    monkeypatch.delenv("UPSTREAM_HTTP_SHARD_COUNT", raising=False)
+
+    assert _request_log_start_write_enabled() is False
+    assert _request_log_write_batch_size() == 250
+    assert _request_log_write_concurrency() == 4
+    assert _request_log_write_queue_max_size() == 20000
+    assert _upstream_http_shard_count() == 8
 
 
 def test_resolve_token_observed_cost_usd_prefers_direct_token_cost() -> None:
@@ -3905,6 +3947,24 @@ def test_request_log_handle_finalizes_via_async_outbox_without_waiting(monkeypat
     assert "request_log_queue_wait_ms" in finalized[0]["timing_spans"]
 
 
+def test_request_log_handle_does_not_enqueue_start_log_by_default(monkeypatch) -> None:
+    submitted: list[_RequestLogWriteJob] = []
+    monkeypatch.delenv("REQUEST_LOG_WRITE_START_ENABLED", raising=False)
+    monkeypatch.setattr("oaix_gateway.api_server._submit_request_log_write", submitted.append)
+
+    _RequestLogHandle.start(
+        endpoint="/v1/responses",
+        model="gpt-5.5",
+        is_stream=False,
+        started_at=datetime.now(timezone.utc),
+        client_ip="127.0.0.1",
+        user_agent="pytest",
+        timing=_RequestTimingRecorder(),
+    )
+
+    assert submitted == []
+
+
 def test_request_log_write_queue_drops_start_logs_before_final_logs(monkeypatch) -> None:
     monkeypatch.setenv("REQUEST_LOG_WRITE_QUEUE_MAX_SIZE", "1")
     written_payloads: list[dict[str, object]] = []
@@ -4018,6 +4078,44 @@ def test_token_pool_snapshot_lru_claim_reorders_cached_tokens() -> None:
 
     assert first.id == 1
     assert second.id == 2
+
+
+def test_token_pool_snapshot_lru_claim_uses_ready_queue() -> None:
+    _TOKEN_ACTIVE_REQUESTS.clear()
+    started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    tokens = tuple(
+        SimpleNamespace(
+            id=index,
+            plan_type=None,
+            last_used_at=started_at,
+            updated_at=started_at,
+            merged_into_token_id=None,
+            is_active=True,
+            refresh_token=f"refresh-{index}",
+            token_type="codex",
+            cooldown_until=None,
+        )
+        for index in range(1, 4)
+    )
+    snapshot = _TokenPoolSnapshot(tokens=tokens, scoped_cooldowns={}, loaded_at=0.0)
+    settings = TokenSelectionSettings(strategy=TOKEN_SELECTION_STRATEGY_LEAST_RECENTLY_USED)
+
+    try:
+        claimed = [
+            _claim_next_active_token_from_snapshot(
+                snapshot,
+                settings,
+                exclude_token_ids=set(),
+                scoped_cooldown_scope=None,
+                timing=None,
+            ).id
+            for _ in range(3)
+        ]
+    finally:
+        _TOKEN_ACTIVE_REQUESTS.clear()
+
+    assert claimed == [1, 2, 3]
+    assert len(snapshot.ready_token_ids_by_key) == 1
 
 
 def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeypatch) -> None:
@@ -4750,15 +4848,16 @@ def test_execute_proxy_request_with_failover_returns_stream_before_mark_success(
                 proxy_call=fake_proxy_call,
             )
         )
-        await asyncio.wait_for(create_started.wait(), timeout=0.05)
         response = await asyncio.wait_for(execute_task, timeout=0.05)
         assert isinstance(response, StreamingResponse)
+        assert not create_started.is_set()
         assert not mark_started.is_set()
 
         async def collect() -> list[bytes]:
             return [chunk async for chunk in response.body_iterator]
 
         collect_task = asyncio.create_task(collect())
+        await asyncio.wait_for(create_started.wait(), timeout=0.05)
         create_continue.set()
         await asyncio.wait_for(mark_started.wait(), timeout=0.05)
         mark_continue.set()
@@ -6881,14 +6980,27 @@ def test_execute_proxy_request_with_failover_opens_circuit_on_connectivity_error
             raise AssertionError("invalidate should not run")
 
     app.state.oauth_manager = DummyOAuthManager()
-    token_row = CodexToken(
-        id=101,
-        account_id="acct_101",
-        refresh_token="refresh-101",
-        token_type="codex",
-        is_active=True,
-    )
+    token_rows = [
+        CodexToken(
+            id=101,
+            account_id="acct_101",
+            refresh_token="refresh-101",
+            token_type="codex",
+            is_active=True,
+        ),
+        CodexToken(
+            id=102,
+            account_id="acct_102",
+            refresh_token="refresh-102",
+            token_type="codex",
+            is_active=True,
+        ),
+    ]
+    token_row = token_rows[0]
+    extra_token_row = token_rows[1]
     claim_count = 0
+    claim_exclusions: list[tuple[int, ...]] = []
+    selected_token_ids: list[int] = []
 
     def make_request() -> Request:
         return Request(
@@ -6910,9 +7022,16 @@ def test_execute_proxy_request_with_failover_opens_circuit_on_connectivity_error
         return kwargs.get("timing_spans")
 
     async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        del selection_strategy
         nonlocal claim_count
         claim_count += 1
-        return token_row
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_exclusions.append(excluded)
+        for candidate in token_rows:
+            if candidate.id not in excluded:
+                selected_token_ids.append(candidate.id)
+                return candidate
+        return None
 
     async def fake_mark_token_error(token_id: int, message: str, **kwargs) -> None:
         del token_id, message, kwargs
@@ -6948,7 +7067,108 @@ def test_execute_proxy_request_with_failover_opens_circuit_on_connectivity_error
 
     asyncio.run(run())
 
-    assert claim_count == 1
+    assert selected_token_ids == [token_row.id, token_row.id, extra_token_row.id]
+    assert (token_row.id,) in claim_exclusions
+    assert claim_count == 3
+    assert app.state.response_traffic.active_responses == 0
+    assert app.state.proxy_concurrency.active == 0
+
+
+def test_execute_proxy_request_with_failover_skips_open_shard_circuit(monkeypatch) -> None:
+    monkeypatch.setenv("TRANSPORT_ERROR_MAX_RETRIES", "10")
+    monkeypatch.setenv("UPSTREAM_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+    monkeypatch.setenv("UPSTREAM_CIRCUIT_BREAKER_OPEN_SECONDS", "30")
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    token_row = CodexToken(
+        id=101,
+        account_id="acct_101",
+        refresh_token="refresh-101",
+        token_type="codex",
+        is_active=True,
+    )
+    claim_count = 0
+    proxy_call_count = 0
+
+    def make_request() -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/responses",
+                "headers": [(b"user-agent", b"test-client")],
+                "client": ("127.0.0.1", 9000),
+                "app": app,
+            },
+            receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+        )
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=201)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs):
+        return kwargs.get("timing_spans")
+
+    async def fake_claim_next_active_token(*, selection_strategy: str, exclude_token_ids=None):
+        nonlocal claim_count
+        del selection_strategy
+        claim_count += 1
+        if token_row.id in set(exclude_token_ids or ()):
+            return None
+        return token_row
+
+    async def fake_mark_token_error(token_id: int, message: str, **kwargs) -> None:
+        del token_id, message, kwargs
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        nonlocal proxy_call_count
+        proxy_call_count += 1
+        raise httpx.ConnectTimeout("connect stalled")
+
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+
+    async def run() -> None:
+        with pytest.raises(HTTPException) as first_exc:
+            await _execute_proxy_request_with_failover(
+                make_request(),
+                endpoint="/v1/responses",
+                request_model="gpt-5.5",
+                is_stream=False,
+                proxy_call=fake_proxy_call,
+            )
+        assert first_exc.value.status_code == 503
+
+        with pytest.raises(HTTPException) as second_exc:
+            await _execute_proxy_request_with_failover(
+                make_request(),
+                endpoint="/v1/responses",
+                request_model="gpt-5.5",
+                is_stream=False,
+                proxy_call=fake_proxy_call,
+            )
+        assert second_exc.value.status_code == 503
+
+    asyncio.run(run())
+
+    assert claim_count == 3
+    assert proxy_call_count == 1
     assert app.state.response_traffic.active_responses == 0
     assert app.state.proxy_concurrency.active == 0
 
@@ -8318,6 +8538,45 @@ def test_wrap_streaming_body_iterator_runs_cleanup_on_close() -> None:
         wrapped = _wrap_streaming_body_iterator(upstream(), on_close=on_close)
         assert await wrapped.__anext__() == b"chunk-1"
         await wrapped.aclose()
+
+    asyncio.run(runner())
+
+    assert events == ["upstream_closed", "cleanup_ran"]
+
+
+def test_finalizing_streaming_response_closes_body_iterator_before_cleanup() -> None:
+    events: list[str] = []
+
+    async def upstream() -> AsyncIterator[bytes]:
+        try:
+            yield b"chunk-1"
+            await asyncio.sleep(60)
+        finally:
+            events.append("upstream_closed")
+
+    async def on_close() -> None:
+        events.append("cleanup_ran")
+
+    async def runner() -> None:
+        response = _FinalizingStreamingResponse(upstream(), on_close=on_close)
+        receive_calls = 0
+
+        async def receive() -> dict[str, object]:
+            nonlocal receive_calls
+            receive_calls += 1
+            if receive_calls == 1:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await asyncio.sleep(0)
+            return {"type": "http.disconnect"}
+
+        sent: list[dict[str, object]] = []
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+            if message.get("type") == "http.response.body" and message.get("body") == b"chunk-1":
+                raise asyncio.CancelledError()
+
+        await response({"type": "http", "method": "GET", "path": "/"}, receive, send)
 
     asyncio.run(runner())
 

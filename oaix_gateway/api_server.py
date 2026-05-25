@@ -10,6 +10,7 @@ import logging
 import math
 import mimetypes
 import os
+import random
 import re
 import time
 import uuid
@@ -303,7 +304,12 @@ async def _finalize_request_log_with_timing(
         if success_hook is not None:
             await _run_request_log_success_hooks([success_hook], request_log_id)
 
-    if resolved_spans:
+    status_code = _coerce_int(kwargs.get("status_code"), 0) or 0
+    should_log_timing = bool(status_code >= 400)
+    if not should_log_timing:
+        sample_rate = _request_timing_log_sample_rate()
+        should_log_timing = sample_rate >= 1.0 or (sample_rate > 0.0 and random.random() < sample_rate)
+    if resolved_spans and should_log_timing:
         logger.info(
             "Request timing spans: request_log_id=%s request_id=%s spans=%s",
             request_log_id,
@@ -329,8 +335,14 @@ _TOKEN_ACTIVE_REQUESTS: dict[int, int] = {}
 _TOKEN_RECENT_TTFT_MS: dict[int, deque[int]] = {}
 _TOKEN_RECENT_TTFT_LIMIT = 200
 DEFAULT_FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP = DEFAULT_TOKEN_ACTIVE_STREAM_CAP
-DEFAULT_UPSTREAM_HTTP_MAX_CONNECTIONS = 512
-DEFAULT_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS = 128
+DEFAULT_UPSTREAM_HTTP_SHARD_COUNT = 8
+DEFAULT_UPSTREAM_HTTP_MAX_CONNECTIONS = 2048
+DEFAULT_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS = 512
+DEFAULT_PROXY_MAX_ACTIVE_RESPONSES = 1024
+DEFAULT_PROXY_QUEUE_MAX_SIZE = 4096
+DEFAULT_REQUEST_LOG_WRITE_CONCURRENCY = 4
+DEFAULT_REQUEST_LOG_WRITE_BATCH_SIZE = 250
+DEFAULT_REQUEST_LOG_WRITE_QUEUE_MAX_SIZE = 20000
 
 
 def _current_request_timing() -> _RequestTimingRecorder | None:
@@ -536,6 +548,10 @@ class _TokenPoolSnapshot:
     ordered_tokens_by_key: dict[tuple[str, tuple[int, ...], bool, tuple[str, ...]], list[Any]] = field(
         default_factory=dict
     )
+    token_by_id: dict[int, Any] = field(default_factory=dict)
+    ready_token_ids_by_key: dict[tuple[str, tuple[int, ...], bool, tuple[str, ...]], deque[int]] = field(
+        default_factory=dict
+    )
 
 
 def _token_snapshot_order_key(
@@ -558,6 +574,34 @@ def _token_snapshot_order_cache(snapshot: Any) -> dict[tuple[str, tuple[int, ...
     with suppress(Exception):
         setattr(snapshot, "ordered_tokens_by_key", cache)
     return cache
+
+
+def _token_snapshot_token_by_id(snapshot: _TokenPoolSnapshot) -> dict[int, Any]:
+    if snapshot.token_by_id:
+        return snapshot.token_by_id
+    snapshot.token_by_id = {
+        int(getattr(token_row, "id", 0) or 0): token_row
+        for token_row in snapshot.tokens
+        if int(getattr(token_row, "id", 0) or 0) > 0
+    }
+    return snapshot.token_by_id
+
+
+def _token_snapshot_ready_queue(
+    snapshot: _TokenPoolSnapshot,
+    settings: TokenSelectionSettings,
+) -> deque[int]:
+    cache_key = _token_snapshot_order_key(settings)
+    queue = snapshot.ready_token_ids_by_key.get(cache_key)
+    if queue is not None:
+        return queue
+    queue = deque(
+        int(getattr(token_row, "id", 0) or 0)
+        for token_row in _token_snapshot_ordered_tokens(snapshot, settings)
+        if int(getattr(token_row, "id", 0) or 0) > 0
+    )
+    snapshot.ready_token_ids_by_key[cache_key] = queue
+    return queue
 
 
 def _token_plan_sort_value(token_row: Any, settings: TokenSelectionSettings) -> int:
@@ -716,6 +760,48 @@ def _token_snapshot_mark_token_claimed(
     ordered.insert(insert_at, selected)
 
 
+def _claim_next_lru_token_from_snapshot(
+    snapshot: _TokenPoolSnapshot,
+    selection_settings: TokenSelectionSettings,
+    *,
+    effective_excluded_ids: set[int],
+    scoped_cooldown_scope: str | None,
+    now: datetime,
+    include_plan_types: Iterable[str] | None,
+    exclude_plan_types: Iterable[str] | None,
+) -> Any | None:
+    queue = _token_snapshot_ready_queue(snapshot, selection_settings)
+    if not queue:
+        return None
+    token_by_id = _token_snapshot_token_by_id(snapshot)
+    active_stream_cap = normalize_token_active_stream_cap(selection_settings.active_stream_cap)
+    for _ in range(len(queue)):
+        token_id = queue.popleft()
+        token_row = token_by_id.get(token_id)
+        if token_row is None:
+            continue
+        queue.append(token_id)
+        if token_id in effective_excluded_ids:
+            continue
+        if not _token_row_matches_plan_filters(
+            token_row,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        ):
+            continue
+        if not _token_snapshot_row_available(
+            token_row,
+            snapshot,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            now=now,
+        ):
+            continue
+        if _token_active_stream_count(token_id) >= active_stream_cap:
+            continue
+        return token_row
+    return None
+
+
 def _snapshot_scoped_cooldown_active(
     snapshot: _TokenPoolSnapshot,
     token_id: int,
@@ -778,6 +864,11 @@ async def _load_token_pool_snapshot() -> _TokenPoolSnapshot:
         tokens=tuple(token_rows),
         scoped_cooldowns=scoped_cooldowns,
         loaded_at=time.monotonic(),
+        token_by_id={
+            int(getattr(token_row, "id", 0) or 0): token_row
+            for token_row in token_rows
+            if int(getattr(token_row, "id", 0) or 0) > 0
+        },
     )
 
 
@@ -862,25 +953,40 @@ def _claim_next_active_token_from_snapshot(
     if timing is not None:
         timing.set_ms("token_pool_snapshot_age_ms", (time.monotonic() - snapshot.loaded_at) * 1000)
 
-    for token_row in _token_snapshot_ordered_tokens(snapshot, selection_settings):
+    if selection_settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+        candidates: Iterable[Any] = _token_snapshot_ordered_tokens(snapshot, selection_settings)
+    else:
+        claimed = _claim_next_lru_token_from_snapshot(
+            snapshot,
+            selection_settings,
+            effective_excluded_ids=effective_excluded_ids,
+            scoped_cooldown_scope=scoped_cooldown_scope,
+            now=now,
+            include_plan_types=include_plan_types,
+            exclude_plan_types=exclude_plan_types,
+        )
+        candidates = (claimed,) if claimed is not None else ()
+
+    for token_row in candidates:
         token_id = int(getattr(token_row, "id", 0) or 0)
         if token_id <= 0 or token_id in effective_excluded_ids:
             continue
-        if not _token_row_matches_plan_filters(
-            token_row,
-            include_plan_types=include_plan_types,
-            exclude_plan_types=exclude_plan_types,
-        ):
-            continue
-        if not _token_snapshot_row_available(
-            token_row,
-            snapshot,
-            scoped_cooldown_scope=scoped_cooldown_scope,
-            now=now,
-        ):
-            continue
-        if _token_active_stream_count(token_id) >= active_stream_cap:
-            continue
+        if selection_settings.strategy == TOKEN_SELECTION_STRATEGY_FILL_FIRST:
+            if not _token_row_matches_plan_filters(
+                token_row,
+                include_plan_types=include_plan_types,
+                exclude_plan_types=exclude_plan_types,
+            ):
+                continue
+            if not _token_snapshot_row_available(
+                token_row,
+                snapshot,
+                scoped_cooldown_scope=scoped_cooldown_scope,
+                now=now,
+            ):
+                continue
+            if _token_active_stream_count(token_id) >= active_stream_cap:
+                continue
         token_row.last_used_at = now
         token_row.updated_at = now
         _token_snapshot_mark_token_claimed(snapshot, selection_settings, token_row)
@@ -1035,6 +1141,10 @@ def _prompt_cache_response_store(app: FastAPI) -> OrderedDict[str, "_PromptCache
 
 def _prompt_cache_prune_store(app: FastAPI) -> None:
     now = time.monotonic()
+    last_pruned_at = float(getattr(app.state, "prompt_cache_last_pruned_at", 0.0) or 0.0)
+    if now - last_pruned_at < _prompt_cache_prune_interval_seconds():
+        return
+    app.state.prompt_cache_last_pruned_at = now
     lane_store = _prompt_cache_lane_store(app)
     lane_ttl = _prompt_cache_lane_ttl_seconds()
     for key in list(lane_store.keys()):
@@ -1512,19 +1622,27 @@ _REQUEST_LOG_WRITE_DRAINERS: set[asyncio.Task[None]] = set()
 
 
 def _request_log_write_concurrency() -> int:
-    return _int_env("REQUEST_LOG_WRITE_CONCURRENCY", 2, minimum=1)
+    return _int_env("REQUEST_LOG_WRITE_CONCURRENCY", DEFAULT_REQUEST_LOG_WRITE_CONCURRENCY, minimum=1)
 
 
 def _request_log_write_batch_size() -> int:
-    return _int_env("REQUEST_LOG_WRITE_BATCH_SIZE", 50, minimum=1)
+    return _int_env("REQUEST_LOG_WRITE_BATCH_SIZE", DEFAULT_REQUEST_LOG_WRITE_BATCH_SIZE, minimum=1)
 
 
 def _request_log_write_queue_max_size() -> int:
-    return _int_env("REQUEST_LOG_WRITE_QUEUE_MAX_SIZE", 2000, minimum=1)
+    return _int_env("REQUEST_LOG_WRITE_QUEUE_MAX_SIZE", DEFAULT_REQUEST_LOG_WRITE_QUEUE_MAX_SIZE, minimum=1)
 
 
 def _request_log_write_timeout_seconds() -> float:
-    return _float_env("REQUEST_LOG_WRITE_TIMEOUT_SECONDS", 3.0, minimum=0.1)
+    return _float_env("REQUEST_LOG_WRITE_TIMEOUT_SECONDS", 5.0, minimum=0.1)
+
+
+def _request_log_start_write_enabled() -> bool:
+    return _bool_env("REQUEST_LOG_WRITE_START_ENABLED", False)
+
+
+def _request_timing_log_sample_rate() -> float:
+    return min(1.0, _float_env("REQUEST_TIMING_LOG_SAMPLE_RATE", 0.0, minimum=0.0))
 
 
 def _request_log_write_queue() -> asyncio.Queue[_RequestLogWriteJob]:
@@ -1535,6 +1653,19 @@ def _request_log_write_queue() -> asyncio.Queue[_RequestLogWriteJob]:
         _REQUEST_LOG_WRITE_QUEUE_LOOP = loop
         _REQUEST_LOG_WRITE_DRAINERS = set()
     return _REQUEST_LOG_WRITE_QUEUE
+
+
+def _request_log_write_queue_stats() -> dict[str, Any]:
+    queue = _REQUEST_LOG_WRITE_QUEUE
+    return {
+        "queue_depth": queue.qsize() if queue is not None else 0,
+        "queue_max_size": queue.maxsize if queue is not None else _request_log_write_queue_max_size(),
+        "dropped": _REQUEST_LOG_WRITE_DROPPED,
+        "active_workers": len([task for task in _REQUEST_LOG_WRITE_DRAINERS if not task.done()]),
+        "worker_limit": _request_log_write_concurrency(),
+        "batch_size": _request_log_write_batch_size(),
+        "start_logs_enabled": _request_log_start_write_enabled(),
+    }
 
 
 def _merge_request_log_payload(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
@@ -1884,7 +2015,8 @@ class _RequestLogHandle:
             timing=timing,
             prompt_cache_trace=prompt_cache_trace if isinstance(prompt_cache_trace, dict) else None,
         )
-        handle._enqueue_start()
+        if _request_log_start_write_enabled():
+            handle._enqueue_start()
         return handle
 
     def _base_payload(self) -> dict[str, Any]:
@@ -2411,6 +2543,10 @@ class _FinalizingStreamingResponse(StreamingResponse):
         finally:
             async def close_with_cancel_shield() -> None:
                 with anyio.CancelScope(shield=True):
+                    close_iterator = getattr(self.body_iterator, "aclose", None)
+                    if callable(close_iterator):
+                        with suppress(Exception):
+                            await close_iterator()
                     await self._on_close_once()
 
             cleanup_task = asyncio.create_task(close_with_cancel_shield(), name="oaix-streamed-response-finalizer")
@@ -2519,28 +2655,53 @@ class ProxyConcurrencyLease:
 
 
 class ProxyConcurrencyLimiter:
-    def __init__(self, max_active: int) -> None:
+    def __init__(self, max_active: int, *, max_queue: int | None = None) -> None:
         self.max_active = max(1, int(max_active))
+        self.max_queue = max(0, int(max_queue if max_queue is not None else DEFAULT_PROXY_QUEUE_MAX_SIZE))
         self._active = 0
+        self._waiting = 0
+        self._rejected_total = 0
         self._condition = asyncio.Condition()
 
     @property
     def active(self) -> int:
         return self._active
 
+    @property
+    def queued(self) -> int:
+        return self._waiting
+
+    @property
+    def rejected_total(self) -> int:
+        return self._rejected_total
+
     async def acquire(self, *, timeout_seconds: float) -> ProxyConcurrencyLease:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, float(timeout_seconds))
         async with self._condition:
-            while self._active >= self.max_active:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise TimeoutError("Timed out waiting for proxy concurrency slot")
-                try:
-                    await asyncio.wait_for(self._condition.wait(), timeout=remaining)
-                except asyncio.TimeoutError as exc:
-                    raise TimeoutError("Timed out waiting for proxy concurrency slot") from exc
-            self._active += 1
+            if self._active >= self.max_active:
+                if self.max_queue <= 0 or self._waiting >= self.max_queue:
+                    self._rejected_total += 1
+                    raise TimeoutError("Proxy concurrency queue is full")
+                self._waiting += 1
+                joined_queue = True
+            else:
+                joined_queue = False
+            try:
+                while self._active >= self.max_active:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        self._rejected_total += 1
+                        raise TimeoutError("Timed out waiting for proxy concurrency slot")
+                    try:
+                        await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                    except asyncio.TimeoutError as exc:
+                        self._rejected_total += 1
+                        raise TimeoutError("Timed out waiting for proxy concurrency slot") from exc
+                self._active += 1
+            finally:
+                if joined_queue:
+                    self._waiting = max(0, self._waiting - 1)
         return ProxyConcurrencyLease(self)
 
     async def release(self) -> None:
@@ -2585,6 +2746,103 @@ class UpstreamCircuitBreaker:
         if len(self._failures) >= self.failure_threshold:
             self._open_until = now + self.open_seconds
 
+    def snapshot(self) -> dict[str, Any]:
+        now = time.monotonic()
+        self._prune(now)
+        return {
+            "open": self.is_open(),
+            "retry_after_seconds": self.retry_after_seconds(),
+            "recent_failures": len(self._failures),
+            "failure_threshold": self.failure_threshold,
+            "window_seconds": self.window_seconds,
+            "open_seconds": self.open_seconds,
+        }
+
+
+class UpstreamCircuitRegistry:
+    def __init__(self) -> None:
+        self._breakers: dict[str, UpstreamCircuitBreaker] = {}
+
+    def breaker_for(self, key: str) -> UpstreamCircuitBreaker:
+        resolved_key = str(key or "default")
+        breaker = self._breakers.get(resolved_key)
+        if breaker is None:
+            breaker = UpstreamCircuitBreaker(
+                failure_threshold=_upstream_circuit_breaker_failure_threshold(),
+                window_seconds=_upstream_circuit_breaker_window_seconds(),
+                open_seconds=_upstream_circuit_breaker_open_seconds(),
+            )
+            self._breakers[resolved_key] = breaker
+        return breaker
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        return {key: breaker.snapshot() for key, breaker in sorted(self._breakers.items())}
+
+
+@dataclass
+class UpstreamHTTPClientShard:
+    key: str
+    client: httpx.AsyncClient
+    breaker: UpstreamCircuitBreaker
+
+
+class UpstreamHTTPClientPool:
+    def __init__(self, *, shard_count: int, max_connections: int, max_keepalive_connections: int) -> None:
+        self.shard_count = max(1, int(shard_count))
+        self.max_connections = max(1, int(max_connections))
+        self.max_keepalive_connections = max(0, int(max_keepalive_connections))
+        per_shard_connections = max(1, math.ceil(self.max_connections / self.shard_count))
+        per_shard_keepalive = min(
+            per_shard_connections,
+            max(0, math.ceil(self.max_keepalive_connections / self.shard_count)),
+        )
+        self._registry = UpstreamCircuitRegistry()
+        self._shards = [
+            UpstreamHTTPClientShard(
+                key=f"shard-{index}",
+                client=httpx.AsyncClient(
+                    follow_redirects=True,
+                    transport=_TimingAsyncHTTPTransport(
+                        http2=False,
+                        limits=httpx.Limits(
+                            max_connections=per_shard_connections,
+                            max_keepalive_connections=per_shard_keepalive,
+                        ),
+                    ),
+                ),
+                breaker=self._registry.breaker_for(f"shard-{index}"),
+            )
+            for index in range(self.shard_count)
+        ]
+
+    def shard_for(self, shard_key: Any) -> UpstreamHTTPClientShard:
+        if not self._shards:
+            raise RuntimeError("Upstream HTTP client pool has no shards")
+        normalized = str(shard_key or "default")
+        digest = hashlib.blake2b(normalized.encode("utf-8"), digest_size=8).digest()
+        index = int.from_bytes(digest, "big", signed=False) % len(self._shards)
+        return self._shards[index]
+
+    @property
+    def default_client(self) -> httpx.AsyncClient:
+        return self._shards[0].client
+
+    def snapshot(self) -> dict[str, Any]:
+        open_count = sum(1 for shard in self._shards if shard.breaker.is_open())
+        return {
+            "shard_count": len(self._shards),
+            "max_connections": self.max_connections,
+            "max_keepalive_connections": self.max_keepalive_connections,
+            "open_breakers": open_count,
+            "breakers": {
+                shard.key: shard.breaker.snapshot()
+                for shard in self._shards
+            },
+        }
+
+    async def aclose(self) -> None:
+        await asyncio.gather(*(shard.client.aclose() for shard in self._shards), return_exceptions=True)
+
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     raw = str(os.getenv(name, "") or "").strip()
@@ -2609,8 +2867,27 @@ def _csv_env(name: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+_MAX_REQUEST_ACCOUNT_RETRIES_WARNED: set[tuple[int, int]] = set()
+
+
+def _max_effective_request_account_retries() -> int:
+    return _int_env("MAX_EFFECTIVE_REQUEST_ACCOUNT_RETRIES", 8, minimum=1)
+
+
 def _max_request_account_retries() -> int:
-    return _int_env("MAX_REQUEST_ACCOUNT_RETRIES", 10, minimum=1)
+    requested = _int_env("MAX_REQUEST_ACCOUNT_RETRIES", 10, minimum=1)
+    cap = _max_effective_request_account_retries()
+    if requested <= cap:
+        return requested
+    warning_key = (requested, cap)
+    if warning_key not in _MAX_REQUEST_ACCOUNT_RETRIES_WARNED:
+        _MAX_REQUEST_ACCOUNT_RETRIES_WARNED.add(warning_key)
+        logger.warning(
+            "MAX_REQUEST_ACCOUNT_RETRIES=%s exceeds MAX_EFFECTIVE_REQUEST_ACCOUNT_RETRIES=%s; using capped value",
+            requested,
+            cap,
+        )
+    return cap
 
 
 def _transport_error_max_retries() -> int:
@@ -2622,7 +2899,11 @@ def _upstream_5xx_max_retries() -> int:
 
 
 def _proxy_max_active_responses() -> int:
-    return _int_env("PROXY_MAX_ACTIVE_RESPONSES", 64, minimum=1)
+    return _int_env("PROXY_MAX_ACTIVE_RESPONSES", DEFAULT_PROXY_MAX_ACTIVE_RESPONSES, minimum=1)
+
+
+def _proxy_queue_max_size() -> int:
+    return _int_env("PROXY_QUEUE_MAX_SIZE", DEFAULT_PROXY_QUEUE_MAX_SIZE, minimum=0)
 
 
 def _proxy_queue_timeout_seconds() -> float:
@@ -2664,6 +2945,10 @@ def _upstream_circuit_breaker_window_seconds() -> float:
 
 def _upstream_circuit_breaker_open_seconds() -> float:
     return _float_env("UPSTREAM_CIRCUIT_BREAKER_OPEN_SECONDS", 30.0, minimum=0.1)
+
+
+def _upstream_http_shard_count() -> int:
+    return _int_env("UPSTREAM_HTTP_SHARD_COUNT", DEFAULT_UPSTREAM_HTTP_SHARD_COUNT, minimum=1)
 
 
 def _fill_first_token_active_stream_cap() -> int:
@@ -2720,28 +3005,39 @@ def _state_http_client(app: FastAPI, name: str) -> httpx.AsyncClient:
     client = getattr(app.state, name, None)
     if isinstance(client, httpx.AsyncClient):
         return client
+    if isinstance(client, UpstreamHTTPClientPool):
+        return client.default_client
     return app.state.http_client
 
 
 def _proxy_concurrency_limiter(app: FastAPI) -> ProxyConcurrencyLimiter:
     limiter = getattr(app.state, "proxy_concurrency", None)
     max_active = _proxy_max_active_responses()
-    if not isinstance(limiter, ProxyConcurrencyLimiter) or limiter.max_active != max_active:
-        limiter = ProxyConcurrencyLimiter(max_active)
+    max_queue = _proxy_queue_max_size()
+    if (
+        not isinstance(limiter, ProxyConcurrencyLimiter)
+        or limiter.max_active != max_active
+        or limiter.max_queue != max_queue
+    ):
+        limiter = ProxyConcurrencyLimiter(max_active, max_queue=max_queue)
         app.state.proxy_concurrency = limiter
     return limiter
 
 
-def _upstream_circuit_breaker(app: FastAPI) -> UpstreamCircuitBreaker:
-    breaker = getattr(app.state, "upstream_circuit_breaker", None)
-    if not isinstance(breaker, UpstreamCircuitBreaker):
-        breaker = UpstreamCircuitBreaker(
-            failure_threshold=_upstream_circuit_breaker_failure_threshold(),
-            window_seconds=_upstream_circuit_breaker_window_seconds(),
-            open_seconds=_upstream_circuit_breaker_open_seconds(),
-        )
-        app.state.upstream_circuit_breaker = breaker
-    return breaker
+def _upstream_circuit_registry(app: FastAPI) -> UpstreamCircuitRegistry:
+    registry = getattr(app.state, "upstream_circuit_registry", None)
+    if isinstance(registry, UpstreamCircuitRegistry):
+        return registry
+    legacy_breaker = getattr(app.state, "upstream_circuit_breaker", None)
+    registry = UpstreamCircuitRegistry()
+    if isinstance(legacy_breaker, UpstreamCircuitBreaker):
+        registry._breakers["default"] = legacy_breaker
+    app.state.upstream_circuit_registry = registry
+    return registry
+
+
+def _upstream_circuit_breaker(app: FastAPI, key: str = "default") -> UpstreamCircuitBreaker:
+    return _upstream_circuit_registry(app).breaker_for(key)
 
 
 def _upstream_circuit_open_exception(breaker: UpstreamCircuitBreaker) -> HTTPException:
@@ -2755,14 +3051,57 @@ def _upstream_circuit_open_exception(breaker: UpstreamCircuitBreaker) -> HTTPExc
     return exc
 
 
-def _raise_if_upstream_circuit_open(app: FastAPI) -> None:
-    breaker = _upstream_circuit_breaker(app)
+def _raise_if_upstream_circuit_open(breaker: UpstreamCircuitBreaker) -> None:
     if breaker.is_open():
         raise _upstream_circuit_open_exception(breaker)
 
 
 def _is_upstream_connectivity_exception(exc: Exception) -> bool:
-    return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout))
+    return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError))
+
+
+def _is_local_upstream_pool_timeout(exc: Exception) -> bool:
+    return isinstance(exc, httpx.PoolTimeout)
+
+
+def _should_record_upstream_circuit_failure(exc: Exception) -> bool:
+    return _is_upstream_connectivity_exception(exc) and not _is_local_upstream_pool_timeout(exc)
+
+
+def _upstream_shard_key(
+    *,
+    token_id: int | None = None,
+    account_id: str | None = None,
+    request_id: str | None = None,
+) -> str:
+    if token_id is not None:
+        return f"token:{int(token_id)}"
+    if account_id:
+        return f"account:{account_id}"
+    if request_id:
+        return f"request:{request_id}"
+    return "default"
+
+
+def _response_http_client_pool(app: FastAPI) -> UpstreamHTTPClientPool | None:
+    pool = getattr(app.state, "response_http_client", None)
+    return pool if isinstance(pool, UpstreamHTTPClientPool) else None
+
+
+def _select_response_http_client(
+    app: FastAPI,
+    *,
+    token_id: int | None = None,
+    account_id: str | None = None,
+    request_id: str | None = None,
+) -> tuple[httpx.AsyncClient, UpstreamCircuitBreaker, str]:
+    key = _upstream_shard_key(token_id=token_id, account_id=account_id, request_id=request_id)
+    pool = _response_http_client_pool(app)
+    if pool is not None:
+        shard = pool.shard_for(key)
+        return shard.client, shard.breaker, shard.key
+    client = _state_http_client(app, "response_http_client")
+    return client, _upstream_circuit_breaker(app, key), key
 
 
 def _image_request_max_account_retries() -> int:
@@ -2858,6 +3197,86 @@ def _request_log_retention_days() -> int:
 
 def _request_log_cleanup_interval_seconds() -> float:
     return _float_env("REQUEST_LOG_CLEANUP_INTERVAL_SECONDS", 3600.0, minimum=60.0)
+
+
+def _token_active_runtime_metrics() -> dict[str, Any]:
+    values = [max(0, int(value or 0)) for value in _TOKEN_ACTIVE_REQUESTS.values()]
+    return {
+        "tokens_with_active_streams": len(values),
+        "total_active_streams": sum(values),
+        "p50": _percentile(values, 50),
+        "p95": _percentile(values, 95),
+        "max": max(values) if values else 0,
+    }
+
+
+def _runtime_fd_metrics() -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "open_fds": None,
+        "tcp_states": {},
+        "tcp_close_wait": 0,
+        "tcp_close_wait_443": 0,
+    }
+    fd_dir = Path("/proc/self/fd")
+    with suppress(Exception):
+        metrics["open_fds"] = len(list(fd_dir.iterdir()))
+
+    state_names = {
+        "01": "ESTABLISHED",
+        "02": "SYN_SENT",
+        "03": "SYN_RECV",
+        "04": "FIN_WAIT1",
+        "05": "FIN_WAIT2",
+        "06": "TIME_WAIT",
+        "07": "CLOSE",
+        "08": "CLOSE_WAIT",
+        "09": "LAST_ACK",
+        "0A": "LISTEN",
+        "0B": "CLOSING",
+    }
+    tcp_states: dict[str, int] = {}
+    close_wait_443 = 0
+    for proc_path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        try:
+            lines = proc_path.read_text(encoding="utf-8").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            state_hex = parts[3].upper()
+            state_name = state_names.get(state_hex, state_hex)
+            tcp_states[state_name] = tcp_states.get(state_name, 0) + 1
+            if state_name == "CLOSE_WAIT":
+                metrics["tcp_close_wait"] = int(metrics["tcp_close_wait"] or 0) + 1
+                remote = parts[2]
+                remote_port_hex = remote.rsplit(":", 1)[-1].upper()
+                if remote_port_hex == "01BB":
+                    close_wait_443 += 1
+    metrics["tcp_states"] = tcp_states
+    metrics["tcp_close_wait_443"] = close_wait_443
+    return metrics
+
+
+def _upstream_runtime_metrics(app: FastAPI) -> dict[str, Any]:
+    pool = _response_http_client_pool(app)
+    if pool is not None:
+        return pool.snapshot()
+    return {
+        "shard_count": 1,
+        "breakers": _upstream_circuit_registry(app).snapshot(),
+    }
+
+
+def _proxy_limiter_runtime_metrics(limiter: ProxyConcurrencyLimiter) -> dict[str, Any]:
+    return {
+        "active": limiter.active,
+        "queued": limiter.queued,
+        "rejected_total": limiter.rejected_total,
+        "max_active": limiter.max_active,
+        "max_queue": limiter.max_queue,
+    }
 
 
 def _get_service_api_keys() -> set[str]:
@@ -3042,6 +3461,10 @@ def _prompt_cache_lane_wait_ms() -> int:
 
 def _prompt_cache_previous_owner_wait_ms() -> int:
     return _int_env("PROMPT_CACHE_PREVIOUS_OWNER_WAIT_MS", 800, minimum=0)
+
+
+def _prompt_cache_prune_interval_seconds() -> float:
+    return _float_env("PROMPT_CACHE_PRUNE_INTERVAL_SECONDS", 1.0, minimum=0.0)
 
 
 def _prompt_cache_global_fallback_enabled() -> bool:
@@ -6432,7 +6855,11 @@ async def _probe_token_with_latest_access_token(
     token_row: Any,
     probe_model: str | None = None,
 ) -> dict[str, Any]:
-    client: httpx.AsyncClient = _state_http_client(app, "response_http_client")
+    client, _, _ = _select_response_http_client(
+        app,
+        token_id=int(getattr(token_row, "id", 0) or 0),
+        account_id=getattr(token_row, "account_id", None),
+    )
     oauth_manager: CodexOAuthManager = app.state.oauth_manager
     resolved_probe_model = _normalize_optional_text(probe_model) or _admin_token_probe_model()
     probe_request = ResponsesRequest(
@@ -6686,7 +7113,6 @@ def _gpt_image_stream_keepalive_response(
     async def worker() -> None:
         timing_context_token = _REQUEST_TIMING.set(timing) if timing is not None else None
         db_timing_context_token = set_db_timing_recorder(timing) if timing is not None else None
-        client: httpx.AsyncClient = _state_http_client(http_request.app, "response_http_client")
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
 
@@ -6712,7 +7138,6 @@ def _gpt_image_stream_keepalive_response(
             upstream_5xx_error_count = 0
 
             while attempt_count < max_attempts and claim_count < max_claims:
-                _raise_if_upstream_circuit_open(http_request.app)
                 claim_count += 1
                 token_row = await _await_timed(
                     _claim_next_token_for_model_request(
@@ -6776,6 +7201,27 @@ def _gpt_image_stream_keepalive_response(
                 attempt = attempt_count
                 last_token_id = token_row.id
                 last_account_id = token_row.account_id
+                client, upstream_breaker, upstream_shard_key = _select_response_http_client(
+                    http_request.app,
+                    token_id=token_row.id,
+                    account_id=token_row.account_id,
+                    request_id=request_log.request_id,
+                )
+                if upstream_breaker.is_open():
+                    excluded_token_ids.add(token_row.id)
+                    last_error = _upstream_circuit_open_exception(upstream_breaker)
+                    logger.info(
+                        "Skipping Codex token because upstream shard circuit is open: token_id=%s account_id=%s shard=%s",
+                        token_row.id,
+                        token_row.account_id,
+                        upstream_shard_key,
+                    )
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_log.started_at,
+                        first_token_at=None,
+                    )
+                    continue
 
                 try:
                     with timing.measure("oauth_ms") if timing is not None else suppress():
@@ -6930,9 +7376,9 @@ def _gpt_image_stream_keepalive_response(
                             account_id=token_row.account_id,
                             model_name=proxy_result.model_name,
                             success_hook=proxy_result.on_success,
-                        )
+                    )
                     await _mark_token_success_with_timing(timing, token_row.id, token_row=token_row)
-                    _upstream_circuit_breaker(http_request.app).record_success()
+                    upstream_breaker.record_success()
                     token_observation_first_token_at = (
                         (
                             proxy_result.stream_capture.first_token_at
@@ -7069,8 +7515,8 @@ def _gpt_image_stream_keepalive_response(
                     raise
                 except httpx.HTTPError as exc:
                     message = f"Upstream request failed: {type(exc).__name__}: {exc}"
-                    if _is_upstream_connectivity_exception(exc):
-                        _upstream_circuit_breaker(http_request.app).record_failure()
+                    if _should_record_upstream_circuit_failure(exc):
+                        upstream_breaker.record_failure()
                     transport_error_count += 1
                     compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
                         compact=compact,
@@ -7080,13 +7526,23 @@ def _gpt_image_stream_keepalive_response(
                     if (
                         transport_error_count <= _transport_error_max_retries()
                         and attempt < max_attempts
-                        and not _upstream_circuit_breaker(http_request.app).is_open()
+                        and not upstream_breaker.is_open()
                     ):
                         excluded_token_ids.add(token_row.id)
                         mark_kwargs: dict[str, Any] = {}
                         if compact_server_error_cooling_time > 0:
                             mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
-                        await mark_token_error(token_row.id, message, **mark_kwargs)
+                        if _is_local_upstream_pool_timeout(exc):
+                            logger.warning(
+                                "Local upstream HTTP pool exhausted before response commit: token_id=%s account_id=%s shard=%s attempt=%s/%s",
+                                token_row.id,
+                                token_row.account_id,
+                                upstream_shard_key,
+                                attempt,
+                                max_attempts,
+                            )
+                        else:
+                            await mark_token_error(token_row.id, message, **mark_kwargs)
                         logger.info(
                             "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                             token_row.id,
@@ -7099,9 +7555,10 @@ def _gpt_image_stream_keepalive_response(
                         )
                         last_error = HTTPException(status_code=502, detail=message)
                         continue
-                    await mark_token_error(token_row.id, message)
-                    if _upstream_circuit_breaker(http_request.app).is_open():
-                        raise _upstream_circuit_open_exception(_upstream_circuit_breaker(http_request.app)) from exc
+                    if not _is_local_upstream_pool_timeout(exc):
+                        await mark_token_error(token_row.id, message)
+                    if upstream_breaker.is_open():
+                        raise _upstream_circuit_open_exception(upstream_breaker) from exc
                     raise HTTPException(status_code=502, detail=message) from exc
                 finally:
                     _record_selected_token_observation_finish(
@@ -7353,7 +7810,6 @@ async def _responses_stream_keepalive_response(
         last_error: HTTPException | None = None
         transport_error_count = 0
         upstream_5xx_error_count = 0
-        client: httpx.AsyncClient = _state_http_client(http_request.app, "response_http_client")
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
         timing_context_token = _REQUEST_TIMING.set(timing)
@@ -7364,6 +7820,7 @@ async def _responses_stream_keepalive_response(
             token_row: Any,
             stream_capture: _ProxyStreamCapture,
             attempt: int,
+            upstream_breaker: UpstreamCircuitBreaker,
         ) -> None:
             nonlocal stream_finalized
             await _finalize_stream_request_log(
@@ -7393,7 +7850,7 @@ async def _responses_stream_keepalive_response(
                 token_row.id,
                 token_row=token_row,
             )
-            _upstream_circuit_breaker(http_request.app).record_success()
+            upstream_breaker.record_success()
             stream_finalized = True
 
         async def finalize_failure(
@@ -7432,7 +7889,6 @@ async def _responses_stream_keepalive_response(
             claim_count = 0
 
             while attempt_count < max_attempts and claim_count < max_claims:
-                _raise_if_upstream_circuit_open(http_request.app)
                 claim_count += 1
                 token_pool_snapshot = _fresh_token_pool_snapshot(http_request.app, timing=timing)
                 affinity_claim = await _await_timed(
@@ -7537,6 +7993,27 @@ async def _responses_stream_keepalive_response(
                 attempt = attempt_count
                 last_token_id = token_row.id
                 last_account_id = token_row.account_id
+                client, upstream_breaker, upstream_shard_key = _select_response_http_client(
+                    http_request.app,
+                    token_id=token_row.id,
+                    account_id=token_row.account_id,
+                    request_id=request_log.request_id,
+                )
+                if upstream_breaker.is_open():
+                    excluded_token_ids.add(token_row.id)
+                    last_error = _upstream_circuit_open_exception(upstream_breaker)
+                    logger.info(
+                        "Skipping Codex token because upstream shard circuit is open: token_id=%s account_id=%s shard=%s",
+                        token_row.id,
+                        token_row.account_id,
+                        upstream_shard_key,
+                    )
+                    _record_selected_token_observation_finish(
+                        token_row.id,
+                        started_at=request_started_at,
+                        first_token_at=None,
+                    )
+                    continue
 
                 try:
                     with timing.measure("oauth_ms") if timing is not None else suppress():
@@ -7719,6 +8196,7 @@ async def _responses_stream_keepalive_response(
                         token_row=token_row,
                         stream_capture=stream_capture,
                         attempt=attempt,
+                        upstream_breaker=upstream_breaker,
                     )
                     stream_finalized = True
                     return
@@ -7814,8 +8292,8 @@ async def _responses_stream_keepalive_response(
                     return
                 except httpx.HTTPError as exc:
                     message = f"Upstream request failed: {type(exc).__name__}: {exc}"
-                    if _is_upstream_connectivity_exception(exc):
-                        _upstream_circuit_breaker(http_request.app).record_failure()
+                    if _should_record_upstream_circuit_failure(exc):
+                        upstream_breaker.record_failure()
                     transport_error_count += 1
                     compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
                         compact=compact,
@@ -7825,20 +8303,31 @@ async def _responses_stream_keepalive_response(
                     if (
                         transport_error_count <= _transport_error_max_retries()
                         and attempt < max_attempts
-                        and not _upstream_circuit_breaker(http_request.app).is_open()
+                        and not upstream_breaker.is_open()
                     ):
                         excluded_token_ids.add(token_row.id)
                         mark_kwargs: dict[str, Any] = {}
                         if compact_server_error_cooling_time > 0:
                             mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
-                        await mark_token_error(token_row.id, message, **mark_kwargs)
-                        if compact_server_error_cooling_time > 0:
-                            _prompt_cache_remove_token(http_request.app, token_row.id)
+                        if _is_local_upstream_pool_timeout(exc):
+                            logger.warning(
+                                "Local upstream HTTP pool exhausted before response commit: token_id=%s account_id=%s shard=%s attempt=%s/%s",
+                                token_row.id,
+                                token_row.account_id,
+                                upstream_shard_key,
+                                attempt,
+                                max_attempts,
+                            )
+                        else:
+                            await mark_token_error(token_row.id, message, **mark_kwargs)
+                            if compact_server_error_cooling_time > 0:
+                                _prompt_cache_remove_token(http_request.app, token_row.id)
                         last_error = HTTPException(status_code=502, detail=message)
                         continue
-                    await mark_token_error(token_row.id, message)
-                    if _upstream_circuit_breaker(http_request.app).is_open():
-                        raise _upstream_circuit_open_exception(_upstream_circuit_breaker(http_request.app)) from exc
+                    if not _is_local_upstream_pool_timeout(exc):
+                        await mark_token_error(token_row.id, message)
+                    if upstream_breaker.is_open():
+                        raise _upstream_circuit_open_exception(upstream_breaker) from exc
                     await finalize_failure(
                         token_row=token_row,
                         attempt=attempt,
@@ -8112,7 +8601,6 @@ async def _execute_proxy_request_with_failover(
         max_attempts = _effective_proxy_max_attempts(endpoint=endpoint)
         max_claims = _max_request_account_retries()
         claim_count = 0
-        client: httpx.AsyncClient = _state_http_client(http_request.app, "response_http_client")
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
         last_error: HTTPException | None = None
@@ -8164,7 +8652,6 @@ async def _execute_proxy_request_with_failover(
             )
 
         while attempt_count < max_attempts and claim_count < max_claims:
-            _raise_if_upstream_circuit_open(http_request.app)
             claim_count += 1
             token_pool_snapshot = _fresh_token_pool_snapshot(http_request.app, timing=timing)
             affinity_claim = await _await_timed(
@@ -8281,6 +8768,27 @@ async def _execute_proxy_request_with_failover(
             attempt = attempt_count
             last_token_id = token_row.id
             last_account_id = token_row.account_id
+            client, upstream_breaker, upstream_shard_key = _select_response_http_client(
+                http_request.app,
+                token_id=token_row.id,
+                account_id=token_row.account_id,
+                request_id=request_log.request_id,
+            )
+            if upstream_breaker.is_open():
+                excluded_token_ids.add(token_row.id)
+                last_error = _upstream_circuit_open_exception(upstream_breaker)
+                logger.info(
+                    "Skipping Codex token because upstream shard circuit is open: token_id=%s account_id=%s shard=%s",
+                    token_row.id,
+                    token_row.account_id,
+                    upstream_shard_key,
+                )
+                _record_selected_token_observation_finish(
+                    token_row.id,
+                    started_at=request_started_at,
+                    first_token_at=None,
+                )
+                continue
 
             try:
                 with timing.measure("oauth_ms"):
@@ -8339,6 +8847,7 @@ async def _execute_proxy_request_with_failover(
                         proxied_account_id: str | None = token_row.account_id,
                         proxied_result: ProxyRequestResult = proxy_result,
                         selected_token_row: Any = token_row,
+                        selected_upstream_breaker: UpstreamCircuitBreaker = upstream_breaker,
                     ) -> None:
                         db_timing_context_token = set_db_timing_recorder(timing)
                         try:
@@ -8419,7 +8928,7 @@ async def _execute_proxy_request_with_failover(
                                     token_id,
                                     token_row=selected_token_row,
                                 )
-                                _upstream_circuit_breaker(http_request.app).record_success()
+                                selected_upstream_breaker.record_success()
                         finally:
                             _record_selected_token_observation_finish(
                                 token_id,
@@ -8460,7 +8969,7 @@ async def _execute_proxy_request_with_failover(
                     )
 
                 await _mark_token_success_with_timing(timing, token_row.id, token_row=token_row)
-                _upstream_circuit_breaker(http_request.app).record_success()
+                upstream_breaker.record_success()
                 token_observation_first_token_at = proxy_result.first_token_at
                 finalized_request_log_id = await _finalize_request_log_with_timing(
                     timing,
@@ -8612,8 +9121,8 @@ async def _execute_proxy_request_with_failover(
                 raise
             except httpx.HTTPError as exc:
                 message = f"Upstream request failed: {type(exc).__name__}: {exc}"
-                if _is_upstream_connectivity_exception(exc):
-                    _upstream_circuit_breaker(http_request.app).record_failure()
+                if _should_record_upstream_circuit_failure(exc):
+                    upstream_breaker.record_failure()
                 transport_error_count += 1
                 compact_server_error_cooling_time = _get_compact_codex_server_error_cooling_time(
                     compact=compact,
@@ -8623,15 +9132,25 @@ async def _execute_proxy_request_with_failover(
                 if (
                     transport_error_count <= _transport_error_max_retries()
                     and attempt < max_attempts
-                    and not _upstream_circuit_breaker(http_request.app).is_open()
+                    and not upstream_breaker.is_open()
                 ):
                     excluded_token_ids.add(token_row.id)
                     mark_kwargs: dict[str, Any] = {}
                     if compact_server_error_cooling_time > 0:
                         mark_kwargs["cooldown_seconds"] = compact_server_error_cooling_time
-                    await mark_token_error(token_row.id, message, **mark_kwargs)
-                    if compact_server_error_cooling_time > 0:
-                        _prompt_cache_remove_token(http_request.app, token_row.id)
+                    if _is_local_upstream_pool_timeout(exc):
+                        logger.warning(
+                            "Local upstream HTTP pool exhausted before response commit: token_id=%s account_id=%s shard=%s attempt=%s/%s",
+                            token_row.id,
+                            token_row.account_id,
+                            upstream_shard_key,
+                            attempt,
+                            max_attempts,
+                        )
+                    else:
+                        await mark_token_error(token_row.id, message, **mark_kwargs)
+                        if compact_server_error_cooling_time > 0:
+                            _prompt_cache_remove_token(http_request.app, token_row.id)
                     logger.info(
                         "Codex upstream transport error before response commit: token_id=%s account_id=%s error_type=%s compact=%s cooldown_seconds=%s attempt=%s/%s",
                         token_row.id,
@@ -8644,9 +9163,10 @@ async def _execute_proxy_request_with_failover(
                     )
                     last_error = HTTPException(status_code=502, detail=message)
                     continue
-                await mark_token_error(token_row.id, message)
-                if _upstream_circuit_breaker(http_request.app).is_open():
-                    raise _upstream_circuit_open_exception(_upstream_circuit_breaker(http_request.app)) from exc
+                if not _is_local_upstream_pool_timeout(exc):
+                    await mark_token_error(token_row.id, message)
+                if upstream_breaker.is_open():
+                    raise _upstream_circuit_open_exception(upstream_breaker) from exc
                 raise HTTPException(status_code=502, detail=message) from exc
             except Exception as exc:
                 if not _is_retryable_upstream_transport_exception(exc):
@@ -9238,17 +9758,12 @@ async def lifespan(app: FastAPI):
             list(repair_summary.canonical_ids),
             list(repair_summary.shadow_ids),
         )
-    app.state.response_http_client = httpx.AsyncClient(
-        follow_redirects=True,
-        transport=_TimingAsyncHTTPTransport(
-            http2=False,
-            limits=httpx.Limits(
-                max_connections=_upstream_http_max_connections(),
-                max_keepalive_connections=_upstream_http_max_keepalive_connections(),
-            ),
-        ),
+    app.state.response_http_client = UpstreamHTTPClientPool(
+        shard_count=_upstream_http_shard_count(),
+        max_connections=_upstream_http_max_connections(),
+        max_keepalive_connections=_upstream_http_max_keepalive_connections(),
     )
-    app.state.http_client = app.state.response_http_client
+    app.state.http_client = app.state.response_http_client.default_client
     app.state.import_http_client = httpx.AsyncClient(
         follow_redirects=True,
         limits=httpx.Limits(
@@ -9319,12 +9834,11 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="oaix Gateway", version="0.1.0", lifespan=lifespan)
     app.state.response_traffic = ResponseTrafficController()
-    app.state.proxy_concurrency = ProxyConcurrencyLimiter(_proxy_max_active_responses())
-    app.state.upstream_circuit_breaker = UpstreamCircuitBreaker(
-        failure_threshold=_upstream_circuit_breaker_failure_threshold(),
-        window_seconds=_upstream_circuit_breaker_window_seconds(),
-        open_seconds=_upstream_circuit_breaker_open_seconds(),
+    app.state.proxy_concurrency = ProxyConcurrencyLimiter(
+        _proxy_max_active_responses(),
+        max_queue=_proxy_queue_max_size(),
     )
+    app.state.upstream_circuit_registry = UpstreamCircuitRegistry()
     app.state.prompt_cache_affinity_lanes = OrderedDict()
     app.state.prompt_cache_response_bindings = OrderedDict()
     app.state.token_import_worker = None
@@ -9372,15 +9886,29 @@ def create_app() -> FastAPI:
     async def livez() -> JSONResponse:
         response_traffic: ResponseTrafficController = app.state.response_traffic
         proxy_limiter = _proxy_concurrency_limiter(app)
-        upstream_breaker = _upstream_circuit_breaker(app)
+        upstream_metrics = _upstream_runtime_metrics(app)
+        breaker_snapshots = upstream_metrics.get("breakers") if isinstance(upstream_metrics, dict) else {}
+        upstream_circuit_open = any(
+            bool(snapshot.get("open"))
+            for snapshot in (breaker_snapshots or {}).values()
+            if isinstance(snapshot, dict)
+        )
+        proxy_metrics = _proxy_limiter_runtime_metrics(proxy_limiter)
         return JSONResponse(
             status_code=200,
             content={
                 "ok": True,
                 "active_responses": response_traffic.active_responses,
-                "active_proxy_requests": proxy_limiter.active,
-                "max_proxy_requests": proxy_limiter.max_active,
-                "upstream_circuit_open": upstream_breaker.is_open(),
+                "active_proxy_requests": proxy_metrics["active"],
+                "queued_proxy_requests": proxy_metrics["queued"],
+                "rejected_proxy_requests_total": proxy_metrics["rejected_total"],
+                "max_proxy_requests": proxy_metrics["max_active"],
+                "max_proxy_queue": proxy_metrics["max_queue"],
+                "upstream_circuit_open": upstream_circuit_open,
+                "upstream": upstream_metrics,
+                "runtime": _runtime_fd_metrics(),
+                "token_active": _token_active_runtime_metrics(),
+                "request_log": _request_log_write_queue_stats(),
             },
         )
 
@@ -9664,6 +10192,21 @@ def create_app() -> FastAPI:
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail="Request logs temporarily unavailable") from exc
         return payload
+
+    @app.get("/admin/runtime")
+    async def runtime_route(
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        response_traffic: ResponseTrafficController = app.state.response_traffic
+        proxy_limiter = _proxy_concurrency_limiter(app)
+        return {
+            "active_responses": response_traffic.active_responses,
+            "proxy": _proxy_limiter_runtime_metrics(proxy_limiter),
+            "upstream": _upstream_runtime_metrics(app),
+            "runtime": _runtime_fd_metrics(),
+            "token_active": _token_active_runtime_metrics(),
+            "request_log": _request_log_write_queue_stats(),
+        }
 
     @app.post("/admin/tokens/import", status_code=202)
     async def import_tokens_route(

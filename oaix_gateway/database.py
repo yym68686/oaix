@@ -433,8 +433,8 @@ def get_request_log_engine():
     if _request_log_engine is None:
         _request_log_engine = create_async_engine(
             normalize_database_url(),
-            pool_size=_int_env("REQUEST_LOG_DATABASE_POOL_SIZE", 2, minimum=1),
-            max_overflow=_int_env("REQUEST_LOG_DATABASE_MAX_OVERFLOW", 2, minimum=0),
+            pool_size=_int_env("REQUEST_LOG_DATABASE_POOL_SIZE", 8, minimum=1),
+            max_overflow=_int_env("REQUEST_LOG_DATABASE_MAX_OVERFLOW", 8, minimum=0),
             pool_timeout=_float_env("REQUEST_LOG_DATABASE_POOL_TIMEOUT_SECONDS", 10.0, minimum=1.0),
             pool_pre_ping=True,
             pool_reset_on_return="rollback",
