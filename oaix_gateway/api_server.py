@@ -3032,6 +3032,37 @@ def _state_http_client(app: FastAPI, name: str) -> httpx.AsyncClient:
     return app.state.http_client
 
 
+async def _close_stream_cm_safely(stream_cm: Any) -> None:
+    current_task = asyncio.current_task()
+    had_cancellation = False
+    if current_task is not None:
+        while current_task.cancelling():
+            current_task.uncancel()
+            had_cancellation = True
+
+    close_task = asyncio.create_task(stream_cm.__aexit__(None, None, None))
+    try:
+        while True:
+            try:
+                await asyncio.shield(close_task)
+                break
+            except asyncio.CancelledError:
+                had_cancellation = True
+                if current_task is not None:
+                    current_task.uncancel()
+                if close_task.done():
+                    break
+            except Exception:
+                break
+    finally:
+        with suppress(Exception):
+            if not close_task.done():
+                await asyncio.shield(close_task)
+
+    if had_cancellation:
+        raise asyncio.CancelledError
+
+
 def _proxy_concurrency_limiter(app: FastAPI) -> ProxyConcurrencyLimiter:
     limiter = getattr(app.state, "proxy_concurrency", None)
     max_active = _proxy_max_active_responses()
@@ -6480,7 +6511,7 @@ async def _stream_upstream_image_response(
             yield error_event
             yield b"data: [DONE]\n\n"
     finally:
-        await stream_cm.__aexit__(None, None, None)
+        await _close_stream_cm_safely(stream_cm)
 
 
 async def _proxy_image_request_with_token(
@@ -6526,7 +6557,7 @@ async def _proxy_image_request_with_token(
                 try:
                     raw = await upstream_response.aread()
                 finally:
-                    await stream_cm.__aexit__(None, None, None)
+                    await _close_stream_cm_safely(stream_cm)
                 raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
             upstream_iter = upstream_response.aiter_raw()
@@ -6536,7 +6567,7 @@ async def _proxy_image_request_with_token(
                     heartbeat_interval_seconds=stream_keepalive_interval_seconds,
                 )
             except Exception:
-                await stream_cm.__aexit__(None, None, None)
+                await _close_stream_cm_safely(stream_cm)
                 raise
 
             async for chunk in _stream_upstream_image_response(
@@ -6596,7 +6627,7 @@ async def _proxy_image_request_with_token(
             first_token_at=first_token_at,
         )
     finally:
-        await stream_cm.__aexit__(None, None, None)
+        await _close_stream_cm_safely(stream_cm)
 
 
 def _load_error_mapping(error_text: str) -> dict[str, Any] | None:
@@ -8108,7 +8139,7 @@ async def _responses_stream_keepalive_response(
                         try:
                             raw = await upstream_response.aread()
                         finally:
-                            await stream_cm.__aexit__(None, None, None)
+                            await _close_stream_cm_safely(stream_cm)
                             stream_cm = None
                         raise _upstream_error_http_exception(
                             upstream_response.status_code,
@@ -8402,7 +8433,7 @@ async def _responses_stream_keepalive_response(
                     return
                 finally:
                     if stream_cm is not None:
-                        await stream_cm.__aexit__(None, None, None)
+                        await _close_stream_cm_safely(stream_cm)
                     _record_selected_token_observation_finish(
                         token_row.id,
                         started_at=request_started_at,
@@ -10556,7 +10587,7 @@ async def _stream_upstream_response(
                 yield error_event
                 yield b"data: [DONE]\n\n"
         finally:
-            await stream_cm.__aexit__(None, None, None)
+            await _close_stream_cm_safely(stream_cm)
         return
 
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -10649,7 +10680,7 @@ async def _stream_upstream_response(
         elif stream_committed:
             yield b"data: [DONE]\n\n"
     finally:
-        await stream_cm.__aexit__(None, None, None)
+        await _close_stream_cm_safely(stream_cm)
 
 
 async def _proxy_request_with_token(
@@ -10743,7 +10774,7 @@ async def _proxy_request_with_token(
                 try:
                     raw = await upstream_response.aread()
                 finally:
-                    await stream_cm.__aexit__(None, None, None)
+                    await _close_stream_cm_safely(stream_cm)
                 raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
             upstream_iter = upstream_response.aiter_raw()
@@ -10753,7 +10784,7 @@ async def _proxy_request_with_token(
                     heartbeat_interval_seconds=heartbeat_interval_seconds,
                 )
             except Exception:
-                await stream_cm.__aexit__(None, None, None)
+                await _close_stream_cm_safely(stream_cm)
                 raise
 
             async for chunk in _stream_upstream_response(
@@ -10800,17 +10831,17 @@ async def _proxy_request_with_token(
         upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()
-            await stream_cm.__aexit__(None, None, None)
+            await _close_stream_cm_safely(stream_cm)
             raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
         upstream_iter = upstream_response.aiter_raw()
         try:
             primed_stream = await _prime_responses_upstream_stream_with_timing(upstream_iter)
         except HTTPException:
-            await stream_cm.__aexit__(None, None, None)
+            await _close_stream_cm_safely(stream_cm)
             raise
         except RESPONSES_STREAM_NETWORK_ERRORS:
-            await stream_cm.__aexit__(None, None, None)
+            await _close_stream_cm_safely(stream_cm)
             raise
 
         effective_model_name = primed_stream.model_name or request_data.model
@@ -10885,7 +10916,7 @@ async def _proxy_request_with_token(
                 response_id=_extract_response_id_from_payload(data),
             )
         finally:
-            await stream_cm.__aexit__(None, None, None)
+            await _close_stream_cm_safely(stream_cm)
 
     upstream_response = await client.post(
         upstream_url,

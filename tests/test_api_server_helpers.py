@@ -64,6 +64,7 @@ from oaix_gateway.api_server import (
     _build_stream_error_event,
     _build_admin_token_items,
     _build_admin_token_quota_items,
+    _close_stream_cm_safely,
     _claim_next_active_token_from_snapshot,
     _claim_prompt_cache_affinity_token,
     _apply_prompt_cache_context_to_payload,
@@ -4192,6 +4193,31 @@ def test_execute_proxy_request_with_failover_finalizes_cancelled_request(monkeyp
     assert finalized[0]["account_id"] is None
     assert finalized[0]["error_message"] == "Client disconnected"
     assert app.state.response_traffic.active_responses == 0
+
+
+def test_close_stream_cm_safely_shields_cleanup_from_cancellation() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    class DummyStreamCM:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            entered.set()
+            await release.wait()
+            closed.set()
+
+    async def run() -> None:
+        task = asyncio.create_task(_close_stream_cm_safely(DummyStreamCM()))
+        await entered.wait()
+        task.cancel()
+        assert not closed.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    assert closed.is_set()
 
 
 def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monkeypatch) -> None:
