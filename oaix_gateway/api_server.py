@@ -3034,11 +3034,9 @@ def _state_http_client(app: FastAPI, name: str) -> httpx.AsyncClient:
 
 async def _close_stream_cm_safely(stream_cm: Any) -> None:
     current_task = asyncio.current_task()
-    had_cancellation = False
     if current_task is not None:
         while current_task.cancelling():
             current_task.uncancel()
-            had_cancellation = True
 
     close_task = asyncio.create_task(stream_cm.__aexit__(None, None, None))
     try:
@@ -3047,7 +3045,6 @@ async def _close_stream_cm_safely(stream_cm: Any) -> None:
                 await asyncio.shield(close_task)
                 break
             except asyncio.CancelledError:
-                had_cancellation = True
                 if current_task is not None:
                     current_task.uncancel()
                 if close_task.done():
@@ -3058,9 +3055,6 @@ async def _close_stream_cm_safely(stream_cm: Any) -> None:
         with suppress(Exception):
             if not close_task.done():
                 await asyncio.shield(close_task)
-
-    if had_cancellation:
-        raise asyncio.CancelledError
 
 
 def _proxy_concurrency_limiter(app: FastAPI) -> ProxyConcurrencyLimiter:

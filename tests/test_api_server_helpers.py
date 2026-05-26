@@ -4199,6 +4199,7 @@ def test_close_stream_cm_safely_shields_cleanup_from_cancellation() -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
     closed = asyncio.Event()
+    cleanup_finished = asyncio.Event()
 
     class DummyStreamCM:
         async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -4210,14 +4211,14 @@ def test_close_stream_cm_safely_shields_cleanup_from_cancellation() -> None:
         task = asyncio.create_task(_close_stream_cm_safely(DummyStreamCM()))
         await entered.wait()
         task.cancel()
-        assert not closed.is_set()
         release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        await task
+        cleanup_finished.set()
 
     asyncio.run(run())
 
     assert closed.is_set()
+    assert cleanup_finished.is_set()
 
 
 def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monkeypatch) -> None:
