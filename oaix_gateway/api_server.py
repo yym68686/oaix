@@ -8567,9 +8567,21 @@ async def _responses_stream_keepalive_response(
         response_body_started = True
         queue_done_sentinel = object()
         worker_task = asyncio.create_task(worker(output_queue, queue_done_sentinel))
+        heartbeat_interval_seconds = _stream_keepalive_interval_seconds()
         try:
+            yield STREAM_KEEPALIVE_COMMENT
             while True:
-                item = await output_queue.get()
+                try:
+                    if heartbeat_interval_seconds > 0:
+                        item = await asyncio.wait_for(
+                            output_queue.get(),
+                            timeout=heartbeat_interval_seconds,
+                        )
+                    else:
+                        item = await output_queue.get()
+                except asyncio.TimeoutError:
+                    yield STREAM_KEEPALIVE_COMMENT
+                    continue
                 if item is queue_done_sentinel:
                     break
                 if isinstance(item, bytes):

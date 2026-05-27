@@ -3274,7 +3274,7 @@ def test_responses_stream_keepalive_response_emits_typed_keepalive_once_and_retr
     result, body = asyncio.run(run_stream())
 
     assert result.status_code == 200
-    assert body.startswith('event: keepalive\ndata: {"type":"keepalive","sequence_number":0}\n\n')
+    assert body.startswith(": keepalive")
     assert body.count("event: keepalive") == 1
     assert "resp_attempt_1" not in body
     assert "resp_attempt_2" in body
@@ -3286,6 +3286,99 @@ def test_responses_stream_keepalive_response_emits_typed_keepalive_once_and_retr
     assert claim_calls == [11, 12]
     assert error_calls and error_calls[0][0] == 11
     assert success_calls == [12]
+
+
+def test_responses_stream_keepalive_response_emits_initial_keepalive_before_upstream_headers(
+    monkeypatch,
+) -> None:
+    class HangingStreamContext:
+        def __init__(self, client: "HangingClient") -> None:
+            self._client = client
+
+        async def __aenter__(self):
+            self._client.enter_started.set()
+            await self._client.release_enter.wait()
+            raise AssertionError("upstream headers should still be pending")
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self._client.closed_calls += 1
+            self._client.closed.set()
+            return None
+
+    class HangingClient:
+        def __init__(self) -> None:
+            self.stream_calls = 0
+            self.closed_calls = 0
+            self.enter_started = asyncio.Event()
+            self.release_enter = asyncio.Event()
+            self.closed = asyncio.Event()
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls += 1
+            return HangingStreamContext(self)
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            return None
+
+    client = HangingClient()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=client,
+            oauth_manager=DummyOAuthManager(),
+        )
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4-mini",
+        input=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+    token_row = SimpleNamespace(id=11, account_id="acct_1", refresh_token="refresh-1")
+
+    async def fake_claim_prompt_cache_affinity_token(*args, **kwargs):
+        return SimpleNamespace(token_row=token_row, result="primary_hit", lane_index=0)
+
+    async def unexpected_fallback_token_claim(*args, **kwargs):
+        raise AssertionError("unexpected fallback token claim")
+
+    monkeypatch.setattr("oaix_gateway.api_server._submit_request_log_write", lambda job: None)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_prompt_cache_affinity_token", fake_claim_prompt_cache_affinity_token)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_next_token_for_model_request", unexpected_fallback_token_claim)
+
+    async def run_stream() -> bytes:
+        result = await _responses_stream_keepalive_response(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.4-mini",
+            compact=False,
+            request_data=request_data,
+        )
+        first_chunk = await asyncio.wait_for(result.body_iterator.__anext__(), timeout=0.2)
+        await asyncio.wait_for(client.enter_started.wait(), timeout=0.2)
+        await result.body_iterator.aclose()
+        await asyncio.wait_for(client.closed.wait(), timeout=0.2)
+        return first_chunk
+
+    first_chunk = asyncio.run(run_stream())
+
+    assert first_chunk.startswith(b": keepalive")
+    assert client.stream_calls == 1
+    assert client.closed_calls == 1
 
 
 def test_responses_route_uses_keepalive_stream_helper_for_non_image_stream_requests(monkeypatch) -> None:
