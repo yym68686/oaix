@@ -2234,6 +2234,7 @@ class ProxyRequestResult:
     first_token_at: datetime | None = None
     usage_metrics: UsageMetrics | None = None
     on_success: Callable[[int], Awaitable[None]] | None = None
+    on_close: Callable[[], Awaitable[None]] | None = None
     stream_capture: "_ProxyStreamCapture | None" = None
     response_id: str | None = None
 
@@ -6328,6 +6329,7 @@ async def _stream_upstream_image_response(
     emit_initial_keepalive: bool = False,
     pending_chunk_task: asyncio.Task[bytes] | None = None,
     stream_capture: _ProxyStreamCapture | None = None,
+    close_stream: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[bytes, None]:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
@@ -6505,7 +6507,10 @@ async def _stream_upstream_image_response(
             yield error_event
             yield b"data: [DONE]\n\n"
     finally:
-        await _close_stream_cm_safely(stream_cm)
+        if close_stream is not None:
+            await close_stream()
+        else:
+            await _close_stream_cm_safely(stream_cm)
 
 
 async def _proxy_image_request_with_token(
@@ -6537,8 +6542,16 @@ async def _proxy_image_request_with_token(
             initial_model_name=image_request.model_name,
             initial_first_token_at=None,
         )
+        stream_cm: Any | None = None
+
+        async def close_upstream_stream_context() -> None:
+            if stream_cm is not None:
+                await _close_stream_cm_safely(stream_cm)
+
+        close_upstream_stream = _IdempotentAsyncCallback(close_upstream_stream_context)
 
         async def body_iterator() -> AsyncGenerator[bytes, None]:
+            nonlocal stream_cm
             stream_cm = client.stream(
                 "POST",
                 upstream_url,
@@ -6551,7 +6564,7 @@ async def _proxy_image_request_with_token(
                 try:
                     raw = await upstream_response.aread()
                 finally:
-                    await _close_stream_cm_safely(stream_cm)
+                    await close_upstream_stream()
                 raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
             upstream_iter = upstream_response.aiter_raw()
@@ -6561,7 +6574,7 @@ async def _proxy_image_request_with_token(
                     heartbeat_interval_seconds=stream_keepalive_interval_seconds,
                 )
             except Exception:
-                await _close_stream_cm_safely(stream_cm)
+                await close_upstream_stream()
                 raise
 
             async for chunk in _stream_upstream_image_response(
@@ -6575,6 +6588,7 @@ async def _proxy_image_request_with_token(
                 emit_initial_keepalive=primed_stream.emit_initial_keepalive,
                 pending_chunk_task=primed_stream.pending_chunk_task,
                 stream_capture=stream_capture,
+                close_stream=close_upstream_stream,
             ):
                 yield chunk
 
@@ -6590,6 +6604,7 @@ async def _proxy_image_request_with_token(
             status_code=200,
             model_name=image_request.model_name,
             first_token_at=None,
+            on_close=close_upstream_stream,
             stream_capture=stream_capture,
         )
 
@@ -8911,6 +8926,9 @@ async def _execute_proxy_request_with_failover(
                     ) -> None:
                         db_timing_context_token = set_db_timing_recorder(timing)
                         try:
+                            proxied_on_close = getattr(proxied_result, "on_close", None)
+                            if proxied_on_close is not None:
+                                await proxied_on_close()
                             disconnected_before_completion = (
                                 proxied_result.stream_capture is not None
                                 and proxied_result.stream_capture.error_message is None
@@ -10552,6 +10570,7 @@ async def _stream_upstream_response(
     response_model_alias: str | None = None,
     emit_initial_keepalive: bool = False,
     pending_chunk_task: asyncio.Task[bytes] | None = None,
+    close_stream: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[bytes, None]:
     if response_model_alias is None:
         try:
@@ -10581,7 +10600,10 @@ async def _stream_upstream_response(
                 yield error_event
                 yield b"data: [DONE]\n\n"
         finally:
-            await _close_stream_cm_safely(stream_cm)
+            if close_stream is not None:
+                await close_stream()
+            else:
+                await _close_stream_cm_safely(stream_cm)
         return
 
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -10674,7 +10696,10 @@ async def _stream_upstream_response(
         elif stream_committed:
             yield b"data: [DONE]\n\n"
     finally:
-        await _close_stream_cm_safely(stream_cm)
+        if close_stream is not None:
+            await close_stream()
+        else:
+            await _close_stream_cm_safely(stream_cm)
 
 
 async def _proxy_request_with_token(
@@ -10754,8 +10779,16 @@ async def _proxy_request_with_token(
             initial_model_name=effective_requested_model,
             initial_first_token_at=None,
         )
+        stream_cm: Any | None = None
+
+        async def close_upstream_stream_context() -> None:
+            if stream_cm is not None:
+                await _close_stream_cm_safely(stream_cm)
+
+        close_upstream_stream = _IdempotentAsyncCallback(close_upstream_stream_context)
 
         async def body_iterator() -> AsyncGenerator[bytes, None]:
+            nonlocal stream_cm
             stream_cm = client.stream(
                 "POST",
                 upstream_url,
@@ -10768,7 +10801,7 @@ async def _proxy_request_with_token(
                 try:
                     raw = await upstream_response.aread()
                 finally:
-                    await _close_stream_cm_safely(stream_cm)
+                    await close_upstream_stream()
                 raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
             upstream_iter = upstream_response.aiter_raw()
@@ -10778,7 +10811,7 @@ async def _proxy_request_with_token(
                     heartbeat_interval_seconds=heartbeat_interval_seconds,
                 )
             except Exception:
-                await _close_stream_cm_safely(stream_cm)
+                await close_upstream_stream()
                 raise
 
             async for chunk in _stream_upstream_response(
@@ -10790,6 +10823,7 @@ async def _proxy_request_with_token(
                 response_model_alias=response_model_alias,
                 emit_initial_keepalive=primed_stream.emit_initial_keepalive,
                 pending_chunk_task=primed_stream.pending_chunk_task,
+                close_stream=close_upstream_stream,
             ):
                 yield chunk
 
@@ -10811,6 +10845,7 @@ async def _proxy_request_with_token(
             status_code=200,
             model_name=effective_requested_model,
             first_token_at=None,
+            on_close=close_upstream_stream,
             stream_capture=stream_capture,
         )
 
@@ -10823,19 +10858,20 @@ async def _proxy_request_with_token(
             timeout=_upstream_http_timeout(read=None),
         )
         upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
+        close_upstream_stream = _IdempotentAsyncCallback(lambda: _close_stream_cm_safely(stream_cm))
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()
-            await _close_stream_cm_safely(stream_cm)
+            await close_upstream_stream()
             raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
         upstream_iter = upstream_response.aiter_raw()
         try:
             primed_stream = await _prime_responses_upstream_stream_with_timing(upstream_iter)
         except HTTPException:
-            await _close_stream_cm_safely(stream_cm)
+            await close_upstream_stream()
             raise
         except RESPONSES_STREAM_NETWORK_ERRORS:
-            await _close_stream_cm_safely(stream_cm)
+            await close_upstream_stream()
             raise
 
         effective_model_name = primed_stream.model_name or request_data.model
@@ -10859,6 +10895,7 @@ async def _proxy_request_with_token(
                     primed_stream.buffered_chunks,
                     stream_committed=primed_stream.stream_committed,
                     stream_capture=stream_capture,
+                    close_stream=close_upstream_stream,
                 ),
                 media_type="text/event-stream",
                 headers=_sse_response_headers(),
@@ -10866,6 +10903,7 @@ async def _proxy_request_with_token(
             status_code=upstream_response.status_code,
             model_name=effective_model_name,
             first_token_at=initial_first_token_at,
+            on_close=close_upstream_stream,
             stream_capture=stream_capture,
         )
 
@@ -11007,6 +11045,7 @@ async def _proxy_chat_completions_with_token(
             first_token_at=proxy_result.first_token_at,
             usage_metrics=proxy_result.usage_metrics,
             on_success=checkpoint_callback,
+            on_close=getattr(proxy_result, "on_close", None),
             stream_capture=proxy_result.stream_capture,
             response_id=proxy_result.response_id,
         )

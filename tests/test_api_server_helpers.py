@@ -2975,6 +2975,75 @@ def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias() -> Non
     assert "gpt-5.4-mini" not in body
 
 
+def test_proxy_request_with_token_stream_on_close_closes_entered_upstream_before_body_iteration() -> None:
+    class DummyStreamingResponse:
+        status_code = 200
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                yield b'event: response.created\ndata: {"type":"response.created","response":{"model":"gpt-5.5"}}\n\n'
+                yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                await asyncio.Event().wait()
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b""
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse) -> None:
+            self._response = response
+            self.closed = 0
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self.closed += 1
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_context: DummyStreamContext | None = None
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_context = DummyStreamContext(DummyStreamingResponse())
+            return self.stream_context
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"test-client")],
+        }
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.5",
+        input=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+
+    async def run() -> tuple[object, DummyClient]:
+        client = DummyClient()
+        result = await _proxy_request_with_token(
+            client,
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+        )
+        assert result.on_close is not None
+        await result.on_close()
+        await result.on_close()
+        return result, client
+
+    result, client = asyncio.run(run())
+
+    assert isinstance(result.response, StreamingResponse)
+    assert client.stream_context is not None
+    assert client.stream_context.closed == 1
+
+
 def test_proxy_request_with_token_stream_rewrites_gpt_image_model_alias_after_prime_keepalive(monkeypatch) -> None:
     class DummyStreamingResponse:
         def __init__(self, chunks: list[bytes]) -> None:
@@ -9002,6 +9071,7 @@ def test_stream_response_finalizes_499_when_client_disconnects_before_body(monke
     )
     finalized: list[dict[str, object]] = []
     marked_success: list[int] = []
+    upstream_closed = 0
 
     async def fake_create_request_log(**kwargs):
         return SimpleNamespace(id=909)
@@ -9016,6 +9086,10 @@ def test_stream_response_finalizes_499_when_client_disconnects_before_body(monke
     async def fake_mark_token_success(token_id: int) -> None:
         marked_success.append(token_id)
 
+    async def fake_on_close() -> None:
+        nonlocal upstream_closed
+        upstream_closed += 1
+
     async def stalled_stream() -> AsyncIterator[bytes]:
         await asyncio.sleep(60)
         yield b"data: unreachable\n\n"
@@ -9028,6 +9102,7 @@ def test_stream_response_finalizes_499_when_client_disconnects_before_body(monke
             first_token_at=None,
             usage_metrics=None,
             on_success=None,
+            on_close=fake_on_close,
             stream_capture=_ProxyStreamCapture(initial_model_name="gpt-5.5", initial_first_token_at=None),
         )
 
@@ -9076,6 +9151,7 @@ def test_stream_response_finalizes_499_when_client_disconnects_before_body(monke
     assert finalized[0]["account_id"] == "acct_51"
     assert finalized[0]["error_message"] == "Client disconnected"
     assert marked_success == []
+    assert upstream_closed == 1
     assert app.state.response_traffic.active_responses == 0
 
 
