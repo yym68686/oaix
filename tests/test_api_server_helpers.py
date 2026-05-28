@@ -60,11 +60,14 @@ from oaix_gateway.api_server import (
     _stream_keepalive_interval_seconds,
     _upstream_http_max_connections,
     _upstream_http_max_keepalive_connections,
+    _upstream_http_keepalive_expiry_seconds,
+    _upstream_http_pool_sweep_interval_seconds,
     _wrap_sse_stream_with_initial_keepalive,
     _build_stream_error_event,
     _build_admin_token_items,
     _build_admin_token_quota_items,
     _close_stream_cm_safely,
+    _sweep_httpx_client_idle_connections,
     _claim_next_active_token_from_snapshot,
     _claim_prompt_cache_affinity_token,
     _apply_prompt_cache_context_to_payload,
@@ -2391,10 +2394,54 @@ def test_upstream_http_pool_size_is_configurable(monkeypatch) -> None:
     monkeypatch.setenv("UPSTREAM_HTTP_MAX_CONNECTIONS", "512")
     monkeypatch.setenv("UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS", "128")
     monkeypatch.setenv("UPSTREAM_HTTP_SHARD_COUNT", "16")
+    monkeypatch.setenv("UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS", "2.5")
+    monkeypatch.setenv("UPSTREAM_HTTP_POOL_SWEEP_INTERVAL_SECONDS", "3")
 
     assert _upstream_http_max_connections() == 512
     assert _upstream_http_max_keepalive_connections() == 128
     assert _upstream_http_shard_count() == 16
+    assert _upstream_http_keepalive_expiry_seconds() == 2.5
+    assert _upstream_http_pool_sweep_interval_seconds() == 3.0
+
+
+def test_upstream_http_keepalive_expiry_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS", "off")
+
+    assert _upstream_http_keepalive_expiry_seconds() is None
+
+
+def test_sweep_httpx_client_idle_connections_runs_httpcore_cleanup() -> None:
+    class DummyLock:
+        def __init__(self) -> None:
+            self.entered = False
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyPool:
+        def __init__(self) -> None:
+            self._optional_thread_lock = DummyLock()
+            self.closed: list[object] = []
+            self.closing = [object(), object()]
+
+        def _assign_requests_to_connections(self) -> list[object]:
+            return self.closing
+
+        async def _close_connections(self, closing: list[object]) -> None:
+            self.closed.extend(closing)
+
+    pool = DummyPool()
+    client = SimpleNamespace(_transport=SimpleNamespace(_pool=pool))
+
+    closed = asyncio.run(_sweep_httpx_client_idle_connections(client))
+
+    assert closed == 2
+    assert pool._optional_thread_lock.entered is True
+    assert pool.closed == pool.closing
 
 
 def test_pool_timeout_is_local_overload_not_upstream_connectivity() -> None:
@@ -2419,12 +2466,16 @@ def test_request_log_and_pool_defaults_target_high_rpm(monkeypatch) -> None:
     monkeypatch.delenv("REQUEST_LOG_WRITE_CONCURRENCY", raising=False)
     monkeypatch.delenv("REQUEST_LOG_WRITE_QUEUE_MAX_SIZE", raising=False)
     monkeypatch.delenv("UPSTREAM_HTTP_SHARD_COUNT", raising=False)
+    monkeypatch.delenv("UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS", raising=False)
+    monkeypatch.delenv("UPSTREAM_HTTP_POOL_SWEEP_INTERVAL_SECONDS", raising=False)
 
     assert _request_log_start_write_enabled() is False
     assert _request_log_write_batch_size() == 250
     assert _request_log_write_concurrency() == 4
     assert _request_log_write_queue_max_size() == 20000
     assert _upstream_http_shard_count() == 8
+    assert _upstream_http_keepalive_expiry_seconds() == 5.0
+    assert _upstream_http_pool_sweep_interval_seconds() == 10.0
 
 
 def test_resolve_token_observed_cost_usd_prefers_direct_token_cost() -> None:

@@ -338,6 +338,8 @@ DEFAULT_FILL_FIRST_TOKEN_ACTIVE_STREAM_CAP = DEFAULT_TOKEN_ACTIVE_STREAM_CAP
 DEFAULT_UPSTREAM_HTTP_SHARD_COUNT = 8
 DEFAULT_UPSTREAM_HTTP_MAX_CONNECTIONS = 2048
 DEFAULT_UPSTREAM_HTTP_MAX_KEEPALIVE_CONNECTIONS = 512
+DEFAULT_UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS = 5.0
+DEFAULT_UPSTREAM_HTTP_POOL_SWEEP_INTERVAL_SECONDS = 10.0
 DEFAULT_PROXY_MAX_ACTIVE_RESPONSES = 1024
 DEFAULT_PROXY_QUEUE_MAX_SIZE = 4096
 DEFAULT_REQUEST_LOG_WRITE_CONCURRENCY = 4
@@ -2809,11 +2811,46 @@ class UpstreamHTTPClientShard:
     breaker: UpstreamCircuitBreaker
 
 
+async def _sweep_httpx_client_idle_connections(client: httpx.AsyncClient) -> int:
+    transport = getattr(client, "_transport", None)
+    if isinstance(transport, _TimingAsyncHTTPTransport):
+        transport = getattr(transport, "_transport", None)
+    pool = getattr(transport, "_pool", None)
+    assign_requests = getattr(pool, "_assign_requests_to_connections", None)
+    close_connections = getattr(pool, "_close_connections", None)
+    lock = getattr(pool, "_optional_thread_lock", None)
+    if not callable(assign_requests) or not callable(close_connections):
+        return 0
+
+    # httpcore only reaps expired/readable idle sockets during pool operations.
+    # Run that same cleanup path periodically so remote FINs do not sit in
+    # CLOSE_WAIT until another request happens to touch this exact shard.
+    if lock is not None:
+        with lock:
+            closing = list(assign_requests())
+    else:
+        closing = list(assign_requests())
+    if not closing:
+        return 0
+    await close_connections(closing)
+    return len(closing)
+
+
 class UpstreamHTTPClientPool:
-    def __init__(self, *, shard_count: int, max_connections: int, max_keepalive_connections: int) -> None:
+    def __init__(
+        self,
+        *,
+        shard_count: int,
+        max_connections: int,
+        max_keepalive_connections: int,
+        keepalive_expiry_seconds: float | None,
+    ) -> None:
         self.shard_count = max(1, int(shard_count))
         self.max_connections = max(1, int(max_connections))
         self.max_keepalive_connections = max(0, int(max_keepalive_connections))
+        self.keepalive_expiry_seconds = keepalive_expiry_seconds
+        self.last_sweep_closed_connections = 0
+        self.last_sweep_at: datetime | None = None
         per_shard_connections = max(1, math.ceil(self.max_connections / self.shard_count))
         per_shard_keepalive = min(
             per_shard_connections,
@@ -2830,6 +2867,7 @@ class UpstreamHTTPClientPool:
                         limits=httpx.Limits(
                             max_connections=per_shard_connections,
                             max_keepalive_connections=per_shard_keepalive,
+                            keepalive_expiry=keepalive_expiry_seconds,
                         ),
                     ),
                 ),
@@ -2856,6 +2894,9 @@ class UpstreamHTTPClientPool:
             "shard_count": len(self._shards),
             "max_connections": self.max_connections,
             "max_keepalive_connections": self.max_keepalive_connections,
+            "keepalive_expiry_seconds": self.keepalive_expiry_seconds,
+            "last_sweep_closed_connections": self.last_sweep_closed_connections,
+            "last_sweep_at": self.last_sweep_at.isoformat() if self.last_sweep_at is not None else None,
             "open_breakers": open_count,
             "breakers": {
                 shard.key: shard.breaker.snapshot()
@@ -2863,8 +2904,41 @@ class UpstreamHTTPClientPool:
             },
         }
 
+    async def sweep_idle_connections(self) -> int:
+        closed_by_shard = await asyncio.gather(
+            *(_sweep_httpx_client_idle_connections(shard.client) for shard in self._shards),
+            return_exceptions=True,
+        )
+        closed = 0
+        for result in closed_by_shard:
+            if isinstance(result, Exception):
+                logger.error(
+                    "Failed to sweep upstream HTTP shard idle connections",
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+                continue
+            closed += int(result or 0)
+        self.last_sweep_closed_connections = closed
+        self.last_sweep_at = utcnow()
+        return closed
+
     async def aclose(self) -> None:
         await asyncio.gather(*(shard.client.aclose() for shard in self._shards), return_exceptions=True)
+
+
+async def _upstream_http_pool_maintenance_loop(pool: UpstreamHTTPClientPool) -> None:
+    interval_seconds = _upstream_http_pool_sweep_interval_seconds()
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            closed = await pool.sweep_idle_connections()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to sweep upstream HTTP pool idle connections")
+            continue
+        if closed:
+            logger.info("Closed stale upstream HTTP idle connections: count=%s", closed)
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
@@ -3000,6 +3074,25 @@ def _upstream_http_max_keepalive_connections() -> int:
         minimum=0,
     )
     return min(keepalive_connections, max_connections)
+
+
+def _upstream_http_keepalive_expiry_seconds() -> float | None:
+    raw = str(os.getenv("UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS", "") or "").strip().lower()
+    if raw in {"none", "null", "off", "disabled"}:
+        return None
+    return _float_env(
+        "UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS",
+        DEFAULT_UPSTREAM_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+        minimum=0.0,
+    )
+
+
+def _upstream_http_pool_sweep_interval_seconds() -> float:
+    return _float_env(
+        "UPSTREAM_HTTP_POOL_SWEEP_INTERVAL_SECONDS",
+        DEFAULT_UPSTREAM_HTTP_POOL_SWEEP_INTERVAL_SECONDS,
+        minimum=1.0,
+    )
 
 
 def _import_http_max_connections() -> int:
@@ -9860,8 +9953,13 @@ async def lifespan(app: FastAPI):
         shard_count=_upstream_http_shard_count(),
         max_connections=_upstream_http_max_connections(),
         max_keepalive_connections=_upstream_http_max_keepalive_connections(),
+        keepalive_expiry_seconds=_upstream_http_keepalive_expiry_seconds(),
     )
     app.state.http_client = app.state.response_http_client.default_client
+    app.state.upstream_http_pool_maintenance_task = asyncio.create_task(
+        _upstream_http_pool_maintenance_loop(app.state.response_http_client),
+        name="oaix-upstream-http-pool-maintenance",
+    )
     app.state.import_http_client = httpx.AsyncClient(
         follow_redirects=True,
         limits=httpx.Limits(
@@ -9920,6 +10018,10 @@ async def lifespan(app: FastAPI):
         if isinstance(retention_task, asyncio.Task):
             retention_task.cancel()
             await asyncio.gather(retention_task, return_exceptions=True)
+        upstream_pool_task = getattr(app.state, "upstream_http_pool_maintenance_task", None)
+        if isinstance(upstream_pool_task, asyncio.Task):
+            upstream_pool_task.cancel()
+            await asyncio.gather(upstream_pool_task, return_exceptions=True)
         await app.state.token_import_worker.stop()
         await _flush_request_log_write_queue()
         await stop_token_status_write_queue()
