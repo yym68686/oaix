@@ -7263,6 +7263,8 @@ def _gpt_image_stream_keepalive_response(
     heartbeat_interval_seconds = _stream_keepalive_interval_seconds()
     first_output_timeout_seconds = _image_stream_first_output_timeout_seconds()
     response_body_started = False
+    worker_task: asyncio.Task[None] | None = None
+    worker_cleanup_lock = asyncio.Lock()
 
     async def worker() -> None:
         timing_context_token = _REQUEST_TIMING.set(timing) if timing is not None else None
@@ -7789,8 +7791,22 @@ def _gpt_image_stream_keepalive_response(
                 if db_timing_context_token is not None:
                     reset_db_timing_recorder(db_timing_context_token)
 
+    async def cancel_worker_task() -> None:
+        task = worker_task
+        if task is None:
+            return
+        async with worker_cleanup_lock:
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("GPT image stream worker failed during shutdown")
+
     async def response_body() -> AsyncGenerator[bytes, None]:
-        nonlocal response_body_started
+        nonlocal response_body_started, worker_task
         response_body_started = True
         worker_task = asyncio.create_task(worker())
         try:
@@ -7804,13 +7820,11 @@ def _gpt_image_stream_keepalive_response(
                 if isinstance(item, bytes):
                     yield item
         finally:
-            if not worker_task.done():
-                worker_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await worker_task
+            await cancel_worker_task()
 
-    async def on_response_close_before_body_start() -> None:
+    async def on_response_close() -> None:
         if response_body_started:
+            await cancel_worker_task()
             return
         try:
             await _finalize_cancelled_request_log(
@@ -7830,7 +7844,7 @@ def _gpt_image_stream_keepalive_response(
 
     return _FinalizingStreamingResponse(
         response_body(),
-        on_close=on_response_close_before_body_start,
+        on_close=on_response_close,
         media_type="text/event-stream",
         headers=_sse_response_headers(),
     )
@@ -7924,6 +7938,8 @@ async def _responses_stream_keepalive_response(
     last_affinity_lane_index: int | None = None
     output_queue: asyncio.Queue[bytes | object] = asyncio.Queue()
     response_body_started = False
+    worker_task: asyncio.Task[None] | None = None
+    worker_cleanup_lock = asyncio.Lock()
 
     def prompt_cache_log_kwargs(
         stream_capture: _ProxyStreamCapture | None = None,
@@ -8655,8 +8671,22 @@ async def _responses_stream_keepalive_response(
                 if db_timing_context_token is not None:
                     reset_db_timing_recorder(db_timing_context_token)
 
+    async def cancel_worker_task() -> None:
+        task = worker_task
+        if task is None:
+            return
+        async with worker_cleanup_lock:
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Responses stream worker failed during shutdown")
+
     async def response_body() -> AsyncGenerator[bytes, None]:
-        nonlocal response_body_started
+        nonlocal response_body_started, worker_task
         response_body_started = True
         queue_done_sentinel = object()
         worker_task = asyncio.create_task(worker(output_queue, queue_done_sentinel))
@@ -8680,13 +8710,11 @@ async def _responses_stream_keepalive_response(
                 if isinstance(item, bytes):
                     yield item
         finally:
-            if not worker_task.done():
-                worker_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await worker_task
+            await cancel_worker_task()
 
-    async def on_response_close_before_body_start() -> None:
+    async def on_response_close() -> None:
         if response_body_started:
+            await cancel_worker_task()
             return
         try:
             await _finalize_cancelled_request_log(
@@ -8706,7 +8734,7 @@ async def _responses_stream_keepalive_response(
 
     return _FinalizingStreamingResponse(
         response_body(),
-        on_close=on_response_close_before_body_start,
+        on_close=on_response_close,
         media_type="text/event-stream",
         headers=_sse_response_headers(),
     )

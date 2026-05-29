@@ -4,7 +4,7 @@ import json
 import logging
 from collections import OrderedDict
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -3428,6 +3428,132 @@ def test_responses_stream_keepalive_response_emits_initial_keepalive_before_upst
     first_chunk = asyncio.run(run_stream())
 
     assert first_chunk.startswith(b": keepalive")
+    assert client.stream_calls == 1
+    assert client.closed_calls == 1
+
+
+def test_responses_stream_keepalive_response_finalizer_closes_running_worker(
+    monkeypatch,
+) -> None:
+    class SlowStreamingResponse:
+        status_code = 200
+
+        def __init__(self, client: "SlowClient") -> None:
+            self._client = client
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                yield b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_cancel","status":"in_progress","model":"gpt-5.4-mini"}}\n\n'
+                yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                self._client.delta_sent.set()
+                await self._client.release_stream.wait()
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b""
+
+    class SlowStreamContext:
+        def __init__(self, client: "SlowClient") -> None:
+            self._client = client
+
+        async def __aenter__(self) -> SlowStreamingResponse:
+            self._client.entered.set()
+            return SlowStreamingResponse(self._client)
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self._client.closed_calls += 1
+            self._client.closed.set()
+            return None
+
+    class SlowClient:
+        def __init__(self) -> None:
+            self.stream_calls = 0
+            self.closed_calls = 0
+            self.entered = asyncio.Event()
+            self.delta_sent = asyncio.Event()
+            self.release_stream = asyncio.Event()
+            self.closed = asyncio.Event()
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls += 1
+            return SlowStreamContext(self)
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            return None
+
+    client = SlowClient()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=client,
+            oauth_manager=DummyOAuthManager(),
+        )
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4-mini",
+        input=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+    token_row = SimpleNamespace(id=11, account_id="acct_1", refresh_token="refresh-1")
+
+    async def fake_claim_prompt_cache_affinity_token(*args, **kwargs):
+        return SimpleNamespace(token_row=token_row, result="primary_hit", lane_index=0)
+
+    async def unexpected_fallback_token_claim(*args, **kwargs):
+        raise AssertionError("unexpected fallback token claim")
+
+    monkeypatch.setattr("oaix_gateway.api_server._submit_request_log_write", lambda job: None)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_prompt_cache_affinity_token", fake_claim_prompt_cache_affinity_token)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_next_token_for_model_request", unexpected_fallback_token_claim)
+
+    async def run_stream() -> list[bytes]:
+        result = await _responses_stream_keepalive_response(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.4-mini",
+            compact=False,
+            request_data=request_data,
+        )
+        sent_bodies: list[bytes] = []
+
+        async def consume_body() -> None:
+            async for body in result.body_iterator:
+                sent_bodies.append(body)
+
+        consumer_task = asyncio.create_task(consume_body())
+        try:
+            await asyncio.wait_for(client.delta_sent.wait(), timeout=0.2)
+            await result._on_close_once()
+            await asyncio.wait_for(client.closed.wait(), timeout=0.2)
+            await asyncio.wait_for(consumer_task, timeout=0.2)
+            return sent_bodies
+        finally:
+            client.release_stream.set()
+            if not consumer_task.done():
+                consumer_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await consumer_task
+
+    sent_bodies = asyncio.run(run_stream())
+
+    assert any(body.startswith(b": keepalive") for body in sent_bodies)
+    assert any(b"response.output_text.delta" in body for body in sent_bodies)
     assert client.stream_calls == 1
     assert client.closed_calls == 1
 
