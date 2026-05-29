@@ -353,10 +353,11 @@ def test_detects_permanent_disable_errors() -> None:
     assert _is_permanent_account_disable_error(401, payload_token_invalidated) is True
 
 
-def test_request_requires_non_free_codex_token_for_image_tool_and_gpt54() -> None:
+def test_request_requires_non_free_codex_token_for_image_tool_and_restricted_models() -> None:
     assert _request_requires_non_free_codex_token("gpt-image-2") is True
     assert _request_requires_non_free_codex_token("gpt-5.4") is True
     assert _request_requires_non_free_codex_token("gpt-5.3-codex") is True
+    assert _request_requires_non_free_codex_token("gpt-5.2") is True
     assert _request_requires_non_free_codex_token("gpt-5.5") is False
     assert _request_requires_non_free_codex_token("gpt-5.4-mini") is False
 
