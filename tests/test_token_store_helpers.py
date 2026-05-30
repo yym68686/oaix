@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import time
 from contextlib import asynccontextmanager
@@ -162,6 +163,21 @@ def test_normalize_access_token_only_payload_adds_sentinel_refresh_token() -> No
     assert payload["refresh_token"] == f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}account:acct_access_only"
     assert payload["token_source"] == "access_token"
     assert payload["expired"].endswith("+00:00")
+
+
+def test_normalize_access_token_only_payload_without_account_id_uses_access_hash() -> None:
+    access_token = _unsigned_jwt(
+        {
+            "aud": ["https://api.openai.com/v1"],
+            "exp": int(time.time()) + 3600,
+        }
+    )
+
+    payload = normalize_token_payload_for_storage({"access_token": access_token, "type": "codex"})
+
+    digest = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    assert payload["refresh_token"] == f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}access:{digest}"
+    assert payload["token_source"] == "access_token"
 
 
 def test_normalize_expired_access_token_only_payload_disables_token() -> None:

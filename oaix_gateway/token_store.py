@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import glob
+import hashlib
 import json
 import logging
 import os
