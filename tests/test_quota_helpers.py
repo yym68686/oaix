@@ -145,6 +145,7 @@ def test_parse_codex_quota_payload_prefers_window_percent_over_global_limit_flag
 def test_quota_service_recovers_missing_account_id_from_usage_payload(monkeypatch) -> None:
     identity_updates: list[dict[str, object]] = []
     plan_updates: list[dict[str, object]] = []
+    oauth_calls: list[dict[str, object]] = []
 
     async def fake_update_token_account_identity(
         token_id: int,
@@ -182,8 +183,15 @@ def test_quota_service_recovers_missing_account_id_from_usage_payload(monkeypatc
             return DummyResponse()
 
     class DummyOAuthManager:
-        async def get_access_token(self, token_row: CodexToken, client) -> tuple[str, bool]:
+        async def get_access_token(
+            self,
+            token_row: CodexToken,
+            client,
+            *,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
             del token_row, client
+            oauth_calls.append({"reactivate_on_refresh": reactivate_on_refresh})
             return "access-token", False
 
     token_row = CodexToken(
@@ -217,6 +225,7 @@ def test_quota_service_recovers_missing_account_id_from_usage_payload(monkeypatc
         {"token_id": 12, "account_id": "acct_from_usage", "email": "user@example.com"}
     ]
     assert plan_updates == [{"token_id": 12, "plan_type": "plus"}]
+    assert oauth_calls == [{"reactivate_on_refresh": False}]
 
 
 def test_quota_service_deactivates_permanently_invalid_refresh_tokens(monkeypatch) -> None:
@@ -249,7 +258,14 @@ def test_quota_service_deactivates_permanently_invalid_refresh_tokens(monkeypatc
         def invalidate(self, token_id: int) -> None:
             self.invalidated.append(token_id)
 
-        async def get_access_token(self, token_row: CodexToken, client) -> tuple[str, bool]:
+        async def get_access_token(
+            self,
+            token_row: CodexToken,
+            client,
+            *,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            assert reactivate_on_refresh is False
             raise HTTPException(
                 status_code=401,
                 detail=(

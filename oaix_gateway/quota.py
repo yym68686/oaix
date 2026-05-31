@@ -631,7 +631,11 @@ class CodexQuotaService:
         oauth_manager: CodexOAuthManager,
         account_id: str | None,
     ) -> httpx.Response:
-        access_token, _ = await oauth_manager.get_access_token(token_row, client)
+        access_token, _ = await oauth_manager.get_access_token(
+            token_row,
+            client,
+            reactivate_on_refresh=False,
+        )
         response = await self._send_usage_request(client, access_token=access_token, account_id=account_id)
         if response.status_code not in (401, 403):
             return response
@@ -639,7 +643,11 @@ class CodexQuotaService:
         oauth_manager.invalidate(token_row.id)
         token_row.access_token = None
         token_row.expires_at = None
-        refreshed_access_token, _ = await oauth_manager.get_access_token(token_row, client)
+        refreshed_access_token, _ = await oauth_manager.get_access_token(
+            token_row,
+            client,
+            reactivate_on_refresh=False,
+        )
         return await self._send_usage_request(client, access_token=refreshed_access_token, account_id=account_id)
 
     async def _send_usage_request(
