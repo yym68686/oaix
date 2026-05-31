@@ -3593,6 +3593,66 @@ def _remove_reasoning_content_fields(value: Any) -> None:
             _remove_reasoning_content_fields(nested_value)
 
 
+def _trim_invalid_encrypted_reasoning_items(payload: dict[str, Any]) -> bool:
+    input_value = payload.get("input")
+    if isinstance(input_value, list):
+        filtered: list[Any] = []
+        changed = False
+        for item in input_value:
+            next_item, item_changed, keep_item = _trim_invalid_encrypted_reasoning_item(item)
+            changed = changed or item_changed
+            if keep_item:
+                filtered.append(next_item)
+        if not changed:
+            return False
+        if filtered:
+            payload["input"] = filtered
+        else:
+            payload.pop("input", None)
+        return True
+
+    if isinstance(input_value, dict):
+        next_item, changed, keep_item = _trim_invalid_encrypted_reasoning_item(input_value)
+        if not changed:
+            return False
+        if keep_item:
+            payload["input"] = next_item
+        else:
+            payload.pop("input", None)
+        return True
+
+    return False
+
+
+def _trim_invalid_encrypted_reasoning_item(item: Any) -> tuple[Any, bool, bool]:
+    if not isinstance(item, dict):
+        return item, False, True
+
+    if str(item.get("type") or "").strip() != "reasoning":
+        return item, False, True
+
+    if "encrypted_content" not in item:
+        return item, False, True
+
+    item.pop("encrypted_content", None)
+    if set(item.keys()) == {"type"}:
+        return None, True, False
+    return item, True, True
+
+
+def _is_invalid_encrypted_content_error(status_code: int, error_text: str) -> bool:
+    if status_code != 400:
+        return False
+
+    error = _extract_error_object(error_text)
+    if isinstance(error, dict):
+        error_code = str(error.get("code") or "").strip().lower()
+        if error_code == "invalid_encrypted_content":
+            return True
+
+    return "invalid_encrypted_content" in str(error_text or "").lower()
+
+
 def _admin_token_probe_model() -> str:
     return _normalize_optional_text(os.getenv("ADMIN_TOKEN_PROBE_MODEL")) or "gpt-5.5"
 
@@ -8024,6 +8084,9 @@ async def _responses_stream_keepalive_response(
         upstream_5xx_error_count = 0
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
+        current_json_payload = json_payload
+        invalid_encrypted_content_recovery_tried = False
+        retry_token_row: Any | None = None
         timing_context_token = _REQUEST_TIMING.set(timing)
         db_timing_context_token = set_db_timing_recorder(timing)
 
@@ -8094,57 +8157,30 @@ async def _responses_stream_keepalive_response(
             )
             stream_finalized = True
 
+        async def emit_terminal_error(status_code: int, detail: str) -> None:
+            await output_queue.put(_build_stream_error_event(status_code, detail))
+            await output_queue.put(b"data: [DONE]\n\n")
+
         try:
             await _record_event_loop_lag(timing)
             max_attempts = _effective_proxy_max_attempts(endpoint=endpoint)
             max_claims = _max_request_account_retries()
             claim_count = 0
 
-            while attempt_count < max_attempts and claim_count < max_claims:
-                claim_count += 1
-                token_pool_snapshot = _fresh_token_pool_snapshot(http_request.app, timing=timing)
-                affinity_claim = await _await_timed(
-                    _claim_prompt_cache_affinity_token(
-                        http_request.app,
-                        selection_settings,
-                        prompt_cache_context=prompt_cache_context,
-                        exclude_token_ids=excluded_token_ids,
-                        scoped_cooldown_scope=scoped_cooldown_scope,
-                        timing=timing,
-                        token_pool_snapshot=token_pool_snapshot,
-                        require_non_free_token=require_non_free_token,
-                    ),
-                    timing=timing,
-                    span_name="claim_prompt_cache_affinity_ms",
-                    db_wait=False,
-                )
-                if affinity_claim is not None:
-                    token_row = affinity_claim.token_row
-                    last_affinity_result = affinity_claim.result
-                    last_affinity_lane_index = affinity_claim.lane_index
-                    if timing is not None:
-                        timing.set_tag("cache_affinity_result", affinity_claim.result)
-                        if affinity_claim.lane_index is not None:
-                            timing.set_ms("cache_affinity_lane_index", affinity_claim.lane_index)
-                elif (
-                    prompt_cache_context is not None
-                    and prompt_cache_context.previous_response_id
-                    and _prompt_cache_previous_strict_enabled()
-                    and _prompt_cache_response_owner(http_request.app, prompt_cache_context.previous_response_id)
-                    is not None
-                ):
-                    last_affinity_result = "previous_owner_busy"
-                    last_affinity_lane_index = None
-                    raise HTTPException(status_code=429, detail="previous_response_busy")
+            while retry_token_row is not None or (attempt_count < max_attempts and claim_count < max_claims):
+                using_postponed_unknown_plan = False
+                if retry_token_row is not None:
+                    token_row = retry_token_row
+                    retry_token_row = None
+                    _record_selected_token_observation_start(token_row.id, timing)
                 else:
-                    if prompt_cache_context is not None and prompt_cache_context.affinity_key and not _prompt_cache_global_fallback_enabled():
-                        raise HTTPException(status_code=429, detail="Prompt cache affinity lanes are busy")
-                    if prompt_cache_context is not None and prompt_cache_context.affinity_key:
-                        last_affinity_result = "global_fallback"
-                        last_affinity_lane_index = None
-                    token_row = await _await_timed(
-                        _claim_next_token_for_model_request(
+                    claim_count += 1
+                    token_pool_snapshot = _fresh_token_pool_snapshot(http_request.app, timing=timing)
+                    affinity_claim = await _await_timed(
+                        _claim_prompt_cache_affinity_token(
+                            http_request.app,
                             selection_settings,
+                            prompt_cache_context=prompt_cache_context,
                             exclude_token_ids=excluded_token_ids,
                             scoped_cooldown_scope=scoped_cooldown_scope,
                             timing=timing,
@@ -8152,18 +8188,54 @@ async def _responses_stream_keepalive_response(
                             require_non_free_token=require_non_free_token,
                         ),
                         timing=timing,
-                        span_name="claim_token_ms",
-                        db_wait=True,
+                        span_name="claim_prompt_cache_affinity_ms",
+                        db_wait=False,
                     )
-
-                using_postponed_unknown_plan = False
-                if token_row is None:
-                    if require_non_free_token and postponed_unknown_plan_tokens:
-                        token_row = postponed_unknown_plan_tokens.pop(0)
-                        using_postponed_unknown_plan = True
-                        _record_selected_token_observation_start(token_row.id, timing)
+                    if affinity_claim is not None:
+                        token_row = affinity_claim.token_row
+                        last_affinity_result = affinity_claim.result
+                        last_affinity_lane_index = affinity_claim.lane_index
+                        if timing is not None:
+                            timing.set_tag("cache_affinity_result", affinity_claim.result)
+                            if affinity_claim.lane_index is not None:
+                                timing.set_ms("cache_affinity_lane_index", affinity_claim.lane_index)
+                    elif (
+                        prompt_cache_context is not None
+                        and prompt_cache_context.previous_response_id
+                        and _prompt_cache_previous_strict_enabled()
+                        and _prompt_cache_response_owner(http_request.app, prompt_cache_context.previous_response_id)
+                        is not None
+                    ):
+                        last_affinity_result = "previous_owner_busy"
+                        last_affinity_lane_index = None
+                        raise HTTPException(status_code=429, detail="previous_response_busy")
                     else:
-                        break
+                        if prompt_cache_context is not None and prompt_cache_context.affinity_key and not _prompt_cache_global_fallback_enabled():
+                            raise HTTPException(status_code=429, detail="Prompt cache affinity lanes are busy")
+                        if prompt_cache_context is not None and prompt_cache_context.affinity_key:
+                            last_affinity_result = "global_fallback"
+                            last_affinity_lane_index = None
+                        token_row = await _await_timed(
+                            _claim_next_token_for_model_request(
+                                selection_settings,
+                                exclude_token_ids=excluded_token_ids,
+                                scoped_cooldown_scope=scoped_cooldown_scope,
+                                timing=timing,
+                                token_pool_snapshot=token_pool_snapshot,
+                                require_non_free_token=require_non_free_token,
+                            ),
+                            timing=timing,
+                            span_name="claim_token_ms",
+                            db_wait=True,
+                        )
+
+                    if token_row is None:
+                        if require_non_free_token and postponed_unknown_plan_tokens:
+                            token_row = postponed_unknown_plan_tokens.pop(0)
+                            using_postponed_unknown_plan = True
+                            _record_selected_token_observation_start(token_row.id, timing)
+                        else:
+                            break
 
                 if require_non_free_token:
                     effective_plan_type = await _effective_token_plan_type(http_request, token_row)
@@ -8292,7 +8364,7 @@ async def _responses_stream_keepalive_response(
                         "POST",
                         _codex_responses_url(compact=compact),
                         headers=headers,
-                        content=json_payload,
+                        content=current_json_payload,
                         timeout=_upstream_http_timeout(read=None),
                     )
                     upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
@@ -8421,6 +8493,23 @@ async def _responses_stream_keepalive_response(
                 except HTTPException as exc:
                     status_code = getattr(exc, "status_code", 500)
                     detail = str(getattr(exc, "detail", "") or exc)
+                    if (
+                        not invalid_encrypted_content_recovery_tried
+                        and _is_invalid_encrypted_content_error(status_code, detail)
+                        and _trim_invalid_encrypted_reasoning_items(payload)
+                    ):
+                        invalid_encrypted_content_recovery_tried = True
+                        current_json_payload = json.dumps(payload, ensure_ascii=False)
+                        retry_token_row = token_row
+                        logger.info(
+                            "Retrying Codex stream once on the same account after invalid encrypted reasoning content: "
+                            "token_id=%s account_id=%s attempt=%s",
+                            token_row.id,
+                            token_row.account_id,
+                            attempt,
+                        )
+                        continue
+
                     cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
 
                     if cooldown_seconds is not None:
@@ -8508,6 +8597,7 @@ async def _responses_stream_keepalive_response(
                     if retryable_server_error:
                         await mark_token_error(token_row.id, detail)
 
+                    await emit_terminal_error(status_code, detail)
                     await finalize_failure(
                         token_row=token_row,
                         attempt=attempt,
@@ -8555,6 +8645,7 @@ async def _responses_stream_keepalive_response(
                         await mark_token_error(token_row.id, message)
                     if upstream_breaker.is_open():
                         raise _upstream_circuit_open_exception(upstream_breaker) from exc
+                    await emit_terminal_error(502, message)
                     await finalize_failure(
                         token_row=token_row,
                         attempt=attempt,
@@ -8585,6 +8676,7 @@ async def _responses_stream_keepalive_response(
                         last_error = HTTPException(status_code=502, detail=message)
                         continue
                     await mark_token_error(token_row.id, message)
+                    await emit_terminal_error(502, message)
                     await finalize_failure(
                         token_row=token_row,
                         attempt=attempt,
@@ -11096,47 +11188,68 @@ async def _proxy_request_with_token(
         )
 
     if upstream_stream:
-        stream_cm = client.stream(
-            "POST",
-            upstream_url,
-            headers=headers,
-            content=json_payload,
-            timeout=_upstream_http_timeout(read=None),
-        )
-        upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
-        try:
-            if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
-                raw = await upstream_response.aread()
-                raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
+        invalid_encrypted_content_recovery_tried = False
+        while True:
+            upstream_response = None
+            stream_cm = client.stream(
+                "POST",
+                upstream_url,
+                headers=headers,
+                content=json_payload,
+                timeout=_upstream_http_timeout(read=None),
+            )
+            upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
+            try:
+                if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+                    raw = await upstream_response.aread()
+                    raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
 
-            data, first_token_at = await _collect_responses_json_from_sse(
-                upstream_response.aiter_raw(),
-                model=effective_requested_model,
-            )
-            if response_model_alias is not None:
-                data = _apply_response_model_alias(data, response_model_alias)
-                effective_model_name = response_model_alias
-            else:
-                effective_model_name = _extract_response_model_name(data) or request_data.model
-            usage_metrics = extract_usage_metrics(data, model_name=effective_model_name)
-            _prompt_cache_update_runtime_trace_fields(
-                prompt_cache_trace,
-                session_id=resolved_session_id,
-                session_id_source=resolved_session_id_source,
-                upstream_response_id=_extract_response_id_from_payload(data),
-                status_code=upstream_response.status_code,
-                usage_metrics=usage_metrics,
-            )
-            return ProxyRequestResult(
-                response=JSONResponse(status_code=upstream_response.status_code, content=data),
-                status_code=upstream_response.status_code,
-                model_name=effective_model_name,
-                first_token_at=first_token_at,
-                usage_metrics=usage_metrics,
-                response_id=_extract_response_id_from_payload(data),
-            )
-        finally:
-            await _close_upstream_response_stream_safely(stream_cm, upstream_response)
+                data, first_token_at = await _collect_responses_json_from_sse(
+                    upstream_response.aiter_raw(),
+                    model=effective_requested_model,
+                )
+                if response_model_alias is not None:
+                    data = _apply_response_model_alias(data, response_model_alias)
+                    effective_model_name = response_model_alias
+                else:
+                    effective_model_name = _extract_response_model_name(data) or request_data.model
+                usage_metrics = extract_usage_metrics(data, model_name=effective_model_name)
+                _prompt_cache_update_runtime_trace_fields(
+                    prompt_cache_trace,
+                    session_id=resolved_session_id,
+                    session_id_source=resolved_session_id_source,
+                    upstream_response_id=_extract_response_id_from_payload(data),
+                    status_code=upstream_response.status_code,
+                    usage_metrics=usage_metrics,
+                )
+                return ProxyRequestResult(
+                    response=JSONResponse(status_code=upstream_response.status_code, content=data),
+                    status_code=upstream_response.status_code,
+                    model_name=effective_model_name,
+                    first_token_at=first_token_at,
+                    usage_metrics=usage_metrics,
+                    response_id=_extract_response_id_from_payload(data),
+                )
+            except HTTPException as exc:
+                status_code = getattr(exc, "status_code", 500)
+                detail = str(getattr(exc, "detail", "") or exc)
+                if (
+                    not invalid_encrypted_content_recovery_tried
+                    and _is_invalid_encrypted_content_error(status_code, detail)
+                    and _trim_invalid_encrypted_reasoning_items(payload)
+                ):
+                    invalid_encrypted_content_recovery_tried = True
+                    json_payload = json.dumps(payload, ensure_ascii=False)
+                    logger.info(
+                        "Retrying Codex request once on the same account after invalid encrypted reasoning content: "
+                        "account_id=%s compact=%s",
+                        account_id,
+                        compact,
+                    )
+                    continue
+                raise
+            finally:
+                await _close_upstream_response_stream_safely(stream_cm, upstream_response)
 
     upstream_response = await client.post(
         upstream_url,

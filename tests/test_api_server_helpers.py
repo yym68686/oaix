@@ -44,6 +44,7 @@ from oaix_gateway.api_server import (
     _extract_usage_limit_cooldown_seconds,
     _get_compact_codex_server_error_cooling_time,
     _is_permanent_account_disable_error,
+    _is_invalid_encrypted_content_error,
     _is_upstream_connectivity_exception,
     _is_local_upstream_pool_timeout,
     _max_request_account_retries,
@@ -97,6 +98,7 @@ from oaix_gateway.api_server import (
     _wrap_streaming_body_iterator,
     _flush_request_log_write_queue,
     _submit_request_log_write,
+    _trim_invalid_encrypted_reasoning_items,
     create_app,
 )
 from oaix_gateway.database import ChatImageCheckpoint, ChatImageCheckpointImage, CodexToken, GatewayRequestLog
@@ -421,6 +423,49 @@ def test_sanitize_codex_payload_removes_reasoning_content_recursively() -> None:
         "store": False,
         "instructions": "",
     }
+
+
+def test_trim_invalid_encrypted_reasoning_items_preserves_valid_input() -> None:
+    payload = {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "type": "reasoning",
+                "encrypted_content": "expired",
+                "summary": [{"type": "summary_text", "text": "prior work"}],
+            },
+            {"type": "message", "role": "user", "content": "hello"},
+            {"type": "reasoning", "encrypted_content": "expired-only"},
+        ],
+    }
+
+    assert _trim_invalid_encrypted_reasoning_items(payload) is True
+    assert payload == {
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "prior work"}],
+            },
+            {"type": "message", "role": "user", "content": "hello"},
+        ],
+    }
+
+
+def test_is_invalid_encrypted_content_error_requires_bad_request_code() -> None:
+    detail = json.dumps(
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_encrypted_content",
+                "message": "encrypted content could not be verified",
+            }
+        }
+    )
+
+    assert _is_invalid_encrypted_content_error(400, detail) is True
+    assert _is_invalid_encrypted_content_error(500, detail) is False
+    assert _is_invalid_encrypted_content_error(400, '{"error":{"code":"invalid_type"}}') is False
 
 
 def test_sanitize_codex_payload_compact_strips_store() -> None:
@@ -3342,6 +3387,275 @@ def test_responses_stream_keepalive_response_emits_typed_keepalive_once_and_retr
     assert success_calls == [12]
 
 
+def test_responses_stream_keepalive_response_repairs_invalid_encrypted_content_on_same_token(
+    monkeypatch,
+) -> None:
+    class DummyStreamingResponse:
+        def __init__(self, *, status_code: int, chunks: list[bytes] | None = None, raw_body: bytes = b"") -> None:
+            self.status_code = status_code
+            self._chunks = chunks or []
+            self._raw_body = raw_body
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return self._raw_body
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse, client: "DummyClient") -> None:
+            self._response = response
+            self._client = client
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self._client.closed_calls += 1
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+            self.closed_calls = 0
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                    "timeout": timeout,
+                }
+            )
+            if len(self.stream_calls) == 1:
+                return DummyStreamContext(
+                    DummyStreamingResponse(
+                        status_code=400,
+                        raw_body=b'{"error":{"type":"invalid_request_error","code":"invalid_encrypted_content","message":"encrypted content could not be verified"}}',
+                    ),
+                    self,
+                )
+            return DummyStreamContext(
+                DummyStreamingResponse(
+                    status_code=200,
+                    chunks=[
+                        b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_retry","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
+                        b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+                        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_retry","status":"completed","model":"gpt-5.4-mini","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+                        b"data: [DONE]\n\n",
+                    ],
+                ),
+                self,
+            )
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            return None
+
+    client = DummyClient()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=client,
+            oauth_manager=DummyOAuthManager(),
+        )
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4-mini",
+        input=[
+            {
+                "type": "reasoning",
+                "encrypted_content": "expired",
+                "summary": [{"type": "summary_text", "text": "prior work"}],
+            },
+            {"type": "message", "role": "user", "content": "hello"},
+        ],
+        stream=True,
+    )
+    token_row = SimpleNamespace(id=11, account_id="acct_1", refresh_token="refresh-1")
+    claim_calls: list[int] = []
+    error_calls: list[tuple[int, str]] = []
+    success_calls: list[int] = []
+
+    async def fake_claim_prompt_cache_affinity_token(*args, **kwargs):
+        claim_calls.append(token_row.id)
+        return SimpleNamespace(token_row=token_row, result="primary_hit", lane_index=0)
+
+    async def fake_mark_token_error(token_id: int, detail: str, **kwargs) -> None:
+        error_calls.append((token_id, detail))
+
+    async def fake_mark_token_success_with_timing(timing, token_id: int, *, token_row=None) -> None:
+        success_calls.append(token_id)
+
+    async def unexpected_fallback_token_claim(*args, **kwargs):
+        raise AssertionError("unexpected fallback token claim")
+
+    monkeypatch.setattr("oaix_gateway.api_server._submit_request_log_write", lambda job: None)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_prompt_cache_affinity_token", fake_claim_prompt_cache_affinity_token)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server._mark_token_success_with_timing", fake_mark_token_success_with_timing)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_next_token_for_model_request", unexpected_fallback_token_claim)
+
+    async def run_stream() -> tuple[object, str]:
+        result = await _responses_stream_keepalive_response(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.4-mini",
+            compact=False,
+            request_data=request_data,
+        )
+        chunks: list[bytes] = []
+        async for chunk in result.body_iterator:
+            chunks.append(chunk)
+        return result, b"".join(chunks).decode("utf-8")
+
+    result, body = asyncio.run(run_stream())
+    first_payload = json.loads(client.stream_calls[0]["content"])
+    second_payload = json.loads(client.stream_calls[1]["content"])
+
+    assert result.status_code == 200
+    assert len(client.stream_calls) == 2
+    assert client.closed_calls == 2
+    assert claim_calls == [11]
+    assert error_calls == []
+    assert success_calls == [11]
+    assert first_payload["input"][0]["encrypted_content"] == "expired"
+    assert "encrypted_content" not in second_payload["input"][0]
+    assert second_payload["input"][0]["summary"] == [{"type": "summary_text", "text": "prior work"}]
+    assert second_payload["input"][1] == {"type": "message", "role": "user", "content": "hello"}
+    assert "invalid_encrypted_content" not in body
+    assert "resp_retry" in body
+    assert body.rstrip().endswith("data: [DONE]")
+
+
+def test_proxy_request_with_token_repairs_invalid_encrypted_content_for_non_stream_response() -> None:
+    class DummyStreamingResponse:
+        def __init__(self, *, status_code: int, chunks: list[bytes] | None = None, raw_body: bytes = b"") -> None:
+            self.status_code = status_code
+            self._chunks = chunks or []
+            self._raw_body = raw_body
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                for chunk in self._chunks:
+                    yield chunk
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return self._raw_body
+
+    class DummyStreamContext:
+        def __init__(self, response: DummyStreamingResponse, client: "DummyClient") -> None:
+            self._response = response
+            self._client = client
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self._client.closed_calls += 1
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+            self.closed_calls = 0
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                    "timeout": timeout,
+                }
+            )
+            if len(self.stream_calls) == 1:
+                return DummyStreamContext(
+                    DummyStreamingResponse(
+                        status_code=400,
+                        raw_body=b'{"error":{"type":"invalid_request_error","code":"invalid_encrypted_content","message":"encrypted content could not be verified"}}',
+                    ),
+                    self,
+                )
+            return DummyStreamContext(
+                DummyStreamingResponse(
+                    status_code=200,
+                    chunks=[
+                        b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_non_stream","status":"in_progress","model":"gpt-5.4-mini"}}\n\n',
+                        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_non_stream","status":"completed","model":"gpt-5.4-mini","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+                        b"data: [DONE]\n\n",
+                    ],
+                ),
+                self,
+            )
+
+    client = DummyClient()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": SimpleNamespace(state=SimpleNamespace()),
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4-mini",
+        input=[
+            {
+                "type": "reasoning",
+                "encrypted_content": "expired",
+                "summary": [{"type": "summary_text", "text": "prior work"}],
+            },
+            {"type": "message", "role": "user", "content": "hello"},
+        ],
+        stream=False,
+    )
+
+    result = asyncio.run(
+        _proxy_request_with_token(
+            client,
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="acct_1",
+        )
+    )
+    first_payload = json.loads(client.stream_calls[0]["content"])
+    second_payload = json.loads(client.stream_calls[1]["content"])
+
+    assert len(client.stream_calls) == 2
+    assert client.closed_calls == 2
+    assert first_payload["input"][0]["encrypted_content"] == "expired"
+    assert "encrypted_content" not in second_payload["input"][0]
+    assert second_payload["input"][0]["summary"] == [{"type": "summary_text", "text": "prior work"}]
+    assert result.status_code == 200
+    assert json.loads(result.response.body)["id"] == "resp_non_stream"
+
+
 def test_responses_stream_keepalive_response_preserves_upstream_error_status_after_close(
     monkeypatch,
 ) -> None:
@@ -3443,6 +3757,10 @@ def test_responses_stream_keepalive_response_preserves_upstream_error_status_aft
     assert client.response_closed_calls == 1
     assert client.closed_calls == 1
     assert body.startswith(": keepalive")
+    assert "event: error" in body
+    assert "bad upstream request" in body
+    assert '"status_code": 400' in body
+    assert body.rstrip().endswith("data: [DONE]")
     assert finalized[0]["status_code"] == 400
 
 
