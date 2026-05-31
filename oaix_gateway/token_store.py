@@ -2358,6 +2358,33 @@ async def update_token_plan_type(token_id: int, *, plan_type: str | None) -> Non
             invalidate_fill_first_token_cache()
 
 
+async def update_token_account_identity(
+    token_id: int,
+    *,
+    account_id: str | None = None,
+    email: str | None = None,
+) -> None:
+    normalized_account_id = str(account_id or "").strip() or None
+    normalized_email = str(email or "").strip() or None
+    if normalized_account_id is None and normalized_email is None:
+        return
+
+    async with get_session() as session:
+        async with session.begin():
+            token = await _resolve_canonical_token_for_update(session, token_id)
+            if token is None:
+                return
+            changed = False
+            if normalized_account_id and not token.account_id:
+                token.account_id = normalized_account_id
+                changed = True
+            if normalized_email and not token.email:
+                token.email = normalized_email
+                changed = True
+            if changed:
+                token.updated_at = utcnow()
+
+
 async def mark_token_import_validation_pending(
     token_id: int,
     message: str,

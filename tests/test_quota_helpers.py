@@ -142,6 +142,83 @@ def test_parse_codex_quota_payload_prefers_window_percent_over_global_limit_flag
     assert windows["code-7d"].exhausted is False
 
 
+def test_quota_service_recovers_missing_account_id_from_usage_payload(monkeypatch) -> None:
+    identity_updates: list[dict[str, object]] = []
+    plan_updates: list[dict[str, object]] = []
+
+    async def fake_update_token_account_identity(
+        token_id: int,
+        *,
+        account_id: str | None = None,
+        email: str | None = None,
+    ) -> None:
+        identity_updates.append({"token_id": token_id, "account_id": account_id, "email": email})
+
+    async def fake_update_token_plan_type(token_id: int, *, plan_type: str | None) -> None:
+        plan_updates.append({"token_id": token_id, "plan_type": plan_type})
+
+    monkeypatch.setattr("oaix_gateway.quota.update_token_account_identity", fake_update_token_account_identity)
+    monkeypatch.setattr("oaix_gateway.quota.update_token_plan_type", fake_update_token_plan_type)
+
+    class DummyResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self) -> dict[str, object]:
+            return {
+                "account_id": "acct_from_usage",
+                "email": "user@example.com",
+                "plan_type": "plus",
+                "rate_limit": {},
+            }
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] | None = None
+
+        async def get(self, url: str, *, headers: dict[str, str], timeout: float):
+            del url, timeout
+            self.headers = dict(headers)
+            return DummyResponse()
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row: CodexToken, client) -> tuple[str, bool]:
+            del token_row, client
+            return "access-token", False
+
+    token_row = CodexToken(
+        id=12,
+        account_id=None,
+        email=None,
+        refresh_token="rt_12",
+        token_type="codex",
+        is_active=True,
+    )
+    client = DummyClient()
+    service = CodexQuotaService(ttl_seconds=60, concurrency=1)
+
+    async def runner():
+        return await service.get_snapshot(
+            token_row,
+            client=client,
+            oauth_manager=DummyOAuthManager(),
+            account_id=None,
+        )
+
+    snapshot = asyncio.run(runner())
+
+    assert client.headers is not None
+    assert "Chatgpt-Account-Id" not in client.headers
+    assert snapshot.error is None
+    assert snapshot.plan_type == "plus"
+    assert token_row.account_id == "acct_from_usage"
+    assert token_row.email == "user@example.com"
+    assert identity_updates == [
+        {"token_id": 12, "account_id": "acct_from_usage", "email": "user@example.com"}
+    ]
+    assert plan_updates == [{"token_id": 12, "plan_type": "plus"}]
+
+
 def test_quota_service_deactivates_permanently_invalid_refresh_tokens(monkeypatch) -> None:
     recorded: dict[str, object] = {}
 

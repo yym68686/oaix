@@ -12,7 +12,7 @@ import httpx
 from .codex_constants import CODEX_WHAM_USER_AGENT
 from .database import CodexToken, utcnow
 from .oauth import CodexOAuthManager, is_permanently_invalid_refresh_token_error
-from .token_store import mark_token_error, update_token_plan_type
+from .token_store import mark_token_error, update_token_account_identity, update_token_plan_type
 
 
 logger = logging.getLogger("oaix.gateway")
@@ -422,6 +422,15 @@ def _extract_response_error(response: httpx.Response) -> str:
     return f"HTTP {response.status_code}"
 
 
+def _extract_quota_account_id(payload: dict[str, Any]) -> str | None:
+    return _normalize_optional_text(
+        payload.get("account_id")
+        or payload.get("accountId")
+        or payload.get("chatgpt_account_id")
+        or payload.get("chatgptAccountId")
+    )
+
+
 class CodexQuotaService:
     def __init__(
         self,
@@ -536,13 +545,6 @@ class CodexQuotaService:
     ) -> CodexQuotaSnapshot:
         fetched_at = utcnow()
         effective_account_id = _normalize_optional_text(account_id or token_row.account_id)
-        if effective_account_id is None:
-            return CodexQuotaSnapshot(
-                fetched_at=fetched_at,
-                error="missing account_id",
-                plan_type=None,
-                windows=[],
-            )
 
         try:
             response = await self._request_usage(
@@ -598,6 +600,22 @@ class CodexQuotaService:
                 windows=[],
             )
 
+        quota_account_id = _extract_quota_account_id(payload)
+        quota_email = _normalize_optional_text(payload.get("email"))
+        if quota_account_id or quota_email:
+            try:
+                await update_token_account_identity(
+                    token_row.id,
+                    account_id=quota_account_id,
+                    email=quota_email,
+                )
+                if quota_account_id and not token_row.account_id:
+                    token_row.account_id = quota_account_id
+                if quota_email and not token_row.email:
+                    token_row.email = quota_email
+            except Exception:
+                logger.exception("Failed to persist quota account identity for token_id=%s", token_row.id)
+
         return CodexQuotaSnapshot(
             fetched_at=fetched_at,
             error=None,
@@ -611,7 +629,7 @@ class CodexQuotaService:
         *,
         client: httpx.AsyncClient,
         oauth_manager: CodexOAuthManager,
-        account_id: str,
+        account_id: str | None,
     ) -> httpx.Response:
         access_token, _ = await oauth_manager.get_access_token(token_row, client)
         response = await self._send_usage_request(client, access_token=access_token, account_id=account_id)
@@ -629,14 +647,16 @@ class CodexQuotaService:
         client: httpx.AsyncClient,
         *,
         access_token: str,
-        account_id: str,
+        account_id: str | None,
     ) -> httpx.Response:
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "User-Agent": WHAM_USER_AGENT,
-            "Chatgpt-Account-Id": account_id,
         }
+        normalized_account_id = _normalize_optional_text(account_id)
+        if normalized_account_id is not None:
+            headers["Chatgpt-Account-Id"] = normalized_account_id
         return await client.get(
             WHAM_USAGE_URL,
             headers=headers,
