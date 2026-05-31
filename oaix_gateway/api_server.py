@@ -3126,29 +3126,71 @@ def _state_http_client(app: FastAPI, name: str) -> httpx.AsyncClient:
     return app.state.http_client
 
 
-async def _close_stream_cm_safely(stream_cm: Any) -> None:
+async def _await_cleanup_task_safely(cleanup_coro: Awaitable[Any], *, label: str) -> None:
     current_task = asyncio.current_task()
     if current_task is not None:
         while current_task.cancelling():
             current_task.uncancel()
 
-    close_task = asyncio.create_task(stream_cm.__aexit__(None, None, None))
-    try:
-        while True:
-            try:
-                await asyncio.shield(close_task)
+    cleanup_task = asyncio.create_task(cleanup_coro)
+    while True:
+        try:
+            await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError:
+            if cleanup_task.done():
                 break
-            except asyncio.CancelledError:
-                if current_task is not None:
+            if current_task is not None:
+                while current_task.cancelling():
                     current_task.uncancel()
-                if close_task.done():
-                    break
-            except Exception:
-                break
-    finally:
-        with suppress(Exception):
-            if not close_task.done():
-                await asyncio.shield(close_task)
+        except Exception:
+            break
+
+    try:
+        cleanup_task.result()
+    except asyncio.CancelledError:
+        logger.warning("%s cleanup was cancelled before it could finish", label)
+    except Exception as exc:
+        logger.warning(
+            "%s cleanup failed",
+            label,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
+async def _close_upstream_response_safely(upstream_response: Any | None) -> None:
+    if upstream_response is None:
+        return
+    aclose = getattr(upstream_response, "aclose", None)
+    if not callable(aclose):
+        return
+    try:
+        close_result = aclose()
+    except Exception as exc:
+        logger.warning(
+            "Upstream HTTP response cleanup failed",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return
+    if not inspect.isawaitable(close_result):
+        return
+    await _await_cleanup_task_safely(close_result, label="Upstream HTTP response")
+
+
+async def _close_stream_cm_safely(stream_cm: Any) -> None:
+    await _await_cleanup_task_safely(
+        stream_cm.__aexit__(None, None, None),
+        label="Upstream stream context manager",
+    )
+
+
+async def _close_upstream_response_stream_safely(
+    stream_cm: Any | None,
+    upstream_response: Any | None,
+) -> None:
+    await _close_upstream_response_safely(upstream_response)
+    if stream_cm is not None:
+        await _close_stream_cm_safely(stream_cm)
 
 
 def _proxy_concurrency_limiter(app: FastAPI) -> ProxyConcurrencyLimiter:
@@ -6636,15 +6678,15 @@ async def _proxy_image_request_with_token(
             initial_first_token_at=None,
         )
         stream_cm: Any | None = None
+        upstream_response: Any | None = None
 
         async def close_upstream_stream_context() -> None:
-            if stream_cm is not None:
-                await _close_stream_cm_safely(stream_cm)
+            await _close_upstream_response_stream_safely(stream_cm, upstream_response)
 
         close_upstream_stream = _IdempotentAsyncCallback(close_upstream_stream_context)
 
         async def body_iterator() -> AsyncGenerator[bytes, None]:
-            nonlocal stream_cm
+            nonlocal stream_cm, upstream_response
             stream_cm = client.stream(
                 "POST",
                 upstream_url,
@@ -6729,7 +6771,7 @@ async def _proxy_image_request_with_token(
             first_token_at=first_token_at,
         )
     finally:
-        await _close_stream_cm_safely(stream_cm)
+        await _close_upstream_response_stream_safely(stream_cm, upstream_response)
 
 
 def _load_error_mapping(error_text: str) -> dict[str, Any] | None:
@@ -8236,6 +8278,7 @@ async def _responses_stream_keepalive_response(
 
                 token_observation_first_token_at: datetime | None = None
                 stream_cm = None
+                upstream_response = None
                 try:
                     headers = _build_upstream_headers(
                         http_request,
@@ -8257,8 +8300,9 @@ async def _responses_stream_keepalive_response(
                         try:
                             raw = await upstream_response.aread()
                         finally:
-                            await _close_stream_cm_safely(stream_cm)
+                            await _close_upstream_response_stream_safely(stream_cm, upstream_response)
                             stream_cm = None
+                            upstream_response = None
                         raise _upstream_error_http_exception(
                             upstream_response.status_code,
                             _decode_error_body(raw),
@@ -8550,8 +8594,7 @@ async def _responses_stream_keepalive_response(
                     stream_finalized = True
                     return
                 finally:
-                    if stream_cm is not None:
-                        await _close_stream_cm_safely(stream_cm)
+                    await _close_upstream_response_stream_safely(stream_cm, upstream_response)
                     _record_selected_token_observation_finish(
                         token_row.id,
                         started_at=request_started_at,
@@ -10922,15 +10965,15 @@ async def _proxy_request_with_token(
             initial_first_token_at=None,
         )
         stream_cm: Any | None = None
+        upstream_response: Any | None = None
 
         async def close_upstream_stream_context() -> None:
-            if stream_cm is not None:
-                await _close_stream_cm_safely(stream_cm)
+            await _close_upstream_response_stream_safely(stream_cm, upstream_response)
 
         close_upstream_stream = _IdempotentAsyncCallback(close_upstream_stream_context)
 
         async def body_iterator() -> AsyncGenerator[bytes, None]:
-            nonlocal stream_cm
+            nonlocal stream_cm, upstream_response
             stream_cm = client.stream(
                 "POST",
                 upstream_url,
@@ -11000,7 +11043,9 @@ async def _proxy_request_with_token(
             timeout=_upstream_http_timeout(read=None),
         )
         upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
-        close_upstream_stream = _IdempotentAsyncCallback(lambda: _close_stream_cm_safely(stream_cm))
+        close_upstream_stream = _IdempotentAsyncCallback(
+            lambda: _close_upstream_response_stream_safely(stream_cm, upstream_response)
+        )
         if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
             raw = await upstream_response.aread()
             await close_upstream_stream()
@@ -11090,7 +11135,7 @@ async def _proxy_request_with_token(
                 response_id=_extract_response_id_from_payload(data),
             )
         finally:
-            await _close_stream_cm_safely(stream_cm)
+            await _close_upstream_response_stream_safely(stream_cm, upstream_response)
 
     upstream_response = await client.post(
         upstream_url,

@@ -3453,6 +3453,10 @@ def test_responses_stream_keepalive_response_finalizer_closes_running_worker(
 
             return iterator()
 
+        async def aclose(self) -> None:
+            self._client.response_closed_calls += 1
+            self._client.response_closed.set()
+
         async def aread(self) -> bytes:
             return b""
 
@@ -3473,10 +3477,12 @@ def test_responses_stream_keepalive_response_finalizer_closes_running_worker(
         def __init__(self) -> None:
             self.stream_calls = 0
             self.closed_calls = 0
+            self.response_closed_calls = 0
             self.entered = asyncio.Event()
             self.delta_sent = asyncio.Event()
             self.release_stream = asyncio.Event()
             self.closed = asyncio.Event()
+            self.response_closed = asyncio.Event()
 
         def stream(self, method, url, headers, content, timeout):
             self.stream_calls += 1
@@ -3543,6 +3549,7 @@ def test_responses_stream_keepalive_response_finalizer_closes_running_worker(
         try:
             await asyncio.wait_for(client.delta_sent.wait(), timeout=0.2)
             await result._on_close_once()
+            await asyncio.wait_for(client.response_closed.wait(), timeout=0.2)
             await asyncio.wait_for(client.closed.wait(), timeout=0.2)
             await asyncio.wait_for(consumer_task, timeout=0.2)
             return sent_bodies
@@ -3558,6 +3565,7 @@ def test_responses_stream_keepalive_response_finalizer_closes_running_worker(
     assert any(body.startswith(b": keepalive") for body in sent_bodies)
     assert any(b"response.output_text.delta" in body for body in sent_bodies)
     assert client.stream_calls == 1
+    assert client.response_closed_calls == 1
     assert client.closed_calls == 1
 
 
@@ -4561,6 +4569,18 @@ def test_close_stream_cm_safely_shields_cleanup_from_cancellation() -> None:
 
     assert closed.is_set()
     assert cleanup_finished.is_set()
+
+
+def test_close_stream_cm_safely_logs_cleanup_failure(caplog) -> None:
+    class FailingStreamCM:
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            raise RuntimeError("close failed")
+
+    with caplog.at_level(logging.WARNING, logger="oaix_gateway.api_server"):
+        asyncio.run(_close_stream_cm_safely(FailingStreamCM()))
+
+    assert "Upstream stream context manager cleanup failed" in caplog.text
+    assert "close failed" in caplog.text
 
 
 def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monkeypatch) -> None:
