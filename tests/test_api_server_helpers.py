@@ -3342,6 +3342,110 @@ def test_responses_stream_keepalive_response_emits_typed_keepalive_once_and_retr
     assert success_calls == [12]
 
 
+def test_responses_stream_keepalive_response_preserves_upstream_error_status_after_close(
+    monkeypatch,
+) -> None:
+    class ErrorStreamingResponse:
+        status_code = 400
+
+        def __init__(self, client: "ErrorClient") -> None:
+            self._client = client
+
+        async def aread(self) -> bytes:
+            return b'{"error":{"message":"bad upstream request"}}'
+
+        async def aclose(self) -> None:
+            self._client.response_closed_calls += 1
+
+    class ErrorStreamContext:
+        def __init__(self, client: "ErrorClient") -> None:
+            self._client = client
+
+        async def __aenter__(self) -> ErrorStreamingResponse:
+            return ErrorStreamingResponse(self._client)
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self._client.closed_calls += 1
+
+    class ErrorClient:
+        def __init__(self) -> None:
+            self.stream_calls = 0
+            self.response_closed_calls = 0
+            self.closed_calls = 0
+
+        def stream(self, method, url, headers, content, timeout):
+            self.stream_calls += 1
+            return ErrorStreamContext(self)
+
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            return "access-token", False
+
+        def invalidate(self, token_id: int) -> None:
+            return None
+
+    client = ErrorClient()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=client,
+            oauth_manager=DummyOAuthManager(),
+        )
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4-mini",
+        input=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+    token_row = SimpleNamespace(id=11, account_id="acct_1", refresh_token="refresh-1")
+    finalized: list[dict[str, object]] = []
+
+    async def fake_claim_prompt_cache_affinity_token(*args, **kwargs):
+        return SimpleNamespace(token_row=token_row, result="primary_hit", lane_index=0)
+
+    def capture_request_log_write(job: _RequestLogWriteJob) -> None:
+        finalized.append(job.payload)
+
+    async def unexpected_fallback_token_claim(*args, **kwargs):
+        raise AssertionError("unexpected fallback token claim")
+
+    monkeypatch.setattr("oaix_gateway.api_server._submit_request_log_write", capture_request_log_write)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_prompt_cache_affinity_token", fake_claim_prompt_cache_affinity_token)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_next_token_for_model_request", unexpected_fallback_token_claim)
+
+    async def run_stream() -> str:
+        result = await _responses_stream_keepalive_response(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.4-mini",
+            compact=False,
+            request_data=request_data,
+        )
+        chunks: list[bytes] = []
+        async for chunk in result.body_iterator:
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(run_stream())
+
+    assert client.stream_calls == 1
+    assert client.response_closed_calls == 1
+    assert client.closed_calls == 1
+    assert body.startswith(": keepalive")
+    assert finalized[0]["status_code"] == 400
+
+
 def test_responses_stream_keepalive_response_emits_initial_keepalive_before_upstream_headers(
     monkeypatch,
 ) -> None:

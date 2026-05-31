@@ -8297,6 +8297,7 @@ async def _responses_stream_keepalive_response(
                     )
                     upstream_response = await _enter_upstream_stream_with_timing(stream_cm, compact=compact)
                     if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+                        upstream_status_code = upstream_response.status_code
                         try:
                             raw = await upstream_response.aread()
                         finally:
@@ -8304,7 +8305,7 @@ async def _responses_stream_keepalive_response(
                             stream_cm = None
                             upstream_response = None
                         raise _upstream_error_http_exception(
-                            upstream_response.status_code,
+                            upstream_status_code,
                             _decode_error_body(raw),
                         )
 
