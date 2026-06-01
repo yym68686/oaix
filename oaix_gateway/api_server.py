@@ -2545,8 +2545,8 @@ class _IdempotentAsyncCallback:
         async with self._lock:
             if self._called:
                 return
-            self._called = True
             await self._callback()
+            self._called = True
 
 
 class _FinalizingStreamingResponse(StreamingResponse):

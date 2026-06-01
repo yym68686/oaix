@@ -17,6 +17,7 @@ from oaix_gateway.api_server import (
     ChatCompletionsRequest,
     ImageProxyRequest,
     _HTTPPhaseTraceRecorder,
+    _IdempotentAsyncCallback,
     _ProxyStreamCapture,
     _TokenPoolSnapshot,
     _RequestLogHandle,
@@ -5066,6 +5067,28 @@ def test_wrap_streaming_body_iterator_runs_on_close_when_inner_aclose_is_cancell
 
     assert iterator.close_calls == 1
     assert closed is True
+
+
+def test_idempotent_async_callback_retries_after_cancelled_callback() -> None:
+    calls = 0
+
+    async def callback() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise asyncio.CancelledError
+
+    cleanup = _IdempotentAsyncCallback(callback)
+
+    async def run() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup()
+        await cleanup()
+        await cleanup()
+
+    asyncio.run(run())
+
+    assert calls == 2
 
 
 def test_close_upstream_response_safely_forces_inner_stream_after_interrupted_httpx_close() -> None:
