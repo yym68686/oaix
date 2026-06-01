@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -16,9 +17,13 @@ from starlette.requests import Request
 from oaix_gateway.api_server import (
     ChatCompletionsRequest,
     ImageProxyRequest,
+    UpstreamStreamOwner,
+    _GATEWAY_GUARD_EVENTS,
     _HTTPPhaseTraceRecorder,
     _IdempotentAsyncCallback,
     _ProxyStreamCapture,
+    _STREAM_OWNER_ACTIVE,
+    _STREAM_OWNER_COUNTERS,
     _TokenPoolSnapshot,
     _RequestLogHandle,
     _RequestLogWriteJob,
@@ -71,6 +76,8 @@ from oaix_gateway.api_server import (
     _close_async_iterator_safely,
     _close_stream_cm_safely,
     _close_upstream_response_safely,
+    _gateway_guard_window_metrics,
+    _record_gateway_guard_event,
     _sweep_httpx_client_idle_connections,
     _claim_next_active_token_from_snapshot,
     _claim_prompt_cache_affinity_token,
@@ -84,6 +91,7 @@ from oaix_gateway.api_server import (
     _prompt_cache_session_context,
     _responses_stream_keepalive_response,
     _stream_responses_to_chat_completions,
+    _stream_owner_runtime_metrics,
     _stream_upstream_image_response,
     _stream_upstream_response,
     ResponsesRequest,
@@ -5089,6 +5097,241 @@ def test_idempotent_async_callback_retries_after_cancelled_callback() -> None:
     asyncio.run(run())
 
     assert calls == 2
+
+
+def test_idempotent_async_callback_retries_after_false_result() -> None:
+    calls = 0
+
+    async def callback() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls >= 2
+
+    cleanup = _IdempotentAsyncCallback(callback)
+
+    async def run() -> None:
+        await cleanup()
+        await cleanup()
+        await cleanup()
+
+    asyncio.run(run())
+
+    assert calls == 2
+
+
+def test_upstream_stream_owner_closes_response_context_and_releases_pool_request() -> None:
+    _STREAM_OWNER_ACTIVE.clear()
+    _STREAM_OWNER_COUNTERS.clear()
+
+    class DeepHTTP11Stream:
+        def __init__(self) -> None:
+            self.closed_calls = 0
+
+        async def aclose(self) -> None:
+            self.closed_calls += 1
+
+    class DummyLock:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyPool:
+        def __init__(self, request: object) -> None:
+            self._requests = [request]
+            self._optional_thread_lock = DummyLock()
+            self.closed_batches: list[list[object]] = []
+
+        def _assign_requests_to_connections(self) -> list[object]:
+            return ["stale-connection"]
+
+        async def _close_connections(self, closing: list[object]) -> None:
+            self.closed_batches.append(closing)
+
+    class InterruptedPoolByteStream:
+        def __init__(self) -> None:
+            self._stream = DeepHTTP11Stream()
+            self._pool_request = object()
+            self._pool = DummyPool(self._pool_request)
+            self._closed = True
+            self.pool_close_calls = 0
+
+        async def aclose(self) -> None:
+            self.pool_close_calls += 1
+            if self._closed:
+                return
+            self._closed = True
+            await self._stream.aclose()
+
+    class BoundLikeStream:
+        def __init__(self, inner: InterruptedPoolByteStream) -> None:
+            self._stream = inner
+
+        async def aclose(self) -> None:
+            await self._stream.aclose()
+
+    class DummyStreamingResponse:
+        status_code = 200
+
+        def __init__(self) -> None:
+            self.pool_stream = InterruptedPoolByteStream()
+            self.stream = BoundLikeStream(self.pool_stream)
+            self.response_closed_calls = 0
+
+        async def aclose(self) -> None:
+            self.response_closed_calls += 1
+            await self.stream.aclose()
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                yield b"data: ok\n\n"
+
+            return iterator()
+
+    class DummyStreamContext:
+        def __init__(self) -> None:
+            self.response = DummyStreamingResponse()
+            self.exited = 0
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self.response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self.exited += 1
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.context = DummyStreamContext()
+
+        def stream(self, method, url, *, headers, content, timeout):
+            return self.context
+
+    async def run() -> tuple[UpstreamStreamOwner, DummyClient]:
+        client = DummyClient()
+        owner = await UpstreamStreamOwner.open(
+            client,
+            "POST",
+            "https://example.test/v1/responses",
+            headers={},
+            content=b"{}",
+            timeout=httpx.Timeout(1.0),
+            label="test_owner",
+        )
+        assert _stream_owner_runtime_metrics()["active"] == 1
+        assert await owner.close(reason="test_finished") is True
+        return owner, client
+
+    owner, client = asyncio.run(run())
+
+    assert owner.owner_id not in _STREAM_OWNER_ACTIVE
+    assert client.context.exited == 1
+    assert client.context.response.response_closed_calls == 1
+    assert client.context.response.pool_stream.pool_close_calls >= 1
+    assert client.context.response.pool_stream._stream.closed_calls == 1
+    assert client.context.response.pool_stream._pool_request not in client.context.response.pool_stream._pool._requests
+    assert client.context.response.pool_stream._pool.closed_batches == [["stale-connection"]]
+    assert _STREAM_OWNER_COUNTERS["close_success_total"] == 1
+    assert _STREAM_OWNER_COUNTERS["force_pool_release_total"] == 1
+    assert _stream_owner_runtime_metrics()["active"] == 0
+
+
+def test_upstream_stream_owner_retries_cleanup_until_success(caplog) -> None:
+    _STREAM_OWNER_ACTIVE.clear()
+    _STREAM_OWNER_COUNTERS.clear()
+
+    class DummyStreamingResponse:
+        status_code = 200
+
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.stream = None
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    class FlakyStreamContext:
+        def __init__(self) -> None:
+            self.response = DummyStreamingResponse()
+            self.exit_calls = 0
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self.response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self.exit_calls += 1
+            if self.exit_calls == 1:
+                raise RuntimeError("transient close failure")
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.context = FlakyStreamContext()
+
+        def stream(self, method, url, *, headers, content, timeout):
+            return self.context
+
+    async def run() -> tuple[UpstreamStreamOwner, DummyClient]:
+        client = DummyClient()
+        owner = await UpstreamStreamOwner.open(
+            client,
+            "POST",
+            "https://example.test/v1/responses",
+            headers={},
+            content=b"{}",
+            timeout=httpx.Timeout(1.0),
+            label="flaky_owner",
+        )
+        with caplog.at_level(logging.WARNING, logger="oaix_gateway.api_server"):
+            assert await owner.close(reason="first_close") is False
+        assert _stream_owner_runtime_metrics()["active_by_state"] == {"close_failed": 1}
+        assert await owner.close(reason="retry_close") is True
+        return owner, client
+
+    owner, client = asyncio.run(run())
+
+    assert owner.owner_id not in _STREAM_OWNER_ACTIVE
+    assert client.context.exit_calls == 2
+    assert client.context.response.close_calls == 2
+    assert _STREAM_OWNER_COUNTERS["close_failed_total"] == 1
+    assert _STREAM_OWNER_COUNTERS["close_retry_total"] == 1
+    assert _STREAM_OWNER_COUNTERS["close_success_total"] == 1
+    assert "transient close failure" in caplog.text
+
+
+def test_gateway_guard_window_metrics_counts_recent_responses_failures() -> None:
+    _GATEWAY_GUARD_EVENTS.clear()
+
+    _GATEWAY_GUARD_EVENTS.append((time.monotonic() - 10.0, "/v1/responses", 499, None))
+    _record_gateway_guard_event(endpoint="/v1/responses", status_code=499)
+    _record_gateway_guard_event(endpoint="/v1/responses", status_code=502, error_message="PoolTimeout")
+    _record_gateway_guard_event(endpoint="/v1/chat/completions", status_code=502, error_message="PoolTimeout")
+    _record_gateway_guard_event(endpoint="/v1/responses", status_code=200, error_message="PoolTimeout during cleanup")
+
+    metrics = _gateway_guard_window_metrics(window_seconds=1.0)
+
+    assert metrics["responses_499"] == 1
+    assert metrics["responses_5xx"] == 1
+    assert metrics["responses_pooltimeout"] == 2
+
+
+def test_livez_exposes_stream_owner_and_guard_metrics() -> None:
+    app = create_app()
+    _GATEWAY_GUARD_EVENTS.clear()
+    _record_gateway_guard_event(endpoint="/v1/responses", status_code=499)
+
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/livez" and "GET" in getattr(route, "methods", set())
+    )
+
+    response = asyncio.run(route.endpoint())
+    payload = json.loads(response.body)
+
+    assert payload["stream_owner"]["active"] == _stream_owner_runtime_metrics()["active"]
+    assert payload["guards"]["window"]["responses_499"] == 1
+    assert payload["guards"]["alerts"]["responses_499"] is True
+    assert "tcp_close_wait_443_warning" in payload["guards"]["alerts"]
 
 
 def test_close_upstream_response_safely_forces_inner_stream_after_interrupted_httpx_close() -> None:
