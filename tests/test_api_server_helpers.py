@@ -68,6 +68,7 @@ from oaix_gateway.api_server import (
     _build_admin_token_items,
     _build_admin_token_quota_items,
     _close_stream_cm_safely,
+    _close_upstream_response_safely,
     _sweep_httpx_client_idle_connections,
     _claim_next_active_token_from_snapshot,
     _claim_prompt_cache_affinity_token,
@@ -5003,6 +5004,41 @@ def test_close_stream_cm_safely_logs_cleanup_failure(caplog) -> None:
 
     assert "Upstream stream context manager cleanup failed" in caplog.text
     assert "close failed" in caplog.text
+
+
+def test_close_upstream_response_safely_forces_inner_stream_after_interrupted_httpx_close() -> None:
+    class InnerStream:
+        def __init__(self) -> None:
+            self.closed_calls = 0
+
+        async def aclose(self) -> None:
+            self.closed_calls += 1
+
+    class BoundLikeStream:
+        def __init__(self, inner: InnerStream) -> None:
+            self._stream = inner
+
+    class InterruptedHttpxLikeResponse:
+        def __init__(self) -> None:
+            self.is_closed = False
+            self.inner = InnerStream()
+            self.stream = BoundLikeStream(self.inner)
+            self.response_closed_calls = 0
+
+        async def aclose(self) -> None:
+            self.response_closed_calls += 1
+            # httpx.Response.aclose() sets is_closed before awaiting the
+            # underlying stream close. This simulates cancellation after that
+            # state change and before the inner stream is actually closed.
+            self.is_closed = True
+
+    response = InterruptedHttpxLikeResponse()
+
+    asyncio.run(_close_upstream_response_safely(response))
+
+    assert response.response_closed_calls == 1
+    assert response.is_closed is True
+    assert response.inner.closed_calls == 1
 
 
 def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monkeypatch) -> None:
