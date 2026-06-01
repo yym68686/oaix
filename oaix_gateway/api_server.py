@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -3175,39 +3175,73 @@ async def _close_upstream_response_safely(upstream_response: Any | None) -> None
                 await _await_cleanup_task_safely(close_result, label="Upstream HTTP response")
 
     # httpx.Response.aclose() marks response.is_closed before it awaits the
-    # underlying BoundAsyncStream.aclose(). If cancellation interrupts that
-    # await, a later Response.aclose() becomes a no-op while the httpcore stream
-    # can still own the socket. Force the lower-level stream close as a second
-    # pass so downstream disconnects cannot leave CLOSE_WAIT sockets pinned as
-    # active pool connections.
+    # underlying BoundAsyncStream.aclose(). httpcore.PoolByteStream.aclose() has
+    # a similar _closed guard before it closes the deeper HTTP/1.1 stream and
+    # releases the pool request. If cancellation interrupts either await, later
+    # public close calls become no-ops while the socket can remain in CLOSE_WAIT
+    # and still pin a pool slot. Walk the private stream chain as a cleanup-only
+    # fallback so downstream disconnects cannot strand active response streams.
     await _force_close_upstream_response_stream_safely(upstream_response)
 
 
 async def _force_close_upstream_response_stream_safely(upstream_response: Any) -> None:
     stream = getattr(upstream_response, "stream", None)
-    inner_stream = getattr(stream, "_stream", None)
-    candidates = [inner_stream] if inner_stream is not None else [stream]
+    candidates: list[Any] = []
+    current = stream
     seen: set[int] = set()
+    while current is not None:
+        current_id = id(current)
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        candidates.append(current)
+        current = getattr(current, "_stream", None)
+
     for candidate in candidates:
         if candidate is None:
             continue
-        candidate_id = id(candidate)
-        if candidate_id in seen:
-            continue
-        seen.add(candidate_id)
         aclose = getattr(candidate, "aclose", None)
-        if not callable(aclose):
-            continue
-        try:
-            close_result = aclose()
-        except Exception as exc:
-            logger.warning(
-                "Upstream HTTP response stream cleanup failed",
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-            continue
-        if inspect.isawaitable(close_result):
-            await _await_cleanup_task_safely(close_result, label="Upstream HTTP response stream")
+        if callable(aclose):
+            try:
+                close_result = aclose()
+            except Exception as exc:
+                logger.warning(
+                    "Upstream HTTP response stream cleanup failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+            else:
+                if inspect.isawaitable(close_result):
+                    await _await_cleanup_task_safely(close_result, label="Upstream HTTP response stream")
+        await _force_release_httpcore_pool_request_safely(candidate)
+
+
+async def _force_release_httpcore_pool_request_safely(stream: Any) -> None:
+    pool = getattr(stream, "_pool", None)
+    pool_request = getattr(stream, "_pool_request", None)
+    if pool is None or pool_request is None:
+        return
+    requests = getattr(pool, "_requests", None)
+    if not isinstance(requests, list) or pool_request not in requests:
+        return
+
+    try:
+        lock = getattr(pool, "_optional_thread_lock", nullcontext())
+        with lock:
+            if pool_request in requests:
+                requests.remove(pool_request)
+            assign = getattr(pool, "_assign_requests_to_connections", None)
+            closing = assign() if callable(assign) else []
+
+        close_connections = getattr(pool, "_close_connections", None)
+        if callable(close_connections):
+            close_result = close_connections(closing)
+            if inspect.isawaitable(close_result):
+                await _await_cleanup_task_safely(close_result, label="Upstream HTTP pool request")
+    except Exception as exc:
+        logger.warning(
+            "Upstream HTTP pool request cleanup failed",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
 
 async def _close_stream_cm_safely(stream_cm: Any) -> None:

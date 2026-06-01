@@ -5041,6 +5041,79 @@ def test_close_upstream_response_safely_forces_inner_stream_after_interrupted_ht
     assert response.inner.closed_calls == 1
 
 
+def test_close_upstream_response_safely_repairs_interrupted_httpcore_pool_stream() -> None:
+    class DeepHTTP11Stream:
+        def __init__(self) -> None:
+            self.closed_calls = 0
+
+        async def aclose(self) -> None:
+            self.closed_calls += 1
+
+    class DummyLock:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyPool:
+        def __init__(self, request: object) -> None:
+            self._requests = [request]
+            self._optional_thread_lock = DummyLock()
+            self.assigned = 0
+            self.closed_batches: list[list[object]] = []
+
+        def _assign_requests_to_connections(self) -> list[object]:
+            self.assigned += 1
+            return ["stale-connection"]
+
+        async def _close_connections(self, closing: list[object]) -> None:
+            self.closed_batches.append(closing)
+
+    class InterruptedPoolByteStream:
+        def __init__(self) -> None:
+            self._stream = DeepHTTP11Stream()
+            self._pool_request = object()
+            self._pool = DummyPool(self._pool_request)
+            self._closed = True
+            self.pool_close_calls = 0
+
+        async def aclose(self) -> None:
+            self.pool_close_calls += 1
+            if self._closed:
+                return
+            self._closed = True
+            await self._stream.aclose()
+
+    class BoundLikeStream:
+        def __init__(self, inner: InterruptedPoolByteStream) -> None:
+            self._stream = inner
+
+        async def aclose(self) -> None:
+            await self._stream.aclose()
+
+    class InterruptedHttpxLikeResponse:
+        def __init__(self) -> None:
+            self.pool_stream = InterruptedPoolByteStream()
+            self.stream = BoundLikeStream(self.pool_stream)
+            self.response_closed_calls = 0
+
+        async def aclose(self) -> None:
+            self.response_closed_calls += 1
+            await self.stream.aclose()
+
+    response = InterruptedHttpxLikeResponse()
+
+    asyncio.run(_close_upstream_response_safely(response))
+
+    assert response.response_closed_calls == 1
+    assert response.pool_stream.pool_close_calls >= 1
+    assert response.pool_stream._stream.closed_calls == 1
+    assert response.pool_stream._pool_request not in response.pool_stream._pool._requests
+    assert response.pool_stream._pool.assigned == 1
+    assert response.pool_stream._pool.closed_batches == [["stale-connection"]]
+
+
 def test_execute_proxy_request_with_failover_excludes_failed_token_on_retry(monkeypatch) -> None:
     app = SimpleNamespace(
         state=SimpleNamespace(
