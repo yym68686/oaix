@@ -2527,10 +2527,10 @@ class _SSEProxyStreamingResponse(Response):
             except (OSError, RuntimeError):
                 pass
             finally:
-                close_iterator = getattr(self.body_iterator, "aclose", None)
-                if callable(close_iterator):
-                    with suppress(Exception):
-                        await close_iterator()
+                await _close_async_iterator_safely(
+                    self.body_iterator,
+                    label="SSE proxy response body iterator",
+                )
 
 
 class _IdempotentAsyncCallback:
@@ -2568,10 +2568,10 @@ class _FinalizingStreamingResponse(StreamingResponse):
         finally:
             async def close_with_cancel_shield() -> None:
                 with anyio.CancelScope(shield=True):
-                    close_iterator = getattr(self.body_iterator, "aclose", None)
-                    if callable(close_iterator):
-                        with suppress(Exception):
-                            await close_iterator()
+                    await _close_async_iterator_safely(
+                        self.body_iterator,
+                        label="Finalizing streaming response body iterator",
+                    )
                     await self._on_close_once()
 
             cleanup_task = asyncio.create_task(close_with_cancel_shield(), name="oaix-streamed-response-finalizer")
@@ -3156,6 +3156,30 @@ async def _await_cleanup_task_safely(cleanup_coro: Awaitable[Any], *, label: str
             label,
             exc_info=(type(exc), exc, exc.__traceback__),
         )
+
+
+async def _close_async_iterator_safely(iterator: Any, *, label: str) -> None:
+    close_iterator = getattr(iterator, "aclose", None)
+    if not callable(close_iterator):
+        return
+    try:
+        close_result = close_iterator()
+    except asyncio.CancelledError as exc:
+        logger.warning(
+            "%s cleanup was cancelled before it could start",
+            label,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return
+    except Exception as exc:
+        logger.warning(
+            "%s cleanup failed before it could start",
+            label,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return
+    if inspect.isawaitable(close_result):
+        await _await_cleanup_task_safely(close_result, label=label)
 
 
 async def _close_upstream_response_safely(upstream_response: Any | None) -> None:
@@ -7989,7 +8013,10 @@ def _gpt_image_stream_keepalive_response(
                 if isinstance(item, bytes):
                     yield item
         finally:
-            await cancel_worker_task()
+            await _await_cleanup_task_safely(
+                cancel_worker_task(),
+                label="GPT image stream worker",
+            )
 
     async def on_response_close() -> None:
         if response_body_started:
@@ -8913,7 +8940,10 @@ async def _responses_stream_keepalive_response(
                 if isinstance(item, bytes):
                     yield item
         finally:
-            await cancel_worker_task()
+            await _await_cleanup_task_safely(
+                cancel_worker_task(),
+                label="Responses stream worker",
+            )
 
     async def on_response_close() -> None:
         if response_body_started:
@@ -9703,13 +9733,10 @@ async def _wrap_streaming_body_iterator(
         async for chunk in body_iterator:
             yield chunk
     finally:
-        close_iterator = getattr(body_iterator, "aclose", None)
-        if callable(close_iterator):
-            try:
-                with anyio.CancelScope(shield=True):
-                    await close_iterator()
-            except Exception:
-                logger.exception("Failed to close streamed response body iterator")
+        await _close_async_iterator_safely(
+            body_iterator,
+            label="Streamed response body iterator",
+        )
 
         async def on_close_with_cancel_shield() -> None:
             with anyio.CancelScope(shield=True):

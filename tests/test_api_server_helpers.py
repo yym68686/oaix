@@ -67,6 +67,7 @@ from oaix_gateway.api_server import (
     _build_stream_error_event,
     _build_admin_token_items,
     _build_admin_token_quota_items,
+    _close_async_iterator_safely,
     _close_stream_cm_safely,
     _close_upstream_response_safely,
     _sweep_httpx_client_idle_connections,
@@ -5004,6 +5005,67 @@ def test_close_stream_cm_safely_logs_cleanup_failure(caplog) -> None:
 
     assert "Upstream stream context manager cleanup failed" in caplog.text
     assert "close failed" in caplog.text
+
+
+def test_close_async_iterator_safely_absorbs_cancelled_aclose(caplog) -> None:
+    class CancellingIterator:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> bytes:
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            raise asyncio.CancelledError
+
+    iterator = CancellingIterator()
+
+    with caplog.at_level(logging.WARNING, logger="oaix_gateway.api_server"):
+        asyncio.run(_close_async_iterator_safely(iterator, label="test iterator"))
+
+    assert iterator.close_calls == 1
+    assert "test iterator cleanup was cancelled before it could finish" in caplog.text
+
+
+def test_wrap_streaming_body_iterator_runs_on_close_when_inner_aclose_is_cancelled() -> None:
+    class CancellingIterator:
+        def __init__(self) -> None:
+            self.sent = False
+            self.close_calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> bytes:
+            if self.sent:
+                await asyncio.Event().wait()
+            self.sent = True
+            return b"event: ping\n\n"
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            raise asyncio.CancelledError
+
+    closed = False
+    iterator = CancellingIterator()
+
+    async def on_close() -> None:
+        nonlocal closed
+        closed = True
+
+    async def run() -> None:
+        wrapped = _wrap_streaming_body_iterator(iterator, on_close=on_close)
+        assert await wrapped.__anext__() == b"event: ping\n\n"
+        await wrapped.aclose()
+
+    asyncio.run(run())
+
+    assert iterator.close_calls == 1
+    assert closed is True
 
 
 def test_close_upstream_response_safely_forces_inner_stream_after_interrupted_httpx_close() -> None:
