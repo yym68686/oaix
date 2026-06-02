@@ -11011,6 +11011,7 @@ async def _cached_admin_requests_payload(
     force_refresh: bool = False,
 ) -> tuple[bytes, str]:
     ttl_seconds = _admin_requests_cache_ttl_seconds()
+    effective_ttl_seconds = ttl_seconds if ttl_seconds > 0 else _admin_requests_cache_refresh_seconds() * 2
     cache: dict[int, tuple[float, bytes]] = getattr(app.state, "admin_requests_cache", {})
     if not isinstance(cache, dict):
         cache = {}
@@ -11019,7 +11020,7 @@ async def _cached_admin_requests_payload(
     cache_key = max(1, min(int(limit), 500))
     now = time.monotonic()
     cached = cache.get(cache_key)
-    if not force_refresh and ttl_seconds > 0 and cached is not None and cached[0] > now:
+    if not force_refresh and cached is not None and cached[0] > now:
         return cached[1], "hit"
     if not force_refresh and cached is not None:
         return cached[1], "stale"
@@ -11034,7 +11035,7 @@ async def _cached_admin_requests_payload(
     async with lock:
         now = time.monotonic()
         cached = cache.get(cache_key)
-        if not force_refresh and ttl_seconds > 0 and cached is not None and cached[0] > now:
+        if not force_refresh and cached is not None and cached[0] > now:
             return cached[1], "hit"
         if not force_refresh and cached is not None:
             return cached[1], "stale"
@@ -11050,11 +11051,10 @@ async def _cached_admin_requests_payload(
             "items": [_serialize_admin_request_log_item(item) for item in raw_items],
         }
         body = _json_response_body(payload)
-        if ttl_seconds > 0:
-            cache[cache_key] = (time.monotonic() + ttl_seconds, body)
-            if len(cache) > 8:
-                for stale_key in sorted(cache, key=lambda key: cache[key][0])[:-8]:
-                    cache.pop(stale_key, None)
+        cache[cache_key] = (time.monotonic() + effective_ttl_seconds, body)
+        if len(cache) > 8:
+            for stale_key in sorted(cache, key=lambda key: cache[key][0])[:-8]:
+                cache.pop(stale_key, None)
         return body, "refresh" if force_refresh else "miss"
 
 
