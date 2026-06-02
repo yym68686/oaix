@@ -5334,6 +5334,16 @@ def _model_unsupported_scoped_cooldown_seconds() -> int:
     return _int_env("MODEL_UNSUPPORTED_SCOPED_COOLDOWN_SECONDS", 3600, minimum=60)
 
 
+def _model_compatibility_max_token_probes() -> int:
+    requested_account_retries = _int_env("MAX_REQUEST_ACCOUNT_RETRIES", 10, minimum=1)
+    configured_probe_limit = _int_env(
+        "MODEL_COMPATIBILITY_MAX_TOKEN_PROBES",
+        requested_account_retries,
+        minimum=1,
+    )
+    return max(configured_probe_limit, _max_request_account_retries())
+
+
 def _model_compatibility_scoped_cooldown_scope(request_model: str | None) -> str | None:
     restricted_model_name = _non_free_only_codex_model_name(request_model)
     if restricted_model_name is None or _is_responses_image_compat_model(restricted_model_name):
@@ -8167,12 +8177,14 @@ def _gpt_image_stream_keepalive_response(
             await _record_event_loop_lag(timing)
             max_attempts = _effective_proxy_max_attempts(endpoint=endpoint)
             max_claims = _max_request_account_retries()
+            if _model_compatibility_scoped_cooldown_scope(request_model) is not None:
+                max_claims = max(max_claims, _model_compatibility_max_token_probes())
             claim_count = 0
             last_error: HTTPException | None = None
             transport_error_count = 0
             upstream_5xx_error_count = 0
 
-            while attempt_count < max_attempts and claim_count < max_claims:
+            while attempt_count - len(incompatible_model_token_ids) < max_attempts and claim_count < max_claims:
                 claim_count += 1
                 token_row = await _await_timed(
                     _claim_next_token_for_model_request(
@@ -8979,9 +8991,13 @@ async def _responses_stream_keepalive_response(
             await _record_event_loop_lag(timing)
             max_attempts = _effective_proxy_max_attempts(endpoint=endpoint)
             max_claims = _max_request_account_retries()
+            if _model_compatibility_scoped_cooldown_scope(request_model) is not None:
+                max_claims = max(max_claims, _model_compatibility_max_token_probes())
             claim_count = 0
 
-            while retry_token_row is not None or (attempt_count < max_attempts and claim_count < max_claims):
+            while retry_token_row is not None or (
+                attempt_count - len(incompatible_model_token_ids) < max_attempts and claim_count < max_claims
+            ):
                 using_postponed_unknown_plan = False
                 if retry_token_row is not None:
                     token_row = retry_token_row
@@ -9797,7 +9813,6 @@ async def _execute_proxy_request_with_failover(
 
         max_attempts = _effective_proxy_max_attempts(endpoint=endpoint)
         max_claims = _max_request_account_retries()
-        claim_count = 0
         oauth_manager: CodexOAuthManager = http_request.app.state.oauth_manager
         selection_settings = _current_token_selection_settings(http_request.app)
         last_error: HTTPException | None = None
@@ -9813,6 +9828,9 @@ async def _execute_proxy_request_with_failover(
         upstream_5xx_error_count = 0
         last_affinity_result: str | None = None
         last_affinity_lane_index: int | None = None
+        if _model_compatibility_scoped_cooldown_scope(request_model) is not None:
+            max_claims = max(max_claims, _model_compatibility_max_token_probes())
+        claim_count = 0
 
         def prompt_cache_log_kwargs(
             proxy_result: ProxyRequestResult | None = None,
@@ -9849,7 +9867,7 @@ async def _execute_proxy_request_with_failover(
                 upstream_response_id=upstream_response_id,
             )
 
-        while attempt_count < max_attempts and claim_count < max_claims:
+        while attempt_count - len(incompatible_model_token_ids) < max_attempts and claim_count < max_claims:
             claim_count += 1
             token_pool_snapshot = _fresh_token_pool_snapshot(http_request.app, timing=timing)
             affinity_claim = await _await_timed(
