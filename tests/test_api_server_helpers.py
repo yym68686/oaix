@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import sys
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
@@ -17,6 +18,7 @@ from starlette.requests import Request
 from oaix_gateway.api_server import (
     ChatCompletionsRequest,
     ImageProxyRequest,
+    StreamingProxySession,
     UpstreamStreamOwner,
     _GATEWAY_GUARD_EVENTS,
     _HTTPPhaseTraceRecorder,
@@ -28,6 +30,7 @@ from oaix_gateway.api_server import (
     _RequestLogHandle,
     _RequestLogWriteJob,
     _RequestTimingRecorder,
+    _RUNTIME_GUARD_SAMPLES,
     _AsyncioSocketSendWarningFilter,
     _FinalizingStreamingResponse,
     _SSEProxyStreamingResponse,
@@ -78,6 +81,7 @@ from oaix_gateway.api_server import (
     _close_upstream_response_safely,
     _gateway_guard_window_metrics,
     _record_gateway_guard_event,
+    _runtime_guard_window_metrics,
     _sweep_httpx_client_idle_connections,
     _claim_next_active_token_from_snapshot,
     _claim_prompt_cache_affinity_token,
@@ -5077,6 +5081,92 @@ def test_wrap_streaming_body_iterator_runs_on_close_when_inner_aclose_is_cancell
     assert closed is True
 
 
+def test_asgi_send_oserror_closes_body_iterator_and_runs_on_close() -> None:
+    events: list[str] = []
+
+    async def upstream() -> AsyncIterator[bytes]:
+        try:
+            yield b"event: ping\n\n"
+            await asyncio.sleep(60)
+        finally:
+            events.append("upstream_closed")
+
+    async def on_close() -> None:
+        events.append("cleanup_ran")
+
+    async def run() -> None:
+        wrapped = _wrap_streaming_body_iterator(upstream(), on_close=on_close)
+        response = _SSEProxyStreamingResponse(wrapped, media_type="text/event-stream")
+
+        async def receive() -> dict[str, object]:
+            await asyncio.sleep(60)
+            return {"type": "http.disconnect"}
+
+        sent: list[dict[str, object]] = []
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+            if message.get("type") == "http.response.body":
+                raise OSError("client disconnected")
+
+        await response({"type": "http", "method": "GET", "path": "/"}, receive, send)
+        assert sent[0]["type"] == "http.response.start"
+
+    asyncio.run(run())
+
+    assert events == ["upstream_closed", "cleanup_ran"]
+
+
+def test_streaming_proxy_session_stop_workers_cancels_queue_read_and_output_waits() -> None:
+    events: list[str] = []
+
+    async def run() -> None:
+        session = StreamingProxySession(label="worker_cancel_matrix")
+        input_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        full_output_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
+        await full_output_queue.put(b"occupied")
+        upstream_read_gate = asyncio.Event()
+
+        async def wait_on_queue() -> None:
+            try:
+                await input_queue.get()
+            finally:
+                events.append("queue_wait_cancelled")
+
+        async def wait_on_upstream_read() -> None:
+            try:
+                await upstream_read_gate.wait()
+            finally:
+                events.append("upstream_read_cancelled")
+
+        async def wait_on_output_write() -> None:
+            try:
+                await full_output_queue.put(b"blocked")
+            finally:
+                events.append("output_write_cancelled")
+
+        tasks = [
+            asyncio.create_task(wait_on_queue()),
+            asyncio.create_task(wait_on_upstream_read()),
+            asyncio.create_task(wait_on_output_write()),
+        ]
+        for task in tasks:
+            session.add_worker(task)
+        await asyncio.sleep(0)
+
+        assert await session.stop_workers(reason="test_cancel") is True
+
+        assert all(task.done() for task in tasks)
+
+    asyncio.run(run())
+
+    assert sorted(events) == [
+        "output_write_cancelled",
+        "queue_wait_cancelled",
+        "upstream_read_cancelled",
+    ]
+
+
 def test_idempotent_async_callback_retries_after_cancelled_callback() -> None:
     calls = 0
 
@@ -5117,6 +5207,347 @@ def test_idempotent_async_callback_retries_after_false_result() -> None:
     asyncio.run(run())
 
     assert calls == 2
+
+
+def test_upstream_stream_owner_closes_context_when_open_is_cancelled() -> None:
+    _STREAM_OWNER_ACTIVE.clear()
+    _STREAM_OWNER_COUNTERS.clear()
+
+    class CancellingStreamContext:
+        def __init__(self) -> None:
+            self.exited = 0
+
+        async def __aenter__(self):
+            raise asyncio.CancelledError
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self.exited += 1
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.context = CancellingStreamContext()
+
+        def stream(self, method, url, *, headers, content, timeout):
+            return self.context
+
+    async def run() -> DummyClient:
+        client = DummyClient()
+        with pytest.raises(asyncio.CancelledError):
+            await UpstreamStreamOwner.open(
+                client,
+                "POST",
+                "https://example.test/v1/responses",
+                headers={},
+                content=b"{}",
+                timeout=httpx.Timeout(1.0),
+                label="open_cancelled",
+            )
+        return client
+
+    client = asyncio.run(run())
+
+    assert client.context.exited == 1
+    assert _stream_owner_runtime_metrics()["active"] == 0
+
+
+@pytest.mark.parametrize(
+    "await_point",
+    [
+        "iterator_aclose",
+        "response_aclose",
+        "httpcore_stream_aclose",
+        "pool_close_connections",
+        "stream_context_aexit",
+    ],
+)
+def test_upstream_stream_owner_retry_matrix_releases_pool_after_cancelled_cleanup(await_point: str) -> None:
+    _STREAM_OWNER_ACTIVE.clear()
+    _STREAM_OWNER_COUNTERS.clear()
+
+    class CancelOnce:
+        def __init__(self, target: str) -> None:
+            self.target = target
+            self.cancelled = False
+            self.calls: dict[str, int] = {}
+
+        async def maybe_cancel(self, name: str) -> None:
+            self.calls[name] = self.calls.get(name, 0) + 1
+            if name == self.target and not self.cancelled:
+                self.cancelled = True
+                raise asyncio.CancelledError
+
+    cancel_once = CancelOnce(await_point)
+
+    class MatrixIterator:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> bytes:
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await cancel_once.maybe_cancel("iterator_aclose")
+
+    class DeepHTTP11Stream:
+        def __init__(self) -> None:
+            self.closed_calls = 0
+
+        async def aclose(self) -> None:
+            self.closed_calls += 1
+
+    class DummyLock:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class DummyPool:
+        def __init__(self, request: object) -> None:
+            self._requests = [request]
+            self._optional_thread_lock = DummyLock()
+            self.closed_batches: list[list[object]] = []
+
+        def _assign_requests_to_connections(self) -> list[object]:
+            return ["matrix-stale-connection"]
+
+        async def _close_connections(self, closing: list[object]) -> None:
+            await cancel_once.maybe_cancel("pool_close_connections")
+            self.closed_batches.append(closing)
+
+    class PoolByteStream:
+        def __init__(self) -> None:
+            self._stream = DeepHTTP11Stream()
+            self._pool_request = object()
+            self._pool = DummyPool(self._pool_request)
+            self.pool_close_calls = 0
+
+        async def aclose(self) -> None:
+            self.pool_close_calls += 1
+            await cancel_once.maybe_cancel("httpcore_stream_aclose")
+            await self._stream.aclose()
+
+    class BoundLikeStream:
+        def __init__(self, inner: PoolByteStream) -> None:
+            self._stream = inner
+
+        async def aclose(self) -> None:
+            await self._stream.aclose()
+
+    class DummyStreamingResponse:
+        status_code = 200
+
+        def __init__(self) -> None:
+            self.pool_stream = PoolByteStream()
+            self.stream = BoundLikeStream(self.pool_stream)
+            self.iterator = MatrixIterator()
+            self.response_closed_calls = 0
+
+        async def aclose(self) -> None:
+            self.response_closed_calls += 1
+            await cancel_once.maybe_cancel("response_aclose")
+            await self.stream.aclose()
+
+        def aiter_raw(self) -> MatrixIterator:
+            return self.iterator
+
+    class DummyStreamContext:
+        def __init__(self) -> None:
+            self.response = DummyStreamingResponse()
+            self.exited = 0
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self.response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self.exited += 1
+            await cancel_once.maybe_cancel("stream_context_aexit")
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.context = DummyStreamContext()
+
+        def stream(self, method, url, *, headers, content, timeout):
+            return self.context
+
+    async def run() -> tuple[UpstreamStreamOwner, DummyClient]:
+        client = DummyClient()
+        owner = await UpstreamStreamOwner.open(
+            client,
+            "POST",
+            "https://example.test/v1/responses",
+            headers={},
+            content=b"{}",
+            timeout=httpx.Timeout(1.0),
+            label=f"matrix_{await_point}",
+        )
+        owner.iter_raw()
+        assert await owner.close(reason=f"{await_point}_first") is False
+        assert owner.final_state == UpstreamStreamOwner.FAILED
+        assert owner.owner_id in _STREAM_OWNER_ACTIVE
+        assert await owner.close(reason=f"{await_point}_retry") is True
+        return owner, client
+
+    owner, client = asyncio.run(run())
+
+    assert owner.final_state == UpstreamStreamOwner.CLOSED
+    assert owner.owner_id not in _STREAM_OWNER_ACTIVE
+    assert client.context.response.pool_stream._pool_request not in client.context.response.pool_stream._pool._requests
+    assert _STREAM_OWNER_COUNTERS["close_failed_total"] == 1
+    assert _STREAM_OWNER_COUNTERS["close_cancel_retry_total"] >= 1
+    assert _STREAM_OWNER_COUNTERS["close_success_total"] == 1
+
+
+def test_upstream_stream_owner_closes_after_cancelled_read() -> None:
+    _STREAM_OWNER_ACTIVE.clear()
+    _STREAM_OWNER_COUNTERS.clear()
+
+    class DummyStreamingResponse:
+        status_code = 200
+
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.stream = None
+
+        async def aread(self) -> bytes:
+            raise asyncio.CancelledError
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                yield b"data: ok\n\n"
+
+            return iterator()
+
+    class DummyStreamContext:
+        def __init__(self) -> None:
+            self.response = DummyStreamingResponse()
+            self.exited = 0
+
+        async def __aenter__(self) -> DummyStreamingResponse:
+            return self.response
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self.exited += 1
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.context = DummyStreamContext()
+
+        def stream(self, method, url, *, headers, content, timeout):
+            return self.context
+
+    async def run() -> tuple[UpstreamStreamOwner, DummyClient]:
+        client = DummyClient()
+        owner = await UpstreamStreamOwner.open(
+            client,
+            "POST",
+            "https://example.test/v1/responses",
+            headers={},
+            content=b"{}",
+            timeout=httpx.Timeout(1.0),
+            label="cancelled_read",
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await owner.aread()
+        assert await owner.close(reason="cancelled_read_finally") is True
+        return owner, client
+
+    owner, client = asyncio.run(run())
+
+    assert owner.final_state == UpstreamStreamOwner.CLOSED
+    assert client.context.exited == 1
+    assert client.context.response.close_calls == 1
+    assert _stream_owner_runtime_metrics()["active"] == 0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux /proc TCP state inspection")
+def test_upstream_stream_owner_linux_close_wait_does_not_accumulate_on_disconnects() -> None:
+    _STREAM_OWNER_ACTIVE.clear()
+    _STREAM_OWNER_COUNTERS.clear()
+
+    def close_wait_count_for_port(port: int) -> int:
+        count = 0
+        for proc_path in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(proc_path, encoding="utf-8") as handle:
+                    rows = handle.read().splitlines()[1:]
+            except OSError:
+                continue
+            for row in rows:
+                parts = row.split()
+                if len(parts) < 4 or parts[3] != "08":
+                    continue
+                local_port = int(parts[1].rsplit(":", 1)[1], 16)
+                remote_port = int(parts[2].rsplit(":", 1)[1], 16)
+                if local_port == port or remote_port == port:
+                    count += 1
+        return count
+
+    async def run() -> tuple[int, int]:
+        async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/event-stream\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"\r\n"
+                )
+                await writer.drain()
+                while True:
+                    writer.write(b"9\r\ndata: x\n\n\r\n")
+                    await writer.drain()
+                    await asyncio.sleep(0.01)
+            except (asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError):
+                return
+            finally:
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
+
+        server = await asyncio.start_server(handle_client, "127.0.0.1", 0)
+        assert server.sockets is not None
+        port = int(server.sockets[0].getsockname()[1])
+        url = f"http://127.0.0.1:{port}/stream"
+        before = close_wait_count_for_port(port)
+        try:
+            limits = httpx.Limits(max_connections=20, max_keepalive_connections=0)
+            async with httpx.AsyncClient(limits=limits, http2=False) as client:
+                for _ in range(500):
+                    owner = await UpstreamStreamOwner.open(
+                        client,
+                        "GET",
+                        url,
+                        headers={},
+                        content=b"",
+                        timeout=httpx.Timeout(5.0, read=None),
+                        label="linux_close_wait",
+                    )
+                    iterator = owner.iter_raw()
+                    await iterator.__anext__()
+                    assert await owner.close(reason="linux_disconnect") is True
+
+            deadline = time.monotonic() + 10.0
+            after = close_wait_count_for_port(port)
+            while after > before + 1 and time.monotonic() < deadline:
+                await asyncio.sleep(0.25)
+                after = close_wait_count_for_port(port)
+            return before, after
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    before_count, after_count = asyncio.run(run())
+
+    assert after_count <= before_count + 1
+    assert _stream_owner_runtime_metrics()["active"] == 0
 
 
 def test_upstream_stream_owner_closes_response_context_and_releases_pool_request() -> None:
@@ -5283,12 +5714,14 @@ def test_upstream_stream_owner_retries_cleanup_until_success(caplog) -> None:
         )
         with caplog.at_level(logging.WARNING, logger="oaix_gateway.api_server"):
             assert await owner.close(reason="first_close") is False
-        assert _stream_owner_runtime_metrics()["active_by_state"] == {"close_failed": 1}
+        assert owner.final_state == UpstreamStreamOwner.FAILED
+        assert _stream_owner_runtime_metrics()["active_by_state"] == {UpstreamStreamOwner.FAILED: 1}
         assert await owner.close(reason="retry_close") is True
         return owner, client
 
     owner, client = asyncio.run(run())
 
+    assert owner.final_state == UpstreamStreamOwner.CLOSED
     assert owner.owner_id not in _STREAM_OWNER_ACTIVE
     assert client.context.exit_calls == 2
     assert client.context.response.close_calls == 2
@@ -5314,9 +5747,28 @@ def test_gateway_guard_window_metrics_counts_recent_responses_failures() -> None
     assert metrics["responses_pooltimeout"] == 2
 
 
+def test_runtime_guard_window_metrics_detect_fd_growth_with_disconnects() -> None:
+    _RUNTIME_GUARD_SAMPLES.clear()
+    now = time.monotonic()
+    _RUNTIME_GUARD_SAMPLES.append((now - 120.0, 500, 0, 8, 0))
+    _RUNTIME_GUARD_SAMPLES.append((now - 60.0, 525, 3, 4, 1))
+    _RUNTIME_GUARD_SAMPLES.append((now, 545, 6, 2, 1))
+
+    metrics = _runtime_guard_window_metrics(window_seconds=300.0)
+
+    assert metrics["open_fds_first"] == 500
+    assert metrics["open_fds_last"] == 545
+    assert metrics["open_fds_delta"] == 45
+    assert metrics["tcp_close_wait_443_max"] == 6
+    assert metrics["responses_499_last"] == 1
+    assert metrics["open_fds_rising_with_499"] is True
+    assert metrics["active_low_open_fds_high"] is True
+
+
 def test_livez_exposes_stream_owner_and_guard_metrics() -> None:
     app = create_app()
     _GATEWAY_GUARD_EVENTS.clear()
+    _RUNTIME_GUARD_SAMPLES.clear()
     _record_gateway_guard_event(endpoint="/v1/responses", status_code=499)
 
     route = next(
@@ -5329,9 +5781,18 @@ def test_livez_exposes_stream_owner_and_guard_metrics() -> None:
     payload = json.loads(response.body)
 
     assert payload["stream_owner"]["active"] == _stream_owner_runtime_metrics()["active"]
+    assert "closing" in payload["stream_owner"]
+    assert "close_success_total" in payload["stream_owner"]
+    assert "force_httpcore_close_total" in payload["stream_owner"]
+    assert "force_pool_release_total" in payload["stream_owner"]
+    assert payload["gateway"]["499_per_5m"] == 1
+    assert "pooltimeout_per_5m" in payload["gateway"]
     assert payload["guards"]["window"]["responses_499"] == 1
+    assert "runtime_window" in payload["guards"]
     assert payload["guards"]["alerts"]["responses_499"] is True
     assert "tcp_close_wait_443_warning" in payload["guards"]["alerts"]
+    assert "open_fds_rising_with_499" in payload["guards"]["alerts"]
+    assert "active_low_open_fds_high" in payload["guards"]["alerts"]
 
 
 def test_close_upstream_response_safely_forces_inner_stream_after_interrupted_httpx_close() -> None:
