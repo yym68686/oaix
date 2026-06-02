@@ -358,13 +358,16 @@ def _runtime_guard_window_metrics(*, window_seconds: float = 900.0) -> dict[str,
     active_values = [sample[3] for sample in samples]
     fd_delta = None
     fd_slope_per_min = None
+    fd_elapsed_seconds = None
     if len(open_fd_values) >= 2 and len(samples) >= 2:
-        first_fd = next((sample[1] for sample in samples if sample[1] is not None), None)
-        last_fd = next((sample[1] for sample in reversed(samples) if sample[1] is not None), None)
+        first_fd_sample = next((sample for sample in samples if sample[1] is not None), None)
+        last_fd_sample = next((sample for sample in reversed(samples) if sample[1] is not None), None)
+        first_fd = first_fd_sample[1] if first_fd_sample is not None else None
+        last_fd = last_fd_sample[1] if last_fd_sample is not None else None
         if first_fd is not None and last_fd is not None:
             fd_delta = int(last_fd) - int(first_fd)
-            elapsed_seconds = max(1.0, samples[-1][0] - samples[0][0])
-            fd_slope_per_min = fd_delta / (elapsed_seconds / 60.0)
+            fd_elapsed_seconds = max(1.0, float(last_fd_sample[0] - first_fd_sample[0]))
+            fd_slope_per_min = fd_delta / (fd_elapsed_seconds / 60.0)
 
     recent_499 = samples[-1][4] if samples else 0
     last_open_fds = open_fd_values[-1] if open_fd_values else None
@@ -376,12 +379,16 @@ def _runtime_guard_window_metrics(*, window_seconds: float = 900.0) -> dict[str,
         "open_fds_last": last_open_fds,
         "open_fds_delta": fd_delta,
         "open_fds_slope_per_min": fd_slope_per_min,
+        "open_fds_elapsed_seconds": fd_elapsed_seconds,
         "tcp_close_wait_443_max": max(close_wait_values) if close_wait_values else 0,
         "active_responses_last": last_active,
         "responses_499_last": recent_499,
         "open_fds_rising_with_499": bool(
             fd_delta is not None
             and fd_slope_per_min is not None
+            and fd_elapsed_seconds is not None
+            and len(open_fd_values) >= 4
+            and fd_elapsed_seconds >= 900.0
             and fd_delta > 0
             and fd_slope_per_min > 1.0
             and recent_499 > 0

@@ -5767,19 +5767,33 @@ def test_gateway_guard_window_metrics_counts_recent_responses_failures() -> None
 def test_runtime_guard_window_metrics_detect_fd_growth_with_disconnects() -> None:
     _RUNTIME_GUARD_SAMPLES.clear()
     now = time.monotonic()
-    _RUNTIME_GUARD_SAMPLES.append((now - 120.0, 500, 0, 8, 0))
-    _RUNTIME_GUARD_SAMPLES.append((now - 60.0, 525, 3, 4, 1))
+    _RUNTIME_GUARD_SAMPLES.append((now - 900.0, 500, 0, 8, 0))
+    _RUNTIME_GUARD_SAMPLES.append((now - 600.0, 515, 1, 6, 1))
+    _RUNTIME_GUARD_SAMPLES.append((now - 300.0, 530, 3, 4, 1))
     _RUNTIME_GUARD_SAMPLES.append((now, 545, 6, 2, 1))
 
-    metrics = _runtime_guard_window_metrics(window_seconds=300.0)
+    metrics = _runtime_guard_window_metrics(window_seconds=1200.0)
 
     assert metrics["open_fds_first"] == 500
     assert metrics["open_fds_last"] == 545
     assert metrics["open_fds_delta"] == 45
+    assert metrics["open_fds_elapsed_seconds"] >= 900.0
     assert metrics["tcp_close_wait_443_max"] == 6
     assert metrics["responses_499_last"] == 1
     assert metrics["open_fds_rising_with_499"] is True
     assert metrics["active_low_open_fds_high"] is True
+
+
+def test_runtime_guard_window_metrics_ignores_short_fd_blips_after_startup() -> None:
+    _RUNTIME_GUARD_SAMPLES.clear()
+    now = time.monotonic()
+    _RUNTIME_GUARD_SAMPLES.append((now - 60.0, 46, 0, 10, 1))
+    _RUNTIME_GUARD_SAMPLES.append((now, 47, 0, 11, 2))
+
+    metrics = _runtime_guard_window_metrics(window_seconds=900.0)
+
+    assert metrics["open_fds_delta"] == 1
+    assert metrics["open_fds_rising_with_499"] is False
 
 
 def test_livez_exposes_stream_owner_and_guard_metrics() -> None:
