@@ -3241,7 +3241,12 @@ def _state_http_client(app: FastAPI, name: str) -> httpx.AsyncClient:
     return app.state.http_client
 
 
-async def _await_cleanup_task_safely(cleanup_coro: Awaitable[Any], *, label: str) -> bool:
+async def _await_cleanup_task_safely(
+    cleanup_coro: Awaitable[Any],
+    *,
+    label: str,
+    false_is_failure: bool = False,
+) -> bool:
     current_task = asyncio.current_task()
     if current_task is not None:
         while current_task.cancelling():
@@ -3273,7 +3278,7 @@ async def _await_cleanup_task_safely(cleanup_coro: Awaitable[Any], *, label: str
             exc_info=(type(exc), exc, exc.__traceback__),
         )
         return False
-    if cleanup_result is False:
+    if false_is_failure and cleanup_result is False:
         return False
     return True
 
@@ -3445,6 +3450,7 @@ class UpstreamStreamOwner:
         return await _await_cleanup_task_safely(
             self._close_once(reason=reason),
             label=f"Upstream stream owner {self.label}",
+            false_is_failure=True,
         )
 
     async def _close_once(self, *, reason: str = "unknown") -> bool:

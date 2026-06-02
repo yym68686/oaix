@@ -5020,6 +5020,23 @@ def test_close_stream_cm_safely_logs_cleanup_failure(caplog) -> None:
     assert "close failed" in caplog.text
 
 
+def test_close_stream_cm_safely_treats_false_context_exit_as_success() -> None:
+    class FalseReturningStreamCM:
+        def __init__(self) -> None:
+            self.exit_calls = 0
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            self.exit_calls += 1
+            return False
+
+    stream_cm = FalseReturningStreamCM()
+
+    result = asyncio.run(_close_stream_cm_safely(stream_cm))
+
+    assert result is True
+    assert stream_cm.exit_calls == 1
+
+
 def test_close_async_iterator_safely_absorbs_cancelled_aclose(caplog) -> None:
     class CancellingIterator:
         def __init__(self) -> None:
