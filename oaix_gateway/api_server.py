@@ -26,6 +26,7 @@ import anyio
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -10975,9 +10976,22 @@ async def _build_admin_token_observed_cost_items(token_rows: list[Any]) -> list[
     ]
 
 
-async def _cached_admin_requests_payload(app: FastAPI, *, limit: int) -> dict[str, Any]:
+def _json_response_body(payload: Any) -> bytes:
+    return json.dumps(
+        jsonable_encoder(payload),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+async def _cached_admin_requests_payload(
+    app: FastAPI,
+    *,
+    limit: int,
+    force_refresh: bool = False,
+) -> bytes:
     ttl_seconds = _admin_requests_cache_ttl_seconds()
-    cache: dict[int, tuple[float, dict[str, Any]]] = getattr(app.state, "admin_requests_cache", {})
+    cache: dict[int, tuple[float, bytes]] = getattr(app.state, "admin_requests_cache", {})
     if not isinstance(cache, dict):
         cache = {}
         app.state.admin_requests_cache = cache
@@ -10985,18 +10999,20 @@ async def _cached_admin_requests_payload(app: FastAPI, *, limit: int) -> dict[st
     cache_key = max(1, min(int(limit), 500))
     now = time.monotonic()
     cached = cache.get(cache_key)
-    if ttl_seconds > 0 and cached is not None and cached[0] > now:
+    if not force_refresh and ttl_seconds > 0 and cached is not None and cached[0] > now:
         return cached[1]
 
     lock = getattr(app.state, "admin_requests_cache_lock", None)
     if not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
         app.state.admin_requests_cache_lock = lock
+    if not force_refresh and cached is not None and lock.locked():
+        return cached[1]
 
     async with lock:
         now = time.monotonic()
         cached = cache.get(cache_key)
-        if ttl_seconds > 0 and cached is not None and cached[0] > now:
+        if not force_refresh and ttl_seconds > 0 and cached is not None and cached[0] > now:
             return cached[1]
 
         summary, analytics, raw_items = await asyncio.gather(
@@ -11009,18 +11025,19 @@ async def _cached_admin_requests_payload(app: FastAPI, *, limit: int) -> dict[st
             "analytics": asdict(analytics),
             "items": [asdict(item) for item in raw_items],
         }
+        body = _json_response_body(payload)
         if ttl_seconds > 0:
-            cache[cache_key] = (time.monotonic() + ttl_seconds, payload)
+            cache[cache_key] = (time.monotonic() + ttl_seconds, body)
             if len(cache) > 8:
                 for stale_key in sorted(cache, key=lambda key: cache[key][0])[:-8]:
                     cache.pop(stale_key, None)
-        return payload
+        return body
 
 
 async def _admin_requests_cache_refresh_loop(app: FastAPI) -> None:
     while True:
         try:
-            await _cached_admin_requests_payload(app, limit=80)
+            await _cached_admin_requests_payload(app, limit=80, force_refresh=True)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -11589,12 +11606,12 @@ def create_app() -> FastAPI:
     async def list_requests_route(
         limit: int = Query(100, ge=1, le=500),
         _: None = Depends(verify_service_api_key),
-    ) -> dict[str, Any]:
+    ) -> Response:
         try:
-            payload = await _cached_admin_requests_payload(app, limit=limit)
+            body = await _cached_admin_requests_payload(app, limit=limit)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail="Request logs temporarily unavailable") from exc
-        return payload
+        return Response(content=body, media_type="application/json")
 
     @app.get("/admin/runtime")
     async def runtime_route(
