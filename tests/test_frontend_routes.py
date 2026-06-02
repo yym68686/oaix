@@ -261,7 +261,8 @@ def test_frontend_dashboard_refresh_loads_admin_panels_in_parallel() -> None:
     assert "tasks.push(loadRequests())" in refresh_function
     assert "await Promise.all(tasks)" in refresh_function
     assert "refreshDashboard({ includeTokens: false })" in app_js
-    assert "refreshDashboard({ includeRequests: false })" in app_js
+    assert "void refreshDashboard();" in app_js
+    assert "scheduleInitialRequestsLoad" not in app_js
     assert "await loadRequests();" not in refresh_function
 
 
@@ -287,6 +288,7 @@ def test_frontend_loads_token_quota_lazily_after_list_render() -> None:
     assert "new AbortController()" in quota_function
     assert "listRequestSeq !== state.tokenListRequestSeq" in quota_function
     assert "quota_loading" in app_js
+    assert "pendingIdSet.has(tokenId)" in quota_function
 
 
 def test_frontend_probe_request_sends_selected_model() -> None:

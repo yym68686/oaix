@@ -76,6 +76,7 @@ from oaix_gateway.api_server import (
     _build_stream_error_event,
     _build_admin_token_items,
     _build_admin_token_quota_items,
+    _admin_quota_sync_refresh_limit,
     _close_async_iterator_safely,
     _close_stream_cm_safely,
     _close_upstream_response_safely,
@@ -11469,6 +11470,14 @@ def test_parse_admin_token_ids_dedupes_and_validates_positive_ids() -> None:
         _parse_admin_token_ids("7,nope")
     with pytest.raises(ValueError):
         _parse_admin_token_ids("0")
+
+
+def test_admin_quota_sync_refresh_default_does_not_block_admin_ui(monkeypatch) -> None:
+    monkeypatch.delenv("ADMIN_QUOTA_SYNC_REFRESH_LIMIT", raising=False)
+    assert _admin_quota_sync_refresh_limit() == 0
+
+    monkeypatch.setenv("ADMIN_QUOTA_SYNC_REFRESH_LIMIT", "2")
+    assert _admin_quota_sync_refresh_limit() == 2
 
 
 def test_build_admin_token_items_skips_inactive_tokens_for_quota_fetch(monkeypatch) -> None:

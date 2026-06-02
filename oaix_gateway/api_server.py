@@ -4118,7 +4118,7 @@ def _admin_quota_max_concurrency() -> int:
 
 
 def _admin_quota_sync_refresh_limit() -> int:
-    return _int_env("ADMIN_QUOTA_SYNC_REFRESH_LIMIT", 12, minimum=0)
+    return _int_env("ADMIN_QUOTA_SYNC_REFRESH_LIMIT", 0, minimum=0)
 
 
 def _admin_quota_background_refresh_limit() -> int:

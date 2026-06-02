@@ -2,7 +2,6 @@ const STORAGE_KEY = "oaix.serviceKey";
 const THEME_STORAGE_KEY = "oaix.themePreference";
 const IMPORT_JOB_STORAGE_KEY = "oaix.importJobId";
 const REFRESH_INTERVAL_MS = 30000;
-const INITIAL_TRAFFIC_LOAD_DELAY_MS = 250;
 const IMPORT_JOB_POLL_INTERVAL_MS = 1500;
 const TOAST_DURATION_MS = 5200;
 const TOAST_EXIT_DURATION_MS = 220;
@@ -2964,6 +2963,11 @@ async function loadTokenQuotas(tokenIds, { listRequestSeq = state.tokenListReque
       }
     });
     const requestedIdSet = new Set(resolvedIds);
+    const pendingIdSet = new Set(
+      (Array.isArray(data.refresh_pending_ids) ? data.refresh_pending_ids : [])
+        .map((id) => Number(id))
+        .filter((id) => Number.isFinite(id) && id > 0),
+    );
     state.tokenItems = state.tokenItems.map((item) => {
       const tokenId = Number(item?.id);
       const patch = patchesById.get(tokenId);
@@ -2971,13 +2975,13 @@ async function loadTokenQuotas(tokenIds, { listRequestSeq = state.tokenListReque
         return {
           ...item,
           ...patch,
-          quota_loading: false,
+          quota_loading: pendingIdSet.has(tokenId) && !patch?.quota,
         };
       }
       if (requestedIdSet.has(tokenId)) {
         return {
           ...item,
-          quota_loading: false,
+          quota_loading: pendingIdSet.has(tokenId),
         };
       }
       return item;
@@ -3800,21 +3804,6 @@ function renderRequestLoadError(error) {
   `;
 }
 
-function scheduleInitialRequestsLoad() {
-  const load = () => {
-    if (document.hidden) {
-      state.refreshPendingOnVisible = true;
-      return;
-    }
-    void loadRequests().catch(renderRequestLoadError);
-  };
-  if (typeof window.requestIdleCallback === "function") {
-    window.requestIdleCallback(load, { timeout: 1200 });
-    return;
-  }
-  window.setTimeout(load, INITIAL_TRAFFIC_LOAD_DELAY_MS);
-}
-
 async function refreshDashboard({ includeTokens = true, includeRequests = true } = {}) {
   if (state.refreshing) {
     return;
@@ -4519,7 +4508,7 @@ elements.clearKeyButton.addEventListener("click", clearServiceKey);
 elements.importButton.addEventListener("click", importTokens);
 elements.resetImportButton.addEventListener("click", resetImportForm);
 
-void refreshDashboard({ includeRequests: false }).finally(scheduleInitialRequestsLoad);
+void refreshDashboard();
 state.timer = window.setInterval(() => {
   if (document.hidden) {
     state.refreshPendingOnVisible = true;
