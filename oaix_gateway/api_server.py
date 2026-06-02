@@ -11009,7 +11009,7 @@ async def _cached_admin_requests_payload(
     *,
     limit: int,
     force_refresh: bool = False,
-) -> bytes:
+) -> tuple[bytes, str]:
     ttl_seconds = _admin_requests_cache_ttl_seconds()
     cache: dict[int, tuple[float, bytes]] = getattr(app.state, "admin_requests_cache", {})
     if not isinstance(cache, dict):
@@ -11020,20 +11020,24 @@ async def _cached_admin_requests_payload(
     now = time.monotonic()
     cached = cache.get(cache_key)
     if not force_refresh and ttl_seconds > 0 and cached is not None and cached[0] > now:
-        return cached[1]
+        return cached[1], "hit"
+    if not force_refresh and cached is not None:
+        return cached[1], "stale"
 
     lock = getattr(app.state, "admin_requests_cache_lock", None)
     if not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
         app.state.admin_requests_cache_lock = lock
     if not force_refresh and cached is not None and lock.locked():
-        return cached[1]
+        return cached[1], "stale"
 
     async with lock:
         now = time.monotonic()
         cached = cache.get(cache_key)
         if not force_refresh and ttl_seconds > 0 and cached is not None and cached[0] > now:
-            return cached[1]
+            return cached[1], "hit"
+        if not force_refresh and cached is not None:
+            return cached[1], "stale"
 
         summary, analytics, raw_items = await asyncio.gather(
             get_request_log_summary(hours=24),
@@ -11051,7 +11055,7 @@ async def _cached_admin_requests_payload(
             if len(cache) > 8:
                 for stale_key in sorted(cache, key=lambda key: cache[key][0])[:-8]:
                     cache.pop(stale_key, None)
-        return body
+        return body, "refresh" if force_refresh else "miss"
 
 
 async def _admin_requests_cache_refresh_loop(app: FastAPI) -> None:
@@ -11628,10 +11632,14 @@ def create_app() -> FastAPI:
         _: None = Depends(verify_service_api_key),
     ) -> Response:
         try:
-            body = await _cached_admin_requests_payload(app, limit=limit)
+            body, cache_status = await _cached_admin_requests_payload(app, limit=limit)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail="Request logs temporarily unavailable") from exc
-        return Response(content=body, media_type="application/json")
+        return Response(
+            content=body,
+            media_type="application/json",
+            headers={"X-OAIX-Admin-Requests-Cache": cache_status},
+        )
 
     @app.get("/admin/runtime")
     async def runtime_route(
