@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from time import perf_counter
 from typing import Any
 
-from sqlalchemy import case, delete, func, select, text
+from sqlalchemy import case, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .database import CodexToken, GatewayRequestLog, get_read_session, get_request_log_session, utcnow
@@ -811,12 +811,51 @@ async def get_request_log_summary(*, hours: int | None = None) -> RequestLogSumm
 async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
     async with get_read_session() as session:
         stmt = (
-            select(GatewayRequestLog)
+            select(
+                GatewayRequestLog.id,
+                GatewayRequestLog.request_id,
+                GatewayRequestLog.endpoint,
+                GatewayRequestLog.model,
+                GatewayRequestLog.model_name,
+                GatewayRequestLog.is_stream,
+                GatewayRequestLog.status_code,
+                GatewayRequestLog.success,
+                GatewayRequestLog.attempt_count,
+                GatewayRequestLog.token_id,
+                GatewayRequestLog.account_id,
+                GatewayRequestLog.started_at,
+                GatewayRequestLog.finished_at,
+                GatewayRequestLog.first_token_at,
+                GatewayRequestLog.ttft_ms,
+                GatewayRequestLog.duration_ms,
+                GatewayRequestLog.timing_spans,
+                GatewayRequestLog.input_tokens,
+                GatewayRequestLog.cached_input_tokens,
+                GatewayRequestLog.output_tokens,
+                GatewayRequestLog.total_tokens,
+                GatewayRequestLog.estimated_cost_usd,
+                GatewayRequestLog.request_payload_hash,
+                GatewayRequestLog.upstream_payload_hash,
+                GatewayRequestLog.prompt_template_hash,
+                GatewayRequestLog.prompt_dynamic_hash,
+                GatewayRequestLog.prompt_cache_source,
+                GatewayRequestLog.prompt_cache_key_hash,
+                GatewayRequestLog.prompt_cache_retention_requested,
+                GatewayRequestLog.prompt_cache_retention_sent,
+                GatewayRequestLog.session_id_hash,
+                GatewayRequestLog.session_id_source,
+                GatewayRequestLog.previous_response_id_hash,
+                GatewayRequestLog.upstream_response_id,
+                GatewayRequestLog.cache_hit_ratio,
+                GatewayRequestLog.cache_affinity_result,
+                GatewayRequestLog.cache_affinity_lane_index,
+                GatewayRequestLog.error_message,
+            )
             .order_by(GatewayRequestLog.started_at.desc(), GatewayRequestLog.id.desc())
             .limit(max(1, min(limit, 500)))
         )
         result = await session.execute(stmt)
-        items = result.scalars().all()
+        items = result.all()
         return [
             RequestLogItem(
                 id=item.id,
@@ -830,8 +869,8 @@ async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
                 attempt_count=item.attempt_count,
                 token_id=item.token_id,
                 account_id=item.account_id,
-                client_ip=item.client_ip,
-                user_agent=item.user_agent,
+                client_ip=None,
+                user_agent=None,
                 started_at=item.started_at,
                 finished_at=item.finished_at,
                 first_token_at=item.first_token_at,
@@ -860,7 +899,7 @@ async def list_request_logs(limit: int = 100) -> list[RequestLogItem]:
                 cache_hit_ratio=item.cache_hit_ratio,
                 cache_affinity_result=item.cache_affinity_result,
                 cache_affinity_lane_index=item.cache_affinity_lane_index,
-                prompt_cache_trace=item.prompt_cache_trace if isinstance(item.prompt_cache_trace, dict) else None,
+                prompt_cache_trace=None,
                 error_message=item.error_message,
             )
             for item in items
@@ -886,14 +925,54 @@ async def get_request_costs_by_token(token_ids: list[int] | set[int] | tuple[int
     resolved_token_ids = _normalize_request_token_ids(token_ids)
     if not resolved_token_ids:
         return {}
+    resolved_token_id_set = set(resolved_token_ids)
 
     async with get_read_session() as session:
-        result = await session.execute(_build_request_token_costs_stmt(token_ids=resolved_token_ids))
+        token_rows = (
+            await session.execute(
+                select(CodexToken.id, CodexToken.merged_into_token_id).where(
+                    or_(
+                        CodexToken.id.in_(resolved_token_ids),
+                        CodexToken.merged_into_token_id.in_(resolved_token_ids),
+                    )
+                )
+            )
+        ).all()
+
+        canonical_by_log_token_id: dict[int, int] = {}
+        for token_id, merged_into_token_id in token_rows:
+            resolved_id = int(token_id)
+            merged_id = int(merged_into_token_id) if merged_into_token_id is not None else None
+            canonical_id = merged_id if merged_id in resolved_token_id_set else resolved_id
+            if canonical_id in resolved_token_id_set:
+                canonical_by_log_token_id[resolved_id] = canonical_id
+
+        if not canonical_by_log_token_id:
+            return {}
+
+        result = await session.execute(
+            select(
+                GatewayRequestLog.token_id,
+                func.sum(GatewayRequestLog.estimated_cost_usd),
+            )
+            .where(GatewayRequestLog.token_id.in_(tuple(canonical_by_log_token_id)))
+            .group_by(GatewayRequestLog.token_id)
+        )
         rows = result.all()
+
+    costs_by_canonical_id: dict[int, float] = {}
+    for token_id, estimated_cost_usd in rows:
+        if token_id is None:
+            continue
+        canonical_id = canonical_by_log_token_id.get(int(token_id))
+        if canonical_id is None:
+            continue
+        costs_by_canonical_id[canonical_id] = costs_by_canonical_id.get(canonical_id, 0.0) + _float_or_zero(
+            estimated_cost_usd
+        )
     return {
-        int(token_id): _round_cost(_float_or_zero(estimated_cost_usd))
-        for token_id, estimated_cost_usd in rows
-        if token_id is not None
+        token_id: _round_cost(estimated_cost_usd)
+        for token_id, estimated_cost_usd in costs_by_canonical_id.items()
     }
 
 

@@ -27,6 +27,7 @@ import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
@@ -10854,6 +10855,7 @@ async def _build_admin_token_items(
     *,
     token_rows: list[Any],
     include_quota: bool,
+    include_observed_cost: bool = True,
 ) -> list[dict[str, Any]]:
     active_stream_cap = normalize_token_active_stream_cap(
         _current_token_selection_settings(app).active_stream_cap
@@ -10872,7 +10874,7 @@ async def _build_admin_token_items(
     observed_costs_by_account: dict[str, float] = {}
     token_counts_by_account: dict[str, int] = {}
     observed_token_ids = {token_row.id for token_row in token_rows}
-    if observed_token_ids:
+    if include_observed_cost and observed_token_ids:
         try:
             observed_costs_by_token = await get_request_costs_by_token(observed_token_ids)
         except Exception:
@@ -10885,7 +10887,7 @@ async def _build_admin_token_items(
         for account_id in [_observed_cost_fallback_account_id(token_row)]
         if account_id is not None
     }
-    if fallback_account_ids:
+    if include_observed_cost and fallback_account_ids:
         try:
             observed_costs_by_account, token_counts_by_account = await asyncio.gather(
                 get_request_costs_by_account(fallback_account_ids),
@@ -10915,6 +10917,50 @@ async def _build_admin_token_items(
             ),
             active_stream_cap=active_stream_cap,
         )
+        for token_row in token_rows
+    ]
+
+
+async def _build_admin_token_observed_cost_items(token_rows: list[Any]) -> list[dict[str, Any]]:
+    if not token_rows:
+        return []
+
+    observed_costs_by_token: dict[int, float] = {}
+    observed_costs_by_account: dict[str, float] = {}
+    token_counts_by_account: dict[str, int] = {}
+    observed_token_ids = {int(token_row.id) for token_row in token_rows}
+    if observed_token_ids:
+        try:
+            observed_costs_by_token = await get_request_costs_by_token(observed_token_ids)
+        except Exception:
+            logger.exception("Failed to collect admin token observed costs by token")
+
+    fallback_account_ids = {
+        account_id
+        for token_row in token_rows
+        if int(token_row.id) not in observed_costs_by_token
+        for account_id in [_observed_cost_fallback_account_id(token_row)]
+        if account_id is not None
+    }
+    if fallback_account_ids:
+        try:
+            observed_costs_by_account, token_counts_by_account = await asyncio.gather(
+                get_request_costs_by_account(fallback_account_ids),
+                get_token_counts_by_account_ids(fallback_account_ids),
+            )
+        except Exception:
+            logger.exception("Failed to collect admin token observed cost fallbacks")
+
+    return [
+        {
+            "id": int(token_row.id),
+            "observed_cost_usd": _resolve_token_observed_cost_usd(
+                observed_costs_by_token,
+                observed_costs_by_account,
+                token_counts_by_account,
+                token_row=token_row,
+            ),
+        }
         for token_row in token_rows
     ]
 
@@ -11103,6 +11149,7 @@ def create_app() -> FastAPI:
     app.state.prompt_cache_affinity_lanes = OrderedDict()
     app.state.prompt_cache_response_bindings = OrderedDict()
     app.state.token_import_worker = None
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_cors_allow_origins(),
@@ -11352,6 +11399,7 @@ def create_app() -> FastAPI:
             http_request.app,
             token_rows=token_rows,
             include_quota=include_quota,
+            include_observed_cost=False,
         )
         total = max(0, int(filtered_total))
         total_pages = max(1, int(math.ceil(total / limit))) if limit else 1
@@ -11389,6 +11437,25 @@ def create_app() -> FastAPI:
             },
             "items": items,
         }
+
+    @app.get("/admin/tokens/costs")
+    async def list_token_costs_route(
+        ids: str = Query("", max_length=2048),
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        try:
+            token_ids = _parse_admin_token_ids(ids, limit=100)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not token_ids:
+            return {"items": []}
+
+        token_rows = await list_token_rows(
+            limit=len(token_ids),
+            offset=0,
+            token_ids=token_ids,
+        )
+        return {"items": await _build_admin_token_observed_cost_items(token_rows)}
 
     @app.get("/admin/tokens/quota")
     async def list_token_quota_route(

@@ -245,7 +245,7 @@ def test_frontend_import_panel_supports_sub2api_export_json() -> None:
     assert "payload.expired = expiresAt" in normalize_function
 
 
-def test_frontend_dashboard_refresh_does_not_overlap_heavy_admin_requests() -> None:
+def test_frontend_dashboard_refresh_loads_admin_panels_in_parallel() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     refresh_function = app_js.split("async function refreshDashboard", 1)[1].split("function splitTokenInputLines", 1)[0]
 
@@ -254,11 +254,12 @@ def test_frontend_dashboard_refresh_does_not_overlap_heavy_admin_requests() -> N
     assert "async function refreshDashboard({ includeTokens = true } = {})" in app_js
     assert "if (state.refreshing)" in refresh_function
     assert "state.refreshing = true" in refresh_function
-    assert "await loadRequests();" in refresh_function
+    assert "const tasks = [loadHealth(), loadRequests()]" in refresh_function
     assert "if (includeTokens)" in refresh_function
-    assert "await loadTokens();" in refresh_function
+    assert "tasks.push(loadTokens())" in refresh_function
+    assert "await Promise.all(tasks)" in refresh_function
     assert "refreshDashboard({ includeTokens: false })" in app_js
-    assert "Promise.all([loadTokens(), loadRequests()])" not in refresh_function
+    assert "await loadRequests();" not in refresh_function
 
 
 def test_frontend_pauses_background_polling_when_tab_is_hidden() -> None:
@@ -432,9 +433,10 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         assert token_ids is None
         return [SimpleNamespace(id=7)]
 
-    async def fake_build_admin_token_items(app, *, token_rows, include_quota):
+    async def fake_build_admin_token_items(app, *, token_rows, include_quota, include_observed_cost=True):
         del app
         assert include_quota is False
+        assert include_observed_cost is False
         assert [item.id for item in token_rows] == [7]
         return [{"id": 7, "email": "a@example.com"}]
 
@@ -536,9 +538,10 @@ def test_admin_tokens_route_includes_selected_import_batch_failed_items(monkeypa
         assert token_ids == (7,)
         return [SimpleNamespace(id=7)]
 
-    async def fake_build_admin_token_items(app, *, token_rows, include_quota):
+    async def fake_build_admin_token_items(app, *, token_rows, include_quota, include_observed_cost=True):
         del app
         assert include_quota is False
+        assert include_observed_cost is False
         assert [item.id for item in token_rows] == [7]
         return [{"id": 7, "email": "a@example.com"}]
 

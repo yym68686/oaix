@@ -87,6 +87,8 @@ const state = {
   tokenPageLoading: false,
   tokenListAbortController: null,
   tokenListRequestSeq: 0,
+  tokenCostAbortController: null,
+  tokenCostRequestSeq: 0,
   tokenQuotaAbortController: null,
   tokenQuotaRequestSeq: 0,
   tokenQuotaRetryTimer: null,
@@ -2833,6 +2835,14 @@ function abortTokenQuotaRequest() {
   }
 }
 
+function abortTokenCostRequest() {
+  state.tokenCostRequestSeq += 1;
+  if (state.tokenCostAbortController) {
+    state.tokenCostAbortController.abort();
+    state.tokenCostAbortController = null;
+  }
+}
+
 function scheduleTokenQuotaRetry(tokenIds, { listRequestSeq = state.tokenListRequestSeq } = {}) {
   const resolvedIds = Array.from(
     new Set(
@@ -2879,6 +2889,65 @@ function markTokenQuotaError(ids, message) {
       },
     };
   });
+}
+
+async function loadTokenCosts(tokenIds, { listRequestSeq = state.tokenListRequestSeq } = {}) {
+  const resolvedIds = Array.from(
+    new Set(
+      (Array.isArray(tokenIds) ? tokenIds : [])
+        .map((id) => Number(id))
+        .filter((id) => Number.isFinite(id) && id > 0),
+    ),
+  );
+  if (!resolvedIds.length || listRequestSeq !== state.tokenListRequestSeq) {
+    return;
+  }
+
+  abortTokenCostRequest();
+  const costRequestSeq = state.tokenCostRequestSeq;
+  const controller = new AbortController();
+  state.tokenCostAbortController = controller;
+
+  try {
+    const params = new URLSearchParams({ ids: resolvedIds.join(",") });
+    const data = await fetchJson(`/admin/tokens/costs?${params.toString()}`, {
+      headers: authHeaders(),
+      signal: controller.signal,
+    });
+    if (costRequestSeq !== state.tokenCostRequestSeq || listRequestSeq !== state.tokenListRequestSeq) {
+      return;
+    }
+
+    const costsById = new Map();
+    (Array.isArray(data.items) ? data.items : []).forEach((item) => {
+      const tokenId = Number(item?.id);
+      if (Number.isFinite(tokenId)) {
+        costsById.set(tokenId, item?.observed_cost_usd ?? null);
+      }
+    });
+    if (!costsById.size) {
+      return;
+    }
+    state.tokenItems = state.tokenItems.map((item) => {
+      const tokenId = Number(item?.id);
+      if (!costsById.has(tokenId)) {
+        return item;
+      }
+      return {
+        ...item,
+        observed_cost_usd: costsById.get(tokenId),
+      };
+    });
+    renderTokenList(state.tokenItems);
+  } catch (error) {
+    if (!isAbortError(error)) {
+      console.warn("Failed to load token costs", error);
+    }
+  } finally {
+    if (state.tokenCostAbortController === controller) {
+      state.tokenCostAbortController = null;
+    }
+  }
 }
 
 async function loadHealth() {
@@ -2998,6 +3067,7 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     state.tokenListAbortController.abort();
     state.tokenListAbortController = null;
   }
+  abortTokenCostRequest();
   abortTokenQuotaRequest();
   const controller = new AbortController();
   state.tokenListAbortController = controller;
@@ -3044,6 +3114,10 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     if (data.counts) {
       renderCounts(data.counts);
     }
+    const visibleTokenIds = state.tokenItems
+      .map((item) => Number(item?.id))
+      .filter((tokenId) => Number.isFinite(tokenId) && tokenId > 0);
+    void loadTokenCosts(visibleTokenIds, { listRequestSeq });
     const quotaTokenIds = state.tokenItems
       .filter((item) => item?.quota_loading)
       .map((item) => Number(item?.id))
@@ -3768,11 +3842,11 @@ async function refreshDashboard({ includeTokens = true } = {}) {
   elements.refreshButton.disabled = true;
   renderInitialLoadingStates({ includeTokens });
   try {
-    await loadHealth();
-    await loadRequests();
+    const tasks = [loadHealth(), loadRequests()];
     if (includeTokens) {
-      await loadTokens();
+      tasks.push(loadTokens());
     }
+    await Promise.all(tasks);
   } catch (error) {
     if (includeTokens) {
       elements.listNote.textContent = `面板同步失败：${error.message}`;
