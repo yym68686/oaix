@@ -127,6 +127,8 @@ _ORIGINAL_CREATE_REQUEST_LOG = create_request_log
 _ORIGINAL_FINALIZE_REQUEST_LOG = finalize_request_log
 WEB_DIR = Path(__file__).resolve().parent / "web"
 WEB_VERSION_TZ = timezone(timedelta(hours=8), name="UTC+8")
+_ADMIN_REQUESTS_CACHE: dict[int, tuple[float, bytes]] = {}
+_ADMIN_REQUESTS_CACHE_LOCK: asyncio.Lock | None = None
 ADMIN_TOKEN_PROBE_INPUT = "say test"
 DEFAULT_IMAGES_MAIN_MODEL = "gpt-5.5"
 DEFAULT_IMAGES_TOOL_MODEL = "gpt-image-2"
@@ -11010,12 +11012,11 @@ async def _cached_admin_requests_payload(
     limit: int,
     force_refresh: bool = False,
 ) -> tuple[bytes, str]:
+    del app
+    global _ADMIN_REQUESTS_CACHE_LOCK
     ttl_seconds = _admin_requests_cache_ttl_seconds()
     effective_ttl_seconds = ttl_seconds if ttl_seconds > 0 else _admin_requests_cache_refresh_seconds() * 2
-    cache: dict[int, tuple[float, bytes]] = getattr(app.state, "admin_requests_cache", {})
-    if not isinstance(cache, dict):
-        cache = {}
-        app.state.admin_requests_cache = cache
+    cache = _ADMIN_REQUESTS_CACHE
 
     cache_key = max(1, min(int(limit), 500))
     now = time.monotonic()
@@ -11025,10 +11026,10 @@ async def _cached_admin_requests_payload(
     if not force_refresh and cached is not None:
         return cached[1], "stale"
 
-    lock = getattr(app.state, "admin_requests_cache_lock", None)
-    if not isinstance(lock, asyncio.Lock):
+    lock = _ADMIN_REQUESTS_CACHE_LOCK
+    if lock is None:
         lock = asyncio.Lock()
-        app.state.admin_requests_cache_lock = lock
+        _ADMIN_REQUESTS_CACHE_LOCK = lock
     if not force_refresh and cached is not None and lock.locked():
         return cached[1], "stale"
 
