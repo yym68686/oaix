@@ -2,6 +2,7 @@ const STORAGE_KEY = "oaix.serviceKey";
 const THEME_STORAGE_KEY = "oaix.themePreference";
 const IMPORT_JOB_STORAGE_KEY = "oaix.importJobId";
 const REFRESH_INTERVAL_MS = 30000;
+const INITIAL_TRAFFIC_LOAD_DELAY_MS = 250;
 const IMPORT_JOB_POLL_INTERVAL_MS = 1500;
 const TOAST_DURATION_MS = 5200;
 const TOAST_EXIT_DURATION_MS = 220;
@@ -897,7 +898,7 @@ function renderRequestAnalyticsLoading() {
   renderChartLoading(elements.requestCostChart, "正在汇总模型金额…");
 }
 
-function renderInitialLoadingStates({ includeTokens = true } = {}) {
+function renderInitialLoadingStates({ includeTokens = true, includeRequests = true } = {}) {
   if (!state.healthLoaded) {
     renderCountsLoading();
     elements.protectionChip.textContent = "正在检测服务状态";
@@ -922,7 +923,7 @@ function renderInitialLoadingStates({ includeTokens = true } = {}) {
     renderTokenPagination("正在载入分页");
     renderTokenListLoading();
   }
-  if (!state.requestsLoaded) {
+  if (includeRequests && !state.requestsLoaded) {
     elements.requestNote.textContent = "正在载入最近 80 条请求…";
     renderRequestSummaryUnavailable();
     renderRequestAnalyticsLoading();
@@ -3834,24 +3835,56 @@ async function loadRequests() {
   }
 }
 
-async function refreshDashboard({ includeTokens = true } = {}) {
+function renderRequestLoadError(error) {
+  elements.requestNote.textContent = `请求日志同步失败：${error.message}`;
+  renderRequestSummaryUnavailable();
+  renderChartEmpty(elements.requestTokenChart, "Token 趋势暂时不可用");
+  renderChartEmpty(elements.requestCostChart, "模型金额暂时不可用");
+  elements.requestList.innerHTML = `
+    <article class="empty-state">
+      <p>${escapeHtml(error.message)}</p>
+    </article>
+  `;
+}
+
+function scheduleInitialRequestsLoad() {
+  const load = () => {
+    if (document.hidden) {
+      state.refreshPendingOnVisible = true;
+      return;
+    }
+    void loadRequests().catch(renderRequestLoadError);
+  };
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(load, { timeout: 1200 });
+    return;
+  }
+  window.setTimeout(load, INITIAL_TRAFFIC_LOAD_DELAY_MS);
+}
+
+async function refreshDashboard({ includeTokens = true, includeRequests = true } = {}) {
   if (state.refreshing) {
     return;
   }
   state.refreshing = true;
   elements.refreshButton.disabled = true;
-  renderInitialLoadingStates({ includeTokens });
+  renderInitialLoadingStates({ includeTokens, includeRequests });
   try {
-    const tasks = [loadHealth(), loadRequests()];
+    const tasks = [loadHealth()];
     if (includeTokens) {
       tasks.push(loadTokens());
+    }
+    if (includeRequests) {
+      tasks.push(loadRequests());
     }
     await Promise.all(tasks);
   } catch (error) {
     if (includeTokens) {
       elements.listNote.textContent = `面板同步失败：${error.message}`;
     }
-    elements.requestNote.textContent = `面板同步失败：${error.message}`;
+    if (includeRequests) {
+      renderRequestLoadError(error);
+    }
   } finally {
     state.refreshing = false;
     elements.refreshButton.disabled = false;
@@ -4533,7 +4566,7 @@ elements.clearKeyButton.addEventListener("click", clearServiceKey);
 elements.importButton.addEventListener("click", importTokens);
 elements.resetImportButton.addEventListener("click", resetImportForm);
 
-refreshDashboard();
+void refreshDashboard({ includeRequests: false }).finally(scheduleInitialRequestsLoad);
 state.timer = window.setInterval(() => {
   if (document.hidden) {
     state.refreshPendingOnVisible = true;

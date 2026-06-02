@@ -4123,7 +4123,17 @@ def _admin_quota_background_refresh_limit() -> int:
 
 
 def _admin_requests_cache_ttl_seconds() -> float:
-    return _float_env("ADMIN_REQUESTS_CACHE_TTL_SECONDS", 5.0, minimum=0.0)
+    return _float_env("ADMIN_REQUESTS_CACHE_TTL_SECONDS", 15.0, minimum=0.0)
+
+
+def _admin_requests_cache_refresh_seconds() -> float:
+    ttl_seconds = _admin_requests_cache_ttl_seconds()
+    default_refresh_seconds = ttl_seconds * 0.8 if ttl_seconds > 0 else 15.0
+    return _float_env(
+        "ADMIN_REQUESTS_CACHE_REFRESH_SECONDS",
+        default_refresh_seconds,
+        minimum=1.0,
+    )
 
 
 def _admin_token_counts_cache_ttl_seconds() -> float:
@@ -10976,24 +10986,46 @@ async def _cached_admin_requests_payload(app: FastAPI, *, limit: int) -> dict[st
     now = time.monotonic()
     cached = cache.get(cache_key)
     if ttl_seconds > 0 and cached is not None and cached[0] > now:
-        return copy.deepcopy(cached[1])
+        return cached[1]
 
-    summary, analytics, raw_items = await asyncio.gather(
-        get_request_log_summary(hours=24),
-        get_request_log_analytics(hours=24, bucket_minutes=60, top_models=6),
-        list_request_logs(limit=cache_key),
-    )
-    payload = {
-        "summary": asdict(summary),
-        "analytics": asdict(analytics),
-        "items": [asdict(item) for item in raw_items],
-    }
-    if ttl_seconds > 0:
-        cache[cache_key] = (now + ttl_seconds, copy.deepcopy(payload))
-        if len(cache) > 8:
-            for stale_key in sorted(cache, key=lambda key: cache[key][0])[:-8]:
-                cache.pop(stale_key, None)
-    return payload
+    lock = getattr(app.state, "admin_requests_cache_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        app.state.admin_requests_cache_lock = lock
+
+    async with lock:
+        now = time.monotonic()
+        cached = cache.get(cache_key)
+        if ttl_seconds > 0 and cached is not None and cached[0] > now:
+            return cached[1]
+
+        summary, analytics, raw_items = await asyncio.gather(
+            get_request_log_summary(hours=24),
+            get_request_log_analytics(hours=24, bucket_minutes=60, top_models=6),
+            list_request_logs(limit=cache_key),
+        )
+        payload = {
+            "summary": asdict(summary),
+            "analytics": asdict(analytics),
+            "items": [asdict(item) for item in raw_items],
+        }
+        if ttl_seconds > 0:
+            cache[cache_key] = (time.monotonic() + ttl_seconds, payload)
+            if len(cache) > 8:
+                for stale_key in sorted(cache, key=lambda key: cache[key][0])[:-8]:
+                    cache.pop(stale_key, None)
+        return payload
+
+
+async def _admin_requests_cache_refresh_loop(app: FastAPI) -> None:
+    while True:
+        try:
+            await _cached_admin_requests_payload(app, limit=80)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to refresh admin requests cache")
+        await asyncio.sleep(_admin_requests_cache_refresh_seconds())
 
 
 async def _build_admin_token_quota_items(
@@ -11099,6 +11131,14 @@ async def lifespan(app: FastAPI):
         _request_log_retention_worker(),
         name="oaix-request-log-retention",
     )
+    try:
+        await _cached_admin_requests_payload(app, limit=80)
+    except Exception:
+        logger.exception("Failed to prewarm admin requests cache")
+    app.state.admin_requests_cache_refresh_task = asyncio.create_task(
+        _admin_requests_cache_refresh_loop(app),
+        name="oaix-admin-requests-cache-refresh",
+    )
 
     async def publish_token_selection_settings(selection: TokenSelectionSettings) -> None:
         _set_current_token_selection_settings(app, selection)
@@ -11125,6 +11165,10 @@ async def lifespan(app: FastAPI):
         if isinstance(retention_task, asyncio.Task):
             retention_task.cancel()
             await asyncio.gather(retention_task, return_exceptions=True)
+        admin_requests_cache_task = getattr(app.state, "admin_requests_cache_refresh_task", None)
+        if isinstance(admin_requests_cache_task, asyncio.Task):
+            admin_requests_cache_task.cancel()
+            await asyncio.gather(admin_requests_cache_task, return_exceptions=True)
         upstream_pool_task = getattr(app.state, "upstream_http_pool_maintenance_task", None)
         if isinstance(upstream_pool_task, asyncio.Task):
             upstream_pool_task.cancel()
@@ -11181,7 +11225,7 @@ def create_app() -> FastAPI:
         html = html.replace("__OAIX_WEB_VERSION_TIME__", web_version_time)
         return HTMLResponse(
             content=html,
-            headers={"Cache-Control": "no-store, max-age=0"},
+            headers={"Cache-Control": "public, max-age=60, stale-while-revalidate=300"},
         )
 
     @app.get("/favicon.ico", include_in_schema=False)

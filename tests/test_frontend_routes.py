@@ -129,7 +129,7 @@ def test_frontend_index_busts_asset_cache_with_content_hash() -> None:
     )
 
     assert response.status_code == 200
-    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert response.headers["cache-control"] == "public, max-age=60, stale-while-revalidate=300"
     assert f'/assets/styles.css?v={css_version}' in response.text
     assert f'/assets/app.js?v={js_version}' in response.text
     assert f'title="资源版本 {bundle_version_hash}"' in response.text
@@ -251,14 +251,17 @@ def test_frontend_dashboard_refresh_loads_admin_panels_in_parallel() -> None:
 
     assert "const REFRESH_INTERVAL_MS = 30000" in app_js
     assert "refreshing: false" in app_js
-    assert "async function refreshDashboard({ includeTokens = true } = {})" in app_js
+    assert "async function refreshDashboard({ includeTokens = true, includeRequests = true } = {})" in app_js
     assert "if (state.refreshing)" in refresh_function
     assert "state.refreshing = true" in refresh_function
-    assert "const tasks = [loadHealth(), loadRequests()]" in refresh_function
+    assert "const tasks = [loadHealth()]" in refresh_function
     assert "if (includeTokens)" in refresh_function
     assert "tasks.push(loadTokens())" in refresh_function
+    assert "if (includeRequests)" in refresh_function
+    assert "tasks.push(loadRequests())" in refresh_function
     assert "await Promise.all(tasks)" in refresh_function
     assert "refreshDashboard({ includeTokens: false })" in app_js
+    assert "refreshDashboard({ includeRequests: false })" in app_js
     assert "await loadRequests();" not in refresh_function
 
 
