@@ -5326,6 +5326,69 @@ def _non_free_codex_token_unavailable_detail(model_name: str) -> str:
     return f"No non-free Codex token available for {model_name} requests"
 
 
+def _model_unsupported_codex_token_unavailable_detail(model_name: str) -> str:
+    return f"No compatible Codex token available for {model_name} requests"
+
+
+def _model_unsupported_scoped_cooldown_seconds() -> int:
+    return _int_env("MODEL_UNSUPPORTED_SCOPED_COOLDOWN_SECONDS", 3600, minimum=60)
+
+
+def _model_compatibility_scoped_cooldown_scope(request_model: str | None) -> str | None:
+    restricted_model_name = _non_free_only_codex_model_name(request_model)
+    if restricted_model_name is None or _is_responses_image_compat_model(restricted_model_name):
+        return None
+    return f"{restricted_model_name}:model-compatibility"
+
+
+def _codex_request_scoped_cooldown_scope(request_model: str | None) -> str | None:
+    return _image_rate_limit_scoped_cooldown_scope(request_model) or _model_compatibility_scoped_cooldown_scope(
+        request_model
+    )
+
+
+def _is_model_unsupported_for_chatgpt_account_error(
+    status_code: int,
+    detail: str,
+    *,
+    request_model: str | None,
+) -> bool:
+    restricted_model_name = _non_free_only_codex_model_name(request_model)
+    if status_code != 400 or restricted_model_name is None:
+        return False
+    normalized_detail = str(detail or "").lower()
+    return (
+        restricted_model_name.lower() in normalized_detail
+        and "model is not supported" in normalized_detail
+        and "chatgpt account" in normalized_detail
+    )
+
+
+async def _mark_model_unsupported_token_for_request(
+    http_request: Request,
+    token_row: Any,
+    *,
+    request_model: str | None,
+    detail: str,
+    excluded_token_ids: set[int],
+) -> None:
+    token_id = int(getattr(token_row, "id", 0) or 0)
+    if token_id <= 0:
+        return
+    excluded_token_ids.add(token_id)
+    _prompt_cache_remove_token(http_request.app, token_id)
+    cooldown_scope = _model_compatibility_scoped_cooldown_scope(request_model)
+    if cooldown_scope is None:
+        await mark_token_error(token_id, detail)
+        return
+    await mark_token_scoped_cooldown(
+        token_id,
+        cooldown_scope,
+        detail,
+        cooldown_seconds=_model_unsupported_scoped_cooldown_seconds(),
+    )
+
+
 def _declared_token_plan_info(token_row: Any) -> CodexPlanInfo:
     return extract_codex_plan_info(
         getattr(token_row, "id_token", None),
@@ -8094,8 +8157,9 @@ def _gpt_image_stream_keepalive_response(
         restricted_model_name = _non_free_only_codex_model_name(request_model)
         require_non_free_token = restricted_model_name is not None
         restricted_model_label = restricted_model_name or "requested"
-        scoped_cooldown_scope = _image_rate_limit_scoped_cooldown_scope(request_model)
+        scoped_cooldown_scope = _codex_request_scoped_cooldown_scope(request_model)
         skipped_free_token_ids: set[int] = set()
+        incompatible_model_token_ids: set[int] = set()
         excluded_token_ids: set[int] = set()
         postponed_unknown_plan_tokens: list[Any] = []
 
@@ -8368,6 +8432,30 @@ def _gpt_image_stream_keepalive_response(
                 except HTTPException as exc:
                     status_code = getattr(exc, "status_code", 500)
                     detail = str(getattr(exc, "detail", "") or exc)
+                    if _is_model_unsupported_for_chatgpt_account_error(
+                        status_code,
+                        detail,
+                        request_model=request_model,
+                    ):
+                        incompatible_model_token_ids.add(token_row.id)
+                        await _mark_model_unsupported_token_for_request(
+                            http_request,
+                            token_row,
+                            request_model=request_model,
+                            detail=detail,
+                            excluded_token_ids=excluded_token_ids,
+                        )
+                        logger.info(
+                            "Skipping Codex token because account does not support %s: token_id=%s account_id=%s attempt=%s/%s",
+                            restricted_model_label,
+                            token_row.id,
+                            token_row.account_id,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
                     cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
 
                     if cooldown_seconds is not None:
@@ -8544,6 +8632,11 @@ def _gpt_image_stream_keepalive_response(
                         first_token_at=token_observation_first_token_at,
                     )
 
+            if require_non_free_token and incompatible_model_token_ids:
+                raise HTTPException(
+                    status_code=503,
+                    detail=_model_unsupported_codex_token_unavailable_detail(restricted_model_label),
+                )
             if last_error is not None:
                 if _should_retry_http_exception(last_error):
                     raise last_error
@@ -8750,8 +8843,9 @@ async def _responses_stream_keepalive_response(
     restricted_model_name = _non_free_only_codex_model_name(request_model)
     require_non_free_token = restricted_model_name is not None
     restricted_model_label = restricted_model_name or "requested"
-    scoped_cooldown_scope = _image_rate_limit_scoped_cooldown_scope(request_model)
+    scoped_cooldown_scope = _codex_request_scoped_cooldown_scope(request_model)
     skipped_free_token_ids: set[int] = set()
+    incompatible_model_token_ids: set[int] = set()
     excluded_token_ids: set[int] = set()
     postponed_unknown_plan_tokens: list[Any] = []
     typed_keepalive_sent = False
@@ -9227,6 +9321,30 @@ async def _responses_stream_keepalive_response(
                         )
                         continue
 
+                    if _is_model_unsupported_for_chatgpt_account_error(
+                        status_code,
+                        detail,
+                        request_model=request_model,
+                    ):
+                        incompatible_model_token_ids.add(token_row.id)
+                        await _mark_model_unsupported_token_for_request(
+                            http_request,
+                            token_row,
+                            request_model=request_model,
+                            detail=detail,
+                            excluded_token_ids=excluded_token_ids,
+                        )
+                        logger.info(
+                            "Skipping Codex token because account does not support %s: token_id=%s account_id=%s attempt=%s/%s",
+                            restricted_model_label,
+                            token_row.id,
+                            token_row.account_id,
+                            attempt,
+                            max_attempts,
+                        )
+                        last_error = exc
+                        continue
+
                     cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
 
                     if cooldown_seconds is not None:
@@ -9411,6 +9529,25 @@ async def _responses_stream_keepalive_response(
                         started_at=request_started_at,
                         first_token_at=token_observation_first_token_at,
                     )
+
+            if require_non_free_token and incompatible_model_token_ids:
+                detail = _model_unsupported_codex_token_unavailable_detail(restricted_model_label)
+                await output_queue.put(_build_stream_error_event(503, detail))
+                await output_queue.put(b"data: [DONE]\n\n")
+                await _finalize_request_log_with_timing(
+                    timing,
+                    request_log,
+                    status_code=503,
+                    success=False,
+                    attempt_count=attempt_count,
+                    finished_at=utcnow(),
+                    token_id=last_token_id,
+                    account_id=last_account_id,
+                    error_message=detail,
+                    **prompt_cache_log_kwargs(status_code=503),
+                )
+                stream_finalized = True
+                return
 
             if last_error is not None:
                 await output_queue.put(
@@ -9667,9 +9804,10 @@ async def _execute_proxy_request_with_failover(
         restricted_model_name = _non_free_only_codex_model_name(request_model)
         require_non_free_token = restricted_model_name is not None
         restricted_model_label = restricted_model_name or "requested"
-        scoped_cooldown_scope = _image_rate_limit_scoped_cooldown_scope(request_model)
+        scoped_cooldown_scope = _codex_request_scoped_cooldown_scope(request_model)
         excluded_token_ids: set[int] = set()
         skipped_free_token_ids: set[int] = set()
+        incompatible_model_token_ids: set[int] = set()
         postponed_unknown_plan_tokens: list[Any] = []
         transport_error_count = 0
         upstream_5xx_error_count = 0
@@ -10061,6 +10199,30 @@ async def _execute_proxy_request_with_failover(
             except HTTPException as exc:
                 status_code = getattr(exc, "status_code", 500)
                 detail = str(getattr(exc, "detail", "") or exc)
+                if _is_model_unsupported_for_chatgpt_account_error(
+                    status_code,
+                    detail,
+                    request_model=request_model,
+                ):
+                    incompatible_model_token_ids.add(token_row.id)
+                    await _mark_model_unsupported_token_for_request(
+                        http_request,
+                        token_row,
+                        request_model=request_model,
+                        detail=detail,
+                        excluded_token_ids=excluded_token_ids,
+                    )
+                    logger.info(
+                        "Skipping Codex token because account does not support %s: token_id=%s account_id=%s attempt=%s/%s",
+                        restricted_model_label,
+                        token_row.id,
+                        token_row.account_id,
+                        attempt,
+                        max_attempts,
+                    )
+                    last_error = exc
+                    continue
+
                 cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
 
                 if cooldown_seconds is not None:
@@ -10281,6 +10443,11 @@ async def _execute_proxy_request_with_failover(
                         first_token_at=token_observation_first_token_at,
                     )
 
+        if require_non_free_token and incompatible_model_token_ids:
+            raise HTTPException(
+                status_code=503,
+                detail=_model_unsupported_codex_token_unavailable_detail(restricted_model_label),
+            )
         if last_error is not None:
             if _should_retry_http_exception(last_error):
                 raise last_error

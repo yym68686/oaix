@@ -79,7 +79,9 @@ from oaix_gateway.api_server import (
     _close_async_iterator_safely,
     _close_stream_cm_safely,
     _close_upstream_response_safely,
+    _codex_request_scoped_cooldown_scope,
     _gateway_guard_window_metrics,
+    _is_model_unsupported_for_chatgpt_account_error,
     _record_gateway_guard_event,
     _runtime_guard_window_metrics,
     _sweep_httpx_client_idle_connections,
@@ -377,6 +379,18 @@ def test_request_requires_non_free_codex_token_for_image_tool_and_restricted_mod
     assert _request_requires_non_free_codex_token("gpt-5.2") is True
     assert _request_requires_non_free_codex_token("gpt-5.5") is False
     assert _request_requires_non_free_codex_token("gpt-5.4-mini") is False
+
+
+def test_codex_request_scopes_model_compatibility_cooldowns() -> None:
+    detail = "The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account."
+
+    assert _codex_request_scoped_cooldown_scope("gpt-5.3-codex") == "gpt-5.3-codex:model-compatibility"
+    assert _codex_request_scoped_cooldown_scope("gpt-5.4") == "gpt-5.4:model-compatibility"
+    assert _codex_request_scoped_cooldown_scope("gpt-image-2") == "gpt-image-2:input-images"
+    assert _codex_request_scoped_cooldown_scope("gpt-5.5") is None
+    assert _is_model_unsupported_for_chatgpt_account_error(400, detail, request_model="gpt-5.3-codex") is True
+    assert _is_model_unsupported_for_chatgpt_account_error(503, detail, request_model="gpt-5.3-codex") is False
+    assert _is_model_unsupported_for_chatgpt_account_error(400, detail, request_model="gpt-5.5") is False
 
 
 def test_sanitize_codex_payload_removes_unsupported_fields() -> None:
@@ -6807,6 +6821,194 @@ def test_execute_proxy_request_with_failover_scopes_gpt_image_input_rate_limit(m
     assert mark_success_calls == [132]
     assert finalized[0]["attempt_count"] == 2
     assert finalized[0]["token_id"] == 132
+
+
+def test_execute_proxy_request_with_failover_retries_model_unsupported_codex_token(monkeypatch) -> None:
+    class DummyQuotaService:
+        def get_cached_snapshot(self, token_id: int):
+            return CodexQuotaSnapshot(
+                fetched_at=datetime.now(timezone.utc),
+                error=None,
+                plan_type="plus",
+                windows=[],
+            )
+
+        async def get_snapshot(self, *args, **kwargs):
+            raise AssertionError("known plus tokens should not fetch quota snapshots on the hot path")
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=object(),
+            oauth_manager=None,
+            quota_service=DummyQuotaService(),
+            prompt_cache_affinity_lanes=OrderedDict(),
+            prompt_cache_response_bindings=OrderedDict(),
+        )
+    )
+
+    class DummyOAuthManager:
+        async def get_access_token(
+            self,
+            token_row,
+            client,
+            *,
+            force_refresh: bool = False,
+            reactivate_on_refresh: bool = True,
+        ) -> tuple[str, bool]:
+            return f"access-token-{token_row.id}", False
+
+        def invalidate(self, token_id: int) -> None:
+            raise AssertionError("invalidate should not run for model compatibility errors")
+
+    app.state.oauth_manager = DummyOAuthManager()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"authorization", b"Bearer test-client")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    first_token = CodexToken(
+        id=151,
+        account_id="acct_151",
+        refresh_token="refresh-151",
+        token_type="codex",
+        is_active=True,
+        plan_type="plus",
+    )
+    second_token = CodexToken(
+        id=152,
+        account_id="acct_152",
+        refresh_token="refresh-152",
+        token_type="codex",
+        is_active=True,
+        plan_type="plus",
+        last_error="previous error",
+    )
+    raw_payload = {
+        "model": "gpt-5.3-codex",
+        "input": [{"role": "user", "content": "Investigate the build failure."}],
+    }
+    prompt_cache_context = _build_prompt_cache_request_context(
+        request,
+        endpoint="/v1/responses",
+        request_model="gpt-5.3-codex",
+        raw_payload=raw_payload,
+    )
+    assert prompt_cache_context is not None
+    _prompt_cache_bind_lane(app, prompt_cache_context, first_token.id)
+
+    scoped_cooling_token_ids: set[int] = set()
+    claim_calls: list[dict[str, object]] = []
+    scoped_cooldown_calls: list[dict[str, object]] = []
+    mark_success_calls: list[int] = []
+    proxy_calls: list[tuple[str, str | None]] = []
+    finalized: list[dict[str, object]] = []
+
+    async def fake_claim_next_active_token(
+        *,
+        selection_strategy: str,
+        exclude_token_ids=None,
+        scoped_cooldown_scope: str | None = None,
+        include_plan_types=None,
+        exclude_plan_types=None,
+    ):
+        excluded = tuple(sorted(int(token_id) for token_id in (exclude_token_ids or ())))
+        claim_calls.append(
+            {
+                "excluded": excluded,
+                "scope": scoped_cooldown_scope,
+                "include_plan_types": include_plan_types,
+                "exclude_plan_types": exclude_plan_types,
+            }
+        )
+        for token in (first_token, second_token):
+            if token.id in excluded:
+                continue
+            if scoped_cooldown_scope == "gpt-5.3-codex:model-compatibility" and token.id in scoped_cooling_token_ids:
+                continue
+            return token
+        return None
+
+    async def fake_create_request_log(**kwargs):
+        return SimpleNamespace(id=251)
+
+    async def fake_finalize_request_log(request_log_id: int, **kwargs) -> None:
+        finalized.append({"request_log_id": request_log_id, **kwargs})
+
+    async def fake_mark_token_scoped_cooldown(
+        token_id: int,
+        scope: str,
+        detail: str,
+        *,
+        cooldown_seconds: int,
+    ) -> None:
+        scoped_cooling_token_ids.add(token_id)
+        scoped_cooldown_calls.append(
+            {
+                "token_id": token_id,
+                "scope": scope,
+                "detail": detail,
+                "cooldown_seconds": cooldown_seconds,
+            }
+        )
+
+    async def fake_mark_token_error(*args, **kwargs) -> None:
+        raise AssertionError("model compatibility errors should use scoped cooldowns")
+
+    async def fake_mark_token_success(token_id: int) -> None:
+        mark_success_calls.append(token_id)
+
+    async def fake_proxy_call(client, access_token: str, account_id: str | None):
+        proxy_calls.append((access_token, account_id))
+        if account_id == "acct_151":
+            raise HTTPException(
+                status_code=400,
+                detail="The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
+            )
+        return SimpleNamespace(
+            response=JSONResponse({"ok": True}),
+            status_code=200,
+            model_name="gpt-5.3-codex",
+            first_token_at=None,
+            usage_metrics=None,
+            on_success=None,
+            stream_capture=None,
+        )
+
+    monkeypatch.setattr("oaix_gateway.api_server.claim_next_active_token", fake_claim_next_active_token)
+    monkeypatch.setattr("oaix_gateway.api_server.create_request_log", fake_create_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.finalize_request_log", fake_finalize_request_log)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_scoped_cooldown", fake_mark_token_scoped_cooldown)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_error", fake_mark_token_error)
+    monkeypatch.setattr("oaix_gateway.api_server.mark_token_success", fake_mark_token_success)
+
+    response = asyncio.run(
+        _execute_proxy_request_with_failover(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.3-codex",
+            is_stream=False,
+            proxy_call=fake_proxy_call,
+            prompt_cache_context=prompt_cache_context,
+        )
+    )
+
+    assert response.status_code == 200
+    assert proxy_calls == [("access-token-151", "acct_151"), ("access-token-152", "acct_152")]
+    assert claim_calls[0]["scope"] == "gpt-5.3-codex:model-compatibility"
+    assert claim_calls[1]["excluded"] == (151,)
+    assert scoped_cooldown_calls[0]["token_id"] == 151
+    assert scoped_cooldown_calls[0]["scope"] == "gpt-5.3-codex:model-compatibility"
+    assert mark_success_calls == [152]
+    assert finalized[0]["attempt_count"] == 2
+    assert finalized[0]["token_id"] == 152
+    assert first_token.id not in app.state.prompt_cache_affinity_lanes[prompt_cache_context.affinity_key].lanes
 
 
 def test_execute_proxy_request_with_failover_returns_stream_before_mark_success(monkeypatch) -> None:
