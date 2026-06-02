@@ -10984,6 +10984,26 @@ def _json_response_body(payload: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _serialize_admin_request_log_item(item: Any) -> dict[str, Any]:
+    error_message = str(getattr(item, "error_message", "") or "")
+    return {
+        "endpoint": getattr(item, "endpoint", None),
+        "model": getattr(item, "model", None),
+        "model_name": getattr(item, "model_name", None),
+        "is_stream": bool(getattr(item, "is_stream", False)),
+        "status_code": getattr(item, "status_code", None),
+        "success": getattr(item, "success", None),
+        "attempt_count": getattr(item, "attempt_count", None),
+        "started_at": getattr(item, "started_at", None),
+        "ttft_ms": getattr(item, "ttft_ms", None),
+        "cache_hit_ratio": getattr(item, "cache_hit_ratio", None),
+        "prompt_cache_source": getattr(item, "prompt_cache_source", None),
+        "cache_affinity_result": getattr(item, "cache_affinity_result", None),
+        "cache_affinity_lane_index": getattr(item, "cache_affinity_lane_index", None),
+        "error_message": error_message[:500] if error_message else None,
+    }
+
+
 async def _cached_admin_requests_payload(
     app: FastAPI,
     *,
@@ -11023,7 +11043,7 @@ async def _cached_admin_requests_payload(
         payload = {
             "summary": asdict(summary),
             "analytics": asdict(analytics),
-            "items": [asdict(item) for item in raw_items],
+            "items": [_serialize_admin_request_log_item(item) for item in raw_items],
         }
         body = _json_response_body(payload)
         if ttl_seconds > 0:

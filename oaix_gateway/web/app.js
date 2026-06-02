@@ -2583,15 +2583,6 @@ function openTokenDeleteDialog(tokenId) {
   }
 }
 
-function cacheTraceSection(item, section) {
-  const trace = item?.prompt_cache_trace;
-  if (!trace || typeof trace !== "object") {
-    return {};
-  }
-  const value = trace[section];
-  return value && typeof value === "object" ? value : {};
-}
-
 function firstDefined(...values) {
   for (const value of values) {
     if (value !== undefined && value !== null && value !== "") {
@@ -2599,11 +2590,6 @@ function firstDefined(...values) {
     }
   }
   return null;
-}
-
-function formatShortHash(value) {
-  const text = String(value || "").trim();
-  return text ? text.slice(0, 10) : "—";
 }
 
 function formatCacheHitRatio(value) {
@@ -2616,16 +2602,11 @@ function formatCacheHitRatio(value) {
 }
 
 function buildRequestCacheDiagnostics(item) {
-  const trace = item?.prompt_cache_trace && typeof item.prompt_cache_trace === "object" ? item.prompt_cache_trace : {};
-  const prompt = cacheTraceSection(item, "prompt");
-  const route = cacheTraceSection(item, "route");
-  const usage = cacheTraceSection(item, "usage");
-  const response = cacheTraceSection(item, "response");
-  const ratio = firstDefined(item?.cache_hit_ratio, usage.cache_hit_ratio);
-  const source = firstDefined(item?.prompt_cache_source, trace.prompt_cache_key_source, "no-key");
-  const affinity = firstDefined(item?.cache_affinity_result, route.cache_affinity_result, "none");
-  const laneIndex = firstDefined(item?.cache_affinity_lane_index, route.cache_affinity_lane_index);
-  const laneCount = firstDefined(route.cache_affinity_lane_count);
+  const ratio = firstDefined(item?.cache_hit_ratio);
+  const source = firstDefined(item?.prompt_cache_source, "no-key");
+  const affinity = firstDefined(item?.cache_affinity_result, "none");
+  const laneIndex = firstDefined(item?.cache_affinity_lane_index);
+  const laneCount = null;
   const laneText =
     laneIndex !== null
       ? `lane ${Number(laneIndex) + 1}${laneCount !== null ? `/${laneCount}` : ""}`
@@ -2637,49 +2618,21 @@ function buildRequestCacheDiagnostics(item) {
     source,
     affinity,
     laneText,
-    promptKeyHash: firstDefined(item?.prompt_cache_key_hash, trace.prompt_cache_key_hash),
-    requestPayloadHash: firstDefined(item?.request_payload_hash, trace.request_payload_hash),
-    upstreamPayloadHash: firstDefined(item?.upstream_payload_hash, trace.upstream_payload_hash),
-    templateHash: firstDefined(item?.prompt_template_hash, prompt.template_hash),
-    dynamicHash: firstDefined(item?.prompt_dynamic_hash, prompt.dynamic_hash),
-    sessionHash: firstDefined(item?.session_id_hash, trace.session_id_hash),
-    sessionSource: firstDefined(item?.session_id_source, trace.session_id_source),
-    previousHash: firstDefined(item?.previous_response_id_hash, trace.previous_response_id_hash),
-    responseId: firstDefined(item?.upstream_response_id, response.response_id),
-    retentionRequested: firstDefined(item?.prompt_cache_retention_requested, trace.prompt_cache_retention_requested),
-    retentionSent: firstDefined(item?.prompt_cache_retention_sent, trace.prompt_cache_retention_sent),
   };
 }
 
 function renderRequestCacheSummary(item) {
   const cache = buildRequestCacheDiagnostics(item);
-  const retention =
-    cache.retentionRequested || cache.retentionSent
-      ? `ret ${cache.retentionSent || "未发送"}${cache.retentionRequested ? `/${cache.retentionRequested}` : ""}`
-      : "ret —";
   const title = [
     `hit_ratio: ${cache.ratio}`,
     `source: ${cache.source}`,
     `affinity: ${cache.affinity}`,
     `lane: ${cache.laneText}`,
-    `prompt_key_hash: ${cache.promptKeyHash || "—"}`,
-    `session_hash: ${cache.sessionHash || "—"}`,
-    `session_source: ${cache.sessionSource || "—"}`,
-    `request_payload_hash: ${cache.requestPayloadHash || "—"}`,
-    `upstream_payload_hash: ${cache.upstreamPayloadHash || "—"}`,
-    `template_hash: ${cache.templateHash || "—"}`,
-    `dynamic_hash: ${cache.dynamicHash || "—"}`,
-    `previous_response_id_hash: ${cache.previousHash || "—"}`,
-    `upstream_response_id: ${cache.responseId || "—"}`,
-    `retention_requested: ${cache.retentionRequested || "—"}`,
-    `retention_sent: ${cache.retentionSent || "—"}`,
   ].join("\n");
   return `
     <div class="request-row__cache" data-label="缓存" title="${escapeHtml(title)}">
       <span class="request-row__cache-line request-row__cache-line--strong">${escapeHtml(`命中 ${cache.ratio}`)}</span>
       <span class="request-row__cache-line">${escapeHtml(`${cache.source} · ${cache.affinity} · ${cache.laneText}`)}</span>
-      <span class="request-row__cache-line request-row__cache-line--hash">${escapeHtml(`key ${formatShortHash(cache.promptKeyHash)} · sess ${formatShortHash(cache.sessionHash)}`)}</span>
-      <span class="request-row__cache-line request-row__cache-line--hash">${escapeHtml(`tpl ${formatShortHash(cache.templateHash)} · dyn ${formatShortHash(cache.dynamicHash)} · up ${formatShortHash(cache.upstreamPayloadHash)} · ${retention}`)}</span>
     </div>
   `;
 }
