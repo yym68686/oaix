@@ -7289,6 +7289,13 @@ def _extract_stream_error_from_chunk(chunk: bytes) -> HTTPException | None:
     return _upstream_error_http_exception(status_code, message)
 
 
+def _stream_error_status_code_from_chunk(chunk: bytes) -> int | None:
+    stream_error = _extract_stream_error_from_chunk(chunk)
+    if stream_error is not None:
+        return int(getattr(stream_error, "status_code", 500) or 500)
+    return None
+
+
 def _transform_image_stream_event(
     event_type: str,
     event_payload: Any,
@@ -8864,7 +8871,7 @@ async def _responses_stream_keepalive_response(
     last_affinity_result: str | None = None
     last_affinity_lane_index: int | None = None
     output_queue: asyncio.Queue[bytes | object] = asyncio.Queue()
-    response_body_started = False
+    queue_done_sentinel = object()
     worker_task: asyncio.Task[None] | None = None
     worker_cleanup_lock = asyncio.Lock()
     response_session = StreamingProxySession(label="responses_keepalive_response")
@@ -9688,27 +9695,19 @@ async def _responses_stream_keepalive_response(
             except Exception:
                 logger.exception("Responses stream worker failed during shutdown")
 
-    async def response_body() -> AsyncGenerator[bytes, None]:
-        nonlocal response_body_started, worker_task
-        response_body_started = True
-        queue_done_sentinel = object()
-        worker_task = asyncio.create_task(worker(output_queue, queue_done_sentinel))
-        response_session.add_worker(worker_task)
-        heartbeat_interval_seconds = _stream_keepalive_interval_seconds()
+    async def read_first_body_item() -> bytes | None:
+        while True:
+            item = await output_queue.get()
+            if item is queue_done_sentinel:
+                return None
+            if isinstance(item, bytes):
+                return item
+
+    async def response_body(first_item: bytes) -> AsyncGenerator[bytes, None]:
         try:
-            yield STREAM_KEEPALIVE_COMMENT
+            yield first_item
             while True:
-                try:
-                    if heartbeat_interval_seconds > 0:
-                        item = await asyncio.wait_for(
-                            output_queue.get(),
-                            timeout=heartbeat_interval_seconds,
-                        )
-                    else:
-                        item = await output_queue.get()
-                except asyncio.TimeoutError:
-                    yield STREAM_KEEPALIVE_COMMENT
-                    continue
+                item = await output_queue.get()
                 if item is queue_done_sentinel:
                     break
                 if isinstance(item, bytes):
@@ -9720,28 +9719,26 @@ async def _responses_stream_keepalive_response(
             )
 
     async def on_response_close() -> None:
-        if response_body_started:
+        if worker_task is not None and not worker_task.done():
             await cancel_worker_task()
-            return
-        try:
-            await _finalize_cancelled_request_log(
-                request_log,
-                status_code=499,
-                success=False,
-                attempt_count=0,
-                finished_at=utcnow(),
-                token_id=None,
-                account_id=None,
-                error_message="Client disconnected",
-                timing=timing,
-            )
-        finally:
-            await response_lease.release()
-            await proxy_lease.release()
 
+    worker_task = asyncio.create_task(worker(output_queue, queue_done_sentinel))
+    response_session.add_worker(worker_task)
+    try:
+        first_item = await read_first_body_item()
+    except BaseException:
+        await cancel_worker_task()
+        raise
+
+    if first_item is None:
+        first_item = _build_stream_error_event(500, "Responses stream worker finished without a body event")
+        await output_queue.put(b"data: [DONE]\n\n")
+
+    status_code = _stream_error_status_code_from_chunk(first_item) or 200
     return _FinalizingStreamingResponse(
-        response_body(),
+        response_body(first_item),
         on_close=on_response_close,
+        status_code=status_code,
         media_type="text/event-stream",
         headers=_sse_response_headers(),
     )

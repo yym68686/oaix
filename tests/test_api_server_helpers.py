@@ -3403,7 +3403,7 @@ def test_responses_stream_keepalive_response_emits_typed_keepalive_once_and_retr
     result, body = asyncio.run(run_stream())
 
     assert result.status_code == 200
-    assert body.startswith(": keepalive")
+    assert body.startswith('event: keepalive\ndata: {"type":"keepalive","sequence_number":0}')
     assert body.count("event: keepalive") == 1
     assert "resp_attempt_1" not in body
     assert "resp_attempt_2" in body
@@ -3768,7 +3768,7 @@ def test_responses_stream_keepalive_response_preserves_upstream_error_status_aft
     monkeypatch.setattr("oaix_gateway.api_server._claim_prompt_cache_affinity_token", fake_claim_prompt_cache_affinity_token)
     monkeypatch.setattr("oaix_gateway.api_server._claim_next_token_for_model_request", unexpected_fallback_token_claim)
 
-    async def run_stream() -> str:
+    async def run_stream() -> tuple[object, str]:
         result = await _responses_stream_keepalive_response(
             request,
             endpoint="/v1/responses",
@@ -3779,14 +3779,15 @@ def test_responses_stream_keepalive_response_preserves_upstream_error_status_aft
         chunks: list[bytes] = []
         async for chunk in result.body_iterator:
             chunks.append(chunk)
-        return b"".join(chunks).decode("utf-8")
+        return result, b"".join(chunks).decode("utf-8")
 
-    body = asyncio.run(run_stream())
+    result, body = asyncio.run(run_stream())
 
     assert client.stream_calls == 1
     assert client.response_closed_calls == 1
     assert client.closed_calls == 1
-    assert body.startswith(": keepalive")
+    assert result.status_code == 400
+    assert not body.startswith(": keepalive")
     assert "event: error" in body
     assert "bad upstream request" in body
     assert '"status_code": 400' in body
@@ -3794,34 +3795,54 @@ def test_responses_stream_keepalive_response_preserves_upstream_error_status_aft
     assert finalized[0]["status_code"] == 400
 
 
-def test_responses_stream_keepalive_response_emits_initial_keepalive_before_upstream_headers(
+def test_responses_stream_keepalive_response_waits_for_response_created_before_keepalive(
     monkeypatch,
 ) -> None:
-    class HangingStreamContext:
-        def __init__(self, client: "HangingClient") -> None:
+    class DelayedStreamingResponse:
+        status_code = 200
+
+        def __init__(self, client: "DelayedClient") -> None:
+            self._client = client
+
+        def aiter_raw(self) -> AsyncIterator[bytes]:
+            async def iterator() -> AsyncIterator[bytes]:
+                self._client.iter_started.set()
+                await self._client.release_created.wait()
+                yield b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_wait","status":"in_progress","model":"gpt-5.4-mini"}}\n\n'
+                yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                yield b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_wait","status":"completed","model":"gpt-5.4-mini","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]}}\n\n'
+                yield b"data: [DONE]\n\n"
+
+            return iterator()
+
+        async def aread(self) -> bytes:
+            return b""
+
+    class DelayedStreamContext:
+        def __init__(self, client: "DelayedClient") -> None:
             self._client = client
 
         async def __aenter__(self):
             self._client.enter_started.set()
-            await self._client.release_enter.wait()
-            raise AssertionError("upstream headers should still be pending")
+            return DelayedStreamingResponse(self._client)
 
         async def __aexit__(self, exc_type, exc, tb) -> None:
             self._client.closed_calls += 1
             self._client.closed.set()
             return None
 
-    class HangingClient:
+    class DelayedClient:
         def __init__(self) -> None:
             self.stream_calls = 0
             self.closed_calls = 0
             self.enter_started = asyncio.Event()
-            self.release_enter = asyncio.Event()
+            self.iter_started = asyncio.Event()
+            self.release_created = asyncio.Event()
             self.closed = asyncio.Event()
 
         def stream(self, method, url, headers, content, timeout):
             self.stream_calls += 1
-            return HangingStreamContext(self)
+            return DelayedStreamContext(self)
 
     class DummyOAuthManager:
         async def get_access_token(self, token_row, client) -> tuple[str, bool]:
@@ -3830,7 +3851,7 @@ def test_responses_stream_keepalive_response_emits_initial_keepalive_before_upst
         def invalidate(self, token_id: int) -> None:
             return None
 
-    client = HangingClient()
+    client = DelayedClient()
     app = SimpleNamespace(
         state=SimpleNamespace(
             response_traffic=ResponseTrafficController(),
@@ -3867,22 +3888,27 @@ def test_responses_stream_keepalive_response_emits_initial_keepalive_before_upst
     monkeypatch.setattr("oaix_gateway.api_server._claim_next_token_for_model_request", unexpected_fallback_token_claim)
 
     async def run_stream() -> bytes:
-        result = await _responses_stream_keepalive_response(
+        response_task = asyncio.create_task(_responses_stream_keepalive_response(
             request,
             endpoint="/v1/responses",
             request_model="gpt-5.4-mini",
             compact=False,
             request_data=request_data,
-        )
-        first_chunk = await asyncio.wait_for(result.body_iterator.__anext__(), timeout=0.2)
+        ))
         await asyncio.wait_for(client.enter_started.wait(), timeout=0.2)
+        await asyncio.wait_for(client.iter_started.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        assert not response_task.done()
+        client.release_created.set()
+        result = await asyncio.wait_for(response_task, timeout=0.2)
+        first_chunk = await asyncio.wait_for(result.body_iterator.__anext__(), timeout=0.2)
         await result.body_iterator.aclose()
         await asyncio.wait_for(client.closed.wait(), timeout=0.2)
         return first_chunk
 
     first_chunk = asyncio.run(run_stream())
 
-    assert first_chunk.startswith(b": keepalive")
+    assert first_chunk.startswith(b'event: keepalive\ndata: {"type":"keepalive","sequence_number":0}')
     assert client.stream_calls == 1
     assert client.closed_calls == 1
 
@@ -4014,11 +4040,87 @@ def test_responses_stream_keepalive_response_finalizer_closes_running_worker(
 
     sent_bodies = asyncio.run(run_stream())
 
-    assert any(body.startswith(b": keepalive") for body in sent_bodies)
+    assert any(body.startswith(b'event: keepalive\ndata: {"type":"keepalive","sequence_number":0}') for body in sent_bodies)
     assert any(b"response.output_text.delta" in body for body in sent_bodies)
     assert client.stream_calls == 1
     assert client.response_closed_calls == 1
     assert client.closed_calls == 1
+
+
+def test_responses_stream_keepalive_response_returns_503_before_commit_when_no_token(
+    monkeypatch,
+) -> None:
+    class DummyOAuthManager:
+        async def get_access_token(self, token_row, client) -> tuple[str, bool]:
+            raise AssertionError("no token should be claimed")
+
+        def invalidate(self, token_id: int) -> None:
+            return None
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            response_traffic=ResponseTrafficController(),
+            http_client=SimpleNamespace(),
+            oauth_manager=DummyOAuthManager(),
+            token_pool_snapshot=_TokenPoolSnapshot(tokens=(), scoped_cooldowns={}, loaded_at=time.monotonic()),
+        )
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"yaak")],
+            "client": ("127.0.0.1", 9000),
+            "app": app,
+        },
+        receive=lambda: {"type": "http.request", "body": b"", "more_body": False},
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.5",
+        input=[{"role": "user", "content": "say test"}],
+        stream=True,
+        store=False,
+    )
+    finalized: list[dict[str, object]] = []
+
+    async def no_affinity_token(*args, **kwargs):
+        return None
+
+    async def no_fallback_token(*args, **kwargs):
+        return None
+
+    def capture_request_log_write(job: _RequestLogWriteJob) -> None:
+        finalized.append(job.payload)
+
+    monkeypatch.setattr("oaix_gateway.api_server._submit_request_log_write", capture_request_log_write)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_prompt_cache_affinity_token", no_affinity_token)
+    monkeypatch.setattr("oaix_gateway.api_server._claim_next_token_for_model_request", no_fallback_token)
+
+    async def run_stream() -> tuple[object, str]:
+        result = await _responses_stream_keepalive_response(
+            request,
+            endpoint="/v1/responses",
+            request_model="gpt-5.5",
+            compact=False,
+            request_data=request_data,
+        )
+        chunks: list[bytes] = []
+        async for chunk in result.body_iterator:
+            chunks.append(chunk)
+        return result, b"".join(chunks).decode("utf-8")
+
+    result, body = asyncio.run(run_stream())
+
+    assert result.status_code == 503
+    assert not body.startswith(": keepalive")
+    assert "event: error" in body
+    assert "No available Codex token could satisfy this request" in body
+    assert '"status_code": 503' in body
+    assert body.rstrip().endswith("data: [DONE]")
+    assert finalized[0]["status_code"] == 503
+    assert finalized[0]["attempt_count"] == 0
+    assert finalized[0].get("token_id") is None
 
 
 def test_responses_route_uses_keepalive_stream_helper_for_non_image_stream_requests(monkeypatch) -> None:
