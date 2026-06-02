@@ -10585,12 +10585,16 @@ def _selection_strategy_description(strategy: str) -> str:
     return "优先分配最久未使用的 key，把请求更均匀地摊在账号窗口上。"
 
 
-def _serialize_token_selection_settings(settings: TokenSelectionSettings) -> dict[str, Any]:
-    return {
+def _serialize_token_selection_settings(
+    settings: TokenSelectionSettings,
+    *,
+    include_token_order: bool = True,
+) -> dict[str, Any]:
+    payload = {
         "strategy": settings.strategy,
         "label": _selection_strategy_label(settings.strategy),
         "description": _selection_strategy_description(settings.strategy),
-        "token_order": list(settings.token_order),
+        "token_order_count": len(settings.token_order),
         "plan_order_enabled": settings.plan_order_enabled,
         "plan_order": list(settings.plan_order),
         "active_stream_cap": normalize_token_active_stream_cap(settings.active_stream_cap),
@@ -10608,6 +10612,9 @@ def _serialize_token_selection_settings(settings: TokenSelectionSettings) -> dic
             },
         ],
     }
+    if include_token_order:
+        payload["token_order"] = list(settings.token_order)
+    return payload
 
 
 def _serialize_token_import_batch_summary(batch: TokenImportBatchSummary) -> dict[str, Any]:
@@ -11501,7 +11508,10 @@ def create_app() -> FastAPI:
             "counts": asdict(counts),
             "filtered_counts": asdict(filtered_counts),
             "plan_counts": asdict(plan_counts),
-            "selection": _serialize_token_selection_settings(_current_token_selection_settings(http_request.app)),
+            "selection": _serialize_token_selection_settings(
+                _current_token_selection_settings(http_request.app),
+                include_token_order=False,
+            ),
             "import_batches": [_serialize_token_import_batch_summary(batch) for batch in import_batches],
             "selected_import_batch": selected_import_batch_payload,
             "query": {
