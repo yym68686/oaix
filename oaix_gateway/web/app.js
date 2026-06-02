@@ -6,6 +6,8 @@ const IMPORT_JOB_POLL_INTERVAL_MS = 1500;
 const TOAST_DURATION_MS = 5200;
 const TOAST_EXIT_DURATION_MS = 220;
 const TOKEN_PAGE_SIZE = 80;
+const TOKEN_LIST_CACHE_TTL_MS = 10000;
+const TOKEN_STATUS_PREFETCH_DELAY_MS = 0;
 const TOKEN_LIST_BASE_NOTE = `每页 ${TOKEN_PAGE_SIZE} 条记录 · 搜索、筛选、排序均作用于全池`;
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
@@ -92,6 +94,11 @@ const state = {
   tokenQuotaAbortController: null,
   tokenQuotaRequestSeq: 0,
   tokenQuotaRetryTimer: null,
+  tokenStatusPageCache: new Map(),
+  tokenStatusCacheGeneration: 0,
+  tokenStatusPrefetching: new Set(),
+  tokenStatusPrefetchPromises: new Map(),
+  tokenStatusPrefetchTimer: null,
   tokenPagination: {
     total: 0,
     limit: TOKEN_PAGE_SIZE,
@@ -484,6 +491,7 @@ async function pollImportJob(jobId, { refreshOnFinish = true } = {}) {
     if (job.status === "completed") {
       setFeedback(buildImportJobCompletedMessage(job), "is-success");
       if (refreshOnFinish) {
+        clearTokenStatusPageCache();
         await refreshDashboard();
       }
       return;
@@ -491,6 +499,7 @@ async function pollImportJob(jobId, { refreshOnFinish = true } = {}) {
 
     setFeedback(buildImportJobFailureMessage(job), "is-error");
     if (refreshOnFinish) {
+      clearTokenStatusPageCache();
       await refreshDashboard();
     }
   } catch (error) {
@@ -2844,6 +2853,157 @@ function markTokenQuotaError(ids, message) {
   });
 }
 
+function isDefaultTokenStatusPageQuery(page = state.tokenPage) {
+  return (
+    normalizePositiveInteger(page, 1) === 1 &&
+    !normalizeWhitespace(state.tokenSearchTerm) &&
+    normalizeAvailablePlanFilter(state.tokenPlanFilter) === AVAILABLE_PLAN_FILTER_ALL &&
+    normalizeTokenSort(state.tokenSort) === DEFAULT_TOKEN_SORT &&
+    state.selectedImportBatchId == null
+  );
+}
+
+function tokenStatusPageCacheKey(status) {
+  return normalizeTokenStatusFilter(status);
+}
+
+function getCachedTokenStatusPage(status) {
+  const cacheKey = tokenStatusPageCacheKey(status);
+  const cached = state.tokenStatusPageCache.get(cacheKey);
+  if (!cached || Date.now() - cached.storedAt > TOKEN_LIST_CACHE_TTL_MS) {
+    state.tokenStatusPageCache.delete(cacheKey);
+    return null;
+  }
+  return cached.data;
+}
+
+function setCachedTokenStatusPage(status, data) {
+  state.tokenStatusPageCache.set(tokenStatusPageCacheKey(status), {
+    data,
+    storedAt: Date.now(),
+  });
+}
+
+function clearTokenStatusPageCache() {
+  state.tokenStatusCacheGeneration += 1;
+  state.tokenStatusPageCache.clear();
+  state.tokenStatusPrefetching.clear();
+  state.tokenStatusPrefetchPromises.clear();
+  if (state.tokenStatusPrefetchTimer) {
+    window.clearTimeout(state.tokenStatusPrefetchTimer);
+    state.tokenStatusPrefetchTimer = null;
+  }
+}
+
+function buildDefaultTokenStatusParams(status) {
+  return new URLSearchParams({
+    limit: String(state.tokenPageSize),
+    offset: "0",
+    q: "",
+    status: normalizeTokenStatusFilter(status),
+    plan_type: AVAILABLE_PLAN_FILTER_ALL,
+    sort: DEFAULT_TOKEN_SORT,
+  });
+}
+
+async function prefetchTokenStatusPage(status) {
+  if (!state.serviceKey || !isDefaultTokenStatusPageQuery(1)) {
+    return;
+  }
+  const cacheKey = tokenStatusPageCacheKey(status);
+  if (state.tokenStatusPrefetching.has(cacheKey) || getCachedTokenStatusPage(status)) {
+    return state.tokenStatusPrefetchPromises.get(cacheKey);
+  }
+  state.tokenStatusPrefetching.add(cacheKey);
+  const cacheGeneration = state.tokenStatusCacheGeneration;
+  const promise = (async () => {
+    try {
+      const data = await fetchJson(`/admin/tokens?${buildDefaultTokenStatusParams(status).toString()}`, {
+        headers: authHeaders(),
+      });
+      if (cacheGeneration === state.tokenStatusCacheGeneration) {
+        setCachedTokenStatusPage(status, data);
+      }
+    } catch (error) {
+      if (!isAbortError(error)) {
+        console.warn("Failed to prefetch token status page", status, error);
+      }
+    } finally {
+      state.tokenStatusPrefetching.delete(cacheKey);
+      state.tokenStatusPrefetchPromises.delete(cacheKey);
+    }
+  })();
+  state.tokenStatusPrefetchPromises.set(cacheKey, promise);
+  return promise;
+}
+
+function scheduleTokenStatusPrefetch({ listRequestSeq = state.tokenListRequestSeq } = {}) {
+  if (!state.serviceKey || !isDefaultTokenStatusPageQuery(1) || state.tokenViewMode !== "keys") {
+    return;
+  }
+  if (state.tokenStatusPrefetchTimer) {
+    window.clearTimeout(state.tokenStatusPrefetchTimer);
+  }
+  state.tokenStatusPrefetchTimer = window.setTimeout(() => {
+    state.tokenStatusPrefetchTimer = null;
+    if (listRequestSeq !== state.tokenListRequestSeq || !isDefaultTokenStatusPageQuery(1)) {
+      return;
+    }
+    TOKEN_STATUS_FILTERS.forEach((status) => {
+      if (status !== state.tokenStatusFilter) {
+        void prefetchTokenStatusPage(status);
+      }
+    });
+  }, TOKEN_STATUS_PREFETCH_DELAY_MS);
+}
+
+function applyTokenListData(data, { requestedPage, allowPageAdjust, listRequestSeq }) {
+  if (listRequestSeq !== state.tokenListRequestSeq) {
+    return false;
+  }
+  state.tokensLoaded = true;
+  state.tokenItems = Array.isArray(data.items) ? data.items.map(markTokenQuotaPending) : [];
+  state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : [];
+  state.selectedImportBatchFailedItems =
+    state.selectedImportBatchId != null && Array.isArray(data.selected_import_batch?.failed_items)
+      ? data.selected_import_batch.failed_items
+      : [];
+  state.tokenFilteredCounts = data.filtered_counts || data.counts || state.tokenFilteredCounts;
+  state.tokenPlanCounts = data.plan_counts || state.tokenPlanCounts;
+  const pagination = normalizeTokenPagination(data.pagination || {}, state.tokenItems.length, requestedPage);
+  if (allowPageAdjust && pagination.total > 0 && state.tokenItems.length === 0 && requestedPage > pagination.totalPages) {
+    state.tokenPage = pagination.totalPages;
+    void loadTokens({ page: pagination.totalPages, allowPageAdjust: false });
+    return false;
+  }
+  state.tokenPagination = pagination;
+  state.tokenPage = pagination.page;
+  state.tokenPageLoading = false;
+  elements.listNote.textContent = buildTokenListNote();
+  renderTokenSelection(data.selection || {});
+  setTokenSelectionDisabled(state.tokenSelectionSaving);
+  setTokenConcurrencyDisabled(state.tokenActiveStreamCapSaving);
+  setTokenPlanOrderDisabled(state.tokenPlanOrderSaving);
+  setTokenSearchDisabled(false);
+  renderTokenQueryControls();
+  renderTokenPagination();
+  renderTokenList(state.tokenItems);
+  if (data.counts) {
+    renderCounts(data.counts);
+  }
+  const visibleTokenIds = state.tokenItems
+    .map((item) => Number(item?.id))
+    .filter((tokenId) => Number.isFinite(tokenId) && tokenId > 0);
+  void loadTokenCosts(visibleTokenIds, { listRequestSeq });
+  const quotaTokenIds = state.tokenItems
+    .filter((item) => item?.quota_loading)
+    .map((item) => Number(item?.id))
+    .filter((tokenId) => Number.isFinite(tokenId) && tokenId > 0);
+  void loadTokenQuotas(quotaTokenIds, { listRequestSeq });
+  scheduleTokenStatusPrefetch({ listRequestSeq });
+  return true;
+}
+
 async function loadTokenCosts(tokenIds, { listRequestSeq = state.tokenListRequestSeq } = {}) {
   const resolvedIds = Array.from(
     new Set(
@@ -3027,60 +3187,39 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
   }
   abortTokenCostRequest();
   abortTokenQuotaRequest();
-  const controller = new AbortController();
-  state.tokenListAbortController = controller;
 
   state.tokenPage = requestedPage;
   state.tokenPageLoading = true;
   renderTokenQueryControls();
   renderTokenPagination("正在载入当前页");
 
+  const tokenStatus = normalizeTokenStatusFilter(state.tokenStatusFilter);
+  const cacheEligible = isDefaultTokenStatusPageQuery(requestedPage);
+  if (cacheEligible) {
+    const cacheKey = tokenStatusPageCacheKey(tokenStatus);
+    const pendingPrefetch = state.tokenStatusPrefetchPromises.get(cacheKey);
+    if (pendingPrefetch) {
+      await pendingPrefetch;
+    }
+    const cachedData = getCachedTokenStatusPage(tokenStatus);
+    if (cachedData) {
+      applyTokenListData(cachedData, { requestedPage, allowPageAdjust, listRequestSeq });
+      return;
+    }
+  }
+
+  const controller = new AbortController();
+  state.tokenListAbortController = controller;
+
   try {
     const data = await fetchJson(`/admin/tokens?${params.toString()}`, {
       headers: authHeaders(),
       signal: controller.signal,
     });
-    if (listRequestSeq !== state.tokenListRequestSeq) {
-      return;
+    if (cacheEligible && listRequestSeq === state.tokenListRequestSeq) {
+      setCachedTokenStatusPage(tokenStatus, data);
     }
-    state.tokensLoaded = true;
-    state.tokenItems = Array.isArray(data.items) ? data.items.map(markTokenQuotaPending) : [];
-    state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : [];
-    state.selectedImportBatchFailedItems =
-      state.selectedImportBatchId != null && Array.isArray(data.selected_import_batch?.failed_items)
-        ? data.selected_import_batch.failed_items
-        : [];
-    state.tokenFilteredCounts = data.filtered_counts || data.counts || state.tokenFilteredCounts;
-    state.tokenPlanCounts = data.plan_counts || state.tokenPlanCounts;
-    const pagination = normalizeTokenPagination(data.pagination || {}, state.tokenItems.length, requestedPage);
-    if (allowPageAdjust && pagination.total > 0 && state.tokenItems.length === 0 && requestedPage > pagination.totalPages) {
-      state.tokenPage = pagination.totalPages;
-      return loadTokens({ page: pagination.totalPages, allowPageAdjust: false });
-    }
-    state.tokenPagination = pagination;
-    state.tokenPage = pagination.page;
-    state.tokenPageLoading = false;
-    elements.listNote.textContent = buildTokenListNote();
-    renderTokenSelection(data.selection || {});
-    setTokenSelectionDisabled(state.tokenSelectionSaving);
-    setTokenConcurrencyDisabled(state.tokenActiveStreamCapSaving);
-    setTokenPlanOrderDisabled(state.tokenPlanOrderSaving);
-    setTokenSearchDisabled(false);
-    renderTokenQueryControls();
-    renderTokenPagination();
-    renderTokenList(state.tokenItems);
-    if (data.counts) {
-      renderCounts(data.counts);
-    }
-    const visibleTokenIds = state.tokenItems
-      .map((item) => Number(item?.id))
-      .filter((tokenId) => Number.isFinite(tokenId) && tokenId > 0);
-    void loadTokenCosts(visibleTokenIds, { listRequestSeq });
-    const quotaTokenIds = state.tokenItems
-      .filter((item) => item?.quota_loading)
-      .map((item) => Number(item?.id))
-      .filter((tokenId) => Number.isFinite(tokenId) && tokenId > 0);
-    void loadTokenQuotas(quotaTokenIds, { listRequestSeq });
+    applyTokenListData(data, { requestedPage, allowPageAdjust, listRequestSeq });
   } catch (error) {
     if (isAbortError(error) || listRequestSeq !== state.tokenListRequestSeq) {
       return;
@@ -3454,6 +3593,7 @@ async function toggleTokenActivation(
         clear_cooldown: Boolean(clearCooldown),
       }),
     });
+    clearTokenStatusPageCache();
     await loadHealth();
     await loadTokens();
   } catch (error) {
@@ -3489,6 +3629,7 @@ async function probeToken(tokenId, model = state.probeModel) {
     clearTokenActionPending(resolvedTokenId);
     showToast(data?.message || "测试完成", resolveProbeToastTone(data));
     try {
+      clearTokenStatusPageCache();
       await loadHealth();
       await loadTokens();
     } catch (refreshError) {
@@ -3531,6 +3672,7 @@ async function deleteToken(tokenId) {
       headers: authHeaders(),
     });
     closeTokenDeleteDialog({ force: true });
+    clearTokenStatusPageCache();
     await loadHealth();
     await loadTokens();
     elements.listNote.textContent = `已删除 ${context.title}`;
@@ -4120,6 +4262,7 @@ async function importTokens() {
       `导入任务 #${job.id} 已创建，共 ${job.total_count || payloads.length} 条，后台会继续处理。`,
       "is-success",
     );
+    clearTokenStatusPageCache();
     await refreshDashboard();
     await pollImportJob(job.id, { refreshOnFinish: false });
   } catch (error) {
@@ -4148,6 +4291,7 @@ function saveServiceKey() {
     localStorage.removeItem(STORAGE_KEY);
     setFeedback("Service API Key 已清空。");
   }
+  clearTokenStatusPageCache();
   refreshDashboard();
   if (state.importJobId) {
     resumeTrackedImportJob();
@@ -4159,6 +4303,7 @@ function clearServiceKey() {
   state.serviceKey = "";
   localStorage.removeItem(STORAGE_KEY);
   setFeedback("Service API Key 已清空。");
+  clearTokenStatusPageCache();
   if (state.importJobId) {
     stopImportJobPolling();
     setImportButtonBusy(true, "等待鉴权…");
@@ -4501,6 +4646,7 @@ if (supportsTokenDeleteDialog) {
 }
 
 elements.refreshButton.addEventListener("click", () => {
+  clearTokenStatusPageCache();
   void refreshDashboard();
 });
 elements.saveKeyButton.addEventListener("click", saveServiceKey);

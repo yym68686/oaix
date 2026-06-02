@@ -282,13 +282,27 @@ def test_frontend_loads_token_quota_lazily_after_list_render() -> None:
     quota_function = app_js.split("async function loadTokenQuotas", 1)[1].split("async function loadTokens", 1)[0]
 
     assert 'include_quota: "1"' not in load_tokens_function
-    assert "void loadTokenQuotas(quotaTokenIds, { listRequestSeq })" in load_tokens_function
+    assert "void loadTokenQuotas(quotaTokenIds, { listRequestSeq })" in app_js
     assert "`/admin/tokens/quota?${params.toString()}`" in quota_function
     assert "new AbortController()" in load_tokens_function
     assert "new AbortController()" in quota_function
     assert "listRequestSeq !== state.tokenListRequestSeq" in quota_function
     assert "quota_loading" in app_js
     assert "pendingIdSet.has(tokenId)" in quota_function
+
+
+def test_frontend_prefetches_default_token_status_pages() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+    load_tokens_function = app_js.split("async function loadTokens", 1)[1].split("async function goToTokenPage", 1)[0]
+    prefetch_function = app_js.split("async function prefetchTokenStatusPage", 1)[1].split("function scheduleTokenStatusPrefetch", 1)[0]
+
+    assert "TOKEN_LIST_CACHE_TTL_MS" in app_js
+    assert "tokenStatusPrefetchPromises" in app_js
+    assert "getCachedTokenStatusPage(tokenStatus)" in load_tokens_function
+    assert "await pendingPrefetch" in load_tokens_function
+    assert "scheduleTokenStatusPrefetch({ listRequestSeq })" in app_js
+    assert "setCachedTokenStatusPage(status, data)" in prefetch_function
+    assert "clearTokenStatusPageCache()" in app_js
 
 
 def test_frontend_probe_request_sends_selected_model() -> None:
