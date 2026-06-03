@@ -4340,6 +4340,8 @@ def _sanitize_codex_payload(
     payload.pop("response_format", None)
     if not preserve_previous_response_id:
         payload.pop("previous_response_id", None)
+    payload.pop("conversation_id", None)
+    payload.pop("session_id", None)
     payload.pop("prompt_cache_retention", None)
     payload.pop("safety_identifier", None)
     if compact:

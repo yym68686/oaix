@@ -402,6 +402,8 @@ def test_sanitize_codex_payload_removes_unsupported_fields() -> None:
         "max_output_tokens": 100,
         "response_format": {"type": "json_schema"},
         "previous_response_id": "abc",
+        "conversation_id": "conv_123",
+        "session_id": "session_123",
         "prompt_cache_retention": "ephemeral",
         "safety_identifier": "sid",
     }
