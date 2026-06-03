@@ -200,6 +200,8 @@ def test_frontend_supports_import_batch_view() -> None:
     assert "导入批次 #" in app_js
     assert "失败 Key" in app_js
     assert "data-import-batch-view" in app_js
+    assert "average_observed_cost_usd" in app_js
+    assert "平均金额" in app_js
 
 
 def test_frontend_import_panel_supports_queue_position_switch() -> None:
@@ -482,6 +484,8 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
                 submitted_at=submitted_at,
                 started_at=submitted_at,
                 finished_at=submitted_at,
+                observed_cost_usd=12.0,
+                average_observed_cost_usd=4.0,
             )
         ]
 
@@ -516,6 +520,8 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
     assert body["import_batches"][0]["cooling"] == 1
     assert body["import_batches"][0]["disabled"] == 1
     assert body["import_batches"][0]["token_ids"] == [7, 8, 9]
+    assert body["import_batches"][0]["observed_cost_usd"] == 12.0
+    assert body["import_batches"][0]["average_observed_cost_usd"] == 4.0
     assert body["filtered_counts"]["available"] == 19
     assert body["plan_counts"]["plus"] == 20
     assert body["query"] == {

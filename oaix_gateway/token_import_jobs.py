@@ -27,6 +27,7 @@ from .database import (
     utcnow,
 )
 from .oauth import CodexOAuthManager
+from .request_store import get_request_costs_by_token
 from .token_identity import normalize_refresh_token
 from .token_store import (
     DEFAULT_TOKEN_IMPORT_QUEUE_POSITION,
@@ -173,6 +174,8 @@ class TokenImportBatchSummary:
     submitted_at: datetime | None
     started_at: datetime | None
     finished_at: datetime | None
+    observed_cost_usd: float = 0.0
+    average_observed_cost_usd: float | None = None
 
 
 def _safe_optional_text(value: Any, *, max_length: int = 512) -> str | None:
@@ -710,6 +713,7 @@ def _build_token_import_batch_summary(
     job: TokenImportJob,
     *,
     tokens_by_id: dict[int, CodexToken],
+    observed_costs_by_token: dict[int, float],
     now: datetime,
 ) -> TokenImportBatchSummary:
     state = _serialize_job_state(job)
@@ -731,6 +735,14 @@ def _build_token_import_batch_summary(
             available += 1
 
     present_count = available + cooling + disabled
+    observed_cost_usd = round(
+        sum(
+            float(observed_costs_by_token.get(token_id, 0.0) or 0.0)
+            for token_id in token_ids
+            if token_id in tokens_by_id
+        ),
+        6,
+    )
     return TokenImportBatchSummary(
         id=state.id,
         status=state.status,
@@ -750,6 +762,8 @@ def _build_token_import_batch_summary(
         submitted_at=state.submitted_at,
         started_at=state.started_at,
         finished_at=state.finished_at,
+        observed_cost_usd=observed_cost_usd,
+        average_observed_cost_usd=round(observed_cost_usd / present_count, 6) if present_count > 0 else None,
     )
 
 
@@ -869,11 +883,17 @@ async def list_token_import_batch_summaries(limit: int = 30) -> list[TokenImport
             )
             tokens_by_id = {int(token.id): token for token in token_result.scalars().all()}
 
-        now = utcnow()
-        return [
-            _build_token_import_batch_summary(job, tokens_by_id=tokens_by_id, now=now)
-            for job in jobs
-        ]
+    observed_costs_by_token = await get_request_costs_by_token(tuple(tokens_by_id)) if tokens_by_id else {}
+    now = utcnow()
+    return [
+        _build_token_import_batch_summary(
+            job,
+            tokens_by_id=tokens_by_id,
+            observed_costs_by_token=observed_costs_by_token,
+            now=now,
+        )
+        for job in jobs
+    ]
 
 
 async def _list_token_import_items(job_id: int) -> list[_TokenImportStagedItem]:

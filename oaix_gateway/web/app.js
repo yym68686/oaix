@@ -2245,6 +2245,7 @@ function renderRequestAnalytics(analytics) {
 }
 
 function buildImportBatchCounts(batch) {
+  const averageObservedCostUsd = Number(batch?.average_observed_cost_usd);
   return {
     available: Math.max(0, Number(batch?.available || 0)),
     cooling: Math.max(0, Number(batch?.cooling || 0)),
@@ -2254,6 +2255,7 @@ function buildImportBatchCounts(batch) {
     totalCount: Math.max(0, Number(batch?.total_count || 0)),
     processedCount: Math.max(0, Number(batch?.processed_count || 0)),
     failedCount: Math.max(0, Number(batch?.failed_count || 0)),
+    averageObservedCostUsd: Number.isFinite(averageObservedCostUsd) ? Math.max(0, averageObservedCostUsd) : null,
   };
 }
 
@@ -2291,6 +2293,8 @@ function renderImportBatchList() {
           const counts = buildImportBatchCounts(batch);
           const batchId = Number(batch?.id);
           const selected = state.selectedImportBatchId === batchId;
+          const averageCostValue =
+            counts.averageObservedCostUsd == null ? "—" : formatUsd(counts.averageObservedCostUsd);
           return `
             <article class="import-batch-card${selected ? " import-batch-card--selected" : ""}" role="listitem">
               <div class="import-batch-card__main">
@@ -2313,6 +2317,7 @@ function renderImportBatchList() {
                 <span><strong>${escapeHtml(formatInteger(counts.cooling))}</strong><small>冷却</small></span>
                 <span><strong>${escapeHtml(formatInteger(counts.disabled))}</strong><small>禁用</small></span>
                 <span><strong>${escapeHtml(formatInteger(counts.failedCount))}</strong><small>失败</small></span>
+                <span><strong>${escapeHtml(averageCostValue)}</strong><small>平均金额</small></span>
               </div>
             </article>
           `;
