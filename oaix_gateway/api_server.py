@@ -4419,7 +4419,10 @@ def _is_invalid_encrypted_content_error(status_code: int, error_text: str) -> bo
         if error_code == "invalid_encrypted_content":
             return True
 
-    return "invalid_encrypted_content" in str(error_text or "").lower()
+    message = str(error_text or "").lower()
+    return "invalid_encrypted_content" in message or (
+        "encrypted content" in message and "could not be verified" in message
+    )
 
 
 def _admin_token_probe_model() -> str:
@@ -12271,16 +12274,35 @@ async def _proxy_request_with_token(
             finally:
                 await session.close(reason="responses_non_stream_attempt_finished")
 
-    upstream_response = await client.post(
-        upstream_url,
-        headers=headers,
-        content=json_payload,
-        timeout=_upstream_http_timeout(read=None),
-    )
+    invalid_encrypted_content_recovery_tried = False
+    while True:
+        upstream_response = await client.post(
+            upstream_url,
+            headers=headers,
+            content=json_payload,
+            timeout=_upstream_http_timeout(read=None),
+        )
 
-    if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
-        raw = await upstream_response.aread()
-        raise _upstream_error_http_exception(upstream_response.status_code, _decode_error_body(raw))
+        if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
+            status_code = upstream_response.status_code
+            raw = await upstream_response.aread()
+            detail = _decode_error_body(raw)
+            if (
+                not invalid_encrypted_content_recovery_tried
+                and _is_invalid_encrypted_content_error(status_code, detail)
+                and _trim_invalid_encrypted_reasoning_items(payload)
+            ):
+                invalid_encrypted_content_recovery_tried = True
+                json_payload = json.dumps(payload, ensure_ascii=False)
+                logger.info(
+                    "Retrying Codex direct request once on the same account after invalid encrypted reasoning content: "
+                    "account_id=%s compact=%s",
+                    account_id,
+                    compact,
+                )
+                continue
+            raise _upstream_error_http_exception(status_code, detail)
+        break
 
     raw = await upstream_response.aread()
     data = _decode_responses_json_body(raw)

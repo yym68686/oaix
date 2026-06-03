@@ -483,7 +483,7 @@ def test_trim_invalid_encrypted_reasoning_items_preserves_valid_input() -> None:
     }
 
 
-def test_is_invalid_encrypted_content_error_requires_bad_request_code() -> None:
+def test_is_invalid_encrypted_content_error_requires_bad_request_and_matching_detail() -> None:
     detail = json.dumps(
         {
             "error": {
@@ -497,6 +497,23 @@ def test_is_invalid_encrypted_content_error_requires_bad_request_code() -> None:
     assert _is_invalid_encrypted_content_error(400, detail) is True
     assert _is_invalid_encrypted_content_error(500, detail) is False
     assert _is_invalid_encrypted_content_error(400, '{"error":{"code":"invalid_type"}}') is False
+    assert (
+        _is_invalid_encrypted_content_error(
+            400,
+            "\u8bf7\u6c42\u65e0\u6548 \u00b7 The encrypted content ## A..."
+            "\u5b9e\u7f3a\u53e3\u3002 could not be verified.",
+        )
+        is True
+    )
+    assert (
+        _is_invalid_encrypted_content_error(
+            400,
+            '{"error":{"message":"The encrypted content '
+            '\u6211\u5148\u628a*...\u7406\u7ed9\u4f60\u3002 could not be verified.",'
+            '"type":"invalid_request_error"}}',
+        )
+        is True
+    )
 
 
 def test_sanitize_codex_payload_compact_strips_store() -> None:
@@ -2954,6 +2971,102 @@ def test_proxy_request_with_token_for_compact_non_stream_request_posts_without_f
     assert body["output"][0]["content"][0]["text"] == "hello compact"
 
 
+def test_proxy_request_with_token_repairs_invalid_encrypted_content_for_compact_direct_response() -> None:
+    class DummyClient:
+        def __init__(self) -> None:
+            self.stream_calls: list[dict[str, object]] = []
+            self.post_calls: list[dict[str, object]] = []
+
+        def stream(self, method, url, headers, content, timeout):
+            raise AssertionError("compact non-stream requests should not call client.stream")
+
+        async def post(self, url, headers, content, timeout):
+            self.post_calls.append(
+                {
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                    "timeout": timeout,
+                }
+            )
+            if len(self.post_calls) == 1:
+                return httpx.Response(
+                    400,
+                    request=httpx.Request("POST", url),
+                    content=(
+                        '{"error":{"type":"invalid_request_error","message":"'
+                        '\u8bf7\u6c42\u65e0\u6548 \u00b7 The encrypted content ## A...'
+                        '\u5b9e\u7f3a\u53e3\u3002 could not be verified."}}'
+                    ).encode("utf-8"),
+                )
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "id": "resp_compact_retry",
+                    "model": "gpt-5.4-compact",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "hello compact",
+                                }
+                            ]
+                        }
+                    ],
+                },
+            )
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses/compact",
+            "headers": [(b"user-agent", b"yaak")],
+        }
+    )
+    request_data = ResponsesRequest(
+        model="gpt-5.4",
+        input=[
+            {
+                "type": "reasoning",
+                "encrypted_content": "expired",
+                "summary": [{"type": "summary_text", "text": "prior work"}],
+            },
+            {"type": "message", "role": "user", "content": "hello compact"},
+        ],
+        stream=False,
+        store=True,
+    )
+
+    client = DummyClient()
+    result = asyncio.run(
+        _proxy_request_with_token(
+            client,
+            request,
+            request_data,
+            access_token="access-token",
+            account_id="account-1",
+            compact=True,
+        )
+    )
+
+    assert client.stream_calls == []
+    assert len(client.post_calls) == 2
+    first_payload = json.loads(client.post_calls[0]["content"])
+    second_payload = json.loads(client.post_calls[1]["content"])
+    assert first_payload["input"][0]["encrypted_content"] == "expired"
+    assert "encrypted_content" not in second_payload["input"][0]
+    assert second_payload["input"][0]["summary"] == [{"type": "summary_text", "text": "prior work"}]
+    assert second_payload["input"][1] == {"type": "message", "role": "user", "content": "hello compact"}
+    assert "store" not in second_payload
+    assert "stream" not in second_payload
+    assert result.status_code == 200
+    assert json.loads(result.response.body)["id"] == "resp_compact_retry"
+
+
 def test_proxy_request_with_token_compact_non_stream_timeout_does_not_fallback() -> None:
     class DummyClient:
         def __init__(self) -> None:
@@ -3467,7 +3580,10 @@ def test_responses_stream_keepalive_response_repairs_invalid_encrypted_content_o
                 return DummyStreamContext(
                     DummyStreamingResponse(
                         status_code=400,
-                        raw_body=b'{"error":{"type":"invalid_request_error","code":"invalid_encrypted_content","message":"encrypted content could not be verified"}}',
+                        raw_body=(
+                            '{"error":{"type":"invalid_request_error","message":"The encrypted content '
+                            '\u6211\u5148\u628a*...\u7406\u7ed9\u4f60\u3002 could not be verified."}}'
+                        ).encode("utf-8"),
                     ),
                     self,
                 )
