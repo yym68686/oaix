@@ -32,13 +32,16 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from types import SimpleNamespace
 from starlette.datastructures import UploadFile
 from .chat_image_store import create_chat_image_checkpoint, resolve_chat_image_output_items
 from .codex_constants import CODEX_CLI_VERSION, CODEX_USER_AGENT
 from .database import (
+    GatewayRequestLog,
     close_database,
+    get_request_log_session,
     init_db,
     reset_db_pool_role,
     reset_db_timing_recorder,
@@ -204,6 +207,9 @@ _STREAM_OWNER_COUNTERS: Counter[str] = Counter()
 _GATEWAY_GUARD_EVENTS: deque[tuple[float, str | None, int, str | None]] = deque(maxlen=50000)
 _GATEWAY_GUARD_WINDOW_SECONDS = 300.0
 _RUNTIME_GUARD_SAMPLES: deque[tuple[float, int | None, int, int, int]] = deque(maxlen=5000)
+_OAIX_WAITING_FIRST_BYTE = 0
+_LAST_EVENT_LOOP_LAG_MS = 0
+_LAST_UPSTREAM_POOL_WAIT_MS = 0
 
 
 def _find_sse_event_separator(text: str, start: int = 0) -> tuple[int, int] | None:
@@ -475,6 +481,46 @@ def _current_request_timing() -> _RequestTimingRecorder | None:
     return _REQUEST_TIMING.get()
 
 
+def _normalize_trace_tag(value: Any, *, max_length: int = 128) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text[:max_length]
+
+
+def _incoming_trace_tags(request: Request) -> dict[str, str]:
+    trace_id = _normalize_trace_tag(request.headers.get("x-request-id"))
+    caller_app = _normalize_trace_tag(request.headers.get("x-caller-app"))
+    ember_request_id = _normalize_trace_tag(
+        request.headers.get("x-uni-api-ember-request-id") or request.headers.get("x-caller-request-id")
+    )
+    tags: dict[str, str] = {}
+    if trace_id is not None:
+        tags["trace_id"] = trace_id
+    if caller_app is not None:
+        tags["caller_app"] = caller_app
+    if ember_request_id is not None:
+        tags["uni_api_ember_request_id"] = ember_request_id
+    return tags
+
+
+def _record_incoming_trace_tags(timing: _RequestTimingRecorder, request: Request) -> dict[str, str]:
+    tags = _incoming_trace_tags(request)
+    for key, value in tags.items():
+        timing.set_tag(key, value)
+    return tags
+
+
+def _begin_waiting_first_byte() -> None:
+    global _OAIX_WAITING_FIRST_BYTE
+    _OAIX_WAITING_FIRST_BYTE += 1
+
+
+def _end_waiting_first_byte() -> None:
+    global _OAIX_WAITING_FIRST_BYTE
+    _OAIX_WAITING_FIRST_BYTE = max(0, _OAIX_WAITING_FIRST_BYTE - 1)
+
+
 def _percentile(values: list[int], percentile: float) -> int | None:
     if not values:
         return None
@@ -547,7 +593,10 @@ class _HTTPPhaseTraceRecorder:
         if phase == "started":
             if not self._first_trace_seen:
                 self._first_trace_seen = True
-                self._timing.add_ms("http_pool_wait_ms", (now - self._started_at) * 1000)
+                pool_wait_ms = int((now - self._started_at) * 1000)
+                self._timing.add_ms("http_pool_wait_ms", pool_wait_ms)
+                global _LAST_UPSTREAM_POOL_WAIT_MS
+                _LAST_UPSTREAM_POOL_WAIT_MS = max(0, pool_wait_ms)
             self._operation_started_at[operation] = now
             return
 
@@ -603,12 +652,13 @@ class _TimingAsyncHTTPTransport(httpx.AsyncBaseTransport):
 
 
 async def _record_event_loop_lag(timing: _RequestTimingRecorder | None) -> None:
-    if timing is None:
-        await asyncio.sleep(0)
-        return
     started_at = time.perf_counter()
     await asyncio.sleep(0)
-    timing.add_elapsed("event_loop_lag_ms", started_at)
+    lag_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+    global _LAST_EVENT_LOOP_LAG_MS
+    _LAST_EVENT_LOOP_LAG_MS = lag_ms
+    if timing is not None:
+        timing.add_ms("event_loop_lag_ms", lag_ms)
 
 
 async def _await_timed(
@@ -2443,6 +2493,7 @@ class _ProxyStreamCapture:
         *,
         initial_model_name: str | None = None,
         initial_first_token_at: datetime | None = None,
+        track_waiting_first_byte: bool = False,
     ) -> None:
         self.model_name = initial_model_name
         self.first_token_at = initial_first_token_at
@@ -2459,6 +2510,9 @@ class _ProxyStreamCapture:
         self._sse_scan_start = 0
         self._captured_bytes = 0
         self._capture_disabled = False
+        self._waiting_first_byte_tracked = bool(track_waiting_first_byte and initial_first_token_at is None)
+        if self._waiting_first_byte_tracked:
+            _begin_waiting_first_byte()
 
     @property
     def response_payload(self) -> dict[str, Any] | None:
@@ -2483,9 +2537,16 @@ class _ProxyStreamCapture:
         return response_payload
 
     def finalize_usage_metrics(self) -> None:
+        self.release_waiting_first_byte()
         response_payload = self.response_payload
         if response_payload is not None:
             self._update_usage_metrics({"response": response_payload})
+
+    def release_waiting_first_byte(self) -> None:
+        if not self._waiting_first_byte_tracked:
+            return
+        self._waiting_first_byte_tracked = False
+        _end_waiting_first_byte()
 
     def _invalidate_response_payload_cache(self) -> None:
         self._response_payload_cache = None
@@ -2529,6 +2590,7 @@ class _ProxyStreamCapture:
 
                 if self.first_token_at is None and event_type and event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
                     self.first_token_at = utcnow()
+                    self.release_waiting_first_byte()
 
                 if not isinstance(event_payload, dict):
                     continue
@@ -4165,13 +4227,21 @@ def _token_active_runtime_metrics() -> dict[str, Any]:
 def _runtime_fd_metrics() -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "open_fds": None,
+        "open_sockets": None,
         "tcp_states": {},
         "tcp_close_wait": 0,
         "tcp_close_wait_443": 0,
     }
     fd_dir = Path("/proc/self/fd")
     with suppress(Exception):
-        metrics["open_fds"] = len(list(fd_dir.iterdir()))
+        fds = list(fd_dir.iterdir())
+        metrics["open_fds"] = len(fds)
+        open_sockets = 0
+        for fd_path in fds:
+            with suppress(OSError):
+                if os.readlink(fd_path).startswith("socket:"):
+                    open_sockets += 1
+        metrics["open_sockets"] = open_sockets
 
     state_names = {
         "01": "ESTABLISHED",
@@ -4228,6 +4298,102 @@ def _proxy_limiter_runtime_metrics(limiter: ProxyConcurrencyLimiter) -> dict[str
         "rejected_total": limiter.rejected_total,
         "max_active": limiter.max_active,
         "max_queue": limiter.max_queue,
+    }
+
+
+def _standard_runtime_gauges(
+    response_traffic: ResponseTrafficController,
+    proxy_limiter: ProxyConcurrencyLimiter,
+) -> dict[str, Any]:
+    proxy_metrics = _proxy_limiter_runtime_metrics(proxy_limiter)
+    runtime_metrics = _runtime_fd_metrics()
+    return {
+        "service": "oaix",
+        "inflight_requests": response_traffic.active_responses,
+        "waiting_first_byte": max(0, int(_OAIX_WAITING_FIRST_BYTE)),
+        "event_loop_lag_ms": max(0, int(_LAST_EVENT_LOOP_LAG_MS)),
+        "open_sockets": runtime_metrics.get("open_sockets"),
+        "upstream_pool_in_use": proxy_metrics["active"],
+        "upstream_pool_wait_ms": max(0, int(_LAST_UPSTREAM_POOL_WAIT_MS)),
+    }
+
+
+def _timing_spans_from_value(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        with suppress(json.JSONDecodeError):
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
+def _aggregate_observability_spans(span_values: Iterable[Any]) -> dict[str, Any]:
+    numeric_values: dict[str, list[int]] = {}
+    tag_values: dict[str, Counter[str]] = {}
+    for value in span_values:
+        spans = _timing_spans_from_value(value)
+        if not spans:
+            continue
+        for raw_key, raw_value in spans.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            if isinstance(raw_value, bool):
+                continue
+            if isinstance(raw_value, str):
+                text = raw_value.strip()
+                if text:
+                    tag_values.setdefault(key, Counter())[text[:128]] += 1
+                continue
+            try:
+                resolved = max(0, int(round(float(raw_value))))
+            except (TypeError, ValueError):
+                continue
+            numeric_values.setdefault(key, []).append(resolved)
+
+    numeric = {
+        key: {
+            "count": len(values),
+            "avg": int(round(sum(values) / len(values))) if values else None,
+            "p50": _percentile(values, 50),
+            "p95": _percentile(values, 95),
+            "max": max(values) if values else None,
+        }
+        for key, values in sorted(numeric_values.items())
+    }
+    tags = {
+        key: [{"value": value, "count": count} for value, count in counter.most_common(10)]
+        for key, counter in sorted(tag_values.items())
+    }
+    return {"numeric": numeric, "tags": tags}
+
+
+async def _oaix_ttft_window_payload(*, window_seconds: int, limit: int) -> dict[str, Any]:
+    await _flush_request_log_write_queue()
+    cutoff = utcnow() - timedelta(seconds=window_seconds)
+    stmt = (
+        select(GatewayRequestLog.ttft_ms, GatewayRequestLog.timing_spans)
+        .where(GatewayRequestLog.started_at >= cutoff)
+        .order_by(GatewayRequestLog.started_at.desc(), GatewayRequestLog.id.desc())
+        .limit(limit)
+    )
+    async with get_request_log_session() as session:
+        rows = (await session.execute(stmt)).all()
+
+    ttft_values = [
+        max(0, int(row.ttft_ms))
+        for row in rows
+        if row.ttft_ms is not None
+    ]
+    return {
+        "service": "oaix",
+        "window_seconds": window_seconds,
+        "sample_count": len(ttft_values),
+        "oaix_ttft_p95_ms": _percentile(ttft_values, 95),
+        "oaix_ttft_p50_ms": _percentile(ttft_values, 50),
+        "span_aggregation": _aggregate_observability_spans(row.timing_spans for row in rows),
     }
 
 
@@ -7590,6 +7756,7 @@ async def _proxy_image_request_with_token(
         stream_capture = _ProxyStreamCapture(
             initial_model_name=image_request.model_name,
             initial_first_token_at=None,
+            track_waiting_first_byte=True,
         )
         return await stream_proxy(
             client,
@@ -8829,6 +8996,7 @@ async def _responses_stream_keepalive_response(
     response_traffic: ResponseTrafficController = http_request.app.state.response_traffic
     response_lease = response_traffic.start_response()
     timing = _RequestTimingRecorder()
+    _record_incoming_trace_tags(timing, http_request)
     request_started_at = utcnow()
     request_log = _RequestLogHandle.start(
         endpoint=endpoint,
@@ -9238,6 +9406,7 @@ async def _responses_stream_keepalive_response(
                     stream_capture = _ProxyStreamCapture(
                         initial_model_name=request_model,
                         initial_first_token_at=None,
+                        track_waiting_first_byte=True,
                     )
                     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     text_buffer = ""
@@ -9793,6 +9962,7 @@ async def _execute_proxy_request_with_failover(
     release_response_traffic = True
     release_proxy_concurrency = True
     timing = _RequestTimingRecorder()
+    _record_incoming_trace_tags(timing, http_request)
     request_started_at = utcnow()
     request_log = _RequestLogHandle.start(
         endpoint=endpoint,
@@ -11322,6 +11492,7 @@ def create_app() -> FastAPI:
                 "max_proxy_requests": proxy_metrics["max_active"],
                 "max_proxy_queue": proxy_metrics["max_queue"],
                 "upstream_circuit_open": upstream_circuit_open,
+                "gauges": _standard_runtime_gauges(response_traffic, proxy_limiter),
                 "upstream": upstream_metrics,
                 "runtime": runtime_metrics,
                 "stream_owner": _stream_owner_runtime_metrics(),
@@ -11665,11 +11836,40 @@ def create_app() -> FastAPI:
         proxy_limiter = _proxy_concurrency_limiter(app)
         return {
             "active_responses": response_traffic.active_responses,
+            "gauges": _standard_runtime_gauges(response_traffic, proxy_limiter),
             "proxy": _proxy_limiter_runtime_metrics(proxy_limiter),
             "upstream": _upstream_runtime_metrics(app),
             "runtime": _runtime_fd_metrics(),
             "token_active": _token_active_runtime_metrics(),
             "request_log": _request_log_write_queue_stats(),
+        }
+
+    @app.get("/admin/observability/ttft")
+    async def observability_ttft_route(
+        window_seconds: int = Query(120, alias="windowSeconds", ge=1, le=3600),
+        limit: int = Query(5000, ge=1, le=50000),
+        web_ttft_p95_ms: int | None = Query(None, alias="webTtftP95Ms", ge=0),
+        threshold_ms: int = Query(30000, alias="thresholdMs", ge=0),
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        try:
+            payload = await _oaix_ttft_window_payload(window_seconds=window_seconds, limit=limit)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail="Request logs temporarily unavailable") from exc
+
+        oaix_ttft_p95_ms = payload.get("oaix_ttft_p95_ms")
+        delta_ms = None
+        if web_ttft_p95_ms is not None and oaix_ttft_p95_ms is not None:
+            delta_ms = max(0, int(web_ttft_p95_ms) - int(oaix_ttft_p95_ms))
+        response_traffic: ResponseTrafficController = app.state.response_traffic
+        proxy_limiter = _proxy_concurrency_limiter(app)
+        return {
+            **payload,
+            "web_ttft_p95_ms": web_ttft_p95_ms,
+            "delta_ms": delta_ms,
+            "threshold_ms": threshold_ms,
+            "alert": bool(delta_ms is not None and delta_ms > threshold_ms),
+            "gauges": _standard_runtime_gauges(response_traffic, proxy_limiter),
         }
 
     @app.post("/admin/tokens/import", status_code=202)
@@ -12156,6 +12356,7 @@ async def _proxy_request_with_token(
         stream_capture = _ProxyStreamCapture(
             initial_model_name=effective_requested_model,
             initial_first_token_at=None,
+            track_waiting_first_byte=True,
         )
         _prompt_cache_update_runtime_trace_fields(
             prompt_cache_trace,
@@ -12183,6 +12384,7 @@ async def _proxy_request_with_token(
         stream_capture = _ProxyStreamCapture(
             initial_model_name=request_data.model,
             initial_first_token_at=None,
+            track_waiting_first_byte=True,
         )
         proxy_result = await stream_proxy(
             client,
