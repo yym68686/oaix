@@ -32,14 +32,13 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from types import SimpleNamespace
 from starlette.datastructures import UploadFile
 from .chat_image_store import create_chat_image_checkpoint, resolve_chat_image_output_items
 from .codex_constants import CODEX_CLI_VERSION, CODEX_USER_AGENT
 from .database import (
-    GatewayRequestLog,
     close_database,
     get_request_log_session,
     init_db,
@@ -4378,19 +4377,23 @@ async def _oaix_ttft_window_payload(*, window_seconds: int, limit: int) -> dict[
         request_log_flush_error = True
         logger.exception("Failed to flush request log queue before oaix TTFT aggregation")
     cutoff = utcnow() - timedelta(seconds=window_seconds)
-    stmt = (
-        select(GatewayRequestLog.ttft_ms, GatewayRequestLog.timing_spans)
-        .where(GatewayRequestLog.started_at >= cutoff)
-        .order_by(GatewayRequestLog.started_at.desc(), GatewayRequestLog.id.desc())
-        .limit(limit)
+    stmt = text(
+        """
+        SELECT ttft_ms, timing_spans
+        FROM gateway_request_logs
+        WHERE started_at >= :cutoff
+        ORDER BY started_at DESC, id DESC
+        LIMIT :limit
+        """
     )
     async with get_request_log_session() as session:
-        rows = (await session.execute(stmt)).all()
+        rows = (await session.execute(stmt, {"cutoff": cutoff, "limit": int(limit)})).all()
 
+    row_mappings = [row._mapping for row in rows]
     ttft_values = [
-        max(0, int(row.ttft_ms))
-        for row in rows
-        if row.ttft_ms is not None
+        max(0, int(row["ttft_ms"]))
+        for row in row_mappings
+        if row["ttft_ms"] is not None
     ]
     return {
         "service": "oaix",
@@ -4399,7 +4402,7 @@ async def _oaix_ttft_window_payload(*, window_seconds: int, limit: int) -> dict[
         "oaix_ttft_p95_ms": _percentile(ttft_values, 95),
         "oaix_ttft_p50_ms": _percentile(ttft_values, 50),
         "request_log_flush_error": request_log_flush_error,
-        "span_aggregation": _aggregate_observability_spans(row.timing_spans for row in rows),
+        "span_aggregation": _aggregate_observability_spans(row["timing_spans"] for row in row_mappings),
     }
 
 
@@ -11861,6 +11864,7 @@ def create_app() -> FastAPI:
         try:
             payload = await _oaix_ttft_window_payload(window_seconds=window_seconds, limit=limit)
         except SQLAlchemyError as exc:
+            logger.exception("Failed to query oaix TTFT aggregation")
             raise HTTPException(status_code=503, detail="Request logs temporarily unavailable") from exc
 
         oaix_ttft_p95_ms = payload.get("oaix_ttft_p95_ms")
