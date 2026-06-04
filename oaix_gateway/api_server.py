@@ -4376,18 +4376,22 @@ async def _oaix_ttft_window_payload(*, window_seconds: int, limit: int) -> dict[
     except SQLAlchemyError:
         request_log_flush_error = True
         logger.exception("Failed to flush request log queue before oaix TTFT aggregation")
-    cutoff = utcnow() - timedelta(seconds=window_seconds)
     stmt = text(
         """
         SELECT ttft_ms, timing_spans
         FROM gateway_request_logs
-        WHERE started_at >= :cutoff
+        WHERE started_at >= now() - make_interval(secs => :window_seconds)
         ORDER BY started_at DESC, id DESC
         LIMIT :limit
         """
     )
     async with get_request_log_session() as session:
-        rows = (await session.execute(stmt, {"cutoff": cutoff, "limit": int(limit)})).all()
+        rows = (
+            await session.execute(
+                stmt,
+                {"window_seconds": int(window_seconds), "limit": int(limit)},
+            )
+        ).all()
 
     row_mappings = [row._mapping for row in rows]
     ttft_values = [
