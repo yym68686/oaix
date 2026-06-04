@@ -83,6 +83,7 @@ from oaix_gateway.api_server import (
     _codex_request_scoped_cooldown_scope,
     _gateway_guard_window_metrics,
     _is_model_unsupported_for_chatgpt_account_error,
+    _log_trace_span,
     _model_compatibility_max_token_probes,
     _record_gateway_guard_event,
     _runtime_guard_window_metrics,
@@ -275,6 +276,31 @@ def test_asyncio_socket_send_warning_filter_suppresses_disconnect_noise() -> Non
 
     assert log_filter.filter(noisy_record) is False
     assert log_filter.filter(other_record) is True
+
+
+def test_log_trace_span_emits_non_pii_trace_metadata(caplog: pytest.LogCaptureFixture) -> None:
+    request_ref = SimpleNamespace(request_id="oaix-req-1", endpoint="/v1/responses")
+    spans = {
+        "trace_id": "trace-123",
+        "caller_app": "uni-api-ember",
+        "uni_api_ember_request_id": "ember-req-1",
+        "upstream_headers_ms": 42,
+    }
+
+    with caplog.at_level(logging.INFO, logger="oaix.gateway"):
+        _log_trace_span(
+            request_log_id=123,
+            request_log_ref=request_ref,
+            status_code=200,
+            spans=spans,
+        )
+
+    output = "\n".join(record.getMessage() for record in caplog.records)
+    assert "trace_span trace_id=trace-123" in output
+    assert "request_id=oaix-req-1" in output
+    assert "caller_app=uni-api-ember" in output
+    assert "uni_api_ember_request_id=ember-req-1" in output
+    assert "alice@example.com" not in output
 
 
 def test_sse_proxy_streaming_response_stops_after_send_failure() -> None:

@@ -445,6 +445,12 @@ async def _finalize_request_log_with_timing(
             getattr(request_log_ref, "request_id", None),
             json.dumps(resolved_spans, sort_keys=True, separators=(",", ":")),
         )
+    _log_trace_span(
+        request_log_id=request_log_id,
+        request_log_ref=request_log_ref,
+        status_code=status_code,
+        spans=resolved_spans,
+    )
     return request_log_id
 
 
@@ -508,6 +514,32 @@ def _record_incoming_trace_tags(timing: _RequestTimingRecorder, request: Request
     for key, value in tags.items():
         timing.set_tag(key, value)
     return tags
+
+
+def _log_trace_span(
+    *,
+    request_log_id: int | None,
+    request_log_ref: Any,
+    status_code: int,
+    spans: dict[str, Any] | None,
+) -> None:
+    if not isinstance(spans, dict):
+        return
+    trace_id = _normalize_trace_tag(spans.get("trace_id"))
+    if trace_id is None:
+        return
+    logger.info(
+        "trace_span trace_id=%s request_id=%s oaix_request_log_id=%s caller_app=%s "
+        "uni_api_ember_request_id=%s endpoint=%s status_code=%s spans=%s",
+        trace_id,
+        getattr(request_log_ref, "request_id", None),
+        request_log_id,
+        _normalize_trace_tag(spans.get("caller_app")) or "-",
+        _normalize_trace_tag(spans.get("uni_api_ember_request_id")) or "-",
+        getattr(request_log_ref, "endpoint", None) or "-",
+        status_code,
+        json.dumps(spans, sort_keys=True, separators=(",", ":")),
+    )
 
 
 def _begin_waiting_first_byte() -> None:
