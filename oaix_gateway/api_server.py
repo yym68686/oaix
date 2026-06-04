@@ -4371,7 +4371,12 @@ def _aggregate_observability_spans(span_values: Iterable[Any]) -> dict[str, Any]
 
 
 async def _oaix_ttft_window_payload(*, window_seconds: int, limit: int) -> dict[str, Any]:
-    await _flush_request_log_write_queue()
+    request_log_flush_error = False
+    try:
+        await _flush_request_log_write_queue()
+    except SQLAlchemyError:
+        request_log_flush_error = True
+        logger.exception("Failed to flush request log queue before oaix TTFT aggregation")
     cutoff = utcnow() - timedelta(seconds=window_seconds)
     stmt = (
         select(GatewayRequestLog.ttft_ms, GatewayRequestLog.timing_spans)
@@ -4393,6 +4398,7 @@ async def _oaix_ttft_window_payload(*, window_seconds: int, limit: int) -> dict[
         "sample_count": len(ttft_values),
         "oaix_ttft_p95_ms": _percentile(ttft_values, 95),
         "oaix_ttft_p50_ms": _percentile(ttft_values, 50),
+        "request_log_flush_error": request_log_flush_error,
         "span_aggregation": _aggregate_observability_spans(row.timing_spans for row in rows),
     }
 
