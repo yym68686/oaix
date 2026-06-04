@@ -4386,12 +4386,13 @@ async def _oaix_ttft_window_payload(*, window_seconds: int, limit: int) -> dict[
         """
     )
     async with get_request_log_session() as session:
-        rows = (
-            await session.execute(
-                stmt,
-                {"window_seconds": int(window_seconds), "limit": int(limit)},
-            )
-        ).all()
+        async with session.begin():
+            rows = (
+                await session.execute(
+                    stmt,
+                    {"window_seconds": int(window_seconds), "limit": int(limit)},
+                )
+            ).all()
 
     row_mappings = [row._mapping for row in rows]
     ttft_values = [
