@@ -367,6 +367,11 @@ def test_fugue_observability_request_events_are_redacted_and_stage_mapped() -> N
             "upstream_headers_ms": 91,
             "event_loop_lag_ms": 2,
             "Authorization": "Bearer secret",
+            "Cookie": "session=oaix-cookie-secret",
+            "database_url": "postgresql://user:pass@db/oaix",
+            "body": "oaix request body secret",
+            "email": "oaix@example.com",
+            "source_ip": "203.0.113.99",
             "refresh_token": "secret-refresh-token",
         },
         error_message="Authorization Bearer secret alice@example.com",
@@ -389,6 +394,11 @@ def test_fugue_observability_request_events_are_redacted_and_stage_mapped() -> N
     assert metric_values["oaix_token_pool_wait_ms"] == 17
     serialized = json.dumps(telemetry, sort_keys=True)
     assert "Bearer secret" not in serialized
+    assert "oaix-cookie-secret" not in serialized
+    assert "postgresql://user:pass@db/oaix" not in serialized
+    assert "oaix request body secret" not in serialized
+    assert "oaix@example.com" not in serialized
+    assert "203.0.113.99" not in serialized
     assert "secret-refresh-token" not in serialized
     assert "alice@example.com" not in serialized
     assert "Authorization" not in serialized
@@ -410,8 +420,19 @@ def test_fugue_observability_request_log_written_event_uses_diagnostic_copy_only
                 "trace_id": "trace-123",
                 "request_log_queue_wait_ms": 9,
                 "Authorization": "Bearer secret",
+                "Cookie": "session=oaix-cookie-secret",
+                "database_url": "postgresql://user:pass@db/oaix",
+                "email": "oaix@example.com",
+                "source_ip": "203.0.113.99",
             },
             "request_payload": {"input": "do not log body"},
+            "headers": {
+                "Authorization": "Bearer secret",
+                "Cookie": "session=oaix-cookie-secret",
+            },
+            "database_url": "postgresql://user:pass@db/oaix",
+            "email": "oaix@example.com",
+            "source_ip": "203.0.113.99",
         },
         request_log_id=123,
         write_ms=11,
@@ -443,6 +464,10 @@ def test_fugue_observability_request_log_written_event_uses_diagnostic_copy_only
     }
     serialized = json.dumps(event, sort_keys=True)
     assert "Bearer secret" not in serialized
+    assert "oaix-cookie-secret" not in serialized
+    assert "postgresql://user:pass@db/oaix" not in serialized
+    assert "oaix@example.com" not in serialized
+    assert "203.0.113.99" not in serialized
     assert "do not log body" not in serialized
     assert "request_payload" not in serialized
 
