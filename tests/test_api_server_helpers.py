@@ -57,6 +57,7 @@ from oaix_gateway.api_server import (
     _is_upstream_connectivity_exception,
     _is_local_upstream_pool_timeout,
     _max_request_account_retries,
+    _incoming_trace_tags,
     _normalize_responses_compact_upstream_url,
     _proxy_request_with_token,
     _prime_responses_upstream_stream,
@@ -120,6 +121,11 @@ from oaix_gateway.api_server import (
     _submit_request_log_write,
     _trim_invalid_encrypted_reasoning_items,
     create_app,
+)
+from oaix_gateway.fugue_observability import (
+    build_oaix_request_log_write_metric_events,
+    build_oaix_request_log_written_event,
+    build_oaix_request_telemetry,
 )
 from oaix_gateway.database import ChatImageCheckpoint, ChatImageCheckpointImage, CodexToken, GatewayRequestLog
 from oaix_gateway.prompt_observability import build_prompt_cache_trace
@@ -301,6 +307,144 @@ def test_log_trace_span_emits_non_pii_trace_metadata(caplog: pytest.LogCaptureFi
     assert "caller_app=uni-api-ember" in output
     assert "uni_api_ember_request_id=ember-req-1" in output
     assert "alice@example.com" not in output
+
+
+def test_incoming_trace_tags_prefers_traceparent_and_preserves_request_id() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [
+                (
+                    b"traceparent",
+                    b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                ),
+                (b"x-request-id", b"legacy-request-id"),
+                (b"x-caller-app", b"uni-api-ember"),
+                (b"x-uni-api-ember-request-id", b"ember-req-1"),
+            ],
+        }
+    )
+
+    tags = _incoming_trace_tags(request)
+
+    assert tags["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+    assert tags["parent_span_id"] == "00f067aa0ba902b7"
+    assert tags["x_request_id"] == "legacy-request-id"
+    assert tags["caller_app"] == "uni-api-ember"
+    assert tags["uni_api_ember_request_id"] == "ember-req-1"
+
+
+def test_fugue_observability_request_events_are_redacted_and_stage_mapped() -> None:
+    started = datetime(2026, 6, 6, 0, 0, 0, tzinfo=timezone.utc)
+    first_token = datetime(2026, 6, 6, 0, 0, 1, 200000, tzinfo=timezone.utc)
+    finished = datetime(2026, 6, 6, 0, 0, 3, tzinfo=timezone.utc)
+
+    telemetry = build_oaix_request_telemetry(
+        service_name="oaix",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        request_id="oaix-req-1",
+        endpoint="/v1/responses",
+        model="gpt-5.5",
+        is_stream=True,
+        request_log_id=123,
+        status_code=200,
+        success=True,
+        attempt_count=2,
+        started_at=started,
+        finished_at=finished,
+        first_token_at=first_token,
+        spans={
+            "trace_id": "trace-123",
+            "parent_span_id": "parent-1",
+            "claim_token_ms": 17,
+            "http_pool_wait_ms": 21,
+            "http_connect_ms": 8,
+            "http_tls_ms": 4,
+            "http_request_write_ms": 3,
+            "upstream_headers_ms": 91,
+            "event_loop_lag_ms": 2,
+            "Authorization": "Bearer secret",
+            "refresh_token": "secret-refresh-token",
+        },
+        error_message="Authorization Bearer secret alice@example.com",
+        request_log_queue_depth=7,
+        runtime_metric_values={"oaix_active_proxy_requests": 3, "oaix_queued_proxy_requests": 1},
+    )
+
+    assert telemetry["logs"][0]["attributes"]["trace_id"] == "trace-123"
+    assert telemetry["logs"][0]["attributes"]["ttfb_ms"] == "1200"
+    assert telemetry["logs"][0]["attributes"]["retry_count"] == "1"
+    stages = {event["attributes"]["stage"]: event["attributes"] for event in telemetry["traces"]}
+    assert stages["token_acquired"]["stage_ms"] == "17"
+    assert stages["http_pool_acquired"]["stage_ms"] == "21"
+    assert stages["upstream_first_token"]["stage_ms"] == "1200"
+    assert stages["response_stream_end"]["stage_ms"] == "3000"
+    assert any(event["metric"] == "oaix_request_log_queue_depth" for event in telemetry["metrics"])
+    metric_values = {event["metric"]: event["value"] for event in telemetry["metrics"]}
+    assert metric_values["oaix_active_proxy_requests"] == 3
+    assert metric_values["oaix_queued_proxy_requests"] == 1
+    assert metric_values["oaix_token_pool_wait_ms"] == 17
+    serialized = json.dumps(telemetry, sort_keys=True)
+    assert "Bearer secret" not in serialized
+    assert "secret-refresh-token" not in serialized
+    assert "alice@example.com" not in serialized
+    assert "Authorization" not in serialized
+
+
+def test_fugue_observability_request_log_written_event_uses_diagnostic_copy_only() -> None:
+    event = build_oaix_request_log_written_event(
+        service_name="oaix",
+        service_version="test",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        payload={
+            "request_id": "oaix-req-1",
+            "endpoint": "/v1/responses",
+            "model_name": "gpt-5.5",
+            "is_stream": True,
+            "status_code": 200,
+            "finished_at": datetime(2026, 6, 6, 0, 0, 3, tzinfo=timezone.utc),
+            "timing_spans": {
+                "trace_id": "trace-123",
+                "request_log_queue_wait_ms": 9,
+                "Authorization": "Bearer secret",
+            },
+            "request_payload": {"input": "do not log body"},
+        },
+        request_log_id=123,
+        write_ms=11,
+        db_spans={"db_query_ms": 5},
+    )
+
+    assert event is not None
+    attrs = event["attributes"]
+    assert attrs["stage"] == "request_log_written"
+    assert attrs["stage_ms"] == "11"
+    assert attrs["request_log_queue_wait_ms"] == "9"
+    assert attrs["db_query_ms"] == "5"
+    metrics = build_oaix_request_log_write_metric_events(
+        service_name="oaix",
+        identity_attrs={"tenant_id": "tenant_123", "app_id": "app_123"},
+        payload={
+            "request_id": "oaix-req-1",
+            "endpoint": "/v1/responses",
+            "status_code": 200,
+            "finished_at": datetime(2026, 6, 6, 0, 0, 3, tzinfo=timezone.utc),
+            "timing_spans": {"request_log_queue_wait_ms": 9},
+        },
+        write_ms=11,
+        db_spans={"db_query_ms": 5},
+    )
+    assert {event["metric"]: event["value"] for event in metrics} == {
+        "oaix_request_log_queue_wait_ms": 9,
+        "oaix_request_log_write_ms": 11,
+    }
+    serialized = json.dumps(event, sort_keys=True)
+    assert "Bearer secret" not in serialized
+    assert "do not log body" not in serialized
+    assert "request_payload" not in serialized
 
 
 def test_sse_proxy_streaming_response_stops_after_send_failure() -> None:

@@ -122,6 +122,12 @@ from .token_store import (
     update_token_selection_settings,
 )
 from .usage_cost import UsageMetrics, extract_usage_metrics
+from .fugue_observability import (
+    emit_oaix_request_log_write_observability,
+    emit_oaix_request_observability,
+    start_fugue_observability_from_env,
+    stop_fugue_observability,
+)
 
 
 logger = logging.getLogger("oaix.gateway")
@@ -451,6 +457,24 @@ async def _finalize_request_log_with_timing(
         status_code=status_code,
         spans=resolved_spans,
     )
+    queue_stats = _request_log_write_queue_stats()
+    emit_oaix_request_observability(
+        request_id=getattr(request_log_ref, "request_id", None),
+        endpoint=getattr(request_log_ref, "endpoint", None),
+        model=kwargs.get("model_name") or getattr(request_log_ref, "model", None),
+        is_stream=getattr(request_log_ref, "is_stream", None),
+        request_log_id=request_log_id,
+        status_code=status_code,
+        success=kwargs.get("success"),
+        attempt_count=kwargs.get("attempt_count"),
+        started_at=getattr(request_log_ref, "started_at", None),
+        finished_at=kwargs.get("finished_at"),
+        first_token_at=kwargs.get("first_token_at"),
+        spans=resolved_spans,
+        error_message=_normalize_optional_text(kwargs.get("error_message")),
+        request_log_queue_depth=_coerce_int(queue_stats.get("queue_depth"), 0),
+        runtime_metric_values=_oaix_request_runtime_metric_values(getattr(request_log_ref, "app", None)),
+    )
     return request_log_id
 
 
@@ -493,8 +517,25 @@ def _normalize_trace_tag(value: Any, *, max_length: int = 128) -> str | None:
     return text[:max_length]
 
 
+def _parse_traceparent(value: Any) -> tuple[str | None, str | None]:
+    text = str(value or "").strip().lower()
+    parts = text.split("-")
+    if len(parts) != 4:
+        return None, None
+    version, trace_id, parent_span_id, _flags = parts
+    if len(version) != 2 or len(trace_id) != 32 or len(parent_span_id) != 16:
+        return None, None
+    if not all(char in "0123456789abcdef" for char in trace_id + parent_span_id):
+        return None, None
+    if trace_id == "0" * 32 or parent_span_id == "0" * 16:
+        return None, None
+    return trace_id, parent_span_id
+
+
 def _incoming_trace_tags(request: Request) -> dict[str, str]:
-    trace_id = _normalize_trace_tag(request.headers.get("x-request-id"))
+    traceparent_trace_id, traceparent_parent_span_id = _parse_traceparent(request.headers.get("traceparent"))
+    request_id_header = _normalize_trace_tag(request.headers.get("x-request-id"))
+    trace_id = traceparent_trace_id or request_id_header
     caller_app = _normalize_trace_tag(request.headers.get("x-caller-app"))
     ember_request_id = _normalize_trace_tag(
         request.headers.get("x-uni-api-ember-request-id") or request.headers.get("x-caller-request-id")
@@ -502,6 +543,10 @@ def _incoming_trace_tags(request: Request) -> dict[str, str]:
     tags: dict[str, str] = {}
     if trace_id is not None:
         tags["trace_id"] = trace_id
+    if traceparent_parent_span_id is not None:
+        tags["parent_span_id"] = traceparent_parent_span_id
+    if request_id_header is not None and request_id_header != trace_id:
+        tags["x_request_id"] = request_id_header
     if caller_app is not None:
         tags["caller_app"] = caller_app
     if ember_request_id is not None:
@@ -514,6 +559,19 @@ def _record_incoming_trace_tags(timing: _RequestTimingRecorder, request: Request
     for key, value in tags.items():
         timing.set_tag(key, value)
     return tags
+
+
+def _oaix_request_runtime_metric_values(app: FastAPI | None) -> dict[str, int | None]:
+    if app is None:
+        return {}
+    try:
+        proxy_metrics = _proxy_limiter_runtime_metrics(_proxy_concurrency_limiter(app))
+    except Exception:
+        return {}
+    return {
+        "oaix_active_proxy_requests": _coerce_int(proxy_metrics.get("active"), 0),
+        "oaix_queued_proxy_requests": _coerce_int(proxy_metrics.get("queued"), 0),
+    }
 
 
 def _log_trace_span(
@@ -2035,6 +2093,7 @@ async def _write_request_log_batch(jobs: list[_RequestLogWriteJob]) -> None:
 
     log_timing = _RequestTimingRecorder()
     db_timing_token = set_db_timing_recorder(log_timing)
+    write_started_at = time.perf_counter()
     try:
         results = await upsert_request_logs(
             list(coalesced_payloads.values()),
@@ -2042,6 +2101,8 @@ async def _write_request_log_batch(jobs: list[_RequestLogWriteJob]) -> None:
         )
     finally:
         reset_db_timing_recorder(db_timing_token)
+    write_ms = max(0, int((time.perf_counter() - write_started_at) * 1000))
+    db_spans = log_timing.snapshot()
 
     for result in results:
         request_id = str(result.get("request_id") or "").strip()
@@ -2055,6 +2116,12 @@ async def _write_request_log_batch(jobs: list[_RequestLogWriteJob]) -> None:
         owner = owners.get(request_id)
         if owner is not None:
             owner._request_log_id = resolved_request_log_id
+        emit_oaix_request_log_write_observability(
+            payload=coalesced_payloads.get(request_id) or {},
+            request_log_id=resolved_request_log_id,
+            write_ms=write_ms,
+            db_spans=db_spans,
+        )
         hooks = success_hooks.get(request_id) or []
         if hooks:
             await _run_request_log_success_hooks(hooks, resolved_request_log_id)
@@ -2215,6 +2282,7 @@ class _RequestLogHandle:
     user_agent: str | None
     timing: _RequestTimingRecorder
     prompt_cache_trace: dict[str, Any] | None = None
+    app: FastAPI | None = None
     _request_log_id: int | None = None
     _finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _finalized: bool = False
@@ -2232,6 +2300,7 @@ class _RequestLogHandle:
         user_agent: str | None,
         timing: _RequestTimingRecorder,
         prompt_cache_trace: dict[str, Any] | None = None,
+        app: FastAPI | None = None,
     ) -> "_RequestLogHandle":
         handle = cls(
             request_id=str(uuid.uuid4()),
@@ -2243,6 +2312,7 @@ class _RequestLogHandle:
             user_agent=user_agent,
             timing=timing,
             prompt_cache_trace=prompt_cache_trace if isinstance(prompt_cache_trace, dict) else None,
+            app=app,
         )
         if _request_log_start_write_enabled():
             handle._enqueue_start()
@@ -9053,6 +9123,7 @@ async def _responses_stream_keepalive_response(
         user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
         timing=timing,
         prompt_cache_trace=prompt_cache_trace if isinstance(prompt_cache_trace, dict) else None,
+        app=http_request.app,
     )
 
     raw_payload = request_data.model_dump(exclude_unset=True)
@@ -10019,6 +10090,7 @@ async def _execute_proxy_request_with_failover(
         user_agent=(http_request.headers.get("User-Agent") or "").strip() or None,
         timing=timing,
         prompt_cache_trace=prompt_cache_trace if isinstance(prompt_cache_trace, dict) else None,
+        app=http_request.app,
     )
     attempt_count = 0
     last_token_id: int | None = None
@@ -11423,6 +11495,7 @@ async def lifespan(app: FastAPI):
         on_token_selection_settings_updated=publish_token_selection_settings,
     )
     await app.state.token_import_worker.start()
+    await start_fugue_observability_from_env(service_version="0.1.0")
     try:
         yield
     finally:
@@ -11446,6 +11519,7 @@ async def lifespan(app: FastAPI):
         await app.state.token_import_worker.stop()
         await _flush_request_log_write_queue()
         await stop_token_status_write_queue()
+        await stop_fugue_observability()
         await app.state.import_http_client.aclose()
         await app.state.admin_http_client.aclose()
         await app.state.response_http_client.aclose()
