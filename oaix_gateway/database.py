@@ -161,6 +161,31 @@ class GatewayRequestLog(Base):
     cache_affinity_lane_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     prompt_cache_trace: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analytics_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+
+class GatewayRequestHourlyStat(Base):
+    __tablename__ = "gateway_request_hourly_stats"
+    __table_args__ = (
+        UniqueConstraint("bucket_start", "model_name", name="uq_gateway_request_hourly_stats_bucket_model"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bucket_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False, default="", index=True)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    streaming_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    ttft_ms_sum: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ttft_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_ms_sum: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class GatewaySetting(Base):
@@ -687,6 +712,8 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN prompt_cache_trace JSON"))
         if "timing_spans" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN timing_spans JSON"))
+        if "analytics_recorded_at" not in request_columns:
+            sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN analytics_recorded_at TIMESTAMPTZ"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_token_id ON gateway_request_logs (token_id)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model ON gateway_request_logs (model)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))
@@ -780,6 +807,33 @@ def _run_schema_migrations(sync_conn) -> None:
                 "ON gateway_request_logs (account_id, started_at)"
             )
         )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_analytics_recorded_at "
+                "ON gateway_request_logs (analytics_recorded_at)"
+            )
+        )
+
+    if "gateway_request_hourly_stats" not in table_names:
+        GatewayRequestHourlyStat.__table__.create(sync_conn, checkfirst=True)
+    sync_conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_gateway_request_hourly_stats_bucket_model "
+            "ON gateway_request_hourly_stats (bucket_start, model_name)"
+        )
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_gateway_request_hourly_stats_bucket_start "
+            "ON gateway_request_hourly_stats (bucket_start)"
+        )
+    )
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_gateway_request_hourly_stats_model_name "
+            "ON gateway_request_hourly_stats (model_name)"
+        )
+    )
 
     if "token_import_jobs" in table_names:
         job_columns = {column["name"] for column in inspector.get_columns("token_import_jobs")}

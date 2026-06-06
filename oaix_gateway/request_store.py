@@ -1,12 +1,12 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any
 
-from sqlalchemy import case, delete, func, or_, select, text
+from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from .database import CodexToken, GatewayRequestLog, get_read_session, get_request_log_session, utcnow
+from .database import CodexToken, GatewayRequestHourlyStat, GatewayRequestLog, get_read_session, get_request_log_session, utcnow
 
 
 @dataclass(frozen=True)
@@ -202,8 +202,24 @@ def _floor_bucket_start(value: datetime, *, bucket_minutes: int) -> datetime:
     return value.replace(minute=minute)
 
 
+def _hour_bucket_start(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+
 def _request_model_label_expr():
     return func.coalesce(GatewayRequestLog.model_name, GatewayRequestLog.model, "未识别模型")
+
+
+def _request_hourly_model_label_expr():
+    return func.coalesce(GatewayRequestHourlyStat.model_name, "未识别模型")
+
+
+def _hour_floor(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
 
 def _build_request_log_summary_stmt(*, since: datetime | None = None):
@@ -220,6 +236,24 @@ def _build_request_log_summary_stmt(*, since: datetime | None = None):
     ).select_from(GatewayRequestLog)
     if since is not None:
         stmt = stmt.where(GatewayRequestLog.started_at >= since)
+    return stmt
+
+
+def _build_request_log_summary_stats_stmt(*, since: datetime | None = None):
+    ttft_count = func.sum(GatewayRequestHourlyStat.ttft_count)
+    stmt = select(
+        func.coalesce(func.sum(GatewayRequestHourlyStat.request_count), 0).label("total"),
+        func.coalesce(func.sum(GatewayRequestHourlyStat.success_count), 0).label("successful"),
+        func.coalesce(func.sum(GatewayRequestHourlyStat.failure_count), 0).label("failed"),
+        func.coalesce(func.sum(GatewayRequestHourlyStat.streaming_count), 0).label("streaming"),
+        (func.sum(GatewayRequestHourlyStat.ttft_ms_sum) / func.nullif(ttft_count, 0)).label("avg_ttft_ms"),
+        func.coalesce(func.sum(GatewayRequestHourlyStat.input_tokens), 0).label("input_tokens"),
+        func.coalesce(func.sum(GatewayRequestHourlyStat.output_tokens), 0).label("output_tokens"),
+        func.coalesce(func.sum(GatewayRequestHourlyStat.total_tokens), 0).label("total_tokens"),
+        func.coalesce(func.sum(GatewayRequestHourlyStat.estimated_cost_usd), 0).label("estimated_cost_usd"),
+    ).select_from(GatewayRequestHourlyStat)
+    if since is not None:
+        stmt = stmt.where(GatewayRequestHourlyStat.bucket_start >= _hour_floor(since))
     return stmt
 
 
@@ -250,6 +284,25 @@ def _build_request_model_analytics_stmt(*, since: datetime, top_models: int):
     )
 
 
+def _build_request_model_analytics_stats_stmt(*, since: datetime, top_models: int):
+    return (
+        select(
+            _request_hourly_model_label_expr().label("model_name"),
+            func.sum(GatewayRequestHourlyStat.request_count),
+            func.sum(GatewayRequestHourlyStat.total_tokens),
+            func.sum(GatewayRequestHourlyStat.estimated_cost_usd),
+        )
+        .where(GatewayRequestHourlyStat.bucket_start >= _hour_floor(since))
+        .group_by(_request_hourly_model_label_expr())
+        .order_by(
+            func.sum(GatewayRequestHourlyStat.estimated_cost_usd).desc().nullslast(),
+            func.sum(GatewayRequestHourlyStat.total_tokens).desc().nullslast(),
+            func.sum(GatewayRequestHourlyStat.request_count).desc(),
+        )
+        .limit(top_models)
+    )
+
+
 def _build_request_bucket_analytics_stmt(*, since: datetime, bucket_minutes: int):
     safe_bucket_minutes = max(1, int(bucket_minutes))
     bucket_start = func.date_bin(
@@ -267,6 +320,28 @@ def _build_request_bucket_analytics_stmt(*, since: datetime, bucket_minutes: int
             func.sum(GatewayRequestLog.estimated_cost_usd).label("estimated_cost_usd"),
         )
         .where(GatewayRequestLog.started_at >= since)
+        .group_by(bucket_start)
+        .order_by(bucket_start.asc())
+    )
+
+
+def _build_request_bucket_analytics_stats_stmt(*, since: datetime, bucket_minutes: int):
+    safe_bucket_minutes = max(1, int(bucket_minutes))
+    bucket_start = func.date_bin(
+        text(f"INTERVAL '{safe_bucket_minutes} minutes'"),
+        GatewayRequestHourlyStat.bucket_start,
+        text("TIMESTAMPTZ '1970-01-01 00:00:00+00'"),
+    ).label("bucket_start")
+    return (
+        select(
+            bucket_start,
+            func.sum(GatewayRequestHourlyStat.request_count).label("request_count"),
+            func.sum(GatewayRequestHourlyStat.input_tokens).label("input_tokens"),
+            func.sum(GatewayRequestHourlyStat.output_tokens).label("output_tokens"),
+            func.sum(GatewayRequestHourlyStat.total_tokens).label("total_tokens"),
+            func.sum(GatewayRequestHourlyStat.estimated_cost_usd).label("estimated_cost_usd"),
+        )
+        .where(GatewayRequestHourlyStat.bucket_start >= _hour_floor(since))
         .group_by(bucket_start)
         .order_by(bucket_start.asc())
     )
@@ -591,6 +666,130 @@ def _merge_request_log_payload(item: GatewayRequestLog, values: dict[str, Any]) 
         item.error_message = values["error_message"]
 
 
+def _request_hourly_stat_deltas(rows: list[Any]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[datetime, str], dict[str, Any]] = {}
+    for row in rows:
+        started_at = getattr(row, "started_at", None)
+        if not isinstance(started_at, datetime):
+            continue
+        model_name = str(getattr(row, "model_name", None) or getattr(row, "model", None) or "未识别模型").strip()
+        model_name = (model_name or "未识别模型")[:128]
+        key = (_hour_bucket_start(started_at), model_name)
+        item = grouped.setdefault(
+            key,
+            {
+                "bucket_start": key[0],
+                "model_name": key[1],
+                "request_count": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "streaming_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "ttft_ms_sum": 0,
+                "ttft_count": 0,
+                "duration_ms_sum": 0,
+                "duration_count": 0,
+                "updated_at": utcnow(),
+            },
+        )
+        item["request_count"] += 1
+        if bool(getattr(row, "success", False)):
+            item["success_count"] += 1
+        else:
+            item["failure_count"] += 1
+        if bool(getattr(row, "is_stream", False)):
+            item["streaming_count"] += 1
+        item["input_tokens"] += _int_or_zero(getattr(row, "input_tokens", None))
+        item["output_tokens"] += _int_or_zero(getattr(row, "output_tokens", None))
+        item["total_tokens"] += _int_or_zero(getattr(row, "total_tokens", None))
+        item["estimated_cost_usd"] += _float_or_zero(getattr(row, "estimated_cost_usd", None))
+        ttft_ms = getattr(row, "ttft_ms", None)
+        if ttft_ms is not None:
+            item["ttft_ms_sum"] += _int_or_zero(ttft_ms)
+            item["ttft_count"] += 1
+        duration_ms = getattr(row, "duration_ms", None)
+        if duration_ms is not None:
+            item["duration_ms_sum"] += _int_or_zero(duration_ms)
+            item["duration_count"] += 1
+    return list(grouped.values())
+
+
+async def _upsert_request_hourly_stats(session, deltas: list[dict[str, Any]]) -> None:
+    if not deltas:
+        return
+    insert_stmt = pg_insert(GatewayRequestHourlyStat).values(deltas)
+    excluded = insert_stmt.excluded
+    await session.execute(
+        insert_stmt.on_conflict_do_update(
+            index_elements=[GatewayRequestHourlyStat.bucket_start, GatewayRequestHourlyStat.model_name],
+            set_={
+                "request_count": GatewayRequestHourlyStat.request_count + excluded.request_count,
+                "success_count": GatewayRequestHourlyStat.success_count + excluded.success_count,
+                "failure_count": GatewayRequestHourlyStat.failure_count + excluded.failure_count,
+                "streaming_count": GatewayRequestHourlyStat.streaming_count + excluded.streaming_count,
+                "input_tokens": GatewayRequestHourlyStat.input_tokens + excluded.input_tokens,
+                "output_tokens": GatewayRequestHourlyStat.output_tokens + excluded.output_tokens,
+                "total_tokens": GatewayRequestHourlyStat.total_tokens + excluded.total_tokens,
+                "estimated_cost_usd": GatewayRequestHourlyStat.estimated_cost_usd + excluded.estimated_cost_usd,
+                "ttft_ms_sum": GatewayRequestHourlyStat.ttft_ms_sum + excluded.ttft_ms_sum,
+                "ttft_count": GatewayRequestHourlyStat.ttft_count + excluded.ttft_count,
+                "duration_ms_sum": GatewayRequestHourlyStat.duration_ms_sum + excluded.duration_ms_sum,
+                "duration_count": GatewayRequestHourlyStat.duration_count + excluded.duration_count,
+                "updated_at": excluded.updated_at,
+            },
+        )
+    )
+
+
+async def _record_request_hourly_stats_once(session, request_ids: list[str]) -> None:
+    normalized_ids = sorted({str(value or "").strip() for value in request_ids if str(value or "").strip()})
+    if not normalized_ids:
+        return
+    now = utcnow()
+    result = await session.execute(
+        update(GatewayRequestLog)
+        .where(
+            GatewayRequestLog.request_id.in_(normalized_ids),
+            GatewayRequestLog.status_code.is_not(None),
+            GatewayRequestLog.analytics_recorded_at.is_(None),
+        )
+        .values(analytics_recorded_at=now)
+        .returning(
+            GatewayRequestLog.started_at,
+            GatewayRequestLog.model,
+            GatewayRequestLog.model_name,
+            GatewayRequestLog.is_stream,
+            GatewayRequestLog.success,
+            GatewayRequestLog.input_tokens,
+            GatewayRequestLog.output_tokens,
+            GatewayRequestLog.total_tokens,
+            GatewayRequestLog.estimated_cost_usd,
+            GatewayRequestLog.ttft_ms,
+            GatewayRequestLog.duration_ms,
+        )
+    )
+    rows = result.all()
+    await _upsert_request_hourly_stats(session, _request_hourly_stat_deltas(rows))
+
+
+async def _request_hourly_stats_cover_window(session, *, since: datetime | None) -> bool:
+    if since is None:
+        return False
+    row = (
+        await session.execute(
+            select(
+                func.min(GatewayRequestHourlyStat.bucket_start),
+                func.coalesce(func.sum(GatewayRequestHourlyStat.request_count), 0),
+            )
+        )
+    ).one()
+    first_bucket, request_count = row
+    return bool(first_bucket is not None and _int_or_zero(request_count) > 0 and first_bucket <= _hour_floor(since))
+
+
 async def _upsert_request_logs_portable(values_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
     results: list[tuple[str, GatewayRequestLog]] = []
     async with get_request_log_session() as session:
@@ -760,13 +959,19 @@ async def upsert_request_logs(
                 )
 
                 result = await session.execute(stmt)
+                rows = result.all()
+                try:
+                    async with session.begin_nested():
+                        await _record_request_hourly_stats_once(session, [request_id for request_id, _, _ in rows])
+                except Exception:
+                    pass
                 return [
                     {
                         "request_id": request_id,
                         "id": request_log_id,
                         "timing_spans": timing_spans,
                     }
-                    for request_id, request_log_id, timing_spans in result.all()
+                    for request_id, request_log_id, timing_spans in rows
                 ]
         except Exception:
             pass
@@ -783,6 +988,20 @@ async def get_request_log_summary(*, hours: int | None = None) -> RequestLogSumm
     if hours is not None:
         since = utcnow() - timedelta(hours=max(1, min(int(hours), 24 * 30)))
     async with get_read_session() as session:
+        if await _request_hourly_stats_cover_window(session, since=since):
+            stats_row = (await session.execute(_build_request_log_summary_stats_stmt(since=since))).one()
+            return RequestLogSummary(
+                total=_int_or_zero(stats_row.total),
+                successful=_int_or_zero(stats_row.successful),
+                failed=_int_or_zero(stats_row.failed),
+                streaming=_int_or_zero(stats_row.streaming),
+                input_tokens=_int_or_zero(stats_row.input_tokens),
+                output_tokens=_int_or_zero(stats_row.output_tokens),
+                total_tokens=_int_or_zero(stats_row.total_tokens),
+                estimated_cost_usd=_round_cost(_float_or_zero(stats_row.estimated_cost_usd)),
+                avg_ttft_ms=int(round(float(stats_row.avg_ttft_ms))) if stats_row.avg_ttft_ms is not None else None,
+            )
+
         row = (await session.execute(_build_request_log_summary_stmt(since=since))).one()
         (
             total,
@@ -986,17 +1205,28 @@ async def get_request_log_analytics(*, hours: int = 24, bucket_minutes: int = 60
     last_bucket = _floor_bucket_start(now, bucket_minutes=effective_bucket_minutes)
 
     async with get_read_session() as session:
-        bucket_rows = (
-            await session.execute(
-                _build_request_bucket_analytics_stmt(
-                    since=since,
-                    bucket_minutes=effective_bucket_minutes,
+        if await _request_hourly_stats_cover_window(session, since=since):
+            bucket_rows = (
+                await session.execute(
+                    _build_request_bucket_analytics_stats_stmt(
+                        since=since,
+                        bucket_minutes=effective_bucket_minutes,
+                    )
                 )
-            )
-        ).all()
-
-        model_stmt = _build_request_model_analytics_stmt(since=since, top_models=effective_top_models)
-        model_rows = (await session.execute(model_stmt)).all()
+            ).all()
+            model_stmt = _build_request_model_analytics_stats_stmt(since=since, top_models=effective_top_models)
+            model_rows = (await session.execute(model_stmt)).all()
+        else:
+            bucket_rows = (
+                await session.execute(
+                    _build_request_bucket_analytics_stmt(
+                        since=since,
+                        bucket_minutes=effective_bucket_minutes,
+                    )
+                )
+            ).all()
+            model_stmt = _build_request_model_analytics_stmt(since=since, top_models=effective_top_models)
+            model_rows = (await session.execute(model_stmt)).all()
 
     bucket_map: dict[datetime, dict[str, float | int | datetime]] = {}
     cursor = first_bucket

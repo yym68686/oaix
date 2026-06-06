@@ -6,12 +6,16 @@ from sqlalchemy.dialects import postgresql
 from oaix_gateway.database import GatewayRequestLog
 from oaix_gateway.request_store import (
     _build_request_bucket_analytics_stmt,
+    _build_request_bucket_analytics_stats_stmt,
     _build_request_log_summary_stmt,
+    _build_request_log_summary_stats_stmt,
     _build_request_account_costs_stmt,
     _build_request_token_costs_stmt,
     _build_request_model_analytics_stmt,
+    _build_request_model_analytics_stats_stmt,
     _normalize_request_account_ids,
     _normalize_request_token_ids,
+    _request_hourly_stat_deltas,
     _upsert_request_logs_portable,
 )
 
@@ -81,6 +85,111 @@ def test_build_request_bucket_analytics_stmt_groups_in_database() -> None:
     assert "date_bin(INTERVAL '60 minutes'" in sql
     assert "GROUP BY date_bin(" in sql
     assert "ORDER BY bucket_start ASC" in sql
+
+
+def test_build_request_log_summary_stats_stmt_uses_hourly_stats() -> None:
+    stmt = _build_request_log_summary_stats_stmt(
+        since=datetime(2026, 4, 14, 12, 34, tzinfo=timezone.utc),
+    )
+
+    sql = str(
+        stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "FROM gateway_request_hourly_stats" in sql
+    assert "FROM gateway_request_logs" not in sql
+    assert "gateway_request_hourly_stats.bucket_start >= '2026-04-14 12:00:00+00:00'" in sql
+
+
+def test_build_request_model_analytics_stats_stmt_groups_hourly_stats() -> None:
+    stmt = _build_request_model_analytics_stats_stmt(
+        since=datetime(2026, 4, 14, tzinfo=timezone.utc),
+        top_models=6,
+    )
+
+    sql = str(
+        stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "FROM gateway_request_hourly_stats" in sql
+    assert "GROUP BY coalesce(gateway_request_hourly_stats.model_name" in sql
+    assert "FROM gateway_request_logs" not in sql
+
+
+def test_build_request_bucket_analytics_stats_stmt_groups_hourly_stats() -> None:
+    stmt = _build_request_bucket_analytics_stats_stmt(
+        since=datetime(2026, 4, 14, tzinfo=timezone.utc),
+        bucket_minutes=60,
+    )
+
+    sql = str(
+        stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "FROM gateway_request_hourly_stats" in sql
+    assert "date_bin(INTERVAL '60 minutes'" in sql
+    assert "FROM gateway_request_logs" not in sql
+
+
+def test_request_hourly_stat_deltas_group_by_utc_hour_and_model() -> None:
+    rows = [
+        GatewayRequestLog(
+            request_id="one",
+            endpoint="/v1/responses",
+            model="gpt-5",
+            model_name="gpt-5",
+            is_stream=True,
+            status_code=200,
+            success=True,
+            started_at=datetime(2026, 4, 14, 12, 30, tzinfo=timezone.utc),
+            input_tokens=10,
+            output_tokens=20,
+            total_tokens=30,
+            estimated_cost_usd=0.01,
+            ttft_ms=100,
+            duration_ms=200,
+        ),
+        GatewayRequestLog(
+            request_id="two",
+            endpoint="/v1/responses",
+            model="gpt-5",
+            model_name="gpt-5",
+            is_stream=False,
+            status_code=502,
+            success=False,
+            started_at=datetime(2026, 4, 14, 12, 45, tzinfo=timezone.utc),
+            input_tokens=1,
+            output_tokens=2,
+            total_tokens=3,
+            estimated_cost_usd=0.02,
+            ttft_ms=300,
+            duration_ms=400,
+        ),
+    ]
+
+    deltas = _request_hourly_stat_deltas(rows)
+
+    assert len(deltas) == 1
+    assert deltas[0]["bucket_start"] == datetime(2026, 4, 14, 12, tzinfo=timezone.utc)
+    assert deltas[0]["model_name"] == "gpt-5"
+    assert deltas[0]["request_count"] == 2
+    assert deltas[0]["success_count"] == 1
+    assert deltas[0]["failure_count"] == 1
+    assert deltas[0]["streaming_count"] == 1
+    assert deltas[0]["input_tokens"] == 11
+    assert deltas[0]["output_tokens"] == 22
+    assert deltas[0]["total_tokens"] == 33
+    assert deltas[0]["ttft_ms_sum"] == 400
+    assert deltas[0]["duration_ms_sum"] == 600
 
 
 def test_normalize_request_account_ids_deduplicates_blank_values() -> None:
