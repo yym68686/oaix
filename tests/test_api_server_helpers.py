@@ -379,9 +379,17 @@ def test_fugue_observability_request_events_are_redacted_and_stage_mapped() -> N
         runtime_metric_values={"oaix_active_proxy_requests": 3, "oaix_queued_proxy_requests": 1},
     )
 
-    assert telemetry["logs"][0]["attributes"]["trace_id"] == "trace-123"
-    assert telemetry["logs"][0]["attributes"]["ttfb_ms"] == "1200"
-    assert telemetry["logs"][0]["attributes"]["retry_count"] == "1"
+    log_event = telemetry["logs"][0]
+    assert log_event["level"] == "info"
+    assert log_event["service"] == "oaix"
+    assert log_event["trace_id"] == "trace-123"
+    assert log_event["request_id"] == "oaix-req-1"
+    assert log_event["event"] == "request_summary"
+    assert log_event["event_type"] == "request_summary"
+    assert log_event["message"] == "oaix request finished"
+    assert log_event["attributes"]["trace_id"] == "trace-123"
+    assert log_event["attributes"]["ttfb_ms"] == "1200"
+    assert log_event["attributes"]["retry_count"] == "1"
     stages = {event["attributes"]["stage"]: event["attributes"] for event in telemetry["traces"]}
     assert stages["token_acquired"]["stage_ms"] == "17"
     assert stages["http_pool_acquired"]["stage_ms"] == "21"

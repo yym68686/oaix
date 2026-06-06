@@ -316,6 +316,11 @@ def build_oaix_request_telemetry(
     logs = [
         {
             "timestamp": _iso_timestamp(finished),
+            "level": _event_level(status_code),
+            "service": service_name,
+            "trace_id": trace_id,
+            "request_id": req_id,
+            "event": "request_summary",
             "event_type": "request_summary",
             "source": service_name,
             "message": "oaix request finished",
@@ -724,6 +729,15 @@ def _status_class(status_code: int) -> str:
     if code <= 0:
         return "unknown"
     return f"{code // 100}xx"
+
+
+def _event_level(status_code: int) -> str:
+    code = max(0, int(status_code or 0))
+    if code >= 500:
+        return "error"
+    if code >= 400:
+        return "warning"
+    return "info"
 
 
 def _classify_error(status_code: int, error_message: str | None) -> str | None:
