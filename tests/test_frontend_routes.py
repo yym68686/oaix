@@ -1,13 +1,21 @@
 import asyncio
 import hashlib
+import json as json_module
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
 from fastapi.responses import JSONResponse
 
+import oaix_gateway.api_server as api_server
 from oaix_gateway.api_server import WEB_DIR, create_app
 from oaix_gateway.database import CodexToken
+from oaix_gateway.request_store import (
+    RequestAnalyticsBucket,
+    RequestLogAnalytics,
+    RequestLogSummary,
+    RequestAnalyticsModel,
+)
 from oaix_gateway.token_import_jobs import TokenImportBatchSummary
 from oaix_gateway.token_store import TokenCounts, TokenPlanCounts, TokenSelectionSettings
 
@@ -266,6 +274,82 @@ def test_frontend_dashboard_refresh_loads_admin_panels_in_parallel() -> None:
     assert "void refreshDashboard();" in app_js
     assert "scheduleInitialRequestsLoad" not in app_js
     assert "await loadRequests();" not in refresh_function
+
+
+def test_admin_requests_expired_cache_refreshes_on_request(monkeypatch) -> None:
+    api_server._ADMIN_REQUESTS_CACHE.clear()
+    monkeypatch.setattr(api_server, "_ADMIN_REQUESTS_CACHE_LOCK", None)
+    api_server._ADMIN_REQUESTS_CACHE[80] = (0.0, b'{"items":[{"started_at":"old"}]}')
+
+    async def fake_get_request_log_summary(*, hours):
+        return RequestLogSummary(
+            total=1,
+            successful=1,
+            failed=0,
+            streaming=1,
+            input_tokens=10,
+            output_tokens=20,
+            total_tokens=30,
+            estimated_cost_usd=0.01,
+            avg_ttft_ms=1200,
+        )
+
+    async def fake_get_request_log_analytics(*, hours, bucket_minutes, top_models):
+        return RequestLogAnalytics(
+            period_hours=hours,
+            bucket_minutes=bucket_minutes,
+            buckets=[
+                RequestAnalyticsBucket(
+                    bucket_start=datetime(2026, 4, 14, 12, tzinfo=timezone.utc),
+                    request_count=1,
+                    input_tokens=10,
+                    output_tokens=20,
+                    total_tokens=30,
+                    estimated_cost_usd=0.01,
+                )
+            ],
+            models=[
+                RequestAnalyticsModel(
+                    model_name="gpt-5.5",
+                    request_count=1,
+                    total_tokens=30,
+                    estimated_cost_usd=0.01,
+                )
+            ],
+        )
+
+    async def fake_list_request_logs(*, limit):
+        return [
+            SimpleNamespace(
+                endpoint="/v1/responses",
+                model="gpt-5.5",
+                model_name="gpt-5.5",
+                is_stream=True,
+                status_code=200,
+                success=True,
+                attempt_count=1,
+                started_at=datetime(2026, 4, 14, 12, 1, tzinfo=timezone.utc),
+                ttft_ms=1200,
+                cache_hit_ratio=None,
+                prompt_cache_source="explicit",
+                cache_affinity_result="primary_hit",
+                cache_affinity_lane_index=0,
+                error_message=None,
+            )
+        ]
+
+    monkeypatch.setattr(api_server, "get_request_log_summary", fake_get_request_log_summary)
+    monkeypatch.setattr(api_server, "get_request_log_analytics", fake_get_request_log_analytics)
+    monkeypatch.setattr(api_server, "list_request_logs", fake_list_request_logs)
+
+    body, cache_status = asyncio.run(
+        api_server._cached_admin_requests_payload(create_app(), limit=80),
+    )
+
+    payload = json_module.loads(body)
+    assert cache_status == "miss"
+    assert payload["items"][0]["started_at"] == "2026-04-14T12:01:00+00:00"
+    assert b"old" not in body
 
 
 def test_frontend_pauses_background_polling_when_tab_is_hidden() -> None:

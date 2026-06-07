@@ -118,7 +118,9 @@ def test_build_request_model_analytics_stats_stmt_groups_hourly_stats() -> None:
     )
 
     assert "FROM gateway_request_hourly_stats" in sql
-    assert "GROUP BY coalesce(gateway_request_hourly_stats.model_name" in sql
+    assert "FROM (SELECT" in sql
+    assert "GROUP BY anon_1.model_name" in sql
+    assert "GROUP BY coalesce(" not in sql
     assert "FROM gateway_request_logs" not in sql
 
 

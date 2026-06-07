@@ -11323,8 +11323,6 @@ async def _cached_admin_requests_payload(
     cached = cache.get(cache_key)
     if not force_refresh and cached is not None and cached[0] > now:
         return cached[1], "hit"
-    if not force_refresh and cached is not None:
-        return cached[1], "stale"
 
     lock = _ADMIN_REQUESTS_CACHE_LOCK
     if lock is None:
@@ -11338,8 +11336,6 @@ async def _cached_admin_requests_payload(
         cached = cache.get(cache_key)
         if not force_refresh and cached is not None and cached[0] > now:
             return cached[1], "hit"
-        if not force_refresh and cached is not None:
-            return cached[1], "stale"
 
         summary, analytics, raw_items = await asyncio.gather(
             get_request_log_summary(hours=24),

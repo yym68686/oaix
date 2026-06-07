@@ -285,19 +285,28 @@ def _build_request_model_analytics_stmt(*, since: datetime, top_models: int):
 
 
 def _build_request_model_analytics_stats_stmt(*, since: datetime, top_models: int):
-    return (
+    model_source = (
         select(
             _request_hourly_model_label_expr().label("model_name"),
-            func.sum(GatewayRequestHourlyStat.request_count),
-            func.sum(GatewayRequestHourlyStat.total_tokens),
-            func.sum(GatewayRequestHourlyStat.estimated_cost_usd),
+            GatewayRequestHourlyStat.request_count.label("request_count"),
+            GatewayRequestHourlyStat.total_tokens.label("total_tokens"),
+            GatewayRequestHourlyStat.estimated_cost_usd.label("estimated_cost_usd"),
         )
         .where(GatewayRequestHourlyStat.bucket_start >= _hour_floor(since))
-        .group_by(_request_hourly_model_label_expr())
+        .subquery()
+    )
+    return (
+        select(
+            model_source.c.model_name,
+            func.sum(model_source.c.request_count),
+            func.sum(model_source.c.total_tokens),
+            func.sum(model_source.c.estimated_cost_usd),
+        )
+        .group_by(model_source.c.model_name)
         .order_by(
-            func.sum(GatewayRequestHourlyStat.estimated_cost_usd).desc().nullslast(),
-            func.sum(GatewayRequestHourlyStat.total_tokens).desc().nullslast(),
-            func.sum(GatewayRequestHourlyStat.request_count).desc(),
+            func.sum(model_source.c.estimated_cost_usd).desc().nullslast(),
+            func.sum(model_source.c.total_tokens).desc().nullslast(),
+            func.sum(model_source.c.request_count).desc(),
         )
         .limit(top_models)
     )
