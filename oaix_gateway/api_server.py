@@ -4630,6 +4630,7 @@ def _sanitize_codex_payload(
         payload.pop("store", None)
     else:
         payload["store"] = False
+        _strip_store_false_reasoning_input_ids(payload)
     payload.setdefault("instructions", "")
     return payload
 
@@ -4644,6 +4645,29 @@ def _remove_reasoning_content_fields(value: Any) -> None:
     if isinstance(value, (list, tuple)):
         for nested_value in value:
             _remove_reasoning_content_fields(nested_value)
+
+
+def _strip_store_false_reasoning_input_ids(payload: dict[str, Any]) -> bool:
+    input_value = payload.get("input")
+    if isinstance(input_value, list):
+        changed = False
+        for item in input_value:
+            if _strip_reasoning_input_id(item):
+                changed = True
+        return changed
+
+    return _strip_reasoning_input_id(input_value)
+
+
+def _strip_reasoning_input_id(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("type") or "").strip() != "reasoning":
+        return False
+    if "id" not in item:
+        return False
+    item.pop("id", None)
+    return True
 
 
 def _trim_invalid_encrypted_reasoning_items(payload: dict[str, Any]) -> bool:

@@ -751,6 +751,38 @@ def test_sanitize_codex_payload_forces_store_false_for_non_compact() -> None:
     }
 
 
+def test_sanitize_codex_payload_strips_reasoning_id_but_preserves_encrypted_content() -> None:
+    payload = {
+        "model": "gpt-5.5",
+        "input": [
+            {"type": "message", "id": "msg_1", "role": "user", "content": "make image 2k"},
+            {
+                "type": "reasoning",
+                "id": "rs_0dc02c5b394c2253016a2c446c9e148191a6595865d06c6054",
+                "summary": [{"type": "summary_text", "text": "prior work"}],
+                "encrypted_content": "encrypted-reasoning",
+            },
+            {
+                "type": "image_generation_call",
+                "id": "ig_123",
+                "status": "completed",
+                "result": "image-b64",
+            },
+        ],
+        "store": True,
+    }
+
+    sanitized = _sanitize_codex_payload(payload)
+
+    assert sanitized["store"] is False
+    input_items = sanitized["input"]
+    assert input_items[0]["id"] == "msg_1"
+    assert "id" not in input_items[1]
+    assert input_items[1]["summary"] == [{"type": "summary_text", "text": "prior work"}]
+    assert input_items[1]["encrypted_content"] == "encrypted-reasoning"
+    assert input_items[2]["id"] == "ig_123"
+
+
 def test_sanitize_codex_payload_can_preserve_previous_response_id() -> None:
     payload = {
         "model": "gpt-image-2",
