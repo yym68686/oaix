@@ -10943,6 +10943,7 @@ def _serialize_admin_token_item(
         "chatgpt_account_id": plan_info.chatgpt_account_id or token_row.account_id,
         "is_active": token_row.is_active,
         "cooldown_until": token_row.cooldown_until,
+        "disabled_at": getattr(token_row, "disabled_at", None),
         "last_refresh_at": token_row.last_refresh_at,
         "expires_at": token_row.expires_at,
         "last_used_at": token_row.last_used_at,
@@ -11892,6 +11893,7 @@ def create_app() -> FastAPI:
             "id": token.id,
             "is_active": token.is_active,
             "cooldown_until": token.cooldown_until,
+            "disabled_at": token.disabled_at,
             "counts": asdict(counts),
         }
 

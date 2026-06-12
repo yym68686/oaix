@@ -24,11 +24,13 @@ const TOKEN_SORT_OPTIONS = new Set([
   "created_at",
   "-last_used_at",
   "last_used_at",
+  "-disabled_at",
   "status",
   "plan_type",
   "account",
 ]);
 const DEFAULT_TOKEN_SORT = "-created_at";
+const DEFAULT_DISABLED_TOKEN_SORT = "-disabled_at";
 const IMPORT_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
 const IMPORT_QUEUE_POSITION_OPTIONS = new Set(["front", "back"]);
 const DEFAULT_IMPORT_QUEUE_POSITION = "front";
@@ -723,6 +725,10 @@ function normalizeTokenViewMode(value) {
 function normalizeTokenSort(value) {
   const normalized = String(value || "").trim().toLowerCase();
   return TOKEN_SORT_OPTIONS.has(normalized) ? normalized : DEFAULT_TOKEN_SORT;
+}
+
+function defaultTokenSortForStatus(status) {
+  return normalizeTokenStatusFilter(status) === "disabled" ? DEFAULT_DISABLED_TOKEN_SORT : DEFAULT_TOKEN_SORT;
 }
 
 function normalizePositiveInteger(value, fallback = 1) {
@@ -1978,7 +1984,12 @@ function renderTokenResultRow(item, workspaceTokenCounts) {
   const planLabel = formatPlanType(item.plan_type);
   const planTone = derivePlanTone(item.plan_type);
   const cooldownValue = formatCooldownUntil(item.cooldown_until);
+  const disabledAtValue = formatDate(item.disabled_at || (!item.is_active ? item.updated_at : null));
   const lastUsedValue = formatDate(item.last_used_at);
+  const lifecycleRows =
+    status.tone === "disabled"
+      ? [`禁用 ${disabledAtValue}`, `最近 ${lastUsedValue}`]
+      : [`冷却 ${cooldownValue}`, `最近 ${lastUsedValue}`];
   const activeStreams = Math.max(0, Number(item.active_streams || 0));
   const activeStreamCap = normalizeTokenActiveStreamCap(state.tokenActiveStreamCap, item.active_stream_cap);
   const activeStreamsValue = `${formatInteger(activeStreams)}/${formatInteger(activeStreamCap)}`;
@@ -2006,8 +2017,7 @@ function renderTokenResultRow(item, workspaceTokenCounts) {
         </span>
         ${renderQuotaPreview(item)}
         <span class="token-result__lifecycle" data-label="生命周期">
-          <span>冷却 ${escapeHtml(cooldownValue)}</span>
-          <span>最近 ${escapeHtml(lastUsedValue)}</span>
+          ${lifecycleRows.map((row) => `<span>${escapeHtml(row)}</span>`).join("")}
         </span>
         <span class="token-result__usage" data-label="并发/金额">
           <span>${escapeHtml(activeStreamsValue)}</span>
@@ -2863,7 +2873,7 @@ function isDefaultTokenStatusPageQuery(page = state.tokenPage) {
     normalizePositiveInteger(page, 1) === 1 &&
     !normalizeWhitespace(state.tokenSearchTerm) &&
     normalizeAvailablePlanFilter(state.tokenPlanFilter) === AVAILABLE_PLAN_FILTER_ALL &&
-    normalizeTokenSort(state.tokenSort) === DEFAULT_TOKEN_SORT &&
+    normalizeTokenSort(state.tokenSort) === defaultTokenSortForStatus(state.tokenStatusFilter) &&
     state.selectedImportBatchId == null
   );
 }
@@ -2907,7 +2917,7 @@ function buildDefaultTokenStatusParams(status) {
     q: "",
     status: normalizeTokenStatusFilter(status),
     plan_type: AVAILABLE_PLAN_FILTER_ALL,
-    sort: DEFAULT_TOKEN_SORT,
+    sort: defaultTokenSortForStatus(status),
   });
 }
 
@@ -3314,6 +3324,9 @@ async function applyTokenQuery(updates = {}) {
   }
   if (Object.prototype.hasOwnProperty.call(updates, "status")) {
     state.tokenStatusFilter = normalizeTokenStatusFilter(updates.status);
+    if (!Object.prototype.hasOwnProperty.call(updates, "sort")) {
+      state.tokenSort = defaultTokenSortForStatus(state.tokenStatusFilter);
+    }
   }
   if (Object.prototype.hasOwnProperty.call(updates, "planType")) {
     state.tokenPlanFilter = normalizeAvailablePlanFilter(updates.planType);

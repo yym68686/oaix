@@ -2292,12 +2292,14 @@ def test_collect_images_api_response_from_sse_aborts_on_client_disconnect() -> N
 
 def test_serialize_admin_token_item_includes_created_at(monkeypatch) -> None:
     created_at = datetime(2026, 4, 15, 9, 30, tzinfo=timezone.utc)
+    disabled_at = datetime(2026, 4, 15, 10, 30, tzinfo=timezone.utc)
     token = CodexToken(
         id=7,
         email="user@example.com",
         account_id="acct_123",
         refresh_token="refresh_token",
-        is_active=True,
+        is_active=False,
+        disabled_at=disabled_at,
     )
     token.created_at = created_at
     _TOKEN_ACTIVE_REQUESTS.clear()
@@ -2317,6 +2319,7 @@ def test_serialize_admin_token_item_includes_created_at(monkeypatch) -> None:
     )
 
     assert item["created_at"] == created_at
+    assert item["disabled_at"] == disabled_at
     assert item["active_streams"] == 3
     assert item["active_stream_cap"] == 10
     _TOKEN_ACTIVE_REQUESTS.clear()

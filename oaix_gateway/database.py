@@ -91,6 +91,7 @@ class CodexToken(Base):
     source_file: Mapped[str | None] = mapped_column(String(512), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -585,7 +586,17 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN merged_into_token_id INTEGER"))
         if "plan_type" not in token_columns:
             sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN plan_type VARCHAR(32)"))
+        if "disabled_at" not in token_columns:
+            sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN disabled_at TIMESTAMPTZ"))
+            sync_conn.execute(
+                text(
+                    "UPDATE codex_tokens "
+                    "SET disabled_at = updated_at "
+                    "WHERE is_active IS NOT TRUE AND disabled_at IS NULL"
+                )
+            )
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_cooldown_until ON codex_tokens (cooldown_until)"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_disabled_at ON codex_tokens (disabled_at)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_refresh_token ON codex_tokens (refresh_token)"))
         sync_conn.execute(
             text("CREATE INDEX IF NOT EXISTS ix_codex_tokens_merged_into_token_id ON codex_tokens (merged_into_token_id)")

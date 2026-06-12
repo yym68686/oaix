@@ -20,6 +20,7 @@ from oaix_gateway.token_store import (
     _FILL_FIRST_TOKEN_REFRESH_TASKS,
     _FillFirstTokenCacheEntry,
     _TOKEN_RUNTIME_STATE,
+    TOKEN_LIST_SORT_DISABLED_DESC,
     _apply_token_runtime_error_state,
     _build_token_counts_stmt,
     _merge_duplicate_token_rows,
@@ -294,6 +295,23 @@ def test_list_token_rows_applies_limit_and_offset(monkeypatch) -> None:
     sql = read_session.statements[-1]
     assert "LIMIT 25" in sql
     assert "OFFSET 50" in sql
+
+
+def test_list_token_rows_can_sort_by_recently_disabled(monkeypatch) -> None:
+    read_session = _FakeReadSession([])
+
+    @asynccontextmanager
+    async def fake_get_read_session():
+        yield read_session
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_read_session", fake_get_read_session)
+
+    asyncio.run(list_token_rows(status="disabled", sort=TOKEN_LIST_SORT_DISABLED_DESC))
+
+    sql = read_session.statements[-1]
+    assert "codex_tokens.is_active IS false" in sql
+    assert "codex_tokens.disabled_at DESC NULLS LAST" in sql
+    assert "codex_tokens.updated_at DESC" in sql
 
 
 def test_claim_next_active_token_fill_first_is_read_only_and_uses_app_token_order(monkeypatch) -> None:
@@ -872,11 +890,13 @@ def test_repair_duplicate_token_histories_acquires_history_lock(monkeypatch) -> 
 
 
 def test_set_token_active_state_can_clear_cooldown_when_reactivating(monkeypatch) -> None:
+    previous_disabled_at = datetime(2026, 4, 15, 14, 0, tzinfo=timezone.utc)
     token = CodexToken(
         id=7,
         token_type="codex",
         is_active=True,
         cooldown_until=datetime(2026, 4, 15, 15, 0, tzinfo=timezone.utc),
+        disabled_at=previous_disabled_at,
     )
     fake_session = _FakeSession()
 
@@ -897,9 +917,11 @@ def test_set_token_active_state_can_clear_cooldown_when_reactivating(monkeypatch
     assert result is token
     assert token.is_active is True
     assert token.cooldown_until is None
+    assert token.disabled_at is None
 
 
 def test_set_token_active_state_clears_cooldown_when_deactivating(monkeypatch) -> None:
+    disabled_at = datetime(2026, 4, 15, 16, 0, tzinfo=timezone.utc)
     token = CodexToken(
         id=8,
         token_type="codex",
@@ -919,9 +941,11 @@ def test_set_token_active_state_clears_cooldown_when_deactivating(monkeypatch) -
 
     monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
     monkeypatch.setattr("oaix_gateway.token_store._resolve_canonical_token_for_update", fake_resolve)
+    monkeypatch.setattr("oaix_gateway.token_store.utcnow", lambda: disabled_at)
 
     result = asyncio.run(set_token_active_state(8, active=False))
 
     assert result is token
     assert token.is_active is False
     assert token.cooldown_until is None
+    assert token.disabled_at == disabled_at

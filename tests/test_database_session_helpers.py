@@ -128,12 +128,33 @@ def test_schema_migrations_use_physical_codex_token_type_column_for_raw_indexes(
                 """
             )
         )
+        conn.execute(
+            text(
+                """
+                INSERT INTO codex_tokens (
+                    email, account_id, refresh_token, type, is_active, created_at, updated_at
+                )
+                VALUES (
+                    'disabled@example.com', 'acct_disabled', 'rt_disabled', 'codex', 0,
+                    '2026-04-15 09:00:00', '2026-04-15 10:30:00'
+                )
+                """
+            )
+        )
 
         database._run_schema_migrations(conn)
         index_rows = conn.execute(text("select name, sql from sqlite_master where type = 'index'")).mappings().all()
+        column_rows = conn.execute(text("pragma table_info(codex_tokens)")).mappings().all()
+        disabled_at = conn.execute(
+            text("select disabled_at from codex_tokens where account_id = 'acct_disabled'")
+        ).scalar_one()
 
     index_sql = {row["name"]: row["sql"] for row in index_rows}
+    columns = {row["name"] for row in column_rows}
+    assert "disabled_at" in columns
+    assert disabled_at == "2026-04-15 10:30:00"
     assert "ix_codex_tokens_pool_snapshot" in index_sql
     assert "ix_codex_tokens_lru_available" in index_sql
+    assert "ix_codex_tokens_disabled_at" in index_sql
     assert "token_type" not in (index_sql["ix_codex_tokens_pool_snapshot"] or "")
     assert "token_type" not in (index_sql["ix_codex_tokens_lru_available"] or "")

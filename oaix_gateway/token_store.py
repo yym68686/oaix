@@ -64,6 +64,7 @@ TOKEN_LIST_SORT_NEWEST = "-created_at"
 TOKEN_LIST_SORT_OLDEST = "created_at"
 TOKEN_LIST_SORT_LAST_USED_DESC = "-last_used_at"
 TOKEN_LIST_SORT_LAST_USED_ASC = "last_used_at"
+TOKEN_LIST_SORT_DISABLED_DESC = "-disabled_at"
 TOKEN_LIST_SORT_STATUS = "status"
 TOKEN_LIST_SORT_PLAN = "plan_type"
 TOKEN_LIST_SORT_ACCOUNT = "account"
@@ -72,6 +73,7 @@ TOKEN_LIST_SORTS = (
     TOKEN_LIST_SORT_OLDEST,
     TOKEN_LIST_SORT_LAST_USED_DESC,
     TOKEN_LIST_SORT_LAST_USED_ASC,
+    TOKEN_LIST_SORT_DISABLED_DESC,
     TOKEN_LIST_SORT_STATUS,
     TOKEN_LIST_SORT_PLAN,
     TOKEN_LIST_SORT_ACCOUNT,
@@ -125,6 +127,7 @@ class TokenStatus:
     account_id: str | None
     is_active: bool
     cooldown_until: datetime | None
+    disabled_at: datetime | None
     last_refresh_at: datetime | None
     expires_at: datetime | None
     last_used_at: datetime | None
@@ -211,6 +214,7 @@ class _TokenStatusWriteJob:
     message: str | None = None
     deactivate: bool = False
     cooldown_until: datetime | None = None
+    disabled_at: datetime | None = None
     clear_access_token: bool = False
     scope: str | None = None
     attempts: int = 0
@@ -409,13 +413,21 @@ def _merge_token_status_write_jobs(
 
     cooldown_until = existing.cooldown_until
     if incoming.cooldown_until is not None:
-        cooldown_until = max(cooldown_until, incoming.cooldown_until) if cooldown_until is not None else incoming.cooldown_until
+        cooldown_until = (
+            max(cooldown_until, incoming.cooldown_until)
+            if cooldown_until is not None
+            else incoming.cooldown_until
+        )
     return _TokenStatusWriteJob(
         token_id=incoming.token_id,
         kind="error",
         message=incoming.message or existing.message,
         deactivate=existing.deactivate or incoming.deactivate,
         cooldown_until=None if existing.deactivate or incoming.deactivate else cooldown_until,
+        disabled_at=max(
+            (value for value in (existing.disabled_at, incoming.disabled_at) if value is not None),
+            default=None,
+        ),
         clear_access_token=existing.clear_access_token or incoming.clear_access_token,
     )
 
@@ -448,12 +460,14 @@ async def _write_token_success_job(session, job: _TokenStatusWriteJob) -> None:
             or_(
                 CodexToken.is_active.is_not(True),
                 CodexToken.cooldown_until.is_not(None),
+                CodexToken.disabled_at.is_not(None),
                 CodexToken.last_error.is_not(None),
             )
         )
         .values(
             is_active=True,
             cooldown_until=None,
+            disabled_at=None,
             last_error=None,
             updated_at=now,
         )
@@ -472,9 +486,11 @@ async def _write_token_error_job(session, job: _TokenStatusWriteJob) -> None:
     if job.deactivate:
         values["is_active"] = False
         values["cooldown_until"] = None
+        values["disabled_at"] = job.disabled_at or now
     elif job.cooldown_until is not None:
         values["is_active"] = True
         values["cooldown_until"] = job.cooldown_until
+        values["disabled_at"] = None
     await session.execute(
         update(CodexToken)
         .where(CodexToken.id == int(job.token_id))
@@ -808,6 +824,7 @@ def _token_history_rank(token: CodexToken) -> tuple[float, ...]:
         _datetime_sort_value(token.last_refresh_at),
         _datetime_sort_value(token.updated_at),
         _datetime_sort_value(token.last_used_at),
+        _datetime_sort_value(token.disabled_at),
         _datetime_sort_value(token.cooldown_until),
         1.0 if token.access_token else 0.0,
         _datetime_sort_value(token.expires_at),
@@ -885,6 +902,18 @@ def _merge_duplicate_token_rows(
         if canonical.is_active
         else None
     )
+    canonical.disabled_at = (
+        None
+        if canonical.is_active
+        else max(
+            (
+                token.disabled_at or token.updated_at
+                for token in tokens
+                if not token.is_active and (token.disabled_at is not None or token.updated_at is not None)
+            ),
+            default=canonical.disabled_at or merged_at,
+        )
+    )
     if canonical.access_token:
         canonical.expires_at = canonical.expires_at or max(
             (token.expires_at for token in tokens if token.expires_at is not None),
@@ -906,6 +935,7 @@ def _merge_duplicate_token_rows(
         shadow.access_token = None
         shadow.expires_at = None
         shadow.cooldown_until = None
+        shadow.disabled_at = merged_at
         shadow.last_error = _merge_shadow_error(canonical.id)
         shadow.updated_at = merged_at
 
@@ -1276,6 +1306,8 @@ def _token_list_order_clauses(sort: str | None, now: datetime) -> tuple[Any, ...
         return (nullslast(CodexToken.last_used_at.desc()), CodexToken.id.desc())
     if normalized == TOKEN_LIST_SORT_LAST_USED_ASC:
         return (nullsfirst(CodexToken.last_used_at.asc()), CodexToken.id.asc())
+    if normalized == TOKEN_LIST_SORT_DISABLED_DESC:
+        return (nullslast(CodexToken.disabled_at.desc()), CodexToken.updated_at.desc(), CodexToken.id.desc())
     if normalized == TOKEN_LIST_SORT_STATUS:
         return (
             case(
@@ -1591,6 +1623,7 @@ async def _upsert_token_payload_in_session(
     is_active = _payload_bool(payload.get("is_active"), default=True)
     payload_last_error = str(payload.get("last_error") or "").strip() or None
     expires_at = extract_token_expiration_from_payload(payload)
+    now = utcnow()
 
     if acquire_identity_lock:
         await _acquire_token_identity_locks(session, refresh_token=refresh_token, account_id=account_id)
@@ -1618,8 +1651,9 @@ async def _upsert_token_payload_in_session(
             source_file=source_file,
             is_active=is_active,
             cooldown_until=None,
+            disabled_at=None if is_active else now,
             last_error=None if is_active else payload_last_error,
-            updated_at=utcnow(),
+            updated_at=now,
         )
         session.add(token)
         await session.flush()
@@ -1636,7 +1670,7 @@ async def _upsert_token_payload_in_session(
     token.refresh_token_aliases = merge_refresh_token_aliases(_token_aliases(token), refresh_token)
     if history_lookup is not None:
         history_lookup.refresh_token_aliases(token)
-    token.updated_at = utcnow()
+    token.updated_at = now
 
     if refresh_token == normalize_refresh_token(token.refresh_token):
         token.id_token = str(payload.get("id_token") or "").strip() or None
@@ -1648,6 +1682,7 @@ async def _upsert_token_payload_in_session(
         token.plan_type = _extract_plan_type_from_payload(payload) or token.plan_type
         token.is_active = is_active
         token.cooldown_until = None
+        token.disabled_at = None if is_active else token.disabled_at or now
         token.last_error = None if is_active else payload_last_error
         await session.flush()
         if invalidate_cache:
@@ -2334,6 +2369,7 @@ async def update_token_refresh_state(
             if reactivate:
                 token.is_active = True
                 token.cooldown_until = None
+                token.disabled_at = None
                 token.last_error = None
                 _TOKEN_STATUS_WRITE_PENDING.pop((int(token.id), "token"), None)
                 _apply_token_runtime_success_state(token.id)
@@ -2405,6 +2441,7 @@ async def mark_token_import_validation_pending(
                 return
             token.is_active = True
             token.cooldown_until = cooldown_until
+            token.disabled_at = None
             token.last_error = message[:4000]
             token.updated_at = utcnow()
             await session.flush()
@@ -2427,10 +2464,12 @@ async def set_token_active_state(
             token = await _resolve_canonical_token_for_update(session, token_id)
             if token is None:
                 return None
+            now = utcnow()
             token.is_active = bool(active)
             if not active or clear_cooldown:
                 token.cooldown_until = None
-            token.updated_at = utcnow()
+            token.disabled_at = None if active else now
+            token.updated_at = now
             await session.flush()
             if active and clear_cooldown:
                 _apply_token_runtime_success_state(token.id)
@@ -2482,8 +2521,9 @@ async def mark_token_error(
     cooldown_seconds: int | None = None,
     clear_access_token: bool = False,
 ) -> None:
+    now = utcnow()
     cooldown_until = (
-        utcnow() + timedelta(seconds=max(0, int(cooldown_seconds)))
+        now + timedelta(seconds=max(0, int(cooldown_seconds)))
         if cooldown_seconds is not None
         else None
     )
@@ -2500,6 +2540,7 @@ async def mark_token_error(
             message=message[:4000],
             deactivate=deactivate,
             cooldown_until=cooldown_until,
+            disabled_at=now if deactivate else None,
             clear_access_token=clear_access_token,
         )
     )
@@ -2792,6 +2833,7 @@ async def list_tokens(limit: int = 100, offset: int = 0) -> list[TokenStatus]:
             account_id=token.account_id,
             is_active=token.is_active,
             cooldown_until=token.cooldown_until,
+            disabled_at=token.disabled_at,
             last_refresh_at=token.last_refresh_at,
             expires_at=token.expires_at,
             last_used_at=token.last_used_at,

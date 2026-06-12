@@ -391,6 +391,21 @@ def test_frontend_prefetches_default_token_status_pages() -> None:
     assert "clearTokenStatusPageCache()" in app_js
 
 
+def test_frontend_disabled_tokens_show_time_and_default_to_recently_disabled_sort() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+    index_html = (WEB_DIR / "index.html").read_text()
+    apply_query_function = app_js.split("async function applyTokenQuery", 1)[1].split("function queueTokenSearch", 1)[0]
+    card_renderer = app_js.split("function renderTokenResultRow", 1)[1].split("function renderCounts", 1)[0]
+
+    assert '<option value="-disabled_at">最近禁用</option>' in index_html
+    assert 'const DEFAULT_DISABLED_TOKEN_SORT = "-disabled_at";' in app_js
+    assert 'normalizeTokenStatusFilter(status) === "disabled" ? DEFAULT_DISABLED_TOKEN_SORT : DEFAULT_TOKEN_SORT' in app_js
+    assert 'sort: defaultTokenSortForStatus(status)' in app_js
+    assert 'state.tokenSort = defaultTokenSortForStatus(state.tokenStatusFilter)' in apply_query_function
+    assert "const disabledAtValue = formatDate(item.disabled_at || (!item.is_active ? item.updated_at : null))" in card_renderer
+    assert '`禁用 ${disabledAtValue}`' in card_renderer
+
+
 def test_frontend_probe_request_sends_selected_model() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     probe_function = app_js.split("async function probeToken", 1)[1].split("async function deleteToken", 1)[0]
@@ -926,6 +941,7 @@ def test_token_activation_route_forwards_clear_cooldown(monkeypatch) -> None:
         "id": 9,
         "is_active": True,
         "cooldown_until": None,
+        "disabled_at": None,
         "counts": {
             "total": 3,
             "active": 2,
