@@ -3100,6 +3100,52 @@ class UpstreamHTTPClientShard:
     breaker: UpstreamCircuitBreaker
 
 
+def _tcp_close_wait_socket_inodes() -> set[str]:
+    inodes: set[str] = set()
+    for path in ("/proc/self/net/tcp", "/proc/self/net/tcp6"):
+        try:
+            rows = Path(path).read_text(encoding="utf-8").splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            parts = row.split()
+            if len(parts) <= 9 or parts[3].upper() != "08":
+                continue
+            inode = parts[9].strip()
+            if inode and inode != "0":
+                inodes.add(inode)
+    return inodes
+
+
+def _socket_inode_for_fd(fd: int) -> str | None:
+    try:
+        target = os.readlink(f"/proc/self/fd/{int(fd)}")
+    except (OSError, TypeError, ValueError):
+        return None
+    match = re.match(r"^socket:\[(\d+)\]$", target)
+    return match.group(1) if match else None
+
+
+def _httpcore_connection_socket_inode(connection: Any) -> str | None:
+    inner_connection = getattr(connection, "_connection", None) or connection
+    network_stream = getattr(inner_connection, "_network_stream", None)
+    get_extra_info = getattr(network_stream, "get_extra_info", None)
+    if not callable(get_extra_info):
+        return None
+    try:
+        sock = get_extra_info("socket")
+    except BaseException:
+        return None
+    fileno = getattr(sock, "fileno", None)
+    if not callable(fileno):
+        return None
+    try:
+        fd = fileno()
+    except BaseException:
+        return None
+    return _socket_inode_for_fd(fd)
+
+
 async def _sweep_httpx_client_idle_connections(client: httpx.AsyncClient) -> int:
     transport = getattr(client, "_transport", None)
     if isinstance(transport, _TimingAsyncHTTPTransport):
@@ -3107,18 +3153,45 @@ async def _sweep_httpx_client_idle_connections(client: httpx.AsyncClient) -> int
     pool = getattr(transport, "_pool", None)
     assign_requests = getattr(pool, "_assign_requests_to_connections", None)
     close_connections = getattr(pool, "_close_connections", None)
+    pool_connections = getattr(pool, "_connections", None)
     lock = getattr(pool, "_optional_thread_lock", None)
     if not callable(assign_requests) or not callable(close_connections):
         return 0
+    if not isinstance(pool_connections, list):
+        return 0
 
-    # httpcore only reaps expired/readable idle sockets during pool operations.
-    # Run that same cleanup path periodically so remote FINs do not sit in
-    # CLOSE_WAIT until another request happens to touch this exact shard.
+    close_wait_inodes = _tcp_close_wait_socket_inodes()
+    closing: list[Any] = []
+
+    def collect_connection(connection: Any) -> None:
+        if all(candidate is not connection for candidate in closing):
+            closing.append(connection)
+
+    def should_close_connection(connection: Any) -> bool:
+        inode = _httpcore_connection_socket_inode(connection)
+        if inode is not None and inode in close_wait_inodes:
+            return True
+        is_closed = getattr(connection, "is_closed", None)
+        has_expired = getattr(connection, "has_expired", None)
+        return (callable(is_closed) and is_closed()) or (callable(has_expired) and has_expired())
+
     if lock is not None:
         with lock:
-            closing = list(assign_requests())
+            for connection in list(pool_connections):
+                if should_close_connection(connection):
+                    if connection in pool_connections:
+                        pool_connections.remove(connection)
+                    collect_connection(connection)
+            for connection in assign_requests():
+                collect_connection(connection)
     else:
-        closing = list(assign_requests())
+        for connection in list(pool_connections):
+            if should_close_connection(connection):
+                if connection in pool_connections:
+                    pool_connections.remove(connection)
+                collect_connection(connection)
+        for connection in assign_requests():
+            collect_connection(connection)
     if not closing:
         return 0
     await close_connections(closing)
@@ -3762,17 +3835,27 @@ class UpstreamStreamOwner:
         if pool is None or pool_request is None:
             return True
         requests = getattr(pool, "_requests", None)
-        if not isinstance(requests, list) or pool_request not in requests:
+        pool_connections = getattr(pool, "_connections", None)
+        connection = getattr(pool_request, "connection", None)
+        if not isinstance(requests, list):
+            requests = []
+        if pool_request not in requests and connection is None:
             return True
 
         try:
-            lock = getattr(pool, "_optional_thread_lock", nullcontext())
-            with lock:
+            closing: list[Any] = []
+            lock = getattr(pool, "_optional_thread_lock", None)
+            with lock if lock is not None else nullcontext():
                 if pool_request in requests:
                     requests.remove(pool_request)
                     _STREAM_OWNER_COUNTERS["force_pool_release_total"] += 1
+                if isinstance(pool_connections, list) and connection in pool_connections:
+                    pool_connections.remove(connection)
                 assign = getattr(pool, "_assign_requests_to_connections", None)
-                closing = assign() if callable(assign) else []
+                closing = list(assign()) if callable(assign) else []
+
+            if connection is not None and all(candidate is not connection for candidate in closing):
+                closing.append(connection)
 
             close_connections = getattr(pool, "_close_connections", None)
             if callable(close_connections):
@@ -3780,6 +3863,18 @@ class UpstreamStreamOwner:
                 if inspect.isawaitable(close_result):
                     if not await _await_cleanup_task_safely(close_result, label="Upstream HTTP pool request"):
                         return False
+            else:
+                for connection_to_close in closing:
+                    aclose = getattr(connection_to_close, "aclose", None)
+                    if not callable(aclose):
+                        continue
+                    close_result = aclose()
+                    if inspect.isawaitable(close_result):
+                        if not await _await_cleanup_task_safely(
+                            close_result,
+                            label="Upstream HTTP pool request connection",
+                        ):
+                            return False
         except Exception as exc:
             logger.warning(
                 "Upstream HTTP pool request cleanup failed",

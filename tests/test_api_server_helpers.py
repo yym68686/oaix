@@ -15,6 +15,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
+import oaix_gateway.api_server as api_server
 from oaix_gateway.api_server import (
     ChatCompletionsRequest,
     ImageProxyRequest,
@@ -2761,6 +2762,7 @@ def test_sweep_httpx_client_idle_connections_runs_httpcore_cleanup() -> None:
     class DummyPool:
         def __init__(self) -> None:
             self._optional_thread_lock = DummyLock()
+            self._connections: list[object] = []
             self.closed: list[object] = []
             self.closing = [object(), object()]
 
@@ -2778,6 +2780,123 @@ def test_sweep_httpx_client_idle_connections_runs_httpcore_cleanup() -> None:
     assert closed == 2
     assert pool._optional_thread_lock.entered is True
     assert pool.closed == pool.closing
+
+
+class _FakePoolConnection:
+    def __init__(self, *, closed: bool = False, expired: bool = False, socket_fd: int | None = None) -> None:
+        self._closed = closed
+        self._expired = expired
+        self.aclose_called = False
+        self._connection = (
+            SimpleNamespace(
+                _network_stream=SimpleNamespace(
+                    get_extra_info=lambda name: SimpleNamespace(fileno=lambda: socket_fd)
+                    if name == "socket"
+                    else None
+                )
+            )
+            if socket_fd is not None
+            else None
+        )
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+    def has_expired(self) -> bool:
+        return self._expired
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+
+
+class _FakePoolRequest:
+    def __init__(self, connection: object) -> None:
+        self.connection = connection
+
+
+class _FakePool:
+    def __init__(self, connections: list[object], requests: list[object] | None = None) -> None:
+        self._connections = connections
+        self._requests = requests if requests is not None else []
+        self._optional_thread_lock = None
+
+    def _assign_requests_to_connections(self) -> list[object]:
+        return []
+
+    async def _close_connections(self, closing: list[object]) -> None:
+        for connection in closing:
+            aclose = getattr(connection, "aclose", None)
+            if callable(aclose):
+                await aclose()
+
+
+class _FakePoolStream:
+    def __init__(self, pool: _FakePool, request: _FakePoolRequest) -> None:
+        self._pool = pool
+        self._pool_request = request
+
+
+async def _force_release_closes_assigned_connection() -> None:
+    connection = _FakePoolConnection()
+    request = _FakePoolRequest(connection)
+    pool = _FakePool([connection], [request])
+    stream = _FakePoolStream(pool, request)
+
+    result = await UpstreamStreamOwner._force_release_httpcore_pool_request_safely(stream)
+
+    assert result is True
+    assert request not in pool._requests
+    assert connection not in pool._connections
+    assert connection.aclose_called is True
+
+
+def test_force_release_httpcore_pool_request_closes_assigned_connection() -> None:
+    asyncio.run(_force_release_closes_assigned_connection())
+
+
+async def _sweep_closes_connections_that_httpcore_assign_would_drop() -> None:
+    closed = _FakePoolConnection(closed=True)
+    expired = _FakePoolConnection(expired=True)
+    healthy = _FakePoolConnection()
+    pool = _FakePool([closed, expired, healthy])
+    client = SimpleNamespace(_transport=SimpleNamespace(_pool=pool))
+
+    result = await _sweep_httpx_client_idle_connections(client)
+
+    assert result == 2
+    assert closed.aclose_called is True
+    assert expired.aclose_called is True
+    assert healthy.aclose_called is False
+    assert pool._connections == [healthy]
+
+
+def test_sweep_httpx_client_idle_connections_closes_closed_connections() -> None:
+    asyncio.run(_sweep_closes_connections_that_httpcore_assign_would_drop())
+
+
+async def _sweep_closes_kernel_close_wait_connections() -> None:
+    close_wait = _FakePoolConnection(socket_fd=123)
+    healthy = _FakePoolConnection(socket_fd=456)
+    pool = _FakePool([close_wait, healthy])
+    client = SimpleNamespace(_transport=SimpleNamespace(_pool=pool))
+
+    result = await _sweep_httpx_client_idle_connections(client)
+
+    assert result == 1
+    assert close_wait.aclose_called is True
+    assert healthy.aclose_called is False
+    assert pool._connections == [healthy]
+
+
+def test_sweep_httpx_client_idle_connections_closes_kernel_close_wait_connections(monkeypatch) -> None:
+    monkeypatch.setattr(api_server, "_tcp_close_wait_socket_inodes", lambda: {"inode-close-wait"})
+    monkeypatch.setattr(
+        api_server,
+        "_socket_inode_for_fd",
+        lambda fd: "inode-close-wait" if fd == 123 else "inode-established",
+    )
+
+    asyncio.run(_sweep_closes_kernel_close_wait_connections())
 
 
 def test_pool_timeout_is_local_overload_not_upstream_connectivity() -> None:
