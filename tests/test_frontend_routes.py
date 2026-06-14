@@ -387,6 +387,8 @@ def test_frontend_prefetches_default_token_status_pages() -> None:
     load_tokens_function = app_js.split("async function loadTokens", 1)[1].split("async function goToTokenPage", 1)[0]
     prefetch_function = app_js.split("async function prefetchTokenStatusPage", 1)[1].split("function scheduleTokenStatusPrefetch", 1)[0]
     schedule_function = app_js.split("function scheduleTokenStatusPrefetch", 1)[1].split("function applyTokenListData", 1)[0]
+    apply_list_function = app_js.split("function applyTokenListData", 1)[1].split("async function loadTokenImportBatches", 1)[0]
+    detail_prefetch_function = app_js.split("function scheduleTokenDetailPrefetch", 1)[1].split("function applyTokenListData", 1)[0]
 
     assert "TOKEN_LIST_CACHE_TTL_MS" in app_js
     assert "tokenStatusPrefetchPromises" in app_js
@@ -397,6 +399,12 @@ def test_frontend_prefetches_default_token_status_pages() -> None:
     assert "for (const status of TOKEN_STATUS_FILTERS)" in schedule_function
     assert "await prefetchTokenStatusPage(status)" in schedule_function
     assert "TOKEN_STATUS_FILTERS.forEach" not in schedule_function
+    assert "TOKEN_DETAIL_PREFETCH_DELAY_MS = 300" in app_js
+    assert "scheduleTokenDetailPrefetch" in app_js
+    assert "void loadTokenCosts(visibleTokenIds, { listRequestSeq })" not in apply_list_function
+    assert "void loadTokenQuotas(quotaTokenIds, { listRequestSeq })" not in apply_list_function
+    assert "void loadTokenCosts(visibleTokenIds, { listRequestSeq })" in detail_prefetch_function
+    assert "void loadTokenQuotas(quotaTokenIds, { listRequestSeq })" in detail_prefetch_function
     assert "clearTokenStatusPageCache()" in app_js
 
 

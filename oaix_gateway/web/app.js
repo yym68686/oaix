@@ -8,6 +8,7 @@ const TOAST_EXIT_DURATION_MS = 220;
 const TOKEN_PAGE_SIZE = 80;
 const TOKEN_LIST_CACHE_TTL_MS = 10000;
 const TOKEN_STATUS_PREFETCH_DELAY_MS = 0;
+const TOKEN_DETAIL_PREFETCH_DELAY_MS = 300;
 const TOKEN_LIST_BASE_NOTE = `每页 ${TOKEN_PAGE_SIZE} 条记录 · 搜索、筛选、排序均作用于全池`;
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
@@ -101,6 +102,7 @@ const state = {
   tokenStatusPrefetching: new Set(),
   tokenStatusPrefetchPromises: new Map(),
   tokenStatusPrefetchTimer: null,
+  tokenDetailPrefetchTimer: null,
   tokenImportBatchesLoaded: false,
   tokenImportBatchesLoading: false,
   tokenImportBatchRequestSeq: 0,
@@ -2912,6 +2914,10 @@ function clearTokenStatusPageCache() {
   state.tokenStatusPageCache.clear();
   state.tokenStatusPrefetching.clear();
   state.tokenStatusPrefetchPromises.clear();
+  if (state.tokenDetailPrefetchTimer) {
+    window.clearTimeout(state.tokenDetailPrefetchTimer);
+    state.tokenDetailPrefetchTimer = null;
+  }
   state.tokenImportBatchesLoaded = false;
   state.tokenImportBatchesLoading = false;
   state.tokenImportBatchRequestSeq += 1;
@@ -2964,7 +2970,12 @@ async function prefetchTokenStatusPage(status) {
 }
 
 function scheduleTokenStatusPrefetch({ listRequestSeq = state.tokenListRequestSeq } = {}) {
-  if (!state.serviceKey || !isDefaultTokenStatusPageQuery(1) || state.tokenViewMode !== "keys") {
+  if (
+    !state.serviceKey ||
+    state.tokenViewMode !== "keys" ||
+    state.tokenStatusFilter !== DEFAULT_TOKEN_STATUS_FILTER ||
+    !isDefaultTokenStatusPageQuery(1)
+  ) {
     return;
   }
   if (state.tokenStatusPrefetchTimer) {
@@ -2988,6 +2999,20 @@ function scheduleTokenStatusPrefetch({ listRequestSeq = state.tokenListRequestSe
       }
     })();
   }, TOKEN_STATUS_PREFETCH_DELAY_MS);
+}
+
+function scheduleTokenDetailPrefetch({ visibleTokenIds, quotaTokenIds, listRequestSeq }) {
+  if (state.tokenDetailPrefetchTimer) {
+    window.clearTimeout(state.tokenDetailPrefetchTimer);
+  }
+  state.tokenDetailPrefetchTimer = window.setTimeout(() => {
+    state.tokenDetailPrefetchTimer = null;
+    if (listRequestSeq !== state.tokenListRequestSeq || state.tokenViewMode !== "keys") {
+      return;
+    }
+    void loadTokenCosts(visibleTokenIds, { listRequestSeq });
+    void loadTokenQuotas(quotaTokenIds, { listRequestSeq });
+  }, TOKEN_DETAIL_PREFETCH_DELAY_MS);
 }
 
 function applyTokenListData(data, { requestedPage, allowPageAdjust, listRequestSeq }) {
@@ -3030,12 +3055,11 @@ function applyTokenListData(data, { requestedPage, allowPageAdjust, listRequestS
   const visibleTokenIds = state.tokenItems
     .map((item) => Number(item?.id))
     .filter((tokenId) => Number.isFinite(tokenId) && tokenId > 0);
-  void loadTokenCosts(visibleTokenIds, { listRequestSeq });
   const quotaTokenIds = state.tokenItems
     .filter((item) => item?.quota_loading)
     .map((item) => Number(item?.id))
     .filter((tokenId) => Number.isFinite(tokenId) && tokenId > 0);
-  void loadTokenQuotas(quotaTokenIds, { listRequestSeq });
+  scheduleTokenDetailPrefetch({ visibleTokenIds, quotaTokenIds, listRequestSeq });
   scheduleTokenStatusPrefetch({ listRequestSeq });
   return true;
 }
@@ -3269,6 +3293,10 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
   if (state.tokenListAbortController) {
     state.tokenListAbortController.abort();
     state.tokenListAbortController = null;
+  }
+  if (state.tokenDetailPrefetchTimer) {
+    window.clearTimeout(state.tokenDetailPrefetchTimer);
+    state.tokenDetailPrefetchTimer = null;
   }
   abortTokenCostRequest();
   abortTokenQuotaRequest();
