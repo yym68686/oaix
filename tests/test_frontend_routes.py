@@ -560,8 +560,9 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         assert [item.id for item in token_rows] == [7]
         return [{"id": 7, "email": "a@example.com"}]
 
-    async def fake_list_token_import_batch_summaries(*, limit):
+    async def fake_list_token_import_batch_summaries(*, limit, include_observed_cost=False):
         assert limit == 30
+        assert include_observed_cost is False
         submitted_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
         return [
             TokenImportBatchSummary(
@@ -583,8 +584,6 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
                 submitted_at=submitted_at,
                 started_at=submitted_at,
                 finished_at=submitted_at,
-                observed_cost_usd=12.0,
-                average_observed_cost_usd=4.0,
             )
         ]
 
@@ -619,8 +618,8 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
     assert body["import_batches"][0]["cooling"] == 1
     assert body["import_batches"][0]["disabled"] == 1
     assert body["import_batches"][0]["token_ids"] == [7, 8, 9]
-    assert body["import_batches"][0]["observed_cost_usd"] == 12.0
-    assert body["import_batches"][0]["average_observed_cost_usd"] == 4.0
+    assert body["import_batches"][0]["observed_cost_usd"] == 0.0
+    assert body["import_batches"][0]["average_observed_cost_usd"] is None
     assert body["filtered_counts"]["available"] == 19
     assert body["plan_counts"]["plus"] == 20
     assert body["query"] == {
@@ -669,8 +668,9 @@ def test_admin_tokens_route_includes_selected_import_batch_failed_items(monkeypa
         assert [item.id for item in token_rows] == [7]
         return [{"id": 7, "email": "a@example.com"}]
 
-    async def fake_list_token_import_batch_summaries(*, limit):
+    async def fake_list_token_import_batch_summaries(*, limit, include_observed_cost=False):
         assert limit == 30
+        assert include_observed_cost is False
         submitted_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
         return [
             TokenImportBatchSummary(

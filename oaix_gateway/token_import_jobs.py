@@ -735,13 +735,18 @@ def _build_token_import_batch_summary(
             available += 1
 
     present_count = available + cooling + disabled
-    observed_cost_usd = round(
-        sum(
-            float(observed_costs_by_token.get(token_id, 0.0) or 0.0)
-            for token_id in token_ids
-            if token_id in tokens_by_id
-        ),
-        6,
+    include_observed_cost = bool(observed_costs_by_token)
+    observed_cost_usd = (
+        round(
+            sum(
+                float(observed_costs_by_token.get(token_id, 0.0) or 0.0)
+                for token_id in token_ids
+                if token_id in tokens_by_id
+            ),
+            6,
+        )
+        if include_observed_cost
+        else 0.0
     )
     return TokenImportBatchSummary(
         id=state.id,
@@ -763,7 +768,11 @@ def _build_token_import_batch_summary(
         started_at=state.started_at,
         finished_at=state.finished_at,
         observed_cost_usd=observed_cost_usd,
-        average_observed_cost_usd=round(observed_cost_usd / present_count, 6) if present_count > 0 else None,
+        average_observed_cost_usd=(
+            round(observed_cost_usd / present_count, 6)
+            if include_observed_cost and present_count > 0
+            else None
+        ),
     )
 
 
@@ -850,7 +859,11 @@ async def list_token_import_batch_failed_items(job_id: int) -> list[dict[str, An
     return [by_index[index] for index in sorted(by_index)]
 
 
-async def list_token_import_batch_summaries(limit: int = 30) -> list[TokenImportBatchSummary]:
+async def list_token_import_batch_summaries(
+    limit: int = 30,
+    *,
+    include_observed_cost: bool = False,
+) -> list[TokenImportBatchSummary]:
     resolved_limit = max(1, min(int(limit or 30), 100))
     async with get_read_session() as session:
         result = await session.execute(
@@ -883,7 +896,11 @@ async def list_token_import_batch_summaries(limit: int = 30) -> list[TokenImport
             )
             tokens_by_id = {int(token.id): token for token in token_result.scalars().all()}
 
-    observed_costs_by_token = await get_request_costs_by_token(tuple(tokens_by_id)) if tokens_by_id else {}
+    observed_costs_by_token = (
+        await get_request_costs_by_token(tuple(tokens_by_id))
+        if include_observed_cost and tokens_by_id
+        else {}
+    )
     now = utcnow()
     return [
         _build_token_import_batch_summary(

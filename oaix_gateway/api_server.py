@@ -11870,7 +11870,7 @@ def create_app() -> FastAPI:
         import_batch_id: int | None = Query(None, ge=1),
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
-        import_batches = await list_token_import_batch_summaries(limit=30)
+        import_batches = await list_token_import_batch_summaries(limit=30, include_observed_cost=False)
         batch_token_ids: tuple[int, ...] | None = None
         selected_import_batch: TokenImportBatchSummary | None = None
         if import_batch_id is not None:
