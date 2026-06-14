@@ -370,13 +370,20 @@ def test_frontend_pauses_background_polling_when_tab_is_hidden() -> None:
 def test_frontend_loads_token_quota_lazily_after_list_render() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     load_tokens_function = app_js.split("async function loadTokens", 1)[1].split("async function goToTokenPage", 1)[0]
+    cost_function = app_js.split("async function loadTokenCosts", 1)[1].split("async function loadHealth", 1)[0]
     quota_function = app_js.split("async function loadTokenQuotas", 1)[1].split("async function loadTokens", 1)[0]
 
     assert 'include_quota: "1"' not in load_tokens_function
     assert "void loadTokenQuotas(quotaTokenIds, { listRequestSeq })" in app_js
+    assert "TOKEN_COST_BATCH_SIZE = 8" in app_js
+    assert "index += TOKEN_COST_BATCH_SIZE" in cost_function
+    assert "resolvedIds.slice(index, index + TOKEN_COST_BATCH_SIZE)" in cost_function
+    assert "`/admin/tokens/costs?${params.toString()}`" in cost_function
     assert "`/admin/tokens/quota?${params.toString()}`" in quota_function
     assert "new AbortController()" in load_tokens_function
+    assert "new AbortController()" in cost_function
     assert "new AbortController()" in quota_function
+    assert "listRequestSeq !== state.tokenListRequestSeq" in cost_function
     assert "listRequestSeq !== state.tokenListRequestSeq" in quota_function
     assert "quota_loading" in app_js
     assert "pendingIdSet.has(tokenId)" in quota_function

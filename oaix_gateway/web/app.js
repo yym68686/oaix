@@ -9,6 +9,7 @@ const TOKEN_PAGE_SIZE = 80;
 const TOKEN_LIST_CACHE_TTL_MS = 10000;
 const TOKEN_STATUS_PREFETCH_DELAY_MS = 600;
 const TOKEN_DETAIL_PREFETCH_DELAY_MS = 300;
+const TOKEN_COST_BATCH_SIZE = 8;
 const TOKEN_LIST_BASE_NOTE = `每页 ${TOKEN_PAGE_SIZE} 条记录 · 搜索、筛选、排序均作用于全池`;
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
@@ -3131,36 +3132,39 @@ async function loadTokenCosts(tokenIds, { listRequestSeq = state.tokenListReques
   state.tokenCostAbortController = controller;
 
   try {
-    const params = new URLSearchParams({ ids: resolvedIds.join(",") });
-    const data = await fetchJson(`/admin/tokens/costs?${params.toString()}`, {
-      headers: authHeaders(),
-      signal: controller.signal,
-    });
-    if (costRequestSeq !== state.tokenCostRequestSeq || listRequestSeq !== state.tokenListRequestSeq) {
-      return;
-    }
+    for (let index = 0; index < resolvedIds.length; index += TOKEN_COST_BATCH_SIZE) {
+      const batchIds = resolvedIds.slice(index, index + TOKEN_COST_BATCH_SIZE);
+      const params = new URLSearchParams({ ids: batchIds.join(",") });
+      const data = await fetchJson(`/admin/tokens/costs?${params.toString()}`, {
+        headers: authHeaders(),
+        signal: controller.signal,
+      });
+      if (costRequestSeq !== state.tokenCostRequestSeq || listRequestSeq !== state.tokenListRequestSeq) {
+        return;
+      }
 
-    const costsById = new Map();
-    (Array.isArray(data.items) ? data.items : []).forEach((item) => {
-      const tokenId = Number(item?.id);
-      if (Number.isFinite(tokenId)) {
-        costsById.set(tokenId, item?.observed_cost_usd ?? null);
+      const costsById = new Map();
+      (Array.isArray(data.items) ? data.items : []).forEach((item) => {
+        const tokenId = Number(item?.id);
+        if (Number.isFinite(tokenId)) {
+          costsById.set(tokenId, item?.observed_cost_usd ?? null);
+        }
+      });
+      if (!costsById.size) {
+        continue;
       }
-    });
-    if (!costsById.size) {
-      return;
+      state.tokenItems = state.tokenItems.map((item) => {
+        const tokenId = Number(item?.id);
+        if (!costsById.has(tokenId)) {
+          return item;
+        }
+        return {
+          ...item,
+          observed_cost_usd: costsById.get(tokenId),
+        };
+      });
+      renderTokenList(state.tokenItems);
     }
-    state.tokenItems = state.tokenItems.map((item) => {
-      const tokenId = Number(item?.id);
-      if (!costsById.has(tokenId)) {
-        return item;
-      }
-      return {
-        ...item,
-        observed_cost_usd: costsById.get(tokenId),
-      };
-    });
-    renderTokenList(state.tokenItems);
   } catch (error) {
     if (!isAbortError(error)) {
       console.warn("Failed to load token costs", error);
