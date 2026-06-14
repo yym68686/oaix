@@ -81,6 +81,7 @@ from .token_import_jobs import (
     job_state_from_lease,
     list_token_import_batch_failed_items,
     list_token_import_batch_summaries,
+    list_token_import_batch_summaries_by_ids,
 )
 from .token_store import (
     DEFAULT_TOKEN_SELECTION_STRATEGY,
@@ -11999,6 +12000,24 @@ def create_app() -> FastAPI:
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
         import_batches = await list_token_import_batch_summaries(limit=limit, include_observed_cost=False)
+        return {"items": [_serialize_token_import_batch_summary(batch) for batch in import_batches]}
+
+    @app.get("/admin/tokens/import-batches/costs")
+    async def list_token_import_batch_costs_route(
+        ids: str = Query("", max_length=2048),
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        try:
+            batch_ids = _parse_admin_token_ids(ids, limit=100)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not batch_ids:
+            return {"items": []}
+
+        import_batches = await list_token_import_batch_summaries_by_ids(
+            batch_ids,
+            include_observed_cost=True,
+        )
         return {"items": [_serialize_token_import_batch_summary(batch) for batch in import_batches]}
 
     @app.get("/admin/tokens/costs")

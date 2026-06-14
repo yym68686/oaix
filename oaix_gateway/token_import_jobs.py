@@ -900,28 +900,92 @@ async def list_token_import_batch_summaries(
     include_observed_cost: bool = False,
 ) -> list[TokenImportBatchSummary]:
     resolved_limit = max(1, min(int(limit or 30), 100))
-    async with get_read_session() as session:
-        result = await session.execute(
-            select(
-                TokenImportJob.id,
-                TokenImportJob.status,
-                TokenImportJob.import_queue_position,
-                TokenImportJob.total_count,
-                TokenImportJob.processed_count,
-                TokenImportJob.created_count,
-                TokenImportJob.updated_count,
-                TokenImportJob.skipped_count,
-                TokenImportJob.failed_count,
-                TokenImportJob.created_items,
-                TokenImportJob.updated_items,
-                TokenImportJob.skipped_items,
-                TokenImportJob.submitted_at,
-                TokenImportJob.started_at,
-                TokenImportJob.finished_at,
-            )
-            .order_by(TokenImportJob.submitted_at.desc(), TokenImportJob.id.desc())
-            .limit(resolved_limit)
+    stmt = (
+        select(
+            TokenImportJob.id,
+            TokenImportJob.status,
+            TokenImportJob.import_queue_position,
+            TokenImportJob.total_count,
+            TokenImportJob.processed_count,
+            TokenImportJob.created_count,
+            TokenImportJob.updated_count,
+            TokenImportJob.skipped_count,
+            TokenImportJob.failed_count,
+            TokenImportJob.created_items,
+            TokenImportJob.updated_items,
+            TokenImportJob.skipped_items,
+            TokenImportJob.submitted_at,
+            TokenImportJob.started_at,
+            TokenImportJob.finished_at,
         )
+        .order_by(TokenImportJob.submitted_at.desc(), TokenImportJob.id.desc())
+        .limit(resolved_limit)
+    )
+    return await _list_token_import_batch_summaries_from_stmt(
+        stmt,
+        include_observed_cost=include_observed_cost,
+    )
+
+
+def _normalize_import_batch_ids(batch_ids: Iterable[int], *, limit: int = 100) -> tuple[int, ...]:
+    resolved: list[int] = []
+    seen: set[int] = set()
+    for value in batch_ids:
+        try:
+            batch_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if batch_id <= 0 or batch_id in seen:
+            continue
+        seen.add(batch_id)
+        resolved.append(batch_id)
+        if len(resolved) >= max(1, int(limit)):
+            break
+    return tuple(resolved)
+
+
+async def list_token_import_batch_summaries_by_ids(
+    batch_ids: Iterable[int],
+    *,
+    include_observed_cost: bool = False,
+) -> list[TokenImportBatchSummary]:
+    resolved_ids = _normalize_import_batch_ids(batch_ids)
+    if not resolved_ids:
+        return []
+    stmt = (
+        select(
+            TokenImportJob.id,
+            TokenImportJob.status,
+            TokenImportJob.import_queue_position,
+            TokenImportJob.total_count,
+            TokenImportJob.processed_count,
+            TokenImportJob.created_count,
+            TokenImportJob.updated_count,
+            TokenImportJob.skipped_count,
+            TokenImportJob.failed_count,
+            TokenImportJob.created_items,
+            TokenImportJob.updated_items,
+            TokenImportJob.skipped_items,
+            TokenImportJob.submitted_at,
+            TokenImportJob.started_at,
+            TokenImportJob.finished_at,
+        )
+        .where(TokenImportJob.id.in_(resolved_ids))
+        .order_by(TokenImportJob.submitted_at.desc(), TokenImportJob.id.desc())
+    )
+    return await _list_token_import_batch_summaries_from_stmt(
+        stmt,
+        include_observed_cost=include_observed_cost,
+    )
+
+
+async def _list_token_import_batch_summaries_from_stmt(
+    stmt,
+    *,
+    include_observed_cost: bool,
+) -> list[TokenImportBatchSummary]:
+    async with get_read_session() as session:
+        result = await session.execute(stmt)
         jobs = list(result.all())
         if not jobs:
             return []

@@ -545,6 +545,7 @@ async def init_db() -> None:
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_run_schema_migrations)
+    await _create_postgres_indexes_concurrently()
     await _backfill_token_refresh_aliases()
 
 
@@ -570,6 +571,32 @@ def _execute_ddl_best_effort(sync_conn, statement: str) -> None:
         # Optional performance indexes/extensions should not prevent startup on
         # managed databases with restricted DDL privileges.
         pass
+
+
+async def _create_postgres_indexes_concurrently() -> None:
+    if get_engine().dialect.name != "postgresql":
+        return
+    engine = create_async_engine(
+        normalize_database_url(),
+        isolation_level="AUTOCOMMIT",
+        pool_size=1,
+        max_overflow=0,
+        pool_pre_ping=True,
+        pool_reset_on_return="rollback",
+    )
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_gateway_request_logs_token_cost "
+                    "ON gateway_request_logs (token_id, estimated_cost_usd) "
+                    "WHERE token_id IS NOT NULL"
+                )
+            )
+    except Exception:
+        pass
+    finally:
+        await engine.dispose()
 
 
 def _run_schema_migrations(sync_conn) -> None:
@@ -733,6 +760,13 @@ def _run_schema_migrations(sync_conn) -> None:
         if "analytics_recorded_at" not in request_columns:
             sync_conn.execute(text("ALTER TABLE gateway_request_logs ADD COLUMN analytics_recorded_at TIMESTAMPTZ"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_token_id ON gateway_request_logs (token_id)"))
+        if sync_conn.dialect.name != "postgresql":
+            sync_conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_token_cost "
+                    "ON gateway_request_logs (token_id, estimated_cost_usd)"
+                )
+            )
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model ON gateway_request_logs (model)"))
         sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gateway_request_logs_model_name ON gateway_request_logs (model_name)"))
         sync_conn.execute(

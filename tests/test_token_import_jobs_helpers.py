@@ -3,7 +3,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from oaix_gateway.database import CodexToken
-from oaix_gateway.token_import_jobs import _build_token_import_batch_summary, list_token_import_batch_summaries
+from oaix_gateway.token_import_jobs import (
+    _build_token_import_batch_summary,
+    list_token_import_batch_summaries,
+    list_token_import_batch_summaries_by_ids,
+)
 
 
 def test_build_token_import_batch_summary_includes_average_observed_cost() -> None:
@@ -198,6 +202,111 @@ def test_list_token_import_batch_summaries_can_include_observed_cost(monkeypatch
     assert captured == {"token_ids": (7,)}
     assert summaries[0].observed_cost_usd == 2.5
     assert summaries[0].average_observed_cost_usd == 2.5
+
+
+def test_list_token_import_batch_summaries_by_ids_can_include_observed_cost(monkeypatch) -> None:
+    jobs = [
+        SimpleNamespace(
+            id=77,
+            status="completed",
+            import_queue_position="front",
+            total_count=1,
+            processed_count=1,
+            created_count=1,
+            updated_count=0,
+            skipped_count=0,
+            failed_count=0,
+            yielded_to_response_traffic_count=0,
+            response_traffic_timeout_count=0,
+            created_items=[{"index": 0, "id": 8}],
+            updated_items=[],
+            skipped_items=[],
+            failed_items=[],
+            submitted_at=datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc),
+            started_at=None,
+            heartbeat_at=None,
+            finished_at=None,
+            last_error=None,
+        ),
+        SimpleNamespace(
+            id=42,
+            status="completed",
+            import_queue_position="back",
+            total_count=1,
+            processed_count=1,
+            created_count=1,
+            updated_count=0,
+            skipped_count=0,
+            failed_count=0,
+            yielded_to_response_traffic_count=0,
+            response_traffic_timeout_count=0,
+            created_items=[{"index": 0, "id": 7}],
+            updated_items=[],
+            skipped_items=[],
+            failed_items=[],
+            submitted_at=datetime(2026, 6, 3, 12, 0, tzinfo=timezone.utc),
+            started_at=None,
+            heartbeat_at=None,
+            finished_at=None,
+            last_error=None,
+        ),
+    ]
+    tokens = [
+        CodexToken(id=7, refresh_token="rt-7", token_type="codex", is_active=True),
+        CodexToken(id=8, refresh_token="rt-8", token_type="codex", is_active=True),
+    ]
+    captured = {}
+
+    class _ScalarResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+        def scalars(self):
+            return _ScalarResult(self._rows)
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def execute(self, stmt):
+            text = str(stmt)
+            if "token_import_jobs" in text:
+                return _Result(jobs)
+            if "codex_tokens" in text:
+                return _Result(tokens)
+            raise AssertionError(f"unexpected query: {text}")
+
+    def fake_get_read_session():
+        return _Session()
+
+    async def fake_get_request_costs_by_token(token_ids):
+        captured["token_ids"] = tuple(token_ids)
+        return {7: 1.25, 8: 2.75}
+
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.get_read_session", fake_get_read_session)
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.get_request_costs_by_token", fake_get_request_costs_by_token)
+
+    summaries = asyncio.run(list_token_import_batch_summaries_by_ids([77, 42], include_observed_cost=True))
+
+    assert captured == {"token_ids": (7, 8)}
+    assert [summary.id for summary in summaries] == [77, 42]
+    assert summaries[0].observed_cost_usd == 2.75
+    assert summaries[0].average_observed_cost_usd == 2.75
+    assert summaries[1].observed_cost_usd == 1.25
+    assert summaries[1].average_observed_cost_usd == 1.25
 
 
 def test_list_token_import_batch_summaries_uses_lightweight_rows(monkeypatch) -> None:

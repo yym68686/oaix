@@ -206,6 +206,8 @@ def test_frontend_supports_import_batch_view() -> None:
     assert "`/admin/tokens/import-batches?${params.toString()}`" in app_js
     assert "data.import_batches_loaded && Array.isArray(data.import_batches)" in app_js
     assert "await loadTokenImportBatches({ force: true })" in app_js
+    assert "loadTokenImportBatchCosts" in app_js
+    assert "计算中" in app_js
     assert "function renderImportBatchList" in app_js
     assert "function renderImportBatchFailureSection" in app_js
     assert 'params.set("import_batch_id", String(state.selectedImportBatchId))' in app_js
@@ -786,6 +788,75 @@ def test_admin_token_import_batches_route_returns_summaries(monkeypatch) -> None
     assert body["items"][0]["id"] == 77
     assert body["items"][0]["token_ids"] == [11, 12]
     assert body["items"][0]["average_observed_cost_usd"] is None
+
+
+def test_admin_token_import_batch_costs_route_returns_summaries(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+
+    async def fake_list_token_import_batch_summaries_by_ids(batch_ids, *, include_observed_cost=False):
+        assert batch_ids == (77, 42)
+        assert include_observed_cost is True
+        submitted_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+        return [
+            TokenImportBatchSummary(
+                id=77,
+                status="completed",
+                import_queue_position="front",
+                total_count=2,
+                processed_count=2,
+                created_count=2,
+                updated_count=0,
+                skipped_count=0,
+                failed_count=0,
+                token_count=2,
+                available=2,
+                cooling=0,
+                disabled=0,
+                missing=0,
+                token_ids=(11, 12),
+                submitted_at=submitted_at,
+                started_at=submitted_at,
+                finished_at=submitted_at,
+                observed_cost_usd=4.5,
+                average_observed_cost_usd=2.25,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.list_token_import_batch_summaries_by_ids",
+        fake_list_token_import_batch_summaries_by_ids,
+    )
+
+    response = asyncio.run(_request(app, "GET", "/admin/tokens/import-batches/costs?ids=77,42"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"] == [
+        {
+            "id": 77,
+            "status": "completed",
+            "import_queue_position": "front",
+            "total_count": 2,
+            "processed_count": 2,
+            "created_count": 2,
+            "updated_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+            "token_count": 2,
+            "available": 2,
+            "cooling": 0,
+            "disabled": 0,
+            "missing": 0,
+            "token_ids": [11, 12],
+            "submitted_at": "2026-05-01T12:00:00Z",
+            "started_at": "2026-05-01T12:00:00Z",
+            "finished_at": "2026-05-01T12:00:00Z",
+            "observed_cost_usd": 4.5,
+            "average_observed_cost_usd": 2.25,
+        }
+    ]
 
 
 def test_admin_tokens_route_includes_selected_import_batch_failed_items(monkeypatch) -> None:

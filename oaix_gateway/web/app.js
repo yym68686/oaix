@@ -10,6 +10,7 @@ const TOKEN_LIST_CACHE_TTL_MS = 10000;
 const TOKEN_STATUS_PREFETCH_DELAY_MS = 600;
 const TOKEN_DETAIL_PREFETCH_DELAY_MS = 300;
 const TOKEN_COST_BATCH_SIZE = 8;
+const IMPORT_BATCH_COST_BATCH_SIZE = 4;
 const TOKEN_LIST_BASE_NOTE = `每页 ${TOKEN_PAGE_SIZE} 条记录 · 搜索、筛选、排序均作用于全池`;
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
@@ -95,6 +96,8 @@ const state = {
   tokenListRequestSeq: 0,
   tokenCostAbortController: null,
   tokenCostRequestSeq: 0,
+  tokenImportBatchCostAbortController: null,
+  tokenImportBatchCostRequestSeq: 0,
   tokenQuotaAbortController: null,
   tokenQuotaRequestSeq: 0,
   tokenQuotaRetryTimer: null,
@@ -2261,7 +2264,8 @@ function renderRequestAnalytics(analytics) {
 }
 
 function buildImportBatchCounts(batch) {
-  const averageObservedCostUsd = Number(batch?.average_observed_cost_usd);
+  const averageObservedCostUsd =
+    batch?.average_observed_cost_usd == null ? null : Number(batch.average_observed_cost_usd);
   return {
     available: Math.max(0, Number(batch?.available || 0)),
     cooling: Math.max(0, Number(batch?.cooling || 0)),
@@ -2315,7 +2319,7 @@ function renderImportBatchList() {
           const batchId = Number(batch?.id);
           const selected = state.selectedImportBatchId === batchId;
           const averageCostValue =
-            counts.averageObservedCostUsd == null ? "—" : formatUsd(counts.averageObservedCostUsd);
+            counts.averageObservedCostUsd == null ? "计算中" : formatUsd(counts.averageObservedCostUsd);
           return `
             <article class="import-batch-card${selected ? " import-batch-card--selected" : ""}" role="listitem">
               <div class="import-batch-card__main">
@@ -2831,6 +2835,14 @@ function abortTokenCostRequest() {
   }
 }
 
+function abortTokenImportBatchCostRequest() {
+  state.tokenImportBatchCostRequestSeq += 1;
+  if (state.tokenImportBatchCostAbortController) {
+    state.tokenImportBatchCostAbortController.abort();
+    state.tokenImportBatchCostAbortController = null;
+  }
+}
+
 function scheduleTokenQuotaRetry(tokenIds, { listRequestSeq = state.tokenListRequestSeq } = {}) {
   const resolvedIds = Array.from(
     new Set(
@@ -2922,6 +2934,7 @@ function clearTokenStatusPageCache() {
   state.tokenImportBatchesLoaded = false;
   state.tokenImportBatchesLoading = false;
   state.tokenImportBatchRequestSeq += 1;
+  abortTokenImportBatchCostRequest();
   if (state.tokenStatusPrefetchTimer) {
     window.clearTimeout(state.tokenStatusPrefetchTimer);
     state.tokenStatusPrefetchTimer = null;
@@ -3025,6 +3038,7 @@ function applyTokenListData(data, { requestedPage, allowPageAdjust, listRequestS
   if (data.import_batches_loaded && Array.isArray(data.import_batches)) {
     state.tokenImportBatches = data.import_batches;
     state.tokenImportBatchesLoaded = true;
+    void loadTokenImportBatchCosts(state.tokenImportBatches, { batchRequestSeq: state.tokenImportBatchRequestSeq });
   }
   state.selectedImportBatchFailedItems =
     state.selectedImportBatchId != null && Array.isArray(data.selected_import_batch?.failed_items)
@@ -3068,6 +3082,7 @@ function applyTokenListData(data, { requestedPage, allowPageAdjust, listRequestS
 async function loadTokenImportBatches({ force = false } = {}) {
   if (!force && state.tokenImportBatchesLoaded && !state.tokenImportBatchesLoading) {
     elements.listNote.textContent = "导入批次独立展示；点击批次可查看关联 key。";
+    void loadTokenImportBatchCosts(state.tokenImportBatches, { batchRequestSeq: state.tokenImportBatchRequestSeq });
     renderImportBatchList();
     return;
   }
@@ -3091,6 +3106,7 @@ async function loadTokenImportBatches({ force = false } = {}) {
     state.tokenImportBatchesLoaded = true;
     elements.listNote.textContent = "导入批次独立展示；点击批次可查看关联 key。";
     loaded = true;
+    void loadTokenImportBatchCosts(state.tokenImportBatches, { batchRequestSeq: requestSeq });
   } catch (error) {
     if (requestSeq !== state.tokenImportBatchRequestSeq) {
       return;
@@ -3172,6 +3188,76 @@ async function loadTokenCosts(tokenIds, { listRequestSeq = state.tokenListReques
   } finally {
     if (state.tokenCostAbortController === controller) {
       state.tokenCostAbortController = null;
+    }
+  }
+}
+
+async function loadTokenImportBatchCosts(batches, { batchRequestSeq = state.tokenImportBatchRequestSeq } = {}) {
+  const batchIds = Array.from(
+    new Set(
+      (Array.isArray(batches) ? batches : [])
+        .map((batch) => Number(batch?.id ?? batch))
+        .filter((id) => Number.isFinite(id) && id > 0),
+    ),
+  );
+  if (!batchIds.length || batchRequestSeq !== state.tokenImportBatchRequestSeq) {
+    return;
+  }
+
+  abortTokenImportBatchCostRequest();
+  const costRequestSeq = state.tokenImportBatchCostRequestSeq;
+  const controller = new AbortController();
+  state.tokenImportBatchCostAbortController = controller;
+
+  try {
+    for (let index = 0; index < batchIds.length; index += IMPORT_BATCH_COST_BATCH_SIZE) {
+      const chunkIds = batchIds.slice(index, index + IMPORT_BATCH_COST_BATCH_SIZE);
+      const params = new URLSearchParams({ ids: chunkIds.join(",") });
+      const data = await fetchJson(`/admin/tokens/import-batches/costs?${params.toString()}`, {
+        headers: authHeaders(),
+        signal: controller.signal,
+      });
+      if (
+        costRequestSeq !== state.tokenImportBatchCostRequestSeq ||
+        batchRequestSeq !== state.tokenImportBatchRequestSeq
+      ) {
+        return;
+      }
+
+      const costsById = new Map();
+      (Array.isArray(data.items) ? data.items : []).forEach((item) => {
+        const batchId = Number(item?.id);
+        if (Number.isFinite(batchId)) {
+          costsById.set(batchId, {
+            observed_cost_usd: item?.observed_cost_usd ?? null,
+            average_observed_cost_usd: item?.average_observed_cost_usd ?? null,
+          });
+        }
+      });
+      if (!costsById.size) {
+        continue;
+      }
+      state.tokenImportBatches = state.tokenImportBatches.map((batch) => {
+        const batchId = Number(batch?.id);
+        if (!costsById.has(batchId)) {
+          return batch;
+        }
+        return {
+          ...batch,
+          ...costsById.get(batchId),
+        };
+      });
+      if (state.tokenViewMode === "import_batches") {
+        renderImportBatchList();
+      }
+    }
+  } catch (error) {
+    if (!isAbortError(error)) {
+      console.warn("Failed to load import batch costs", error);
+    }
+  } finally {
+    if (state.tokenImportBatchCostAbortController === controller) {
+      state.tokenImportBatchCostAbortController = null;
     }
   }
 }
@@ -3303,6 +3389,7 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
     state.tokenDetailPrefetchTimer = null;
   }
   abortTokenCostRequest();
+  abortTokenImportBatchCostRequest();
   abortTokenQuotaRequest();
 
   state.tokenPage = requestedPage;
