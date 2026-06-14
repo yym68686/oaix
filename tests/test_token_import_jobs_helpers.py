@@ -87,6 +87,9 @@ def test_list_token_import_batch_summaries_skips_observed_cost_by_default(monkey
         def __init__(self, rows):
             self._rows = rows
 
+        def all(self):
+            return self._rows
+
         def scalars(self):
             return _ScalarResult(self._rows)
 
@@ -159,6 +162,9 @@ def test_list_token_import_batch_summaries_can_include_observed_cost(monkeypatch
         def __init__(self, rows):
             self._rows = rows
 
+        def all(self):
+            return self._rows
+
         def scalars(self):
             return _ScalarResult(self._rows)
 
@@ -192,3 +198,60 @@ def test_list_token_import_batch_summaries_can_include_observed_cost(monkeypatch
     assert captured == {"token_ids": (7,)}
     assert summaries[0].observed_cost_usd == 2.5
     assert summaries[0].average_observed_cost_usd == 2.5
+
+
+def test_list_token_import_batch_summaries_uses_lightweight_rows(monkeypatch) -> None:
+    job = SimpleNamespace(
+        id=42,
+        status="completed",
+        import_queue_position="front",
+        total_count=1,
+        processed_count=1,
+        created_count=1,
+        updated_count=0,
+        skipped_count=0,
+        failed_count=0,
+        created_items=[{"index": 0, "id": 7}],
+        updated_items=[],
+        skipped_items=[],
+        submitted_at=datetime(2026, 6, 3, 12, 0, tzinfo=timezone.utc),
+        started_at=None,
+        finished_at=None,
+    )
+    token = SimpleNamespace(id=7, is_active=True, cooldown_until=None)
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def execute(self, stmt):
+            text = str(stmt)
+            if "token_import_jobs" in text:
+                assert "payloads" not in text
+                assert "failed_items" not in text
+                return _Result([job])
+            if "codex_tokens" in text:
+                assert "access_token" not in text
+                assert "refresh_token" not in text
+                return _Result([token])
+            raise AssertionError(f"unexpected query: {text}")
+
+    def fake_get_read_session():
+        return _Session()
+
+    monkeypatch.setattr("oaix_gateway.token_import_jobs.get_read_session", fake_get_read_session)
+
+    summaries = asyncio.run(list_token_import_batch_summaries(limit=30))
+
+    assert summaries[0].id == 42
+    assert summaries[0].token_ids == (7,)

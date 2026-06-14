@@ -2738,6 +2738,7 @@ async def list_token_rows(
     plan_type: str | None = TOKEN_LIST_PLAN_ALL,
     sort: str | None = TOKEN_LIST_SORT_NEWEST,
     token_ids: Iterable[int] | None = None,
+    include_credentials: bool = True,
 ) -> list[CodexToken]:
     now = utcnow()
     async with get_read_session() as session:
@@ -2756,6 +2757,27 @@ async def list_token_rows(
             .limit(max(1, min(limit, 500)))
             .offset(max(0, int(offset)))
         )
+        if not include_credentials:
+            stmt = stmt.options(
+                load_only(
+                    CodexToken.id,
+                    CodexToken.email,
+                    CodexToken.account_id,
+                    CodexToken.id_token,
+                    CodexToken.raw_payload,
+                    CodexToken.plan_type,
+                    CodexToken.source_file,
+                    CodexToken.is_active,
+                    CodexToken.cooldown_until,
+                    CodexToken.disabled_at,
+                    CodexToken.last_refresh_at,
+                    CodexToken.expires_at,
+                    CodexToken.last_used_at,
+                    CodexToken.last_error,
+                    CodexToken.created_at,
+                    CodexToken.updated_at,
+                )
+            )
         result = await session.execute(stmt)
         return result.scalars().all()
 

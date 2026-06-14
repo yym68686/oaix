@@ -11898,6 +11898,7 @@ def create_app() -> FastAPI:
                 plan_type=plan_type,
                 sort=sort,
                 token_ids=batch_token_ids,
+                include_credentials=include_quota,
             ),
         )
         items = await _build_admin_token_items(
@@ -11962,6 +11963,7 @@ def create_app() -> FastAPI:
             limit=len(token_ids),
             offset=0,
             token_ids=token_ids,
+            include_credentials=False,
         )
         return {"items": await _build_admin_token_observed_cost_items(token_rows)}
 

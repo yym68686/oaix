@@ -3211,11 +3211,6 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
   const tokenStatus = normalizeTokenStatusFilter(state.tokenStatusFilter);
   const cacheEligible = isDefaultTokenStatusPageQuery(requestedPage);
   if (cacheEligible) {
-    const cacheKey = tokenStatusPageCacheKey(tokenStatus);
-    const pendingPrefetch = state.tokenStatusPrefetchPromises.get(cacheKey);
-    if (pendingPrefetch) {
-      await pendingPrefetch;
-    }
     const cachedData = getCachedTokenStatusPage(tokenStatus);
     if (cachedData) {
       applyTokenListData(cachedData, { requestedPage, allowPageAdjust, listRequestSeq });

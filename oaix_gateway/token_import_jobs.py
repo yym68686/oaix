@@ -209,6 +209,14 @@ class _TokenImportStagedItem:
     error_message: str | None = None
 
 
+@dataclass(frozen=True)
+class _TokenImportBatchToken:
+    id: int
+    is_active: bool
+    cooldown_until: datetime | None
+    account_id: str | None
+
+
 def _serialize_job_state(job: TokenImportJob) -> TokenImportJobState:
     return TokenImportJobState(
         id=job.id,
@@ -233,6 +241,33 @@ def _serialize_job_state(job: TokenImportJob) -> TokenImportJobState:
         heartbeat_at=job.heartbeat_at,
         finished_at=job.finished_at,
         last_error=job.last_error,
+    )
+
+
+def _token_import_job_state_from_summary_row(row: Any) -> TokenImportJobState:
+    return TokenImportJobState(
+        id=int(row.id),
+        status=str(row.status or IMPORT_JOB_STATUS_QUEUED),
+        import_queue_position=normalize_token_import_queue_position(
+            getattr(row, "import_queue_position", DEFAULT_TOKEN_IMPORT_QUEUE_POSITION)
+        ),
+        total_count=int(row.total_count or 0),
+        processed_count=int(row.processed_count or 0),
+        created_count=int(row.created_count or 0),
+        updated_count=int(row.updated_count or 0),
+        skipped_count=int(row.skipped_count or 0),
+        failed_count=int(row.failed_count or 0),
+        yielded_to_response_traffic_count=0,
+        response_traffic_timeout_count=0,
+        created=_as_item_list(row.created_items),
+        updated=_as_item_list(row.updated_items),
+        skipped=_as_item_list(row.skipped_items),
+        failed=[],
+        submitted_at=row.submitted_at,
+        started_at=row.started_at,
+        heartbeat_at=None,
+        finished_at=row.finished_at,
+        last_error=None,
     )
 
 
@@ -700,7 +735,7 @@ def _token_ids_from_import_items(items: list[dict[str, Any]]) -> tuple[int, ...]
     return tuple(token_ids)
 
 
-def _token_import_batch_status(token: CodexToken, *, now: datetime) -> str:
+def _token_import_batch_status(token: Any, *, now: datetime) -> str:
     if not bool(getattr(token, "is_active", False)):
         return "disabled"
     cooldown_until = getattr(token, "cooldown_until", None)
@@ -710,13 +745,13 @@ def _token_import_batch_status(token: CodexToken, *, now: datetime) -> str:
 
 
 def _build_token_import_batch_summary(
-    job: TokenImportJob,
+    job: TokenImportJob | TokenImportJobState,
     *,
-    tokens_by_id: dict[int, CodexToken],
+    tokens_by_id: dict[int, Any],
     observed_costs_by_token: dict[int, float],
     now: datetime,
 ) -> TokenImportBatchSummary:
-    state = _serialize_job_state(job)
+    state = job if isinstance(job, TokenImportJobState) else _serialize_job_state(job)
     token_ids = _token_ids_from_import_items([*state.created, *state.updated, *state.skipped])
     available = 0
     cooling = 0
@@ -867,11 +902,27 @@ async def list_token_import_batch_summaries(
     resolved_limit = max(1, min(int(limit or 30), 100))
     async with get_read_session() as session:
         result = await session.execute(
-            select(TokenImportJob)
+            select(
+                TokenImportJob.id,
+                TokenImportJob.status,
+                TokenImportJob.import_queue_position,
+                TokenImportJob.total_count,
+                TokenImportJob.processed_count,
+                TokenImportJob.created_count,
+                TokenImportJob.updated_count,
+                TokenImportJob.skipped_count,
+                TokenImportJob.failed_count,
+                TokenImportJob.created_items,
+                TokenImportJob.updated_items,
+                TokenImportJob.skipped_items,
+                TokenImportJob.submitted_at,
+                TokenImportJob.started_at,
+                TokenImportJob.finished_at,
+            )
             .order_by(TokenImportJob.submitted_at.desc(), TokenImportJob.id.desc())
             .limit(resolved_limit)
         )
-        jobs = list(result.scalars().all())
+        jobs = list(result.all())
         if not jobs:
             return []
 
@@ -886,15 +937,28 @@ async def list_token_import_batch_summaries(
                 ]
             )
         }
-        tokens_by_id: dict[int, CodexToken] = {}
+        tokens_by_id: dict[int, _TokenImportBatchToken] = {}
         if token_ids:
             token_result = await session.execute(
-                select(CodexToken).where(
+                select(
+                    CodexToken.id,
+                    CodexToken.is_active,
+                    CodexToken.cooldown_until,
+                    CodexToken.account_id,
+                ).where(
                     CodexToken.merged_into_token_id.is_(None),
                     CodexToken.id.in_(token_ids),
                 )
             )
-            tokens_by_id = {int(token.id): token for token in token_result.scalars().all()}
+            tokens_by_id = {
+                int(token.id): _TokenImportBatchToken(
+                    id=int(token.id),
+                    is_active=bool(token.is_active),
+                    cooldown_until=token.cooldown_until,
+                    account_id=getattr(token, "account_id", None),
+                )
+                for token in token_result.all()
+            }
 
     observed_costs_by_token = (
         await get_request_costs_by_token(tuple(tokens_by_id))
@@ -904,7 +968,7 @@ async def list_token_import_batch_summaries(
     now = utcnow()
     return [
         _build_token_import_batch_summary(
-            job,
+            _token_import_job_state_from_summary_row(job),
             tokens_by_id=tokens_by_id,
             observed_costs_by_token=observed_costs_by_token,
             now=now,

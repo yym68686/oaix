@@ -385,7 +385,7 @@ def test_frontend_prefetches_default_token_status_pages() -> None:
     assert "TOKEN_LIST_CACHE_TTL_MS" in app_js
     assert "tokenStatusPrefetchPromises" in app_js
     assert "getCachedTokenStatusPage(tokenStatus)" in load_tokens_function
-    assert "await pendingPrefetch" in load_tokens_function
+    assert "await pendingPrefetch" not in load_tokens_function
     assert "scheduleTokenStatusPrefetch({ listRequestSeq })" in app_js
     assert "setCachedTokenStatusPage(status, data)" in prefetch_function
     assert "clearTokenStatusPageCache()" in app_js
@@ -543,7 +543,7 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         assert kwargs == {"search": "acct", "status": "available", "plan_type": "plus", "token_ids": None}
         return 21
 
-    async def fake_list_token_rows(*, limit, offset, search, status, plan_type, sort, token_ids):
+    async def fake_list_token_rows(*, limit, offset, search, status, plan_type, sort, token_ids, include_credentials=True):
         assert limit == 10
         assert offset == 20
         assert search == "acct"
@@ -551,6 +551,7 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         assert plan_type == "plus"
         assert sort == "account"
         assert token_ids is None
+        assert include_credentials is False
         return [SimpleNamespace(id=7)]
 
     async def fake_build_admin_token_items(app, *, token_rows, include_quota, include_observed_cost=True):
@@ -651,7 +652,7 @@ def test_admin_tokens_route_includes_selected_import_batch_failed_items(monkeypa
         assert kwargs == {"search": "", "status": "available", "plan_type": "all", "token_ids": (7,)}
         return 1
 
-    async def fake_list_token_rows(*, limit, offset, search, status, plan_type, sort, token_ids):
+    async def fake_list_token_rows(*, limit, offset, search, status, plan_type, sort, token_ids, include_credentials=True):
         assert limit == 10
         assert offset == 0
         assert search == ""
@@ -659,6 +660,7 @@ def test_admin_tokens_route_includes_selected_import_batch_failed_items(monkeypa
         assert plan_type == "all"
         assert sort == "-created_at"
         assert token_ids == (7,)
+        assert include_credentials is False
         return [SimpleNamespace(id=7)]
 
     async def fake_build_admin_token_items(app, *, token_rows, include_quota, include_observed_cost=True):

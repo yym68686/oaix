@@ -314,6 +314,27 @@ def test_list_token_rows_can_sort_by_recently_disabled(monkeypatch) -> None:
     assert "codex_tokens.updated_at DESC" in sql
 
 
+def test_list_token_rows_can_skip_credential_columns(monkeypatch) -> None:
+    read_session = _FakeReadSession([])
+
+    @asynccontextmanager
+    async def fake_get_read_session():
+        yield read_session
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_read_session", fake_get_read_session)
+
+    asyncio.run(list_token_rows(include_credentials=False))
+
+    sql = read_session.statements[-1]
+    select_clause = sql.split("FROM codex_tokens", 1)[0]
+    assert "codex_tokens.id_token" in select_clause
+    assert "codex_tokens.raw_payload" in select_clause
+    assert "codex_tokens.access_token" not in select_clause
+    assert "codex_tokens.refresh_token" not in select_clause
+    assert "codex_tokens.refresh_token_aliases" not in select_clause
+    assert "codex_tokens.recovery" not in select_clause
+
+
 def test_claim_next_active_token_fill_first_is_read_only_and_uses_app_token_order(monkeypatch) -> None:
     invalidate_fill_first_token_cache()
     token = CodexToken(
