@@ -3314,6 +3314,21 @@ async function loadTokens({ page = state.tokenPage, allowPageAdjust = true } = {
       applyTokenListData(cachedData, { requestedPage, allowPageAdjust, listRequestSeq });
       return;
     }
+    const pendingPrefetch = state.tokenStatusPrefetchPromises.get(tokenStatusPageCacheKey(tokenStatus));
+    if (pendingPrefetch) {
+      try {
+        await pendingPrefetch;
+        const prefetchedData = getCachedTokenStatusPage(tokenStatus);
+        if (prefetchedData) {
+          applyTokenListData(prefetchedData, { requestedPage, allowPageAdjust, listRequestSeq });
+          return;
+        }
+      } catch (error) {
+        if (!isAbortError(error)) {
+          console.warn("Failed to reuse token status prefetch", tokenStatus, error);
+        }
+      }
+    }
   }
 
   const controller = new AbortController();

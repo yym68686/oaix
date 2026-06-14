@@ -92,6 +92,9 @@ from .token_store import (
     TOKEN_LIST_PLAN_ALL,
     TOKEN_LIST_SORT_NEWEST,
     TOKEN_LIST_STATUS_ALL,
+    TOKEN_LIST_STATUS_AVAILABLE,
+    TOKEN_LIST_STATUS_COOLING,
+    TOKEN_LIST_STATUS_DISABLED,
     TokenSelectionSettings,
     claim_next_active_token,
     count_token_rows,
@@ -120,6 +123,8 @@ from .token_store import (
     update_token_order_settings,
     update_token_plan_order_settings,
     update_token_selection_settings,
+    normalize_token_list_plan_type,
+    normalize_token_list_status,
 )
 from .usage_cost import UsageMetrics, extract_usage_metrics
 from .fugue_observability import (
@@ -11150,6 +11155,30 @@ async def _cached_admin_token_counts(app: FastAPI) -> Any:
     return counts
 
 
+def _admin_tokens_can_reuse_global_counts(
+    *,
+    search: str,
+    plan_type: str,
+    token_ids: Iterable[int] | None,
+) -> bool:
+    return (
+        not str(search or "").strip()
+        and token_ids is None
+        and normalize_token_list_plan_type(plan_type) == TOKEN_LIST_PLAN_ALL
+    )
+
+
+def _admin_token_filtered_total_from_counts(counts: Any, *, status: str) -> int:
+    normalized_status = normalize_token_list_status(status)
+    if normalized_status == TOKEN_LIST_STATUS_AVAILABLE:
+        return int(counts.available)
+    if normalized_status == TOKEN_LIST_STATUS_COOLING:
+        return int(counts.cooling)
+    if normalized_status == TOKEN_LIST_STATUS_DISABLED:
+        return int(counts.disabled)
+    return int(counts.total)
+
+
 def _admin_quota_refresh_tasks(app: FastAPI) -> dict[int, asyncio.Task[None]]:
     tasks = getattr(app.state, "admin_quota_refresh_tasks", None)
     if not isinstance(tasks, dict):
@@ -11891,11 +11920,9 @@ def create_app() -> FastAPI:
             else []
         )
 
-        counts, filtered_counts, plan_counts, filtered_total, token_rows = await asyncio.gather(
+        counts, plan_counts, token_rows = await asyncio.gather(
             _cached_admin_token_counts(http_request.app),
-            get_token_status_counts(search=q, plan_type=plan_type, token_ids=batch_token_ids),
             get_token_plan_counts(search=q, status=status, token_ids=batch_token_ids),
-            count_token_rows(search=q, status=status, plan_type=plan_type, token_ids=batch_token_ids),
             list_token_rows(
                 limit=limit,
                 offset=offset,
@@ -11907,6 +11934,18 @@ def create_app() -> FastAPI:
                 include_credentials=include_quota,
             ),
         )
+        if _admin_tokens_can_reuse_global_counts(
+            search=q,
+            plan_type=plan_type,
+            token_ids=batch_token_ids,
+        ):
+            filtered_counts = counts
+            filtered_total = _admin_token_filtered_total_from_counts(counts, status=status)
+        else:
+            filtered_counts, filtered_total = await asyncio.gather(
+                get_token_status_counts(search=q, plan_type=plan_type, token_ids=batch_token_ids),
+                count_token_rows(search=q, status=status, plan_type=plan_type, token_ids=batch_token_ids),
+            )
         items = await _build_admin_token_items(
             http_request.app,
             token_rows=token_rows,

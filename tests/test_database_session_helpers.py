@@ -156,5 +156,9 @@ def test_schema_migrations_use_physical_codex_token_type_column_for_raw_indexes(
     assert "ix_codex_tokens_pool_snapshot" in index_sql
     assert "ix_codex_tokens_lru_available" in index_sql
     assert "ix_codex_tokens_disabled_at" in index_sql
+    assert "ix_codex_tokens_newest_canonical" in index_sql
+    assert "created_at DESC" in (index_sql["ix_codex_tokens_newest_canonical"] or "")
+    assert "merged_into_token_id IS NULL" in (index_sql["ix_codex_tokens_newest_canonical"] or "")
+    assert "id DESC" in (index_sql["ix_codex_tokens_newest_canonical"] or "")
     assert "token_type" not in (index_sql["ix_codex_tokens_pool_snapshot"] or "")
     assert "token_type" not in (index_sql["ix_codex_tokens_lru_available"] or "")

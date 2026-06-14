@@ -394,7 +394,8 @@ def test_frontend_prefetches_default_token_status_pages() -> None:
     assert "TOKEN_STATUS_PREFETCH_DELAY_MS = 600" in app_js
     assert "tokenStatusPrefetchPromises" in app_js
     assert "getCachedTokenStatusPage(tokenStatus)" in load_tokens_function
-    assert "await pendingPrefetch" not in load_tokens_function
+    assert "await pendingPrefetch" in load_tokens_function
+    assert "getCachedTokenStatusPage(tokenStatus)" in load_tokens_function.split("await pendingPrefetch", 1)[1]
     assert "scheduleTokenStatusPrefetch({ listRequestSeq })" in app_js
     assert "setCachedTokenStatusPage(status, data)" in prefetch_function
     assert "for (const status of TOKEN_STATUS_FILTERS)" in schedule_function
@@ -673,6 +674,65 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
     assert body["import_batches_loaded"] is False
     assert body["import_batches"] == []
     assert summary_calls == [30]
+
+
+def test_admin_tokens_route_reuses_global_counts_for_default_filters(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+
+    async def fake_get_token_counts():
+        return TokenCounts(total=21, active=20, available=19, cooling=1, disabled=1)
+
+    async def fail_get_token_status_counts(**kwargs):
+        raise AssertionError(f"default filters should reuse global counts: {kwargs}")
+
+    async def fake_get_token_plan_counts(**kwargs):
+        assert kwargs == {"search": "", "status": "available", "token_ids": None}
+        return TokenPlanCounts(free=1, plus=18, team=0, pro=1, unknown=0)
+
+    async def fail_count_token_rows(**kwargs):
+        raise AssertionError(f"default filters should derive total from global counts: {kwargs}")
+
+    async def fake_list_token_rows(*, limit, offset, search, status, plan_type, sort, token_ids, include_credentials=True):
+        assert limit == 10
+        assert offset == 0
+        assert search == ""
+        assert status == "available"
+        assert plan_type == "all"
+        assert sort == "-created_at"
+        assert token_ids is None
+        assert include_credentials is False
+        return [SimpleNamespace(id=7)]
+
+    async def fake_build_admin_token_items(app, *, token_rows, include_quota, include_observed_cost=True):
+        del app
+        assert include_quota is False
+        assert include_observed_cost is False
+        assert [item.id for item in token_rows] == [7]
+        return [{"id": 7, "email": "a@example.com"}]
+
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_counts", fake_get_token_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_status_counts", fail_get_token_status_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.get_token_plan_counts", fake_get_token_plan_counts)
+    monkeypatch.setattr("oaix_gateway.api_server.count_token_rows", fail_count_token_rows)
+    monkeypatch.setattr("oaix_gateway.api_server.list_token_rows", fake_list_token_rows)
+    monkeypatch.setattr("oaix_gateway.api_server._build_admin_token_items", fake_build_admin_token_items)
+
+    response = asyncio.run(_request(app, "GET", "/admin/tokens?limit=10&offset=0&status=available"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filtered_counts"] == {
+        "total": 21,
+        "active": 20,
+        "available": 19,
+        "cooling": 1,
+        "disabled": 1,
+    }
+    assert body["pagination"]["total"] == 19
+    assert body["pagination"]["total_pages"] == 2
+    assert body["items"] == [{"id": 7, "email": "a@example.com"}]
 
 
 def test_admin_token_import_batches_route_returns_summaries(monkeypatch) -> None:

@@ -624,6 +624,13 @@ def _run_schema_migrations(sync_conn) -> None:
                 "WHERE merged_into_token_id IS NULL"
             )
         )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_codex_tokens_newest_canonical "
+                "ON codex_tokens (created_at DESC, id DESC) "
+                "WHERE merged_into_token_id IS NULL"
+            )
+        )
         if sync_conn.dialect.name == "postgresql":
             _execute_ddl_best_effort(sync_conn, "CREATE EXTENSION IF NOT EXISTS pg_trgm")
             _execute_ddl_best_effort(
