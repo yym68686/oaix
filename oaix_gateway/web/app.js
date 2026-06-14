@@ -3240,7 +3240,7 @@ async function loadTokenImportBatchCosts(batches, { batchRequestSeq = state.toke
         }
       });
       if (!costsById.size) {
-        continue;
+        return;
       }
       state.tokenImportBatches = state.tokenImportBatches.map((batch) => {
         const batchId = Number(batch?.id);
