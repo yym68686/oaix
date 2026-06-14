@@ -391,6 +391,7 @@ def test_frontend_prefetches_default_token_status_pages() -> None:
     detail_prefetch_function = app_js.split("function scheduleTokenDetailPrefetch", 1)[1].split("function applyTokenListData", 1)[0]
 
     assert "TOKEN_LIST_CACHE_TTL_MS" in app_js
+    assert "TOKEN_STATUS_PREFETCH_DELAY_MS = 600" in app_js
     assert "tokenStatusPrefetchPromises" in app_js
     assert "getCachedTokenStatusPage(tokenStatus)" in load_tokens_function
     assert "await pendingPrefetch" not in load_tokens_function
