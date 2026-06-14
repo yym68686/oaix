@@ -219,6 +219,11 @@ def test_frontend_supports_import_batch_view() -> None:
     assert "data-import-batch-view" in app_js
     assert "average_observed_cost_usd" in app_js
     assert "平均金额" in app_js
+    view_batch_function = app_js.split("async function viewImportBatch", 1)[1].split("async function saveTokenSelection", 1)[0]
+    assert 'const IMPORT_BATCH_TOKEN_STATUS_FILTER = "all";' in app_js
+    assert "state.tokenStatusFilter = IMPORT_BATCH_TOKEN_STATUS_FILTER" in view_batch_function
+    assert "state.tokenPlanFilter = AVAILABLE_PLAN_FILTER_ALL" in view_batch_function
+    assert "state.tokenSearchTerm = \"\"" in view_batch_function
 
 
 def test_frontend_import_panel_supports_queue_position_switch() -> None:

@@ -21,6 +21,7 @@ const DEFAULT_PLAN_ORDER = [...PLAN_TYPE_OPTIONS];
 const TOKEN_STATUS_FILTERS = new Set(["all", "available", "cooling", "disabled"]);
 const TOKEN_VIEW_MODES = new Set(["keys", "import_batches"]);
 const DEFAULT_TOKEN_STATUS_FILTER = "available";
+const IMPORT_BATCH_TOKEN_STATUS_FILTER = "all";
 const AVAILABLE_PLAN_FILTER_ALL = "all";
 const TOKEN_PLAN_FILTER_UNKNOWN = "unknown";
 const TOKEN_SORT_OPTIONS = new Set([
@@ -3609,8 +3610,9 @@ async function viewImportBatch(batchId) {
   state.selectedImportBatchId = resolvedBatchId;
   state.selectedImportBatchFailedItems = [];
   state.tokenViewMode = "keys";
-  state.tokenStatusFilter = DEFAULT_TOKEN_STATUS_FILTER;
+  state.tokenStatusFilter = IMPORT_BATCH_TOKEN_STATUS_FILTER;
   state.tokenPlanFilter = AVAILABLE_PLAN_FILTER_ALL;
+  state.tokenSort = defaultTokenSortForStatus(state.tokenStatusFilter);
   state.tokenSearchTerm = "";
   if (elements.tokenSearchInput) {
     elements.tokenSearchInput.value = "";
