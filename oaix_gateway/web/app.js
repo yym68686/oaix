@@ -101,6 +101,9 @@ const state = {
   tokenStatusPrefetching: new Set(),
   tokenStatusPrefetchPromises: new Map(),
   tokenStatusPrefetchTimer: null,
+  tokenImportBatchesLoaded: false,
+  tokenImportBatchesLoading: false,
+  tokenImportBatchRequestSeq: 0,
   tokenPagination: {
     total: 0,
     limit: TOKEN_PAGE_SIZE,
@@ -2286,6 +2289,11 @@ function formatImportBatchStatus(batch) {
 }
 
 function renderImportBatchList() {
+  if (state.tokenImportBatchesLoading) {
+    elements.tokenList.innerHTML = renderLoadingState("正在加载导入批次…");
+    return;
+  }
+
   const batches = Array.isArray(state.tokenImportBatches) ? [...state.tokenImportBatches].sort(compareImportBatches) : [];
   if (!batches.length) {
     elements.tokenList.innerHTML = `
@@ -2904,6 +2912,9 @@ function clearTokenStatusPageCache() {
   state.tokenStatusPageCache.clear();
   state.tokenStatusPrefetching.clear();
   state.tokenStatusPrefetchPromises.clear();
+  state.tokenImportBatchesLoaded = false;
+  state.tokenImportBatchesLoading = false;
+  state.tokenImportBatchRequestSeq += 1;
   if (state.tokenStatusPrefetchTimer) {
     window.clearTimeout(state.tokenStatusPrefetchTimer);
     state.tokenStatusPrefetchTimer = null;
@@ -2985,7 +2996,10 @@ function applyTokenListData(data, { requestedPage, allowPageAdjust, listRequestS
   }
   state.tokensLoaded = true;
   state.tokenItems = Array.isArray(data.items) ? data.items.map(markTokenQuotaPending) : [];
-  state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : [];
+  if (data.import_batches_loaded && Array.isArray(data.import_batches)) {
+    state.tokenImportBatches = data.import_batches;
+    state.tokenImportBatchesLoaded = true;
+  }
   state.selectedImportBatchFailedItems =
     state.selectedImportBatchId != null && Array.isArray(data.selected_import_batch?.failed_items)
       ? data.selected_import_batch.failed_items
@@ -3024,6 +3038,55 @@ function applyTokenListData(data, { requestedPage, allowPageAdjust, listRequestS
   void loadTokenQuotas(quotaTokenIds, { listRequestSeq });
   scheduleTokenStatusPrefetch({ listRequestSeq });
   return true;
+}
+
+async function loadTokenImportBatches({ force = false } = {}) {
+  if (!force && state.tokenImportBatchesLoaded && !state.tokenImportBatchesLoading) {
+    elements.listNote.textContent = "导入批次独立展示；点击批次可查看关联 key。";
+    renderImportBatchList();
+    return;
+  }
+
+  state.tokenImportBatchRequestSeq += 1;
+  const requestSeq = state.tokenImportBatchRequestSeq;
+  state.tokenImportBatchesLoading = true;
+  elements.listNote.textContent = "正在加载导入批次…";
+  renderImportBatchList();
+
+  let loaded = false;
+  try {
+    const params = new URLSearchParams({ limit: "30" });
+    const data = await fetchJson(`/admin/tokens/import-batches?${params.toString()}`, {
+      headers: authHeaders(),
+    });
+    if (requestSeq !== state.tokenImportBatchRequestSeq) {
+      return;
+    }
+    state.tokenImportBatches = Array.isArray(data.items) ? data.items : [];
+    state.tokenImportBatchesLoaded = true;
+    elements.listNote.textContent = "导入批次独立展示；点击批次可查看关联 key。";
+    loaded = true;
+  } catch (error) {
+    if (requestSeq !== state.tokenImportBatchRequestSeq) {
+      return;
+    }
+    state.tokenImportBatchesLoaded = false;
+    elements.listNote.textContent =
+      error.status === 401 ? "需要输入 Service API Key 才能查看导入批次" : `导入批次加载失败：${error.message}`;
+    elements.tokenList.innerHTML = `
+      <article class="empty-state">
+        <p>${escapeHtml(error.status === 401 ? "管理接口已加锁。填入 Service API Key 后可查看导入批次。" : error.message)}</p>
+      </article>
+    `;
+  } finally {
+    if (requestSeq === state.tokenImportBatchRequestSeq) {
+      state.tokenImportBatchesLoading = false;
+    }
+  }
+
+  if (loaded && state.tokenViewMode === "import_batches") {
+    renderImportBatchList();
+  }
 }
 
 async function loadTokenCosts(tokenIds, { listRequestSeq = state.tokenListRequestSeq } = {}) {
@@ -3361,6 +3424,10 @@ async function setTokenViewMode(mode) {
       await loadTokens({ page: 1 });
       return;
     }
+    if (nextMode === "import_batches") {
+      await loadTokenImportBatches();
+      return;
+    }
     renderTokenViewMode(nextMode);
     return;
   }
@@ -3370,8 +3437,7 @@ async function setTokenViewMode(mode) {
   state.tokenPage = 1;
   renderTokenViewMode(nextMode);
   if (nextMode === "import_batches") {
-    renderImportBatchList();
-    elements.listNote.textContent = "导入批次独立展示；点击批次可查看关联 key。";
+    await loadTokenImportBatches({ force: true });
     return;
   }
   await loadTokens({ page: 1 });
@@ -3976,7 +4042,7 @@ async function refreshDashboard({ includeTokens = true, includeRequests = true }
   try {
     const tasks = [loadHealth()];
     if (includeTokens) {
-      tasks.push(loadTokens());
+      tasks.push(state.tokenViewMode === "import_batches" ? loadTokenImportBatches({ force: true }) : loadTokens());
     }
     if (includeRequests) {
       tasks.push(loadRequests());

@@ -45,6 +45,7 @@ def test_frontend_routes_are_registered() -> None:
     assert "/healthz" in paths
     assert "/admin/tokens" in paths
     assert "/admin/tokens/quota" in paths
+    assert "/admin/tokens/import-batches" in paths
     assert "/admin/token-selection" in paths
     assert "/admin/token-selection/order" in paths
     assert "/admin/token-selection/plan-order" in paths
@@ -200,7 +201,11 @@ def test_frontend_supports_import_batch_view() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
 
     assert 'data-token-view-mode="import_batches"' in index_html
-    assert "state.tokenImportBatches = Array.isArray(data.import_batches) ? data.import_batches : []" in app_js
+    assert "tokenImportBatchesLoaded: false" in app_js
+    assert "async function loadTokenImportBatches" in app_js
+    assert "`/admin/tokens/import-batches?${params.toString()}`" in app_js
+    assert "data.import_batches_loaded && Array.isArray(data.import_batches)" in app_js
+    assert "await loadTokenImportBatches({ force: true })" in app_js
     assert "function renderImportBatchList" in app_js
     assert "function renderImportBatchFailureSection" in app_js
     assert 'params.set("import_batch_id", String(state.selectedImportBatchId))' in app_js
@@ -266,7 +271,7 @@ def test_frontend_dashboard_refresh_loads_admin_panels_in_parallel() -> None:
     assert "state.refreshing = true" in refresh_function
     assert "const tasks = [loadHealth()]" in refresh_function
     assert "if (includeTokens)" in refresh_function
-    assert "tasks.push(loadTokens())" in refresh_function
+    assert 'state.tokenViewMode === "import_batches" ? loadTokenImportBatches({ force: true }) : loadTokens()' in refresh_function
     assert "if (includeRequests)" in refresh_function
     assert "tasks.push(loadRequests())" in refresh_function
     assert "await Promise.all(tasks)" in refresh_function
@@ -565,9 +570,12 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         assert [item.id for item in token_rows] == [7]
         return [{"id": 7, "email": "a@example.com"}]
 
+    summary_calls: list[int] = []
+
     async def fake_list_token_import_batch_summaries(*, limit, include_observed_cost=False):
         assert limit == 30
         assert include_observed_cost is False
+        summary_calls.append(limit)
         submitted_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
         return [
             TokenImportBatchSummary(
@@ -603,7 +611,13 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         fake_list_token_import_batch_summaries,
     )
 
-    response = asyncio.run(_request(app, "GET", "/admin/tokens?limit=10&offset=20&q=acct&status=available&plan_type=plus&sort=account"))
+    response = asyncio.run(
+        _request(
+            app,
+            "GET",
+            "/admin/tokens?limit=10&offset=20&include_import_batches=1&q=acct&status=available&plan_type=plus&sort=account",
+        )
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -625,6 +639,7 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
     assert body["import_batches"][0]["token_ids"] == [7, 8, 9]
     assert body["import_batches"][0]["observed_cost_usd"] == 0.0
     assert body["import_batches"][0]["average_observed_cost_usd"] is None
+    assert body["import_batches_loaded"] is True
     assert body["filtered_counts"]["available"] == 19
     assert body["plan_counts"]["plus"] == 20
     assert body["query"] == {
@@ -634,6 +649,67 @@ def test_admin_tokens_route_includes_import_batch_summaries(monkeypatch) -> None
         "sort": "account",
         "import_batch_id": None,
     }
+    assert summary_calls == [30]
+
+    response = asyncio.run(
+        _request(
+            app,
+            "GET",
+            "/admin/tokens?limit=10&offset=20&q=acct&status=available&plan_type=plus&sort=account",
+        )
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["import_batches_loaded"] is False
+    assert body["import_batches"] == []
+    assert summary_calls == [30]
+
+
+def test_admin_token_import_batches_route_returns_summaries(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+
+    async def fake_list_token_import_batch_summaries(*, limit, include_observed_cost=False):
+        assert limit == 5
+        assert include_observed_cost is False
+        submitted_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+        return [
+            TokenImportBatchSummary(
+                id=77,
+                status="completed",
+                import_queue_position="back",
+                total_count=2,
+                processed_count=2,
+                created_count=2,
+                updated_count=0,
+                skipped_count=0,
+                failed_count=0,
+                token_count=2,
+                available=2,
+                cooling=0,
+                disabled=0,
+                missing=0,
+                token_ids=(11, 12),
+                submitted_at=submitted_at,
+                started_at=submitted_at,
+                finished_at=submitted_at,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "oaix_gateway.api_server.list_token_import_batch_summaries",
+        fake_list_token_import_batch_summaries,
+    )
+
+    response = asyncio.run(_request(app, "GET", "/admin/tokens/import-batches?limit=5"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"][0]["id"] == 77
+    assert body["items"][0]["token_ids"] == [11, 12]
+    assert body["items"][0]["average_observed_cost_usd"] is None
 
 
 def test_admin_tokens_route_includes_selected_import_batch_failed_items(monkeypatch) -> None:

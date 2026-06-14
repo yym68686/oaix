@@ -11863,6 +11863,7 @@ def create_app() -> FastAPI:
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
         include_quota: bool = Query(False),
+        include_import_batches: bool = Query(False),
         q: str = Query("", max_length=512),
         status: str = Query(TOKEN_LIST_STATUS_ALL, max_length=32),
         plan_type: str = Query(TOKEN_LIST_PLAN_ALL, max_length=32),
@@ -11870,7 +11871,12 @@ def create_app() -> FastAPI:
         import_batch_id: int | None = Query(None, ge=1),
         _: None = Depends(verify_service_api_key),
     ) -> dict[str, Any]:
-        import_batches = await list_token_import_batch_summaries(limit=30, include_observed_cost=False)
+        should_load_import_batches = bool(include_import_batches or import_batch_id is not None)
+        import_batches = (
+            await list_token_import_batch_summaries(limit=30, include_observed_cost=False)
+            if should_load_import_batches
+            else []
+        )
         batch_token_ids: tuple[int, ...] | None = None
         selected_import_batch: TokenImportBatchSummary | None = None
         if import_batch_id is not None:
@@ -11925,6 +11931,7 @@ def create_app() -> FastAPI:
                 _current_token_selection_settings(http_request.app),
                 include_token_order=False,
             ),
+            "import_batches_loaded": should_load_import_batches,
             "import_batches": [_serialize_token_import_batch_summary(batch) for batch in import_batches],
             "selected_import_batch": selected_import_batch_payload,
             "query": {
@@ -11946,6 +11953,14 @@ def create_app() -> FastAPI:
             },
             "items": items,
         }
+
+    @app.get("/admin/tokens/import-batches")
+    async def list_token_import_batches_route(
+        limit: int = Query(30, ge=1, le=100),
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        import_batches = await list_token_import_batch_summaries(limit=limit, include_observed_cost=False)
+        return {"items": [_serialize_token_import_batch_summary(batch) for batch in import_batches]}
 
     @app.get("/admin/tokens/costs")
     async def list_token_costs_route(
