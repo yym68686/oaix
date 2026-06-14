@@ -2320,7 +2320,11 @@ function renderImportBatchList() {
           const batchId = Number(batch?.id);
           const selected = state.selectedImportBatchId === batchId;
           const averageCostValue =
-            counts.averageObservedCostUsd == null ? "计算中" : formatUsd(counts.averageObservedCostUsd);
+            counts.tokenCount <= 0
+              ? "—"
+              : counts.averageObservedCostUsd == null
+                ? "计算中"
+                : formatUsd(counts.averageObservedCostUsd);
           return `
             <article class="import-batch-card${selected ? " import-batch-card--selected" : ""}" role="listitem">
               <div class="import-batch-card__main">

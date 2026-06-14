@@ -209,6 +209,7 @@ def test_frontend_supports_import_batch_view() -> None:
     assert "loadTokenImportBatchCosts" in app_js
     assert "const IMPORT_BATCH_COST_BATCH_SIZE = 30;" in app_js
     assert "计算中" in app_js
+    assert 'counts.tokenCount <= 0' in app_js
     assert "function renderImportBatchList" in app_js
     assert "function renderImportBatchFailureSection" in app_js
     assert 'params.set("import_batch_id", String(state.selectedImportBatchId))' in app_js
