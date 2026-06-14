@@ -2961,14 +2961,21 @@ function scheduleTokenStatusPrefetch({ listRequestSeq = state.tokenListRequestSe
   }
   state.tokenStatusPrefetchTimer = window.setTimeout(() => {
     state.tokenStatusPrefetchTimer = null;
-    if (listRequestSeq !== state.tokenListRequestSeq || !isDefaultTokenStatusPageQuery(1)) {
-      return;
-    }
-    TOKEN_STATUS_FILTERS.forEach((status) => {
-      if (status !== state.tokenStatusFilter) {
-        void prefetchTokenStatusPage(status);
+    void (async () => {
+      if (listRequestSeq !== state.tokenListRequestSeq || !isDefaultTokenStatusPageQuery(1)) {
+        return;
       }
-    });
+      // Keep background reads one-at-a-time so the admin DB pool is never saturated by prefetch.
+      for (const status of TOKEN_STATUS_FILTERS) {
+        if (status === state.tokenStatusFilter) {
+          continue;
+        }
+        await prefetchTokenStatusPage(status);
+        if (listRequestSeq !== state.tokenListRequestSeq || !isDefaultTokenStatusPageQuery(1)) {
+          return;
+        }
+      }
+    })();
   }, TOKEN_STATUS_PREFETCH_DELAY_MS);
 }
 

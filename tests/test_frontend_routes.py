@@ -381,6 +381,7 @@ def test_frontend_prefetches_default_token_status_pages() -> None:
     app_js = (WEB_DIR / "app.js").read_text()
     load_tokens_function = app_js.split("async function loadTokens", 1)[1].split("async function goToTokenPage", 1)[0]
     prefetch_function = app_js.split("async function prefetchTokenStatusPage", 1)[1].split("function scheduleTokenStatusPrefetch", 1)[0]
+    schedule_function = app_js.split("function scheduleTokenStatusPrefetch", 1)[1].split("function applyTokenListData", 1)[0]
 
     assert "TOKEN_LIST_CACHE_TTL_MS" in app_js
     assert "tokenStatusPrefetchPromises" in app_js
@@ -388,6 +389,9 @@ def test_frontend_prefetches_default_token_status_pages() -> None:
     assert "await pendingPrefetch" not in load_tokens_function
     assert "scheduleTokenStatusPrefetch({ listRequestSeq })" in app_js
     assert "setCachedTokenStatusPage(status, data)" in prefetch_function
+    assert "for (const status of TOKEN_STATUS_FILTERS)" in schedule_function
+    assert "await prefetchTokenStatusPage(status)" in schedule_function
+    assert "TOKEN_STATUS_FILTERS.forEach" not in schedule_function
     assert "clearTokenStatusPageCache()" in app_js
 
 
