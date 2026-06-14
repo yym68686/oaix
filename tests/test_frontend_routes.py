@@ -207,6 +207,7 @@ def test_frontend_supports_import_batch_view() -> None:
     assert "data.import_batches_loaded && Array.isArray(data.import_batches)" in app_js
     assert "await loadTokenImportBatches({ force: true })" in app_js
     assert "loadTokenImportBatchCosts" in app_js
+    assert "const IMPORT_BATCH_COST_BATCH_SIZE = 30;" in app_js
     assert "计算中" in app_js
     assert "function renderImportBatchList" in app_js
     assert "function renderImportBatchFailureSection" in app_js

@@ -63,6 +63,7 @@ from .prompt_cache import (
 )
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
 from .request_store import (
+    backfill_request_token_costs_from_logs,
     create_request_log,
     delete_request_logs_older_than,
     finalize_request_log,
@@ -11567,6 +11568,17 @@ async def _build_admin_token_quota_items(
 async def lifespan(app: FastAPI):
     _configure_runtime_logging()
     await init_db()
+    async def _backfill_request_token_costs_task() -> None:
+        try:
+            await backfill_request_token_costs_from_logs()
+            logger.info("Backfilled request token costs")
+        except Exception:
+            logger.exception("Failed to backfill request token costs")
+
+    app.state.request_token_cost_backfill_task = asyncio.create_task(
+        _backfill_request_token_costs_task(),
+        name="oaix-request-token-cost-backfill",
+    )
     repair_summary = await repair_duplicate_token_histories()
     if repair_summary.merged_row_count:
         logger.info(
@@ -11658,6 +11670,10 @@ async def lifespan(app: FastAPI):
         if isinstance(admin_requests_cache_task, asyncio.Task):
             admin_requests_cache_task.cancel()
             await asyncio.gather(admin_requests_cache_task, return_exceptions=True)
+        request_token_cost_backfill_task = getattr(app.state, "request_token_cost_backfill_task", None)
+        if isinstance(request_token_cost_backfill_task, asyncio.Task):
+            request_token_cost_backfill_task.cancel()
+            await asyncio.gather(request_token_cost_backfill_task, return_exceptions=True)
         upstream_pool_task = getattr(app.state, "upstream_http_pool_maintenance_task", None)
         if isinstance(upstream_pool_task, asyncio.Task):
             upstream_pool_task.cancel()

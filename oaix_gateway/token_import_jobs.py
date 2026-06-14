@@ -1029,6 +1029,11 @@ async def _list_token_import_batch_summaries_from_stmt(
         if include_observed_cost and tokens_by_id
         else {}
     )
+    if include_observed_cost and tokens_by_id:
+        observed_costs_by_token = {
+            token_id: float(observed_costs_by_token.get(token_id, 0.0) or 0.0)
+            for token_id in tokens_by_id
+        }
     now = utcnow()
     return [
         _build_token_import_batch_summary(

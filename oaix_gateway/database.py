@@ -189,6 +189,15 @@ class GatewayRequestHourlyStat(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class GatewayRequestTokenCost(Base):
+    __tablename__ = "gateway_request_token_costs"
+
+    token_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class GatewaySetting(Base):
     __tablename__ = "gateway_settings"
 
@@ -886,6 +895,9 @@ def _run_schema_migrations(sync_conn) -> None:
             "ON gateway_request_hourly_stats (model_name)"
         )
     )
+
+    if "gateway_request_token_costs" not in table_names:
+        GatewayRequestTokenCost.__table__.create(sync_conn, checkfirst=True)
 
     if "token_import_jobs" in table_names:
         job_columns = {column["name"] for column in inspector.get_columns("token_import_jobs")}

@@ -10,7 +10,8 @@ const TOKEN_LIST_CACHE_TTL_MS = 10000;
 const TOKEN_STATUS_PREFETCH_DELAY_MS = 600;
 const TOKEN_DETAIL_PREFETCH_DELAY_MS = 300;
 const TOKEN_COST_BATCH_SIZE = 8;
-const IMPORT_BATCH_COST_BATCH_SIZE = 4;
+const IMPORT_BATCH_COST_BATCH_SIZE = 30;
+const IMPORT_BATCH_COST_CONCURRENCY = 2;
 const TOKEN_LIST_BASE_NOTE = `每页 ${TOKEN_PAGE_SIZE} 条记录 · 搜索、筛选、排序均作用于全池`;
 const THEME_OPTIONS = new Set(["auto", "light", "dark"]);
 const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"];
@@ -3210,8 +3211,12 @@ async function loadTokenImportBatchCosts(batches, { batchRequestSeq = state.toke
   state.tokenImportBatchCostAbortController = controller;
 
   try {
+    const chunks = [];
     for (let index = 0; index < batchIds.length; index += IMPORT_BATCH_COST_BATCH_SIZE) {
-      const chunkIds = batchIds.slice(index, index + IMPORT_BATCH_COST_BATCH_SIZE);
+      chunks.push(batchIds.slice(index, index + IMPORT_BATCH_COST_BATCH_SIZE));
+    }
+    let nextChunkIndex = 0;
+    const loadChunk = async (chunkIds) => {
       const params = new URLSearchParams({ ids: chunkIds.join(",") });
       const data = await fetchJson(`/admin/tokens/import-batches/costs?${params.toString()}`, {
         headers: authHeaders(),
@@ -3250,7 +3255,22 @@ async function loadTokenImportBatchCosts(batches, { batchRequestSeq = state.toke
       if (state.tokenViewMode === "import_batches") {
         renderImportBatchList();
       }
-    }
+    };
+    const workers = Array.from(
+      { length: Math.min(IMPORT_BATCH_COST_CONCURRENCY, chunks.length) },
+      async () => {
+        while (
+          nextChunkIndex < chunks.length &&
+          costRequestSeq === state.tokenImportBatchCostRequestSeq &&
+          batchRequestSeq === state.tokenImportBatchRequestSeq
+        ) {
+          const chunk = chunks[nextChunkIndex];
+          nextChunkIndex += 1;
+          await loadChunk(chunk);
+        }
+      },
+    );
+    await Promise.all(workers);
   } catch (error) {
     if (!isAbortError(error)) {
       console.warn("Failed to load import batch costs", error);

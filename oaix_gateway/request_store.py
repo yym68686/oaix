@@ -6,7 +6,18 @@ from typing import Any
 from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from .database import CodexToken, GatewayRequestHourlyStat, GatewayRequestLog, get_read_session, get_request_log_session, utcnow
+from .database import (
+    CodexToken,
+    GatewayRequestHourlyStat,
+    GatewayRequestLog,
+    GatewaySetting,
+    GatewayRequestTokenCost,
+    get_read_session,
+    get_request_log_session,
+    utcnow,
+)
+
+REQUEST_TOKEN_COST_BACKFILL_SETTING_KEY = "request_token_costs_backfilled_at"
 
 
 @dataclass(frozen=True)
@@ -160,16 +171,12 @@ def _build_request_account_costs_stmt(*, account_ids: list[str]):
 
 
 def _build_request_token_costs_stmt(*, token_ids: list[int]):
-    canonical_token_id = func.coalesce(CodexToken.merged_into_token_id, CodexToken.id)
     return (
         select(
-            canonical_token_id,
-            func.sum(GatewayRequestLog.estimated_cost_usd),
+            GatewayRequestTokenCost.token_id,
+            GatewayRequestTokenCost.estimated_cost_usd,
         )
-        .select_from(GatewayRequestLog)
-        .join(CodexToken, GatewayRequestLog.token_id == CodexToken.id)
-        .where(canonical_token_id.in_(token_ids))
-        .group_by(canonical_token_id)
+        .where(GatewayRequestTokenCost.token_id.in_(token_ids))
     )
 
 
@@ -193,6 +200,60 @@ def _float_or_zero(value) -> float:
 
 def _round_cost(value: float) -> float:
     return round(max(0.0, float(value)), 6)
+
+
+def _request_token_cost_deltas(rows: list[Any]) -> list[dict[str, Any]]:
+    grouped: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        token_id = getattr(row, "token_id", None)
+        estimated_cost_usd = getattr(row, "estimated_cost_usd", None)
+        try:
+            resolved_token_id = int(token_id)
+        except (TypeError, ValueError):
+            continue
+        if resolved_token_id <= 0 or estimated_cost_usd is None:
+            continue
+        item = grouped.setdefault(
+            resolved_token_id,
+            {
+                "token_id": resolved_token_id,
+                "request_count": 0,
+                "estimated_cost_usd": 0.0,
+                "updated_at": utcnow(),
+            },
+        )
+        item["request_count"] += 1
+        item["estimated_cost_usd"] += _float_or_zero(estimated_cost_usd)
+    return list(grouped.values())
+
+
+async def _upsert_request_token_costs(session, deltas: list[dict[str, Any]]) -> None:
+    if not deltas:
+        return
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name != "postgresql":
+        for delta in deltas:
+            item = await session.get(GatewayRequestTokenCost, int(delta["token_id"]))
+            if item is None:
+                session.add(GatewayRequestTokenCost(**delta))
+                continue
+            item.request_count = _int_or_zero(item.request_count) + _int_or_zero(delta["request_count"])
+            item.estimated_cost_usd = _float_or_zero(item.estimated_cost_usd) + _float_or_zero(delta["estimated_cost_usd"])
+            item.updated_at = delta["updated_at"]
+        return
+
+    insert_stmt = pg_insert(GatewayRequestTokenCost).values(deltas)
+    excluded = insert_stmt.excluded
+    await session.execute(
+        insert_stmt.on_conflict_do_update(
+            index_elements=[GatewayRequestTokenCost.token_id],
+            set_={
+                "request_count": GatewayRequestTokenCost.request_count + excluded.request_count,
+                "estimated_cost_usd": GatewayRequestTokenCost.estimated_cost_usd + excluded.estimated_cost_usd,
+                "updated_at": excluded.updated_at,
+            },
+        )
+    )
 
 
 def _floor_bucket_start(value: datetime, *, bucket_minutes: int) -> datetime:
@@ -753,6 +814,108 @@ async def _upsert_request_hourly_stats(session, deltas: list[dict[str, Any]]) ->
     )
 
 
+async def _request_token_costs_backfilled(session) -> bool:
+    row = await session.get(GatewaySetting, REQUEST_TOKEN_COST_BACKFILL_SETTING_KEY)
+    value = getattr(row, "value", None)
+    return isinstance(value, dict) and bool(value.get("completed"))
+
+
+async def _mark_request_token_costs_backfilled(session) -> None:
+    now = utcnow()
+    value = {"completed": True, "completed_at": now.isoformat()}
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        insert_stmt = pg_insert(GatewaySetting).values(
+            key=REQUEST_TOKEN_COST_BACKFILL_SETTING_KEY,
+            value=value,
+            updated_at=now,
+        )
+        await session.execute(
+            insert_stmt.on_conflict_do_update(
+                index_elements=[GatewaySetting.key],
+                set_={"value": value, "updated_at": now},
+            )
+        )
+        return
+
+    setting = await session.get(GatewaySetting, REQUEST_TOKEN_COST_BACKFILL_SETTING_KEY)
+    if setting is None:
+        session.add(
+            GatewaySetting(
+                key=REQUEST_TOKEN_COST_BACKFILL_SETTING_KEY,
+                value=value,
+                updated_at=now,
+            )
+        )
+        return
+    setting.value = value
+    setting.updated_at = now
+
+
+async def backfill_request_token_costs_from_logs() -> None:
+    async with get_request_log_session() as session:
+        async with session.begin():
+            if await _request_token_costs_backfilled(session):
+                return
+            bind = session.get_bind()
+            if bind is not None and bind.dialect.name == "postgresql":
+                await session.execute(text("LOCK TABLE gateway_request_token_costs IN EXCLUSIVE MODE"))
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO gateway_request_token_costs (
+                            token_id,
+                            request_count,
+                            estimated_cost_usd,
+                            updated_at
+                        )
+                        SELECT
+                            token_id,
+                            count(*) AS request_count,
+                            coalesce(sum(estimated_cost_usd), 0) AS estimated_cost_usd,
+                            now() AS updated_at
+                        FROM gateway_request_logs
+                        WHERE token_id IS NOT NULL
+                          AND estimated_cost_usd IS NOT NULL
+                        GROUP BY token_id
+                        ON CONFLICT (token_id) DO UPDATE SET
+                            request_count = EXCLUDED.request_count,
+                            estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+                            updated_at = EXCLUDED.updated_at
+                        """
+                    )
+                )
+                await _mark_request_token_costs_backfilled(session)
+                return
+
+            rows = (
+                await session.execute(
+                    select(
+                        GatewayRequestLog.token_id,
+                        func.count(),
+                        func.coalesce(func.sum(GatewayRequestLog.estimated_cost_usd), 0),
+                    )
+                    .where(GatewayRequestLog.token_id.is_not(None))
+                    .where(GatewayRequestLog.estimated_cost_usd.is_not(None))
+                    .group_by(GatewayRequestLog.token_id)
+                )
+            ).all()
+            await _upsert_request_token_costs(
+                session,
+                [
+                    {
+                        "token_id": int(token_id),
+                        "request_count": _int_or_zero(request_count),
+                        "estimated_cost_usd": _float_or_zero(estimated_cost_usd),
+                        "updated_at": utcnow(),
+                    }
+                    for token_id, request_count, estimated_cost_usd in rows
+                    if token_id is not None
+                ],
+            )
+            await _mark_request_token_costs_backfilled(session)
+
+
 async def _record_request_hourly_stats_once(session, request_ids: list[str]) -> None:
     normalized_ids = sorted({str(value or "").strip() for value in request_ids if str(value or "").strip()})
     if not normalized_ids:
@@ -772,6 +935,7 @@ async def _record_request_hourly_stats_once(session, request_ids: list[str]) -> 
             GatewayRequestLog.model_name,
             GatewayRequestLog.is_stream,
             GatewayRequestLog.success,
+            GatewayRequestLog.token_id,
             GatewayRequestLog.input_tokens,
             GatewayRequestLog.output_tokens,
             GatewayRequestLog.total_tokens,
@@ -782,6 +946,7 @@ async def _record_request_hourly_stats_once(session, request_ids: list[str]) -> 
     )
     rows = result.all()
     await _upsert_request_hourly_stats(session, _request_hourly_stat_deltas(rows))
+    await _upsert_request_token_costs(session, _request_token_cost_deltas(rows))
 
 
 async def _request_hourly_stats_cover_window(session, *, since: datetime | None) -> bool:
@@ -1178,30 +1343,56 @@ async def get_request_costs_by_token(token_ids: list[int] | set[int] | tuple[int
         if not canonical_by_log_token_id:
             return {}
 
-        result = await session.execute(
-            select(
-                GatewayRequestLog.token_id,
-                func.sum(GatewayRequestLog.estimated_cost_usd),
+        if not await _request_token_costs_backfilled(session):
+            result = await session.execute(
+                select(
+                    GatewayRequestLog.token_id,
+                    func.sum(GatewayRequestLog.estimated_cost_usd),
+                )
+                .where(GatewayRequestLog.token_id.in_(tuple(canonical_by_log_token_id)))
+                .group_by(GatewayRequestLog.token_id)
             )
-            .where(GatewayRequestLog.token_id.in_(tuple(canonical_by_log_token_id)))
-            .group_by(GatewayRequestLog.token_id)
-        )
-        rows = result.all()
+            rows = result.all()
+            costs_by_canonical_id: dict[int, float] = {}
+            for token_id, estimated_cost_usd in rows:
+                if token_id is None:
+                    continue
+                canonical_id = canonical_by_log_token_id.get(int(token_id))
+                if canonical_id is None:
+                    continue
+                costs_by_canonical_id[canonical_id] = costs_by_canonical_id.get(canonical_id, 0.0) + _float_or_zero(
+                    estimated_cost_usd
+                )
+            return {
+                token_id: _round_cost(estimated_cost_usd)
+                for token_id, estimated_cost_usd in costs_by_canonical_id.items()
+            }
 
-    costs_by_canonical_id: dict[int, float] = {}
-    for token_id, estimated_cost_usd in rows:
-        if token_id is None:
-            continue
-        canonical_id = canonical_by_log_token_id.get(int(token_id))
-        if canonical_id is None:
-            continue
-        costs_by_canonical_id[canonical_id] = costs_by_canonical_id.get(canonical_id, 0.0) + _float_or_zero(
-            estimated_cost_usd
-        )
-    return {
-        token_id: _round_cost(estimated_cost_usd)
-        for token_id, estimated_cost_usd in costs_by_canonical_id.items()
-    }
+        cost_rows = (
+            await session.execute(
+                select(
+                    GatewayRequestTokenCost.token_id,
+                    GatewayRequestTokenCost.request_count,
+                    GatewayRequestTokenCost.estimated_cost_usd,
+                ).where(GatewayRequestTokenCost.token_id.in_(tuple(canonical_by_log_token_id)))
+            )
+        ).all()
+        costs_by_canonical_id: dict[int, float] = {}
+        for token_id, _request_count, estimated_cost_usd in cost_rows:
+            if token_id is None:
+                continue
+            canonical_id = canonical_by_log_token_id.get(int(token_id))
+            if canonical_id is None:
+                continue
+            costs_by_canonical_id[canonical_id] = costs_by_canonical_id.get(canonical_id, 0.0) + _float_or_zero(
+                estimated_cost_usd
+            )
+        for canonical_id in set(canonical_by_log_token_id.values()):
+            costs_by_canonical_id.setdefault(canonical_id, 0.0)
+        return {
+            token_id: _round_cost(estimated_cost_usd)
+            for token_id, estimated_cost_usd in costs_by_canonical_id.items()
+        }
 
 
 async def get_request_log_analytics(*, hours: int = 24, bucket_minutes: int = 60, top_models: int = 6) -> RequestLogAnalytics:
