@@ -18,6 +18,7 @@ from .database import (
 )
 
 REQUEST_TOKEN_COST_BACKFILL_SETTING_KEY = "request_token_costs_backfilled_at"
+REQUEST_TOKEN_LAST_USED_BACKFILL_SETTING_KEY = "request_token_last_used_backfilled_at"
 
 
 @dataclass(frozen=True)
@@ -227,6 +228,29 @@ def _request_token_cost_deltas(rows: list[Any]) -> list[dict[str, Any]]:
     return list(grouped.values())
 
 
+def _request_token_last_used_deltas(rows: list[Any]) -> list[dict[str, Any]]:
+    grouped: dict[int, datetime] = {}
+    for row in rows:
+        token_id = getattr(row, "token_id", None)
+        started_at = getattr(row, "started_at", None)
+        try:
+            resolved_token_id = int(token_id)
+        except (TypeError, ValueError):
+            continue
+        if resolved_token_id <= 0 or not isinstance(started_at, datetime):
+            continue
+        current = grouped.get(resolved_token_id)
+        if current is None or started_at > current:
+            grouped[resolved_token_id] = started_at
+    return [
+        {
+            "token_id": token_id,
+            "last_used_at": last_used_at,
+        }
+        for token_id, last_used_at in sorted(grouped.items())
+    ]
+
+
 async def _upsert_request_token_costs(session, deltas: list[dict[str, Any]]) -> None:
     if not deltas:
         return
@@ -254,6 +278,21 @@ async def _upsert_request_token_costs(session, deltas: list[dict[str, Any]]) -> 
             },
         )
     )
+
+
+async def _update_token_last_used_at(session, deltas: list[dict[str, Any]]) -> None:
+    for delta in deltas:
+        token_id = int(delta["token_id"])
+        last_used_at = delta["last_used_at"]
+        if not isinstance(last_used_at, datetime):
+            continue
+        await session.execute(
+            update(CodexToken)
+            .where(CodexToken.id == token_id)
+            .where(CodexToken.merged_into_token_id.is_(None))
+            .where(or_(CodexToken.last_used_at.is_(None), CodexToken.last_used_at < last_used_at))
+            .values(last_used_at=last_used_at)
+        )
 
 
 def _floor_bucket_start(value: datetime, *, bucket_minutes: int) -> datetime:
@@ -852,6 +891,44 @@ async def _mark_request_token_costs_backfilled(session) -> None:
     setting.updated_at = now
 
 
+async def _request_token_last_used_backfilled(session) -> bool:
+    row = await session.get(GatewaySetting, REQUEST_TOKEN_LAST_USED_BACKFILL_SETTING_KEY)
+    value = getattr(row, "value", None)
+    return isinstance(value, dict) and bool(value.get("completed"))
+
+
+async def _mark_request_token_last_used_backfilled(session) -> None:
+    now = utcnow()
+    value = {"completed": True, "completed_at": now.isoformat()}
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        insert_stmt = pg_insert(GatewaySetting).values(
+            key=REQUEST_TOKEN_LAST_USED_BACKFILL_SETTING_KEY,
+            value=value,
+            updated_at=now,
+        )
+        await session.execute(
+            insert_stmt.on_conflict_do_update(
+                index_elements=[GatewaySetting.key],
+                set_={"value": value, "updated_at": now},
+            )
+        )
+        return
+
+    setting = await session.get(GatewaySetting, REQUEST_TOKEN_LAST_USED_BACKFILL_SETTING_KEY)
+    if setting is None:
+        session.add(
+            GatewaySetting(
+                key=REQUEST_TOKEN_LAST_USED_BACKFILL_SETTING_KEY,
+                value=value,
+                updated_at=now,
+            )
+        )
+        return
+    setting.value = value
+    setting.updated_at = now
+
+
 async def backfill_request_token_costs_from_logs() -> None:
     async with get_request_log_session() as session:
         async with session.begin():
@@ -916,6 +993,64 @@ async def backfill_request_token_costs_from_logs() -> None:
             await _mark_request_token_costs_backfilled(session)
 
 
+async def backfill_token_last_used_from_request_logs() -> None:
+    async with get_request_log_session() as session:
+        async with session.begin():
+            if await _request_token_last_used_backfilled(session):
+                return
+            bind = session.get_bind()
+            if bind is not None and bind.dialect.name == "postgresql":
+                await session.execute(
+                    text(
+                        """
+                        UPDATE codex_tokens AS tokens
+                        SET last_used_at = latest.latest_started_at
+                        FROM (
+                            SELECT
+                                logs.token_id,
+                                max(logs.started_at) AS latest_started_at
+                            FROM gateway_request_logs AS logs
+                            WHERE logs.token_id IS NOT NULL
+                              AND logs.started_at IS NOT NULL
+                            GROUP BY logs.token_id
+                        ) AS latest
+                        WHERE tokens.id = latest.token_id
+                          AND tokens.merged_into_token_id IS NULL
+                          AND (
+                              tokens.last_used_at IS NULL
+                              OR tokens.last_used_at < latest.latest_started_at
+                          )
+                        """
+                    )
+                )
+                await _mark_request_token_last_used_backfilled(session)
+                return
+
+            rows = (
+                await session.execute(
+                    select(
+                        GatewayRequestLog.token_id,
+                        func.max(GatewayRequestLog.started_at),
+                    )
+                    .where(GatewayRequestLog.token_id.is_not(None))
+                    .where(GatewayRequestLog.started_at.is_not(None))
+                    .group_by(GatewayRequestLog.token_id)
+                )
+            ).all()
+            await _update_token_last_used_at(
+                session,
+                [
+                    {
+                        "token_id": int(token_id),
+                        "last_used_at": last_used_at,
+                    }
+                    for token_id, last_used_at in rows
+                    if token_id is not None and isinstance(last_used_at, datetime)
+                ],
+            )
+            await _mark_request_token_last_used_backfilled(session)
+
+
 async def _record_request_hourly_stats_once(session, request_ids: list[str]) -> None:
     normalized_ids = sorted({str(value or "").strip() for value in request_ids if str(value or "").strip()})
     if not normalized_ids:
@@ -947,6 +1082,7 @@ async def _record_request_hourly_stats_once(session, request_ids: list[str]) -> 
     rows = result.all()
     await _upsert_request_hourly_stats(session, _request_hourly_stat_deltas(rows))
     await _upsert_request_token_costs(session, _request_token_cost_deltas(rows))
+    await _update_token_last_used_at(session, _request_token_last_used_deltas(rows))
 
 
 async def _request_hourly_stats_cover_window(session, *, since: datetime | None) -> bool:

@@ -64,6 +64,7 @@ from .prompt_cache import (
 from .quota import CodexPlanInfo, CodexQuotaService, CodexQuotaSnapshot, extract_codex_plan_info
 from .request_store import (
     backfill_request_token_costs_from_logs,
+    backfill_token_last_used_from_request_logs,
     create_request_log,
     delete_request_logs_older_than,
     finalize_request_log,
@@ -11575,9 +11576,20 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to backfill request token costs")
 
+    async def _backfill_token_last_used_task() -> None:
+        try:
+            await backfill_token_last_used_from_request_logs()
+            logger.info("Backfilled token last-used timestamps")
+        except Exception:
+            logger.exception("Failed to backfill token last-used timestamps")
+
     app.state.request_token_cost_backfill_task = asyncio.create_task(
         _backfill_request_token_costs_task(),
         name="oaix-request-token-cost-backfill",
+    )
+    app.state.token_last_used_backfill_task = asyncio.create_task(
+        _backfill_token_last_used_task(),
+        name="oaix-token-last-used-backfill",
     )
     repair_summary = await repair_duplicate_token_histories()
     if repair_summary.merged_row_count:
@@ -11674,6 +11686,10 @@ async def lifespan(app: FastAPI):
         if isinstance(request_token_cost_backfill_task, asyncio.Task):
             request_token_cost_backfill_task.cancel()
             await asyncio.gather(request_token_cost_backfill_task, return_exceptions=True)
+        token_last_used_backfill_task = getattr(app.state, "token_last_used_backfill_task", None)
+        if isinstance(token_last_used_backfill_task, asyncio.Task):
+            token_last_used_backfill_task.cancel()
+            await asyncio.gather(token_last_used_backfill_task, return_exceptions=True)
         upstream_pool_task = getattr(app.state, "upstream_http_pool_maintenance_task", None)
         if isinstance(upstream_pool_task, asyncio.Task):
             upstream_pool_task.cancel()

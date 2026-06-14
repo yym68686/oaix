@@ -16,8 +16,10 @@ from oaix_gateway.request_store import (
     _normalize_request_account_ids,
     _normalize_request_token_ids,
     _request_token_cost_deltas,
+    _request_token_last_used_deltas,
     _request_hourly_stat_deltas,
     backfill_request_token_costs_from_logs,
+    backfill_token_last_used_from_request_logs,
     get_request_costs_by_token,
     _upsert_request_logs_portable,
 )
@@ -265,6 +267,42 @@ def test_request_token_cost_deltas_group_by_token_id() -> None:
     assert deltas[0]["estimated_cost_usd"] == 0.03
 
 
+def test_request_token_last_used_deltas_group_latest_request_by_token_id() -> None:
+    rows = [
+        GatewayRequestLog(
+            request_id="one",
+            endpoint="/v1/responses",
+            token_id=7,
+            started_at=datetime(2026, 4, 14, 12, 10, tzinfo=timezone.utc),
+        ),
+        GatewayRequestLog(
+            request_id="two",
+            endpoint="/v1/responses",
+            token_id=7,
+            started_at=datetime(2026, 4, 14, 12, 45, tzinfo=timezone.utc),
+        ),
+        GatewayRequestLog(
+            request_id="three",
+            endpoint="/v1/responses",
+            token_id=8,
+            started_at=datetime(2026, 4, 14, 12, 30, tzinfo=timezone.utc),
+        ),
+        GatewayRequestLog(
+            request_id="missing",
+            endpoint="/v1/responses",
+            token_id=None,
+            started_at=datetime(2026, 4, 14, 12, 50, tzinfo=timezone.utc),
+        ),
+    ]
+
+    deltas = _request_token_last_used_deltas(rows)
+
+    assert deltas == [
+        {"token_id": 7, "last_used_at": datetime(2026, 4, 14, 12, 45, tzinfo=timezone.utc)},
+        {"token_id": 8, "last_used_at": datetime(2026, 4, 14, 12, 30, tzinfo=timezone.utc)},
+    ]
+
+
 def test_get_request_costs_by_token_uses_token_cost_summary_when_backfilled(monkeypatch) -> None:
     class _FakeResult:
         def __init__(self, rows) -> None:
@@ -437,6 +475,123 @@ def test_backfill_request_token_costs_from_logs_skips_when_already_backfilled(mo
     monkeypatch.setattr("oaix_gateway.request_store.get_request_log_session", lambda: _Ctx())
 
     asyncio.run(backfill_request_token_costs_from_logs())
+
+    assert fake_session.executed == []
+
+
+def test_backfill_token_last_used_from_request_logs_updates_tokens(monkeypatch) -> None:
+    class _FakeResult:
+        def __init__(self, rows) -> None:
+            self._rows = rows
+
+        def all(self):
+            return list(self._rows)
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.executed = []
+
+        def get_bind(self):
+            class _Bind:
+                class dialect:
+                    name = "postgresql"
+
+            return _Bind()
+
+        def begin(self):
+            class _Tx:
+                async def __aenter__(self_inner):
+                    return None
+
+                async def __aexit__(self_inner, exc_type, exc, tb):
+                    return False
+
+            return _Tx()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, stmt):
+            sql = str(stmt.compile(dialect=postgresql.dialect()))
+            self.executed.append(sql)
+            return _FakeResult([])
+
+        async def get(self, model, key):
+            return None
+
+        def add(self, item):
+            del item
+
+    fake_session = _FakeSession()
+
+    class _Ctx:
+        async def __aenter__(self):
+            return fake_session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("oaix_gateway.request_store.get_request_log_session", lambda: _Ctx())
+
+    asyncio.run(backfill_token_last_used_from_request_logs())
+
+    assert any("UPDATE codex_tokens AS tokens" in sql for sql in fake_session.executed)
+    assert any("max(logs.started_at)" in sql for sql in fake_session.executed)
+    assert any("gateway_settings" in sql for sql in fake_session.executed)
+
+
+def test_backfill_token_last_used_from_request_logs_skips_when_already_backfilled(monkeypatch) -> None:
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.executed = []
+
+        def get_bind(self):
+            class _Bind:
+                class dialect:
+                    name = "postgresql"
+
+            return _Bind()
+
+        def begin(self):
+            class _Tx:
+                async def __aenter__(self_inner):
+                    return None
+
+                async def __aexit__(self_inner, exc_type, exc, tb):
+                    return False
+
+            return _Tx()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, stmt):
+            self.executed.append(str(stmt.compile(dialect=postgresql.dialect())))
+            return type("_Result", (), {"all": lambda self_inner: []})()
+
+        async def get(self, model, key):
+            if model.__tablename__ == "gateway_settings":
+                return type("Setting", (), {"value": {"completed": True}})()
+            return None
+
+    fake_session = _FakeSession()
+
+    class _Ctx:
+        async def __aenter__(self):
+            return fake_session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("oaix_gateway.request_store.get_request_log_session", lambda: _Ctx())
+
+    asyncio.run(backfill_token_last_used_from_request_logs())
 
     assert fake_session.executed == []
 
