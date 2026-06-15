@@ -5466,6 +5466,9 @@ def _chat_messages_to_responses_input(messages: list[Any]) -> list[dict[str, Any
         if role is None:
             continue
 
+        if role == "system":
+            continue
+
         if role == "tool":
             tool_call_id = _normalize_optional_text(message.get("tool_call_id"))
             if tool_call_id is None:
@@ -5479,13 +5482,12 @@ def _chat_messages_to_responses_input(messages: list[Any]) -> list[dict[str, Any
             )
             continue
 
-        responses_role = "developer" if role == "system" else role
         content_parts: list[dict[str, Any]] = []
         _append_chat_content_parts(content_parts, message.get("content"), role=role)
         input_items.append(
             {
                 "type": "message",
-                "role": responses_role,
+                "role": role,
                 "content": content_parts,
             }
         )
@@ -5518,6 +5520,35 @@ def _chat_messages_to_responses_input(messages: list[Any]) -> list[dict[str, Any
             )
 
     return input_items
+
+
+def _chat_message_content_to_instruction_text(content_value: Any, *, role: str) -> str:
+    tokens = _extract_chat_content_tokens(content_value, role=role)
+    text_parts = [token.text for token in tokens if token.kind == "text" and token.text]
+    if isinstance(content_value, list):
+        return "\n".join(text_parts)
+    return "".join(text_parts)
+
+
+def _chat_messages_to_responses_instructions(messages: list[Any]) -> str | None:
+    instruction_parts: list[str] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = _normalize_chat_message_role(message.get("role"))
+        if role != "system":
+            continue
+
+        instruction_text = _chat_message_content_to_instruction_text(message.get("content"), role=role)
+        if instruction_text:
+            instruction_parts.append(instruction_text)
+
+    if not instruction_parts:
+        return None
+
+    return "\n\n".join(instruction_parts)
 
 
 def _chat_image_checkpoint_scope_hash(http_request: Request | None) -> str:
@@ -5609,12 +5640,15 @@ async def _chat_messages_to_responses_input_with_image_checkpoints(
         if role is None:
             continue
 
+        if role == "system":
+            continue
+
         if role == "tool":
             parsed_messages.append((message, role, role, []))
             continue
 
         tokens = _extract_chat_content_tokens(message.get("content"), role=role)
-        parsed_messages.append((message, role, "developer" if role == "system" else role, tokens))
+        parsed_messages.append((message, role, role, tokens))
         if role == "assistant":
             assistant_image_urls.extend(
                 token.image_url
@@ -5718,6 +5752,9 @@ async def _chat_completions_request_to_responses_request(
     }
     payload["model"] = request_data.model
     message_list = messages if isinstance(messages, list) else []
+    instructions = _chat_messages_to_responses_instructions(message_list)
+    if instructions is not None:
+        payload["instructions"] = instructions
     if _is_responses_image_compat_model(request_data.model):
         payload["input"] = await _chat_messages_to_responses_input_with_image_checkpoints(
             message_list,

@@ -1142,6 +1142,29 @@ def test_chat_completions_request_to_responses_request_preserves_prompt_cache_ke
     assert payload["prompt_cache_key"] == "explicit-cache-key"
 
 
+def test_chat_completions_request_to_responses_request_moves_system_to_instructions() -> None:
+    request_data = ChatCompletionsRequest(
+        model="gpt-5.4",
+        messages=[
+            {"role": "system", "content": "You are terse."},
+            {"role": "system", "content": [{"type": "text", "text": "Prefer JSON."}]},
+            {"role": "user", "content": "Summarize this file."},
+        ],
+    )
+
+    responses_request = asyncio.run(_chat_completions_request_to_responses_request(request_data))
+    payload = responses_request.model_dump(exclude_unset=True)
+
+    assert payload["instructions"] == "You are terse.\n\nPrefer JSON."
+    assert payload["input"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Summarize this file."}],
+        }
+    ]
+
+
 def test_translate_responses_image_compat_payload_injects_image_tool() -> None:
     translated, response_model_alias = _translate_responses_image_compat_payload(
         {
@@ -1284,6 +1307,32 @@ def test_chat_completions_request_to_responses_request_parses_markdown_image_his
                 {"type": "input_text", "text": "Make the mug blue"},
             ],
         },
+    ]
+
+
+def test_chat_completions_request_to_responses_request_moves_system_to_instructions_for_images() -> None:
+    request_data = ChatCompletionsRequest(
+        model="gpt-image-2",
+        messages=[
+            {"role": "system", "content": "Use a clean product-render style."},
+            {
+                "role": "user",
+                "content": "Draw a mug",
+            },
+        ],
+        stream=False,
+    )
+
+    responses_request = asyncio.run(_chat_completions_request_to_responses_request(request_data))
+    payload = responses_request.model_dump(exclude_unset=True)
+
+    assert payload["instructions"] == "Use a clean product-render style."
+    assert payload["input"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Draw a mug"}],
+        }
     ]
 
 
