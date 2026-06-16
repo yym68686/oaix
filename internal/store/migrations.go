@@ -1,0 +1,316 @@
+package store
+
+import (
+	"context"
+	"fmt"
+	"strings"
+)
+
+var migrationStatements = []string{
+	`create table if not exists schema_migrations (
+		name text primary key,
+		version integer not null,
+		updated_at timestamptz not null default now()
+	)`,
+	`create table if not exists codex_tokens (
+		id serial primary key,
+		email varchar(320),
+		account_id varchar(128),
+		id_token text,
+		access_token text,
+		refresh_token text not null,
+		refresh_token_aliases jsonb,
+		merged_into_token_id integer,
+		type varchar(32) not null default 'codex',
+		last_refresh timestamptz,
+		expired timestamptz,
+		recovery jsonb,
+		raw_payload jsonb,
+		plan_type varchar(32),
+		remark text,
+		source_file varchar(512),
+		is_active boolean not null default true,
+		cooldown_until timestamptz,
+		disabled_at timestamptz,
+		last_used_at timestamptz,
+		last_error text,
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now()
+	)`,
+	`create index if not exists ix_codex_tokens_active_ready on codex_tokens (is_active, cooldown_until, last_used_at, id) where merged_into_token_id is null`,
+	`create index if not exists ix_codex_tokens_account_id on codex_tokens (account_id)`,
+	`create index if not exists ix_codex_tokens_plan_type on codex_tokens (plan_type)`,
+	`create index if not exists ix_codex_tokens_refresh_token on codex_tokens (refresh_token)`,
+	`create table if not exists token_secrets (
+		token_id integer primary key references codex_tokens(id) on delete cascade,
+		access_token text,
+		refresh_token text,
+		id_token text,
+		updated_at timestamptz not null default now()
+	)`,
+	`create table if not exists token_scopes (
+		id serial primary key,
+		token_id integer not null references codex_tokens(id) on delete cascade,
+		scope varchar(128) not null,
+		model varchar(128) not null default '*',
+		created_at timestamptz not null default now(),
+		unique(token_id, scope, model)
+	)`,
+	`create index if not exists ix_token_scopes_scope_model on token_scopes (scope, model)`,
+	`create table if not exists token_refresh_history (
+		id bigserial primary key,
+		token_id integer not null references codex_tokens(id) on delete cascade,
+		refresh_token_hash varchar(64) not null,
+		seen_at timestamptz not null default now(),
+		unique(token_id, refresh_token_hash)
+	)`,
+	`create index if not exists ix_token_refresh_history_hash on token_refresh_history (refresh_token_hash)`,
+	`create table if not exists codex_token_scoped_cooldowns (
+		id serial primary key,
+		token_id integer not null references codex_tokens(id) on delete cascade,
+		scope varchar(128) not null,
+		cooldown_until timestamptz not null,
+		last_error text,
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now(),
+		unique(token_id, scope)
+	)`,
+	`create index if not exists ix_codex_token_scoped_cooldowns_scope on codex_token_scoped_cooldowns (scope, cooldown_until)`,
+	`create table if not exists gateway_request_logs (
+		id serial primary key,
+		request_id varchar(64) not null unique,
+		endpoint varchar(64) not null,
+		model varchar(128),
+		model_name varchar(128),
+		is_stream boolean not null default false,
+		status_code integer,
+		success boolean,
+		attempt_count integer not null default 0,
+		token_id integer,
+		account_id varchar(128),
+		client_ip varchar(64),
+		user_agent varchar(512),
+		started_at timestamptz not null default now(),
+		finished_at timestamptz,
+		first_token_at timestamptz,
+		ttft_ms integer,
+		duration_ms integer,
+		timing_spans jsonb,
+		input_tokens integer,
+		cached_input_tokens integer,
+		output_tokens integer,
+		total_tokens integer,
+		estimated_cost_usd double precision,
+		request_payload_hash varchar(64),
+		upstream_payload_hash varchar(64),
+		prompt_template_hash varchar(64),
+		prompt_dynamic_hash varchar(64),
+		prompt_cache_source varchar(64),
+		prompt_cache_key_hash varchar(64),
+		prompt_cache_retention_requested varchar(32),
+		prompt_cache_retention_sent varchar(32),
+		session_id_hash varchar(64),
+		session_id_source varchar(32),
+		previous_response_id_hash varchar(64),
+		upstream_response_id varchar(128),
+		cache_hit_ratio double precision,
+		cache_affinity_result varchar(64),
+		cache_affinity_lane_index integer,
+		prompt_cache_trace jsonb,
+		error_message text,
+		analytics_recorded_at timestamptz
+	)`,
+	`create index if not exists ix_gateway_request_logs_started_at on gateway_request_logs (started_at desc)`,
+	`create index if not exists ix_gateway_request_logs_finished_at on gateway_request_logs (finished_at desc)`,
+	`create index if not exists ix_gateway_request_logs_token_id on gateway_request_logs (token_id)`,
+	`create index if not exists ix_gateway_request_logs_model_name on gateway_request_logs (model_name)`,
+	`create table if not exists gateway_request_log_partitions (
+		partition_date date primary key,
+		table_name varchar(128) not null unique,
+		started_at timestamptz not null,
+		finished_at timestamptz not null,
+		created_at timestamptz not null default now()
+	)`,
+	`create table if not exists gateway_request_hourly_stats (
+		id serial primary key,
+		bucket_start timestamptz not null,
+		model_name varchar(128) not null default '',
+		request_count integer not null default 0,
+		success_count integer not null default 0,
+		failure_count integer not null default 0,
+		streaming_count integer not null default 0,
+		input_tokens integer not null default 0,
+		output_tokens integer not null default 0,
+		total_tokens integer not null default 0,
+		estimated_cost_usd double precision not null default 0,
+		ttft_ms_sum integer not null default 0,
+		ttft_count integer not null default 0,
+		duration_ms_sum integer not null default 0,
+		duration_count integer not null default 0,
+		updated_at timestamptz not null default now(),
+		unique(bucket_start, model_name)
+	)`,
+	`create table if not exists gateway_request_token_costs (
+		token_id integer primary key,
+		request_count integer not null default 0,
+		estimated_cost_usd double precision not null default 0,
+		updated_at timestamptz not null default now()
+	)`,
+	`create table if not exists gateway_settings (
+		key varchar(128) primary key,
+		value jsonb,
+		updated_at timestamptz not null default now()
+	)`,
+	`create table if not exists token_runtime_state (
+		token_id integer primary key references codex_tokens(id) on delete cascade,
+		active_streams integer not null default 0,
+		cooldown_until timestamptz,
+		disabled_reason text,
+		failure_streak integer not null default 0,
+		last_success_at timestamptz,
+		last_failure_at timestamptz,
+		updated_at timestamptz not null default now()
+	)`,
+	`create table if not exists token_state_events (
+		id bigserial primary key,
+		token_id integer not null,
+		event_type varchar(64) not null,
+		reason text,
+		cooldown_until timestamptz,
+		created_at timestamptz not null default now()
+	)`,
+	`create index if not exists ix_token_state_events_token_created on token_state_events (token_id, created_at desc)`,
+	`create table if not exists request_log_outbox (
+		id bigserial primary key,
+		request_id varchar(64) not null,
+		payload jsonb not null,
+		attempt_count integer not null default 0,
+		next_attempt_at timestamptz not null default now(),
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now()
+	)`,
+	`create index if not exists ix_request_log_outbox_next_attempt on request_log_outbox (next_attempt_at, id)`,
+	`create table if not exists prompt_affinity_lanes (
+		prompt_key_hash varchar(128) primary key,
+		primary_token_id integer,
+		secondary_token_ids jsonb,
+		policy_version integer not null default 1,
+		expires_at timestamptz not null,
+		updated_at timestamptz not null default now()
+	)`,
+	`create index if not exists ix_prompt_affinity_lanes_expires_at on prompt_affinity_lanes (expires_at)`,
+	`create index if not exists ix_prompt_affinity_lanes_primary_token on prompt_affinity_lanes (primary_token_id)`,
+	`create table if not exists response_owner_bindings (
+		response_id_hash varchar(128) primary key,
+		token_id integer not null,
+		expires_at timestamptz not null,
+		updated_at timestamptz not null default now()
+	)`,
+	`create index if not exists ix_response_owner_bindings_expires_at on response_owner_bindings (expires_at)`,
+	`create table if not exists token_import_jobs (
+		id serial primary key,
+		status varchar(32) not null default 'queued',
+		import_queue_position varchar(16) not null default 'front',
+		payloads jsonb not null,
+		total_count integer not null default 0,
+		processed_count integer not null default 0,
+		created_count integer not null default 0,
+		updated_count integer not null default 0,
+		skipped_count integer not null default 0,
+		failed_count integer not null default 0,
+		yielded_to_response_traffic_count integer not null default 0,
+		response_traffic_timeout_count integer not null default 0,
+		created_items jsonb,
+		updated_items jsonb,
+		skipped_items jsonb,
+		failed_items jsonb,
+		last_error text,
+		submitted_at timestamptz not null default now(),
+		started_at timestamptz,
+		heartbeat_at timestamptz,
+		finished_at timestamptz
+	)`,
+	`create table if not exists token_import_items (
+		id serial primary key,
+		job_id integer not null references token_import_jobs(id) on delete cascade,
+		item_index integer not null,
+		status varchar(32) not null default 'queued',
+		refresh_token_hash varchar(64),
+		encrypted_payload text,
+		payload jsonb,
+		validated_payload jsonb,
+		token_id integer,
+		action varchar(32),
+		error_message text,
+		validation_ms integer,
+		publish_ms integer,
+		import_validate_ms integer,
+		import_publish_ms integer,
+		validation_started_at timestamptz,
+		validation_finished_at timestamptz,
+		published_at timestamptz,
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now(),
+		unique(job_id, item_index)
+	)`,
+	`create table if not exists admin_audit_logs (
+		id bigserial primary key,
+		action varchar(128) not null,
+		actor varchar(128),
+		target_type varchar(64),
+		target_id varchar(128),
+		payload jsonb,
+		created_at timestamptz not null default now()
+	)`,
+}
+
+var downMigrationStatements = []string{
+	`drop table if exists admin_audit_logs`,
+	`drop table if exists token_import_items`,
+	`drop table if exists token_import_jobs`,
+	`drop table if exists response_owner_bindings`,
+	`drop table if exists prompt_affinity_lanes`,
+	`drop table if exists gateway_request_log_partitions`,
+	`drop table if exists request_log_outbox`,
+	`drop table if exists token_state_events`,
+	`drop table if exists token_runtime_state`,
+	`drop table if exists token_refresh_history`,
+	`drop table if exists token_scopes`,
+	`drop table if exists token_secrets`,
+	`delete from schema_migrations where name = 'oaix_go'`,
+}
+
+func (s *Store) Migrate(ctx context.Context) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for index, statement := range migrationStatements {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return fmt.Errorf("migration statement %d failed: %w\n%s", index+1, err, strings.TrimSpace(statement))
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		insert into schema_migrations(name, version, updated_at)
+		values ('oaix_go', $1, now())
+		on conflict (name) do update set version = excluded.version, updated_at = now()
+	`, SchemaVersion); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) MigrateDown(ctx context.Context) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for index, statement := range downMigrationStatements {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return fmt.Errorf("down migration statement %d failed: %w\n%s", index+1, err, strings.TrimSpace(statement))
+		}
+	}
+	return tx.Commit(ctx)
+}

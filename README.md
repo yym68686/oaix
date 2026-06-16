@@ -20,11 +20,12 @@
 
 ## 目录
 
-- `oaix_gateway/database.py`: PostgreSQL 模型与连接初始化
-- `oaix_gateway/token_store.py`: key 导入、选择、冷却、失败/成功状态更新
-- `oaix_gateway/oauth.py`: access token 刷新、缓存、并发锁
-- `oaix_gateway/api_server.py`: FastAPI 网关与管理接口
-- `import_tokens.py`: 从本地 `token_*.json` 批量导入
+- `cmd/oaix-gateway`: Go 网关主进程，承载 OpenAI-compatible API、管理 API、token snapshot 调度、流式代理。
+- `cmd/oaix-migrate`: Go 数据库迁移工具。gateway 启动时只检查 schema，不做 DDL。
+- `cmd/oaix-worker`: Go 后台 worker，当前负责 request log outbox drain。
+- `internal/*`: Go 终局实现的配置、存储、代理、token 池、日志、transport、observability 等模块。
+- `oaix_gateway/*`: Python 旧实现，保留为行为参考和回归测试来源。
+- `import_tokens.py`: Python 旧实现的本地导入辅助脚本。
 
 ## 环境变量
 
@@ -90,21 +91,23 @@
 ## 安装
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+go mod download
 ```
 
 ## 启动
 
 ```bash
-uvicorn oaix_gateway.api_server:app --host 0.0.0.0 --port 8000
+export DATABASE_URL='postgresql://oaix:oaix_password@127.0.0.1:5432/oaix_gateway'
+go run ./cmd/oaix-migrate
+go run ./cmd/oaix-gateway
 ```
 
-或：
+导入本地 access token 文件并启动：
 
 ```bash
-python -m oaix_gateway
+OAIX_ACCESS_TOKEN_FILE='/Users/yanyuming/Downloads/at.txt' \
+SERVICE_API_KEYS='change-me' \
+go run ./cmd/oaix-gateway
 ```
 
 启动后直接打开：
@@ -135,7 +138,9 @@ docker compose up -d --build
 默认行为：
 
 - `postgres`: PostgreSQL 16
-- `gateway`: Web 控制台 + `/v1/responses`、`/v1/images/*` 网关
+- `migrate`: 显式执行 Go schema migration
+- `gateway`: Go Web 控制台 + `/v1/responses`、`/v1/chat/completions`、`/v1/images/*` 网关
+- `worker`: Go request log outbox worker
 
 常用环境变量：
 
@@ -164,9 +169,9 @@ export IMPORT_PUBLISH_FLUSH_INTERVAL_SECONDS='0.5'
 export IMPORT_JOB_RESPECT_RESPONSE_TRAFFIC='false'
 export IMPORT_RESPONSE_IDLE_GRACE_SECONDS='0.25'
 export IMPORT_WAIT_TIMEOUT_SECONDS='30'
-export REQUEST_LOG_WRITE_CONCURRENCY='2'
-export REQUEST_LOG_WRITE_BATCH_SIZE='50'
-export REQUEST_LOG_WRITE_QUEUE_MAX_SIZE='2000'
+export REQUEST_LOG_WRITE_CONCURRENCY='4'
+export REQUEST_LOG_WRITE_BATCH_SIZE='250'
+export REQUEST_LOG_WRITE_QUEUE_MAX_SIZE='20000'
 export REQUEST_LOG_RETENTION_DAYS='30'
 export REQUEST_LOG_CLEANUP_INTERVAL_SECONDS='3600'
 export ADMIN_REQUESTS_CACHE_TTL_SECONDS='5'
@@ -226,7 +231,7 @@ access_token_2
 access_token_3
 ```
 
-粘贴后会自动解析成导入批次；导入接口只写入 `token_import_items` staging 区，不会直接写入正式 `codex_tokens` 池。后台导入 worker 会先高并发验证：带 `refresh_token` 的 item 会刷新 OAuth 并提取 `account_id`、`email`、`plan_type`、`access_token` 和过期时间；只有 `access_token` 的 item 会解码 JWT 提取账号、套餐和过期时间，不会尝试刷新。验证成功的 item 会按小批短事务发布到正式池；验证失败的 refresh token 会停留在 staging 失败状态，正常 `/v1/responses` 请求不会命中这些未验证 token。
+Go 版当前支持 access token 直接导入：导入接口会解码 JWT payload 中可用的账号、邮箱、套餐信息，并 upsert 到正式 `codex_tokens` 池，然后刷新内存 token snapshot。refresh token OAuth 验证接口已经预留，但 refresh worker 尚未启用；需要 refresh token 自动换 access token 的场景仍在 TODO 中。
 
 导入去重规则：
 
@@ -236,16 +241,24 @@ access_token_3
 - 如果重复的是当前仍在使用的最新 RT，导入会视为“更新现有记录”
 - 如果重复的是历史旧 RT，导入会直接跳过，不会把当前最新 RT 回滚成旧值
 - 前端导入时可选择把本批新增/更新的 key 放到请求队列开头或最后，默认放到开头
-- 批量导入时，OAuth 验证使用独立 HTTP client 和导入 DB 池；发布阶段使用短事务小批量写入正式池，并在发布后刷新内存 token 池快照
+- 批量导入 access token 时，Go 版使用短事务 upsert 正式池，并在导入后刷新内存 token 池快照
 - 正常 `/v1/responses*` 请求从内存 token 池快照选择 key；DB 仅作为启动/快照重建来源，以及请求日志和 token 状态的异步持久化目标
 
 ## 接口
 
 - `GET /healthz`: 查看可用 key 数量与状态
 - `GET /admin/tokens`: 查看 key 列表与统计，支持 `limit` / `offset` 分页，以及 `q` / `status` / `plan_type` / `sort` / `import_batch_id` 查询
+- `GET /admin/tokens/{id}`: 查看单个 key
+- `POST /admin/tokens/{id}/activation`: 启用/禁用 key
+- `POST /admin/tokens/{id}/remark`: 更新 key 备注
 - `GET /admin/requests`: 查看请求次数汇总与最近请求日志
 - `POST /admin/tokens/import`: 导入单个 key、key 数组，或 `{"tokens": [...], "import_queue_position": "front|back"}` 批量导入
+- `GET /admin/tokens/import-batches`: 查看导入批次
+- `GET /admin/tokens/import-jobs/{id}`: 查看导入 job
+- `POST /admin/tokens/import-jobs/{id}/cancel`: 取消导入 job
+- `GET /admin/settings` / `POST /admin/settings/{key}`: 查看/更新设置
 - `POST /v1/responses`: 代理到上游 Codex responses
+- `POST /v1/chat/completions`: 代理 chat completions
 - `POST /v1/responses/compact`: 代理到上游 Codex responses compact
 - `POST /v1/images/generations`: OpenAI 兼容图片生成，内部转到 Codex responses 的 `image_generation` tool
 - `POST /v1/images/edits`: OpenAI 兼容图片编辑，支持 JSON 和 multipart form-data，内部转到 Codex responses 的 `image_generation` tool

@@ -9,6 +9,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oaix_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
@@ -24,6 +26,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "${GATEWAY_PORT:-8000}:8000"
     environment:
@@ -60,13 +64,43 @@ services:
       test:
         [
           "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5).read()",
+          "/usr/local/bin/oaix-gateway",
+          "-healthcheck",
         ]
       interval: 15s
       timeout: 5s
       retries: 10
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: oaix-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/oaix-migrate"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-oaix}:${POSTGRES_PASSWORD:-oaix_password}@postgres:5432/${POSTGRES_DB:-oaix_gateway}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: oaix-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/oaix-worker"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-oaix}:${POSTGRES_PASSWORD:-oaix_password}@postgres:5432/${POSTGRES_DB:-oaix_gateway}
+      REQUEST_LOG_OUTBOX_DRAIN_BATCH_SIZE: ${REQUEST_LOG_OUTBOX_DRAIN_BATCH_SIZE:-500}
+      REQUEST_LOG_AGGREGATION_INTERVAL_SECONDS: ${REQUEST_LOG_AGGREGATION_INTERVAL_SECONDS:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 volumes:
   postgres_data:

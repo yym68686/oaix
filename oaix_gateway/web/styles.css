@@ -3278,3 +3278,166 @@ button {
     content: attr(data-label);
   }
 }
+
+.token-batch-bar,
+.settings-editor {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--border-panel);
+  border-radius: var(--radius-md);
+  background: var(--surface-card);
+  margin-bottom: 12px;
+}
+
+.token-batch-bar span {
+  margin-left: auto;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.virtual-list-spacer {
+  position: relative;
+}
+
+.virtual-list-spacer > div {
+  position: absolute;
+  inset-inline: 0;
+  top: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.token-card {
+  min-height: 130px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(260px, 0.9fr) auto;
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid var(--border-panel);
+  border-radius: var(--radius-md);
+  background: var(--surface-card);
+}
+
+.token-card__select {
+  display: grid;
+  place-items: center;
+}
+
+.token-card__main,
+.token-card__meta {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.token-card__main strong,
+.token-card__meta span,
+.request-row span,
+.request-row strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.token-card--disabled {
+  border-color: color-mix(in oklab, var(--disabled) 42%, var(--border-panel));
+}
+
+.token-card--cooling {
+  border-color: color-mix(in oklab, var(--cooling) 42%, var(--border-panel));
+}
+
+.request-row {
+  min-height: 54px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-table-row);
+}
+
+.request-row--failed {
+  color: var(--feedback-error-fg);
+}
+
+.chart-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(120px, 2fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 0;
+}
+
+.chart-row__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chart-row__bar {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--border-panel) 55%, var(--surface-card));
+}
+
+.chart-row__bar i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--available), var(--cooling));
+}
+
+.settings-panel {
+  grid-column: 1 / -1;
+}
+
+.settings-editor .field {
+  flex: 1 1 220px;
+}
+
+.settings-editor textarea {
+  min-height: 92px;
+}
+
+.settings-list {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.6fr) minmax(220px, 1.5fr) minmax(160px, 0.6fr);
+  gap: 12px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--border-panel);
+  border-radius: var(--radius-md);
+  background: var(--surface-card);
+}
+
+.settings-row code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.error-text {
+  color: var(--feedback-error-fg);
+}
+
+@media (max-width: 900px) {
+  .token-card,
+  .settings-row,
+  .chart-row {
+    grid-template-columns: 1fr;
+  }
+
+  .token-card__actions {
+    justify-content: flex-start;
+  }
+}
