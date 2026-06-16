@@ -525,6 +525,52 @@
       </div>
     </dialog>
 
+    <dialog
+      class="confirm-dialog confirm-dialog--remark"
+      id="token-remark-dialog"
+      aria-labelledby="token-remark-title"
+      aria-describedby="token-remark-description token-remark-feedback"
+    >
+      <div class="confirm-dialog__surface">
+        <div class="confirm-dialog__header">
+          <p class="confirm-dialog__eyebrow confirm-dialog__eyebrow--neutral">Key Remark</p>
+          <button class="confirm-dialog__close" id="token-remark-close" type="button" aria-label="关闭备注编辑">
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+        <div class="confirm-dialog__copy">
+          <h2 id="token-remark-title">编辑备注</h2>
+          <p class="confirm-dialog__body" id="token-remark-description">
+            写下这把 key 的来源、用途、限制或迁移线索。
+          </p>
+        </div>
+        <div class="confirm-dialog__target confirm-dialog__target--neutral">
+          <span class="confirm-dialog__target-label confirm-dialog__target-label--neutral">当前 Key</span>
+          <strong class="confirm-dialog__target-value" id="token-remark-target">—</strong>
+          <p class="confirm-dialog__target-meta" id="token-remark-meta">—</p>
+        </div>
+        <label class="remark-field" for="token-remark-textarea">
+          <span class="remark-field__label">备注内容</span>
+          <textarea
+            class="remark-field__textarea"
+            id="token-remark-textarea"
+            name="token-remark"
+            rows="6"
+            maxlength="2000"
+            spellcheck="true"
+            autocomplete="off"
+            placeholder="例如来源、使用范围、账号限制或迁移说明…"
+          ></textarea>
+        </label>
+        <p class="confirm-dialog__feedback" id="token-remark-feedback" role="status" aria-live="polite"></p>
+        <div class="confirm-dialog__actions">
+          <button class="ghost-button" id="token-remark-cancel" type="button">取消</button>
+          <button class="ghost-button" id="token-remark-clear" type="button">清空备注</button>
+          <button class="primary-button" id="token-remark-save" type="button">保存备注</button>
+        </div>
+      </div>
+    </dialog>
+
     <script src="/assets/app.js" defer></script>
   </body>
 </html>

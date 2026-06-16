@@ -1870,6 +1870,12 @@ button {
   border-top: 1px solid var(--border-table-row);
 }
 
+.token-result__detail-stack {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
 .token-result__quiet-note {
   display: grid;
   align-content: center;
@@ -2046,6 +2052,41 @@ button {
 .token-card__error-meta {
   font-size: 0.84rem;
   line-height: 1.45;
+  color: var(--ink-soft);
+}
+
+.token-card__remark {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: calc(var(--radius-md) - 2px);
+  background: color-mix(in oklab, var(--surface-button) 72%, transparent);
+}
+
+.token-card__remark--empty {
+  border-style: dashed;
+}
+
+.token-card__remark-label {
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.token-card__remark-text {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.58;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+
+.token-card__remark--empty .token-card__remark-text {
   color: var(--ink-soft);
 }
 
@@ -2344,6 +2385,16 @@ button {
   background: color-mix(in oklab, var(--available) 10%, transparent);
 }
 
+.token-action-button--remark {
+  border-color: color-mix(in oklab, var(--accent) 34%, var(--border-panel));
+  color: color-mix(in oklab, var(--accent) 66%, var(--ink));
+}
+
+.token-action-button--remark:hover,
+.token-action-button--remark:focus-visible {
+  background: color-mix(in oklab, var(--accent) 9%, transparent);
+}
+
 .token-action-button--delete {
   border-color: var(--border-feedback-error);
   color: var(--feedback-error-fg);
@@ -2401,6 +2452,10 @@ button {
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--feedback-error-fg);
+}
+
+.confirm-dialog__eyebrow--neutral {
+  color: color-mix(in oklab, var(--accent) 76%, var(--ink));
 }
 
 .confirm-dialog__close {
@@ -2469,12 +2524,21 @@ button {
   background: color-mix(in oklab, var(--disabled) 9%, transparent);
 }
 
+.confirm-dialog__target--neutral {
+  border-color: color-mix(in oklab, var(--accent) 28%, var(--border-soft));
+  background: color-mix(in oklab, var(--accent) 7%, transparent);
+}
+
 .confirm-dialog__target-label {
   font-size: 0.72rem;
   font-weight: 800;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--feedback-error-fg);
+}
+
+.confirm-dialog__target-label--neutral {
+  color: color-mix(in oklab, var(--accent) 76%, var(--ink));
 }
 
 .confirm-dialog__target-value,
@@ -2512,6 +2576,55 @@ button {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.remark-field {
+  display: grid;
+  gap: 8px;
+}
+
+.remark-field__label {
+  font-size: 0.82rem;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.remark-field__textarea {
+  width: 100%;
+  min-height: 148px;
+  resize: vertical;
+  padding: 13px 14px;
+  border: 1px solid var(--border-panel);
+  border-radius: calc(var(--radius-md) - 2px);
+  background: var(--surface-card);
+  color: var(--ink);
+  font: inherit;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    background-color 180ms ease,
+    opacity 180ms ease;
+}
+
+.remark-field__textarea::placeholder {
+  color: var(--ink-faint);
+}
+
+.remark-field__textarea:hover,
+.remark-field__textarea:focus-visible {
+  border-color: color-mix(in oklab, var(--accent) 36%, var(--border-panel));
+}
+
+.remark-field__textarea:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.remark-field__textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
 .token-row__time,

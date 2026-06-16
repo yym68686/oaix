@@ -91,6 +91,7 @@ DEFAULT_TOKEN_STATUS_WRITE_LOCK_TIMEOUT_MS = 250
 MIN_TOKEN_ACTIVE_STREAM_CAP = 1
 MAX_TOKEN_ACTIVE_STREAM_CAP = 10
 DEFAULT_TOKEN_ACTIVE_STREAM_CAP = 10
+MAX_TOKEN_REMARK_LENGTH = 2000
 ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX = "__oaix_access_token_only__:"
 ACCESS_TOKEN_ONLY_EXPIRED_ERROR = "Access token expired and no refresh_token is available"
 
@@ -2484,6 +2485,28 @@ async def set_token_active_state(
             return token
 
 
+def normalize_token_remark(value: str | None) -> str | None:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "").strip()
+    if not text:
+        return None
+    if len(text) > MAX_TOKEN_REMARK_LENGTH:
+        raise ValueError(f"remark must be at most {MAX_TOKEN_REMARK_LENGTH} characters")
+    return text
+
+
+async def update_token_remark(token_id: int, *, remark: str | None) -> CodexToken | None:
+    normalized_remark = normalize_token_remark(remark)
+    async with get_session() as session:
+        async with session.begin():
+            token = await _resolve_canonical_token_for_update(session, token_id)
+            if token is None:
+                return None
+            token.remark = normalized_remark
+            token.updated_at = utcnow()
+            await session.flush()
+            return token
+
+
 async def delete_token(token_id: int) -> TokenDeleteResult | None:
     async with get_session() as session:
         async with session.begin():
@@ -2766,6 +2789,7 @@ async def list_token_rows(
                     CodexToken.id_token,
                     CodexToken.raw_payload,
                     CodexToken.plan_type,
+                    CodexToken.remark,
                     CodexToken.source_file,
                     CodexToken.is_active,
                     CodexToken.cooldown_until,

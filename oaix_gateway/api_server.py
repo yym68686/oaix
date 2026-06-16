@@ -125,6 +125,7 @@ from .token_store import (
     update_token_active_stream_cap_settings,
     update_token_order_settings,
     update_token_plan_order_settings,
+    update_token_remark,
     update_token_selection_settings,
     normalize_token_list_plan_type,
     normalize_token_list_status,
@@ -2505,6 +2506,10 @@ class TokenSelectionConcurrencyUpdateRequest(BaseModel):
 class TokenActivationUpdateRequest(BaseModel):
     active: bool
     clear_cooldown: bool = False
+
+
+class TokenRemarkUpdateRequest(BaseModel):
+    remark: str | None = None
 
 
 class TokenProbeRequest(BaseModel):
@@ -11112,6 +11117,7 @@ def _serialize_admin_token_item(
         "expires_at": token_row.expires_at,
         "last_used_at": token_row.last_used_at,
         "last_error": token_row.last_error,
+        "remark": getattr(token_row, "remark", None),
         "source_file": token_row.source_file,
         "created_at": token_row.created_at,
         "updated_at": token_row.updated_at,
@@ -12158,6 +12164,24 @@ def create_app() -> FastAPI:
             "cooldown_until": token.cooldown_until,
             "disabled_at": token.disabled_at,
             "counts": asdict(counts),
+        }
+
+    @app.post("/admin/tokens/{token_id}/remark")
+    async def update_token_remark_route(
+        token_id: int,
+        payload: TokenRemarkUpdateRequest,
+        _: None = Depends(verify_service_api_key),
+    ) -> dict[str, Any]:
+        try:
+            token = await update_token_remark(token_id, remark=payload.remark)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if token is None:
+            raise HTTPException(status_code=404, detail="Token not found")
+        return {
+            "id": token.id,
+            "remark": token.remark,
+            "updated_at": token.updated_at,
         }
 
     @app.post("/admin/tokens/{token_id}/probe")

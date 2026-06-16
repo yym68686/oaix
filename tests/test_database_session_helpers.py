@@ -152,6 +152,7 @@ def test_schema_migrations_use_physical_codex_token_type_column_for_raw_indexes(
     index_sql = {row["name"]: row["sql"] for row in index_rows}
     columns = {row["name"] for row in column_rows}
     assert "disabled_at" in columns
+    assert "remark" in columns
     assert disabled_at == "2026-04-15 10:30:00"
     assert "ix_codex_tokens_pool_snapshot" in index_sql
     assert "ix_codex_tokens_lru_available" in index_sql

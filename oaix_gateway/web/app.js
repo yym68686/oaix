@@ -44,6 +44,7 @@ const TOKEN_QUOTA_RETRY_DELAY_MS = 1200;
 const TOKEN_ACTIVE_STREAM_CAP_MIN = 1;
 const TOKEN_ACTIVE_STREAM_CAP_MAX = 10;
 const DEFAULT_TOKEN_ACTIVE_STREAM_CAP = 10;
+const TOKEN_REMARK_MAX_LENGTH = 2000;
 
 function readStoredImportJobId() {
   const raw = localStorage.getItem(IMPORT_JOB_STORAGE_KEY) || "";
@@ -84,6 +85,7 @@ const state = {
   tokenSearchDebounceTimer: null,
   tokenActionPendingKinds: new Map(),
   tokenDeleteTargetId: null,
+  tokenRemarkTargetId: null,
   tokenDetailsOpenStates: Object.create(null),
   tokenViewMode: "keys",
   tokenSearchTerm: "",
@@ -239,11 +241,23 @@ const elements = {
   tokenDeleteCancel: document.getElementById("token-delete-cancel"),
   tokenDeleteClose: document.getElementById("token-delete-close"),
   tokenDeleteConfirm: document.getElementById("token-delete-confirm"),
+  tokenRemarkDialog: document.getElementById("token-remark-dialog"),
+  tokenRemarkDescription: document.getElementById("token-remark-description"),
+  tokenRemarkTarget: document.getElementById("token-remark-target"),
+  tokenRemarkMeta: document.getElementById("token-remark-meta"),
+  tokenRemarkTextarea: document.getElementById("token-remark-textarea"),
+  tokenRemarkFeedback: document.getElementById("token-remark-feedback"),
+  tokenRemarkCancel: document.getElementById("token-remark-cancel"),
+  tokenRemarkClose: document.getElementById("token-remark-close"),
+  tokenRemarkSave: document.getElementById("token-remark-save"),
+  tokenRemarkClear: document.getElementById("token-remark-clear"),
 };
 
 elements.serviceKey.value = state.serviceKey;
 const supportsTokenDeleteDialog =
   typeof HTMLDialogElement !== "undefined" && elements.tokenDeleteDialog instanceof HTMLDialogElement;
+const supportsTokenRemarkDialog =
+  typeof HTMLDialogElement !== "undefined" && elements.tokenRemarkDialog instanceof HTMLDialogElement;
 const DEFAULT_IMPORT_BUTTON_LABEL = elements.importButton.textContent.trim() || "导入";
 
 function resolveTheme(preference) {
@@ -1396,6 +1410,7 @@ function renderTokenActionButtons(item) {
   const status = deriveStatus(item);
   const pendingKind = getTokenActionPendingKind(tokenId);
   const pending = Boolean(pendingKind);
+  const remarkLabel = pendingKind === "remark" ? "保存中…" : normalizeWhitespace(item?.remark) ? "修改备注" : "添加备注";
   const probeLabel = pendingKind === "probe" ? "测试中" : "测试";
   const probeModel = normalizeProbeModel(state.probeModel);
   const probeModelOptions = PROBE_MODEL_OPTIONS.map(
@@ -1429,6 +1444,17 @@ function renderTokenActionButtons(item) {
       ${pending ? "disabled" : ""}
     >
       ${probeLabel}
+    </button>
+  `;
+  const remarkButton = `
+    <button
+      class="token-action-button token-action-button--remark"
+      type="button"
+      data-token-remark="true"
+      data-token-id="${tokenId}"
+      ${pending ? "disabled" : ""}
+    >
+      ${escapeHtml(remarkLabel)}
     </button>
   `;
   const actionButtons = [];
@@ -1497,6 +1523,7 @@ function renderTokenActionButtons(item) {
   return `
     <div class="token-card__actions">
       ${probeModelSelect}
+      ${remarkButton}
       ${probeButton}
       ${actionButtons.join("")}
     </div>
@@ -1960,6 +1987,25 @@ function renderTokenErrorSection(item) {
   `;
 }
 
+function renderTokenRemarkSection(item) {
+  const remark = String(item?.remark || "").trim();
+  if (!remark) {
+    return `
+      <div class="token-card__remark token-card__remark--empty">
+        <span class="token-card__remark-label">备注</span>
+        <p class="token-card__remark-text">还没有备注。</p>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="token-card__remark">
+      <span class="token-card__remark-label">备注</span>
+      <p class="token-card__remark-text">${escapeHtml(remark)}</p>
+    </div>
+  `;
+}
+
 function resolveTokenDetailsOpenState(tokenId, fallbackOpen = false) {
   const key = String(tokenId);
   return Object.prototype.hasOwnProperty.call(state.tokenDetailsOpenStates, key)
@@ -2039,7 +2085,10 @@ function renderTokenResultRow(item, workspaceTokenCounts) {
       <div class="token-result__details">
         <div class="token-result__detail-grid">
           ${renderQuotaSection(item, presentation)}
-          ${errorSection || `<div class="token-result__quiet-note">当前没有最近错误。</div>`}
+          <div class="token-result__detail-stack">
+            ${renderTokenRemarkSection(item)}
+            ${errorSection || `<div class="token-result__quiet-note">当前没有最近错误。</div>`}
+          </div>
         </div>
         ${renderTokenActionButtons(item)}
       </div>
@@ -2624,6 +2673,199 @@ function openTokenDeleteDialog(tokenId) {
 
   if (!dialog.open) {
     dialog.showModal();
+  }
+}
+
+function buildTokenRemarkContext(item) {
+  const workspaceTokenCounts = buildWorkspaceTokenCounts(state.tokenItems);
+  const presentation = buildTokenPresentation(item, workspaceTokenCounts);
+  const status = deriveStatus(item);
+  const tokenLabel = `Token #${item.id}`;
+  const metaParts = [status.label];
+  if (!presentation.meta || !presentation.meta.includes(tokenLabel)) {
+    metaParts.unshift(tokenLabel);
+  }
+  if (presentation.meta) {
+    metaParts.push(presentation.meta);
+  }
+  return {
+    title: presentation.account,
+    meta: metaParts.filter(Boolean).join(" · "),
+  };
+}
+
+function normalizeTokenRemarkInput(value) {
+  return String(value || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\u0000/g, "").trim();
+}
+
+function clearTokenRemarkFeedback() {
+  if (!elements.tokenRemarkFeedback) {
+    return;
+  }
+  elements.tokenRemarkFeedback.textContent = "";
+  elements.tokenRemarkFeedback.classList.remove("is-error");
+}
+
+function setTokenRemarkFeedback(message, tone = "") {
+  if (!elements.tokenRemarkFeedback) {
+    return;
+  }
+  elements.tokenRemarkFeedback.textContent = message;
+  elements.tokenRemarkFeedback.classList.toggle("is-error", tone === "error");
+}
+
+function updateTokenRemarkFeedback() {
+  if (!elements.tokenRemarkTextarea || getTokenActionPendingKind(state.tokenRemarkTargetId) === "remark") {
+    return;
+  }
+  const remark = normalizeTokenRemarkInput(elements.tokenRemarkTextarea.value);
+  setTokenRemarkFeedback(
+    remark ? `${formatInteger(remark.length)} / ${formatInteger(TOKEN_REMARK_MAX_LENGTH)} 字` : "留空保存会清除备注。",
+    remark.length > TOKEN_REMARK_MAX_LENGTH ? "error" : "",
+  );
+}
+
+function setTokenRemarkDialogBusy(busy) {
+  const disabled = Boolean(busy);
+  if (elements.tokenRemarkTextarea) {
+    elements.tokenRemarkTextarea.disabled = disabled;
+  }
+  if (elements.tokenRemarkCancel) {
+    elements.tokenRemarkCancel.disabled = disabled;
+  }
+  if (elements.tokenRemarkClose) {
+    elements.tokenRemarkClose.disabled = disabled;
+  }
+  if (elements.tokenRemarkClear) {
+    elements.tokenRemarkClear.disabled = disabled;
+  }
+  if (elements.tokenRemarkSave) {
+    elements.tokenRemarkSave.disabled = disabled || !Number.isFinite(Number(state.tokenRemarkTargetId));
+    elements.tokenRemarkSave.textContent = disabled ? "保存中…" : "保存备注";
+  }
+}
+
+function closeTokenRemarkDialog({ force = false } = {}) {
+  const dialog = elements.tokenRemarkDialog;
+  if (!supportsTokenRemarkDialog) {
+    state.tokenRemarkTargetId = null;
+    return;
+  }
+  if (!force && state.tokenRemarkTargetId != null && getTokenActionPendingKind(state.tokenRemarkTargetId) === "remark") {
+    return;
+  }
+  if (dialog.open) {
+    dialog.close();
+    return;
+  }
+  state.tokenRemarkTargetId = null;
+  setTokenRemarkDialogBusy(false);
+  clearTokenRemarkFeedback();
+}
+
+function openTokenRemarkDialog(tokenId) {
+  const item = getTokenItemById(tokenId);
+  if (!item) {
+    return;
+  }
+
+  const context = buildTokenRemarkContext(item);
+  const currentRemark = String(item.remark || "");
+  state.tokenRemarkTargetId = Number(item.id);
+
+  if (elements.tokenRemarkTarget) {
+    elements.tokenRemarkTarget.textContent = context.title;
+  }
+  if (elements.tokenRemarkMeta) {
+    elements.tokenRemarkMeta.textContent = context.meta;
+  }
+  if (elements.tokenRemarkDescription) {
+    elements.tokenRemarkDescription.textContent = "写下这把 key 的来源、用途、限制或迁移线索。";
+  }
+  if (elements.tokenRemarkTextarea) {
+    elements.tokenRemarkTextarea.value = currentRemark;
+  }
+  setTokenRemarkDialogBusy(false);
+  updateTokenRemarkFeedback();
+
+  const dialog = elements.tokenRemarkDialog;
+  if (!supportsTokenRemarkDialog || typeof dialog.showModal !== "function") {
+    const nextRemark = window.prompt(`备注 ${context.title}`, currentRemark);
+    if (nextRemark !== null) {
+      void saveTokenRemark(item.id, nextRemark);
+    }
+    return;
+  }
+
+  if (!dialog.open) {
+    dialog.showModal();
+  }
+  window.setTimeout(() => {
+    elements.tokenRemarkTextarea?.focus();
+  }, 0);
+}
+
+async function saveTokenRemark(tokenId, remarkValue) {
+  const resolvedTokenId = Number(tokenId);
+  if (!Number.isFinite(resolvedTokenId) || isTokenActionPending(resolvedTokenId)) {
+    return;
+  }
+
+  const remark = normalizeTokenRemarkInput(remarkValue);
+  if (remark.length > TOKEN_REMARK_MAX_LENGTH) {
+    setTokenRemarkFeedback(
+      `备注最多 ${formatInteger(TOKEN_REMARK_MAX_LENGTH)} 字，当前 ${formatInteger(remark.length)} 字。`,
+      "error",
+    );
+    return;
+  }
+
+  state.tokenActionPendingKinds.set(resolvedTokenId, "remark");
+  if (state.tokenRemarkTargetId === resolvedTokenId) {
+    setTokenRemarkFeedback("正在保存备注…");
+    setTokenRemarkDialogBusy(true);
+  }
+  renderTokenList(state.tokenItems);
+
+  try {
+    const data = await fetchJson(`/admin/tokens/${resolvedTokenId}/remark`, {
+      method: "POST",
+      headers: authHeaders(true),
+      body: JSON.stringify({ remark }),
+    });
+    const returnedTokenId = Number(data?.id);
+    state.tokenItems = state.tokenItems.map((item) => {
+      const itemId = Number(item?.id);
+      if (itemId !== resolvedTokenId && itemId !== returnedTokenId) {
+        return item;
+      }
+      return {
+        ...item,
+        remark: data?.remark || "",
+        updated_at: data?.updated_at || item.updated_at,
+      };
+    });
+    clearTokenStatusPageCache();
+    renderTokenList(state.tokenItems);
+    closeTokenRemarkDialog({ force: true });
+    elements.listNote.textContent = remark ? "备注已保存" : "备注已清除";
+  } catch (error) {
+    const summary =
+      error.status === 401 ? "需要输入 Service API Key 才能保存备注" : `备注保存失败：${error.message}`;
+    elements.listNote.textContent = summary;
+    if (state.tokenRemarkTargetId === resolvedTokenId) {
+      setTokenRemarkFeedback(
+        error.status === 401 ? "需要先填写 Service API Key，才能保存这把 key 的备注。" : summary,
+        "error",
+      );
+    }
+    throw error;
+  } finally {
+    state.tokenActionPendingKinds.delete(resolvedTokenId);
+    if (state.tokenRemarkTargetId === resolvedTokenId) {
+      setTokenRemarkDialogBusy(false);
+    }
+    renderTokenList(state.tokenItems);
   }
 }
 
@@ -4778,6 +5020,11 @@ elements.tokenList.addEventListener("click", async (event) => {
     } catch {}
     return;
   }
+  const remarkButton = event.target.closest("[data-token-remark]");
+  if (remarkButton instanceof HTMLElement) {
+    openTokenRemarkDialog(remarkButton.dataset.tokenId);
+    return;
+  }
   const probeButton = event.target.closest("[data-token-probe]");
   if (probeButton instanceof HTMLElement) {
     const actions = probeButton.closest(".token-card__actions");
@@ -4888,6 +5135,69 @@ if (supportsTokenDeleteDialog) {
     state.tokenDeleteTargetId = null;
     setTokenDeleteDialogBusy(false);
     clearTokenDeleteFeedback();
+  });
+}
+
+if (elements.tokenRemarkCancel) {
+  elements.tokenRemarkCancel.addEventListener("click", () => closeTokenRemarkDialog());
+}
+
+if (elements.tokenRemarkClose) {
+  elements.tokenRemarkClose.addEventListener("click", () => closeTokenRemarkDialog());
+}
+
+if (elements.tokenRemarkClear) {
+  elements.tokenRemarkClear.addEventListener("click", () => {
+    if (!elements.tokenRemarkTextarea) {
+      return;
+    }
+    elements.tokenRemarkTextarea.value = "";
+    updateTokenRemarkFeedback();
+    elements.tokenRemarkTextarea.focus();
+  });
+}
+
+if (elements.tokenRemarkTextarea) {
+  elements.tokenRemarkTextarea.addEventListener("input", updateTokenRemarkFeedback);
+  elements.tokenRemarkTextarea.addEventListener("keydown", async (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      if (state.tokenRemarkTargetId == null) {
+        return;
+      }
+      try {
+        await saveTokenRemark(state.tokenRemarkTargetId, elements.tokenRemarkTextarea.value);
+      } catch {}
+    }
+  });
+}
+
+if (elements.tokenRemarkSave) {
+  elements.tokenRemarkSave.addEventListener("click", async () => {
+    if (state.tokenRemarkTargetId == null || !elements.tokenRemarkTextarea) {
+      return;
+    }
+    try {
+      await saveTokenRemark(state.tokenRemarkTargetId, elements.tokenRemarkTextarea.value);
+    } catch {}
+  });
+}
+
+if (supportsTokenRemarkDialog) {
+  elements.tokenRemarkDialog.addEventListener("click", (event) => {
+    if (event.target === elements.tokenRemarkDialog) {
+      closeTokenRemarkDialog();
+    }
+  });
+  elements.tokenRemarkDialog.addEventListener("cancel", (event) => {
+    if (state.tokenRemarkTargetId != null && getTokenActionPendingKind(state.tokenRemarkTargetId) === "remark") {
+      event.preventDefault();
+    }
+  });
+  elements.tokenRemarkDialog.addEventListener("close", () => {
+    state.tokenRemarkTargetId = null;
+    setTokenRemarkDialogBusy(false);
+    clearTokenRemarkFeedback();
   });
 }
 

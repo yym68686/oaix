@@ -12,6 +12,7 @@ from oaix_gateway.database import CodexToken
 from oaix_gateway.token_store import (
     ACCESS_TOKEN_ONLY_EXPIRED_ERROR,
     ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX,
+    MAX_TOKEN_REMARK_LENGTH,
     TOKEN_SELECTION_STRATEGY_FILL_FIRST,
     TokenHistoryRepairSummary,
     TokenSelectionSettings,
@@ -33,6 +34,7 @@ from oaix_gateway.token_store import (
     publish_token_payload_batch,
     repair_duplicate_token_histories,
     set_token_active_state,
+    update_token_remark,
     update_token_refresh_state,
 )
 
@@ -329,10 +331,44 @@ def test_list_token_rows_can_skip_credential_columns(monkeypatch) -> None:
     select_clause = sql.split("FROM codex_tokens", 1)[0]
     assert "codex_tokens.id_token" in select_clause
     assert "codex_tokens.raw_payload" in select_clause
+    assert "codex_tokens.remark" in select_clause
     assert "codex_tokens.access_token" not in select_clause
     assert "codex_tokens.refresh_token" not in select_clause
     assert "codex_tokens.refresh_token_aliases" not in select_clause
     assert "codex_tokens.recovery" not in select_clause
+
+
+def test_update_token_remark_normalizes_and_limits_text(monkeypatch) -> None:
+    token = CodexToken(id=12, refresh_token="rt_12", token_type="codex", is_active=True)
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield _FakeSession()
+
+    async def fake_resolve(session, token_id):
+        del session
+        assert token_id == 12
+        return token
+
+    monkeypatch.setattr("oaix_gateway.token_store.get_session", fake_get_session)
+    monkeypatch.setattr("oaix_gateway.token_store._resolve_canonical_token_for_update", fake_resolve)
+
+    result = asyncio.run(update_token_remark(12, remark="  first line\r\nsecond line  "))
+
+    assert result is token
+    assert token.remark == "first line\nsecond line"
+    assert token.updated_at is not None
+
+    asyncio.run(update_token_remark(12, remark="   "))
+    assert token.remark is None
+
+    too_long = "x" * (MAX_TOKEN_REMARK_LENGTH + 1)
+    try:
+        asyncio.run(update_token_remark(12, remark=too_long))
+    except ValueError as exc:
+        assert "remark must be at most" in str(exc)
+    else:
+        raise AssertionError("Expected long remark to be rejected")
 
 
 def test_claim_next_active_token_fill_first_is_read_only_and_uses_app_token_order(monkeypatch) -> None:

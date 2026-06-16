@@ -88,6 +88,7 @@ class CodexToken(Base):
     recovery: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     raw_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     plan_type: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    remark: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_file: Mapped[str | None] = mapped_column(String(512), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -622,6 +623,8 @@ def _run_schema_migrations(sync_conn) -> None:
             sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN merged_into_token_id INTEGER"))
         if "plan_type" not in token_columns:
             sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN plan_type VARCHAR(32)"))
+        if "remark" not in token_columns:
+            sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN remark TEXT"))
         if "disabled_at" not in token_columns:
             sync_conn.execute(text("ALTER TABLE codex_tokens ADD COLUMN disabled_at TIMESTAMPTZ"))
             sync_conn.execute(

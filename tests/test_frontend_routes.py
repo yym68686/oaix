@@ -50,6 +50,7 @@ def test_frontend_routes_are_registered() -> None:
     assert "/admin/token-selection/order" in paths
     assert "/admin/token-selection/plan-order" in paths
     assert "/admin/tokens/{token_id}/activation" in paths
+    assert "/admin/tokens/{token_id}/remark" in paths
     assert "/admin/tokens/{token_id}/probe" in paths
     assert "/admin/tokens/{token_id}" in paths
     assert "/admin/requests" in paths
@@ -77,6 +78,8 @@ def test_frontend_index_includes_token_search_input() -> None:
     assert 'id="token-search-summary"' in response.text
     assert 'id="token-pagination"' in response.text
     assert 'id="token-page-input"' in response.text
+    assert 'id="token-remark-dialog"' in response.text
+    assert 'id="token-remark-textarea"' in response.text
 
 
 def test_frontend_defaults_key_status_to_available_tab() -> None:
@@ -448,6 +451,18 @@ def test_frontend_probe_request_sends_selected_model() -> None:
     assert "const selectedModel = normalizeProbeModel(model)" in probe_function
     assert "headers: authHeaders(true)" in probe_function
     assert "body: JSON.stringify({ model: selectedModel })" in probe_function
+
+
+def test_frontend_token_remark_dialog_is_wired() -> None:
+    app_js = (WEB_DIR / "app.js").read_text()
+    remark_function = app_js.split("async function saveTokenRemark", 1)[1].split("function firstDefined", 1)[0]
+    token_renderer = app_js.split("function renderTokenResultRow", 1)[1].split("function renderCounts", 1)[0]
+
+    assert "data-token-remark=\"true\"" in app_js
+    assert "renderTokenRemarkSection(item)" in token_renderer
+    assert "`/admin/tokens/${resolvedTokenId}/remark`" in remark_function
+    assert "body: JSON.stringify({ remark })" in remark_function
+    assert "TOKEN_REMARK_MAX_LENGTH" in remark_function
 
 
 def test_frontend_summarizes_html_error_pages_before_rendering() -> None:
@@ -1186,3 +1201,41 @@ def test_token_activation_route_forwards_clear_cooldown(monkeypatch) -> None:
             "disabled": 1,
         },
     }
+
+
+def test_token_remark_route_forwards_remark(monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    app = create_app()
+    captured: dict[str, object] = {}
+    updated_at = datetime(2026, 6, 17, 8, 30, tzinfo=timezone.utc)
+
+    async def fake_update_token_remark(token_id: int, *, remark: str | None) -> CodexToken | None:
+        captured["token_id"] = token_id
+        captured["remark"] = remark
+        token = CodexToken(
+            id=token_id,
+            token_type="codex",
+            is_active=True,
+            refresh_token="rt_12",
+            remark=remark,
+        )
+        token.updated_at = updated_at
+        return token
+
+    monkeypatch.setattr("oaix_gateway.api_server.update_token_remark", fake_update_token_remark)
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/admin/tokens/12/remark",
+            json={"remark": "internal batch A"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert captured == {"token_id": 12, "remark": "internal batch A"}
+    assert response.json()["id"] == 12
+    assert response.json()["remark"] == "internal batch A"
+    assert response.json()["updated_at"] == "2026-06-17T08:30:00Z"

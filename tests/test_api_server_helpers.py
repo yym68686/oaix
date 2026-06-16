@@ -2382,6 +2382,7 @@ def test_serialize_admin_token_item_includes_created_at(monkeypatch) -> None:
         refresh_token="refresh_token",
         is_active=False,
         disabled_at=disabled_at,
+        remark="batch A for image requests",
     )
     token.created_at = created_at
     _TOKEN_ACTIVE_REQUESTS.clear()
@@ -2402,6 +2403,7 @@ def test_serialize_admin_token_item_includes_created_at(monkeypatch) -> None:
 
     assert item["created_at"] == created_at
     assert item["disabled_at"] == disabled_at
+    assert item["remark"] == "batch A for image requests"
     assert item["active_streams"] == 3
     assert item["active_stream_cap"] == 10
     _TOKEN_ACTIVE_REQUESTS.clear()
