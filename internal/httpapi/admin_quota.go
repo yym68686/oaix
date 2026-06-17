@@ -129,6 +129,9 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 	cap := a.tokens.ActiveStreamCap()
 	items := make([]adminTokenItem, 0, len(tokens))
 	for _, token := range tokens {
+		if quota := quotaByID[token.ID]; quota != nil && quota.PlanType != nil {
+			token.PlanType = quota.PlanType
+		}
 		items = append(items, adminTokenItem{
 			Token:           token,
 			ActiveStreams:   activeByID[token.ID],

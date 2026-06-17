@@ -49,6 +49,9 @@ type AuthConfig struct {
 type UpstreamConfig struct {
 	ResponsesURL              string
 	ChatCompletionsURL        string
+	OAuthTokenURL             string
+	OAuthClientID             string
+	OAuthScope                string
 	MaxRetries                int
 	ShardCount                int
 	MaxIdleConns              int
@@ -139,6 +142,9 @@ func Load() (Config, error) {
 		Upstream: UpstreamConfig{
 			ResponsesURL:              envString("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex/responses"),
 			ChatCompletionsURL:        envString("CHAT_COMPLETIONS_BASE_URL", ""),
+			OAuthTokenURL:             envString("CODEX_OAUTH_TOKEN_URL", "https://auth.openai.com/oauth/token"),
+			OAuthClientID:             envString("CODEX_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann"),
+			OAuthScope:                envString("CODEX_OAUTH_SCOPE", "openid profile email"),
 			MaxRetries:                envInt("MAX_REQUEST_ACCOUNT_RETRIES", 100),
 			ShardCount:                envInt("UPSTREAM_HTTP_SHARD_COUNT", 4),
 			MaxIdleConns:              envInt("UPSTREAM_HTTP_MAX_IDLE_CONNECTIONS", 512),

@@ -32,6 +32,12 @@ func TestLoadUsesTypedDefaultsAndEnvOverrides(t *testing.T) {
 	if cfg.TokenPool.SnapshotMaxAge != 7*time.Second {
 		t.Fatalf("SnapshotMaxAge = %s", cfg.TokenPool.SnapshotMaxAge)
 	}
+	if cfg.Upstream.OAuthTokenURL != "https://auth.openai.com/oauth/token" {
+		t.Fatalf("OAuthTokenURL = %q", cfg.Upstream.OAuthTokenURL)
+	}
+	if cfg.Upstream.OAuthClientID == "" || cfg.Upstream.OAuthScope != "openid profile email" {
+		t.Fatalf("OAuth config = %#v", cfg.Upstream)
+	}
 	if !cfg.Worker.Embedded {
 		t.Fatal("embedded worker should default to enabled")
 	}

@@ -302,10 +302,10 @@ func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, jobID
 		payloadData := jsonBytes(payload)
 		hash := refreshHashFromPayload(payload)
 		base := len(args) + 1
-		args = append(args, item.Index, status, payloadData, payloadData, hash, item.TokenID, item.Action)
+		args = append(args, item.Index, status, payloadData, payloadData, hash, item.TokenID, item.Action, item.ErrorMessage)
 		values = append(values, fmt.Sprintf(
-			"($1, $%d, $%d, $%d, $%d, $%d, $%d, nullif($%d, ''), now(), now())",
-			base, base+1, base+2, base+3, base+4, base+5, base+6,
+			"($1, $%d, $%d, $%d, $%d, $%d, $%d, nullif($%d, ''), nullif($%d, ''), now(), now())",
+			base, base+1, base+2, base+3, base+4, base+5, base+6, base+7,
 		))
 	}
 	if len(values) == 0 {
@@ -314,7 +314,7 @@ func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, jobID
 	_, err := tx.Exec(ctx, `
 		insert into token_import_items(
 			job_id, item_index, status, payload, validated_payload,
-			refresh_token_hash, token_id, action, published_at, updated_at
+			refresh_token_hash, token_id, action, error_message, published_at, updated_at
 		)
 		values `+strings.Join(values, ",")+`
 		on conflict (job_id, item_index) do update
@@ -324,6 +324,7 @@ func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, jobID
 		    refresh_token_hash = excluded.refresh_token_hash,
 		    token_id = excluded.token_id,
 		    action = excluded.action,
+		    error_message = excluded.error_message,
 		    published_at = excluded.published_at,
 		    updated_at = now()
 	`, args...)

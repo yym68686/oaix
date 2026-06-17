@@ -228,9 +228,12 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 	}
 	defer tx.Rollback(ctx)
 	for index, rawPayload := range payloads {
+		resultIndex := importPayloadIndex(rawPayload, index)
+		previousRefreshToken := stringFromPayload(rawPayload, "_previous_refresh_token")
 		payload := normalizeTokenPayload(rawPayload)
 		accessToken := stringFromPayload(payload, "access_token", "accessToken")
 		refreshToken := stringFromPayload(payload, "refresh_token", "refreshToken")
+		lastRefresh := timeFromPayload(payload, "last_refresh")
 		if refreshToken == "" && accessToken != "" {
 			refreshToken = "access:" + hashString(accessToken)
 			payload["refresh_token"] = refreshToken
@@ -239,7 +242,7 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 		if refreshToken == "" {
 			result.Failed++
 			result.Items = append(result.Items, ImportResultItem{
-				Index:        index,
+				Index:        resultIndex,
 				Action:       "failed",
 				ErrorMessage: "token payload missing refresh_token or access_token",
 				Status:       "failed",
@@ -274,7 +277,14 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 		}
 
 		var existingID int64
-		err := tx.QueryRow(ctx, `select id from codex_tokens where refresh_token = $1 and merged_into_token_id is null limit 1`, refreshToken).Scan(&existingID)
+		err := tx.QueryRow(ctx, `
+					select id
+					from codex_tokens
+					where merged_into_token_id is null
+					  and refresh_token = any($1::text[])
+					order by case when $2 <> '' and refresh_token = $2 then 0 else 1 end, id desc
+					limit 1
+				`, postgresTextArray(refreshToken, previousRefreshToken), strings.TrimSpace(previousRefreshToken)).Scan(&existingID)
 		if err != nil && err != pgx.ErrNoRows {
 			return result, err
 		}
@@ -283,20 +293,22 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 				update codex_tokens
 				set access_token = coalesce(nullif($2, ''), access_token),
 				    account_id = coalesce($3, account_id),
-				    email = coalesce($4, email),
-				    plan_type = coalesce($5, plan_type),
-				    source_file = coalesce($6, source_file),
-				    id_token = coalesce($7, id_token),
-				    type = coalesce(nullif($8, ''), type, 'codex'),
-				    raw_payload = coalesce($9, raw_payload),
-				    is_active = $10,
-				    disabled_at = case when $10 then null else coalesce(disabled_at, now()) end,
-				    last_error = $11,
-				    updated_at = now()
-				where id = $1
-				returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-				          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
-			`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(payload), isActive, lastError)
+					    email = coalesce($4, email),
+					    plan_type = coalesce($5, plan_type),
+					    source_file = coalesce($6, source_file),
+					    id_token = coalesce($7, id_token),
+					    type = coalesce(nullif($8, ''), type, 'codex'),
+					    raw_payload = coalesce($9, raw_payload),
+					    is_active = $10,
+					    disabled_at = case when $10 then null else coalesce(disabled_at, now()) end,
+					    last_error = $11,
+					    refresh_token = coalesce(nullif($12, ''), refresh_token),
+					    last_refresh = coalesce($13, last_refresh),
+					    updated_at = now()
+					where id = $1
+					returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+					          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(payload), isActive, lastError, refreshToken, lastRefresh)
 			token, scanErr := scanToken(row)
 			if scanErr != nil {
 				return result, scanErr
@@ -309,7 +321,7 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 			result.Tokens = append(result.Tokens, token)
 			tokenID := token.ID
 			result.Items = append(result.Items, ImportResultItem{
-				Index:   index,
+				Index:   resultIndex,
 				TokenID: &tokenID,
 				Action:  action,
 				Status:  "published",
@@ -318,14 +330,14 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 		}
 
 		row := tx.QueryRow(ctx, `
-			insert into codex_tokens (
-				email, account_id, id_token, access_token, refresh_token, raw_payload, plan_type, source_file,
-				type, is_active, disabled_at, last_error, created_at, updated_at
-			)
-			values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, case when $10 then null else now() end, $11, now(), now())
-			returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-			          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
-		`, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError)
+				insert into codex_tokens (
+					email, account_id, id_token, access_token, refresh_token, raw_payload, plan_type, source_file,
+					type, is_active, disabled_at, last_error, last_refresh, created_at, updated_at
+				)
+				values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, case when $10 then null else now() end, $11, $12, now(), now())
+				returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+				          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+			`, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh)
 		token, scanErr := scanToken(row)
 		if scanErr != nil {
 			return result, scanErr
@@ -337,7 +349,7 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 		result.Tokens = append(result.Tokens, token)
 		tokenID := token.ID
 		result.Items = append(result.Items, ImportResultItem{
-			Index:   index,
+			Index:   resultIndex,
 			TokenID: &tokenID,
 			Action:  "created",
 			Status:  "published",
@@ -695,9 +707,38 @@ func nullableString(value string) *string {
 	return &value
 }
 
+func timeFromPayload(payload map[string]any, keys ...string) *time.Time {
+	for _, key := range keys {
+		switch value := payload[key].(type) {
+		case time.Time:
+			if !value.IsZero() {
+				normalized := value.UTC()
+				return &normalized
+			}
+		case string:
+			text := strings.TrimSpace(value)
+			if text == "" {
+				continue
+			}
+			if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
+				normalized := parsed.UTC()
+				return &normalized
+			}
+			if parsed, err := time.Parse(time.RFC3339, text); err == nil {
+				normalized := parsed.UTC()
+				return &normalized
+			}
+		}
+	}
+	return nil
+}
+
 func normalizeTokenPayload(payload map[string]any) map[string]any {
 	out := make(map[string]any, len(payload)+2)
 	for key, value := range payload {
+		if key == "_import_index" || key == "_previous_refresh_token" {
+			continue
+		}
 		out[key] = value
 	}
 	if out["access_token"] == nil {
@@ -720,6 +761,46 @@ func normalizeTokenPayload(payload map[string]any) map[string]any {
 		}
 	}
 	return out
+}
+
+func postgresTextArray(values ...string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func importPayloadIndex(payload map[string]any, fallback int) int {
+	switch value := payload["_import_index"].(type) {
+	case int:
+		if value >= 0 {
+			return value
+		}
+	case int64:
+		if value >= 0 {
+			return int(value)
+		}
+	case float64:
+		index := int(value)
+		if value == float64(index) && index >= 0 {
+			return index
+		}
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil && parsed >= 0 {
+			return int(parsed)
+		}
+	}
+	return fallback
 }
 
 func stringFromPayload(payload map[string]any, keys ...string) string {

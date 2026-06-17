@@ -1100,6 +1100,7 @@ function TokenCard({
 }: Parameters<typeof TokenExplorer>[0] & { item: TokenItem }) {
   const status = tokenStatusOf(item);
   const title = tokenTitle(item);
+  const planType = tokenPlanType(item);
   const checked = selectedIds.has(item.id);
   const secondaryText = item.remark || item.source_file || "-";
   const probeResult = probeResults[item.id];
@@ -1133,8 +1134,8 @@ function TokenCard({
                 </strong>
                 <Badge size="sm" variant="outline">ID {item.id}</Badge>
                 <Badge size="sm" variant={statusBadge(status)}>{tokenStatusLabel(status)}</Badge>
-                <Badge className="max-w-[7rem] truncate" size="sm" title={item.plan_type || "unknown"} variant="secondary">
-                  {item.plan_type || "unknown"}
+                <Badge className="max-w-[7rem] truncate" size="sm" title={planType} variant="secondary">
+                  {planType}
                 </Badge>
               </div>
               <div className="flex shrink-0 flex-wrap items-center gap-1">
@@ -1640,6 +1641,7 @@ function ImportBatchDetailPanel({
 function ImportBatchTokenRow({ token }: { token: TokenItem }) {
   const status = tokenStatusOf(token);
   const title = tokenTitle(token);
+  const planType = tokenPlanType(token);
   return (
     <TableRow>
       <TableCell>
@@ -1656,8 +1658,8 @@ function ImportBatchTokenRow({ token }: { token: TokenItem }) {
       <TableCell>
         <div className="flex flex-wrap items-center gap-1">
           <Badge size="sm" variant={statusBadge(status)}>{tokenStatusLabel(status)}</Badge>
-          <Badge className="max-w-24 truncate" size="sm" title={token.plan_type || "unknown"} variant="secondary">
-            {token.plan_type || "unknown"}
+          <Badge className="max-w-24 truncate" size="sm" title={planType} variant="secondary">
+            {planType}
           </Badge>
         </div>
       </TableCell>
@@ -1895,6 +1897,10 @@ function ToastStack({ items }: { items: ToastMessage[] }) {
 
 function tokenTitle(item: TokenItem): string {
   return item.email || item.account_id || `Token #${item.id}`;
+}
+
+function tokenPlanType(item: TokenItem): string {
+  return item.quota?.plan_type || item.plan_type || "unknown";
 }
 
 function tokenStatusOf(item: TokenItem): "active" | "cooling" | "disabled" {

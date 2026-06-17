@@ -20,6 +20,7 @@ import (
 
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/logs"
+	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/proxy"
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/tokens"
@@ -388,12 +389,15 @@ func (a *App) importTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	result, err := a.store.UpsertTokenPayloads(ctx, payloads, "admin_api")
+	originalPayloads := payloads
+	upsertPayloads, preflightResult := a.prepareImportPayloads(ctx, originalPayloads)
+	result, err := a.store.UpsertTokenPayloads(ctx, upsertPayloads, "admin_api")
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	job, err := a.store.CreateCompletedImportJob(ctx, payloads, queuePosition, result)
+	result = mergeImportResults(preflightResult, result)
+	job, err := a.store.CreateCompletedImportJob(ctx, originalPayloads, queuePosition, result)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -411,6 +415,104 @@ func (a *App) importTokens(w http.ResponseWriter, r *http.Request) {
 		"job":    job,
 		"result": result,
 	})
+}
+
+func (a *App) prepareImportPayloads(ctx context.Context, payloads []map[string]any) ([]map[string]any, store.ImportResult) {
+	result := store.ImportResult{}
+	out := make([]map[string]any, 0, len(payloads))
+	client := oauth.NewHTTPClient(a.cfg.Upstream.OAuthTokenURL)
+	client.ClientID = a.cfg.Upstream.OAuthClientID
+	client.Scope = a.cfg.Upstream.OAuthScope
+	for index, payload := range payloads {
+		normalized := clonePayload(payload)
+		refreshToken := stringFromImportPayload(normalized, "refresh_token", "refreshToken")
+		accessToken := stringFromImportPayload(normalized, "access_token", "accessToken")
+		if accessToken == "" {
+			if token := stringFromImportPayload(normalized, "token"); looksLikeAccessTokenText(token) {
+				accessToken = token
+			}
+		}
+		if refreshToken != "" && accessToken == "" {
+			refreshed, err := client.Refresh(ctx, refreshToken)
+			if err != nil {
+				result.Failed++
+				result.Items = append(result.Items, store.ImportResultItem{
+					Index:        index,
+					Action:       "failed",
+					Status:       "failed",
+					ErrorMessage: sanitizeImportError(err),
+				})
+				continue
+			}
+			normalized["_previous_refresh_token"] = refreshToken
+			normalized["access_token"] = refreshed.AccessToken
+			if refreshed.RefreshToken != "" {
+				normalized["refresh_token"] = refreshed.RefreshToken
+			}
+			if refreshed.IDToken != "" {
+				normalized["id_token"] = refreshed.IDToken
+			}
+			if refreshed.AccountID != "" {
+				normalized["account_id"] = refreshed.AccountID
+				normalized["chatgpt_account_id"] = refreshed.AccountID
+			}
+			if refreshed.Email != "" {
+				normalized["email"] = refreshed.Email
+			}
+			if refreshed.PlanType != "" {
+				normalized["plan_type"] = refreshed.PlanType
+			}
+			normalized["last_refresh"] = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+		normalized["_import_index"] = index
+		out = append(out, normalized)
+	}
+	return out, result
+}
+
+func mergeImportResults(left store.ImportResult, right store.ImportResult) store.ImportResult {
+	if left.Failed == 0 && len(left.Items) == 0 {
+		return right
+	}
+	right.Created += left.Created
+	right.Updated += left.Updated
+	right.Skipped += left.Skipped
+	right.Failed += left.Failed
+	if len(left.Tokens) > 0 {
+		right.Tokens = append(left.Tokens, right.Tokens...)
+	}
+	if len(left.Items) > 0 {
+		right.Items = append(left.Items, right.Items...)
+	}
+	return right
+}
+
+func clonePayload(payload map[string]any) map[string]any {
+	out := make(map[string]any, len(payload))
+	for key, value := range payload {
+		out[key] = value
+	}
+	return out
+}
+
+func stringFromImportPayload(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func sanitizeImportError(err error) string {
+	value := strings.TrimSpace(err.Error())
+	if value == "" {
+		return "token refresh failed"
+	}
+	if len(value) > 500 {
+		value = value[:500]
+	}
+	return value
 }
 
 func (a *App) getToken(w http.ResponseWriter, r *http.Request) {

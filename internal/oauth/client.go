@@ -16,6 +16,7 @@ import (
 type RefreshResult struct {
 	AccessToken  string
 	RefreshToken string
+	IDToken      string
 	ExpiresIn    int
 	AccountID    string
 	Email        string
@@ -28,6 +29,8 @@ type Client interface {
 
 type HTTPClient struct {
 	TokenURL   string
+	ClientID   string
+	Scope      string
 	HTTPClient *http.Client
 	MaxRetries int
 	metrics    Metrics
@@ -51,6 +54,7 @@ const (
 func NewHTTPClient(tokenURL string) *HTTPClient {
 	return &HTTPClient{
 		TokenURL: tokenURL,
+		Scope:    "openid profile email",
 		HTTPClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -106,13 +110,20 @@ func (c *HTTPClient) Stats() Metrics {
 
 func (c *HTTPClient) refreshOnce(ctx context.Context, refreshToken string) (RefreshResult, int, error) {
 	form := url.Values{}
+	if c.ClientID != "" {
+		form.Set("client_id", c.ClientID)
+	}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
+	if c.Scope != "" {
+		form.Set("scope", c.Scope)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.TokenURL, bytes.NewBufferString(form.Encode()))
 	if err != nil {
 		return RefreshResult{}, 0, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return RefreshResult{}, 0, err
@@ -137,6 +148,7 @@ func ParseRefreshResponse(body []byte) (RefreshResult, error) {
 	result := RefreshResult{
 		AccessToken:  stringField(payload, "access_token"),
 		RefreshToken: stringField(payload, "refresh_token"),
+		IDToken:      stringField(payload, "id_token"),
 		AccountID:    stringField(payload, "account_id"),
 		Email:        stringField(payload, "email"),
 		PlanType:     stringField(payload, "plan_type"),

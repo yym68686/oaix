@@ -40,6 +40,9 @@ func TestHTTPClientRefreshRetries(t *testing.T) {
 		if err := r.ParseForm(); err != nil {
 			t.Fatalf("ParseForm: %v", err)
 		}
+		if r.Form.Get("client_id") != "client-fixture" || r.Form.Get("scope") != "scope-fixture" {
+			t.Fatalf("missing oauth client metadata: %v", r.Form)
+		}
 		if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "rt" {
 			t.Fatalf("unexpected form: %v", r.Form)
 		}
@@ -48,6 +51,8 @@ func TestHTTPClientRefreshRetries(t *testing.T) {
 	}))
 	defer server.Close()
 	client := NewHTTPClient(server.URL)
+	client.ClientID = "client-fixture"
+	client.Scope = "scope-fixture"
 	client.MaxRetries = 2
 	result, err := client.Refresh(context.Background(), "rt")
 	if err != nil {

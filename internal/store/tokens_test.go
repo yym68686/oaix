@@ -52,6 +52,48 @@ func TestParseAccessTokenClaims(t *testing.T) {
 	}
 }
 
+func TestNormalizeTokenPayloadDropsImportMetadata(t *testing.T) {
+	payload := normalizeTokenPayload(map[string]any{
+		"_import_index":           7,
+		"_previous_refresh_token": "rt-old",
+		"refresh_token":           "rt-new",
+	})
+	if _, ok := payload["_import_index"]; ok {
+		t.Fatalf("internal import index leaked: %#v", payload)
+	}
+	if _, ok := payload["_previous_refresh_token"]; ok {
+		t.Fatalf("previous refresh token leaked: %#v", payload)
+	}
+	if payload["refresh_token"] != "rt-new" {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if importPayloadIndex(map[string]any{"_import_index": float64(9)}, 1) != 9 {
+		t.Fatal("importPayloadIndex did not parse numeric metadata")
+	}
+}
+
+func TestTimeFromPayloadParsesRFC3339Nano(t *testing.T) {
+	got := timeFromPayload(map[string]any{
+		"last_refresh": "2026-06-17T12:34:56.123456789+08:00",
+	}, "last_refresh")
+	if got == nil {
+		t.Fatal("expected parsed timestamp")
+	}
+	if got.Location() != time.UTC {
+		t.Fatalf("timestamp location = %s", got.Location())
+	}
+	if got.Format(time.RFC3339Nano) != "2026-06-17T04:34:56.123456789Z" {
+		t.Fatalf("timestamp = %s", got.Format(time.RFC3339Nano))
+	}
+}
+
+func TestPostgresTextArrayDeduplicates(t *testing.T) {
+	got := postgresTextArray(" rt1 ", "", "rt2", "rt1")
+	if len(got) != 2 || got[0] != "rt1" || got[1] != "rt2" {
+		t.Fatalf("postgresTextArray = %#v", got)
+	}
+}
+
 func TestScanTokenAllowsMissingSecretColumns(t *testing.T) {
 	now := time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC)
 	token, err := scanToken(fakeTokenRow{values: []any{
