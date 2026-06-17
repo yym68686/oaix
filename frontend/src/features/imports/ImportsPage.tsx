@@ -543,7 +543,7 @@ function ImportBatchDetailDialog({
   const items = detail?.items || [];
   const failedItems = items.filter((item) => item.error_message);
   const statusOptions = useMemo(() => statusOptionsWithCounts(countTokenStatuses(tokens)), [tokens]);
-  const planOptions = useMemo(() => planOptionsWithCounts(countTokenPlans(tokens)), [tokens]);
+  const planOptions = useMemo(() => planOptionsWithCounts(countTokenPlans(tokens, status)), [status, tokens]);
   const filteredTokens = useMemo(
     () =>
       tokens.filter((token) => {
@@ -660,9 +660,14 @@ function countTokenStatuses(tokens: TokenItem[]): TokenCounts {
   return counts;
 }
 
-function countTokenPlans(tokens: TokenItem[]): TokenPlanCount[] {
+function countTokenPlans(tokens: TokenItem[], status: TokenStatus = "all"): TokenPlanCount[] {
   const countByPlan = new Map<string, number>();
   for (const token of tokens) {
+    const tokenStatus = tokenStatusOf(token);
+    const matchesStatus = status === "all" || (status === "available" ? tokenStatus === "active" : tokenStatus === status);
+    if (!matchesStatus) {
+      continue;
+    }
     const plan = normalizePlanValue(tokenPlanType(token)) || "unknown";
     countByPlan.set(plan, (countByPlan.get(plan) || 0) + 1);
   }

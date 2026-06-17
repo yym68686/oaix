@@ -332,7 +332,7 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 	counts, _ := a.store.TokenCounts(ctx)
 	planCtx, planCancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer planCancel()
-	planCounts, _ := a.store.TokenPlanCounts(planCtx, store.TokenListOptions{})
+	planCounts, _ := a.store.TokenPlanCounts(planCtx, tokenOpts)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts":          counts,
 		"filtered_counts": counts,
