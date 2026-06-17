@@ -2,11 +2,10 @@ package tokens
 
 import (
 	"context"
+	"crypto/sha256"
 	"sort"
 	"strconv"
 	"time"
-
-	"golang.org/x/crypto/blake2b"
 
 	"github.com/yym68686/oaix/internal/affinity"
 )
@@ -295,17 +294,7 @@ func sortTokenCandidates(affinityKey string, snapshot *Snapshot, tokenIDs []int6
 }
 
 func rendezvousScore(affinityKey string, tokenID int64) uint64 {
-	hash, err := blake2b.New(8, nil)
-	if err != nil {
-		return 0
-	}
-	_, _ = hash.Write([]byte(affinityKey))
-	_, _ = hash.Write([]byte(":"))
-	_, _ = hash.Write([]byte(strconv.FormatInt(tokenID, 10)))
-	sum := hash.Sum(nil)
-	if len(sum) < 8 {
-		return 0
-	}
+	sum := sha256.Sum256([]byte(affinityKey + ":" + strconv.FormatInt(tokenID, 10)))
 	return uint64(sum[0])<<56 | uint64(sum[1])<<48 | uint64(sum[2])<<40 | uint64(sum[3])<<32 |
 		uint64(sum[4])<<24 | uint64(sum[5])<<16 | uint64(sum[6])<<8 | uint64(sum[7])
 }
