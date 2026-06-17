@@ -52,3 +52,11 @@ func TestStartOpenAIOAuthBuildsAuthorizationURL(t *testing.T) {
 		t.Fatalf("missing pkce fields: %s", authURL.RawQuery)
 	}
 }
+
+func TestPublicOriginDefaultsHTTPSForPublicHost(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/admin/oauth/openai/start", nil)
+	request.Host = "oaix.fugue.pro"
+	if got := publicOrigin(request); got != "https://oaix.fugue.pro" {
+		t.Fatalf("publicOrigin = %q", got)
+	}
+}

@@ -242,16 +242,28 @@ func (a *App) oauthRedirectURI(r *http.Request, requested string) string {
 
 func publicOrigin(r *http.Request) string {
 	proto := firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))
+	host := firstForwardedValue(r.Header.Get("X-Forwarded-Host"))
+	if proto == "" || host == "" {
+		if forwardedProto, forwardedHost := parseForwardedHeader(r.Header.Get("Forwarded")); proto == "" || host == "" {
+			if proto == "" {
+				proto = forwardedProto
+			}
+			if host == "" {
+				host = forwardedHost
+			}
+		}
+	}
+	if host == "" {
+		host = r.Host
+	}
 	if proto == "" {
 		if r.TLS != nil {
+			proto = "https"
+		} else if shouldDefaultHTTPS(host) {
 			proto = "https"
 		} else {
 			proto = "http"
 		}
-	}
-	host := firstForwardedValue(r.Header.Get("X-Forwarded-Host"))
-	if host == "" {
-		host = r.Host
 	}
 	return strings.TrimRight(proto, "/") + "://" + host
 }
@@ -263,6 +275,38 @@ func firstForwardedValue(value string) string {
 	}
 	parts := strings.Split(value, ",")
 	return strings.TrimSpace(parts[0])
+}
+
+func parseForwardedHeader(value string) (string, string) {
+	value = firstForwardedValue(value)
+	if value == "" {
+		return "", ""
+	}
+	var proto string
+	var host string
+	for _, part := range strings.Split(value, ";") {
+		key, val, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok {
+			continue
+		}
+		val = strings.Trim(strings.TrimSpace(val), `"`)
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "proto":
+			proto = val
+		case "host":
+			host = val
+		}
+	}
+	return proto, host
+}
+
+func shouldDefaultHTTPS(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host != "" &&
+		!strings.HasPrefix(host, "localhost") &&
+		!strings.HasPrefix(host, "127.") &&
+		!strings.HasPrefix(host, "[::1]") &&
+		!strings.HasPrefix(host, "::1")
 }
 
 func normalizeImportQueuePosition(value string) string {
