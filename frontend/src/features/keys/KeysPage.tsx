@@ -117,7 +117,6 @@ function KeyListPage({
   const [error, setError] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
   const [probeBusyIds, setProbeBusyIds] = useState<Set<number>>(() => new Set());
-  const [probeResults, setProbeResults] = useState<Record<number, TokenProbeResponse>>({});
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
 
@@ -197,7 +196,6 @@ function KeyListPage({
     setProbeBusyIds((current) => new Set(current).add(id));
     try {
       const result = await api.probeToken(id);
-      setProbeResults((items) => ({ ...items, [id]: result }));
       pushToast(result.message || "测试完成", probeToastVariant(result.outcome));
       await loadTokens();
     } catch (caught) {
@@ -342,7 +340,6 @@ function KeyListPage({
             onSelectedChange={setSelectedIds}
             onToggleActivation={(id, active) => void updateActivation(id, active)}
             probeBusyIds={probeBusyIds}
-            probeResults={probeResults}
             selectedIds={selectedIds}
             tokens={tokens}
           />
@@ -370,7 +367,6 @@ function TokenTable({
   onSelectedChange,
   onToggleActivation,
   probeBusyIds,
-  probeResults,
   selectedIds,
   tokens,
 }: {
@@ -383,7 +379,6 @@ function TokenTable({
   onSelectedChange: (selected: Set<number>) => void;
   onToggleActivation: (id: number, active: boolean) => void;
   probeBusyIds: Set<number>;
-  probeResults: Record<number, TokenProbeResponse>;
   selectedIds: Set<number>;
   tokens: TokenItem[];
 }) {
@@ -406,7 +401,8 @@ function TokenTable({
             <TableHead>状态</TableHead>
             <TableHead>额度</TableHead>
             <TableHead>并发 / 金额</TableHead>
-            <TableHead>最近 / 备注</TableHead>
+            <TableHead>最近</TableHead>
+            <TableHead>备注</TableHead>
             <TableHead className="text-right">操作</TableHead>
           </TableRow>
         </TableHeader>
@@ -422,7 +418,6 @@ function TokenTable({
               onSelectedChange={onSelectedChange}
               onToggleActivation={onToggleActivation}
               probeBusy={probeBusyIds.has(item.id)}
-              probeResult={probeResults[item.id]}
               selectedIds={selectedIds}
             />
           ))}
@@ -441,7 +436,6 @@ function TokenRow({
   onSelectedChange,
   onToggleActivation,
   probeBusy,
-  probeResult,
   selectedIds,
 }: {
   activeStreamCap: number;
@@ -452,7 +446,6 @@ function TokenRow({
   onSelectedChange: (selected: Set<number>) => void;
   onToggleActivation: (id: number, active: boolean) => void;
   probeBusy: boolean;
-  probeResult?: TokenProbeResponse;
   selectedIds: Set<number>;
 }) {
   const status = tokenStatusOf(item);
@@ -477,7 +470,7 @@ function TokenRow({
         />
       </TableCell>
       <TableCell className="min-w-[18rem] max-w-[28rem]">
-        <div className="grid min-w-0 gap-1">
+        <div className="grid max-h-11 min-w-0 gap-1 overflow-hidden">
           <button className="min-w-0 text-left font-medium hover:underline" onClick={() => navigateTo(`/keys/${item.id}`)} type="button">
             <span className="block truncate" title={title}>
               {title}
@@ -496,7 +489,7 @@ function TokenRow({
         </div>
       </TableCell>
       <TableCell>
-        <div className="flex flex-wrap items-center gap-1">
+        <div className="flex max-h-6 flex-wrap items-center gap-1 overflow-hidden">
           <Badge size="sm" variant={statusBadge(status)}>
             {tokenStatusLabel(status)}
           </Badge>
@@ -506,32 +499,26 @@ function TokenRow({
         </div>
       </TableCell>
       <TableCell>
-        <div className="flex min-w-[11rem] flex-wrap items-center gap-1 text-[11px]">
+        <div className="flex max-h-11 min-w-[11rem] flex-wrap items-center gap-1 overflow-hidden text-[11px]">
           <TokenQuotaStrip quota={item.quota} />
         </div>
       </TableCell>
       <TableCell>
-        <div className="flex min-w-[12rem] flex-wrap items-center gap-1 text-[11px]">
+        <div className="flex max-h-11 min-w-[12rem] flex-wrap items-center gap-1 overflow-hidden text-[11px]">
           <TokenConcurrency fallbackCap={activeStreamCap} item={item} />
           <TokenObservedCost value={item.observed_cost_usd} />
         </div>
       </TableCell>
-      <TableCell className="max-w-[24rem]">
-        <div className="grid min-w-0 gap-1 text-xs">
-          <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
-            <span className="oaix-tabular">最近 {formatDate(item.last_used_at)}</span>
-            <span className="oaix-tabular">冷却 {formatDate(item.cooldown_until)}</span>
-          </div>
-          <span className="min-w-0 truncate text-muted-foreground" title={secondaryText}>
-            {secondaryText}
-          </span>
-          {probeResult && <TokenProbeResult result={probeResult} />}
-          {item.last_error && (
-            <span className="min-w-0 truncate rounded-md bg-muted/64 px-2 py-1 font-mono text-muted-foreground" title={item.last_error}>
-              {item.last_error}
-            </span>
-          )}
+      <TableCell>
+        <div className="grid max-h-10 min-w-0 gap-1 overflow-hidden text-xs">
+          <span className="oaix-tabular text-muted-foreground">最近 {formatDate(item.last_used_at)}</span>
+          <span className="oaix-tabular text-muted-foreground">冷却 {formatDate(item.cooldown_until)}</span>
         </div>
+      </TableCell>
+      <TableCell className="max-w-[18rem]">
+        <span className="block min-w-0 truncate text-muted-foreground text-xs" title={secondaryText}>
+          {secondaryText}
+        </span>
       </TableCell>
       <TableCell>
         <div className="flex justify-end gap-1">

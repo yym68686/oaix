@@ -5,8 +5,7 @@ import {
   Trash2Icon,
   UploadIcon,
 } from "lucide-react";
-import type * as React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
@@ -354,89 +353,123 @@ function ImportBatchList({
     return <EmptyState title="暂无导入批次" description="导入任务提交后会在这里出现。" />;
   }
   return (
-    <div className="grid gap-3">
+    <div className="min-w-0 overflow-hidden rounded-lg border">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>批次</TableHead>
+            <TableHead>状态</TableHead>
+            <TableHead>数量</TableHead>
+            <TableHead>进度</TableHead>
+            <TableHead>变更</TableHead>
+            <TableHead>余额</TableHead>
+            <TableHead>时间</TableHead>
+            <TableHead className="text-right">操作</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
       {batches.map((job) => {
         const expanded = expandedId === job.id;
         const detail = details[job.id];
         const cancelable = importBatchCancelable(job.status);
+        const errorText = job.last_error || job.error_message || "";
         return (
-          <Card key={job.id} className="block overflow-hidden">
-            <CardPanel className="grid flex-none gap-3 p-3">
-              <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <strong className="text-sm">导入批次 #{job.id}</strong>
-                    <Badge size="sm" variant={importBatchBadge(job.status)}>
-                      {importBatchStatusLabel(job.status)}
+          <Fragment key={job.id}>
+            <TableRow data-state={expanded ? "selected" : undefined}>
+              <TableCell className="min-w-[12rem]">
+                <div className="grid min-w-0 gap-1">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <strong className="truncate text-sm">导入批次 #{job.id}</strong>
+                    <Badge className="shrink-0" size="sm" variant="outline">
+                      {job.import_queue_position === "back" ? "最后" : "开头"}
                     </Badge>
-                    <Badge size="sm" variant="outline">
-                      {formatNumber(importBatchTotal(job))} key
-                    </Badge>
-                    <span className="oaix-tabular text-muted-foreground text-xs">提交 {formatDate(job.submitted_at)}</span>
-                    {job.finished_at && <span className="oaix-tabular text-muted-foreground text-xs">完成 {formatDate(job.finished_at)}</span>}
                   </div>
-                  <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-                    <ImportBatchMetric label="进度" value={`${formatNumber(job.processed_count)} / ${formatNumber(job.total_count)}`} />
-                    <ImportBatchMetric label="变更" value={`新 ${formatNumber(job.created_count)} · 更 ${formatNumber(job.updated_count)} · 跳 ${formatNumber(job.skipped_count)}`} />
-                    <ImportBatchMetric label="状态" value={`有效 ${formatNumber(job.available)} · 冷却 ${formatNumber(job.cooling)} · 禁用 ${formatNumber(job.disabled)}`} />
-                    <ImportBatchMetric label="余额" value={`${formatUSDOptional(job.observed_cost_usd)} · 平均 ${formatUSDOptional(job.average_observed_cost_usd)}`} />
-                  </div>
-                  {(job.failed_count || job.missing || job.last_error || job.error_message) ? (
-                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                      {Boolean(job.failed_count) && (
-                        <Badge size="sm" variant="error">
-                          失败 {formatNumber(job.failed_count)}
-                        </Badge>
-                      )}
-                      {Boolean(job.missing) && (
-                        <Badge size="sm" variant="warning">
-                          缺失 {formatNumber(job.missing)}
-                        </Badge>
-                      )}
-                      {(job.last_error || job.error_message) && (
-                        <span className="min-w-0 truncate text-destructive-foreground" title={job.last_error || job.error_message || ""}>
-                          {job.last_error || job.error_message}
-                        </span>
-                      )}
-                    </div>
-                  ) : null}
+                  {errorText && (
+                    <span className="min-w-0 truncate text-destructive-foreground text-xs" title={errorText}>
+                      {errorText}
+                    </span>
+                  )}
                 </div>
-                <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
-                  <Button onClick={() => onToggle(job.id)} size="sm" variant={expanded ? "secondary" : "outline"}>
+              </TableCell>
+              <TableCell>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Badge size="sm" variant={importBatchBadge(job.status)}>
+                    {importBatchStatusLabel(job.status)}
+                  </Badge>
+                  {Boolean(job.failed_count) && (
+                    <Badge size="sm" variant="error">
+                      失败 {formatNumber(job.failed_count)}
+                    </Badge>
+                  )}
+                  {Boolean(job.missing) && (
+                    <Badge size="sm" variant="warning">
+                      缺失 {formatNumber(job.missing)}
+                    </Badge>
+                  )}
+                </div>
+              </TableCell>
+              <TableCell>
+                <div className="grid gap-1 text-xs">
+                  <span className="oaix-tabular font-medium">{formatNumber(importBatchTotal(job))} key</span>
+                  <span className="oaix-tabular text-muted-foreground">
+                    有效 {formatNumber(job.available)} · 冷却 {formatNumber(job.cooling)} · 禁用 {formatNumber(job.disabled)}
+                  </span>
+                </div>
+              </TableCell>
+              <TableCell>
+                <span className="oaix-tabular text-sm">
+                  {formatNumber(job.processed_count)} / {formatNumber(job.total_count)}
+                </span>
+              </TableCell>
+              <TableCell>
+                <span className="oaix-tabular text-muted-foreground text-xs">
+                  新 {formatNumber(job.created_count)} · 更 {formatNumber(job.updated_count)} · 跳 {formatNumber(job.skipped_count)}
+                </span>
+              </TableCell>
+              <TableCell>
+                <div className="grid gap-1 text-xs">
+                  <span className="oaix-tabular font-medium">{formatUSDOptional(job.observed_cost_usd)}</span>
+                  <span className="oaix-tabular text-muted-foreground">平均 {formatUSDOptional(job.average_observed_cost_usd)}</span>
+                </div>
+              </TableCell>
+              <TableCell>
+                <div className="grid gap-1 text-muted-foreground text-xs">
+                  <span className="oaix-tabular">提交 {formatDate(job.submitted_at)}</span>
+                  <span className="oaix-tabular">完成 {formatDate(job.finished_at || job.completed_at)}</span>
+                </div>
+              </TableCell>
+              <TableCell>
+                <div className="flex justify-end gap-1">
+                  <Button onClick={() => onToggle(job.id)} size="xs" variant={expanded ? "secondary" : "outline"}>
                     {expanded ? <ChevronDownIcon /> : <ChevronRightIcon />}
                     {expanded ? "收起 Key" : "查看 Key"}
                   </Button>
                   {cancelable && (
-                    <Button onClick={() => onCancel(job.id)} size="sm" variant="destructive-outline">
+                    <Button onClick={() => onCancel(job.id)} size="xs" variant="destructive-outline">
                       <Trash2Icon />
                       取消
                     </Button>
                   )}
                 </div>
-              </div>
-              {expanded && (
-                <ImportBatchDetailPanel
-                  detail={detail}
-                  error={detailErrors[job.id]}
-                  fallbackJob={job}
-                  loading={detailLoadingId === job.id}
-                />
-              )}
-            </CardPanel>
-          </Card>
+              </TableCell>
+            </TableRow>
+            {expanded && (
+              <TableRow>
+                <TableCell className="bg-muted/16 p-3" colSpan={8}>
+                  <ImportBatchDetailPanel
+                    detail={detail}
+                    error={detailErrors[job.id]}
+                    fallbackJob={job}
+                    loading={detailLoadingId === job.id}
+                  />
+                </TableCell>
+              </TableRow>
+            )}
+          </Fragment>
         );
       })}
-    </div>
-  );
-}
-
-function ImportBatchMetric({ label, value }: { label: string; value: React.ReactNode }) {
-  return (
-    <div className="min-w-0 rounded-lg border bg-muted/32 px-2.5 py-2">
-      <div className="text-muted-foreground text-[11px]">{label}</div>
-      <div className="mt-0.5 min-w-0 truncate oaix-tabular text-xs font-medium" title={typeof value === "string" ? value : undefined}>
-        {value || "-"}
-      </div>
+        </TableBody>
+      </Table>
     </div>
   );
 }
@@ -457,7 +490,7 @@ function ImportBatchDetailPanel({
   }
   if (loading && !detail) {
     return (
-      <div className="grid gap-2 border-t pt-3">
+      <div className="grid gap-2">
         <LoadingRows rows={2} />
       </div>
     );
@@ -469,7 +502,7 @@ function ImportBatchDetailPanel({
     return <div className="rounded-lg border border-dashed bg-muted/24 p-4 text-muted-foreground text-sm">这个批次暂时没有可关联的 key 明细。</div>;
   }
   return (
-    <div className="grid gap-3 border-t pt-3">
+    <div className="grid gap-3">
       <div className="flex flex-wrap items-center gap-2">
         <Badge size="sm" variant="outline">
           明细 {formatNumber(tokens.length)} key
