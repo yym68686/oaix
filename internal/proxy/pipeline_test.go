@@ -300,6 +300,47 @@ func TestStreamResponsesPreflightUsesStructuredKeepalive(t *testing.T) {
 	}
 }
 
+func TestWriteResponsesJSONFromSSECollectsTextPlainUpstream(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","object":"response","model":"gpt-5.5","status":"in_progress","output":[]}}`,
+		``,
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"type":"message","status":"completed","content":[{"type":"output_text","text":"test"}],"role":"assistant"},"output_index":0}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","model":"gpt-5.5","status":"completed","output":[],"usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13}}}`,
+		``,
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.writeResponsesJSONFromSSE(recorder, resp, Attempt{Intent: RequestIntent{Model: "gpt-5.5"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Committed || result.ResponseID != "resp_1" || result.Usage == nil {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("content-type should be application/json, got %q", recorder.Header().Get("Content-Type"))
+	}
+	output := payload["output"].([]any)
+	content := output[0].(map[string]any)["content"].([]any)
+	if content[0].(map[string]any)["text"] != "test" {
+		t.Fatalf("output_item.done fallback was not patched: %v", payload)
+	}
+}
+
 func TestWriteImageJSONResponseFromSSE(t *testing.T) {
 	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
 	body := strings.Join([]string{

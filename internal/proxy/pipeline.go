@@ -346,7 +346,7 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		}
 		return p.writeImageJSONResponse(w, resp, attempt)
 	}
-	if isSSE(resp.Header.Get("Content-Type")) && !attempt.Intent.Stream {
+	if (isSSE(resp.Header.Get("Content-Type")) || attempt.Intent.UpstreamAccept == "text/event-stream") && !attempt.Intent.Stream {
 		return p.writeResponsesJSONFromSSE(w, resp, attempt)
 	}
 	if isSSE(resp.Header.Get("Content-Type")) || attempt.Intent.Stream {
