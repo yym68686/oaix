@@ -9,6 +9,23 @@ export type TokenCounts = {
   disabled?: number;
 };
 
+export type TokenQuotaWindow = {
+  id: string;
+  label: string;
+  limit_window_seconds?: number | null;
+  used_percent?: number | null;
+  remaining_percent?: number | null;
+  reset_at?: string | null;
+  exhausted?: boolean;
+};
+
+export type TokenQuotaSnapshot = {
+  fetched_at?: string | null;
+  error?: string | null;
+  plan_type?: string | null;
+  windows?: TokenQuotaWindow[];
+};
+
 export type TokenItem = {
   id: number;
   email?: string | null;
@@ -23,6 +40,21 @@ export type TokenItem = {
   last_error?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  active_streams?: number | null;
+  active_stream_cap?: number | null;
+  quota?: TokenQuotaSnapshot | null;
+};
+
+export type TokenProbeResponse = {
+  id: number;
+  outcome?: "reactivated" | "cooling" | "disabled" | "inconclusive" | string;
+  status_code?: number | null;
+  message?: string | null;
+  detail?: string | null;
+  cooldown_seconds?: number | null;
+  probe_model?: string | null;
+  probe_input?: string | null;
+  response_model?: string | null;
 };
 
 export type Pagination = {
@@ -179,6 +211,8 @@ export const api = {
     postJSON<Record<string, unknown>>(`/admin/tokens/${id}/activation`, payload),
   updateRemark: (id: number, remark: string) =>
     postJSON<Record<string, unknown>>(`/admin/tokens/${id}/remark`, { remark }),
+  probeToken: (id: number, payload: Record<string, unknown> = {}) =>
+    postJSON<TokenProbeResponse>(`/admin/tokens/${id}/probe`, payload),
   deleteToken: (id: number) =>
     requestJSON<Record<string, unknown>>(`/admin/tokens/${id}`, { method: "DELETE" }),
   batchTokens: (payload: Record<string, unknown>) =>

@@ -32,6 +32,7 @@ type App struct {
 	tokens   *tokens.Manager
 	logs     *logs.Writer
 	proxy    *proxy.Pipeline
+	quota    *adminQuotaService
 	webDir   string
 	started  time.Time
 	authKeys []string
@@ -45,6 +46,7 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		tokens:   tokenManager,
 		logs:     logWriter,
 		proxy:    pipeline,
+		quota:    newAdminQuotaService(),
 		webDir:   filepath.Join("oaix_gateway", "web"),
 		started:  time.Now().UTC(),
 		authKeys: cfg.Auth.ServiceAPIKeys,
@@ -63,12 +65,14 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/tokens", a.requireAuth(a.listTokens))
 	mux.HandleFunc("POST /admin/tokens/batch", a.requireAuth(a.batchTokens))
 	mux.HandleFunc("GET /admin/tokens/{token_id}", a.requireAuth(a.getToken))
+	mux.HandleFunc("GET /admin/tokens/quota", a.requireAuth(a.listTokenQuota))
 	mux.HandleFunc("POST /admin/tokens/import", a.requireAuth(a.importTokens))
 	mux.HandleFunc("GET /admin/tokens/import-batches", a.requireAuth(a.listImportBatches))
 	mux.HandleFunc("GET /admin/tokens/import-jobs/{job_id}", a.requireAuth(a.getImportJob))
 	mux.HandleFunc("POST /admin/tokens/import-jobs/{job_id}/cancel", a.requireAuth(a.cancelImportJob))
 	mux.HandleFunc("POST /admin/tokens/{token_id}/activation", a.requireAuth(a.updateTokenActivation))
 	mux.HandleFunc("POST /admin/tokens/{token_id}/remark", a.requireAuth(a.updateTokenRemark))
+	mux.HandleFunc("POST /admin/tokens/{token_id}/probe", a.requireAuth(a.probeToken))
 	mux.HandleFunc("DELETE /admin/tokens/{token_id}", a.requireAuth(a.deleteToken))
 	mux.HandleFunc("GET /admin/requests", a.requireAuth(a.listRequests))
 	mux.HandleFunc("GET /admin/analytics", a.requireAuth(a.analytics))
@@ -270,6 +274,7 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	counts, _ := a.store.TokenCounts(ctx)
+	adminItems, pendingIDs := a.adminTokenItems(r.Context(), items, queryBool(r, "include_quota", false))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts":          counts,
 		"filtered_counts": counts,
@@ -281,7 +286,8 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 			"has_previous": offset > 0,
 			"has_next":     offset+len(items) < total,
 		},
-		"items": items,
+		"items":                     adminItems,
+		"quota_refresh_pending_ids": pendingIDs,
 	})
 }
 
@@ -339,6 +345,11 @@ func (a *App) getToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	items, _ := a.adminTokenItems(r.Context(), []store.Token{*token}, queryBool(r, "include_quota", false))
+	if len(items) > 0 {
+		writeJSON(w, http.StatusOK, items[0])
 		return
 	}
 	writeJSON(w, http.StatusOK, token)
@@ -748,6 +759,21 @@ func queryInt(r *http.Request, key string, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func queryBool(r *http.Request, key string, fallback bool) bool {
+	raw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get(key)))
+	if raw == "" {
+		return fallback
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func bearerToken(r *http.Request) string {

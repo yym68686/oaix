@@ -1,4 +1,5 @@
 import {
+  ActivityIcon,
   AlertCircleIcon,
   CheckCircle2Icon,
   ChevronLeftIcon,
@@ -85,6 +86,8 @@ import {
   type SettingItem,
   type TokenCounts,
   type TokenItem,
+  type TokenProbeResponse,
+  type TokenQuotaWindow,
 } from "./lib/api";
 import { clamp, formatCurrency, formatDate, formatNumber } from "./lib/format";
 
@@ -154,6 +157,8 @@ export function App(): React.ReactElement {
   const [tokenSearch, setTokenSearch] = useState("");
   const [tokenMode, setTokenMode] = useState<TokenMode>("keys");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
+  const [probeBusyIds, setProbeBusyIds] = useState<Set<number>>(() => new Set());
+  const [probeResults, setProbeResults] = useState<Record<number, TokenProbeResponse>>({});
   const [importBatches, setImportBatches] = useState<ImportBatch[]>([]);
   const [requests, setRequests] = useState<RequestItem[]>([]);
   const [requestSummary, setRequestSummary] = useState<RequestSummary>({});
@@ -211,6 +216,7 @@ export function App(): React.ReactElement {
     setTokenError("");
     try {
       const params = new URLSearchParams({
+        include_quota: "true",
         limit: String(PAGE_SIZE),
         offset: String((tokenPage - 1) * PAGE_SIZE),
       });
@@ -375,6 +381,34 @@ export function App(): React.ReactElement {
     await refreshAll();
   }
 
+  async function runTokenProbe(id: number) {
+    setProbeBusyIds((current) => new Set(current).add(id));
+    try {
+      const result = await api.probeToken(id);
+      setProbeResults((current) => ({ ...current, [id]: result }));
+      pushToast(result.message || "测试完成", probeToastVariant(result.outcome));
+      await loadTokens();
+    } catch (error) {
+      const message = errorMessage(error);
+      setProbeResults((current) => ({
+        ...current,
+        [id]: {
+          detail: message,
+          id,
+          message,
+          outcome: "inconclusive",
+        },
+      }));
+      pushToast(message, "error");
+    } finally {
+      setProbeBusyIds((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
+
   async function runBatchActivation(active: boolean) {
     const ids = [...selectedIds];
     if (!ids.length) {
@@ -506,6 +540,7 @@ export function App(): React.ReactElement {
                 setTokenPage(clamp(page, 1, totalPages));
               }}
               onRemark={(target) => setRemarkTarget(target)}
+              onProbe={(id) => void runTokenProbe(id)}
               onSearchChange={(value) => {
                 setTokenSearch(value);
                 setTokenPage(1);
@@ -520,7 +555,10 @@ export function App(): React.ReactElement {
                 setTokenPage(1);
               }}
               onToggleActivation={(id, active) => void updateActivation(id, active)}
+              activeStreamCap={streamCap}
               page={tokenPage}
+              probeBusyIds={probeBusyIds}
+              probeResults={probeResults}
               search={tokenSearch}
               selectedIds={selectedIds}
               sort={tokenSort}
@@ -822,6 +860,7 @@ function DispatchPanel({
 }
 
 function TokenExplorer(props: {
+  activeStreamCap: number;
   counts: TokenCounts;
   importBatches: ImportBatch[];
   mode: TokenMode;
@@ -830,6 +869,7 @@ function TokenExplorer(props: {
   onDelete: (target: DeleteTarget) => void;
   onModeChange: (mode: TokenMode) => void;
   onPageChange: (page: number) => void;
+  onProbe: (id: number) => void;
   onRemark: (target: RemarkTarget) => void;
   onSearchChange: (value: string) => void;
   onSelectedChange: (selected: Set<number>) => void;
@@ -837,6 +877,8 @@ function TokenExplorer(props: {
   onStatusChange: (status: TokenStatus) => void;
   onToggleActivation: (id: number, active: boolean) => void;
   page: number;
+  probeBusyIds: Set<number>;
+  probeResults: Record<number, TokenProbeResponse>;
   search: string;
   selectedIds: Set<number>;
   sort: string;
@@ -968,7 +1010,7 @@ function TokenList(props: Parameters<typeof TokenExplorer>[0]) {
     return <EmptyState title="没有匹配的 key" description="调整搜索、状态或排序后再试。" />;
   }
   return (
-    <div className="grid max-h-[760px] gap-3 overflow-auto pr-1 oaix-scrollbar">
+    <div className="grid max-h-[760px] gap-2 overflow-auto pr-1 oaix-scrollbar">
       {props.tokens.map((item) => (
         <TokenCard key={item.id} item={item} {...props} />
       ))}
@@ -977,21 +1019,27 @@ function TokenList(props: Parameters<typeof TokenExplorer>[0]) {
 }
 
 function TokenCard({
+  activeStreamCap,
   item,
   onDelete,
+  onProbe,
   onRemark,
   onSelectedChange,
   onToggleActivation,
+  probeBusyIds,
+  probeResults,
   selectedIds,
 }: Parameters<typeof TokenExplorer>[0] & { item: TokenItem }) {
   const status = tokenStatusOf(item);
   const title = tokenTitle(item);
   const checked = selectedIds.has(item.id);
   const secondaryText = item.remark || item.source_file || "-";
+  const probeResult = probeResults[item.id];
+  const probeBusy = probeBusyIds.has(item.id);
   return (
-    <Card className="overflow-hidden">
-      <CardPanel className="grid flex-none gap-3 p-4">
-        <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-3 xl:grid-cols-[auto_minmax(0,1fr)_auto]">
+    <Card className="overflow-hidden rounded-xl">
+      <CardPanel className="grid flex-none gap-1.5 p-2.5">
+        <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-2">
           <Checkbox
             checked={checked}
             className="mt-0.5"
@@ -1005,69 +1053,161 @@ function TokenCard({
               onSelectedChange(next);
             }}
           />
-          <div className="min-w-0">
-            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-              <strong className="max-w-full min-w-0 truncate text-sm font-semibold leading-5" title={title}>
-                {title}
-              </strong>
-              <Badge variant="outline">ID {item.id}</Badge>
-              <Badge variant={statusBadge(status)}>{tokenStatusLabel(status)}</Badge>
-              <Badge className="max-w-full truncate" title={item.plan_type || "unknown"} variant="secondary">
-                {item.plan_type || "unknown"}
-              </Badge>
+          <div className="min-w-0 space-y-1.5">
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-1.5">
+              <div className="flex min-w-0 items-center gap-1.5">
+                <strong className="min-w-0 truncate text-sm font-semibold leading-5" title={title}>
+                  {title}
+                </strong>
+                <Badge size="sm" variant="outline">ID {item.id}</Badge>
+                <Badge size="sm" variant={statusBadge(status)}>{tokenStatusLabel(status)}</Badge>
+                <Badge className="max-w-[7rem] truncate" size="sm" title={item.plan_type || "unknown"} variant="secondary">
+                  {item.plan_type || "unknown"}
+                </Badge>
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-1">
+                <Button loading={probeBusy} onClick={() => onProbe(item.id)} size="xs" variant="outline">
+                  <ActivityIcon />
+                  测试
+                </Button>
+                <Button onClick={() => onToggleActivation(item.id, !item.is_active)} size="xs" variant="outline">
+                  {item.is_active ? "禁用" : "启用"}
+                </Button>
+                <Button
+                  onClick={() =>
+                    onRemark({
+                      id: item.id,
+                      meta: item.source_file || "-",
+                      remark: item.remark || "",
+                      title,
+                    })
+                  }
+                  size="xs"
+                  variant="ghost"
+                >
+                  备注
+                </Button>
+                <Button
+                  onClick={() =>
+                    onDelete({
+                      description: "删除后会从调度池和最近列表移除。此操作不可撤销。",
+                      ids: [item.id],
+                      title: `删除 ${title}？`,
+                    })
+                  }
+                  size="xs"
+                  variant="destructive"
+                >
+                  <Trash2Icon />
+                  删除
+                </Button>
+              </div>
+            </div>
+            <div className="grid gap-1.5 text-[11px] xl:grid-cols-[auto_minmax(0,1fr)] xl:items-center">
+              <div className="flex min-w-0 flex-wrap items-center gap-1">
+                <TokenQuotaStrip quota={item.quota} />
+                <TokenConcurrency fallbackCap={activeStreamCap} item={item} />
+              </div>
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground">
+                <span className="oaix-tabular">最近 {formatDate(item.last_used_at)}</span>
+                <span className="oaix-tabular">冷却 {formatDate(item.cooldown_until)}</span>
+                <span className="min-w-0 truncate" title={secondaryText}>
+                  {secondaryText}
+                </span>
+              </div>
             </div>
           </div>
-          <div className="col-start-2 flex flex-wrap items-center gap-2 xl:col-start-3 xl:row-start-1 xl:justify-end">
-            <Button onClick={() => onToggleActivation(item.id, !item.is_active)} size="xs" variant="outline">
-              {item.is_active ? "禁用" : "启用"}
-            </Button>
-            <Button
-              onClick={() =>
-                onRemark({
-                  id: item.id,
-                  meta: item.source_file || "-",
-                  remark: item.remark || "",
-                  title,
-                })
-              }
-              size="xs"
-              variant="ghost"
-            >
-              备注
-            </Button>
-            <Button
-              onClick={() =>
-                onDelete({
-                  description: "删除后会从调度池和最近列表移除。此操作不可撤销。",
-                  ids: [item.id],
-                  title: `删除 ${title}？`,
-                })
-              }
-              size="xs"
-              variant="destructive"
-            >
-              <Trash2Icon />
-              删除
-            </Button>
+        </div>
+        {(probeResult || item.last_error) && (
+          <div className="grid gap-1 border-t pt-2 text-[11px] sm:ms-7">
+            {probeResult && <TokenProbeResult result={probeResult} />}
+            {item.last_error && (
+              <p className="min-w-0 truncate rounded-md bg-muted/64 px-2 py-1 font-mono text-muted-foreground" title={item.last_error}>
+                {item.last_error}
+              </p>
+            )}
           </div>
-        </div>
-        <div className="grid gap-2 border-t pt-3 text-muted-foreground text-xs sm:ms-8 md:grid-cols-[minmax(9rem,0.8fr)_minmax(9rem,0.8fr)_minmax(0,1.4fr)]">
-          <span className="min-w-0 truncate">最近使用 {formatDate(item.last_used_at)}</span>
-          <span className="min-w-0 truncate">冷却至 {formatDate(item.cooldown_until)}</span>
-          <span className="min-w-0 truncate" title={secondaryText}>
-            {secondaryText}
-          </span>
-        </div>
-        {item.last_error && (
-          <p
-            className="max-h-16 overflow-hidden rounded-md bg-muted/72 px-3 py-2 font-mono text-[11px] text-muted-foreground leading-5 [overflow-wrap:anywhere] sm:ms-8"
-            title={item.last_error}
-          >
-            {item.last_error}
-          </p>
         )}
       </CardPanel>
     </Card>
+  );
+}
+
+function TokenQuotaStrip({ quota }: { quota?: TokenItem["quota"] | null }) {
+  if (!quota) {
+    return <div className="rounded-md bg-muted/64 px-2 py-0.5 text-muted-foreground">额度更新中</div>;
+  }
+  if (quota.error) {
+    return (
+      <div className="max-w-48 truncate rounded-md bg-warning/8 px-2 py-0.5 text-warning-foreground" title={quota.error}>
+        额度错误：{quota.error}
+      </div>
+    );
+  }
+  const fiveHour = quotaWindowFor(quota, "5h");
+  const weekly = quotaWindowFor(quota, "7d");
+  return (
+    <>
+      <QuotaMeter label="5h" window={fiveHour} />
+      <QuotaMeter label="7d" window={weekly} />
+    </>
+  );
+}
+
+function QuotaMeter({
+  label,
+  window,
+}: {
+  label: string;
+  window?: TokenQuotaWindow;
+}) {
+  const used = Number(window?.used_percent ?? NaN);
+  const remaining = Number(window?.remaining_percent ?? (Number.isFinite(used) ? 100 - used : NaN));
+  const usedWidth = Number.isFinite(used) ? clamp(used, 0, 100) : 0;
+  const tone = window?.exhausted || usedWidth >= 95 ? "bg-destructive" : usedWidth >= 80 ? "bg-warning" : "bg-success";
+  const title = window
+    ? `${label} 已用 ${formatPercent(used)}，剩余 ${formatPercent(remaining)}，重置 ${formatDate(window.reset_at)}`
+    : `${label} quota 暂无数据`;
+  return (
+    <div className="inline-flex min-w-[5.4rem] items-center gap-1 rounded-md border bg-muted/32 px-2 py-0.5" title={title}>
+      <span className="font-medium">{label}</span>
+      <span className="oaix-tabular text-muted-foreground">余 {formatPercent(remaining)}</span>
+      <div className="h-1 w-8 overflow-hidden rounded-full bg-muted">
+        <div className={cn("h-full rounded-full", tone)} style={{ width: `${usedWidth}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function TokenConcurrency({ fallbackCap, item }: { fallbackCap: number; item: TokenItem }) {
+  const active = Math.max(0, Number(item.active_streams || 0));
+  const cap = Math.max(0, Number(item.active_stream_cap || fallbackCap || 0));
+  const used = cap > 0 ? clamp((active / cap) * 100, 0, 100) : 0;
+  return (
+    <div className="inline-flex min-w-[5.8rem] items-center gap-1 rounded-md border bg-muted/32 px-2 py-0.5" title={`当前并发 ${active}，上限 ${cap || "-"}`}>
+      <span className="text-muted-foreground">并发</span>
+      <span className="oaix-tabular font-medium">
+        {formatNumber(active)}/{cap ? formatNumber(cap) : "-"}
+      </span>
+      <div className="h-1 w-8 overflow-hidden rounded-full bg-muted">
+        <div className={cn("h-full rounded-full", used >= 90 ? "bg-warning" : "bg-info")} style={{ width: `${used}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function TokenProbeResult({ result }: { result: TokenProbeResponse }) {
+  const text = result.message || result.detail || "测试完成";
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <Badge size="sm" variant={probeBadgeVariant(result.outcome)}>
+        {probeOutcomeLabel(result.outcome)}
+        {result.status_code ? ` ${result.status_code}` : ""}
+      </Badge>
+      <span className="min-w-0 truncate text-muted-foreground" title={result.detail || text}>
+        {text}
+      </span>
+    </div>
   );
 }
 
@@ -1521,6 +1661,57 @@ function statusBadge(status: "active" | "cooling" | "disabled"): "success" | "wa
     return "warning";
   }
   return "error";
+}
+
+function quotaWindowFor(quota: NonNullable<TokenItem["quota"]>, label: "5h" | "7d"): TokenQuotaWindow | undefined {
+  return quota.windows?.find((item) => item.label === label || item.id.endsWith(label));
+}
+
+function formatPercent(value: unknown): string {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "-";
+  }
+  return `${Math.round(clamp(number, 0, 100))}%`;
+}
+
+function probeOutcomeLabel(outcome?: string): string {
+  if (outcome === "reactivated") {
+    return "通过";
+  }
+  if (outcome === "cooling") {
+    return "冷却";
+  }
+  if (outcome === "disabled") {
+    return "禁用";
+  }
+  return "未定";
+}
+
+function probeBadgeVariant(outcome?: string): React.ComponentProps<typeof Badge>["variant"] {
+  if (outcome === "reactivated") {
+    return "success";
+  }
+  if (outcome === "cooling") {
+    return "warning";
+  }
+  if (outcome === "disabled") {
+    return "error";
+  }
+  return "secondary";
+}
+
+function probeToastVariant(outcome?: string): ToastMessage["variant"] {
+  if (outcome === "reactivated") {
+    return "success";
+  }
+  if (outcome === "cooling") {
+    return "warning";
+  }
+  if (outcome === "disabled") {
+    return "error";
+  }
+  return "info";
 }
 
 function statusOptionsWithCounts(counts: TokenCounts): Array<{ label: string; value: TokenStatus }> {
