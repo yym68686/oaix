@@ -43,12 +43,18 @@ type tokenStateStore interface {
 }
 
 type RequestIntent struct {
-	Endpoint       string
-	Model          string
-	Stream         bool
-	Compact        bool
-	Method         string
-	UpstreamSuffix string
+	Endpoint            string
+	Model               string
+	Stream              bool
+	Compact             bool
+	Method              string
+	UpstreamSuffix      string
+	UpstreamEndpoint    string
+	UpstreamContentType string
+	UpstreamAccept      string
+	ResponseModelAlias  string
+	ImageResponseFormat string
+	ImageStreamPrefix   string
 }
 
 type Attempt struct {
@@ -118,6 +124,12 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	_ = r.Body.Close()
 	bodyBytes, _ = sanitizeReasoningContentBody(bodyBytes)
 	intent = normalizeIntent(intent, bodyBytes)
+	var status int
+	bodyBytes, intent, status, err = prepareUpstreamPayload(r, bodyBytes, intent)
+	if err != nil {
+		writeErrorResponse(w, intent.Stream, status, err.Error())
+		return
+	}
 	promptCacheContext, upstreamBody := buildPromptCacheContext(r.Header, intent, bodyBytes, p.cfg.PromptCache)
 	bodyBytes = upstreamBody
 	if promptCacheContext != nil && intent.Model == "" {
@@ -306,7 +318,10 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	copyProxyHeaders(req.Header, r.Header)
 	req.Header.Set("X-Request-ID", attempt.RequestID)
 	req.Header.Set("Authorization", "Bearer "+attempt.Claim.AccessToken())
-	req.Header.Set("Content-Type", contentType(r.Header.Get("Content-Type")))
+	req.Header.Set("Content-Type", contentType(firstNonEmpty(attempt.Intent.UpstreamContentType, r.Header.Get("Content-Type"))))
+	if attempt.Intent.UpstreamAccept != "" {
+		req.Header.Set("Accept", attempt.Intent.UpstreamAccept)
+	}
 	if attempt.PromptCache != nil && attempt.PromptCache.SessionID != "" {
 		req.Header.Set("Session_id", attempt.PromptCache.SessionID)
 	}
@@ -315,36 +330,29 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		return AttemptResult{Status: http.StatusBadGateway, Retry: true}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return AttemptResult{Status: resp.StatusCode, Retry: true}, fmt.Errorf("upstream returned %d", resp.StatusCode)
-	}
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
-		return AttemptResult{Status: resp.StatusCode, Retry: true}, fmt.Errorf("upstream returned %d", resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		detail := decodeUpstreamError(resp.Body)
+		retry := resp.StatusCode == http.StatusUnauthorized ||
+			resp.StatusCode == http.StatusForbidden ||
+			resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode >= 500
+		return AttemptResult{Status: resp.StatusCode, Retry: retry}, fmt.Errorf("%s", detail)
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("X-OAIX-Token-ID", fmt.Sprint(attempt.Claim.TokenID()))
-	w.WriteHeader(resp.StatusCode)
-	if isSSE(resp.Header.Get("Content-Type")) || attempt.Intent.Stream {
-		observer := newUsageObserver(attempt.Intent.Model)
-		if flusher, ok := w.(http.Flusher); ok {
-			_, _ = w.Write(sse.Keepalive())
-			flusher.Flush()
+	if attempt.Intent.ImageResponseFormat != "" {
+		if attempt.Intent.Stream {
+			return p.streamImageResponse(w, resp, attempt)
 		}
-		_, copyErr := copyAndFlush(w, resp.Body, observer)
-		observer.flushEvent()
-		result := AttemptResult{
-			Status:       resp.StatusCode,
-			Committed:    true,
-			Usage:        observer.usage,
-			ResponseID:   observer.responseID,
-			FirstTokenAt: observer.firstTokenAt,
-		}
-		if copyErr != nil {
-			return result, copyErr
-		}
-		return result, nil
+		return p.writeImageJSONResponse(w, resp, attempt)
 	}
+	if isSSE(resp.Header.Get("Content-Type")) && !attempt.Intent.Stream {
+		return p.writeResponsesJSONFromSSE(w, resp, attempt)
+	}
+	if isSSE(resp.Header.Get("Content-Type")) || attempt.Intent.Stream {
+		return p.streamResponsesWithPreflight(w, resp, attempt)
+	}
+	w.WriteHeader(resp.StatusCode)
 	if attempt.PromptCache != nil {
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, p.cfg.Upstream.NonStreamMaxResponseBytes))
 		if readErr != nil {
@@ -367,7 +375,11 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 }
 
 func (p *Pipeline) upstreamURL(intent RequestIntent) (string, error) {
-	if intent.Endpoint == "/v1/chat/completions" && strings.TrimSpace(p.cfg.Upstream.ChatCompletionsURL) != "" {
+	endpoint := intent.Endpoint
+	if intent.UpstreamEndpoint != "" {
+		endpoint = intent.UpstreamEndpoint
+	}
+	if endpoint == "/v1/chat/completions" && strings.TrimSpace(p.cfg.Upstream.ChatCompletionsURL) != "" {
 		return p.cfg.Upstream.ChatCompletionsURL, nil
 	}
 	base := strings.TrimSpace(p.cfg.Upstream.ResponsesURL)
@@ -380,7 +392,7 @@ func (p *Pipeline) upstreamURL(intent RequestIntent) (string, error) {
 	if intent.UpstreamSuffix != "" {
 		return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(intent.UpstreamSuffix, "/"), nil
 	}
-	if intent.Endpoint == "/v1/chat/completions" {
+	if endpoint == "/v1/chat/completions" {
 		parsed, err := url.Parse(base)
 		if err != nil {
 			return "", err

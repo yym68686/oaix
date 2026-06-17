@@ -116,6 +116,227 @@ func TestPromptCacheContextStripsRetentionFromUpstream(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesPayloadAppliesCodexDefaults(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": [{"type":"reasoning","id":"rs_1","summary":[],"reasoning_content":"hidden"}],
+		"stream": true,
+		"max_output_tokens": 10,
+		"response_format": {"type":"json_object"},
+		"safety_identifier": "client",
+		"prompt_cache_retention": "ephemeral"
+	}`)
+	intent := RequestIntent{Endpoint: "/v1/responses", Stream: true}
+	upstream, err := prepareResponsesPayload(body, &intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(upstream, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["instructions"] != "" {
+		t.Fatalf("instructions default = %v", payload["instructions"])
+	}
+	if payload["store"] != false {
+		t.Fatalf("store must be false, got %v", payload["store"])
+	}
+	for _, key := range []string{"max_output_tokens", "response_format", "safety_identifier", "prompt_cache_retention"} {
+		if _, ok := payload[key]; ok {
+			t.Fatalf("%s should be stripped: %v", key, payload)
+		}
+	}
+	if containsReasoningContent(payload) {
+		t.Fatalf("reasoning_content should be stripped: %v", payload)
+	}
+	input := payload["input"].([]any)
+	if _, ok := input[0].(map[string]any)["id"]; ok {
+		t.Fatalf("store=false reasoning input id should be stripped: %v", input[0])
+	}
+}
+
+func TestPrepareResponsesPayloadTranslatesGPTImage2(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-image-2",
+		"input": [{"role":"user","content":[{"type":"input_text","text":"draw"},{"type":"input_image","image_url":"https://example.test/a.png"}]}],
+		"size": "1024x1024",
+		"output_compression": 80,
+		"tool_choice": "required"
+	}`)
+	intent := RequestIntent{Endpoint: "/v1/responses", Stream: true}
+	upstream, err := prepareResponsesPayload(body, &intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.ResponseModelAlias != "gpt-image-2" {
+		t.Fatalf("response model alias = %q", intent.ResponseModelAlias)
+	}
+	if intent.UpstreamAccept != "text/event-stream" {
+		t.Fatalf("upstream accept = %q", intent.UpstreamAccept)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(upstream, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["model"] != "gpt-5.5" {
+		t.Fatalf("upstream model = %v", payload["model"])
+	}
+	if payload["store"] != false || payload["instructions"] != "" || payload["parallel_tool_calls"] != true {
+		t.Fatalf("missing image defaults: %v", payload)
+	}
+	if _, ok := payload["tool_choice"]; ok {
+		t.Fatalf("tool_choice should be removed: %v", payload)
+	}
+	include := payload["include"].([]any)
+	if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include defaults = %v", include)
+	}
+	tool := payload["tools"].([]any)[0].(map[string]any)
+	if tool["type"] != "image_generation" || tool["model"] != "gpt-image-2" || tool["action"] != "auto" {
+		t.Fatalf("bad image tool: %v", tool)
+	}
+	if tool["size"] != "1024x1024" || tool["output_compression"].(float64) != 80 {
+		t.Fatalf("image tool fields were not moved: %v", tool)
+	}
+	if _, ok := payload["size"]; ok {
+		t.Fatalf("top-level image field should be moved: %v", payload)
+	}
+}
+
+func TestPrepareImageGenerationPayloadTargetsResponses(t *testing.T) {
+	intent := RequestIntent{Endpoint: "/v1/images/generations"}
+	upstream, err := prepareImageGenerationPayload([]byte(`{
+		"model": "gpt-image-2",
+		"prompt": "draw a test",
+		"response_format": "url",
+		"stream": false,
+		"size": "1024x1024"
+	}`), &intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.UpstreamEndpoint != "/v1/responses" || intent.UpstreamContentType != "application/json" || intent.UpstreamAccept != "text/event-stream" {
+		t.Fatalf("bad upstream routing: %+v", intent)
+	}
+	if intent.Model != "gpt-image-2" || intent.ImageResponseFormat != "url" || intent.ImageStreamPrefix != "image_generation" {
+		t.Fatalf("bad image intent: %+v", intent)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(upstream, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["model"] != "gpt-5.5" || payload["stream"] != true || payload["store"] != false {
+		t.Fatalf("bad image upstream payload: %v", payload)
+	}
+	tool := payload["tools"].([]any)[0].(map[string]any)
+	if tool["action"] != "generate" || tool["model"] != "gpt-image-2" || tool["size"] != "1024x1024" {
+		t.Fatalf("bad image generation tool: %v", tool)
+	}
+	content := payload["input"].([]any)[0].(map[string]any)["content"].([]any)
+	if content[0].(map[string]any)["text"] != "draw a test" {
+		t.Fatalf("prompt was not converted to input_text: %v", content)
+	}
+}
+
+func TestStreamResponsesPreflightFailureDoesNotCommit(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}`,
+		``,
+		`event: response.failed`,
+		`data: {"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","message":"Concurrency limit exceeded for account, please retry later"}}}`,
+		``,
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.streamResponsesWithPreflight(recorder, resp, Attempt{Intent: RequestIntent{Model: "gpt-5.5", Stream: true}})
+	if err == nil {
+		t.Fatal("expected retryable preflight error")
+	}
+	if result.Committed || !result.Retry || result.Status != http.StatusTooManyRequests {
+		t.Fatalf("unexpected result: %+v err=%v", result, err)
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("preflight failure should not write downstream bytes: %q", recorder.Body.String())
+	}
+}
+
+func TestStreamResponsesPreflightUsesStructuredKeepalive(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}`,
+		``,
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"ok"}`,
+		``,
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.streamResponsesWithPreflight(recorder, resp, Attempt{Intent: RequestIntent{Model: "gpt-5.5", Stream: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Committed {
+		t.Fatalf("expected committed stream: %+v", result)
+	}
+	output := recorder.Body.String()
+	if strings.HasPrefix(output, ": keepalive") || strings.Contains(output, "\n: keepalive") {
+		t.Fatalf("comment keepalive should not be emitted: %q", output)
+	}
+	if !strings.Contains(output, "event: keepalive") || !strings.Contains(output, `"type":"keepalive"`) {
+		t.Fatalf("structured keepalive missing: %q", output)
+	}
+}
+
+func TestWriteImageJSONResponseFromSSE(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := strings.Join([]string{
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"created_at":1710000000,"output":[{"type":"image_generation_call","result":"QUJD","output_format":"png","size":"1024x1024","quality":"high","revised_prompt":"drawn"}],"tool_usage":{"image_gen":{"input_tokens":3}}}}`,
+		``,
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.writeImageJSONResponse(recorder, resp, Attempt{Intent: RequestIntent{Model: "gpt-image-2", ImageResponseFormat: "url", ImageStreamPrefix: "image_generation"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Committed {
+		t.Fatalf("expected committed image response: %+v", result)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["created"].(float64) != 1710000000 || payload["output_format"] != "png" || payload["size"] != "1024x1024" {
+		t.Fatalf("bad image response metadata: %v", payload)
+	}
+	data := payload["data"].([]any)[0].(map[string]any)
+	if data["url"] != "data:image/png;base64,QUJD" || data["revised_prompt"] != "drawn" {
+		t.Fatalf("bad image data: %v", data)
+	}
+	if payload["usage"].(map[string]any)["input_tokens"].(float64) != 3 {
+		t.Fatalf("usage missing: %v", payload)
+	}
+}
+
 func defaultPromptCacheConfig() config.PromptCacheConfig {
 	return config.PromptCacheConfig{
 		AffinityEnabled:       true,
