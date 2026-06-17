@@ -45,7 +45,6 @@ import {
   EmptyState,
   ErrorAlert,
   LoadingRows,
-  MiniMetric,
   SelectField,
   TokenConcurrency,
   TokenObservedCost,
@@ -66,13 +65,16 @@ export function ImportsPage({
   refreshNonce: number;
   route: RouteState;
 }) {
-  if (route.key === "import_new") {
-    return <ImportNewPage pushToast={pushToast} />;
-  }
-  return <ImportBatchesPage pushToast={pushToast} refreshNonce={refreshNonce} />;
+  return <ImportBatchesPage pushToast={pushToast} refreshNonce={refreshNonce} route={route} />;
 }
 
-function ImportNewPage({ pushToast }: { pushToast: (title: string, variant?: ToastMessage["variant"]) => void }) {
+function ImportForm({
+  onImported,
+  pushToast,
+}: {
+  onImported?: () => void | Promise<void>;
+  pushToast: (title: string, variant?: ToastMessage["variant"]) => void;
+}) {
   const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
   const [tokenInput, setTokenInput] = useState("");
   const [queuePosition, setQueuePosition] = useState<"front" | "back">("front");
@@ -117,6 +119,7 @@ function ImportNewPage({ pushToast }: { pushToast: (title: string, variant?: Toa
         fileInputRef.current.value = "";
       }
       pushToast("导入任务已提交");
+      await onImported?.();
     } catch (caught) {
       setImportFeedback(errorMessage(caught));
       pushToast(errorMessage(caught), "error");
@@ -126,122 +129,118 @@ function ImportNewPage({ pushToast }: { pushToast: (title: string, variant?: Toa
   }
 
   return (
-    <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(280px,.6fr)]">
-      <Card className="min-w-0 overflow-hidden">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+    <div className="grid min-w-0 gap-4">
+      <div className="grid min-w-0 gap-2">
+        <Label htmlFor="service-key">Service API Key</Label>
+        <Input
+          id="service-key"
+          nativeInput
+          onChange={(event) => setServiceKeyDraft(event.currentTarget.value)}
+          placeholder="如果启用了 SERVICE_API_KEYS，请填在这里"
+          type="password"
+          value={serviceKeyDraft}
+        />
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <Button onClick={() => void saveServiceKey()}>
+          <SaveIcon />
+          保存凭证
+        </Button>
+        <Button onClick={clearServiceKey} variant="outline">
+          清空
+        </Button>
+      </div>
+      <Separator />
+      <div className="grid min-w-0 gap-2">
+        <Label htmlFor="token-json">粘贴 Key 数据</Label>
+        <Textarea
+          className="block w-full min-w-0 max-w-full overflow-hidden"
+          id="token-json"
+          onChange={(event) => setTokenInput(event.currentTarget.value)}
+          placeholder="支持普通 JSON / sub2api 导出 JSON；也支持每行 access_token / refresh_token，或 account_id,refresh_token。"
+          rows={10}
+          spellCheck={false}
+          value={tokenInput}
+          wrap="soft"
+        />
+      </div>
+      <div className="grid min-w-0 gap-2">
+        <Label htmlFor="token-files">选择文件</Label>
+        <Input
+          accept=".json,.txt,.csv,application/json,text/plain"
+          id="token-files"
+          multiple
+          nativeInput
+          ref={fileInputRef}
+          type="file"
+        />
+      </div>
+      <div className="grid min-w-0 gap-2">
+        <Label>导入位置</Label>
+        <div className="flex rounded-lg bg-muted p-1">
+          <Button className="flex-1" onClick={() => setQueuePosition("front")} variant={queuePosition === "front" ? "secondary" : "ghost"}>
+            开头
+          </Button>
+          <Button className="flex-1" onClick={() => setQueuePosition("back")} variant={queuePosition === "back" ? "secondary" : "ghost"}>
+            最后
+          </Button>
+        </div>
+      </div>
+      <Button disabled={importBusy} loading={importBusy} onClick={() => void importTokens()}>
+        开始导入
+      </Button>
+      <Alert variant={importFeedback.includes("失败") || importFeedback.includes("错误") ? "error" : "info"}>
+        <UploadIcon />
+        <AlertTitle>导入状态</AlertTitle>
+        <AlertDescription>{importFeedback}</AlertDescription>
+      </Alert>
+    </div>
+  );
+}
+
+function ImportNewDialog({
+  onImported,
+  onOpenChange,
+  open,
+  pushToast,
+}: {
+  onImported: () => void | Promise<void>;
+  onOpenChange: (open: boolean) => void;
+  open: boolean;
+  pushToast: (title: string, variant?: ToastMessage["variant"]) => void;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogPopup className="max-w-[min(48rem,calc(100vw-2rem))]">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
             <UploadIcon className="size-5" />
             导入 Key
-          </CardTitle>
-          <CardDescription>保存凭证并导入 access token / refresh token 数据。</CardDescription>
-          <CardAction>
-            <Button onClick={() => go("/imports")} size="sm" variant="outline">
-              查看批次
-            </Button>
-          </CardAction>
-        </CardHeader>
-        <CardPanel className="grid min-w-0 gap-4">
-          <div className="grid min-w-0 gap-2">
-            <Label htmlFor="service-key">Service API Key</Label>
-            <Input
-              id="service-key"
-              nativeInput
-              onChange={(event) => setServiceKeyDraft(event.currentTarget.value)}
-              placeholder="如果启用了 SERVICE_API_KEYS，请填在这里"
-              type="password"
-              value={serviceKeyDraft}
-            />
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button onClick={() => void saveServiceKey()}>
-              <SaveIcon />
-              保存凭证
-            </Button>
-            <Button onClick={clearServiceKey} variant="outline">
-              清空
-            </Button>
-          </div>
-          <Separator />
-          <div className="grid min-w-0 gap-2">
-            <Label htmlFor="token-json">粘贴 Key 数据</Label>
-            <Textarea
-              className="block w-full min-w-0 max-w-full overflow-hidden"
-              id="token-json"
-              onChange={(event) => setTokenInput(event.currentTarget.value)}
-              placeholder="支持普通 JSON / sub2api 导出 JSON；也支持每行 access_token / refresh_token，或 account_id,refresh_token。"
-              rows={12}
-              spellCheck={false}
-              value={tokenInput}
-              wrap="soft"
-            />
-          </div>
-          <div className="grid min-w-0 gap-2">
-            <Label htmlFor="token-files">选择文件</Label>
-            <Input
-              accept=".json,.txt,.csv,application/json,text/plain"
-              id="token-files"
-              multiple
-              nativeInput
-              ref={fileInputRef}
-              type="file"
-            />
-          </div>
-          <div className="grid min-w-0 gap-2">
-            <Label>导入位置</Label>
-            <div className="flex rounded-lg bg-muted p-1">
-              <Button
-                className="flex-1"
-                onClick={() => setQueuePosition("front")}
-                variant={queuePosition === "front" ? "secondary" : "ghost"}
-              >
-                开头
-              </Button>
-              <Button
-                className="flex-1"
-                onClick={() => setQueuePosition("back")}
-                variant={queuePosition === "back" ? "secondary" : "ghost"}
-              >
-                最后
-              </Button>
-            </div>
-          </div>
-          <Button disabled={importBusy} loading={importBusy} onClick={() => void importTokens()}>
-            开始导入
-          </Button>
-          <Alert variant={importFeedback.includes("失败") || importFeedback.includes("错误") ? "error" : "info"}>
-            <UploadIcon />
-            <AlertTitle>导入状态</AlertTitle>
-            <AlertDescription>{importFeedback}</AlertDescription>
-          </Alert>
-        </CardPanel>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>导入说明</CardTitle>
-          <CardDescription>导入任务会进入后台队列，批次页可查看每个 key 的校验和发布结果。</CardDescription>
-        </CardHeader>
-        <CardPanel className="grid gap-3">
-          <MiniMetric label="支持格式" value="access_token / refresh_token / account_id,refresh_token / JSON" />
-          <MiniMetric label="导入位置" value={queuePosition === "front" ? "队列开头" : "队列最后"} />
-          <MiniMetric label="凭证状态" value={serviceKeyDraft.trim() ? "已填写" : "未填写"} />
-        </CardPanel>
-      </Card>
-    </div>
+          </DialogTitle>
+          <DialogDescription>保存凭证并导入 access token / refresh token 数据。</DialogDescription>
+        </DialogHeader>
+        <DialogPanel>
+          <ImportForm onImported={onImported} pushToast={pushToast} />
+        </DialogPanel>
+      </DialogPopup>
+    </Dialog>
   );
 }
 
 function ImportBatchesPage({
   pushToast,
   refreshNonce,
+  route,
 }: {
   pushToast: (title: string, variant?: ToastMessage["variant"]) => void;
   refreshNonce: number;
+  route: RouteState;
 }) {
   const [batches, setBatches] = useState<ImportBatch[]>([]);
   const [detailDialogId, setDetailDialogId] = useState<number | null>(null);
   const [detailStatus, setDetailStatus] = useState<TokenStatus>("all");
   const [detailPlan, setDetailPlan] = useState("all");
+  const [importDialogOpen, setImportDialogOpen] = useState(route.key === "import_new");
   const [deleteTarget, setDeleteTarget] = useState<ImportBatch | null>(null);
   const [details, setDetails] = useState<Record<number, ImportBatchDetail>>({});
   const [detailErrors, setDetailErrors] = useState<Record<number, string>>({});
@@ -285,6 +284,19 @@ function ImportBatchesPage({
   useEffect(() => {
     void loadBatches();
   }, [loadBatches, refreshNonce]);
+
+  useEffect(() => {
+    if (route.key === "import_new") {
+      setImportDialogOpen(true);
+    }
+  }, [route.key]);
+
+  function changeImportDialogOpen(open: boolean) {
+    setImportDialogOpen(open);
+    if (!open && route.key === "import_new") {
+      go("/imports", { replace: true });
+    }
+  }
 
   async function cancelJob(id: number) {
     await api.cancelImportJob(id);
@@ -335,7 +347,7 @@ function ImportBatchesPage({
         </CardTitle>
         <CardDescription>查看每次导入的处理结果、平均余额和关联 key。</CardDescription>
         <CardAction>
-          <Button onClick={() => go("/imports/new")} size="sm">
+          <Button onClick={() => setImportDialogOpen(true)} size="sm">
             新导入
           </Button>
         </CardAction>
@@ -376,6 +388,12 @@ function ImportBatchesPage({
                 }
               }}
               target={deleteTarget}
+            />
+            <ImportNewDialog
+              onImported={loadBatches}
+              onOpenChange={changeImportDialogOpen}
+              open={importDialogOpen}
+              pushToast={pushToast}
             />
           </>
         )}
