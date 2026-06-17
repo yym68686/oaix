@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"net/http"
 	"testing"
 	"time"
 )
@@ -70,5 +71,18 @@ func TestParseCodexQuotaPayloadDeducesExhaustedWindow(t *testing.T) {
 	}
 	if !window.Exhausted {
 		t.Fatalf("expected exhausted window: %+v", window)
+	}
+}
+
+func TestQuotaStatusShouldRefresh(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		if !quotaStatusShouldRefresh(status) {
+			t.Fatalf("status %d should refresh", status)
+		}
+	}
+	for _, status := range []int{http.StatusOK, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		if quotaStatusShouldRefresh(status) {
+			t.Fatalf("status %d should not refresh", status)
+		}
 	}
 }

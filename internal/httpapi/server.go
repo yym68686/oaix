@@ -64,7 +64,7 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		tokens:   tokenManager,
 		logs:     logWriter,
 		proxy:    pipeline,
-		quota:    newAdminQuotaService(),
+		quota:    newAdminQuotaService(cfg, store),
 		webDir:   filepath.Join("oaix_gateway", "web"),
 		started:  time.Now().UTC(),
 		authKeys: cfg.Auth.ServiceAPIKeys,

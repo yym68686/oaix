@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yym68686/oaix/internal/config"
+	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -61,6 +63,8 @@ type cachedQuotaSnapshot struct {
 
 type adminQuotaService struct {
 	client            *http.Client
+	oauthClient       oauth.Client
+	store             *store.Store
 	usageURL          string
 	userAgent         string
 	ttl               time.Duration
@@ -73,7 +77,7 @@ type adminQuotaService struct {
 	pending           map[int64]struct{}
 }
 
-func newAdminQuotaService() *adminQuotaService {
+func newAdminQuotaService(cfg config.Config, tokenStore *store.Store) *adminQuotaService {
 	concurrency := envIntDefault("OAIX_ADMIN_QUOTA_CONCURRENCY", defaultQuotaConcurrency)
 	if concurrency <= 0 {
 		concurrency = defaultQuotaConcurrency
@@ -86,10 +90,15 @@ func newAdminQuotaService() *adminQuotaService {
 	if ttlSeconds <= 0 {
 		ttlSeconds = defaultQuotaTTLSeconds
 	}
+	oauthClient := oauth.NewHTTPClient(cfg.Upstream.OAuthTokenURL)
+	oauthClient.ClientID = cfg.Upstream.OAuthClientID
+	oauthClient.Scope = cfg.Upstream.OAuthScope
 	return &adminQuotaService{
 		client: &http.Client{
 			Timeout: time.Duration(timeoutSeconds) * time.Second,
 		},
+		oauthClient:       oauthClient,
+		store:             tokenStore,
 		usageURL:          firstEnv("OAIX_WHAM_USAGE_URL", "WHAM_USAGE_URL", defaultWHAMUsageURL),
 		userAgent:         firstEnv("OAIX_WHAM_USER_AGENT", "WHAM_USER_AGENT", defaultWHAMUserAgent),
 		ttl:               time.Duration(ttlSeconds) * time.Second,
@@ -225,7 +234,7 @@ func (s *adminQuotaService) collect(ctx context.Context, tokens []store.Token) (
 }
 
 func quotaEligible(token store.Token) bool {
-	return token.IsActive && token.DisabledAt == nil && strings.TrimSpace(token.AccessToken) != ""
+	return token.IsActive && token.DisabledAt == nil && (strings.TrimSpace(token.AccessToken) != "" || strings.TrimSpace(token.RefreshToken) != "")
 }
 
 func (s *adminQuotaService) cached(tokenID int64, now time.Time, includeStale bool) (*codexQuotaSnapshot, bool) {
@@ -312,9 +321,6 @@ func (s *adminQuotaService) fetchMany(ctx context.Context, tokens []store.Token)
 
 func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token) *codexQuotaSnapshot {
 	now := time.Now().UTC()
-	if strings.TrimSpace(token.AccessToken) == "" {
-		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, "token has no access token"))
-	}
 	select {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
@@ -322,25 +328,29 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, ctx.Err().Error()))
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.usageURL, nil)
-	if err != nil {
-		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
-	}
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token.AccessToken))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", s.userAgent)
-	if token.AccountID != nil && strings.TrimSpace(*token.AccountID) != "" {
-		req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(*token.AccountID))
+	if strings.TrimSpace(token.AccessToken) == "" {
+		refreshed, err := s.refreshQuotaToken(ctx, token)
+		if err != nil {
+			return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
+		}
+		token = refreshed
 	}
 
-	resp, err := s.client.Do(req)
+	statusCode, body, err := s.requestUsage(ctx, token)
 	if err != nil {
 		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, defaultQuotaBodyMaxBytes))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, responseErrorDetail(resp.StatusCode, body)))
+	if quotaStatusShouldRefresh(statusCode) {
+		if refreshed, refreshErr := s.refreshQuotaToken(ctx, token); refreshErr == nil {
+			token = refreshed
+			statusCode, body, err = s.requestUsage(ctx, token)
+			if err != nil {
+				return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
+			}
+		}
+	}
+	if statusCode < 200 || statusCode >= 300 {
+		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, responseErrorDetail(statusCode, body)))
 	}
 
 	var payload map[string]any
@@ -352,6 +362,85 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
 	}
 	return s.storeSnapshot(token.ID, snapshot)
+}
+
+func (s *adminQuotaService) requestUsage(ctx context.Context, token store.Token) (int, []byte, error) {
+	accessToken := strings.TrimSpace(token.AccessToken)
+	if accessToken == "" {
+		return 0, nil, fmt.Errorf("token has no access token")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.usageURL, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", s.userAgent)
+	if token.AccountID != nil && strings.TrimSpace(*token.AccountID) != "" {
+		req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(*token.AccountID))
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, defaultQuotaBodyMaxBytes))
+	return resp.StatusCode, body, nil
+}
+
+func quotaStatusShouldRefresh(statusCode int) bool {
+	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusNotFound
+}
+
+func (s *adminQuotaService) refreshQuotaToken(ctx context.Context, token store.Token) (store.Token, error) {
+	refreshToken := strings.TrimSpace(token.RefreshToken)
+	if refreshToken == "" {
+		return token, fmt.Errorf("token has no refresh token")
+	}
+	if s.oauthClient == nil {
+		return token, fmt.Errorf("oauth refresh client is not configured")
+	}
+	result, err := s.oauthClient.Refresh(ctx, refreshToken)
+	if err != nil {
+		return token, err
+	}
+	expiresAt := (*time.Time)(nil)
+	if result.ExpiresIn > 0 {
+		expires := time.Now().UTC().Add(time.Duration(result.ExpiresIn) * time.Second)
+		expiresAt = &expires
+	}
+	if s.store != nil {
+		if err := s.store.UpdateTokenSecret(ctx, store.TokenSecretUpdate{
+			TokenID:      token.ID,
+			AccessToken:  result.AccessToken,
+			RefreshToken: result.RefreshToken,
+			IDToken:      result.IDToken,
+			ExpiresAt:    expiresAt,
+			AccountID:    result.AccountID,
+			Email:        result.Email,
+			PlanType:     result.PlanType,
+		}); err != nil {
+			return token, err
+		}
+	}
+	token.AccessToken = result.AccessToken
+	if strings.TrimSpace(result.RefreshToken) != "" {
+		token.RefreshToken = result.RefreshToken
+	}
+	if strings.TrimSpace(result.AccountID) != "" {
+		value := result.AccountID
+		token.AccountID = &value
+	}
+	if strings.TrimSpace(result.Email) != "" {
+		value := result.Email
+		token.Email = &value
+	}
+	if strings.TrimSpace(result.PlanType) != "" {
+		value := result.PlanType
+		token.PlanType = &value
+	}
+	return token, nil
 }
 
 func (s *adminQuotaService) storeSnapshot(tokenID int64, snapshot *codexQuotaSnapshot) *codexQuotaSnapshot {
