@@ -88,6 +88,7 @@ import {
   type SettingItem,
   type TokenCounts,
   type TokenItem,
+  type TokenPlanCount,
   type TokenProbeResponse,
   type TokenQuotaWindow,
 } from "./lib/api";
@@ -156,8 +157,10 @@ export function App(): React.ReactElement {
   const [tokenTotal, setTokenTotal] = useState(0);
   const [tokenPage, setTokenPage] = useState(1);
   const [tokenStatus, setTokenStatus] = useState<TokenStatus>("available");
+  const [tokenPlan, setTokenPlan] = useState("all");
   const [tokenSort, setTokenSort] = useState("-created_at");
   const [tokenSearch, setTokenSearch] = useState("");
+  const [tokenPlanCounts, setTokenPlanCounts] = useState<TokenPlanCount[]>([]);
   const [tokenMode, setTokenMode] = useState<TokenMode>("keys");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
   const [probeBusyIds, setProbeBusyIds] = useState<Set<number>>(() => new Set());
@@ -236,6 +239,9 @@ export function App(): React.ReactElement {
       if (tokenStatus !== "all") {
         params.set("status", tokenStatus);
       }
+      if (tokenPlan !== "all") {
+        params.set("plan", tokenPlan);
+      }
       const sort = sortParam(tokenSort);
       if (sort) {
         params.set("sort", sort);
@@ -245,6 +251,7 @@ export function App(): React.ReactElement {
       setTokens(items);
       setTokenTotal(payload.pagination?.total ?? items.length);
       setCounts(payload.counts || {});
+      setTokenPlanCounts(payload.plan_counts || []);
       setSelectedIds(new Set());
     } catch (error) {
       setTokenError(errorMessage(error));
@@ -252,7 +259,7 @@ export function App(): React.ReactElement {
     } finally {
       setTokenLoading(false);
     }
-  }, [expandedImportBatchId, tokenMode, tokenPage, tokenSearch, tokenSort, tokenStatus]);
+  }, [expandedImportBatchId, tokenMode, tokenPage, tokenPlan, tokenSearch, tokenSort, tokenStatus]);
 
   const loadImportBatchDetail = useCallback(
     async (id: number) => {
@@ -586,6 +593,10 @@ export function App(): React.ReactElement {
                 setTokenPage(1);
               }}
               onSelectedChange={setSelectedIds}
+              onPlanChange={(plan) => {
+                setTokenPlan(plan);
+                setTokenPage(1);
+              }}
               onSortChange={(value) => {
                 setTokenSort(value);
                 setTokenPage(1);
@@ -607,6 +618,8 @@ export function App(): React.ReactElement {
               }}
               activeStreamCap={streamCap}
               page={tokenPage}
+              plan={tokenPlan}
+              planCounts={tokenPlanCounts}
               probeBusyIds={probeBusyIds}
               probeResults={probeResults}
               search={tokenSearch}
@@ -923,6 +936,7 @@ function TokenExplorer(props: {
   onDelete: (target: DeleteTarget) => void;
   onModeChange: (mode: TokenMode) => void;
   onPageChange: (page: number) => void;
+  onPlanChange: (plan: string) => void;
   onProbe: (id: number) => void;
   onRemark: (target: RemarkTarget) => void;
   onSearchChange: (value: string) => void;
@@ -932,6 +946,8 @@ function TokenExplorer(props: {
   onToggleActivation: (id: number, active: boolean) => void;
   onToggleImportBatch: (id: number) => void;
   page: number;
+  plan: string;
+  planCounts: TokenPlanCount[];
   probeBusyIds: Set<number>;
   probeResults: Record<number, TokenProbeResponse>;
   search: string;
@@ -948,6 +964,7 @@ function TokenExplorer(props: {
   const pageIds = props.tokens.map((item) => item.id);
   const allSelected = pageIds.length > 0 && pageIds.every((id) => props.selectedIds.has(id));
   const statusOptions = useMemo(() => statusOptionsWithCounts(props.counts), [props.counts]);
+  const planOptions = useMemo(() => planOptionsWithCounts(props.planCounts, props.counts.total || 0), [props.planCounts, props.counts.total]);
   const note =
     props.mode === "keys"
       ? `显示 ${formatNumber(props.tokens.length)} / ${formatNumber(props.tokenTotal)} 个 key`
@@ -973,7 +990,7 @@ function TokenExplorer(props: {
       <CardPanel className="grid gap-4">
         <Tabs value={props.mode} onValueChange={(value) => props.onModeChange(value as TokenMode)}>
           <TabsPanel value="keys" className="grid gap-4">
-            <div className="grid gap-3 lg:grid-cols-[minmax(220px,1fr)_180px_180px]">
+            <div className="grid gap-3 lg:grid-cols-[minmax(220px,1fr)_170px_170px_170px]">
               <div className="grid gap-2">
                 <Label htmlFor="token-search">搜索 Key</Label>
                 <div className="relative">
@@ -994,6 +1011,12 @@ function TokenExplorer(props: {
                 onChange={(value) => props.onStatusChange(value as TokenStatus)}
                 options={statusOptions}
                 value={props.status}
+              />
+              <SelectField
+                label="计划"
+                onChange={props.onPlanChange}
+                options={planOptions}
+                value={props.plan}
               />
               <SelectField
                 label="排序"
@@ -2059,6 +2082,58 @@ function statusOptionsWithCounts(counts: TokenCounts): Array<{ label: string; va
     ...option,
     label: `${option.label} ${formatNumber(valueByStatus[option.value])}`,
   }));
+}
+
+function planOptionsWithCounts(planCounts: TokenPlanCount[], total: number): Array<{ label: string; value: string }> {
+  const options = [
+    {
+      label: `全部计划 ${formatNumber(total)}`,
+      value: "all",
+    },
+  ];
+  const seen = new Set<string>();
+  for (const item of planCounts) {
+    const value = normalizePlanValue(item.plan);
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    options.push({
+      label: `${item.label || planLabel(value)} ${formatNumber(item.count || 0)}`,
+      value,
+    });
+  }
+  for (const value of ["free", "plus", "team", "pro", "unknown"]) {
+    if (!seen.has(value)) {
+      options.push({
+        label: `${planLabel(value)} 0`,
+        value,
+      });
+    }
+  }
+  return options;
+}
+
+function normalizePlanValue(value: string): string {
+  return String(value || "").trim().toLowerCase();
+}
+
+function planLabel(value: string): string {
+  switch (normalizePlanValue(value)) {
+    case "free":
+      return "Free";
+    case "plus":
+      return "Plus";
+    case "team":
+      return "Team";
+    case "pro":
+      return "Pro";
+    case "unknown":
+    case "":
+      return "Unknown";
+    default:
+      return value;
+  }
 }
 
 function sortParam(value: string): string {

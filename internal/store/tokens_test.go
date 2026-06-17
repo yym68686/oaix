@@ -94,6 +94,30 @@ func TestPostgresTextArrayDeduplicates(t *testing.T) {
 	}
 }
 
+func TestBuildPlanCountsIncludesCommonPlansAndExtras(t *testing.T) {
+	got := buildPlanCounts(map[string]int{
+		"pro":        12,
+		"enterprise": 3,
+		"unknown":    4,
+	})
+	want := []TokenPlanCount{
+		{Plan: "free", Label: "Free", Count: 0},
+		{Plan: "plus", Label: "Plus", Count: 0},
+		{Plan: "team", Label: "Team", Count: 0},
+		{Plan: "pro", Label: "Pro", Count: 12},
+		{Plan: "enterprise", Label: "enterprise", Count: 3},
+		{Plan: "unknown", Label: "Unknown", Count: 4},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("plan count length = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("plan count[%d] = %#v, want %#v", index, got[index], want[index])
+		}
+	}
+}
+
 func TestScanTokenAllowsMissingSecretColumns(t *testing.T) {
 	now := time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC)
 	token, err := scanToken(fakeTokenRow{values: []any{

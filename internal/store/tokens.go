@@ -6,11 +6,22 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
+
+const (
+	planFree    = "free"
+	planPlus    = "plus"
+	planTeam    = "team"
+	planPro     = "pro"
+	planUnknown = "unknown"
+)
+
+var primaryPlanOrder = []string{planFree, planPlus, planTeam, planPro}
 
 type Token struct {
 	ID            int64      `json:"id"`
@@ -42,6 +53,12 @@ type TokenCounts struct {
 	Disabled  int `json:"disabled"`
 }
 
+type TokenPlanCount struct {
+	Plan  string `json:"plan"`
+	Label string `json:"label"`
+	Count int    `json:"count"`
+}
+
 type ImportResult struct {
 	Created int                `json:"created"`
 	Updated int                `json:"updated"`
@@ -64,6 +81,7 @@ type TokenListOptions struct {
 	Offset int
 	Query  string
 	Status string
+	Plan   string
 	Sort   string
 }
 
@@ -131,6 +149,14 @@ func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token,
 		filters = append(filters, "cooldown_until > now()")
 	case "disabled", "inactive":
 		filters = append(filters, "(is_active = false or disabled_at is not null)")
+	}
+	if plan := normalizePlanFilter(opts.Plan); plan != "" && plan != "all" {
+		placeholder := arg(plan)
+		if plan == "unknown" {
+			filters = append(filters, fmt.Sprintf("(plan_type is null or btrim(plan_type) = '' or lower(btrim(plan_type)) = %s)", placeholder))
+		} else {
+			filters = append(filters, fmt.Sprintf("lower(btrim(plan_type)) = %s", placeholder))
+		}
 	}
 	where := strings.Join(filters, " and ")
 	if where == "" {
@@ -207,6 +233,106 @@ func (s *Store) TokenCounts(ctx context.Context) (TokenCounts, error) {
 		where merged_into_token_id is null
 	`).Scan(&counts.Total, &counts.Available, &counts.Cooling, &counts.Disabled)
 	return counts, err
+}
+
+func (s *Store) TokenPlanCounts(ctx context.Context) ([]TokenPlanCount, error) {
+	rows, err := s.pool.Query(ctx, `
+		with normalized as (
+			select case
+				when plan_type is null or btrim(plan_type) = '' then 'unknown'
+				else lower(btrim(plan_type))
+			end as plan
+			from codex_tokens
+			where merged_into_token_id is null
+		)
+		select plan, count(*)::int
+		from normalized
+		group by plan
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	countByPlan := map[string]int{}
+	for rows.Next() {
+		var plan string
+		var count int
+		if err := rows.Scan(&plan, &count); err != nil {
+			return nil, err
+		}
+		plan = normalizePlanFilter(plan)
+		if plan == "" {
+			plan = planUnknown
+		}
+		countByPlan[plan] += count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return buildPlanCounts(countByPlan), nil
+}
+
+func buildPlanCounts(countByPlan map[string]int) []TokenPlanCount {
+	counts := make([]TokenPlanCount, 0, len(countByPlan)+len(primaryPlanOrder)+1)
+	seen := map[string]struct{}{}
+	appendPlan := func(plan string) {
+		plan = normalizePlanFilter(plan)
+		if plan == "" {
+			plan = planUnknown
+		}
+		if _, ok := seen[plan]; ok {
+			return
+		}
+		seen[plan] = struct{}{}
+		counts = append(counts, TokenPlanCount{
+			Plan:  plan,
+			Label: planLabel(plan),
+			Count: countByPlan[plan],
+		})
+	}
+	for _, plan := range primaryPlanOrder {
+		appendPlan(plan)
+	}
+	extras := make([]string, 0, len(countByPlan))
+	for plan := range countByPlan {
+		if _, ok := seen[plan]; ok || plan == planUnknown {
+			continue
+		}
+		extras = append(extras, plan)
+	}
+	sort.Slice(extras, func(i, j int) bool {
+		left, right := extras[i], extras[j]
+		if countByPlan[left] != countByPlan[right] {
+			return countByPlan[left] > countByPlan[right]
+		}
+		return left < right
+	})
+	for _, plan := range extras {
+		appendPlan(plan)
+	}
+	appendPlan(planUnknown)
+	return counts
+}
+
+func normalizePlanFilter(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func planLabel(plan string) string {
+	switch normalizePlanFilter(plan) {
+	case planFree:
+		return "Free"
+	case planPlus:
+		return "Plus"
+	case planTeam:
+		return "Team"
+	case planPro:
+		return "Pro"
+	case planUnknown, "":
+		return "Unknown"
+	default:
+		return plan
+	}
 }
 
 func (s *Store) UpsertAccessTokens(ctx context.Context, accessTokens []string, source string) (ImportResult, error) {

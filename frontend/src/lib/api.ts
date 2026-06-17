@@ -9,6 +9,12 @@ export type TokenCounts = {
   disabled?: number;
 };
 
+export type TokenPlanCount = {
+  plan: string;
+  label?: string;
+  count: number;
+};
+
 export type TokenQuotaWindow = {
   id: string;
   label: string;
@@ -75,6 +81,7 @@ export type Pagination = {
 export type TokenListResponse = {
   counts?: TokenCounts;
   filtered_counts?: TokenCounts;
+  plan_counts?: TokenPlanCount[];
   items?: TokenItem[];
   pagination?: Pagination;
 };

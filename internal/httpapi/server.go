@@ -319,6 +319,7 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 		Offset: offset,
 		Query:  r.URL.Query().Get("q"),
 		Status: r.URL.Query().Get("status"),
+		Plan:   r.URL.Query().Get("plan"),
 		Sort:   r.URL.Query().Get("sort"),
 	})
 	if err != nil {
@@ -326,10 +327,12 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	counts, _ := a.store.TokenCounts(ctx)
+	planCounts, _ := a.store.TokenPlanCounts(ctx)
 	adminItems, pendingIDs := a.adminTokenItems(r.Context(), items, queryBool(r, "include_quota", false))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts":          counts,
 		"filtered_counts": counts,
+		"plan_counts":     planCounts,
 		"pagination": map[string]any{
 			"limit":        limit,
 			"offset":       offset,
