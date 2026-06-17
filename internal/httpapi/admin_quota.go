@@ -54,6 +54,7 @@ type codexQuotaSnapshot struct {
 	FetchedAt time.Time          `json:"fetched_at"`
 	Error     *string            `json:"error"`
 	PlanType  *string            `json:"plan_type"`
+	Disabled  bool               `json:"disabled,omitempty"`
 	Windows   []codexQuotaWindow `json:"windows"`
 }
 
@@ -140,9 +141,16 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 	cap := a.tokens.ActiveStreamCap()
 	now := time.Now().UTC()
 	items := make([]adminTokenItem, 0, len(tokens))
+	disabledFromQuota := false
 	for _, token := range tokens {
 		if quota := quotaByID[token.ID]; quota != nil && quota.PlanType != nil {
 			token.PlanType = quota.PlanType
+		}
+		if quotaSnapshotDisablesToken(quotaByID[token.ID]) {
+			if token.IsActive {
+				disabledFromQuota = true
+			}
+			token.IsActive = false
 		}
 		items = append(items, adminTokenItem{
 			Token:           token,
@@ -152,6 +160,13 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 			ObservedCostUSD: observedCostByID[token.ID],
 			Quota:           quotaByID[token.ID],
 		})
+	}
+	if disabledFromQuota && a.tokens != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := a.tokens.Refresh(ctx); err != nil && a.logger != nil {
+			a.logger.Warn("token pool refresh after quota disable failed", "error", err)
+		}
 	}
 	return items, pendingIDs
 }
@@ -363,7 +378,11 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 		}
 	}
 	if statusCode < 200 || statusCode >= 300 {
-		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, responseErrorDetail(statusCode, body)))
+		detail := responseErrorDetail(statusCode, body)
+		if quotaResponseShouldDisable(statusCode, body) {
+			s.disableTokenFromQuota(ctx, token.ID)
+		}
+		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, detail))
 	}
 
 	var payload map[string]any
@@ -479,8 +498,39 @@ func quotaErrorSnapshot(fetchedAt time.Time, message string) *codexQuotaSnapshot
 	return &codexQuotaSnapshot{
 		FetchedAt: fetchedAt,
 		Error:     &errText,
+		Disabled:  quotaErrorMessageShouldDisable(errText),
 		Windows:   []codexQuotaWindow{},
 	}
+}
+
+func (s *adminQuotaService) disableTokenFromQuota(ctx context.Context, tokenID int64) {
+	if s.store == nil || tokenID <= 0 {
+		return
+	}
+	disableCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _ = s.store.SetTokenActive(disableCtx, tokenID, false, true)
+}
+
+func quotaResponseShouldDisable(status int, body []byte) bool {
+	if status != http.StatusPaymentRequired {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(body)), "deactivated_workspace")
+}
+
+func quotaErrorMessageShouldDisable(message string) bool {
+	return strings.Contains(strings.ToLower(message), "deactivated_workspace")
+}
+
+func quotaSnapshotDisablesToken(snapshot *codexQuotaSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	if snapshot.Disabled {
+		return true
+	}
+	return snapshot.Error != nil && quotaErrorMessageShouldDisable(*snapshot.Error)
 }
 
 func parseCodexQuotaPayload(payload map[string]any, now time.Time) (*codexQuotaSnapshot, error) {
@@ -583,11 +633,11 @@ func responseErrorDetail(status int, body []byte) string {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err == nil {
 		if errorValue, ok := payload["error"].(map[string]any); ok {
-			if message := normalizeText(firstValue(errorValue, "message", "type", "code")); message != nil {
+			if message := responseValueText(firstValue(errorValue, "message", "type", "code")); message != nil {
 				return fmt.Sprintf("HTTP %d: %s", status, *message)
 			}
 		}
-		if detail := normalizeText(firstValue(payload, "detail", "message")); detail != nil {
+		if detail := responseValueText(firstValue(payload, "detail", "message", "code")); detail != nil {
 			return fmt.Sprintf("HTTP %d: %s", status, *detail)
 		}
 	}
@@ -596,6 +646,26 @@ func responseErrorDetail(status int, body []byte) string {
 		return fmt.Sprintf("HTTP %d", status)
 	}
 	return fmt.Sprintf("HTTP %d: %s", status, text)
+}
+
+func responseValueText(value any) *string {
+	if mapping, ok := value.(map[string]any); ok {
+		for _, key := range []string{"message", "type", "code", "detail", "error"} {
+			if text := responseValueText(mapping[key]); text != nil {
+				return text
+			}
+		}
+		return nil
+	}
+	if values, ok := value.([]any); ok {
+		for _, item := range values {
+			if text := responseValueText(item); text != nil {
+				return text
+			}
+		}
+		return nil
+	}
+	return normalizeText(value)
 }
 
 func firstMapping(mapping map[string]any, keys ...string) map[string]any {

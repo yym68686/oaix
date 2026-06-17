@@ -89,6 +89,28 @@ func TestQuotaStatusShouldRefresh(t *testing.T) {
 	}
 }
 
+func TestQuotaResponseShouldDisableOnlyForDeactivatedWorkspace(t *testing.T) {
+	if !quotaResponseShouldDisable(http.StatusPaymentRequired, []byte(`{"error":{"code":"deactivated_workspace"}}`)) {
+		t.Fatal("expected deactivated workspace to disable token")
+	}
+	if !quotaResponseShouldDisable(http.StatusPaymentRequired, []byte(`{"detail":"deactivated_workspace"}`)) {
+		t.Fatal("expected deactivated workspace detail to disable token")
+	}
+	if quotaResponseShouldDisable(http.StatusPaymentRequired, []byte(`{"error":{"code":"usage_limit_reached"}}`)) {
+		t.Fatal("usage limit should not disable token")
+	}
+	if quotaResponseShouldDisable(http.StatusTooManyRequests, []byte(`{"error":{"code":"deactivated_workspace"}}`)) {
+		t.Fatal("non-402 should not disable token")
+	}
+}
+
+func TestQuotaErrorSnapshotMarksDeactivatedWorkspace(t *testing.T) {
+	snapshot := quotaErrorSnapshot(time.Now().UTC(), "HTTP 402: deactivated_workspace")
+	if !snapshot.Disabled {
+		t.Fatal("expected snapshot to be disabled")
+	}
+}
+
 func TestAdminTokenStatusUsesServerTime(t *testing.T) {
 	now := time.Date(2026, 6, 17, 17, 30, 0, 0, time.UTC)
 	pastCooldown := now.Add(-time.Second)

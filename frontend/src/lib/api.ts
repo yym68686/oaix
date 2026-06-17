@@ -29,6 +29,7 @@ export type TokenQuotaSnapshot = {
   fetched_at?: string | null;
   error?: string | null;
   plan_type?: string | null;
+  disabled?: boolean;
   windows?: TokenQuotaWindow[];
 };
 

@@ -197,6 +197,9 @@ export function TokenQuotaStrip({ quota }: { quota?: TokenItem["quota"] | null }
   if (!quota) {
     return <div className="rounded-md bg-muted/64 px-2 py-0.5 text-muted-foreground">额度更新中</div>;
   }
+  if (quota.disabled || String(quota.error || "").toLowerCase().includes("deactivated_workspace")) {
+    return <div className="rounded-md bg-destructive/10 px-2 py-0.5 text-destructive-foreground">工作区停用，已禁用</div>;
+  }
   if (quota.error) {
     return (
       <div className="max-w-52 truncate rounded-md bg-warning/8 px-2 py-0.5 text-warning-foreground" title={quota.error}>

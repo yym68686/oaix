@@ -35,6 +35,9 @@ export function tokenPlanType(item: TokenItem): string {
 
 export function tokenStatusOf(item: TokenItem): "active" | "cooling" | "disabled" {
   const serverStatus = String(item.status || "").trim().toLowerCase();
+  if (item.quota?.disabled || quotaMarksDisabled(item.quota?.error)) {
+    return "disabled";
+  }
   if (serverStatus === "active" || serverStatus === "available") {
     return "active";
   }
@@ -54,6 +57,10 @@ export function tokenStatusOf(item: TokenItem): "active" | "cooling" | "disabled
     }
   }
   return "active";
+}
+
+function quotaMarksDisabled(message?: string | null): boolean {
+  return String(message || "").toLowerCase().includes("deactivated_workspace");
 }
 
 export function tokenStatusLabel(status: "active" | "cooling" | "disabled"): string {
