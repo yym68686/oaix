@@ -2,11 +2,12 @@ import {
   ActivityIcon,
   ChevronLeftIcon,
   KeyRoundIcon,
+  LoaderCircleIcon,
   SearchIcon,
   Trash2Icon,
 } from "lucide-react";
 import type * as React from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
@@ -119,30 +120,51 @@ function KeyListPage({
   const [probeBusyIds, setProbeBusyIds] = useState<Set<number>>(() => new Set());
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
+  const requestSeq = useRef(0);
 
   const totalPages = Math.max(1, Math.ceil(tokenTotal / PAGE_SIZE));
   const statusOptions = useMemo(() => statusOptionsWithCounts(counts), [counts]);
   const planOptions = useMemo(() => planOptionsWithCounts(planCounts), [planCounts]);
+  const queryKey = useMemo(() => JSON.stringify({ page, plan, search, sort, status }), [page, plan, search, sort, status]);
+  const [loadedQueryKey, setLoadedQueryKey] = useState("");
+  const tableLoading = loading && (!tokens.length || loadedQueryKey !== queryKey);
   const pageIds = tokens.map((item) => item.id);
   const allSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.has(id));
+
+  const beginQueryLoading = useCallback(() => {
+    requestSeq.current += 1;
+    setLoading(true);
+    setError("");
+    setLoadedQueryKey("");
+    setSelectedIds(new Set());
+  }, []);
 
   const updateQuery = useCallback(
     (patch: Record<string, string | number | null>, replace = true) => {
       const params = new URLSearchParams(route.search);
       for (const [key, value] of Object.entries(patch)) {
-        if (value == null || value === "" || value === "all" || (key === "status" && value === "available") || (key === "sort" && value === "-created_at")) {
+        const stringValue = value == null ? "" : String(value);
+        if (!stringValue || (key === "status" && stringValue === "available") || (key === "sort" && stringValue === "-created_at")) {
+          params.delete(key);
+        } else if (key !== "status" && stringValue === "all") {
           params.delete(key);
         } else {
-          params.set(key, String(value));
+          params.set(key, stringValue);
         }
       }
       const query = params.toString();
-      navigateTo(`/keys${query ? `?${query}` : ""}`, { replace });
+      const nextPath = `/keys${query ? `?${query}` : ""}`;
+      if (nextPath !== `${route.path}${route.search}`) {
+        beginQueryLoading();
+      }
+      navigateTo(nextPath, { replace });
     },
-    [route.search],
+    [beginQueryLoading, route.path, route.search],
   );
 
   const loadTokens = useCallback(async () => {
+    const requestID = requestSeq.current + 1;
+    requestSeq.current = requestID;
     setLoading(true);
     setError("");
     try {
@@ -165,6 +187,9 @@ function KeyListPage({
         params.set("sort", mappedSort);
       }
       const payload = await api.listTokens(params);
+      if (requestID !== requestSeq.current) {
+        return;
+      }
       const items = payload.items || [];
       const nextCounts = payload.counts || {};
       setTokens(items);
@@ -172,14 +197,26 @@ function KeyListPage({
       setCounts(nextCounts);
       setPlanCounts(payload.plan_counts || []);
       setSelectedIds(new Set());
+      setLoadedQueryKey(queryKey);
       onCountsChange(nextCounts);
     } catch (caught) {
+      if (requestID !== requestSeq.current) {
+        return;
+      }
       setError(errorMessage(caught));
       setTokens([]);
     } finally {
-      setLoading(false);
+      if (requestID === requestSeq.current) {
+        setLoading(false);
+      }
     }
-  }, [onCountsChange, page, plan, search, sort, status]);
+  }, [onCountsChange, page, plan, queryKey, search, sort, status]);
+
+  useEffect(() => {
+    if (loadedQueryKey && loadedQueryKey !== queryKey) {
+      beginQueryLoading();
+    }
+  }, [beginQueryLoading, loadedQueryKey, queryKey]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void loadTokens(), search.trim() ? 260 : 0);
@@ -333,7 +370,7 @@ function KeyListPage({
           <TokenTable
             activeStreamCap={activeStreamCap}
             error={error}
-            loading={loading && !tokens.length}
+            loading={tableLoading}
             onDelete={setDeleteTarget}
             onProbe={(id) => void runTokenProbe(id)}
             onRemark={setRemarkTarget}
@@ -386,7 +423,14 @@ function TokenTable({
     return <ErrorAlert title="Key 池载入失败" message={error} />;
   }
   if (loading) {
-    return <LoadingRows />;
+    return (
+      <div className="grid min-h-[18rem] place-items-center rounded-lg border bg-muted/24">
+        <div className="flex items-center gap-2 rounded-lg border bg-background px-4 py-3 text-muted-foreground text-sm shadow-xs">
+          <LoaderCircleIcon className="size-4 animate-spin" />
+          <span>正在加载 Key</span>
+        </div>
+      </div>
+    );
   }
   if (!tokens.length) {
     return <EmptyState title="没有匹配的 key" description="调整搜索、状态、计划或排序后再试。" />;
