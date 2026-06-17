@@ -1010,7 +1010,7 @@ function TokenList(props: Parameters<typeof TokenExplorer>[0]) {
     return <EmptyState title="没有匹配的 key" description="调整搜索、状态或排序后再试。" />;
   }
   return (
-    <div className="grid max-h-[760px] gap-2 overflow-auto pr-1 oaix-scrollbar">
+    <div className="flex max-h-[760px] flex-col gap-2 overflow-auto pr-1 oaix-scrollbar">
       {props.tokens.map((item) => (
         <TokenCard key={item.id} item={item} {...props} />
       ))}
