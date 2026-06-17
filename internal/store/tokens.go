@@ -662,6 +662,36 @@ func (s *Store) UpdateTokenRemark(ctx context.Context, tokenID int64, remark str
 	return &token, nil
 }
 
+func (s *Store) UpdateTokenPlanTypes(ctx context.Context, planByTokenID map[int64]string) error {
+	if len(planByTokenID) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(planByTokenID))
+	args := make([]any, 0, len(planByTokenID)*2)
+	for tokenID, plan := range planByTokenID {
+		plan = normalizePlanFilter(plan)
+		if tokenID <= 0 || plan == "" || len(plan) > 32 {
+			continue
+		}
+		args = append(args, tokenID, plan)
+		base := len(args) - 1
+		values = append(values, fmt.Sprintf("($%d::integer, $%d::varchar(32))", base, base+1))
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `
+		update codex_tokens as token
+		set plan_type = incoming.plan_type,
+		    updated_at = now()
+		from (values `+strings.Join(values, ",")+`) as incoming(id, plan_type)
+		where token.id = incoming.id
+		  and token.merged_into_token_id is null
+		  and coalesce(lower(btrim(token.plan_type)), '') <> incoming.plan_type
+	`, args...)
+	return err
+}
+
 func (s *Store) DeleteToken(ctx context.Context, tokenID int64) error {
 	tag, err := s.pool.Exec(ctx, `delete from codex_tokens where id = $1 or merged_into_token_id = $1`, tokenID)
 	if err != nil {

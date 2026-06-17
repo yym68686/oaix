@@ -109,6 +109,7 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 		defer cancel()
 		quotaByID, pendingIDs = a.quota.collect(ctx, tokens)
+		a.syncQuotaPlanTypes(parent, quotaByID)
 	}
 
 	observedCostByID := map[int64]*float64{}
@@ -141,6 +142,31 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 		})
 	}
 	return items, pendingIDs
+}
+
+func (a *App) syncQuotaPlanTypes(parent context.Context, quotaByID map[int64]*codexQuotaSnapshot) {
+	if a.store == nil || len(quotaByID) == 0 {
+		return
+	}
+	planByTokenID := make(map[int64]string, len(quotaByID))
+	for tokenID, quota := range quotaByID {
+		if quota == nil || quota.PlanType == nil {
+			continue
+		}
+		plan := strings.TrimSpace(*quota.PlanType)
+		if plan == "" {
+			continue
+		}
+		planByTokenID[tokenID] = plan
+	}
+	if len(planByTokenID) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	if err := a.store.UpdateTokenPlanTypes(ctx, planByTokenID); err != nil && a.logger != nil {
+		a.logger.Warn("admin quota plan type sync failed", "error", err)
+	}
 }
 
 func (a *App) activeStreamsByTokenID(tokens []store.Token) map[int64]int64 {
