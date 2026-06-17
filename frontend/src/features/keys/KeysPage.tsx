@@ -525,8 +525,8 @@ function TokenRow({
           <span className="oaix-tabular text-muted-foreground">冷却 {formatDate(item.cooldown_until)}</span>
         </div>
       </TableCell>
-      <TableCell className="max-w-[18rem]">
-        <span className="block min-w-0 truncate text-muted-foreground text-xs" title={secondaryText}>
+      <TableCell className="min-w-0 max-w-[18rem] align-top">
+        <span className="block min-w-0 whitespace-pre-wrap break-words text-muted-foreground text-xs leading-relaxed [overflow-wrap:anywhere]" title={secondaryText}>
           {secondaryText}
         </span>
       </TableCell>

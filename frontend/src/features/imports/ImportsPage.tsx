@@ -1,15 +1,15 @@
 import {
-  ChevronDownIcon,
-  ChevronRightIcon,
+  EyeIcon,
   SaveIcon,
   Trash2Icon,
   UploadIcon,
 } from "lucide-react";
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
 import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Separator } from "@/registry/default/ui/separator";
@@ -21,7 +21,9 @@ import {
   setServiceKey,
   type ImportBatch,
   type ImportBatchDetail,
+  type TokenCounts,
   type TokenItem,
+  type TokenPlanCount,
 } from "@/lib/api";
 import { formatDate, formatNumber } from "@/lib/format";
 import {
@@ -31,6 +33,9 @@ import {
   importBatchCancelable,
   importBatchStatusLabel,
   importBatchTotal,
+  normalizePlanValue,
+  planOptionsWithCounts,
+  statusOptionsWithCounts,
   tokenPlanType,
   tokenStatusLabel,
   tokenStatusOf,
@@ -41,6 +46,7 @@ import {
   ErrorAlert,
   LoadingRows,
   MiniMetric,
+  SelectField,
   TokenConcurrency,
   TokenObservedCost,
   TokenQuotaStrip,
@@ -49,7 +55,7 @@ import {
 } from "@/shared/components";
 import type { RouteState } from "@/app/router";
 import { navigateTo as go } from "@/app/router";
-import type { ToastMessage } from "@/shared/types";
+import type { ToastMessage, TokenStatus } from "@/shared/types";
 
 export function ImportsPage({
   pushToast,
@@ -233,7 +239,9 @@ function ImportBatchesPage({
   refreshNonce: number;
 }) {
   const [batches, setBatches] = useState<ImportBatch[]>([]);
-  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [detailDialogId, setDetailDialogId] = useState<number | null>(null);
+  const [detailStatus, setDetailStatus] = useState<TokenStatus>("all");
+  const [detailPlan, setDetailPlan] = useState("all");
   const [details, setDetails] = useState<Record<number, ImportBatchDetail>>({});
   const [detailErrors, setDetailErrors] = useState<Record<number, string>>({});
   const [detailLoadingId, setDetailLoadingId] = useState<number | null>(null);
@@ -284,6 +292,17 @@ function ImportBatchesPage({
     await loadDetail(id);
   }
 
+  function openDetail(job: ImportBatch) {
+    setDetailDialogId(job.id);
+    setDetailStatus("all");
+    setDetailPlan("all");
+    if (!details[job.id]) {
+      void loadDetail(job.id);
+    }
+  }
+
+  const detailJob = batches.find((job) => job.id === detailDialogId) || null;
+
   return (
     <Card>
       <CardHeader>
@@ -302,25 +321,30 @@ function ImportBatchesPage({
         {error ? (
           <ErrorAlert title="导入批次载入失败" message={error} />
         ) : (
-          <ImportBatchList
-            batches={batches}
-            detailErrors={detailErrors}
-            detailLoadingId={detailLoadingId}
-            details={details}
-            expandedId={expandedId}
-            loading={loading && !batches.length}
-            onCancel={(id) => void cancelJob(id)}
-            onToggle={(id) => {
-              if (expandedId === id) {
-                setExpandedId(null);
-                return;
-              }
-              setExpandedId(id);
-              if (!details[id]) {
-                void loadDetail(id);
-              }
-            }}
-          />
+          <>
+            <ImportBatchList
+              batches={batches}
+              detailLoadingId={detailLoadingId}
+              loading={loading && !batches.length}
+              onCancel={(id) => void cancelJob(id)}
+              onView={openDetail}
+            />
+            <ImportBatchDetailDialog
+              detail={detailDialogId ? details[detailDialogId] : undefined}
+              error={detailDialogId ? detailErrors[detailDialogId] : undefined}
+              job={detailJob}
+              loading={detailDialogId != null && detailLoadingId === detailDialogId}
+              onOpenChange={(open) => {
+                if (!open) {
+                  setDetailDialogId(null);
+                }
+              }}
+              onPlanChange={setDetailPlan}
+              onStatusChange={(value) => setDetailStatus(readTokenStatus(value))}
+              plan={detailPlan}
+              status={detailStatus}
+            />
+          </>
         )}
       </CardPanel>
     </Card>
@@ -329,22 +353,16 @@ function ImportBatchesPage({
 
 function ImportBatchList({
   batches,
-  detailErrors,
   detailLoadingId,
-  details,
-  expandedId,
   loading,
   onCancel,
-  onToggle,
+  onView,
 }: {
   batches: ImportBatch[];
-  detailErrors: Record<number, string>;
   detailLoadingId: number | null;
-  details: Record<number, ImportBatchDetail>;
-  expandedId: number | null;
   loading: boolean;
   onCancel: (id: number) => void;
-  onToggle: (id: number) => void;
+  onView: (job: ImportBatch) => void;
 }) {
   if (loading) {
     return <LoadingRows />;
@@ -368,218 +386,284 @@ function ImportBatchList({
           </TableRow>
         </TableHeader>
         <TableBody>
-      {batches.map((job) => {
-        const expanded = expandedId === job.id;
-        const detail = details[job.id];
-        const cancelable = importBatchCancelable(job.status);
-        const errorText = job.last_error || job.error_message || "";
-        return (
-          <Fragment key={job.id}>
-            <TableRow data-state={expanded ? "selected" : undefined}>
-              <TableCell className="min-w-[12rem]">
-                <div className="grid min-w-0 gap-1">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <strong className="truncate text-sm">导入批次 #{job.id}</strong>
-                    <Badge className="shrink-0" size="sm" variant="outline">
-                      {job.import_queue_position === "back" ? "最后" : "开头"}
-                    </Badge>
+          {batches.map((job) => {
+            const cancelable = importBatchCancelable(job.status);
+            const errorText = job.last_error || job.error_message || "";
+            return (
+              <TableRow key={job.id}>
+                <TableCell className="min-w-[12rem]">
+                  <div className="grid min-w-0 gap-1">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <strong className="truncate text-sm">导入批次 #{job.id}</strong>
+                      <Badge className="shrink-0" size="sm" variant="outline">
+                        {job.import_queue_position === "back" ? "最后" : "开头"}
+                      </Badge>
+                    </div>
+                    {errorText && (
+                      <span className="min-w-0 truncate text-destructive-foreground text-xs" title={errorText}>
+                        {errorText}
+                      </span>
+                    )}
                   </div>
-                  {errorText && (
-                    <span className="min-w-0 truncate text-destructive-foreground text-xs" title={errorText}>
-                      {errorText}
+                </TableCell>
+                <TableCell>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge size="sm" variant={importBatchBadge(job.status)}>
+                      {importBatchStatusLabel(job.status)}
+                    </Badge>
+                    {Boolean(job.failed_count) && (
+                      <Badge size="sm" variant="error">
+                        失败 {formatNumber(job.failed_count)}
+                      </Badge>
+                    )}
+                    {Boolean(job.missing) && (
+                      <Badge size="sm" variant="warning">
+                        缺失 {formatNumber(job.missing)}
+                      </Badge>
+                    )}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="grid gap-1 text-xs">
+                    <span className="oaix-tabular font-medium">{formatNumber(importBatchTotal(job))} key</span>
+                    <span className="oaix-tabular text-muted-foreground">
+                      有效 {formatNumber(job.available)} · 冷却 {formatNumber(job.cooling)} · 禁用 {formatNumber(job.disabled)}
                     </span>
-                  )}
-                </div>
-              </TableCell>
-              <TableCell>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <Badge size="sm" variant={importBatchBadge(job.status)}>
-                    {importBatchStatusLabel(job.status)}
-                  </Badge>
-                  {Boolean(job.failed_count) && (
-                    <Badge size="sm" variant="error">
-                      失败 {formatNumber(job.failed_count)}
-                    </Badge>
-                  )}
-                  {Boolean(job.missing) && (
-                    <Badge size="sm" variant="warning">
-                      缺失 {formatNumber(job.missing)}
-                    </Badge>
-                  )}
-                </div>
-              </TableCell>
-              <TableCell>
-                <div className="grid gap-1 text-xs">
-                  <span className="oaix-tabular font-medium">{formatNumber(importBatchTotal(job))} key</span>
-                  <span className="oaix-tabular text-muted-foreground">
-                    有效 {formatNumber(job.available)} · 冷却 {formatNumber(job.cooling)} · 禁用 {formatNumber(job.disabled)}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <span className="oaix-tabular text-sm">
+                    {formatNumber(job.processed_count)} / {formatNumber(job.total_count)}
                   </span>
-                </div>
-              </TableCell>
-              <TableCell>
-                <span className="oaix-tabular text-sm">
-                  {formatNumber(job.processed_count)} / {formatNumber(job.total_count)}
-                </span>
-              </TableCell>
-              <TableCell>
-                <span className="oaix-tabular text-muted-foreground text-xs">
-                  新 {formatNumber(job.created_count)} · 更 {formatNumber(job.updated_count)} · 跳 {formatNumber(job.skipped_count)}
-                </span>
-              </TableCell>
-              <TableCell>
-                <div className="grid gap-1 text-xs">
-                  <span className="oaix-tabular font-medium">{formatUSDOptional(job.observed_cost_usd)}</span>
-                  <span className="oaix-tabular text-muted-foreground">平均 {formatUSDOptional(job.average_observed_cost_usd)}</span>
-                </div>
-              </TableCell>
-              <TableCell>
-                <div className="grid gap-1 text-muted-foreground text-xs">
-                  <span className="oaix-tabular">提交 {formatDate(job.submitted_at)}</span>
-                  <span className="oaix-tabular">完成 {formatDate(job.finished_at || job.completed_at)}</span>
-                </div>
-              </TableCell>
-              <TableCell>
-                <div className="flex justify-end gap-1">
-                  <Button onClick={() => onToggle(job.id)} size="xs" variant={expanded ? "secondary" : "outline"}>
-                    {expanded ? <ChevronDownIcon /> : <ChevronRightIcon />}
-                    {expanded ? "收起 Key" : "查看 Key"}
-                  </Button>
-                  {cancelable && (
-                    <Button onClick={() => onCancel(job.id)} size="xs" variant="destructive-outline">
-                      <Trash2Icon />
-                      取消
+                </TableCell>
+                <TableCell>
+                  <span className="oaix-tabular text-muted-foreground text-xs">
+                    新 {formatNumber(job.created_count)} · 更 {formatNumber(job.updated_count)} · 跳 {formatNumber(job.skipped_count)}
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <div className="grid gap-1 text-xs">
+                    <span className="oaix-tabular font-medium">{formatUSDOptional(job.observed_cost_usd)}</span>
+                    <span className="oaix-tabular text-muted-foreground">平均 {formatUSDOptional(job.average_observed_cost_usd)}</span>
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="grid gap-1 text-muted-foreground text-xs">
+                    <span className="oaix-tabular">提交 {formatDate(job.submitted_at)}</span>
+                    <span className="oaix-tabular">完成 {formatDate(job.finished_at || job.completed_at)}</span>
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="flex justify-end gap-1">
+                    <Button loading={detailLoadingId === job.id} onClick={() => onView(job)} size="xs" variant="outline">
+                      <EyeIcon />
+                      查看 Key
                     </Button>
-                  )}
-                </div>
-              </TableCell>
-            </TableRow>
-            {expanded && (
-              <TableRow>
-                <TableCell className="bg-muted/16 p-3" colSpan={8}>
-                  <ImportBatchDetailPanel
-                    detail={detail}
-                    error={detailErrors[job.id]}
-                    fallbackJob={job}
-                    loading={detailLoadingId === job.id}
-                  />
+                    {cancelable && (
+                      <Button onClick={() => onCancel(job.id)} size="xs" variant="destructive-outline">
+                        <Trash2Icon />
+                        取消
+                      </Button>
+                    )}
+                  </div>
                 </TableCell>
               </TableRow>
-            )}
-          </Fragment>
-        );
-      })}
+            );
+          })}
         </TableBody>
       </Table>
     </div>
   );
 }
 
-function ImportBatchDetailPanel({
+function ImportBatchDetailDialog({
   detail,
   error,
-  fallbackJob,
+  job,
   loading,
+  onOpenChange,
+  onPlanChange,
+  onStatusChange,
+  plan,
+  status,
 }: {
   detail?: ImportBatchDetail;
   error?: string;
-  fallbackJob: ImportBatch;
+  job: ImportBatch | null;
   loading: boolean;
+  onOpenChange: (open: boolean) => void;
+  onPlanChange: (plan: string) => void;
+  onStatusChange: (status: string) => void;
+  plan: string;
+  status: TokenStatus;
 }) {
-  if (error) {
-    return <ErrorAlert title="批次详情载入失败" message={error} />;
-  }
-  if (loading && !detail) {
-    return (
-      <div className="grid gap-2">
-        <LoadingRows rows={2} />
-      </div>
-    );
-  }
   const tokens = detail?.tokens || [];
   const items = detail?.items || [];
   const failedItems = items.filter((item) => item.error_message);
-  if (!tokens.length && !failedItems.length) {
-    return <div className="rounded-lg border border-dashed bg-muted/24 p-4 text-muted-foreground text-sm">这个批次暂时没有可关联的 key 明细。</div>;
-  }
-  return (
-    <div className="grid gap-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge size="sm" variant="outline">
-          明细 {formatNumber(tokens.length)} key
-        </Badge>
-        <Badge size="sm" variant="secondary">
-          批次 #{fallbackJob.id}
-        </Badge>
-        {failedItems.length > 0 && (
-          <Badge size="sm" variant="error">
-            失败项 {formatNumber(failedItems.length)}
-          </Badge>
-        )}
-      </div>
-      {tokens.length > 0 && (
-        <div className="max-h-[460px] min-w-0 overflow-auto rounded-lg border oaix-scrollbar">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Key</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>额度</TableHead>
-                <TableHead>并发</TableHead>
-                <TableHead>余额</TableHead>
-                <TableHead>最近</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {tokens.map((token) => (
-                <ImportBatchTokenRow key={token.id} token={token} />
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      )}
-      {failedItems.length > 0 && (
-        <div className="grid gap-1.5">
-          {failedItems.slice(0, 10).map((item) => (
-            <div className="rounded-lg border bg-muted/32 px-2.5 py-2 text-xs" key={item.id}>
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge size="sm" variant="error">
-                  #{item.item_index + 1}
-                </Badge>
-                <span className="min-w-0 truncate text-muted-foreground" title={item.error_message || ""}>
-                  {item.error_message || "-"}
-                </span>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
+  const statusOptions = useMemo(() => statusOptionsWithCounts(countTokenStatuses(tokens)), [tokens]);
+  const planOptions = useMemo(() => planOptionsWithCounts(countTokenPlans(tokens)), [tokens]);
+  const filteredTokens = useMemo(
+    () =>
+      tokens.filter((token) => {
+        const tokenStatus = tokenStatusOf(token);
+        const matchesStatus = status === "all" || (status === "available" ? tokenStatus === "active" : tokenStatus === status);
+        const matchesPlan = plan === "all" || normalizePlanValue(tokenPlanType(token)) === plan;
+        return matchesStatus && matchesPlan;
+      }),
+    [plan, status, tokens],
   );
+
+  return (
+    <Dialog open={Boolean(job)} onOpenChange={onOpenChange}>
+      <DialogPopup className="h-[min(84vh,760px)] max-w-[min(112rem,calc(100vw-2rem))]">
+        <DialogHeader>
+          <DialogTitle>导入批次 Key</DialogTitle>
+          <DialogDescription>
+            批次 #{job?.id || "-"} · 显示 {formatNumber(filteredTokens.length)} / {formatNumber(tokens.length)} 个 key
+          </DialogDescription>
+        </DialogHeader>
+        <DialogPanel className="grid min-h-0 gap-4">
+          <div className="grid min-w-0 gap-3 md:grid-cols-[minmax(0,1fr)_15rem_15rem]">
+            <div className="flex min-w-0 flex-wrap items-end gap-2">
+              <Badge size="sm" variant="outline">
+                全部 {formatNumber(tokens.length)} key
+              </Badge>
+              {failedItems.length > 0 && (
+                <Badge size="sm" variant="error">
+                  失败项 {formatNumber(failedItems.length)}
+                </Badge>
+              )}
+              {job && (
+                <Badge size="sm" variant="secondary">
+                  {importBatchStatusLabel(job.status)}
+                </Badge>
+              )}
+            </div>
+            <SelectField label="状态" onChange={onStatusChange} options={statusOptions} value={status} />
+            <SelectField label="计划" onChange={onPlanChange} options={planOptions} value={plan} />
+          </div>
+
+          {error ? (
+            <ErrorAlert title="批次详情载入失败" message={error} />
+          ) : loading && !detail ? (
+            <LoadingRows rows={6} />
+          ) : !tokens.length && !failedItems.length ? (
+            <div className="rounded-lg border border-dashed bg-muted/24 p-4 text-muted-foreground text-sm">这个批次暂时没有可关联的 key 明细。</div>
+          ) : filteredTokens.length > 0 ? (
+            <div className="min-h-0 min-w-0 overflow-auto rounded-lg border oaix-scrollbar">
+              <Table className="table-fixed">
+                <colgroup>
+                  <col className="w-[28%]" />
+                  <col className="w-[7rem]" />
+                  <col className="w-[10rem]" />
+                  <col className="w-[10rem]" />
+                  <col className="w-[9.5rem]" />
+                  <col />
+                </colgroup>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Key</TableHead>
+                    <TableHead>状态</TableHead>
+                    <TableHead>额度</TableHead>
+                    <TableHead>并发 / 金额</TableHead>
+                    <TableHead>最近</TableHead>
+                    <TableHead>备注</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredTokens.map((token) => (
+                    <ImportBatchTokenRow key={token.id} token={token} />
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-dashed bg-muted/24 p-4 text-muted-foreground text-sm">当前筛选下没有 key。</div>
+          )}
+
+          {failedItems.length > 0 && (
+            <div className="grid gap-1.5">
+              {failedItems.slice(0, 10).map((item) => (
+                <div className="rounded-lg border bg-muted/32 px-2.5 py-2 text-xs" key={item.id}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge size="sm" variant="error">
+                      #{item.item_index + 1}
+                    </Badge>
+                    <span className="min-w-0 truncate text-muted-foreground" title={item.error_message || ""}>
+                      {item.error_message || "-"}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </DialogPanel>
+      </DialogPopup>
+    </Dialog>
+  );
+}
+
+function countTokenStatuses(tokens: TokenItem[]): TokenCounts {
+  const counts: TokenCounts = { available: 0, cooling: 0, disabled: 0, total: tokens.length };
+  for (const token of tokens) {
+    const status = tokenStatusOf(token);
+    if (status === "active") {
+      counts.available = (counts.available || 0) + 1;
+    } else if (status === "cooling") {
+      counts.cooling = (counts.cooling || 0) + 1;
+    } else {
+      counts.disabled = (counts.disabled || 0) + 1;
+    }
+  }
+  return counts;
+}
+
+function countTokenPlans(tokens: TokenItem[]): TokenPlanCount[] {
+  const countByPlan = new Map<string, number>();
+  for (const token of tokens) {
+    const plan = normalizePlanValue(tokenPlanType(token)) || "unknown";
+    countByPlan.set(plan, (countByPlan.get(plan) || 0) + 1);
+  }
+  return Array.from(countByPlan.entries()).map(([plan, count]) => ({
+    count,
+    label: undefined,
+    plan,
+  }));
+}
+
+function readTokenStatus(value: string): TokenStatus {
+  if (value === "all" || value === "cooling" || value === "disabled") {
+    return value;
+  }
+  return "available";
 }
 
 function ImportBatchTokenRow({ token }: { token: TokenItem }) {
   const status = tokenStatusOf(token);
   const title = tokenTitle(token);
   const planType = tokenPlanType(token);
+  const note = token.remark || token.source_file || "-";
   return (
     <TableRow>
-      <TableCell className="min-w-[16rem]">
-        <div className="flex min-w-0 flex-col gap-1">
+      <TableCell className="min-w-0">
+        <div className="grid max-h-11 min-w-0 gap-1 overflow-hidden">
           <div className="flex min-w-0 items-center gap-1.5">
             <span className="min-w-0 truncate font-medium" title={title}>
               {title}
             </span>
-            <Badge size="sm" variant="outline">
+            <Badge className="shrink-0" size="sm" variant="outline">
               ID {token.id}
             </Badge>
           </div>
-          <span className="min-w-0 truncate text-muted-foreground text-xs" title={token.remark || token.source_file || ""}>
-            {token.remark || token.source_file || "-"}
-          </span>
+          {token.account_id && token.email && (
+            <span className="min-w-0 truncate text-muted-foreground text-xs" title={token.account_id}>
+              {token.account_id}
+            </span>
+          )}
         </div>
       </TableCell>
       <TableCell>
-        <div className="flex flex-wrap items-center gap-1">
+        <div className="flex max-h-6 flex-wrap items-center gap-1 overflow-hidden">
           <Badge size="sm" variant={statusBadge(status)}>
             {tokenStatusLabel(status)}
           </Badge>
@@ -589,21 +673,26 @@ function ImportBatchTokenRow({ token }: { token: TokenItem }) {
         </div>
       </TableCell>
       <TableCell>
-        <div className="flex flex-wrap items-center gap-1 text-[11px]">
+        <div className="flex max-h-11 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
           <TokenQuotaStrip quota={token.quota} />
         </div>
       </TableCell>
       <TableCell>
-        <TokenConcurrency fallbackCap={Number(token.active_stream_cap || 0)} item={token} />
+        <div className="flex max-h-11 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
+          <TokenConcurrency fallbackCap={Number(token.active_stream_cap || 0)} item={token} />
+          <TokenObservedCost value={token.observed_cost_usd} />
+        </div>
       </TableCell>
       <TableCell>
-        <TokenObservedCost value={token.observed_cost_usd} />
-      </TableCell>
-      <TableCell>
-        <div className="grid gap-1 text-muted-foreground text-xs">
-          <span className="oaix-tabular">使用 {formatDate(token.last_used_at)}</span>
+        <div className="grid max-h-10 gap-1 overflow-hidden text-muted-foreground text-xs">
+          <span className="oaix-tabular">最近 {formatDate(token.last_used_at)}</span>
           <span className="oaix-tabular">冷却 {formatDate(token.cooldown_until)}</span>
         </div>
+      </TableCell>
+      <TableCell>
+        <span className="block min-w-0 whitespace-pre-wrap break-words text-muted-foreground text-xs leading-relaxed [overflow-wrap:anywhere]" title={note}>
+          {note}
+        </span>
       </TableCell>
     </TableRow>
   );
