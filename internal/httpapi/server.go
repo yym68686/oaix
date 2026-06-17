@@ -89,6 +89,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/tokens/import-batches", a.requireAuth(a.listImportBatches))
 	mux.HandleFunc("GET /admin/tokens/import-jobs/{job_id}", a.requireAuth(a.getImportJob))
 	mux.HandleFunc("POST /admin/tokens/import-jobs/{job_id}/cancel", a.requireAuth(a.cancelImportJob))
+	mux.HandleFunc("DELETE /admin/tokens/import-jobs/{job_id}", a.requireAuth(a.deleteImportJob))
 	mux.HandleFunc("POST /admin/tokens/{token_id}/activation", a.requireAuth(a.updateTokenActivation))
 	mux.HandleFunc("POST /admin/tokens/{token_id}/remark", a.requireAuth(a.updateTokenRemark))
 	mux.HandleFunc("POST /admin/tokens/{token_id}/probe", a.requireAuth(a.probeToken))
@@ -611,6 +612,40 @@ func (a *App) cancelImportJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"job": job})
+}
+
+func (a *App) deleteImportJob(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("job_id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("invalid job id"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	result, err := a.store.DeleteImportJobWithTokens(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("import job not found"))
+		return
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "cannot delete") {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	_ = a.tokens.Refresh(ctx)
+	_ = a.store.WriteAuditLog(ctx, "token_import_job_delete", "api", "import_job", strconv.FormatInt(id, 10), map[string]any{
+		"job_id":         id,
+		"token_ids":      result.TokenIDs,
+		"deleted_tokens": result.DeletedTokens,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job":            result.ImportJob,
+		"token_ids":      result.TokenIDs,
+		"deleted_tokens": result.DeletedTokens,
+	})
 }
 
 func orderTokensByID(tokens []store.Token, ids []int64) []store.Token {

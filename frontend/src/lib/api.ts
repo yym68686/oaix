@@ -285,6 +285,8 @@ export const api = {
     requestJSON<ImportBatchDetail>(`/admin/tokens/import-jobs/${id}?include_quota=true`),
   cancelImportJob: (id: number) =>
     postJSON<Record<string, unknown>>(`/admin/tokens/import-jobs/${id}/cancel`, {}),
+  deleteImportJob: (id: number) =>
+    requestJSON<Record<string, unknown>>(`/admin/tokens/import-jobs/${id}`, { method: "DELETE" }),
   requests: (limit = 80) =>
     requestJSON<{ items?: RequestItem[]; summary?: RequestSummary }>(`/admin/requests?limit=${limit}`),
   analytics: (hours = 24) =>

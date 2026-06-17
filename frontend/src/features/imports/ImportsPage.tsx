@@ -9,7 +9,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
 import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
-import { Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
+import { Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Separator } from "@/registry/default/ui/separator";
@@ -242,6 +242,7 @@ function ImportBatchesPage({
   const [detailDialogId, setDetailDialogId] = useState<number | null>(null);
   const [detailStatus, setDetailStatus] = useState<TokenStatus>("all");
   const [detailPlan, setDetailPlan] = useState("all");
+  const [deleteTarget, setDeleteTarget] = useState<ImportBatch | null>(null);
   const [details, setDetails] = useState<Record<number, ImportBatchDetail>>({});
   const [detailErrors, setDetailErrors] = useState<Record<number, string>>({});
   const [detailLoadingId, setDetailLoadingId] = useState<number | null>(null);
@@ -292,6 +293,28 @@ function ImportBatchesPage({
     await loadDetail(id);
   }
 
+  async function deleteJob() {
+    if (!deleteTarget) {
+      return;
+    }
+    const id = deleteTarget.id;
+    await api.deleteImportJob(id);
+    pushToast(`已删除批次 #${id}`);
+    setDeleteTarget(null);
+    setDetailDialogId((current) => (current === id ? null : current));
+    setDetails((items) => {
+      const next = { ...items };
+      delete next[id];
+      return next;
+    });
+    setDetailErrors((items) => {
+      const next = { ...items };
+      delete next[id];
+      return next;
+    });
+    await loadBatches();
+  }
+
   function openDetail(job: ImportBatch) {
     setDetailDialogId(job.id);
     setDetailStatus("all");
@@ -327,6 +350,7 @@ function ImportBatchesPage({
               detailLoadingId={detailLoadingId}
               loading={loading && !batches.length}
               onCancel={(id) => void cancelJob(id)}
+              onDelete={setDeleteTarget}
               onView={openDetail}
             />
             <ImportBatchDetailDialog
@@ -344,6 +368,15 @@ function ImportBatchesPage({
               plan={detailPlan}
               status={detailStatus}
             />
+            <DeleteImportBatchDialog
+              onConfirm={() => void deleteJob()}
+              onOpenChange={(open) => {
+                if (!open) {
+                  setDeleteTarget(null);
+                }
+              }}
+              target={deleteTarget}
+            />
           </>
         )}
       </CardPanel>
@@ -356,12 +389,14 @@ function ImportBatchList({
   detailLoadingId,
   loading,
   onCancel,
+  onDelete,
   onView,
 }: {
   batches: ImportBatch[];
   detailLoadingId: number | null;
   loading: boolean;
   onCancel: (id: number) => void;
+  onDelete: (job: ImportBatch) => void;
   onView: (job: ImportBatch) => void;
 }) {
   if (loading) {
@@ -388,6 +423,7 @@ function ImportBatchList({
         <TableBody>
           {batches.map((job) => {
             const cancelable = importBatchCancelable(job.status);
+            const deletable = importBatchDeletable(job.status);
             const errorText = job.last_error || job.error_message || "";
             return (
               <TableRow key={job.id}>
@@ -454,7 +490,7 @@ function ImportBatchList({
                   </div>
                 </TableCell>
                 <TableCell>
-                  <div className="flex justify-end gap-1">
+                  <div className="flex flex-wrap justify-end gap-1">
                     <Button loading={detailLoadingId === job.id} onClick={() => onView(job)} size="xs" variant="outline">
                       <EyeIcon />
                       查看 Key
@@ -463,6 +499,12 @@ function ImportBatchList({
                       <Button onClick={() => onCancel(job.id)} size="xs" variant="destructive-outline">
                         <Trash2Icon />
                         取消
+                      </Button>
+                    )}
+                    {deletable && (
+                      <Button onClick={() => onDelete(job)} size="xs" variant="destructive">
+                        <Trash2Icon />
+                        删除批次
                       </Button>
                     )}
                   </div>
@@ -522,7 +564,7 @@ function ImportBatchDetailDialog({
             批次 #{job?.id || "-"} · 显示 {formatNumber(filteredTokens.length)} / {formatNumber(tokens.length)} 个 key
           </DialogDescription>
         </DialogHeader>
-        <DialogPanel className="grid min-h-0 gap-4">
+        <DialogPanel className="flex min-h-0 flex-col gap-4">
           <div className="grid min-w-0 gap-3 md:grid-cols-[minmax(0,1fr)_15rem_15rem]">
             <div className="flex min-w-0 flex-wrap items-end gap-2">
               <Badge size="sm" variant="outline">
@@ -550,7 +592,7 @@ function ImportBatchDetailDialog({
           ) : !tokens.length && !failedItems.length ? (
             <div className="rounded-lg border border-dashed bg-muted/24 p-4 text-muted-foreground text-sm">这个批次暂时没有可关联的 key 明细。</div>
           ) : filteredTokens.length > 0 ? (
-            <div className="min-h-0 min-w-0 overflow-auto rounded-lg border oaix-scrollbar">
+            <div className="max-h-[min(52vh,28rem)] min-w-0 overflow-auto rounded-lg border oaix-scrollbar">
               <Table className="table-fixed">
                 <colgroup>
                   <col className="w-[28%]" />
@@ -638,14 +680,49 @@ function readTokenStatus(value: string): TokenStatus {
   return "available";
 }
 
+function importBatchDeletable(status?: string): boolean {
+  return !["queued", "running", "validating", "publishing"].includes(String(status || "").toLowerCase());
+}
+
+function DeleteImportBatchDialog({
+  onConfirm,
+  onOpenChange,
+  target,
+}: {
+  onConfirm: () => void;
+  onOpenChange: (open: boolean) => void;
+  target: ImportBatch | null;
+}) {
+  const tokenCount = target ? importBatchTotal(target) : 0;
+  return (
+    <Dialog open={Boolean(target)} onOpenChange={onOpenChange}>
+      <DialogPopup className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>删除导入批次？</DialogTitle>
+          <DialogDescription>
+            批次 #{target?.id || "-"} 会被删除，批次内关联的 {formatNumber(tokenCount)} 个 key 也会一起删除。此操作不可撤销。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <DialogClose render={<Button variant="ghost" />}>取消</DialogClose>
+          <Button onClick={onConfirm} variant="destructive">
+            <Trash2Icon />
+            删除批次和 Key
+          </Button>
+        </DialogFooter>
+      </DialogPopup>
+    </Dialog>
+  );
+}
+
 function ImportBatchTokenRow({ token }: { token: TokenItem }) {
   const status = tokenStatusOf(token);
   const title = tokenTitle(token);
   const planType = tokenPlanType(token);
   const note = token.remark || token.source_file || "-";
   return (
-    <TableRow>
-      <TableCell className="min-w-0">
+    <TableRow className="h-auto">
+      <TableCell className="min-w-0 py-2 align-middle">
         <div className="grid max-h-11 min-w-0 gap-1 overflow-hidden">
           <div className="flex min-w-0 items-center gap-1.5">
             <span className="min-w-0 truncate font-medium" title={title}>
@@ -662,7 +739,7 @@ function ImportBatchTokenRow({ token }: { token: TokenItem }) {
           )}
         </div>
       </TableCell>
-      <TableCell>
+      <TableCell className="py-2 align-middle">
         <div className="flex max-h-6 flex-wrap items-center gap-1 overflow-hidden">
           <Badge size="sm" variant={statusBadge(status)}>
             {tokenStatusLabel(status)}
@@ -672,24 +749,24 @@ function ImportBatchTokenRow({ token }: { token: TokenItem }) {
           </Badge>
         </div>
       </TableCell>
-      <TableCell>
+      <TableCell className="py-2 align-middle">
         <div className="flex max-h-11 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
           <TokenQuotaStrip quota={token.quota} />
         </div>
       </TableCell>
-      <TableCell>
+      <TableCell className="py-2 align-middle">
         <div className="flex max-h-11 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
           <TokenConcurrency fallbackCap={Number(token.active_stream_cap || 0)} item={token} />
           <TokenObservedCost value={token.observed_cost_usd} />
         </div>
       </TableCell>
-      <TableCell>
+      <TableCell className="py-2 align-middle">
         <div className="grid max-h-10 gap-1 overflow-hidden text-muted-foreground text-xs">
           <span className="oaix-tabular">最近 {formatDate(token.last_used_at)}</span>
           <span className="oaix-tabular">冷却 {formatDate(token.cooldown_until)}</span>
         </div>
       </TableCell>
-      <TableCell>
+      <TableCell className="py-2 align-top">
         <span className="block min-w-0 whitespace-pre-wrap break-words text-muted-foreground text-xs leading-relaxed [overflow-wrap:anywhere]" title={note}>
           {note}
         </span>

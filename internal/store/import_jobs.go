@@ -39,6 +39,12 @@ type ImportBatchSummary struct {
 	AverageObservedCostUSD *float64 `json:"average_observed_cost_usd,omitempty"`
 }
 
+type DeletedImportJob struct {
+	ImportJob
+	TokenIDs      []int64 `json:"token_ids"`
+	DeletedTokens int64   `json:"deleted_tokens"`
+}
+
 type ImportItem struct {
 	ID                 int64          `json:"id"`
 	JobID              int64          `json:"job_id"`
@@ -211,6 +217,140 @@ func (s *Store) CancelImportJob(ctx context.Context, id int64) (ImportJob, error
 		return ImportJob{}, err
 	}
 	return job, nil
+}
+
+func (s *Store) DeleteImportJobWithTokens(ctx context.Context, id int64) (DeletedImportJob, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return DeletedImportJob{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	row := tx.QueryRow(ctx, `
+		select id, status, import_queue_position, total_count, processed_count,
+		       created_count, updated_count, skipped_count, failed_count, last_error,
+		       submitted_at, started_at, heartbeat_at, finished_at
+		from token_import_jobs
+		where id = $1
+		for update
+	`, id)
+	job, err := scanImportJob(row)
+	if err != nil {
+		return DeletedImportJob{}, err
+	}
+	if importJobDeleteBlocked(job.Status) {
+		return DeletedImportJob{}, fmt.Errorf("cannot delete %s import job", job.Status)
+	}
+
+	tokenIDs, err := s.importJobTokenIDsForDelete(ctx, tx, id)
+	if err != nil {
+		return DeletedImportJob{}, err
+	}
+	var deletedTokens int64
+	if len(tokenIDs) > 0 {
+		tag, err := tx.Exec(ctx, `
+			delete from codex_tokens
+			where id = any($1::integer[])
+			   or merged_into_token_id = any($1::integer[])
+		`, postgresIntIDs(tokenIDs))
+		if err != nil {
+			return DeletedImportJob{}, err
+		}
+		deletedTokens = tag.RowsAffected()
+	}
+
+	tag, err := tx.Exec(ctx, `delete from token_import_jobs where id = $1`, id)
+	if err != nil {
+		return DeletedImportJob{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return DeletedImportJob{}, pgx.ErrNoRows
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return DeletedImportJob{}, err
+	}
+	return DeletedImportJob{
+		ImportJob:     job,
+		TokenIDs:      tokenIDs,
+		DeletedTokens: deletedTokens,
+	}, nil
+}
+
+func (s *Store) importJobTokenIDsForDelete(ctx context.Context, tx pgx.Tx, jobID int64) ([]int64, error) {
+	tokenIDs, err := s.importJobTokenIDsFromItemsTx(ctx, tx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if len(tokenIDs) > 0 {
+		return tokenIDs, nil
+	}
+	fallbackTokenIDs, err := s.importJobTokenIDsFromPayloadsTx(ctx, tx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	return fallbackTokenIDs, nil
+}
+
+func (s *Store) importJobTokenIDsFromItemsTx(ctx context.Context, tx pgx.Tx, jobID int64) ([]int64, error) {
+	rows, err := tx.Query(ctx, `
+		select token_id
+		from token_import_items
+		where job_id = $1
+		  and token_id is not null
+		order by item_index asc, id asc
+	`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tokenIDs := make([]int64, 0)
+	for rows.Next() {
+		var tokenID int64
+		if err := rows.Scan(&tokenID); err != nil {
+			return nil, err
+		}
+		tokenIDs = appendUniqueInt64(tokenIDs, tokenID)
+	}
+	return tokenIDs, rows.Err()
+}
+
+func (s *Store) importJobTokenIDsFromPayloadsTx(ctx context.Context, tx pgx.Tx, jobID int64) ([]int64, error) {
+	var rawPayloads []byte
+	if err := tx.QueryRow(ctx, `select payloads from token_import_jobs where id = $1`, jobID).Scan(&rawPayloads); err != nil {
+		return nil, err
+	}
+	refreshTokens := storedRefreshTokensFromPayloads(rawPayloads)
+	if len(refreshTokens) == 0 {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `
+		select id
+		from codex_tokens
+		where refresh_token = any($1::text[])
+		  and merged_into_token_id is null
+	`, refreshTokens)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tokenIDs := make([]int64, 0)
+	for rows.Next() {
+		var tokenID int64
+		if err := rows.Scan(&tokenID); err != nil {
+			return nil, err
+		}
+		tokenIDs = appendUniqueInt64(tokenIDs, tokenID)
+	}
+	return tokenIDs, rows.Err()
+}
+
+func importJobDeleteBlocked(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "queued", "running", "validating", "publishing":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Store) ListImportJobs(ctx context.Context, limit int) ([]ImportJob, error) {
