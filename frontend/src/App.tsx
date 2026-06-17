@@ -1037,8 +1037,12 @@ function TokenCard({
   const probeResult = probeResults[item.id];
   const probeBusy = probeBusyIds.has(item.id);
   return (
-    <Card className="overflow-hidden rounded-xl">
-      <CardPanel className="grid flex-none gap-1.5 p-2.5">
+    <div
+      className="relative overflow-hidden rounded-xl border bg-card not-dark:bg-clip-padding text-card-foreground shadow-xs/5 before:pointer-events-none before:absolute before:inset-0 before:rounded-[calc(var(--radius-xl)-1px)] before:shadow-[0_1px_--theme(--color-black/4%)] dark:before:shadow-[0_-1px_--theme(--color-white/6%)]"
+      data-token-card
+      data-token-id={item.id}
+    >
+      <div className="relative grid gap-1.5 p-2.5">
         <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-2">
           <Checkbox
             checked={checked}
@@ -1128,8 +1132,8 @@ function TokenCard({
             )}
           </div>
         )}
-      </CardPanel>
-    </Card>
+      </div>
+    </div>
   );
 }
 
