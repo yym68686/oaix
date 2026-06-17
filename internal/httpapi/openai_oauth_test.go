@@ -60,3 +60,12 @@ func TestPublicOriginDefaultsHTTPSForPublicHost(t *testing.T) {
 		t.Fatalf("publicOrigin = %q", got)
 	}
 }
+
+func TestPublicOriginUpgradesForwardedHTTPForPublicHost(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/admin/oauth/openai/start", nil)
+	request.Host = "oaix.fugue.pro"
+	request.Header.Set("X-Forwarded-Proto", "http")
+	if got := publicOrigin(request); got != "https://oaix.fugue.pro" {
+		t.Fatalf("publicOrigin = %q", got)
+	}
+}

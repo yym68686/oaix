@@ -265,6 +265,10 @@ func publicOrigin(r *http.Request) string {
 			proto = "http"
 		}
 	}
+	proto = strings.ToLower(strings.TrimSpace(proto))
+	if proto == "http" && shouldDefaultHTTPS(host) {
+		proto = "https"
+	}
 	return strings.TrimRight(proto, "/") + "://" + host
 }
 
