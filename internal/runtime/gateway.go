@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/yym68686/oaix/internal/affinity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/httpapi"
 	"github.com/yym68686/oaix/internal/importer"
@@ -58,7 +59,8 @@ func RunGateway(ctx context.Context) error {
 	stopEmbeddedWorker := startEmbeddedWorker(ctx, cfg, logger, db, tokenManager)
 	upstream := transport.New(cfg.Upstream)
 	defer upstream.CloseIdleConnections()
-	pipeline := proxy.New(cfg, logger, tokenManager, upstream, logWriter, db)
+	affinityStore := affinity.NewPostgresStore(db.Pool())
+	pipeline := proxy.New(cfg, logger, tokenManager, upstream, logWriter, db, affinityStore)
 	app := httpapi.NewApp(cfg, logger, db, tokenManager, logWriter, pipeline)
 	server := &http.Server{
 		Addr:         cfg.Address(),

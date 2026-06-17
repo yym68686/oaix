@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yym68686/oaix/internal/affinity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/protocol/openai"
@@ -32,6 +33,7 @@ type Pipeline struct {
 	transport      *transport.Client
 	logs           *logs.Writer
 	store          tokenStateStore
+	affinity       affinity.Store
 	commitFailures atomic.Int64
 }
 
@@ -59,6 +61,16 @@ type Attempt struct {
 	RetryCause  Outcome
 	UpstreamURL string
 	Method      string
+	PromptCache *PromptCacheContext
+}
+
+type AttemptResult struct {
+	Status       int
+	Retry        bool
+	Committed    bool
+	Usage        *UsageMetrics
+	ResponseID   string
+	FirstTokenAt *time.Time
 }
 
 type Outcome string
@@ -74,7 +86,7 @@ const (
 	OutcomeNoToken             Outcome = "no_token"
 )
 
-func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, client *transport.Client, writer *logs.Writer, stateStore tokenStateStore) *Pipeline {
+func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, client *transport.Client, writer *logs.Writer, stateStore tokenStateStore, affinityStore affinity.Store) *Pipeline {
 	return &Pipeline{
 		cfg:       cfg,
 		logger:    logger,
@@ -82,6 +94,7 @@ func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, c
 		transport: client,
 		logs:      writer,
 		store:     stateStore,
+		affinity:  affinityStore,
 	}
 }
 
@@ -104,18 +117,39 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	}
 	_ = r.Body.Close()
 	intent = normalizeIntent(intent, bodyBytes)
+	promptCacheContext, upstreamBody := buildPromptCacheContext(r.Header, intent, bodyBytes, p.cfg.PromptCache)
+	bodyBytes = upstreamBody
+	if promptCacheContext != nil && intent.Model == "" {
+		intent.Model = promptCacheContext.Model
+	}
 	timing := map[string]any{"request_body_bytes": len(bodyBytes)}
+	if promptCacheContext != nil {
+		timing["prompt_cache_key_hash"] = promptCacheContext.PromptCacheKeyHash
+		timing["prompt_cache_source"] = promptCacheContext.Source
+	}
 	p.logs.Submit(r.Context(), store.RequestLog{
-		RequestID:    requestID,
-		Endpoint:     intent.Endpoint,
-		Model:        nullable(intent.Model),
-		ModelName:    nullable(intent.Model),
-		IsStream:     intent.Stream,
-		StartedAt:    started,
-		ClientIP:     nullable(clientIP(r)),
-		UserAgent:    nullable(r.UserAgent()),
-		TimingSpans:  timing,
-		AttemptCount: 0,
+		RequestID:                     requestID,
+		Endpoint:                      intent.Endpoint,
+		Model:                         nullable(intent.Model),
+		ModelName:                     nullable(intent.Model),
+		IsStream:                      intent.Stream,
+		StartedAt:                     started,
+		ClientIP:                      nullable(clientIP(r)),
+		UserAgent:                     nullable(r.UserAgent()),
+		TimingSpans:                   timing,
+		AttemptCount:                  0,
+		RequestPayloadHash:            promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.RequestPayloadHash }),
+		UpstreamPayloadHash:           promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.UpstreamPayloadHash }),
+		PromptTemplateHash:            promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptTemplateHash }),
+		PromptDynamicHash:             promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptDynamicHash }),
+		PromptCacheSource:             promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.Source }),
+		PromptCacheKeyHash:            promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheKeyHash }),
+		PromptCacheRetentionRequested: promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheRetentionRequested }),
+		PromptCacheRetentionSent:      promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheRetentionSent }),
+		SessionIDHash:                 promptString(promptCacheContext, func(c *PromptCacheContext) string { return shortHash(c.SessionID, 64) }),
+		SessionIDSource:               promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.SessionIDSource }),
+		PreviousResponseIDHash:        promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PreviousResponseIDHash }),
+		PromptCacheTrace:              promptTrace(promptCacheContext),
 	}, false)
 
 	var excluded = make(map[int64]struct{})
@@ -123,13 +157,31 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var finalStatus = http.StatusBadGateway
 	var selectedTokenID *int64
 	var accountID *string
+	var lastAffinityResult tokens.PromptAffinityResult
+	var lastUsage *UsageMetrics
+	var lastResponseID string
+	var lastFirstTokenAt *time.Time
 	for attempt := 1; attempt <= p.cfg.Upstream.MaxRetries; attempt++ {
 		selectStarted := time.Now()
-		claim, err := p.tokens.Claim(r.Context(), tokens.Intent{
+		tokenIntent := tokens.Intent{
 			Endpoint:        intent.Endpoint,
 			Model:           intent.Model,
 			ExcludeTokenIDs: excluded,
-		})
+		}
+		if promptCacheContext != nil {
+			tokenIntent.PromptCacheKeyHash = promptCacheContext.PromptCacheKeyHash
+		}
+		claim, affinityResult, err := p.claimToken(r.Context(), tokenIntent, promptCacheContext)
+		lastAffinityResult = affinityResult
+		if affinityResult.Result != "" {
+			timing["cache_affinity_result"] = affinityResult.Result
+		}
+		if affinityResult.LaneIndex != nil {
+			timing["cache_affinity_lane_index"] = *affinityResult.LaneIndex
+		}
+		if affinityResult.LaneCount > 0 {
+			timing["cache_affinity_lane_count"] = affinityResult.LaneCount
+		}
 		timing["token_select_ms"] = int(time.Since(selectStarted).Milliseconds())
 		if err != nil {
 			finalStatus = http.StatusServiceUnavailable
@@ -140,15 +192,28 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		accountID = claim.AccountID()
 		attemptStarted := time.Now()
 		attemptSpec := Attempt{
-			Index:      attempt,
-			RequestID:  requestID,
-			Intent:     intent,
-			Claim:      claim,
-			Body:       bodyBytes,
-			StartedAt:  attemptStarted.UTC(),
-			RetryCause: classify(finalStatus, lastErr),
+			Index:       attempt,
+			RequestID:   requestID,
+			Intent:      intent,
+			Claim:       claim,
+			Body:        bodyBytes,
+			StartedAt:   attemptStarted.UTC(),
+			RetryCause:  classify(finalStatus, lastErr),
+			PromptCache: promptCacheContext,
 		}
-		status, retry, committed, err := p.doAttempt(w, r, attemptSpec)
+		result, err := p.doAttempt(w, r, attemptSpec)
+		status := result.Status
+		retry := result.Retry
+		committed := result.Committed
+		if result.Usage != nil {
+			lastUsage = result.Usage
+		}
+		if result.ResponseID != "" {
+			lastResponseID = result.ResponseID
+		}
+		if result.FirstTokenAt != nil {
+			lastFirstTokenAt = result.FirstTokenAt
+		}
 		timing["upstream_attempt_ms"] = int(time.Since(attemptStarted).Milliseconds())
 		timing["upstream_attempt_count"] = attempt
 		claim.Release()
@@ -160,21 +225,24 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				text := err.Error()
 				msg = &text
 			}
-			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, accountID, msg, timing)
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, accountID, msg, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 			if success {
 				p.commitSuccess(claim.TokenID())
+				p.recordPromptCacheSuccess(promptCacheContext, claim.TokenID(), lastResponseID)
 			}
 			return
 		}
 		if err == nil && status >= 200 && status < 400 {
 			p.commitSuccess(claim.TokenID())
-			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, accountID, nil, timing)
+			p.recordPromptCacheSuccess(promptCacheContext, claim.TokenID(), lastResponseID)
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, accountID, nil, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 			return
 		}
 		lastErr = err
 		action := classify(status, err)
 		if action == OutcomeUpstream401Invalid || action == OutcomeUpstream403Invalid {
 			p.commitTokenError(claim.TokenID(), fmt.Sprintf("terminal upstream status %d", status), true, nil)
+			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 		} else if action == OutcomeUpstream429Cooldown {
 			cooldown := time.Now().UTC().Add(p.cfg.TokenPool.DefaultCooldown)
 			p.commitTokenError(claim.TokenID(), "upstream 429 cooldown", false, &cooldown)
@@ -189,7 +257,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	}
 	if errors.Is(lastErr, tokens.ErrNoToken) {
 		writeErrorResponse(w, intent.Stream, http.StatusServiceUnavailable, "no available token")
-		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, len(excluded), selectedTokenID, accountID, stringPtr("no available token"), timing)
+		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, len(excluded), selectedTokenID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 		return
 	}
 	message := "upstream request failed"
@@ -197,13 +265,32 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		message = lastErr.Error()
 	}
 	writeErrorResponse(w, intent.Stream, finalStatus, message)
-	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, len(excluded), selectedTokenID, accountID, &message, timing)
+	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, len(excluded), selectedTokenID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 }
 
-func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Attempt) (int, bool, bool, error) {
+func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {
+	if promptCacheContext == nil {
+		claim, err := p.tokens.Claim(ctx, intent)
+		return claim, tokens.PromptAffinityResult{Result: claimReason(claim)}, err
+	}
+	return p.tokens.ClaimPromptAffinity(ctx, p.affinity, intent, tokens.PromptAffinityOptions{
+		AffinityKey:           promptCacheContext.AffinityKey,
+		PreviousResponseID:    promptCacheContext.PreviousResponseID,
+		MaxLanesPerKey:        p.cfg.PromptCache.MaxLanesPerKey,
+		PrimaryWait:           p.cfg.PromptCache.PrimaryWait,
+		LaneWait:              p.cfg.PromptCache.LaneWait,
+		PreviousOwnerWait:     p.cfg.PromptCache.PreviousOwnerWait,
+		PreviousStrict:        p.cfg.PromptCache.PreviousStrict,
+		GlobalFallbackEnabled: p.cfg.PromptCache.GlobalFallbackEnabled,
+		LaneTTL:               p.cfg.PromptCache.LaneTTL,
+		ResponseTTL:           p.cfg.PromptCache.ResponseTTL,
+	})
+}
+
+func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Attempt) (AttemptResult, error) {
 	upstreamURL, err := p.upstreamURL(attempt.Intent)
 	if err != nil {
-		return http.StatusBadGateway, false, false, err
+		return AttemptResult{Status: http.StatusBadGateway}, err
 	}
 	attempt.UpstreamURL = upstreamURL
 	method := attempt.Intent.Method
@@ -213,43 +300,69 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	attempt.Method = method
 	req, err := http.NewRequestWithContext(r.Context(), method, upstreamURL, bytes.NewReader(attempt.Body))
 	if err != nil {
-		return http.StatusBadGateway, false, false, err
+		return AttemptResult{Status: http.StatusBadGateway}, err
 	}
 	copyProxyHeaders(req.Header, r.Header)
 	req.Header.Set("X-Request-ID", attempt.RequestID)
 	req.Header.Set("Authorization", "Bearer "+attempt.Claim.AccessToken())
 	req.Header.Set("Content-Type", contentType(r.Header.Get("Content-Type")))
+	if attempt.PromptCache != nil && attempt.PromptCache.SessionID != "" {
+		req.Header.Set("Session_id", attempt.PromptCache.SessionID)
+	}
 	resp, err := p.transport.Do(r.Context(), req)
 	if err != nil {
-		return http.StatusBadGateway, true, false, err
+		return AttemptResult{Status: http.StatusBadGateway, Retry: true}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return resp.StatusCode, true, false, fmt.Errorf("upstream returned %d", resp.StatusCode)
+		return AttemptResult{Status: resp.StatusCode, Retry: true}, fmt.Errorf("upstream returned %d", resp.StatusCode)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
-		return resp.StatusCode, true, false, fmt.Errorf("upstream returned %d", resp.StatusCode)
+		return AttemptResult{Status: resp.StatusCode, Retry: true}, fmt.Errorf("upstream returned %d", resp.StatusCode)
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("X-OAIX-Token-ID", fmt.Sprint(attempt.Claim.TokenID()))
 	w.WriteHeader(resp.StatusCode)
 	if isSSE(resp.Header.Get("Content-Type")) || attempt.Intent.Stream {
+		observer := newUsageObserver(attempt.Intent.Model)
 		if flusher, ok := w.(http.Flusher); ok {
 			_, _ = w.Write(sse.Keepalive())
 			flusher.Flush()
 		}
-		_, copyErr := copyAndFlush(w, resp.Body)
-		if copyErr != nil {
-			return resp.StatusCode, false, true, copyErr
+		_, copyErr := copyAndFlush(w, resp.Body, observer)
+		observer.flushEvent()
+		result := AttemptResult{
+			Status:       resp.StatusCode,
+			Committed:    true,
+			Usage:        observer.usage,
+			ResponseID:   observer.responseID,
+			FirstTokenAt: observer.firstTokenAt,
 		}
-		return resp.StatusCode, false, true, nil
+		if copyErr != nil {
+			return result, copyErr
+		}
+		return result, nil
+	}
+	if attempt.PromptCache != nil {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, p.cfg.Upstream.NonStreamMaxResponseBytes))
+		if readErr != nil {
+			return AttemptResult{Status: resp.StatusCode, Committed: true}, readErr
+		}
+		usage, responseID := extractResponseMetrics(body, attempt.Intent.Model)
+		_, copyErr := w.Write(body)
+		result := AttemptResult{Status: resp.StatusCode, Committed: true, Usage: usage, ResponseID: responseID}
+		if copyErr != nil {
+			return result, copyErr
+		}
+		return result, nil
 	}
 	_, copyErr := io.Copy(w, resp.Body)
+	result := AttemptResult{Status: resp.StatusCode, Committed: true}
 	if copyErr != nil {
-		return resp.StatusCode, false, true, copyErr
+		return result, copyErr
 	}
-	return resp.StatusCode, false, true, nil
+	return result, nil
 }
 
 func (p *Pipeline) upstreamURL(intent RequestIntent) (string, error) {
@@ -347,36 +460,69 @@ func (p *Pipeline) withCommitRetry(ctx context.Context, fn func(context.Context)
 	return lastErr
 }
 
-func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent RequestIntent, started time.Time, status int, success bool, attempts int, tokenID *int64, accountID *string, errMsg *string, timing map[string]any) {
+func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent RequestIntent, started time.Time, status int, success bool, attempts int, tokenID *int64, accountID *string, errMsg *string, timing map[string]any, promptCacheContext *PromptCacheContext, affinityResult tokens.PromptAffinityResult, usage *UsageMetrics, upstreamResponseID string, firstTokenAt *time.Time) {
 	finished := time.Now().UTC()
 	duration := int(finished.Sub(started).Milliseconds())
 	if timing == nil {
 		timing = map[string]any{}
 	}
 	timing["total_ms"] = duration
+	trace := updatePromptTrace(promptCacheContext, affinityResult, usage, upstreamResponseID, status)
 	p.logs.Submit(ctx, store.RequestLog{
-		RequestID:    requestID,
-		Endpoint:     intent.Endpoint,
-		Model:        nullable(intent.Model),
-		ModelName:    nullable(intent.Model),
-		IsStream:     intent.Stream,
-		StatusCode:   ptrInt(status),
-		Success:      &success,
-		AttemptCount: attempts,
-		TokenID:      tokenID,
-		AccountID:    accountID,
-		StartedAt:    started,
-		FinishedAt:   &finished,
-		DurationMs:   &duration,
-		TimingSpans:  timing,
-		ErrorMessage: errMsg,
+		RequestID:                     requestID,
+		Endpoint:                      intent.Endpoint,
+		Model:                         nullable(intent.Model),
+		ModelName:                     nullable(intent.Model),
+		IsStream:                      intent.Stream,
+		StatusCode:                    ptrInt(status),
+		Success:                       &success,
+		AttemptCount:                  attempts,
+		TokenID:                       tokenID,
+		AccountID:                     accountID,
+		StartedAt:                     started,
+		FinishedAt:                    &finished,
+		FirstTokenAt:                  firstTokenAt,
+		TTFTMs:                        ttftMillis(started, firstTokenAt),
+		DurationMs:                    &duration,
+		TimingSpans:                   timing,
+		InputTokens:                   usageInt(usage, func(u *UsageMetrics) int { return u.InputTokens }),
+		CachedInputTokens:             usageInt(usage, func(u *UsageMetrics) int { return u.CachedInputTokens }),
+		OutputTokens:                  usageInt(usage, func(u *UsageMetrics) int { return u.OutputTokens }),
+		TotalTokens:                   usageInt(usage, func(u *UsageMetrics) int { return u.TotalTokens }),
+		EstimatedCostUSD:              usageFloat(usage, func(u *UsageMetrics) *float64 { return u.EstimatedCostUSD }),
+		RequestPayloadHash:            promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.RequestPayloadHash }),
+		UpstreamPayloadHash:           promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.UpstreamPayloadHash }),
+		PromptTemplateHash:            promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptTemplateHash }),
+		PromptDynamicHash:             promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptDynamicHash }),
+		PromptCacheSource:             promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.Source }),
+		PromptCacheKeyHash:            promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheKeyHash }),
+		PromptCacheRetentionRequested: promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheRetentionRequested }),
+		PromptCacheRetentionSent:      promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheRetentionSent }),
+		SessionIDHash:                 promptString(promptCacheContext, func(c *PromptCacheContext) string { return shortHash(c.SessionID, 64) }),
+		SessionIDSource:               promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.SessionIDSource }),
+		PreviousResponseIDHash:        promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PreviousResponseIDHash }),
+		UpstreamResponseID:            nullable(upstreamResponseID),
+		CacheHitRatio:                 usageFloatValue(usage, func(u *UsageMetrics) *float64 { return u.CacheHitRatio }),
+		CacheAffinityResult:           nullable(affinityResult.Result),
+		CacheAffinityLaneIndex:        affinityResult.LaneIndex,
+		PromptCacheTrace:              trace,
+		ErrorMessage:                  errMsg,
 	}, true)
+}
+
+func (p *Pipeline) recordPromptCacheSuccess(promptCacheContext *PromptCacheContext, tokenID int64, responseID string) {
+	if promptCacheContext == nil {
+		return
+	}
+	if responseID != "" {
+		p.tokens.BindPromptResponseOwner(p.affinity, responseID, tokenID, p.cfg.PromptCache.ResponseTTL)
+	}
 }
 
 func copyProxyHeaders(dst, src http.Header) {
 	for key, values := range src {
 		lower := strings.ToLower(key)
-		if lower == "host" || lower == "authorization" || strings.HasPrefix(lower, "x-oaix-") {
+		if lower == "host" || lower == "authorization" || lower == "content-length" || strings.HasPrefix(lower, "x-oaix-") {
 			continue
 		}
 		for _, value := range values {
@@ -397,13 +543,16 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 }
 
-func copyAndFlush(w http.ResponseWriter, reader io.Reader) (int64, error) {
+func copyAndFlush(w http.ResponseWriter, reader io.Reader, observer *usageObserver) (int64, error) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	var written int64
 	for {
 		n, readErr := reader.Read(buf)
 		if n > 0 {
+			if observer != nil {
+				observer.Observe(buf[:n])
+			}
 			m, writeErr := w.Write(buf[:n])
 			written += int64(m)
 			if flusher != nil {

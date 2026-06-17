@@ -11,28 +11,46 @@ import (
 )
 
 type RequestLog struct {
-	RequestID    string         `json:"request_id"`
-	Endpoint     string         `json:"endpoint"`
-	Model        *string        `json:"model,omitempty"`
-	ModelName    *string        `json:"model_name,omitempty"`
-	IsStream     bool           `json:"is_stream"`
-	StatusCode   *int           `json:"status_code,omitempty"`
-	Success      *bool          `json:"success,omitempty"`
-	AttemptCount int            `json:"attempt_count"`
-	TokenID      *int64         `json:"token_id,omitempty"`
-	AccountID    *string        `json:"account_id,omitempty"`
-	ClientIP     *string        `json:"client_ip,omitempty"`
-	UserAgent    *string        `json:"user_agent,omitempty"`
-	StartedAt    time.Time      `json:"started_at"`
-	FinishedAt   *time.Time     `json:"finished_at,omitempty"`
-	FirstTokenAt *time.Time     `json:"first_token_at,omitempty"`
-	TTFTMs       *int           `json:"ttft_ms,omitempty"`
-	DurationMs   *int           `json:"duration_ms,omitempty"`
-	TimingSpans  map[string]any `json:"timing_spans,omitempty"`
-	InputTokens  *int           `json:"input_tokens,omitempty"`
-	OutputTokens *int           `json:"output_tokens,omitempty"`
-	TotalTokens  *int           `json:"total_tokens,omitempty"`
-	ErrorMessage *string        `json:"error_message,omitempty"`
+	RequestID                     string         `json:"request_id"`
+	Endpoint                      string         `json:"endpoint"`
+	Model                         *string        `json:"model,omitempty"`
+	ModelName                     *string        `json:"model_name,omitempty"`
+	IsStream                      bool           `json:"is_stream"`
+	StatusCode                    *int           `json:"status_code,omitempty"`
+	Success                       *bool          `json:"success,omitempty"`
+	AttemptCount                  int            `json:"attempt_count"`
+	TokenID                       *int64         `json:"token_id,omitempty"`
+	AccountID                     *string        `json:"account_id,omitempty"`
+	ClientIP                      *string        `json:"client_ip,omitempty"`
+	UserAgent                     *string        `json:"user_agent,omitempty"`
+	StartedAt                     time.Time      `json:"started_at"`
+	FinishedAt                    *time.Time     `json:"finished_at,omitempty"`
+	FirstTokenAt                  *time.Time     `json:"first_token_at,omitempty"`
+	TTFTMs                        *int           `json:"ttft_ms,omitempty"`
+	DurationMs                    *int           `json:"duration_ms,omitempty"`
+	TimingSpans                   map[string]any `json:"timing_spans,omitempty"`
+	InputTokens                   *int           `json:"input_tokens,omitempty"`
+	CachedInputTokens             *int           `json:"cached_input_tokens,omitempty"`
+	OutputTokens                  *int           `json:"output_tokens,omitempty"`
+	TotalTokens                   *int           `json:"total_tokens,omitempty"`
+	EstimatedCostUSD              *float64       `json:"estimated_cost_usd,omitempty"`
+	RequestPayloadHash            *string        `json:"request_payload_hash,omitempty"`
+	UpstreamPayloadHash           *string        `json:"upstream_payload_hash,omitempty"`
+	PromptTemplateHash            *string        `json:"prompt_template_hash,omitempty"`
+	PromptDynamicHash             *string        `json:"prompt_dynamic_hash,omitempty"`
+	PromptCacheSource             *string        `json:"prompt_cache_source,omitempty"`
+	PromptCacheKeyHash            *string        `json:"prompt_cache_key_hash,omitempty"`
+	PromptCacheRetentionRequested *string        `json:"prompt_cache_retention_requested,omitempty"`
+	PromptCacheRetentionSent      *string        `json:"prompt_cache_retention_sent,omitempty"`
+	SessionIDHash                 *string        `json:"session_id_hash,omitempty"`
+	SessionIDSource               *string        `json:"session_id_source,omitempty"`
+	PreviousResponseIDHash        *string        `json:"previous_response_id_hash,omitempty"`
+	UpstreamResponseID            *string        `json:"upstream_response_id,omitempty"`
+	CacheHitRatio                 *float64       `json:"cache_hit_ratio,omitempty"`
+	CacheAffinityResult           *string        `json:"cache_affinity_result,omitempty"`
+	CacheAffinityLaneIndex        *int           `json:"cache_affinity_lane_index,omitempty"`
+	PromptCacheTrace              map[string]any `json:"prompt_cache_trace,omitempty"`
+	ErrorMessage                  *string        `json:"error_message,omitempty"`
 }
 
 type RequestLogSummary struct {
@@ -70,14 +88,19 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 			modelName = item.Model
 		}
 		timing := jsonBytes(item.TimingSpans)
+		promptTrace := jsonBytes(item.PromptCacheTrace)
 		batch.Queue(`
 			insert into gateway_request_logs (
 				request_id, endpoint, model, model_name, is_stream, status_code, success,
 				attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
-				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, output_tokens,
-				total_tokens, error_message
+				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, cached_input_tokens,
+				output_tokens, total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
+				prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
+				prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
+				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
+				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40)
 			on conflict (request_id) do update set
 				endpoint = excluded.endpoint,
 				model = coalesce(excluded.model, gateway_request_logs.model),
@@ -97,14 +120,36 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				duration_ms = coalesce(excluded.duration_ms, gateway_request_logs.duration_ms),
 				timing_spans = coalesce(excluded.timing_spans, gateway_request_logs.timing_spans),
 				input_tokens = coalesce(excluded.input_tokens, gateway_request_logs.input_tokens),
+				cached_input_tokens = coalesce(excluded.cached_input_tokens, gateway_request_logs.cached_input_tokens),
 				output_tokens = coalesce(excluded.output_tokens, gateway_request_logs.output_tokens),
 				total_tokens = coalesce(excluded.total_tokens, gateway_request_logs.total_tokens),
+				estimated_cost_usd = coalesce(excluded.estimated_cost_usd, gateway_request_logs.estimated_cost_usd),
+				request_payload_hash = coalesce(excluded.request_payload_hash, gateway_request_logs.request_payload_hash),
+				upstream_payload_hash = coalesce(excluded.upstream_payload_hash, gateway_request_logs.upstream_payload_hash),
+				prompt_template_hash = coalesce(excluded.prompt_template_hash, gateway_request_logs.prompt_template_hash),
+				prompt_dynamic_hash = coalesce(excluded.prompt_dynamic_hash, gateway_request_logs.prompt_dynamic_hash),
+				prompt_cache_source = coalesce(excluded.prompt_cache_source, gateway_request_logs.prompt_cache_source),
+				prompt_cache_key_hash = coalesce(excluded.prompt_cache_key_hash, gateway_request_logs.prompt_cache_key_hash),
+				prompt_cache_retention_requested = coalesce(excluded.prompt_cache_retention_requested, gateway_request_logs.prompt_cache_retention_requested),
+				prompt_cache_retention_sent = coalesce(excluded.prompt_cache_retention_sent, gateway_request_logs.prompt_cache_retention_sent),
+				session_id_hash = coalesce(excluded.session_id_hash, gateway_request_logs.session_id_hash),
+				session_id_source = coalesce(excluded.session_id_source, gateway_request_logs.session_id_source),
+				previous_response_id_hash = coalesce(excluded.previous_response_id_hash, gateway_request_logs.previous_response_id_hash),
+				upstream_response_id = coalesce(excluded.upstream_response_id, gateway_request_logs.upstream_response_id),
+				cache_hit_ratio = coalesce(excluded.cache_hit_ratio, gateway_request_logs.cache_hit_ratio),
+				cache_affinity_result = coalesce(excluded.cache_affinity_result, gateway_request_logs.cache_affinity_result),
+				cache_affinity_lane_index = coalesce(excluded.cache_affinity_lane_index, gateway_request_logs.cache_affinity_lane_index),
+				prompt_cache_trace = coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace),
 				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message)
 		`,
 			item.RequestID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
 			item.FinishedAt, item.FirstTokenAt, item.TTFTMs, item.DurationMs, timing, item.InputTokens,
-			item.OutputTokens, item.TotalTokens, item.ErrorMessage,
+			item.CachedInputTokens, item.OutputTokens, item.TotalTokens, item.EstimatedCostUSD, item.RequestPayloadHash,
+			item.UpstreamPayloadHash, item.PromptTemplateHash, item.PromptDynamicHash, item.PromptCacheSource,
+			item.PromptCacheKeyHash, item.PromptCacheRetentionRequested, item.PromptCacheRetentionSent,
+			item.SessionIDHash, item.SessionIDSource, item.PreviousResponseIDHash, item.UpstreamResponseID,
+			item.CacheHitRatio, item.CacheAffinityResult, item.CacheAffinityLaneIndex, promptTrace, item.ErrorMessage,
 		)
 	}
 	br := s.pool.SendBatch(ctx, batch)
@@ -199,14 +244,19 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 		if modelName == nil {
 			modelName = item.Model
 		}
+		promptTrace := jsonBytes(item.PromptCacheTrace)
 		_, err := tx.Exec(ctx, `
 			insert into gateway_request_logs (
 				request_id, endpoint, model, model_name, is_stream, status_code, success,
 				attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
-				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, output_tokens,
-				total_tokens, error_message
+				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, cached_input_tokens,
+				output_tokens, total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
+				prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
+				prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
+				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
+				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40)
 			on conflict (request_id) do update set
 				status_code = coalesce(excluded.status_code, gateway_request_logs.status_code),
 				success = coalesce(excluded.success, gateway_request_logs.success),
@@ -216,12 +266,39 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				first_token_at = coalesce(gateway_request_logs.first_token_at, excluded.first_token_at),
 				ttft_ms = coalesce(excluded.ttft_ms, gateway_request_logs.ttft_ms),
 				duration_ms = coalesce(excluded.duration_ms, gateway_request_logs.duration_ms),
+				timing_spans = coalesce(excluded.timing_spans, gateway_request_logs.timing_spans),
+				input_tokens = coalesce(excluded.input_tokens, gateway_request_logs.input_tokens),
+				cached_input_tokens = coalesce(excluded.cached_input_tokens, gateway_request_logs.cached_input_tokens),
+				output_tokens = coalesce(excluded.output_tokens, gateway_request_logs.output_tokens),
+				total_tokens = coalesce(excluded.total_tokens, gateway_request_logs.total_tokens),
+				estimated_cost_usd = coalesce(excluded.estimated_cost_usd, gateway_request_logs.estimated_cost_usd),
+				request_payload_hash = coalesce(excluded.request_payload_hash, gateway_request_logs.request_payload_hash),
+				upstream_payload_hash = coalesce(excluded.upstream_payload_hash, gateway_request_logs.upstream_payload_hash),
+				prompt_template_hash = coalesce(excluded.prompt_template_hash, gateway_request_logs.prompt_template_hash),
+				prompt_dynamic_hash = coalesce(excluded.prompt_dynamic_hash, gateway_request_logs.prompt_dynamic_hash),
+				prompt_cache_source = coalesce(excluded.prompt_cache_source, gateway_request_logs.prompt_cache_source),
+				prompt_cache_key_hash = coalesce(excluded.prompt_cache_key_hash, gateway_request_logs.prompt_cache_key_hash),
+				prompt_cache_retention_requested = coalesce(excluded.prompt_cache_retention_requested, gateway_request_logs.prompt_cache_retention_requested),
+				prompt_cache_retention_sent = coalesce(excluded.prompt_cache_retention_sent, gateway_request_logs.prompt_cache_retention_sent),
+				session_id_hash = coalesce(excluded.session_id_hash, gateway_request_logs.session_id_hash),
+				session_id_source = coalesce(excluded.session_id_source, gateway_request_logs.session_id_source),
+				previous_response_id_hash = coalesce(excluded.previous_response_id_hash, gateway_request_logs.previous_response_id_hash),
+				upstream_response_id = coalesce(excluded.upstream_response_id, gateway_request_logs.upstream_response_id),
+				cache_hit_ratio = coalesce(excluded.cache_hit_ratio, gateway_request_logs.cache_hit_ratio),
+				cache_affinity_result = coalesce(excluded.cache_affinity_result, gateway_request_logs.cache_affinity_result),
+				cache_affinity_lane_index = coalesce(excluded.cache_affinity_lane_index, gateway_request_logs.cache_affinity_lane_index),
+				prompt_cache_trace = coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace),
 				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message)
 		`,
 			item.RequestID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
 			item.FinishedAt, item.FirstTokenAt, item.TTFTMs, item.DurationMs, jsonBytes(item.TimingSpans),
-			item.InputTokens, item.OutputTokens, item.TotalTokens, item.ErrorMessage,
+			item.InputTokens, item.CachedInputTokens, item.OutputTokens, item.TotalTokens, item.EstimatedCostUSD,
+			item.RequestPayloadHash, item.UpstreamPayloadHash, item.PromptTemplateHash, item.PromptDynamicHash,
+			item.PromptCacheSource, item.PromptCacheKeyHash, item.PromptCacheRetentionRequested,
+			item.PromptCacheRetentionSent, item.SessionIDHash, item.SessionIDSource, item.PreviousResponseIDHash,
+			item.UpstreamResponseID, item.CacheHitRatio, item.CacheAffinityResult, item.CacheAffinityLaneIndex,
+			promptTrace, item.ErrorMessage,
 		)
 		if err != nil {
 			return err
@@ -376,7 +453,12 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 	rows, err := s.pool.Query(ctx, `
 		select request_id, endpoint, model, model_name, is_stream, status_code, success,
 		       attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
-		       first_token_at, ttft_ms, duration_ms, input_tokens, output_tokens, total_tokens, error_message
+		       first_token_at, ttft_ms, duration_ms, input_tokens, cached_input_tokens, output_tokens,
+		       total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
+		       prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
+		       prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
+		       session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
+		       cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message
 		from gateway_request_logs
 		order by started_at desc
 		limit $1
@@ -388,13 +470,22 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 	var items []RequestLog
 	for rows.Next() {
 		var item RequestLog
+		var promptTrace []byte
 		if err := rows.Scan(
 			&item.RequestID, &item.Endpoint, &item.Model, &item.ModelName, &item.IsStream, &item.StatusCode,
 			&item.Success, &item.AttemptCount, &item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
 			&item.StartedAt, &item.FinishedAt, &item.FirstTokenAt, &item.TTFTMs, &item.DurationMs,
-			&item.InputTokens, &item.OutputTokens, &item.TotalTokens, &item.ErrorMessage,
+			&item.InputTokens, &item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,
+			&item.RequestPayloadHash, &item.UpstreamPayloadHash, &item.PromptTemplateHash, &item.PromptDynamicHash,
+			&item.PromptCacheSource, &item.PromptCacheKeyHash, &item.PromptCacheRetentionRequested,
+			&item.PromptCacheRetentionSent, &item.SessionIDHash, &item.SessionIDSource, &item.PreviousResponseIDHash,
+			&item.UpstreamResponseID, &item.CacheHitRatio, &item.CacheAffinityResult, &item.CacheAffinityLaneIndex,
+			&promptTrace, &item.ErrorMessage,
 		); err != nil {
 			return nil, err
+		}
+		if len(promptTrace) > 0 {
+			_ = json.Unmarshal(promptTrace, &item.PromptCacheTrace)
 		}
 		items = append(items, item)
 	}

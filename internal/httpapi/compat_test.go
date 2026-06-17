@@ -13,6 +13,7 @@ import (
 
 	"log/slog"
 
+	"github.com/yym68686/oaix/internal/affinity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/proxy"
@@ -86,7 +87,7 @@ func TestBlackboxCompatibilityFixture(t *testing.T) {
 	defer writer.Stop(ctx)
 	client := transport.New(cfg.Upstream)
 	defer client.CloseIdleConnections()
-	pipeline := proxy.New(cfg, logger, manager, client, writer, db)
+	pipeline := proxy.New(cfg, logger, manager, client, writer, db, affinity.NewMemoryStore())
 	app := NewApp(cfg, logger, db, manager, writer, pipeline)
 	server := httptest.NewServer(app.Handler())
 	defer server.Close()

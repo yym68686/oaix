@@ -16,6 +16,7 @@ type Config struct {
 	Auth          AuthConfig
 	Upstream      UpstreamConfig
 	TokenPool     TokenPoolConfig
+	PromptCache   PromptCacheConfig
 	RequestLog    RequestLogConfig
 	Import        ImportConfig
 	Worker        WorkerConfig
@@ -68,6 +69,20 @@ type TokenPoolConfig struct {
 	DefaultCooldown      time.Duration
 	CompactErrorCooldown time.Duration
 	AccessTokenFile      string
+}
+
+type PromptCacheConfig struct {
+	AffinityEnabled       bool
+	AutoKeyEnabled        bool
+	MaxLanesPerKey        int
+	PrimaryWait           time.Duration
+	LaneWait              time.Duration
+	PreviousOwnerWait     time.Duration
+	PreviousStrict        bool
+	GlobalFallbackEnabled bool
+	SessionPreferHeader   bool
+	LaneTTL               time.Duration
+	ResponseTTL           time.Duration
 }
 
 type RequestLogConfig struct {
@@ -144,6 +159,19 @@ func Load() (Config, error) {
 			CompactErrorCooldown: envDurationSeconds("COMPACT_SERVER_ERROR_COOLDOWN_SECONDS", 60*time.Second),
 			AccessTokenFile:      envString("OAIX_ACCESS_TOKEN_FILE", envString("ACCESS_TOKEN_FILE", "")),
 		},
+		PromptCache: PromptCacheConfig{
+			AffinityEnabled:       envBool("PROMPT_CACHE_AFFINITY_ENABLED", true),
+			AutoKeyEnabled:        envBool("PROMPT_CACHE_AUTO_KEY_ENABLED", true),
+			MaxLanesPerKey:        envInt("PROMPT_CACHE_MAX_LANES_PER_KEY", 3),
+			PrimaryWait:           envDurationMilliseconds("PROMPT_CACHE_PRIMARY_WAIT_MS", 500*time.Millisecond),
+			LaneWait:              envDurationMilliseconds("PROMPT_CACHE_LANE_WAIT_MS", 100*time.Millisecond),
+			PreviousOwnerWait:     envDurationMilliseconds("PROMPT_CACHE_PREVIOUS_OWNER_WAIT_MS", 800*time.Millisecond),
+			PreviousStrict:        promptCachePreviousStrictDefault(),
+			GlobalFallbackEnabled: envBool("PROMPT_CACHE_GLOBAL_FALLBACK_ENABLED", true),
+			SessionPreferHeader:   promptCacheSessionPreferHeader(),
+			LaneTTL:               envDurationSeconds("PROMPT_CACHE_LANE_TTL_SECONDS", time.Hour),
+			ResponseTTL:           envDurationSeconds("PROMPT_CACHE_RESPONSE_TTL_SECONDS", 24*time.Hour),
+		},
 		RequestLog: RequestLogConfig{
 			Concurrency:       envInt("REQUEST_LOG_WRITE_CONCURRENCY", 1),
 			BatchSize:         envInt("REQUEST_LOG_WRITE_BATCH_SIZE", 250),
@@ -189,6 +217,9 @@ func (c Config) Validate() error {
 	}
 	if c.TokenPool.ActiveStreamCap <= 0 {
 		errs = append(errs, fmt.Errorf("TOKEN_ACTIVE_STREAM_CAP must be positive"))
+	}
+	if c.PromptCache.MaxLanesPerKey <= 0 {
+		errs = append(errs, fmt.Errorf("PROMPT_CACHE_MAX_LANES_PER_KEY must be positive"))
 	}
 	if c.RequestLog.BatchSize <= 0 {
 		errs = append(errs, fmt.Errorf("REQUEST_LOG_WRITE_BATCH_SIZE must be positive"))
@@ -236,6 +267,13 @@ func (c Config) SanitizedSummary() map[string]any {
 			"refresh_interval":  c.TokenPool.RefreshInterval.String(),
 			"active_stream_cap": c.TokenPool.ActiveStreamCap,
 			"access_token_file": c.TokenPool.AccessTokenFile != "",
+		},
+		"prompt_cache": map[string]any{
+			"affinity_enabled":        c.PromptCache.AffinityEnabled,
+			"auto_key_enabled":        c.PromptCache.AutoKeyEnabled,
+			"max_lanes_per_key":       c.PromptCache.MaxLanesPerKey,
+			"global_fallback_enabled": c.PromptCache.GlobalFallbackEnabled,
+			"session_prefer_header":   c.PromptCache.SessionPreferHeader,
 		},
 		"request_log": map[string]any{
 			"concurrency":  c.RequestLog.Concurrency,
@@ -327,4 +365,33 @@ func envDurationSeconds(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return time.Duration(value * float64(time.Second))
+}
+
+func envDurationMilliseconds(key string, fallback time.Duration) time.Duration {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || value < 0 {
+		return fallback
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+func promptCacheSessionPreferHeader() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("PROMPT_CACHE_SESSION_ID_MODE")))
+	switch value {
+	case "header", "prefer_header", "client", "client_header":
+		return true
+	default:
+		return false
+	}
+}
+
+func promptCachePreviousStrictDefault() bool {
+	if _, ok := os.LookupEnv("PROMPT_CACHE_PREVIOUS_STRICT_ENABLED"); ok {
+		return envBool("PROMPT_CACHE_PREVIOUS_STRICT_ENABLED", true)
+	}
+	return !envBool("PROMPT_CACHE_PREVIOUS_REPLAY_FALLBACK_ENABLED", false)
 }
