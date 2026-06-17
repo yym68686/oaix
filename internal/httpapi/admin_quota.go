@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -252,7 +253,9 @@ func (s *adminQuotaService) collect(ctx context.Context, tokens []store.Token) (
 	}
 	if syncLimit > 0 {
 		for id, snapshot := range s.fetchMany(ctx, refresh[:syncLimit]) {
-			out[id] = snapshot
+			if snapshot != nil {
+				out[id] = snapshot
+			}
 		}
 	}
 	if syncLimit < len(refresh) {
@@ -353,12 +356,15 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	case <-ctx.Done():
-		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, ctx.Err().Error()))
+		return nil
 	}
 
 	if strings.TrimSpace(token.AccessToken) == "" {
 		refreshed, err := s.refreshQuotaToken(ctx, token)
 		if err != nil {
+			if contextError(err) {
+				return nil
+			}
 			return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
 		}
 		token = refreshed
@@ -366,6 +372,9 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 
 	statusCode, body, err := s.requestUsage(ctx, token)
 	if err != nil {
+		if contextError(err) {
+			return nil
+		}
 		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
 	}
 	if quotaStatusShouldRefresh(statusCode) {
@@ -373,6 +382,9 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 			token = refreshed
 			statusCode, body, err = s.requestUsage(ctx, token)
 			if err != nil {
+				if contextError(err) {
+					return nil
+				}
 				return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
 			}
 		}
@@ -423,6 +435,10 @@ func (s *adminQuotaService) requestUsage(ctx context.Context, token store.Token)
 
 func quotaStatusShouldRefresh(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusNotFound
+}
+
+func contextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (s *adminQuotaService) refreshQuotaToken(ctx context.Context, token store.Token) (store.Token, error) {

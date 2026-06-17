@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -108,6 +109,48 @@ func TestQuotaErrorSnapshotMarksDeactivatedWorkspace(t *testing.T) {
 	snapshot := quotaErrorSnapshot(time.Now().UTC(), "HTTP 402: deactivated_workspace")
 	if !snapshot.Disabled {
 		t.Fatal("expected snapshot to be disabled")
+	}
+}
+
+func TestQuotaCollectKeepsStaleSnapshotOnCanceledContext(t *testing.T) {
+	now := time.Now().UTC()
+	plan := "pro"
+	stale := &codexQuotaSnapshot{
+		FetchedAt: now.Add(-2 * time.Minute),
+		PlanType:  &plan,
+		Windows: []codexQuotaWindow{
+			{ID: "code-5h", Label: "5h"},
+		},
+	}
+	service := &adminQuotaService{
+		client:           &http.Client{Timeout: time.Second},
+		usageURL:         "https://example.invalid/usage",
+		ttl:              time.Minute,
+		syncRefreshLimit: 1,
+		sem:              make(chan struct{}, 1),
+		cache: map[int64]cachedQuotaSnapshot{
+			7: {
+				snapshot:  stale,
+				expiresAt: now.Add(-time.Minute),
+			},
+		},
+		pending: map[int64]struct{}{},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	items, pending := service.collect(ctx, []store.Token{{
+		ID:          7,
+		AccessToken: "access-token",
+		IsActive:    true,
+	}})
+	if len(pending) != 0 {
+		t.Fatalf("pending = %v", pending)
+	}
+	if items[7] != stale {
+		t.Fatalf("expected stale quota snapshot to survive canceled refresh, got %#v", items[7])
+	}
+	if items[7].Error != nil {
+		t.Fatalf("canceled request should not poison quota cache: %q", *items[7].Error)
 	}
 }
 
