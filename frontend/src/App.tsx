@@ -118,7 +118,7 @@ type RemarkTarget = {
 };
 
 const PAGE_SIZE = 100;
-const STATUS_OPTIONS: Array<{ label: string; value: TokenStatus }> = [
+const STATUS_OPTION_DEFINITIONS: Array<{ label: string; value: TokenStatus }> = [
   { label: "全部", value: "all" },
   { label: "有效", value: "available" },
   { label: "冷却", value: "cooling" },
@@ -149,7 +149,7 @@ export function App(): React.ReactElement {
   const [tokens, setTokens] = useState<TokenItem[]>([]);
   const [tokenTotal, setTokenTotal] = useState(0);
   const [tokenPage, setTokenPage] = useState(1);
-  const [tokenStatus, setTokenStatus] = useState<TokenStatus>("all");
+  const [tokenStatus, setTokenStatus] = useState<TokenStatus>("available");
   const [tokenSort, setTokenSort] = useState("-created_at");
   const [tokenSearch, setTokenSearch] = useState("");
   const [tokenMode, setTokenMode] = useState<TokenMode>("keys");
@@ -487,6 +487,7 @@ export function App(): React.ReactElement {
           <section className="flex min-w-0 flex-col gap-5">
             <OverviewCards counts={counts} health={health} loading={loading && !counts.total} statusCounts={statusCounts} />
             <TokenExplorer
+              counts={counts}
               deleteTarget={deleteTarget}
               importBatches={importBatches}
               mode={tokenMode}
@@ -821,6 +822,7 @@ function DispatchPanel({
 }
 
 function TokenExplorer(props: {
+  counts: TokenCounts;
   importBatches: ImportBatch[];
   mode: TokenMode;
   onBatchActivation: (active: boolean) => void;
@@ -848,6 +850,7 @@ function TokenExplorer(props: {
 }) {
   const pageIds = props.tokens.map((item) => item.id);
   const allSelected = pageIds.length > 0 && pageIds.every((id) => props.selectedIds.has(id));
+  const statusOptions = useMemo(() => statusOptionsWithCounts(props.counts), [props.counts]);
   const note =
     props.mode === "keys"
       ? `显示 ${formatNumber(props.tokens.length)} / ${formatNumber(props.tokenTotal)} 个 key`
@@ -892,7 +895,7 @@ function TokenExplorer(props: {
               <SelectField
                 label="状态"
                 onChange={(value) => props.onStatusChange(value as TokenStatus)}
-                options={STATUS_OPTIONS}
+                options={statusOptions}
                 value={props.status}
               />
               <SelectField
@@ -919,13 +922,14 @@ function TokenExplorer(props: {
                   />
                   全选本页
                 </Label>
-                <Button onClick={() => props.onBatchActivation(true)} variant="outline">
+                <Button disabled={!props.selectedIds.size} onClick={() => props.onBatchActivation(true)} variant="outline">
                   启用
                 </Button>
-                <Button onClick={() => props.onBatchActivation(false)} variant="outline">
+                <Button disabled={!props.selectedIds.size} onClick={() => props.onBatchActivation(false)} variant="outline">
                   禁用
                 </Button>
                 <Button
+                  disabled={!props.selectedIds.size}
                   onClick={() =>
                     props.onDelete({
                       description: "批量删除后会从调度池和最近列表移除。此操作不可撤销。",
@@ -983,74 +987,85 @@ function TokenCard({
   const status = tokenStatusOf(item);
   const title = tokenTitle(item);
   const checked = selectedIds.has(item.id);
+  const secondaryText = item.remark || item.source_file || "-";
   return (
-    <Card className="block">
-      <CardPanel className="grid flex-none gap-3 p-4 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-start">
-        <Checkbox
-          checked={checked}
-          onCheckedChange={(value) => {
-            const next = new Set(selectedIds);
-            if (value) {
-              next.add(item.id);
-            } else {
-              next.delete(item.id);
-            }
-            onSelectedChange(next);
-          }}
-        />
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <strong className="min-w-0 truncate text-sm">{title}</strong>
-            <Badge variant="outline">ID {item.id}</Badge>
-            <Badge variant={statusBadge(status)}>{status}</Badge>
-            <Badge variant="secondary">{item.plan_type || "unknown"}</Badge>
+    <Card className="overflow-hidden">
+      <CardPanel className="grid flex-none gap-3 p-4">
+        <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-3 xl:grid-cols-[auto_minmax(0,1fr)_auto]">
+          <Checkbox
+            checked={checked}
+            className="mt-0.5"
+            onCheckedChange={(value) => {
+              const next = new Set(selectedIds);
+              if (value) {
+                next.add(item.id);
+              } else {
+                next.delete(item.id);
+              }
+              onSelectedChange(next);
+            }}
+          />
+          <div className="min-w-0">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+              <strong className="max-w-full min-w-0 truncate text-sm font-semibold leading-5" title={title}>
+                {title}
+              </strong>
+              <Badge variant="outline">ID {item.id}</Badge>
+              <Badge variant={statusBadge(status)}>{tokenStatusLabel(status)}</Badge>
+              <Badge className="max-w-full truncate" title={item.plan_type || "unknown"} variant="secondary">
+                {item.plan_type || "unknown"}
+              </Badge>
+            </div>
           </div>
-          <div className="mt-3 grid gap-2 text-muted-foreground text-xs md:grid-cols-3">
-            <span>最近使用 {formatDate(item.last_used_at)}</span>
-            <span>冷却至 {formatDate(item.cooldown_until)}</span>
-            <span className="truncate" title={item.remark || item.source_file || ""}>
-              {item.remark || item.source_file || "-"}
-            </span>
+          <div className="col-start-2 flex flex-wrap items-center gap-2 xl:col-start-3 xl:row-start-1 xl:justify-end">
+            <Button onClick={() => onToggleActivation(item.id, !item.is_active)} size="xs" variant="outline">
+              {item.is_active ? "禁用" : "启用"}
+            </Button>
+            <Button
+              onClick={() =>
+                onRemark({
+                  id: item.id,
+                  meta: item.source_file || "-",
+                  remark: item.remark || "",
+                  title,
+                })
+              }
+              size="xs"
+              variant="ghost"
+            >
+              备注
+            </Button>
+            <Button
+              onClick={() =>
+                onDelete({
+                  description: "删除后会从调度池和最近列表移除。此操作不可撤销。",
+                  ids: [item.id],
+                  title: `删除 ${title}？`,
+                })
+              }
+              size="xs"
+              variant="destructive"
+            >
+              <Trash2Icon />
+              删除
+            </Button>
           </div>
-          {item.last_error && (
-            <p className="mt-3 line-clamp-2 rounded-lg bg-muted px-3 py-2 text-muted-foreground text-xs" title={item.last_error}>
-              {item.last_error}
-            </p>
-          )}
         </div>
-        <div className="flex flex-wrap justify-end gap-2">
-          <Button onClick={() => onToggleActivation(item.id, !item.is_active)} size="sm" variant="outline">
-            {item.is_active ? "禁用" : "启用"}
-          </Button>
-          <Button
-            onClick={() =>
-              onRemark({
-                id: item.id,
-                meta: item.source_file || "-",
-                remark: item.remark || "",
-                title,
-              })
-            }
-            size="sm"
-            variant="ghost"
-          >
-            备注
-          </Button>
-          <Button
-            onClick={() =>
-              onDelete({
-                description: "删除后会从调度池和最近列表移除。此操作不可撤销。",
-                ids: [item.id],
-                title: `删除 ${title}？`,
-              })
-            }
-            size="sm"
-            variant="destructive"
-          >
-            <Trash2Icon />
-            删除
-          </Button>
+        <div className="grid gap-2 border-t pt-3 text-muted-foreground text-xs sm:ms-8 md:grid-cols-[minmax(9rem,0.8fr)_minmax(9rem,0.8fr)_minmax(0,1.4fr)]">
+          <span className="min-w-0 truncate">最近使用 {formatDate(item.last_used_at)}</span>
+          <span className="min-w-0 truncate">冷却至 {formatDate(item.cooldown_until)}</span>
+          <span className="min-w-0 truncate" title={secondaryText}>
+            {secondaryText}
+          </span>
         </div>
+        {item.last_error && (
+          <p
+            className="max-h-16 overflow-hidden rounded-md bg-muted/72 px-3 py-2 font-mono text-[11px] text-muted-foreground leading-5 [overflow-wrap:anywhere] sm:ms-8"
+            title={item.last_error}
+          >
+            {item.last_error}
+          </p>
+        )}
       </CardPanel>
     </Card>
   );
@@ -1488,6 +1503,16 @@ function tokenStatusOf(item: TokenItem): "active" | "cooling" | "disabled" {
   return "active";
 }
 
+function tokenStatusLabel(status: "active" | "cooling" | "disabled"): string {
+  if (status === "active") {
+    return "有效";
+  }
+  if (status === "cooling") {
+    return "冷却";
+  }
+  return "禁用";
+}
+
 function statusBadge(status: "active" | "cooling" | "disabled"): "success" | "warning" | "error" {
   if (status === "active") {
     return "success";
@@ -1496,6 +1521,19 @@ function statusBadge(status: "active" | "cooling" | "disabled"): "success" | "wa
     return "warning";
   }
   return "error";
+}
+
+function statusOptionsWithCounts(counts: TokenCounts): Array<{ label: string; value: TokenStatus }> {
+  const valueByStatus: Record<TokenStatus, number> = {
+    all: counts.total || 0,
+    available: counts.available ?? counts.active ?? 0,
+    cooling: counts.cooling || 0,
+    disabled: counts.disabled || 0,
+  };
+  return STATUS_OPTION_DEFINITIONS.map((option) => ({
+    ...option,
+    label: `${option.label} ${formatNumber(valueByStatus[option.value])}`,
+  }));
 }
 
 function sortParam(value: string): string {
