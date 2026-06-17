@@ -791,7 +791,7 @@ function CredentialPanel({
   tokenInput: string;
 }) {
   return (
-    <Card>
+    <Card className="min-w-0 max-w-full overflow-hidden">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <UploadIcon className="size-5" />
@@ -799,8 +799,8 @@ function CredentialPanel({
         </CardTitle>
         <CardDescription>保存凭证并导入 access token / refresh token 数据。</CardDescription>
       </CardHeader>
-      <CardPanel className="grid gap-4">
-        <div className="grid gap-2">
+      <CardPanel className="grid min-w-0 gap-4">
+        <div className="grid min-w-0 gap-2">
           <Label htmlFor="service-key">Service API Key</Label>
           <Input
             id="service-key"
@@ -821,9 +821,10 @@ function CredentialPanel({
           </Button>
         </div>
         <Separator />
-        <div className="grid gap-2">
+        <div className="grid min-w-0 gap-2">
           <Label htmlFor="token-json">粘贴 Key 数据</Label>
           <Textarea
+            className="min-w-0 max-w-full"
             id="token-json"
             onChange={(event) => onTokenInputChange(event.currentTarget.value)}
             placeholder="支持普通 JSON / sub2api 导出 JSON；也支持每行 access_token / refresh_token，或 account_id,refresh_token。"
@@ -832,7 +833,7 @@ function CredentialPanel({
             value={tokenInput}
           />
         </div>
-        <div className="grid gap-2">
+        <div className="grid min-w-0 gap-2">
           <Label htmlFor="token-files">选择文件</Label>
           <Input
             accept=".json,.txt,.csv,application/json,text/plain"
@@ -843,7 +844,7 @@ function CredentialPanel({
             type="file"
           />
         </div>
-        <div className="grid gap-2">
+        <div className="grid min-w-0 gap-2">
           <Label>导入位置</Label>
           <div className="flex rounded-lg bg-muted p-1">
             <Button
