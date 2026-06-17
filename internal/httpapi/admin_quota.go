@@ -33,6 +33,7 @@ const (
 
 type adminTokenItem struct {
 	store.Token
+	Status          string              `json:"status"`
 	ActiveStreams   int64               `json:"active_streams"`
 	ActiveStreamCap int64               `json:"active_stream_cap"`
 	ObservedCostUSD *float64            `json:"observed_cost_usd"`
@@ -137,6 +138,7 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 
 	activeByID := a.activeStreamsByTokenID(tokens)
 	cap := a.tokens.ActiveStreamCap()
+	now := time.Now().UTC()
 	items := make([]adminTokenItem, 0, len(tokens))
 	for _, token := range tokens {
 		if quota := quotaByID[token.ID]; quota != nil && quota.PlanType != nil {
@@ -144,6 +146,7 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 		}
 		items = append(items, adminTokenItem{
 			Token:           token,
+			Status:          adminTokenStatus(token, now),
 			ActiveStreams:   activeByID[token.ID],
 			ActiveStreamCap: cap,
 			ObservedCostUSD: observedCostByID[token.ID],
@@ -151,6 +154,16 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 		})
 	}
 	return items, pendingIDs
+}
+
+func adminTokenStatus(token store.Token, now time.Time) string {
+	if !token.IsActive || token.DisabledAt != nil {
+		return "disabled"
+	}
+	if token.CooldownUntil != nil && token.CooldownUntil.After(now) {
+		return "cooling"
+	}
+	return "active"
 }
 
 func (a *App) syncQuotaPlanTypes(parent context.Context, quotaByID map[int64]*codexQuotaSnapshot) {

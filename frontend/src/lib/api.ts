@@ -46,6 +46,7 @@ export type TokenItem = {
   last_error?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  status?: string | null;
   active_streams?: number | null;
   active_stream_cap?: number | null;
   observed_cost_usd?: number | null;

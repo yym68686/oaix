@@ -34,6 +34,16 @@ export function tokenPlanType(item: TokenItem): string {
 }
 
 export function tokenStatusOf(item: TokenItem): "active" | "cooling" | "disabled" {
+  const serverStatus = String(item.status || "").trim().toLowerCase();
+  if (serverStatus === "active" || serverStatus === "available") {
+    return "active";
+  }
+  if (serverStatus === "cooling" || serverStatus === "cooldown") {
+    return "cooling";
+  }
+  if (serverStatus === "disabled" || serverStatus === "inactive") {
+    return "disabled";
+  }
   if (!item.is_active || item.disabled_at) {
     return "disabled";
   }

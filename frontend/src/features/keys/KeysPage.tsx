@@ -393,15 +393,25 @@ function TokenTable({
   }
   return (
     <div className="min-w-0 overflow-hidden rounded-lg border">
-      <Table>
+      <Table className="table-fixed">
+        <colgroup>
+          <col className="w-9" />
+          <col className="w-[28%]" />
+          <col className="w-[4.5rem]" />
+          <col className="w-[8.75rem]" />
+          <col className="w-[9.5rem]" />
+          <col className="w-[9.75rem]" />
+          <col />
+          <col className="w-[13rem]" />
+        </colgroup>
         <TableHeader>
           <TableRow>
             <TableHead className="w-9" />
             <TableHead>Key</TableHead>
             <TableHead>状态</TableHead>
-            <TableHead>额度</TableHead>
-            <TableHead>并发 / 金额</TableHead>
-            <TableHead>最近</TableHead>
+            <TableHead className="px-1.5">额度</TableHead>
+            <TableHead className="px-1.5">并发 / 金额</TableHead>
+            <TableHead className="px-1.5">最近</TableHead>
             <TableHead>备注</TableHead>
             <TableHead className="text-right">操作</TableHead>
           </TableRow>
@@ -498,18 +508,18 @@ function TokenRow({
           </Badge>
         </div>
       </TableCell>
-      <TableCell>
-        <div className="flex max-h-11 min-w-[11rem] flex-wrap items-center gap-1 overflow-hidden text-[11px]">
+      <TableCell className="px-1.5">
+        <div className="flex max-h-11 min-w-0 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
           <TokenQuotaStrip quota={item.quota} />
         </div>
       </TableCell>
-      <TableCell>
-        <div className="flex max-h-11 min-w-[12rem] flex-wrap items-center gap-1 overflow-hidden text-[11px]">
+      <TableCell className="px-1.5">
+        <div className="flex max-h-11 min-w-0 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
           <TokenConcurrency fallbackCap={activeStreamCap} item={item} />
           <TokenObservedCost value={item.observed_cost_usd} />
         </div>
       </TableCell>
-      <TableCell>
+      <TableCell className="px-1.5">
         <div className="grid max-h-10 min-w-0 gap-1 overflow-hidden text-xs">
           <span className="oaix-tabular text-muted-foreground">最近 {formatDate(item.last_used_at)}</span>
           <span className="oaix-tabular text-muted-foreground">冷却 {formatDate(item.cooldown_until)}</span>

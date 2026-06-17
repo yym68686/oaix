@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/yym68686/oaix/internal/store"
 )
 
 func TestParseCodexQuotaPayloadExtracts5HAnd7DWindows(t *testing.T) {
@@ -84,5 +86,58 @@ func TestQuotaStatusShouldRefresh(t *testing.T) {
 		if quotaStatusShouldRefresh(status) {
 			t.Fatalf("status %d should not refresh", status)
 		}
+	}
+}
+
+func TestAdminTokenStatusUsesServerTime(t *testing.T) {
+	now := time.Date(2026, 6, 17, 17, 30, 0, 0, time.UTC)
+	pastCooldown := now.Add(-time.Second)
+	futureCooldown := now.Add(time.Second)
+	disabledAt := now.Add(-time.Minute)
+
+	tests := []struct {
+		name  string
+		token store.Token
+		want  string
+	}{
+		{
+			name: "active when cooldown has expired",
+			token: store.Token{
+				IsActive:      true,
+				CooldownUntil: &pastCooldown,
+			},
+			want: "active",
+		},
+		{
+			name: "cooling when cooldown is in the future",
+			token: store.Token{
+				IsActive:      true,
+				CooldownUntil: &futureCooldown,
+			},
+			want: "cooling",
+		},
+		{
+			name: "disabled when inactive",
+			token: store.Token{
+				IsActive: false,
+			},
+			want: "disabled",
+		},
+		{
+			name: "disabled when disabled_at is set",
+			token: store.Token{
+				IsActive:   true,
+				DisabledAt: &disabledAt,
+			},
+			want: "disabled",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := adminTokenStatus(test.token, now); got != test.want {
+				t.Fatalf("status = %s, want %s", got, test.want)
+			}
+		})
 	}
 }
