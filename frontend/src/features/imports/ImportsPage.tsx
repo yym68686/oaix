@@ -13,6 +13,7 @@ import { Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader, Dia
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Separator } from "@/registry/default/ui/separator";
+import { Tabs, TabsList, TabsPanel, TabsTab } from "@/registry/default/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { Textarea } from "@/registry/default/ui/textarea";
 import {
@@ -77,6 +78,7 @@ function ImportForm({
 }) {
   const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
   const [tokenInput, setTokenInput] = useState("");
+  const [importSource, setImportSource] = useState<"paste" | "file">("paste");
   const [queuePosition, setQueuePosition] = useState<"front" | "back">("front");
   const [importFeedback, setImportFeedback] = useState("等待导入。");
   const [importBusy, setImportBusy] = useState(false);
@@ -93,11 +95,20 @@ function ImportForm({
     pushToast("凭证已清空", "info");
   }
 
+  function changeImportSource(value: unknown) {
+    if (value === "paste" || value === "file") {
+      setImportSource(value);
+    }
+  }
+
   async function importTokens() {
     setImportBusy(true);
     try {
       setImportFeedback("正在解析导入内容...");
-      const entries = await collectImportEntries(tokenInput, fileInputRef.current?.files);
+      const entries = await collectImportEntries(
+        importSource === "paste" ? tokenInput : "",
+        importSource === "file" ? fileInputRef.current?.files : undefined,
+      );
       if (!entries.length) {
         setImportFeedback("没有可导入的 token。");
         return;
@@ -151,30 +162,40 @@ function ImportForm({
         </Button>
       </div>
       <Separator />
-      <div className="grid min-w-0 gap-2">
-        <Label htmlFor="token-json">粘贴 Key 数据</Label>
-        <Textarea
-          className="block w-full min-w-0 max-w-full overflow-hidden"
-          id="token-json"
-          onChange={(event) => setTokenInput(event.currentTarget.value)}
-          placeholder="支持普通 JSON / sub2api 导出 JSON；也支持每行 access_token / refresh_token，或 account_id,refresh_token。"
-          rows={10}
-          spellCheck={false}
-          value={tokenInput}
-          wrap="soft"
-        />
-      </div>
-      <div className="grid min-w-0 gap-2">
-        <Label htmlFor="token-files">选择文件</Label>
-        <Input
-          accept=".json,.txt,.csv,application/json,text/plain"
-          id="token-files"
-          multiple
-          nativeInput
-          ref={fileInputRef}
-          type="file"
-        />
-      </div>
+      <Tabs className="min-w-0" onValueChange={changeImportSource} value={importSource}>
+        <TabsList className="w-full sm:w-fit">
+          <TabsTab className="flex-1 sm:flex-none" value="paste">
+            粘贴 Key 数据
+          </TabsTab>
+          <TabsTab className="flex-1 sm:flex-none" value="file">
+            选择文件
+          </TabsTab>
+        </TabsList>
+        <TabsPanel className="grid min-w-0 gap-2" keepMounted value="paste">
+          <Label htmlFor="token-json">粘贴 Key 数据</Label>
+          <Textarea
+            className="block w-full min-w-0 max-w-full overflow-hidden"
+            id="token-json"
+            onChange={(event) => setTokenInput(event.currentTarget.value)}
+            placeholder="支持普通 JSON / sub2api 导出 JSON；也支持每行 access_token / refresh_token，或 account_id,refresh_token。"
+            rows={10}
+            spellCheck={false}
+            value={tokenInput}
+            wrap="soft"
+          />
+        </TabsPanel>
+        <TabsPanel className="grid min-w-0 gap-2" keepMounted value="file">
+          <Label htmlFor="token-files">选择文件</Label>
+          <Input
+            accept=".json,.txt,.csv,application/json,text/plain"
+            id="token-files"
+            multiple
+            nativeInput
+            ref={fileInputRef}
+            type="file"
+          />
+        </TabsPanel>
+      </Tabs>
       <div className="grid min-w-0 gap-2">
         <Label>导入位置</Label>
         <div className="flex rounded-lg bg-muted p-1">
