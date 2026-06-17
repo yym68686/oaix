@@ -984,8 +984,8 @@ function TokenCard({
   const title = tokenTitle(item);
   const checked = selectedIds.has(item.id);
   return (
-    <Card className="overflow-hidden">
-      <CardPanel className="grid gap-3 p-4 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-start">
+    <Card className="block">
+      <CardPanel className="grid flex-none gap-3 p-4 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-start">
         <Checkbox
           checked={checked}
           onCheckedChange={(value) => {
@@ -1233,8 +1233,8 @@ function ImportBatchList({
   return (
     <div className="grid gap-3">
       {batches.map((job) => (
-        <Card key={job.id}>
-          <CardPanel className="grid gap-3 p-4 sm:grid-cols-[1fr_auto] sm:items-center">
+        <Card key={job.id} className="block">
+          <CardPanel className="grid flex-none gap-3 p-4 sm:grid-cols-[1fr_auto] sm:items-center">
             <div>
               <div className="flex flex-wrap items-center gap-2">
                 <strong>导入批次 #{job.id}</strong>
@@ -1446,8 +1446,8 @@ function LoadingRows() {
   return (
     <div className="grid gap-3">
       {[0, 1, 2].map((item) => (
-        <Card key={item}>
-          <CardPanel className="grid gap-3 p-4">
+        <Card key={item} className="block">
+          <CardPanel className="grid flex-none gap-3 p-4">
             <Skeleton className="h-5 w-56" />
             <Skeleton className="h-4 w-full" />
             <Skeleton className="h-4 w-3/4" />
