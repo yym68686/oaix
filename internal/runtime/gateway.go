@@ -55,6 +55,7 @@ func RunGateway(ctx context.Context) error {
 	tokenManager.Start(ctx)
 	logWriter := logs.NewWriter(db, logger, cfg.RequestLog)
 	logWriter.Start(ctx)
+	stopEmbeddedWorker := startEmbeddedWorker(ctx, cfg, logger, db, tokenManager)
 	upstream := transport.New(cfg.Upstream)
 	defer upstream.CloseIdleConnections()
 	pipeline := proxy.New(cfg, logger, tokenManager, upstream, logWriter, db)
@@ -87,6 +88,7 @@ func RunGateway(ctx context.Context) error {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("gateway shutdown failed", "error", err)
 	}
+	stopEmbeddedWorker(shutdownCtx)
 	_ = logWriter.Stop(context.Background())
 	tokenManager.Stop()
 	logger.Info("oaix gateway stopped")

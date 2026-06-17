@@ -13,7 +13,7 @@ type Setting struct {
 }
 
 func (s *Store) ListSettings(ctx context.Context) ([]Setting, error) {
-	rows, err := s.pool.Query(ctx, `select key, coalesce(value, '{}'::jsonb), updated_at from gateway_settings order by key`)
+	rows, err := s.pool.Query(ctx, `select key, coalesce(value::jsonb, '{}'::jsonb), updated_at from gateway_settings order by key`)
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +34,7 @@ func (s *Store) UpsertSetting(ctx context.Context, key string, value json.RawMes
 		insert into gateway_settings(key, value, updated_at)
 		values ($1, $2, now())
 		on conflict (key) do update set value = excluded.value, updated_at = now()
-		returning key, coalesce(value, '{}'::jsonb), updated_at
+		returning key, coalesce(value::jsonb, '{}'::jsonb), updated_at
 	`, key, value)
 	var item Setting
 	err := row.Scan(&item.Key, &item.Value, &item.UpdatedAt)

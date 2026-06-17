@@ -1,19 +1,34 @@
 const KEY_STORAGE = "oaix.serviceApiKey";
+const LEGACY_KEY_STORAGE = "oaix.serviceKey";
 
 export function getServiceKey() {
   try {
-    return window.localStorage.getItem(KEY_STORAGE) || "";
+    const current = window.localStorage.getItem(KEY_STORAGE) || "";
+    if (current) {
+      return current;
+    }
+    const legacy = window.localStorage.getItem(LEGACY_KEY_STORAGE) || "";
+    if (legacy) {
+      window.localStorage.setItem(KEY_STORAGE, legacy);
+    }
+    return legacy;
   } catch {
     return "";
   }
+}
+
+export function hasServiceKey() {
+  return getServiceKey().trim() !== "";
 }
 
 export function setServiceKey(value) {
   try {
     if (value) {
       window.localStorage.setItem(KEY_STORAGE, value);
+      window.localStorage.setItem(LEGACY_KEY_STORAGE, value);
     } else {
       window.localStorage.removeItem(KEY_STORAGE);
+      window.localStorage.removeItem(LEGACY_KEY_STORAGE);
     }
   } catch {}
 }
@@ -44,7 +59,14 @@ export async function requestJSON(path, init = {}) {
   const text = await response.text();
   const payload = text ? parseJSON(text) : {};
   if (!response.ok) {
-    const message = payload?.error?.message || payload?.error || response.statusText || "请求失败";
+    const message =
+      payload?.error?.message ||
+      payload?.error ||
+      payload?.detail?.message ||
+      payload?.detail ||
+      payload?.message ||
+      response.statusText ||
+      "请求失败";
     const error = new Error(message);
     error.status = response.status;
     error.payload = payload;

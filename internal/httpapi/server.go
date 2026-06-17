@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -53,7 +54,7 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", a.index)
-	mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir(a.webDir))))
+	mux.Handle("GET /assets/", a.assets())
 	mux.HandleFunc("GET /livez", a.livez)
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /metrics", a.metrics)
@@ -85,6 +86,14 @@ func (a *App) Handler() http.Handler {
 	return a.recoverer(a.cors(mux))
 }
 
+func (a *App) assets() http.Handler {
+	files := http.StripPrefix("/assets/", http.FileServer(http.Dir(a.webDir)))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		files.ServeHTTP(w, r)
+	})
+}
+
 func (a *App) index(w http.ResponseWriter, r *http.Request) {
 	path := filepath.Join(a.webDir, "index.html")
 	data, err := os.ReadFile(path)
@@ -93,9 +102,51 @@ func (a *App) index(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "<!doctype html><title>oaix</title><h1>oaix gateway</h1>")
 		return
 	}
+	html := string(data)
+	html = strings.ReplaceAll(html, "/assets/styles.css", "/assets/styles.css?v="+a.webAssetVersion("styles.css"))
+	html = strings.ReplaceAll(html, "/assets/src/main.js", "/assets/src/main.js?v="+a.webAssetVersion(filepath.Join("src", "main.js")))
+	hash, versionTime := a.webBundleVersion()
+	html = strings.ReplaceAll(html, "__OAIX_WEB_VERSION_HASH__", hash)
+	html = strings.ReplaceAll(html, "__OAIX_WEB_VERSION_TIME__", versionTime)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
-	_, _ = w.Write(data)
+	_, _ = io.WriteString(w, html)
+}
+
+func (a *App) webAssetVersion(rel string) string {
+	data, err := os.ReadFile(filepath.Join(a.webDir, rel))
+	if err != nil {
+		return "missing"
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:6])
+}
+
+func (a *App) webBundleVersion() (string, string) {
+	digest := sha256.New()
+	var newest time.Time
+	_ = filepath.WalkDir(a.webDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext != ".html" && ext != ".css" && ext != ".js" {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr == nil {
+			_, _ = digest.Write(data)
+		}
+		if info, statErr := entry.Info(); statErr == nil && info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+		return nil
+	})
+	hash := fmt.Sprintf("%x", digest.Sum(nil)[:6])
+	if newest.IsZero() {
+		return hash, "-"
+	}
+	return hash, newest.UTC().In(time.FixedZone("UTC+8", 8*60*60)).Format("2006-01-02 15:04:05 UTC+8")
 }
 
 func (a *App) livez(w http.ResponseWriter, r *http.Request) {

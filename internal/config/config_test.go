@@ -32,6 +32,9 @@ func TestLoadUsesTypedDefaultsAndEnvOverrides(t *testing.T) {
 	if cfg.TokenPool.SnapshotMaxAge != 7*time.Second {
 		t.Fatalf("SnapshotMaxAge = %s", cfg.TokenPool.SnapshotMaxAge)
 	}
+	if !cfg.Worker.Embedded {
+		t.Fatal("embedded worker should default to enabled")
+	}
 }
 
 func TestLoadRejectsInvalidPort(t *testing.T) {

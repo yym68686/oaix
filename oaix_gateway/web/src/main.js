@@ -1,26 +1,47 @@
-import { api, getServiceKey, setServiceKey } from "./api.js";
-import { $, button, on, text, toast } from "./dom.js";
+import { api, getServiceKey, hasServiceKey, setServiceKey } from "./api.js";
+import { $, button, html, on, text, toast } from "./dom.js";
 import { initImportView } from "./importView.js";
 import { loadRequests } from "./requestView.js";
 import { initSettingsView, loadSettings } from "./settingsView.js";
 import { initTokenView, loadTokens } from "./tokenView.js";
 
 async function refreshAll() {
-  await Promise.allSettled([loadHealth(), loadTokenSelection(), loadTokens(), loadRequests(), loadSettings()]);
+  const health = await loadHealth();
+  if (health?.service_key_protected && !hasServiceKey()) {
+    renderAuthRequired();
+    text("sync-chip", `已同步 ${new Date().toLocaleTimeString("zh-CN")}`);
+    return;
+  }
+  await Promise.allSettled([loadTokenSelection(), loadTokens(), loadRequests(), loadSettings()]);
   text("sync-chip", `已同步 ${new Date().toLocaleTimeString("zh-CN")}`);
 }
 
 async function loadHealth() {
   try {
     const payload = await api.health();
-    const counts = payload.counts || {};
-    text("protection-chip", payload.service_key_protected ? "已启用 Service API Key" : "未启用服务侧凭证");
-    text("available-count", counts.available ?? "-");
-    text("cooling-count", counts.cooling ?? "-");
-    text("disabled-count", counts.disabled ?? "-");
+    renderHealth(payload);
+    return payload;
   } catch (error) {
+    if (error.payload?.service_key_protected != null) {
+      renderHealth(error.payload, "健康检查退化");
+      return error.payload;
+    }
     text("protection-chip", `健康检查失败：${error.message}`);
+    return null;
   }
+}
+
+function renderHealth(payload, prefix = "") {
+  const counts = payload.counts || {};
+  const protection = payload.service_key_protected ? "已启用 Service API Key" : "未启用服务侧凭证";
+  text("protection-chip", prefix ? `${prefix}：${protection}` : protection);
+  text("available-count", counts.available ?? "-");
+  text("cooling-count", counts.cooling ?? "-");
+  text("disabled-count", counts.disabled ?? "-");
+  text("total-count", counts.total ?? "-");
+  text("legend-available", counts.available ?? "-");
+  text("legend-cooling", counts.cooling ?? "-");
+  text("legend-disabled", counts.disabled ?? "-");
 }
 
 async function loadTokenSelection() {
@@ -36,6 +57,35 @@ async function loadTokenSelection() {
   } catch (error) {
     text("token-selection-summary", error.message);
   }
+}
+
+function renderAuthRequired() {
+  text("protection-chip", "管理接口需要 Service API Key");
+  text("list-note", "需要填写 Service API Key 后加载 Key 明细");
+  text("token-search-summary", "需要 Service API Key");
+  text("token-pagination-summary", "需要 Service API Key");
+  text("token-selection-summary", "需要 Service API Key");
+  text("token-concurrency-summary", "需要 Service API Key");
+  text("token-plan-order-summary", "需要 Service API Key");
+  text("request-note", "需要填写 Service API Key 后加载请求观察");
+  html(
+    "token-list",
+    `<article class="empty-state" role="status">
+      <p>管理接口已加锁。请先在导入面板填写并保存 Service API Key。</p>
+    </article>`,
+  );
+  html(
+    "request-list",
+    `<article class="empty-state" role="status">
+      <p>保存 Service API Key 后加载请求日志。</p>
+    </article>`,
+  );
+  html(
+    "settings-list",
+    `<article class="empty-state" role="status">
+      <p>保存 Service API Key 后加载运行设置。</p>
+    </article>`,
+  );
 }
 
 function initCredentialControls() {

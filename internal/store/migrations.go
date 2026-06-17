@@ -264,6 +264,11 @@ var migrationStatements = []string{
 	)`,
 }
 
+var onlineMigrationStatements = []string{
+	`create index concurrently if not exists ix_gateway_request_logs_analytics_pending on gateway_request_logs (id) where analytics_recorded_at is null and finished_at is not null`,
+	`create index concurrently if not exists ix_gateway_request_hourly_stats_bucket_start on gateway_request_hourly_stats (bucket_start desc)`,
+}
+
 var downMigrationStatements = []string{
 	`drop table if exists admin_audit_logs`,
 	`drop table if exists token_import_items`,
@@ -298,7 +303,15 @@ func (s *Store) Migrate(ctx context.Context) error {
 	`, SchemaVersion); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	for index, statement := range onlineMigrationStatements {
+		if _, err := s.pool.Exec(ctx, statement); err != nil {
+			return fmt.Errorf("online migration statement %d failed: %w\n%s", index+1, err, strings.TrimSpace(statement))
+		}
+	}
+	return nil
 }
 
 func (s *Store) MigrateDown(ctx context.Context) error {

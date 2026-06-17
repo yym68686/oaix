@@ -18,6 +18,7 @@ type Config struct {
 	TokenPool     TokenPoolConfig
 	RequestLog    RequestLogConfig
 	Import        ImportConfig
+	Worker        WorkerConfig
 	Observability ObservabilityConfig
 }
 
@@ -89,6 +90,10 @@ type ImportConfig struct {
 	DefaultQueuePolicy string
 }
 
+type WorkerConfig struct {
+	Embedded bool
+}
+
 type ObservabilityConfig struct {
 	LogLevel    string
 	ServiceName string
@@ -156,6 +161,9 @@ func Load() (Config, error) {
 			PublishBatchSize:   envInt("IMPORT_PUBLISH_BATCH_SIZE", 100),
 			PublishInterval:    envDurationSeconds("IMPORT_PUBLISH_FLUSH_INTERVAL_SECONDS", 500*time.Millisecond),
 			DefaultQueuePolicy: envString("DEFAULT_TOKEN_IMPORT_QUEUE_POSITION", "front"),
+		},
+		Worker: WorkerConfig{
+			Embedded: envBool("OAIX_EMBEDDED_WORKER_ENABLED", true),
 		},
 		Observability: ObservabilityConfig{
 			LogLevel:    envString("LOG_LEVEL", "INFO"),
@@ -236,6 +244,9 @@ func (c Config) SanitizedSummary() map[string]any {
 			"retention":    c.RequestLog.RetentionDays,
 			"final_sync":   c.RequestLog.FinalSyncOnFull,
 			"outbox_batch": c.RequestLog.OutboxDrainBatch,
+		},
+		"worker": map[string]any{
+			"embedded": c.Worker.Embedded,
 		},
 	}
 }

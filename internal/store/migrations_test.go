@@ -17,6 +17,18 @@ func TestMigrationStatementsAreIdempotent(t *testing.T) {
 	}
 }
 
+func TestOnlineMigrationStatementsUseConcurrentIndexes(t *testing.T) {
+	if len(onlineMigrationStatements) == 0 {
+		t.Fatal("online migration statements are empty")
+	}
+	for index, statement := range onlineMigrationStatements {
+		normalized := strings.ToLower(strings.Join(strings.Fields(statement), " "))
+		if !strings.Contains(normalized, "create index concurrently if not exists") {
+			t.Fatalf("online migration statement %d is not concurrent and idempotent: %s", index+1, statement)
+		}
+	}
+}
+
 func TestDownMigrationIsExplicitlyDestructive(t *testing.T) {
 	if len(downMigrationStatements) == 0 {
 		t.Fatal("down migration statements are empty")

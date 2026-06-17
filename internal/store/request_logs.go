@@ -237,13 +237,19 @@ func (s *Store) RequestLogSummary(ctx context.Context, hours int) (RequestLogSum
 	var summary RequestLogSummary
 	err := s.pool.QueryRow(ctx, `
 		select
-			count(*)::int,
-			count(*) filter (where success = true)::int,
-			count(*) filter (where success = false)::int,
-			coalesce(avg(ttft_ms) filter (where ttft_ms is not null), 0)::float8,
-			coalesce(avg(duration_ms) filter (where duration_ms is not null), 0)::float8
-		from gateway_request_logs
-		where started_at >= now() - make_interval(hours => $1)
+			coalesce(sum(request_count), 0)::int,
+			coalesce(sum(success_count), 0)::int,
+			coalesce(sum(failure_count), 0)::int,
+			case when coalesce(sum(ttft_count), 0) > 0
+				then coalesce(sum(ttft_ms_sum), 0)::float8 / sum(ttft_count)
+				else 0
+			end,
+			case when coalesce(sum(duration_count), 0) > 0
+				then coalesce(sum(duration_ms_sum), 0)::float8 / sum(duration_count)
+				else 0
+			end
+		from gateway_request_hourly_stats
+		where bucket_start >= date_trunc('hour', now() - make_interval(hours => $1))
 	`, hours).Scan(&summary.Total, &summary.Success, &summary.Failure, &summary.AverageTTFT, &summary.AverageDurMS)
 	return summary, err
 }
@@ -271,6 +277,7 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 			from gateway_request_logs
 			where analytics_recorded_at is null
 			  and finished_at is not null
+			order by id
 			limit 5000
 			for update skip locked
 		),
@@ -403,14 +410,14 @@ func (s *Store) RequestAnalytics(ctx context.Context, hours int) (RequestAnalyti
 		return RequestAnalytics{}, err
 	}
 	rows, err := s.pool.Query(ctx, `
-		select coalesce(model_name, model, '') as model_name,
-		       count(*)::int,
-		       count(*) filter (where success = true)::int,
-		       count(*) filter (where success = false)::int
-		from gateway_request_logs
-		where started_at >= now() - make_interval(hours => $1)
-		group by coalesce(model_name, model, '')
-		order by count(*) desc
+		select model_name,
+		       coalesce(sum(request_count), 0)::int,
+		       coalesce(sum(success_count), 0)::int,
+		       coalesce(sum(failure_count), 0)::int
+		from gateway_request_hourly_stats
+		where bucket_start >= date_trunc('hour', now() - make_interval(hours => $1))
+		group by model_name
+		order by coalesce(sum(request_count), 0) desc
 		limit 20
 	`, hours)
 	if err != nil {
