@@ -7,6 +7,7 @@ func TestParseImportPayloadPreservesRefreshTokenInputs(t *testing.T) {
 		"import_queue_position": "back",
 		"tokens": []any{
 			"rt-refresh-only",
+			"rt.1.refresh-token-with-dots",
 			map[string]any{"account_id": "acct_123", "refresh_token": "rt-with-account"},
 			map[string]any{"token": "eyJhbGciOi.test.signature"},
 		},
@@ -17,16 +18,19 @@ func TestParseImportPayloadPreservesRefreshTokenInputs(t *testing.T) {
 	if queuePosition != "back" {
 		t.Fatalf("queue position = %q", queuePosition)
 	}
-	if len(payloads) != 3 {
+	if len(payloads) != 4 {
 		t.Fatalf("payload count = %d", len(payloads))
 	}
 	if payloads[0]["refresh_token"] != "rt-refresh-only" {
 		t.Fatalf("bare refresh token parsed as %#v", payloads[0])
 	}
-	if payloads[1]["account_id"] != "acct_123" || payloads[1]["refresh_token"] != "rt-with-account" {
+	if payloads[1]["refresh_token"] != "rt.1.refresh-token-with-dots" {
 		t.Fatalf("account refresh payload parsed as %#v", payloads[1])
 	}
-	if payloads[2]["access_token"] != "eyJhbGciOi.test.signature" {
-		t.Fatalf("access token parsed as %#v", payloads[2])
+	if payloads[2]["account_id"] != "acct_123" || payloads[2]["refresh_token"] != "rt-with-account" {
+		t.Fatalf("account refresh payload parsed as %#v", payloads[2])
+	}
+	if payloads[3]["access_token"] != "eyJhbGciOi.test.signature" {
+		t.Fatalf("access token parsed as %#v", payloads[3])
 	}
 }

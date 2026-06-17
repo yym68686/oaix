@@ -2122,7 +2122,7 @@ function parseTokenText(raw: string): ImportEntry[] {
     if (!value || value.startsWith("#")) {
       continue;
     }
-    if (value.includes(",") && !value.includes(".")) {
+    if (value.includes(",")) {
       const parts = value.split(",").map((part) => part.trim()).filter(Boolean);
       if (parts.length >= 2) {
         values.push({ account_id: parts[0], refresh_token: parts[parts.length - 1] });

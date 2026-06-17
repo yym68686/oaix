@@ -41,6 +41,9 @@ var migrationStatements = []string{
 	`create index if not exists ix_codex_tokens_account_id on codex_tokens (account_id)`,
 	`create index if not exists ix_codex_tokens_plan_type on codex_tokens (plan_type)`,
 	`create index if not exists ix_codex_tokens_refresh_token on codex_tokens (refresh_token)`,
+	`alter table codex_tokens alter column type set default 'codex'`,
+	`update codex_tokens set type = 'codex' where type is null`,
+	`alter table codex_tokens alter column type set not null`,
 	`create table if not exists token_secrets (
 		token_id integer primary key references codex_tokens(id) on delete cascade,
 		access_token text,
@@ -230,6 +233,17 @@ var migrationStatements = []string{
 		heartbeat_at timestamptz,
 		finished_at timestamptz
 	)`,
+	`alter table token_import_jobs add column if not exists yielded_to_response_traffic_count integer`,
+	`alter table token_import_jobs add column if not exists response_traffic_timeout_count integer`,
+	`update token_import_jobs
+		set yielded_to_response_traffic_count = coalesce(yielded_to_response_traffic_count, 0),
+		    response_traffic_timeout_count = coalesce(response_traffic_timeout_count, 0)
+		where yielded_to_response_traffic_count is null
+		   or response_traffic_timeout_count is null`,
+	`alter table token_import_jobs alter column yielded_to_response_traffic_count set default 0`,
+	`alter table token_import_jobs alter column response_traffic_timeout_count set default 0`,
+	`alter table token_import_jobs alter column yielded_to_response_traffic_count set not null`,
+	`alter table token_import_jobs alter column response_traffic_timeout_count set not null`,
 	`create table if not exists token_import_items (
 		id serial primary key,
 		job_id integer not null references token_import_jobs(id) on delete cascade,

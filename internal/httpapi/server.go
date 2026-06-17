@@ -920,7 +920,7 @@ func normalizeImportPayloadMap(payload map[string]any) map[string]any {
 
 func looksLikeAccessTokenText(value string) bool {
 	value = strings.TrimSpace(value)
-	return strings.Count(value, ".") >= 2 || strings.HasPrefix(value, "eyJ")
+	return strings.HasPrefix(value, "eyJ")
 }
 
 func requestStream(r *http.Request) bool {

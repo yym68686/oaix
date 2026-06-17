@@ -90,15 +90,16 @@ func (s *Store) CreateCompletedImportJob(ctx context.Context, payloads []map[str
 	}
 	defer tx.Rollback(ctx)
 	row := tx.QueryRow(ctx, `
-		insert into token_import_jobs (
-			status, import_queue_position, payloads, total_count, processed_count,
-			created_count, updated_count, skipped_count, failed_count,
-			submitted_at, started_at, heartbeat_at, finished_at
-		)
-		values ('completed', $1, $2, $3, $4, $5, $6, $7, $8, now(), now(), now(), now())
-		returning id, status, import_queue_position, total_count, processed_count,
-		          created_count, updated_count, skipped_count, failed_count, last_error,
-		          submitted_at, started_at, heartbeat_at, finished_at
+			insert into token_import_jobs (
+				status, import_queue_position, payloads, total_count, processed_count,
+				created_count, updated_count, skipped_count, failed_count,
+				yielded_to_response_traffic_count, response_traffic_timeout_count,
+				submitted_at, started_at, heartbeat_at, finished_at
+			)
+			values ('completed', $1, $2, $3, $4, $5, $6, $7, $8, 0, 0, now(), now(), now(), now())
+			returning id, status, import_queue_position, total_count, processed_count,
+			          created_count, updated_count, skipped_count, failed_count, last_error,
+			          submitted_at, started_at, heartbeat_at, finished_at
 	`, queuePosition, data, len(payloads), result.Created+result.Updated+result.Skipped+result.Failed, result.Created, result.Updated, result.Skipped, result.Failed)
 	job, err := scanImportJob(row)
 	if err != nil {
@@ -127,13 +128,15 @@ func (s *Store) CreateQueuedImportJob(ctx context.Context, payloads []map[string
 	}
 	defer tx.Rollback(ctx)
 	row := tx.QueryRow(ctx, `
-		insert into token_import_jobs (
-			status, import_queue_position, payloads, total_count, submitted_at, heartbeat_at
-		)
-		values ('queued', $1, $2, $3, now(), now())
-		returning id, status, import_queue_position, total_count, processed_count,
-		          created_count, updated_count, skipped_count, failed_count, last_error,
-		          submitted_at, started_at, heartbeat_at, finished_at
+			insert into token_import_jobs (
+				status, import_queue_position, payloads, total_count,
+				yielded_to_response_traffic_count, response_traffic_timeout_count,
+				submitted_at, heartbeat_at
+			)
+			values ('queued', $1, $2, $3, 0, 0, now(), now())
+			returning id, status, import_queue_position, total_count, processed_count,
+			          created_count, updated_count, skipped_count, failed_count, last_error,
+			          submitted_at, started_at, heartbeat_at, finished_at
 	`, queuePosition, data, len(payloads))
 	job, err := scanImportJob(row)
 	if err != nil {
@@ -852,7 +855,7 @@ func tokenIdentityFromPayload(payload map[string]any) string {
 
 func looksLikeAccessTokenText(value string) bool {
 	value = strings.TrimSpace(value)
-	return strings.Count(value, ".") >= 2 || strings.HasPrefix(value, "eyJ")
+	return strings.HasPrefix(value, "eyJ")
 }
 
 func appendUniqueInt64(values []int64, value int64) []int64 {

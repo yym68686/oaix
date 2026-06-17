@@ -752,7 +752,7 @@ func payloadBool(value any, fallback bool) bool {
 
 func looksLikeAccessToken(value string) bool {
 	value = strings.TrimSpace(value)
-	return strings.Count(value, ".") >= 2 || strings.HasPrefix(value, "eyJ")
+	return strings.HasPrefix(value, "eyJ")
 }
 
 func truncate(value string, max int) string {
