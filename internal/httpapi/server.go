@@ -314,20 +314,24 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 	offset := queryInt(r, "offset", 0)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	items, total, err := a.store.ListTokens(ctx, store.TokenListOptions{
+	tokenOpts := store.TokenListOptions{
 		Limit:  limit,
 		Offset: offset,
 		Query:  r.URL.Query().Get("q"),
 		Status: r.URL.Query().Get("status"),
 		Plan:   r.URL.Query().Get("plan"),
 		Sort:   r.URL.Query().Get("sort"),
-	})
+	}
+	items, total, err := a.store.ListTokens(ctx, tokenOpts)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
 	counts, _ := a.store.TokenCounts(ctx)
-	planCounts, _ := a.store.TokenPlanCounts(ctx)
+	planCounts, _ := a.store.TokenPlanCounts(ctx, store.TokenListOptions{
+		Query:  tokenOpts.Query,
+		Status: tokenOpts.Status,
+	})
 	adminItems, pendingIDs := a.adminTokenItems(r.Context(), items, queryBool(r, "include_quota", false))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts":          counts,

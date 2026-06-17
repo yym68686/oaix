@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 )
@@ -115,6 +116,31 @@ func TestBuildPlanCountsIncludesCommonPlansAndExtras(t *testing.T) {
 		if got[index] != want[index] {
 			t.Fatalf("plan count[%d] = %#v, want %#v", index, got[index], want[index])
 		}
+	}
+}
+
+func TestTokenListWhereCanSkipPlanFilterForPlanCounts(t *testing.T) {
+	where, args := tokenListWhere(TokenListOptions{
+		Query:  "acct",
+		Status: "available",
+		Plan:   "pro",
+	}, false)
+	if len(args) != 1 || args[0] != "%acct%" {
+		t.Fatalf("args = %#v", args)
+	}
+	if !strings.Contains(where, "is_active = true") {
+		t.Fatalf("status filter missing: %s", where)
+	}
+	if strings.Contains(where, "plan_type") {
+		t.Fatalf("plan filter should be skipped: %s", where)
+	}
+
+	where, args = tokenListWhere(TokenListOptions{Plan: "unknown"}, true)
+	if len(args) != 1 || args[0] != "unknown" {
+		t.Fatalf("args = %#v", args)
+	}
+	if !strings.Contains(where, "plan_type is null") {
+		t.Fatalf("unknown plan filter missing: %s", where)
 	}
 }
 

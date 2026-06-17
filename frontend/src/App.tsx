@@ -964,7 +964,7 @@ function TokenExplorer(props: {
   const pageIds = props.tokens.map((item) => item.id);
   const allSelected = pageIds.length > 0 && pageIds.every((id) => props.selectedIds.has(id));
   const statusOptions = useMemo(() => statusOptionsWithCounts(props.counts), [props.counts]);
-  const planOptions = useMemo(() => planOptionsWithCounts(props.planCounts, props.counts.total || 0), [props.planCounts, props.counts.total]);
+  const planOptions = useMemo(() => planOptionsWithCounts(props.planCounts), [props.planCounts]);
   const note =
     props.mode === "keys"
       ? `显示 ${formatNumber(props.tokens.length)} / ${formatNumber(props.tokenTotal)} 个 key`
@@ -2084,7 +2084,8 @@ function statusOptionsWithCounts(counts: TokenCounts): Array<{ label: string; va
   }));
 }
 
-function planOptionsWithCounts(planCounts: TokenPlanCount[], total: number): Array<{ label: string; value: string }> {
+function planOptionsWithCounts(planCounts: TokenPlanCount[]): Array<{ label: string; value: string }> {
+  const total = planCounts.reduce((sum, item) => sum + (Number(item.count) || 0), 0);
   const options = [
     {
       label: `全部计划 ${formatNumber(total)}`,

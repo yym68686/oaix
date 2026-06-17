@@ -131,37 +131,7 @@ func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token,
 	if offset < 0 {
 		offset = 0
 	}
-	var filters []string
-	var args []any
-	arg := func(value any) string {
-		args = append(args, value)
-		return fmt.Sprintf("$%d", len(args))
-	}
-	filters = append(filters, "merged_into_token_id is null")
-	if q := strings.TrimSpace(opts.Query); q != "" {
-		placeholder := arg("%" + q + "%")
-		filters = append(filters, fmt.Sprintf("(email ilike %s or account_id ilike %s or remark ilike %s)", placeholder, placeholder, placeholder))
-	}
-	switch strings.ToLower(strings.TrimSpace(opts.Status)) {
-	case "available", "active":
-		filters = append(filters, "is_active = true and disabled_at is null and (cooldown_until is null or cooldown_until <= now())")
-	case "cooling", "cooldown":
-		filters = append(filters, "cooldown_until > now()")
-	case "disabled", "inactive":
-		filters = append(filters, "(is_active = false or disabled_at is not null)")
-	}
-	if plan := normalizePlanFilter(opts.Plan); plan != "" && plan != "all" {
-		placeholder := arg(plan)
-		if plan == "unknown" {
-			filters = append(filters, fmt.Sprintf("(plan_type is null or btrim(plan_type) = '' or lower(btrim(plan_type)) = %s)", placeholder))
-		} else {
-			filters = append(filters, fmt.Sprintf("lower(btrim(plan_type)) = %s", placeholder))
-		}
-	}
-	where := strings.Join(filters, " and ")
-	if where == "" {
-		where = "true"
-	}
+	where, args := tokenListWhere(opts, true)
 	var total int
 	if err := s.pool.QueryRow(ctx, "select count(*) from codex_tokens where "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -194,6 +164,43 @@ func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token,
 		return nil, 0, err
 	}
 	return items, total, nil
+}
+
+func tokenListWhere(opts TokenListOptions, includePlan bool) (string, []any) {
+	var filters []string
+	var args []any
+	arg := func(value any) string {
+		args = append(args, value)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	filters = append(filters, "merged_into_token_id is null")
+	if q := strings.TrimSpace(opts.Query); q != "" {
+		placeholder := arg("%" + q + "%")
+		filters = append(filters, fmt.Sprintf("(email ilike %s or account_id ilike %s or remark ilike %s)", placeholder, placeholder, placeholder))
+	}
+	switch strings.ToLower(strings.TrimSpace(opts.Status)) {
+	case "available", "active":
+		filters = append(filters, "is_active = true and disabled_at is null and (cooldown_until is null or cooldown_until <= now())")
+	case "cooling", "cooldown":
+		filters = append(filters, "cooldown_until > now()")
+	case "disabled", "inactive":
+		filters = append(filters, "(is_active = false or disabled_at is not null)")
+	}
+	if includePlan {
+		if plan := normalizePlanFilter(opts.Plan); plan != "" && plan != "all" {
+			placeholder := arg(plan)
+			if plan == planUnknown {
+				filters = append(filters, fmt.Sprintf("(plan_type is null or btrim(plan_type) = '' or lower(btrim(plan_type)) = %s)", placeholder))
+			} else {
+				filters = append(filters, fmt.Sprintf("lower(btrim(plan_type)) = %s", placeholder))
+			}
+		}
+	}
+	where := strings.Join(filters, " and ")
+	if where == "" {
+		where = "true"
+	}
+	return where, args
 }
 
 func (s *Store) ListTokensByIDs(ctx context.Context, tokenIDs []int64) ([]Token, error) {
@@ -235,7 +242,8 @@ func (s *Store) TokenCounts(ctx context.Context) (TokenCounts, error) {
 	return counts, err
 }
 
-func (s *Store) TokenPlanCounts(ctx context.Context) ([]TokenPlanCount, error) {
+func (s *Store) TokenPlanCounts(ctx context.Context, opts TokenListOptions) ([]TokenPlanCount, error) {
+	where, args := tokenListWhere(opts, false)
 	rows, err := s.pool.Query(ctx, `
 		with normalized as (
 			select case
@@ -243,12 +251,12 @@ func (s *Store) TokenPlanCounts(ctx context.Context) ([]TokenPlanCount, error) {
 				else lower(btrim(plan_type))
 			end as plan
 			from codex_tokens
-			where merged_into_token_id is null
+			where `+where+`
 		)
 		select plan, count(*)::int
 		from normalized
 		group by plan
-	`)
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
