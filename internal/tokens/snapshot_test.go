@@ -89,6 +89,20 @@ func TestSnapshotIndexes(t *testing.T) {
 	}
 }
 
+func TestManagerActiveStreamCapCanUpdateAtRuntime(t *testing.T) {
+	manager := NewManager(&fakeSource{tokens: makeTokens(1)}, slog.Default(), time.Second, time.Second, 4)
+	if manager.ActiveStreamCap() != 4 {
+		t.Fatalf("ActiveStreamCap = %d, want 4", manager.ActiveStreamCap())
+	}
+	manager.SetActiveStreamCap(10)
+	if manager.ActiveStreamCap() != 10 {
+		t.Fatalf("ActiveStreamCap after update = %d, want 10", manager.ActiveStreamCap())
+	}
+	if stats := manager.Stats(); stats.ActiveCap != 10 {
+		t.Fatalf("Stats.ActiveCap = %d, want 10", stats.ActiveCap)
+	}
+}
+
 func TestClaimRejectsStaleSnapshotWhenRefreshFails(t *testing.T) {
 	manager := NewManager(&fakeSource{tokens: makeTokens(1)}, slog.Default(), time.Nanosecond, time.Second, 1)
 	if err := manager.Refresh(context.Background()); err != nil {

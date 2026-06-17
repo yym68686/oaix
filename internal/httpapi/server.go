@@ -243,17 +243,50 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) tokenSelection(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	settings, err := a.store.GetTokenSelectionSettings(ctx, a.cfg.TokenPool.ActiveStreamCap)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	activeCap := a.tokens.SetActiveStreamCap(settings.ActiveStreamCap)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"strategy":          "snapshot_round_robin",
-		"active_stream_cap": a.cfg.TokenPool.ActiveStreamCap,
+		"active_stream_cap": activeCap,
+		"settings":          settings,
 		"snapshot":          a.tokens.Stats(),
 	})
 }
 
 func (a *App) updateTokenSelection(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		ActiveStreamCap *int64 `json:"active_stream_cap"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if payload.ActiveStreamCap == nil {
+		writeError(w, http.StatusBadRequest, errors.New("active_stream_cap is required"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	settings, err := a.store.UpdateTokenActiveStreamCapSettings(ctx, *payload.ActiveStreamCap, a.cfg.TokenPool.ActiveStreamCap)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	activeCap := a.tokens.SetActiveStreamCap(settings.ActiveStreamCap)
+	_ = a.store.WriteAuditLog(ctx, "token_selection_concurrency_updated", "admin", "setting", store.TokenSelectionSettingKey, map[string]any{
+		"active_stream_cap": activeCap,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"strategy":          "snapshot_round_robin",
-		"active_stream_cap": a.cfg.TokenPool.ActiveStreamCap,
+		"active_stream_cap": activeCap,
+		"settings":          settings,
+		"snapshot":          a.tokens.Stats(),
 	})
 }
 

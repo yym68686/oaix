@@ -41,7 +41,7 @@ type Manager struct {
 	logger          *slog.Logger
 	maxAge          time.Duration
 	refreshInterval time.Duration
-	activeCap       int64
+	activeCap       atomic.Int64
 	selector        Selector
 	selectorMisses  atomic.Int64
 	version         atomic.Int64
@@ -58,6 +58,7 @@ type Stats struct {
 	AgeMs         int64     `json:"age_ms"`
 	ReadyTokens   int       `json:"ready_tokens"`
 	ActiveStreams int64     `json:"active_streams"`
+	ActiveCap     int64     `json:"active_stream_cap"`
 	Stale         bool      `json:"stale"`
 }
 
@@ -78,9 +79,6 @@ type Claim struct {
 }
 
 func NewManager(source Source, logger *slog.Logger, maxAge, refreshInterval time.Duration, activeCap int64) *Manager {
-	if activeCap <= 0 {
-		activeCap = 1
-	}
 	if maxAge <= 0 {
 		maxAge = 10 * time.Second
 	}
@@ -92,9 +90,9 @@ func NewManager(source Source, logger *slog.Logger, maxAge, refreshInterval time
 		logger:          logger,
 		maxAge:          maxAge,
 		refreshInterval: refreshInterval,
-		activeCap:       activeCap,
 		stopCh:          make(chan struct{}),
 	}
+	manager.SetActiveStreamCap(activeCap)
 	manager.snapshot.Store(&Snapshot{
 		Version:  0,
 		LoadedAt: time.Time{},
@@ -106,6 +104,28 @@ func NewManager(source Source, logger *slog.Logger, maxAge, refreshInterval time
 		Ready:    nil,
 	})
 	return manager
+}
+
+func (m *Manager) ActiveStreamCap() int64 {
+	if m == nil {
+		return 0
+	}
+	value := m.activeCap.Load()
+	if value <= 0 {
+		return 1
+	}
+	return value
+}
+
+func (m *Manager) SetActiveStreamCap(value int64) int64 {
+	if m == nil {
+		return 0
+	}
+	if value <= 0 {
+		value = 1
+	}
+	m.activeCap.Store(value)
+	return value
 }
 
 func (m *Manager) Start(ctx context.Context) {
@@ -227,6 +247,7 @@ func (m *Manager) Stats() Stats {
 		AgeMs:         age.Milliseconds(),
 		ReadyTokens:   len(snapshot.Ready),
 		ActiveStreams: active,
+		ActiveCap:     m.ActiveStreamCap(),
 		Stale:         snapshot.LoadedAt.IsZero() || now.Sub(snapshot.LoadedAt) > m.maxAge,
 	}
 }
@@ -258,15 +279,16 @@ func (m *Manager) Claim(ctx context.Context, intent Intent) (*Claim, error) {
 	if selector == nil {
 		selector = RoundRobinSelector{}
 	}
+	activeCap := m.ActiveStreamCap()
 	cursor := m.cursor.Load()
 	for offset := uint64(0); offset < total; offset++ {
-		candidate, reason := selector.Select(ctx, snapshot, intent, m.activeCap, &cursor)
+		candidate, reason := selector.Select(ctx, snapshot, intent, activeCap, &cursor)
 		m.cursor.Store(cursor)
 		if candidate == nil {
 			break
 		}
 		next := candidate.Active.Add(1)
-		if next > m.activeCap {
+		if next > activeCap {
 			candidate.Active.Add(-1)
 			continue
 		}

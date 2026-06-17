@@ -52,7 +52,13 @@ func RunGateway(ctx context.Context) error {
 		}
 		logger.Info("access token file imported", "created", result.Created, "updated", result.Updated, "skipped", result.Skipped, "failed", result.Failed)
 	}
-	tokenManager := tokens.NewManager(db, logger, cfg.TokenPool.SnapshotMaxAge, cfg.TokenPool.RefreshInterval, cfg.TokenPool.ActiveStreamCap)
+	activeStreamCap := cfg.TokenPool.ActiveStreamCap
+	if settings, err := db.GetTokenSelectionSettings(ctx, cfg.TokenPool.ActiveStreamCap); err != nil {
+		logger.Warn("token selection settings load failed; using configured active stream cap", "error", err, "active_stream_cap", activeStreamCap)
+	} else {
+		activeStreamCap = settings.ActiveStreamCap
+	}
+	tokenManager := tokens.NewManager(db, logger, cfg.TokenPool.SnapshotMaxAge, cfg.TokenPool.RefreshInterval, activeStreamCap)
 	tokenManager.Start(ctx)
 	logWriter := logs.NewWriter(db, logger, cfg.RequestLog)
 	logWriter.Start(ctx)

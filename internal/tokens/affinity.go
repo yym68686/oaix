@@ -186,6 +186,7 @@ func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent 
 	if candidate == nil || !tokenMatchesIntent(candidate, intent) {
 		return nil
 	}
+	activeCap := m.ActiveStreamCap()
 	deadline := time.Now().Add(wait)
 	for {
 		select {
@@ -193,9 +194,9 @@ func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent 
 			return nil
 		default:
 		}
-		if candidate.Active.Load() < m.activeCap {
+		if candidate.Active.Load() < activeCap {
 			next := candidate.Active.Add(1)
-			if next <= m.activeCap {
+			if next <= activeCap {
 				return &Claim{
 					Token:      candidate,
 					Reason:     reason,

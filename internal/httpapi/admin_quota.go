@@ -111,7 +111,7 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 	}
 
 	activeByID := a.activeStreamsByTokenID(tokens)
-	cap := a.cfg.TokenPool.ActiveStreamCap
+	cap := a.tokens.ActiveStreamCap()
 	items := make([]adminTokenItem, 0, len(tokens))
 	for _, token := range tokens {
 		items = append(items, adminTokenItem{
