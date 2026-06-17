@@ -256,6 +256,14 @@ export const api = {
     postJSON<Record<string, unknown>>("/admin/token-selection", payload),
   listTokens: (params: URLSearchParams) =>
     requestJSON<TokenListResponse>(`/admin/tokens?${params.toString()}`),
+  getToken: (id: number, includeQuota = false) => {
+    const params = new URLSearchParams();
+    if (includeQuota) {
+      params.set("include_quota", "true");
+    }
+    const query = params.toString();
+    return requestJSON<TokenItem>(`/admin/tokens/${id}${query ? `?${query}` : ""}`);
+  },
   tokenCosts: (ids: number[]) =>
     requestJSON<{ items?: TokenObservedCostItem[] }>(`/admin/tokens/costs?ids=${ids.join(",")}`),
   updateActivation: (id: number, payload: Record<string, unknown>) =>

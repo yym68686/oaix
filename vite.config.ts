@@ -3,8 +3,8 @@ import react from "@vitejs/plugin-react";
 import { resolve } from "node:path";
 import { defineConfig } from "vite";
 
-export default defineConfig({
-  base: "/assets/",
+export default defineConfig(({ command }) => ({
+  base: command === "serve" ? "/" : "/assets/",
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
@@ -35,4 +35,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));
