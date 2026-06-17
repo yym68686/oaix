@@ -116,6 +116,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		return
 	}
 	_ = r.Body.Close()
+	bodyBytes, _ = sanitizeReasoningContentBody(bodyBytes)
 	intent = normalizeIntent(intent, bodyBytes)
 	promptCacheContext, upstreamBody := buildPromptCacheContext(r.Header, intent, bodyBytes, p.cfg.PromptCache)
 	bodyBytes = upstreamBody
