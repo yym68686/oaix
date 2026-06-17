@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -483,12 +484,14 @@ type rowScanner interface {
 
 func scanToken(row rowScanner) (Token, error) {
 	var token Token
+	var accessToken sql.NullString
+	var refreshToken sql.NullString
 	err := row.Scan(
 		&token.ID,
 		&token.Email,
 		&token.AccountID,
-		&token.AccessToken,
-		&token.RefreshToken,
+		&accessToken,
+		&refreshToken,
 		&token.PlanType,
 		&token.Remark,
 		&token.SourceFile,
@@ -500,6 +503,12 @@ func scanToken(row rowScanner) (Token, error) {
 		&token.CreatedAt,
 		&token.UpdatedAt,
 	)
+	if accessToken.Valid {
+		token.AccessToken = accessToken.String
+	}
+	if refreshToken.Valid {
+		token.RefreshToken = refreshToken.String
+	}
 	return token, err
 }
 
