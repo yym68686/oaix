@@ -232,7 +232,7 @@ function QuotaMeter({
     ? `${label} 已用 ${formatPercent(used)}，剩余 ${formatPercent(remaining)}，重置 ${formatDate(window.reset_at)}`
     : `${label} quota 暂无数据`;
   return (
-    <div className="inline-flex min-w-[5.4rem] items-center gap-1 rounded-md border bg-muted/32 px-2 py-0.5" title={title}>
+    <div className="inline-grid w-36 grid-cols-[1.5rem_3.75rem_2rem] items-center gap-1 rounded-md border bg-muted/32 px-2 py-0.5" title={title}>
       <span className="font-medium">{label}</span>
       <span className="oaix-tabular text-muted-foreground">余 {formatPercent(remaining)}</span>
       <div className="h-1 w-8 overflow-hidden rounded-full bg-muted">
