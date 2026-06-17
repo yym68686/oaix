@@ -262,8 +262,15 @@ func TestStreamResponsesPreflightFailureDoesNotCommit(t *testing.T) {
 	if result.Committed || !result.Retry || result.Status != http.StatusTooManyRequests {
 		t.Fatalf("unexpected result: %+v err=%v", result, err)
 	}
-	if recorder.Body.Len() != 0 {
-		t.Fatalf("preflight failure should not write downstream bytes: %q", recorder.Body.String())
+	if !result.StreamState.DownstreamStarted || !result.StreamState.KeepaliveSent {
+		t.Fatalf("response.created should start downstream with keepalive: %+v", result.StreamState)
+	}
+	output := recorder.Body.String()
+	if !strings.Contains(output, "event: keepalive") || !strings.Contains(output, `"type":"keepalive"`) {
+		t.Fatalf("keepalive should be written immediately: %q", output)
+	}
+	if strings.Contains(output, "response.created") || strings.Contains(output, "response.failed") {
+		t.Fatalf("preflight failure should not flush buffered upstream events: %q", output)
 	}
 }
 
@@ -297,6 +304,45 @@ func TestStreamResponsesPreflightUsesStructuredKeepalive(t *testing.T) {
 	}
 	if !strings.Contains(output, "event: keepalive") || !strings.Contains(output, `"type":"keepalive"`) {
 		t.Fatalf("structured keepalive missing: %q", output)
+	}
+}
+
+func TestStreamResponsesPreflightDoesNotDuplicateKeepaliveAfterRetry(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_2","model":"gpt-5.5"}}`,
+		``,
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"ok"}`,
+		``,
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.streamResponsesWithPreflight(recorder, resp, Attempt{
+		Intent: RequestIntent{Model: "gpt-5.5", Stream: true},
+		StreamState: StreamAttemptState{
+			DownstreamStarted: true,
+			KeepaliveSent:     true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Committed {
+		t.Fatalf("expected committed stream: %+v", result)
+	}
+	output := recorder.Body.String()
+	if strings.Contains(output, "event: keepalive") {
+		t.Fatalf("keepalive should not be duplicated after retry: %q", output)
+	}
+	if !strings.Contains(output, "response.created") || !strings.Contains(output, "response.output_text.delta") {
+		t.Fatalf("buffered upstream events should flush on semantic output: %q", output)
 	}
 }
 

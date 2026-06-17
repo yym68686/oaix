@@ -68,15 +68,22 @@ type Attempt struct {
 	UpstreamURL string
 	Method      string
 	PromptCache *PromptCacheContext
+	StreamState StreamAttemptState
 }
 
 type AttemptResult struct {
 	Status       int
 	Retry        bool
 	Committed    bool
+	StreamState  StreamAttemptState
 	Usage        *UsageMetrics
 	ResponseID   string
 	FirstTokenAt *time.Time
+}
+
+type StreamAttemptState struct {
+	DownstreamStarted bool
+	KeepaliveSent     bool
 }
 
 type Outcome string
@@ -174,6 +181,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var lastUsage *UsageMetrics
 	var lastResponseID string
 	var lastFirstTokenAt *time.Time
+	var streamState StreamAttemptState
 	for attempt := 1; attempt <= p.cfg.Upstream.MaxRetries; attempt++ {
 		selectStarted := time.Now()
 		tokenIntent := tokens.Intent{
@@ -213,8 +221,15 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			StartedAt:   attemptStarted.UTC(),
 			RetryCause:  classify(finalStatus, lastErr),
 			PromptCache: promptCacheContext,
+			StreamState: streamState,
 		}
 		result, err := p.doAttempt(w, r, attemptSpec)
+		if result.StreamState.DownstreamStarted {
+			streamState.DownstreamStarted = true
+		}
+		if result.StreamState.KeepaliveSent {
+			streamState.KeepaliveSent = true
+		}
 		status := result.Status
 		retry := result.Retry
 		committed := result.Committed

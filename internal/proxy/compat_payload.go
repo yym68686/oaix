@@ -1541,7 +1541,28 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 	flusher, _ := w.(http.Flusher)
 	var buffered [][]byte
 	committed := false
+	streamState := attempt.StreamState
 	firstTokenAt := (*time.Time)(nil)
+	writeImmediateKeepalive := func() error {
+		if streamState.KeepaliveSent {
+			return nil
+		}
+		if !streamState.DownstreamStarted {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(resp.StatusCode)
+			streamState.DownstreamStarted = true
+		}
+		raw := structuredKeepaliveRaw(0)
+		observer.Observe(raw)
+		if _, err := w.Write(raw); err != nil {
+			return err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		streamState.KeepaliveSent = true
+		return nil
+	}
 	parser := sse.NewParser(int(p.cfg.Upstream.NonStreamMaxResponseBytes))
 	err := parser.Parse(responseContext(resp), resp.Body, func(event sse.Event) error {
 		payload := parseEventPayload(event)
@@ -1551,13 +1572,18 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		}
 		if !committed && isPreflightResponseEvent(typ) {
 			if typ == "response.created" {
-				buffered = append(buffered, structuredKeepaliveRaw(0))
+				if err := writeImmediateKeepalive(); err != nil {
+					return err
+				}
 			}
 			buffered = append(buffered, rawEventForDownstream(event, attempt.Intent.ResponseModelAlias))
 			return nil
 		}
 		if !committed {
-			w.WriteHeader(resp.StatusCode)
+			if !streamState.DownstreamStarted {
+				w.WriteHeader(resp.StatusCode)
+				streamState.DownstreamStarted = true
+			}
 			for _, raw := range buffered {
 				observer.Observe(raw)
 				if _, err := w.Write(raw); err != nil {
@@ -1585,6 +1611,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 	result := AttemptResult{
 		Status:       resp.StatusCode,
 		Committed:    committed,
+		StreamState:  streamState,
 		Usage:        observer.usage,
 		ResponseID:   observer.responseID,
 		FirstTokenAt: firstNonNilTime(firstTokenAt, observer.firstTokenAt),
@@ -1604,15 +1631,20 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		return result, err
 	}
 	if !committed {
-		w.WriteHeader(resp.StatusCode)
+		if !streamState.DownstreamStarted {
+			w.WriteHeader(resp.StatusCode)
+			streamState.DownstreamStarted = true
+		}
 		for _, raw := range buffered {
 			observer.Observe(raw)
 			if _, err := w.Write(raw); err != nil {
 				result.Committed = true
+				result.StreamState = streamState
 				return result, err
 			}
 		}
 		result.Committed = true
+		result.StreamState = streamState
 	}
 	return result, nil
 }
