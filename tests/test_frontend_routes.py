@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json as json_module
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -18,6 +19,13 @@ from oaix_gateway.request_store import (
 )
 from oaix_gateway.token_import_jobs import TokenImportBatchSummary
 from oaix_gateway.token_store import TokenCounts, TokenPlanCounts, TokenSelectionSettings
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FRONTEND_SRC = REPO_ROOT / "frontend" / "src"
+FRONTEND_APP = FRONTEND_SRC / "App.tsx"
+FRONTEND_API = FRONTEND_SRC / "lib" / "api.ts"
+COSS_UI_DIR = FRONTEND_SRC / "registry" / "default" / "ui"
 
 
 async def _request(
@@ -74,19 +82,28 @@ def test_frontend_index_includes_token_search_input() -> None:
     response = asyncio.run(_request(app, "GET", "/"))
 
     assert response.status_code == 200
-    assert 'id="token-search-input"' in response.text
-    assert 'id="token-search-summary"' in response.text
-    assert 'id="token-pagination"' in response.text
-    assert 'id="token-page-input"' in response.text
-    assert 'id="token-remark-dialog"' in response.text
-    assert 'id="token-remark-textarea"' in response.text
+    assert '<div id="root"></div>' in response.text
+    assert '/assets/src/main.js?v=' in response.text
+    assert '/assets/styles.css?v=' in response.text
+    assert "oaix Key Console" in response.text
+    assert "__OAIX_WEB_VERSION_HASH__" not in response.text
+    assert "__OAIX_WEB_VERSION_TIME__" not in response.text
 
 
-def test_frontend_defaults_key_status_to_available_tab() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
+def test_frontend_uses_react_vite_and_coss_registry() -> None:
+    app_tsx = FRONTEND_APP.read_text()
+    main_tsx = (FRONTEND_SRC / "main.tsx").read_text()
+    styles_css = (FRONTEND_SRC / "styles.css").read_text()
 
-    assert 'const DEFAULT_TOKEN_STATUS_FILTER = "available";' in app_js
-    assert 'tokenStatusFilter: DEFAULT_TOKEN_STATUS_FILTER' in app_js
+    assert 'from "@/registry/default/ui/button"' in app_tsx
+    assert 'from "@/registry/default/ui/card"' in app_tsx
+    assert 'from "@/registry/default/ui/tabs"' in app_tsx
+    assert 'from "@/registry/default/ui/dialog"' in app_tsx
+    assert 'createRoot(document.getElementById("root")' in main_tsx
+    assert '@source "./**/*.{ts,tsx}"' in styles_css
+    assert (COSS_UI_DIR / "button.tsx").exists()
+    assert (COSS_UI_DIR / "card.tsx").exists()
+    assert (COSS_UI_DIR / "select.tsx").exists()
 
 
 def test_livez_returns_without_token_count_query(monkeypatch) -> None:
@@ -126,11 +143,10 @@ def test_frontend_index_busts_asset_cache_with_content_hash() -> None:
     response = asyncio.run(_request(app, "GET", "/"))
 
     css_version = hashlib.sha256((WEB_DIR / "styles.css").read_bytes()).hexdigest()[:12]
-    js_version = hashlib.sha256((WEB_DIR / "app.js").read_bytes()).hexdigest()[:12]
+    js_version = hashlib.sha256((WEB_DIR / "src" / "main.js").read_bytes()).hexdigest()[:12]
     bundle_digest = hashlib.sha256()
     bundle_mtime = 0.0
-    for filename in ("index.html", "styles.css", "app.js"):
-        path = WEB_DIR / filename
+    for path in (WEB_DIR / "index.html", WEB_DIR / "styles.css", WEB_DIR / "src" / "main.js"):
         bundle_digest.update(path.read_bytes())
         bundle_mtime = max(bundle_mtime, path.stat().st_mtime)
     bundle_version_hash = bundle_digest.hexdigest()[:12]
@@ -143,10 +159,11 @@ def test_frontend_index_busts_asset_cache_with_content_hash() -> None:
     assert response.status_code == 200
     assert response.headers["cache-control"] == "public, max-age=60, stale-while-revalidate=300"
     assert f'/assets/styles.css?v={css_version}' in response.text
-    assert f'/assets/app.js?v={js_version}' in response.text
-    assert f'title="资源版本 {bundle_version_hash}"' in response.text
-    assert f"前端版本 {bundle_version_time}" in response.text
-    assert "__OAIX_WEB_VERSION_" not in response.text
+    assert f'/assets/src/main.js?v={js_version}' in response.text
+    assert f'hash: "{bundle_version_hash}"' in response.text
+    assert f'time: "{bundle_version_time}"' in response.text
+    assert "__OAIX_WEB_VERSION_HASH__" not in response.text
+    assert "__OAIX_WEB_VERSION_TIME__" not in response.text
 
 
 def test_browser_icon_routes_do_not_404() -> None:
@@ -157,140 +174,70 @@ def test_browser_icon_routes_do_not_404() -> None:
         assert response.status_code == 204
 
 
-def test_frontend_token_cards_always_render_probe_button() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
-    action_renderer = app_js.split("function renderTokenActionButtons", 1)[1].split("function clampWidth", 1)[0]
+def test_frontend_token_explorer_keeps_core_admin_actions() -> None:
+    app_tsx = FRONTEND_APP.read_text()
+    api_ts = FRONTEND_API.read_text()
 
-    assert 'const PROBE_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4-mini"]' in app_js
-    assert 'data-token-probe-model="true"' in action_renderer
-    assert 'const probeButton = `' in action_renderer
-    assert 'data-token-probe="true"' in action_renderer
-    assert "${probeButton}" in action_renderer
-    assert action_renderer.index("${probeButton}") < action_renderer.index('${actionButtons.join("")}')
-
-
-def test_frontend_token_cards_support_fill_first_drag_ordering() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
-
-    assert 'data-token-draggable="${draggable ? "true" : "false"}"' in app_js
-    assert 'draggable="${draggable ? "true" : "false"}"' in app_js
-    assert 'fetchJson("/admin/token-selection/order"' in app_js
-    assert 'elements.tokenList.addEventListener("dragstart", handleTokenCardDragStart)' in app_js
-    assert 'state.tokenSelectionStrategy === "fill_first"' in app_js
-    assert "const activeStreamsValue =" in app_js
-    assert "token-result__usage" in app_js
+    assert "const PAGE_SIZE = 100" in app_tsx
+    assert 'type TokenStatus = "all" | "available" | "cooling" | "disabled"' in app_tsx
+    assert 'type TokenMode = "keys" | "import_batches"' in app_tsx
+    assert "api.listTokens(params)" in app_tsx
+    assert "api.batchTokens" in app_tsx
+    assert "api.updateActivation" in app_tsx
+    assert "api.updateRemark" in app_tsx
+    assert "api.deleteToken" in app_tsx
+    assert "api.importJobs(50)" in app_tsx
+    assert 'listTokens: (params: URLSearchParams)' in api_ts
+    assert 'batchTokens: (payload: Record<string, unknown>)' in api_ts
 
 
-def test_frontend_supports_custom_plan_order_and_global_plan_filters() -> None:
-    index_html = (WEB_DIR / "index.html").read_text()
-    app_js = (WEB_DIR / "app.js").read_text()
+def test_frontend_import_panel_supports_queue_position_and_token_formats() -> None:
+    app_tsx = FRONTEND_APP.read_text()
 
-    assert 'id="token-plan-order-summary"' in index_html
-    assert 'id="token-plan-order-list"' in index_html
-    assert 'id="token-active-stream-cap"' in index_html
-    assert 'id="token-active-stream-cap-range"' in index_html
-    assert 'id="token-plan-filters"' in index_html
-    assert 'data-plan-order-enabled="true"' in index_html
-    assert "const TOKEN_ACTIVE_STREAM_CAP_MAX = 10" in app_js
-    assert 'const PLAN_TYPE_OPTIONS = ["free", "plus", "team", "pro"]' in app_js
-    assert 'fetchJson("/admin/token-selection/concurrency"' in app_js
-    assert 'fetchJson("/admin/token-selection/plan-order"' in app_js
-    assert 'data-token-plan-filter="${escapeHtml(planType)}"' in app_js
-    assert "state.tokenPlanFilter === AVAILABLE_PLAN_FILTER_ALL" in app_js
+    assert 'const [queuePosition, setQueuePosition] = useState<"front" | "back">("front")' in app_tsx
+    assert "import_queue_position: queuePosition" in app_tsx
+    assert 'tokens: entries' in app_tsx
+    assert "collectImportEntries(tokenInput, fileInputRef.current?.files)" in app_tsx
+    assert "parseTokenText(await file.text())" in app_tsx
+    assert '"access_token"' in app_tsx
+    assert '"refresh_token"' in app_tsx
+    assert '"refreshToken"' in app_tsx
+    assert "sub2api 导出 JSON" in app_tsx
 
 
-def test_frontend_supports_import_batch_view() -> None:
-    index_html = (WEB_DIR / "index.html").read_text()
-    app_js = (WEB_DIR / "app.js").read_text()
+def test_frontend_dashboard_refresh_loads_admin_panels_together() -> None:
+    app_tsx = FRONTEND_APP.read_text()
 
-    assert 'data-token-view-mode="import_batches"' in index_html
-    assert "tokenImportBatchesLoaded: false" in app_js
-    assert "async function loadTokenImportBatches" in app_js
-    assert "`/admin/tokens/import-batches?${params.toString()}`" in app_js
-    assert "data.import_batches_loaded && Array.isArray(data.import_batches)" in app_js
-    assert "await loadTokenImportBatches({ force: true })" in app_js
-    assert "loadTokenImportBatchCosts" in app_js
-    assert "const IMPORT_BATCH_COST_BATCH_SIZE = 30;" in app_js
-    assert "计算中" in app_js
-    assert 'counts.tokenCount <= 0' in app_js
-    assert "function renderImportBatchList" in app_js
-    assert "function renderImportBatchFailureSection" in app_js
-    assert 'params.set("import_batch_id", String(state.selectedImportBatchId))' in app_js
-    assert "data.selected_import_batch?.failed_items" in app_js
-    assert "导入批次 #" in app_js
-    assert "失败 Key" in app_js
-    assert "data-import-batch-view" in app_js
-    assert "average_observed_cost_usd" in app_js
-    assert "平均金额" in app_js
-    view_batch_function = app_js.split("async function viewImportBatch", 1)[1].split("async function saveTokenSelection", 1)[0]
-    assert 'const IMPORT_BATCH_TOKEN_STATUS_FILTER = "all";' in app_js
-    assert "state.tokenStatusFilter = IMPORT_BATCH_TOKEN_STATUS_FILTER" in view_batch_function
-    assert "state.tokenPlanFilter = AVAILABLE_PLAN_FILTER_ALL" in view_batch_function
-    assert "state.tokenSearchTerm = \"\"" in view_batch_function
+    assert "await Promise.allSettled([loadTokenSelection(), loadTokens(), loadRequests(), loadSettings()])" in app_tsx
+    assert "window.setInterval(() => void refreshAll(), 30_000)" in app_tsx
+    assert "loading && !counts.total" in app_tsx
+    assert "tokenLoading && !tokens.length" in app_tsx
+    assert "requestLoading && !requests.length && !requestSummary.total" in app_tsx
 
 
-def test_frontend_import_panel_supports_queue_position_switch() -> None:
-    index_html = (WEB_DIR / "index.html").read_text()
-    app_js = (WEB_DIR / "app.js").read_text()
-    import_function = app_js.split("async function importTokens", 1)[1].split("function resetImportForm", 1)[0]
+def test_frontend_service_key_storage_keeps_legacy_compatibility() -> None:
+    api_ts = FRONTEND_API.read_text()
 
-    assert 'id="import-queue-position-summary"' in index_html
-    assert 'data-import-queue-position="front"' in index_html
-    assert 'data-import-queue-position="back"' in index_html
-    assert 'const DEFAULT_IMPORT_QUEUE_POSITION = "front"' in app_js
-    assert "renderImportQueuePosition(state.importQueuePosition)" in app_js
-    assert "tokens: payloads" in import_function
-    assert "import_queue_position: state.importQueuePosition" in import_function
+    assert 'const KEY_STORAGE = "oaix.serviceApiKey";' in api_ts
+    assert 'const LEGACY_KEY_STORAGE = "oaix.serviceKey";' in api_ts
+    assert "window.localStorage.setItem(KEY_STORAGE, legacy)" in api_ts
+    assert "window.localStorage.setItem(LEGACY_KEY_STORAGE, key)" in api_ts
+    assert 'headers.set("Authorization", `Bearer ${key}`)' in api_ts
 
 
-def test_frontend_import_panel_supports_refresh_and_access_token_only_lines() -> None:
-    index_html = (WEB_DIR / "index.html").read_text()
-    app_js = (WEB_DIR / "app.js").read_text()
-    parse_function = app_js.split("function parseAccountRefreshLines", 1)[1].split("function parseImportText", 1)[0]
+def test_frontend_request_settings_and_dispatch_panels_are_wired() -> None:
+    app_tsx = FRONTEND_APP.read_text()
+    api_ts = FRONTEND_API.read_text()
 
-    assert "每行 access_token / refresh_token" in index_html
-    assert "应为 access_token、refresh_token 或 account_id,refresh_token" in parse_function
-    assert 'isLikelyAccessToken(token) ? "access_token" : "refresh_token"' in parse_function
-    assert "account_id: accountId" in parse_function
-
-
-def test_frontend_import_panel_supports_sub2api_export_json() -> None:
-    index_html = (WEB_DIR / "index.html").read_text()
-    app_js = (WEB_DIR / "app.js").read_text()
-    normalize_function = app_js.split("function normalizeSub2apiAccount", 1)[1].split(
-        "function collectLogicalKeyLines",
-        1,
-    )[0]
-
-    assert "sub2api 导出 JSON" in index_html
-    assert 'raw.type === "sub2api-data"' in normalize_function
-    assert "Array.isArray(raw.accounts)" in normalize_function
-    assert 'type: "codex"' in normalize_function
-    assert 'token_source: "sub2api"' in normalize_function
-    assert "payloads = accounts.flatMap" in normalize_function
-    assert "payload.account_id = accountId" in normalize_function
-    assert "payload.expired = expiresAt" in normalize_function
-
-
-def test_frontend_dashboard_refresh_loads_admin_panels_in_parallel() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
-    refresh_function = app_js.split("async function refreshDashboard", 1)[1].split("function splitTokenInputLines", 1)[0]
-
-    assert "const REFRESH_INTERVAL_MS = 30000" in app_js
-    assert "refreshing: false" in app_js
-    assert "async function refreshDashboard({ includeTokens = true, includeRequests = true } = {})" in app_js
-    assert "if (state.refreshing)" in refresh_function
-    assert "state.refreshing = true" in refresh_function
-    assert "const tasks = [loadHealth()]" in refresh_function
-    assert "if (includeTokens)" in refresh_function
-    assert 'state.tokenViewMode === "import_batches" ? loadTokenImportBatches({ force: true }) : loadTokens()' in refresh_function
-    assert "if (includeRequests)" in refresh_function
-    assert "tasks.push(loadRequests())" in refresh_function
-    assert "await Promise.all(tasks)" in refresh_function
-    assert "refreshDashboard({ includeTokens: false })" in app_js
-    assert "void refreshDashboard();" in app_js
-    assert "scheduleInitialRequestsLoad" not in app_js
-    assert "await loadRequests();" not in refresh_function
+    assert "api.requests(80)" in app_tsx
+    assert "api.analytics(24)" in app_tsx
+    assert "api.settings()" in app_tsx
+    assert "api.updateSetting(settingKey.trim(), value)" in app_tsx
+    assert "api.updateTokenSelection({ active_stream_cap: streamCap })" in app_tsx
+    assert 'requests: (limit = 80)' in api_ts
+    assert 'analytics: (hours = 24)' in api_ts
+    assert 'settings: ()' in api_ts
+    assert 'updateSetting: (key: string, value: unknown)' in api_ts
 
 
 def test_admin_requests_expired_cache_refreshes_on_request(monkeypatch) -> None:
@@ -369,112 +316,49 @@ def test_admin_requests_expired_cache_refreshes_on_request(monkeypatch) -> None:
     assert b"old" not in body
 
 
-def test_frontend_pauses_background_polling_when_tab_is_hidden() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
+def test_frontend_uses_state_driven_token_loading_without_stale_closure_requests() -> None:
+    app_tsx = FRONTEND_APP.read_text()
 
-    assert "refreshPendingOnVisible: false" in app_js
-    assert "if (document.hidden)" in app_js
-    assert "state.refreshPendingOnVisible = true" in app_js
-    assert 'document.addEventListener("visibilitychange"' in app_js
-    assert "state.refreshPendingOnVisible = false" in app_js
-
-
-def test_frontend_loads_token_quota_lazily_after_list_render() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
-    load_tokens_function = app_js.split("async function loadTokens", 1)[1].split("async function goToTokenPage", 1)[0]
-    cost_function = app_js.split("async function loadTokenCosts", 1)[1].split("async function loadHealth", 1)[0]
-    quota_function = app_js.split("async function loadTokenQuotas", 1)[1].split("async function loadTokens", 1)[0]
-
-    assert 'include_quota: "1"' not in load_tokens_function
-    assert "void loadTokenQuotas(quotaTokenIds, { listRequestSeq })" in app_js
-    assert "TOKEN_COST_BATCH_SIZE = 8" in app_js
-    assert "index += TOKEN_COST_BATCH_SIZE" in cost_function
-    assert "resolvedIds.slice(index, index + TOKEN_COST_BATCH_SIZE)" in cost_function
-    assert "`/admin/tokens/costs?${params.toString()}`" in cost_function
-    assert "`/admin/tokens/quota?${params.toString()}`" in quota_function
-    assert "new AbortController()" in load_tokens_function
-    assert "new AbortController()" in cost_function
-    assert "new AbortController()" in quota_function
-    assert "listRequestSeq !== state.tokenListRequestSeq" in cost_function
-    assert "listRequestSeq !== state.tokenListRequestSeq" in quota_function
-    assert "quota_loading" in app_js
-    assert "pendingIdSet.has(tokenId)" in quota_function
+    assert "useEffect(() => {" in app_tsx
+    assert "window.setTimeout(" in app_tsx
+    assert "tokenSearch.trim() ? 260 : 0" in app_tsx
+    assert "setTokenPage(1)" in app_tsx
+    assert "sortParam(tokenSort)" in app_tsx
+    assert "params.set(\"status\", tokenStatus)" in app_tsx
+    assert "params.set(\"q\", tokenSearch.trim())" in app_tsx
 
 
-def test_frontend_prefetches_default_token_status_pages() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
-    load_tokens_function = app_js.split("async function loadTokens", 1)[1].split("async function goToTokenPage", 1)[0]
-    prefetch_function = app_js.split("async function prefetchTokenStatusPage", 1)[1].split("function scheduleTokenStatusPrefetch", 1)[0]
-    schedule_function = app_js.split("function scheduleTokenStatusPrefetch", 1)[1].split("function applyTokenListData", 1)[0]
-    apply_list_function = app_js.split("function applyTokenListData", 1)[1].split("async function loadTokenImportBatches", 1)[0]
-    detail_prefetch_function = app_js.split("function scheduleTokenDetailPrefetch", 1)[1].split("function applyTokenListData", 1)[0]
+def test_frontend_token_cards_show_status_timestamps_and_coss_badges() -> None:
+    app_tsx = FRONTEND_APP.read_text()
 
-    assert "TOKEN_LIST_CACHE_TTL_MS" in app_js
-    assert "TOKEN_STATUS_PREFETCH_DELAY_MS = 600" in app_js
-    assert "tokenStatusPrefetchPromises" in app_js
-    assert "getCachedTokenStatusPage(tokenStatus)" in load_tokens_function
-    assert "await pendingPrefetch" in load_tokens_function
-    assert "getCachedTokenStatusPage(tokenStatus)" in load_tokens_function.split("await pendingPrefetch", 1)[1]
-    assert "scheduleTokenStatusPrefetch({ listRequestSeq })" in app_js
-    assert "setCachedTokenStatusPage(status, data)" in prefetch_function
-    assert "for (const status of TOKEN_STATUS_FILTERS)" in schedule_function
-    assert "await prefetchTokenStatusPage(status)" in schedule_function
-    assert "TOKEN_STATUS_FILTERS.forEach" not in schedule_function
-    assert "TOKEN_DETAIL_PREFETCH_DELAY_MS = 300" in app_js
-    assert "scheduleTokenDetailPrefetch" in app_js
-    assert "void loadTokenCosts(visibleTokenIds, { listRequestSeq })" not in apply_list_function
-    assert "void loadTokenQuotas(quotaTokenIds, { listRequestSeq })" not in apply_list_function
-    assert "void loadTokenCosts(visibleTokenIds, { listRequestSeq })" in detail_prefetch_function
-    assert "void loadTokenQuotas(quotaTokenIds, { listRequestSeq })" in detail_prefetch_function
-    assert "clearTokenStatusPageCache()" in app_js
+    assert "function tokenStatusOf" in app_tsx
+    assert "item.disabled_at" in app_tsx
+    assert "item.cooldown_until" in app_tsx
+    assert "最近使用 {formatDate(item.last_used_at)}" in app_tsx
+    assert "冷却至 {formatDate(item.cooldown_until)}" in app_tsx
+    assert "statusBadge(status)" in app_tsx
+    assert "<Badge" in app_tsx
 
 
-def test_frontend_disabled_tokens_show_time_and_default_to_recently_disabled_sort() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
-    index_html = (WEB_DIR / "index.html").read_text()
-    apply_query_function = app_js.split("async function applyTokenQuery", 1)[1].split("function queueTokenSearch", 1)[0]
-    card_renderer = app_js.split("function renderTokenResultRow", 1)[1].split("function renderCounts", 1)[0]
+def test_frontend_delete_and_remark_dialogs_use_coss_dialogs() -> None:
+    app_tsx = FRONTEND_APP.read_text()
 
-    assert '<option value="-disabled_at">最近禁用</option>' in index_html
-    assert 'const DEFAULT_DISABLED_TOKEN_SORT = "-disabled_at";' in app_js
-    assert 'normalizeTokenStatusFilter(status) === "disabled" ? DEFAULT_DISABLED_TOKEN_SORT : DEFAULT_TOKEN_SORT' in app_js
-    assert 'sort: defaultTokenSortForStatus(status)' in app_js
-    assert 'state.tokenSort = defaultTokenSortForStatus(state.tokenStatusFilter)' in apply_query_function
-    assert "const disabledAtValue = formatDate(item.disabled_at || (!item.is_active ? item.updated_at : null))" in card_renderer
-    assert '`禁用 ${disabledAtValue}`' in card_renderer
+    assert "function DeleteDialog" in app_tsx
+    assert "function RemarkDialog" in app_tsx
+    assert "<Dialog open={Boolean(target)}" in app_tsx
+    assert "<DialogPopup" in app_tsx
+    assert "<DialogFooter>" in app_tsx
+    assert "api.updateRemark(remarkTarget.id, remarkTarget.remark)" in app_tsx
+    assert "api.batchTokens({ action: \"delete\", token_ids: deleteTarget.ids })" in app_tsx
 
 
-def test_frontend_probe_request_sends_selected_model() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
-    probe_function = app_js.split("async function probeToken", 1)[1].split("async function deleteToken", 1)[0]
+def test_frontend_fetch_errors_preserve_backend_detail_messages() -> None:
+    api_ts = FRONTEND_API.read_text()
 
-    assert "const selectedModel = normalizeProbeModel(model)" in probe_function
-    assert "headers: authHeaders(true)" in probe_function
-    assert "body: JSON.stringify({ model: selectedModel })" in probe_function
-
-
-def test_frontend_token_remark_dialog_is_wired() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
-    remark_function = app_js.split("async function saveTokenRemark", 1)[1].split("function firstDefined", 1)[0]
-    token_renderer = app_js.split("function renderTokenResultRow", 1)[1].split("function renderCounts", 1)[0]
-
-    assert "data-token-remark=\"true\"" in app_js
-    assert "renderTokenRemarkSection(item)" in token_renderer
-    assert "`/admin/tokens/${resolvedTokenId}/remark`" in remark_function
-    assert "body: JSON.stringify({ remark })" in remark_function
-    assert "TOKEN_REMARK_MAX_LENGTH" in remark_function
-
-
-def test_frontend_summarizes_html_error_pages_before_rendering() -> None:
-    app_js = (WEB_DIR / "app.js").read_text()
-    fetch_function = app_js.split("async function fetchJson", 1)[1].split("async function loadHealth", 1)[0]
-    request_renderer = app_js.split("function renderRequestList", 1)[1].split("function escapeHtml", 1)[0]
-
-    assert "function summarizeHtmlError" in app_js
-    assert "524: \"源站响应超时，请稍后重试\"" in app_js
-    assert "throw createFetchError(response, data)" in fetch_function
-    assert "summarizeTokenError(rawErrorMessage)" in request_renderer
-    assert "data?.detail || data?.message" not in fetch_function
+    assert "payload?.detail?.message" in api_ts
+    assert "payload?.detail" in api_ts
+    assert "response.statusText" in api_ts
+    assert "throw Object.assign(new Error(String(message))" in api_ts
 
 
 def test_token_selection_order_route_forwards_token_ids(monkeypatch) -> None:

@@ -1,1 +1,4 @@
 /oaix_gateway.egg-info
+node_modules/
+frontend/node_modules/
+dist/

@@ -30,4 +30,4 @@ include = ["oaix_gateway*"]
 py-modules = ["import_tokens"]
 
 [tool.setuptools.package-data]
-oaix_gateway = ["web/*"]
+oaix_gateway = ["web/*", "web/src/*"]

@@ -2438,7 +2438,7 @@ def _web_asset_version(path: Path) -> str:
 
 def _web_bundle_version_hash() -> str:
     digest = hashlib.sha256()
-    for path in (WEB_DIR / "index.html", WEB_DIR / "styles.css", WEB_DIR / "app.js"):
+    for path in (WEB_DIR / "index.html", WEB_DIR / "styles.css", WEB_DIR / "src" / "main.js"):
         try:
             digest.update(path.read_bytes())
         except OSError:
@@ -2448,7 +2448,7 @@ def _web_bundle_version_hash() -> str:
 
 def _web_bundle_version_time() -> str:
     mtimes: list[float] = []
-    for path in (WEB_DIR / "index.html", WEB_DIR / "styles.css", WEB_DIR / "app.js"):
+    for path in (WEB_DIR / "index.html", WEB_DIR / "styles.css", WEB_DIR / "src" / "main.js"):
         try:
             mtimes.append(path.stat().st_mtime)
         except OSError:
@@ -11781,11 +11781,11 @@ def create_app() -> FastAPI:
     async def index() -> HTMLResponse:
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
         css_version = _web_asset_version(WEB_DIR / "styles.css")
-        js_version = _web_asset_version(WEB_DIR / "app.js")
+        js_version = _web_asset_version(WEB_DIR / "src" / "main.js")
         web_version_hash = _web_bundle_version_hash()
         web_version_time = _web_bundle_version_time()
         html = html.replace("/assets/styles.css", f"/assets/styles.css?v={css_version}")
-        html = html.replace("/assets/app.js", f"/assets/app.js?v={js_version}")
+        html = html.replace("/assets/src/main.js", f"/assets/src/main.js?v={js_version}")
         html = html.replace("__OAIX_WEB_VERSION_HASH__", web_version_hash)
         html = html.replace("__OAIX_WEB_VERSION_TIME__", web_version_time)
         return HTMLResponse(
