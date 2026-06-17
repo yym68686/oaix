@@ -37,6 +37,7 @@ type DatabaseConfig struct {
 	ConnectTimeout   time.Duration
 	AcquireTimeout   time.Duration
 	RuntimeMustMatch bool
+	AutoMigrate      bool
 }
 
 type AuthConfig struct {
@@ -110,6 +111,7 @@ func Load() (Config, error) {
 			ConnectTimeout:   envDurationSeconds("DATABASE_CONNECT_TIMEOUT_SECONDS", 5*time.Second),
 			AcquireTimeout:   envDurationSeconds("DATABASE_POOL_TIMEOUT_SECONDS", 5*time.Second),
 			RuntimeMustMatch: envBool("OAIX_RUNTIME_SCHEMA_MUST_MATCH", true),
+			AutoMigrate:      envBool("OAIX_AUTO_MIGRATE_ON_STARTUP", false),
 		},
 		Auth: AuthConfig{
 			ServiceAPIKeys: envCSV("SERVICE_API_KEYS"),
@@ -206,8 +208,9 @@ func (c Config) SanitizedSummary() map[string]any {
 			"port": c.Server.Port,
 		},
 		"database": map[string]any{
-			"max_conns": c.Database.MaxConns,
-			"min_conns": c.Database.MinConns,
+			"max_conns":    c.Database.MaxConns,
+			"min_conns":    c.Database.MinConns,
+			"auto_migrate": c.Database.AutoMigrate,
 		},
 		"auth": map[string]any{
 			"service_key_protected": len(c.Auth.ServiceAPIKeys) > 0,
@@ -252,7 +255,10 @@ func normalizeDatabaseURL(raw string) string {
 
 func envString(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
-		return strings.TrimSpace(value)
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			return trimmed
+		}
 	}
 	return fallback
 }

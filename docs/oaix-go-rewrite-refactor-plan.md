@@ -98,7 +98,7 @@ uv run pytest -q
 | request log stats | upsert 中混合日志写入和 hourly stats | 写路径承担统计副作用，失败处理复杂 | 日志主写入和统计聚合解耦，worker 异步聚合 |
 | token last_used_at | 每 token 单独 UPDATE | 高并发下 DB round-trip 放大 | `UPDATE ... FROM (VALUES ...)` 批量更新 |
 | token status write | token 状态写入进程内队列 | 崩溃丢 pending 状态；多实例同步弱 | 状态机 + durable event/outbox；关键状态同步提交 |
-| schema migration | gateway 启动期 create_all/migration/index/backfill | 多实例启动竞争；启动抖动；DDL 风险 | 独立 `oaix-migrate`，runtime 禁止 DDL |
+| schema migration | gateway 启动期 create_all/migration/index/backfill | 多实例启动竞争；启动抖动；DDL 风险 | 标准路径使用独立 `oaix-migrate`；容器镜像可通过 `OAIX_AUTO_MIGRATE_ON_STARTUP=true` 做启动前幂等迁移以适配单容器平台 |
 | import worker | 每 item 多次 DB 状态更新，OAuth 并发和 publish 混合 | 后台任务 DB 写放大，可能影响热路径 | worker 独立进程，批量 claim/update/publish |
 | admin frontend | `web/app.js` 单文件 5000+ 行，多处全量 map/render | 管理面演进成本高，大列表性能差 | 前端模块化，列表虚拟化，管理 API 分页/增量 |
 
@@ -148,6 +148,7 @@ cmd/oaix-worker
 cmd/oaix-migrate
   数据库迁移工具。
   部署前显式执行，gateway/worker/admin 启动时不做 DDL。
+  对没有 migration job 的单容器平台，可在容器镜像中打开 OAIX_AUTO_MIGRATE_ON_STARTUP=true 执行同一套幂等迁移。
 
 cmd/oaix-bench
   压测和回归辅助工具。
@@ -617,14 +618,14 @@ OAuth 失败不能污染 gateway 热路径；gateway 只读取可用 access toke
 
 ### 13.1 迁移策略
 
-只允许 `oaix-migrate` 修改 schema。
+只允许迁移模块修改 schema：标准部署显式运行 `oaix-migrate`，单容器平台可在 gateway 进程启动前通过 `OAIX_AUTO_MIGRATE_ON_STARTUP=true` 调用同一套幂等迁移。
 
 gateway/admin/worker 启动时：
 
 - 检查 schema version。
-- 不自动 create table。
-- 不自动 create index。
-- 不自动 backfill。
+- 默认不自动 create table。
+- 默认不自动 create index。
+- 默认不自动 backfill。
 - schema 不匹配时 readiness fail。
 
 ### 13.2 推荐表
@@ -1329,7 +1330,7 @@ Go 包单元测试：
 - Import worker：已定义 job/item 状态机，支持 batch claim、并发 validation、batch item update、batch publish、cancel job、stale job resume 和 worker metrics。
 - Admin frontend：运行入口切到 ES module，拆分为 `api.js`、`tokenView.js`、`requestView.js`、`importView.js`、`settingsView.js`、`charts.js`、`state.js`、`dom.js`；实现 token 虚拟列表、批量操作、job progress、analytics charts、loading/error 状态。
 - Docker：多阶段 Go 构建，runtime 使用 distroless；compose 增加 `migrate` 和 `worker` 服务。
-- runtime DDL：gateway 启动只检查 schema version，不自动迁移；迁移由 `oaix-migrate` 执行。
+- runtime DDL：源码本地运行时 gateway 默认只检查 schema version；容器镜像默认 `OAIX_AUTO_MIGRATE_ON_STARTUP=true`，用于 Fugue 这类单容器部署启动前自举迁移，迁移逻辑仍复用 `oaix-migrate` 的幂等 SQL。
 
 ### 24.2 本地功能验证
 

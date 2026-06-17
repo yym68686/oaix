@@ -29,6 +29,12 @@ func RunGateway(ctx context.Context) error {
 		return err
 	}
 	defer db.Close()
+	if cfg.Database.AutoMigrate {
+		logger.Info("running startup database migration")
+		if err := db.Migrate(ctx); err != nil {
+			return err
+		}
+	}
 	if cfg.Database.RuntimeMustMatch {
 		if _, err := db.CheckSchema(ctx); err != nil {
 			return err

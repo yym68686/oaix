@@ -16,6 +16,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/oaix-ga
 FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
+ENV OAIX_AUTO_MIGRATE_ON_STARTUP=true
 
 COPY --from=build /out/oaix-gateway /usr/local/bin/oaix-gateway
 COPY --from=build /out/oaix-worker /usr/local/bin/oaix-worker
