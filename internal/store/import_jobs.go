@@ -27,6 +27,18 @@ type ImportJob struct {
 	FinishedAt          *time.Time `json:"finished_at,omitempty"`
 }
 
+type ImportBatchSummary struct {
+	ImportJob
+	TokenCount             int      `json:"token_count"`
+	Available              int      `json:"available"`
+	Cooling                int      `json:"cooling"`
+	Disabled               int      `json:"disabled"`
+	Missing                int      `json:"missing"`
+	TokenIDs               []int64  `json:"token_ids"`
+	ObservedCostUSD        float64  `json:"observed_cost_usd"`
+	AverageObservedCostUSD *float64 `json:"average_observed_cost_usd,omitempty"`
+}
+
 type ImportItem struct {
 	ID                 int64          `json:"id"`
 	JobID              int64          `json:"job_id"`
@@ -72,7 +84,12 @@ func (s *Store) CreateCompletedImportJob(ctx context.Context, payloads []map[str
 	if err != nil {
 		return ImportJob{}, err
 	}
-	row := s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ImportJob{}, err
+	}
+	defer tx.Rollback(ctx)
+	row := tx.QueryRow(ctx, `
 		insert into token_import_jobs (
 			status, import_queue_position, payloads, total_count, processed_count,
 			created_count, updated_count, skipped_count, failed_count,
@@ -83,7 +100,17 @@ func (s *Store) CreateCompletedImportJob(ctx context.Context, payloads []map[str
 		          created_count, updated_count, skipped_count, failed_count, last_error,
 		          submitted_at, started_at, heartbeat_at, finished_at
 	`, queuePosition, data, len(payloads), result.Created+result.Updated+result.Skipped+result.Failed, result.Created, result.Updated, result.Skipped, result.Failed)
-	return scanImportJob(row)
+	job, err := scanImportJob(row)
+	if err != nil {
+		return ImportJob{}, err
+	}
+	if err := s.insertCompletedImportItems(ctx, tx, job.ID, payloads, result); err != nil {
+		return ImportJob{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ImportJob{}, err
+	}
+	return job, nil
 }
 
 func (s *Store) CreateQueuedImportJob(ctx context.Context, payloads []map[string]any, queuePosition string) (ImportJob, error) {
@@ -208,6 +235,290 @@ func (s *Store) ListImportJobs(ctx context.Context, limit int) ([]ImportJob, err
 		jobs = append(jobs, job)
 	}
 	return jobs, rows.Err()
+}
+
+func (s *Store) ListImportJobSummaries(ctx context.Context, limit int, includeObservedCost bool) ([]ImportBatchSummary, error) {
+	jobs, err := s.ListImportJobs(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.importJobSummaries(ctx, jobs, includeObservedCost)
+}
+
+func (s *Store) GetImportJobSummary(ctx context.Context, id int64, includeObservedCost bool) (*ImportBatchSummary, error) {
+	job, err := s.GetImportJob(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	summaries, err := s.importJobSummaries(ctx, []ImportJob{job}, includeObservedCost)
+	if err != nil {
+		return nil, err
+	}
+	if len(summaries) == 0 {
+		return nil, pgx.ErrNoRows
+	}
+	return &summaries[0], nil
+}
+
+func (s *Store) ListImportJobItems(ctx context.Context, jobID int64) ([]ImportItem, error) {
+	rows, err := s.pool.Query(ctx, `
+		select id, job_id, item_index, status, refresh_token_hash, payload,
+		       validated_payload, token_id, action, error_message, validation_ms,
+		       publish_ms, validation_started_at, validation_finished_at,
+		       published_at, created_at, updated_at
+		from token_import_items
+		where job_id = $1
+		order by item_index asc, id asc
+	`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanImportItems(rows)
+}
+
+func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, jobID int64, payloads []map[string]any, result ImportResult) error {
+	if len(payloads) == 0 || len(result.Items) == 0 {
+		return nil
+	}
+	args := []any{jobID}
+	values := make([]string, 0, len(result.Items))
+	for _, item := range result.Items {
+		if item.Index < 0 || item.Index >= len(payloads) {
+			continue
+		}
+		payload := payloads[item.Index]
+		status := strings.TrimSpace(item.Status)
+		if status == "" {
+			if item.TokenID != nil {
+				status = "published"
+			} else {
+				status = "skipped"
+			}
+		}
+		payloadData := jsonBytes(payload)
+		hash := refreshHashFromPayload(payload)
+		base := len(args) + 1
+		args = append(args, item.Index, status, payloadData, payloadData, hash, item.TokenID, item.Action)
+		values = append(values, fmt.Sprintf(
+			"($1, $%d, $%d, $%d, $%d, $%d, $%d, nullif($%d, ''), now(), now())",
+			base, base+1, base+2, base+3, base+4, base+5, base+6,
+		))
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		insert into token_import_items(
+			job_id, item_index, status, payload, validated_payload,
+			refresh_token_hash, token_id, action, published_at, updated_at
+		)
+		values `+strings.Join(values, ",")+`
+		on conflict (job_id, item_index) do update
+		set status = excluded.status,
+		    payload = excluded.payload,
+		    validated_payload = excluded.validated_payload,
+		    refresh_token_hash = excluded.refresh_token_hash,
+		    token_id = excluded.token_id,
+		    action = excluded.action,
+		    published_at = excluded.published_at,
+		    updated_at = now()
+	`, args...)
+	return err
+}
+
+func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includeObservedCost bool) ([]ImportBatchSummary, error) {
+	if len(jobs) == 0 {
+		return []ImportBatchSummary{}, nil
+	}
+	summaries := make([]ImportBatchSummary, len(jobs))
+	jobIDs := make([]int64, 0, len(jobs))
+	for index, job := range jobs {
+		summaries[index] = ImportBatchSummary{
+			ImportJob: job,
+			TokenIDs:  []int64{},
+		}
+		jobIDs = append(jobIDs, job.ID)
+	}
+
+	tokenIDsByJob, err := s.importJobTokenIDsFromItems(ctx, jobIDs)
+	if err != nil {
+		return nil, err
+	}
+	fallbackJobIDs := make([]int64, 0)
+	for _, job := range jobs {
+		if len(tokenIDsByJob[job.ID]) == 0 {
+			fallbackJobIDs = append(fallbackJobIDs, job.ID)
+		}
+	}
+	if len(fallbackJobIDs) > 0 {
+		fallbackTokenIDs, err := s.importJobTokenIDsFromPayloads(ctx, fallbackJobIDs)
+		if err != nil {
+			return nil, err
+		}
+		for jobID, tokenIDs := range fallbackTokenIDs {
+			tokenIDsByJob[jobID] = tokenIDs
+		}
+	}
+
+	allTokenIDs := make([]int64, 0)
+	for index := range summaries {
+		tokenIDs := tokenIDsByJob[summaries[index].ID]
+		summaries[index].TokenIDs = append([]int64(nil), tokenIDs...)
+		for _, tokenID := range tokenIDs {
+			allTokenIDs = appendUniqueInt64(allTokenIDs, tokenID)
+		}
+	}
+
+	tokens, err := s.ListTokensByIDs(ctx, allTokenIDs)
+	if err != nil {
+		return nil, err
+	}
+	tokenByID := make(map[int64]Token, len(tokens))
+	for _, token := range tokens {
+		tokenByID[token.ID] = token
+	}
+
+	costByTokenID := map[int64]*float64{}
+	if includeObservedCost && len(tokens) > 0 {
+		costByTokenID, err = s.TokenObservedCosts(ctx, tokens)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	now := time.Now()
+	for index := range summaries {
+		present := 0
+		totalCost := 0.0
+		for _, tokenID := range summaries[index].TokenIDs {
+			token, ok := tokenByID[tokenID]
+			if !ok {
+				summaries[index].Missing++
+				continue
+			}
+			present++
+			switch {
+			case !token.IsActive || token.DisabledAt != nil:
+				summaries[index].Disabled++
+			case token.CooldownUntil != nil && token.CooldownUntil.After(now):
+				summaries[index].Cooling++
+			default:
+				summaries[index].Available++
+			}
+			if includeObservedCost {
+				if value := costByTokenID[tokenID]; value != nil {
+					totalCost += *value
+				}
+			}
+		}
+		summaries[index].TokenCount = present
+		if includeObservedCost {
+			summaries[index].ObservedCostUSD = totalCost
+			if present > 0 {
+				average := totalCost / float64(present)
+				summaries[index].AverageObservedCostUSD = &average
+			}
+		}
+	}
+	return summaries, nil
+}
+
+func (s *Store) importJobTokenIDsFromItems(ctx context.Context, jobIDs []int64) (map[int64][]int64, error) {
+	result := make(map[int64][]int64, len(jobIDs))
+	ids := postgresIntIDs(jobIDs)
+	if len(ids) == 0 {
+		return result, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		select job_id, token_id
+		from token_import_items
+		where job_id = any($1::integer[])
+		  and token_id is not null
+		order by job_id asc, item_index asc, id asc
+	`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var jobID int64
+		var tokenID int64
+		if err := rows.Scan(&jobID, &tokenID); err != nil {
+			return nil, err
+		}
+		result[jobID] = appendUniqueInt64(result[jobID], tokenID)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) importJobTokenIDsFromPayloads(ctx context.Context, jobIDs []int64) (map[int64][]int64, error) {
+	result := make(map[int64][]int64, len(jobIDs))
+	ids := postgresIntIDs(jobIDs)
+	if len(ids) == 0 {
+		return result, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		select id, payloads
+		from token_import_jobs
+		where id = any($1::integer[])
+	`, ids)
+	if err != nil {
+		return nil, err
+	}
+	refreshesByJob := make(map[int64][]string, len(jobIDs))
+	allRefreshes := make([]string, 0)
+	for rows.Next() {
+		var jobID int64
+		var rawPayloads []byte
+		if err := rows.Scan(&jobID, &rawPayloads); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		for _, refreshToken := range storedRefreshTokensFromPayloads(rawPayloads) {
+			refreshesByJob[jobID] = appendUniqueString(refreshesByJob[jobID], refreshToken)
+			allRefreshes = appendUniqueString(allRefreshes, refreshToken)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if len(allRefreshes) == 0 {
+		return result, nil
+	}
+
+	tokenRows, err := s.pool.Query(ctx, `
+		select refresh_token, id
+		from codex_tokens
+		where refresh_token = any($1::text[])
+		  and merged_into_token_id is null
+	`, allRefreshes)
+	if err != nil {
+		return nil, err
+	}
+	defer tokenRows.Close()
+	tokenIDByRefresh := make(map[string]int64, len(allRefreshes))
+	for tokenRows.Next() {
+		var refreshToken string
+		var tokenID int64
+		if err := tokenRows.Scan(&refreshToken, &tokenID); err != nil {
+			return nil, err
+		}
+		tokenIDByRefresh[refreshToken] = tokenID
+	}
+	if err := tokenRows.Err(); err != nil {
+		return nil, err
+	}
+	for jobID, refreshTokens := range refreshesByJob {
+		for _, refreshToken := range refreshTokens {
+			if tokenID, ok := tokenIDByRefresh[refreshToken]; ok {
+				result[jobID] = appendUniqueInt64(result[jobID], tokenID)
+			}
+		}
+	}
+	return result, nil
 }
 
 func (s *Store) ClaimImportItems(ctx context.Context, limit int) ([]ImportItem, error) {
@@ -471,11 +782,100 @@ func scanImportItems(rows pgx.Rows) ([]ImportItem, error) {
 }
 
 func refreshHashFromPayload(payload map[string]any) *string {
-	for _, key := range []string{"refresh_token", "refreshToken", "access_token", "accessToken", "token"} {
-		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			hash := hashString(strings.TrimSpace(value))
-			return &hash
-		}
+	if value := tokenIdentityFromPayload(payload); value != "" {
+		hash := hashString(value)
+		return &hash
 	}
 	return nil
+}
+
+func storedRefreshTokensFromPayloads(rawPayloads []byte) []string {
+	var values []any
+	if len(rawPayloads) == 0 || json.Unmarshal(rawPayloads, &values) != nil {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		switch typed := value.(type) {
+		case string:
+			if token := strings.TrimSpace(typed); token != "" {
+				if looksLikeAccessTokenText(token) {
+					out = append(out, "access:"+hashString(token))
+				} else {
+					out = append(out, token)
+				}
+			}
+		case map[string]any:
+			if token := storedRefreshTokenFromPayload(typed); token != "" {
+				out = append(out, token)
+			}
+		}
+	}
+	return out
+}
+
+func importAccessTokenFromPayload(payload map[string]any) string {
+	for _, key := range []string{"access_token", "accessToken"} {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	if value, ok := payload["token"].(string); ok && looksLikeAccessTokenText(value) {
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func storedRefreshTokenFromPayload(payload map[string]any) string {
+	for _, key := range []string{"refresh_token", "refreshToken"} {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	if accessToken := importAccessTokenFromPayload(payload); accessToken != "" {
+		return "access:" + hashString(accessToken)
+	}
+	if value, ok := payload["token"].(string); ok && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func tokenIdentityFromPayload(payload map[string]any) string {
+	for _, key := range []string{"refresh_token", "refreshToken", "access_token", "accessToken", "token"} {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func looksLikeAccessTokenText(value string) bool {
+	value = strings.TrimSpace(value)
+	return strings.Count(value, ".") >= 2 || strings.HasPrefix(value, "eyJ")
+}
+
+func appendUniqueInt64(values []int64, value int64) []int64 {
+	if value <= 0 {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func appendUniqueString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }

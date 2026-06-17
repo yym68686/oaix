@@ -109,9 +109,15 @@ func publishValidatedAccessTokens(ctx context.Context, db *store.Store, items []
 			continue
 		}
 		publishedUpdates := make([]store.ImportItemUpdate, 0, len(updatesByJob[jobID]))
-		for _, update := range updatesByJob[jobID] {
+		for index, update := range updatesByJob[jobID] {
 			update.Status = string(importer.ItemPublished)
 			update.Published = true
+			if index < len(result.Items) {
+				update.TokenID = result.Items[index].TokenID
+				if result.Items[index].Action != "" {
+					update.Action = result.Items[index].Action
+				}
+			}
 			publishedUpdates = append(publishedUpdates, update)
 		}
 		if err := db.UpdateImportItems(ctx, publishedUpdates); err != nil {

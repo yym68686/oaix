@@ -2,6 +2,7 @@ import {
   ActivityIcon,
   AlertCircleIcon,
   CheckCircle2Icon,
+  ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   DatabaseIcon,
@@ -81,6 +82,7 @@ import {
   setServiceKey,
   type HealthResponse,
   type ImportBatch,
+  type ImportBatchDetail,
   type RequestItem,
   type RequestSummary,
   type SettingItem,
@@ -89,7 +91,7 @@ import {
   type TokenProbeResponse,
   type TokenQuotaWindow,
 } from "./lib/api";
-import { clamp, formatCurrency, formatDate, formatNumber } from "./lib/format";
+import { clamp, formatDate, formatNumber } from "./lib/format";
 
 declare global {
   interface Window {
@@ -119,6 +121,7 @@ type RemarkTarget = {
   meta: string;
   remark: string;
 };
+type ImportEntry = string | Record<string, unknown>;
 
 const PAGE_SIZE = 100;
 const STATUS_OPTION_DEFINITIONS: Array<{ label: string; value: TokenStatus }> = [
@@ -160,6 +163,10 @@ export function App(): React.ReactElement {
   const [probeBusyIds, setProbeBusyIds] = useState<Set<number>>(() => new Set());
   const [probeResults, setProbeResults] = useState<Record<number, TokenProbeResponse>>({});
   const [importBatches, setImportBatches] = useState<ImportBatch[]>([]);
+  const [expandedImportBatchId, setExpandedImportBatchId] = useState<number | null>(null);
+  const [importBatchDetails, setImportBatchDetails] = useState<Record<number, ImportBatchDetail>>({});
+  const [importBatchDetailErrors, setImportBatchDetailErrors] = useState<Record<number, string>>({});
+  const [importBatchDetailLoadingId, setImportBatchDetailLoadingId] = useState<number | null>(null);
   const [requests, setRequests] = useState<RequestItem[]>([]);
   const [requestSummary, setRequestSummary] = useState<RequestSummary>({});
   const [modelStats, setModelStats] = useState<Array<Record<string, unknown>>>([]);
@@ -204,6 +211,9 @@ export function App(): React.ReactElement {
       try {
         const payload = await api.importJobs(50);
         setImportBatches(payload.items || []);
+        if (expandedImportBatchId && !(payload.items || []).some((item) => item.id === expandedImportBatchId)) {
+          setExpandedImportBatchId(null);
+        }
       } catch (error) {
         setTokenError(errorMessage(error));
       } finally {
@@ -242,7 +252,32 @@ export function App(): React.ReactElement {
     } finally {
       setTokenLoading(false);
     }
-  }, [tokenMode, tokenPage, tokenSearch, tokenSort, tokenStatus]);
+  }, [expandedImportBatchId, tokenMode, tokenPage, tokenSearch, tokenSort, tokenStatus]);
+
+  const loadImportBatchDetail = useCallback(
+    async (id: number) => {
+      setImportBatchDetailLoadingId(id);
+      setImportBatchDetailErrors((items) => {
+        const next = { ...items };
+        delete next[id];
+        return next;
+      });
+      try {
+        const payload = await api.importJob(id);
+        setImportBatchDetails((items) => ({ ...items, [id]: payload }));
+        if (payload.job) {
+          setImportBatches((items) => items.map((job) => (job.id === id ? { ...job, ...payload.job } : job)));
+        }
+      } catch (error) {
+        const message = errorMessage(error);
+        setImportBatchDetailErrors((items) => ({ ...items, [id]: message }));
+        pushToast(message, "error");
+      } finally {
+        setImportBatchDetailLoadingId(null);
+      }
+    },
+    [pushToast],
+  );
 
   const loadRequests = useCallback(async () => {
     setRequestLoading(true);
@@ -523,13 +558,18 @@ export function App(): React.ReactElement {
             <TokenExplorer
               counts={counts}
               deleteTarget={deleteTarget}
+              expandedImportBatchId={expandedImportBatchId}
               importBatches={importBatches}
+              importBatchDetailErrors={importBatchDetailErrors}
+              importBatchDetailLoadingId={importBatchDetailLoadingId}
+              importBatchDetails={importBatchDetails}
               mode={tokenMode}
               onBatchActivation={(active) => void runBatchActivation(active)}
               onCancelImportJob={async (id) => {
                 await api.cancelImportJob(id);
-                pushToast("已发送取消请求");
+                pushToast("已发送取消导入请求");
                 await loadTokens();
+                await loadImportBatchDetail(id);
               }}
               onDelete={(target) => setDeleteTarget(target)}
               onModeChange={(mode) => {
@@ -555,6 +595,16 @@ export function App(): React.ReactElement {
                 setTokenPage(1);
               }}
               onToggleActivation={(id, active) => void updateActivation(id, active)}
+              onToggleImportBatch={(id) => {
+                if (expandedImportBatchId === id) {
+                  setExpandedImportBatchId(null);
+                  return;
+                }
+                setExpandedImportBatchId(id);
+                if (!importBatchDetails[id]) {
+                  void loadImportBatchDetail(id);
+                }
+              }}
               activeStreamCap={streamCap}
               page={tokenPage}
               probeBusyIds={probeBusyIds}
@@ -564,7 +614,7 @@ export function App(): React.ReactElement {
               sort={tokenSort}
               status={tokenStatus}
               tokenError={tokenError}
-              tokenLoading={tokenLoading && !tokens.length}
+              tokenLoading={tokenLoading && (tokenMode === "keys" ? !tokens.length : !importBatches.length)}
               tokenTotal={tokenTotal}
               tokens={tokens}
               totalPages={totalPages}
@@ -862,7 +912,11 @@ function DispatchPanel({
 function TokenExplorer(props: {
   activeStreamCap: number;
   counts: TokenCounts;
+  expandedImportBatchId: number | null;
   importBatches: ImportBatch[];
+  importBatchDetailErrors: Record<number, string>;
+  importBatchDetailLoadingId: number | null;
+  importBatchDetails: Record<number, ImportBatchDetail>;
   mode: TokenMode;
   onBatchActivation: (active: boolean) => void;
   onCancelImportJob: (id: number) => void;
@@ -876,6 +930,7 @@ function TokenExplorer(props: {
   onSortChange: (value: string) => void;
   onStatusChange: (status: TokenStatus) => void;
   onToggleActivation: (id: number, active: boolean) => void;
+  onToggleImportBatch: (id: number) => void;
   page: number;
   probeBusyIds: Set<number>;
   probeResults: Record<number, TokenProbeResponse>;
@@ -991,7 +1046,20 @@ function TokenExplorer(props: {
             <Pagination page={props.page} totalPages={props.totalPages} onPageChange={props.onPageChange} total={props.tokenTotal} />
           </TabsPanel>
           <TabsPanel value="import_batches">
-            <ImportBatchList batches={props.importBatches} loading={props.tokenLoading} onCancel={props.onCancelImportJob} />
+            {props.tokenError ? (
+              <ErrorAlert title="导入批次载入失败" message={props.tokenError} />
+            ) : (
+              <ImportBatchList
+                batches={props.importBatches}
+                detailErrors={props.importBatchDetailErrors}
+                detailLoadingId={props.importBatchDetailLoadingId}
+                details={props.importBatchDetails}
+                expandedId={props.expandedImportBatchId}
+                loading={props.tokenLoading}
+                onCancel={props.onCancelImportJob}
+                onToggle={props.onToggleImportBatch}
+              />
+            )}
           </TabsPanel>
         </Tabs>
       </CardPanel>
@@ -1390,12 +1458,22 @@ function SettingsPanel({
 
 function ImportBatchList({
   batches,
+  detailErrors,
+  detailLoadingId,
+  details,
+  expandedId,
   loading,
   onCancel,
+  onToggle,
 }: {
   batches: ImportBatch[];
+  detailErrors: Record<number, string>;
+  detailLoadingId: number | null;
+  details: Record<number, ImportBatchDetail>;
+  expandedId: number | null;
   loading: boolean;
   onCancel: (id: number) => void;
+  onToggle: (id: number) => void;
 }) {
   if (loading) {
     return <LoadingRows />;
@@ -1405,31 +1483,202 @@ function ImportBatchList({
   }
   return (
     <div className="grid gap-3">
-      {batches.map((job) => (
-        <Card key={job.id} className="block">
-          <CardPanel className="grid flex-none gap-3 p-4 sm:grid-cols-[1fr_auto] sm:items-center">
-            <div>
-              <div className="flex flex-wrap items-center gap-2">
-                <strong>导入批次 #{job.id}</strong>
-                <Badge variant={job.status === "failed" ? "error" : job.status === "completed" ? "success" : "warning"}>
-                  {job.status}
-                </Badge>
+      {batches.map((job) => {
+        const expanded = expandedId === job.id;
+        const detail = details[job.id];
+        const cancelable = importBatchCancelable(job.status);
+        return (
+          <Card key={job.id} className="block overflow-hidden">
+            <CardPanel className="grid flex-none gap-3 p-3">
+              <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <strong className="text-sm">导入批次 #{job.id}</strong>
+                    <Badge size="sm" variant={importBatchBadge(job.status)}>{importBatchStatusLabel(job.status)}</Badge>
+                    <Badge size="sm" variant="outline">{formatNumber(job.token_count)} key</Badge>
+                    <span className="oaix-tabular text-muted-foreground text-xs">提交 {formatDate(job.submitted_at)}</span>
+                    {job.finished_at && (
+                      <span className="oaix-tabular text-muted-foreground text-xs">完成 {formatDate(job.finished_at)}</span>
+                    )}
+                  </div>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                    <ImportBatchMetric label="进度" value={`${formatNumber(job.processed_count)} / ${formatNumber(job.total_count)}`} />
+                    <ImportBatchMetric label="变更" value={`新 ${formatNumber(job.created_count)} · 更 ${formatNumber(job.updated_count)} · 跳 ${formatNumber(job.skipped_count)}`} />
+                    <ImportBatchMetric label="状态" value={`有效 ${formatNumber(job.available)} · 冷却 ${formatNumber(job.cooling)} · 禁用 ${formatNumber(job.disabled)}`} />
+                    <ImportBatchMetric label="余额" value={`${formatUSDOptional(job.observed_cost_usd)} · 平均 ${formatUSDOptional(job.average_observed_cost_usd)}`} />
+                  </div>
+                  {(job.failed_count || job.missing || job.last_error || job.error_message) ? (
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                      {Boolean(job.failed_count) && <Badge size="sm" variant="error">失败 {formatNumber(job.failed_count)}</Badge>}
+                      {Boolean(job.missing) && <Badge size="sm" variant="warning">缺失 {formatNumber(job.missing)}</Badge>}
+                      {(job.last_error || job.error_message) && (
+                        <span className="min-w-0 truncate text-destructive-foreground" title={job.last_error || job.error_message || ""}>
+                          {job.last_error || job.error_message}
+                        </span>
+                      )}
+                    </div>
+                  ) : null}
+                </div>
+                <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
+                  <Button onClick={() => onToggle(job.id)} size="sm" variant={expanded ? "secondary" : "outline"}>
+                    {expanded ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                    {expanded ? "收起 Key" : "查看 Key"}
+                  </Button>
+                  {cancelable && (
+                    <Button onClick={() => onCancel(job.id)} size="sm" variant="destructive-outline">
+                      取消导入
+                    </Button>
+                  )}
+                </div>
               </div>
-              <div className="mt-2 grid gap-2 text-muted-foreground text-xs sm:grid-cols-5">
-                <span>总量 {formatNumber(job.total_count)}</span>
-                <span>已处理 {formatNumber(job.processed_count)}</span>
-                <span>新增 {formatNumber(job.created_count)}</span>
-                <span>更新 {formatNumber(job.updated_count)}</span>
-                <span>失败 {formatNumber(job.failed_count)}</span>
+              {expanded && (
+                <ImportBatchDetailPanel
+                  detail={detail}
+                  error={detailErrors[job.id]}
+                  fallbackJob={job}
+                  loading={detailLoadingId === job.id}
+                />
+              )}
+            </CardPanel>
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+function ImportBatchMetric({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="min-w-0 rounded-lg border bg-muted/32 px-2.5 py-2">
+      <div className="text-muted-foreground text-[11px]">{label}</div>
+      <div className="mt-0.5 min-w-0 truncate oaix-tabular text-xs font-medium" title={typeof value === "string" ? value : undefined}>
+        {value || "-"}
+      </div>
+    </div>
+  );
+}
+
+function ImportBatchDetailPanel({
+  detail,
+  error,
+  fallbackJob,
+  loading,
+}: {
+  detail?: ImportBatchDetail;
+  error?: string;
+  fallbackJob: ImportBatch;
+  loading: boolean;
+}) {
+  if (error) {
+    return <ErrorAlert title="批次详情载入失败" message={error} />;
+  }
+  if (loading && !detail) {
+    return (
+      <div className="grid gap-2 border-t pt-3">
+        <Skeleton className="h-5 w-40" />
+        <Skeleton className="h-10 w-full" />
+        <Skeleton className="h-10 w-full" />
+      </div>
+    );
+  }
+  const tokens = detail?.tokens || [];
+  const items = detail?.items || [];
+  const failedItems = items.filter((item) => item.error_message);
+  if (!tokens.length && !failedItems.length) {
+    return (
+      <div className="rounded-xl border border-dashed bg-muted/24 p-4 text-muted-foreground text-sm">
+        这个批次暂时没有可关联的 key 明细。新导入批次会自动记录 token 明细；历史批次会尽量从 payload 映射。
+      </div>
+    );
+  }
+  return (
+    <div className="grid gap-3 border-t pt-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge size="sm" variant="outline">明细 {formatNumber(tokens.length)} key</Badge>
+        <Badge size="sm" variant="secondary">批次 #{fallbackJob.id}</Badge>
+        {failedItems.length > 0 && <Badge size="sm" variant="error">失败项 {formatNumber(failedItems.length)}</Badge>}
+      </div>
+      {tokens.length > 0 && (
+        <div className="max-h-[420px] overflow-auto rounded-xl border oaix-scrollbar">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Key</TableHead>
+                <TableHead>状态</TableHead>
+                <TableHead>额度</TableHead>
+                <TableHead>并发</TableHead>
+                <TableHead>余额</TableHead>
+                <TableHead>最近</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {tokens.map((token) => (
+                <ImportBatchTokenRow key={token.id} token={token} />
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+      {failedItems.length > 0 && (
+        <div className="grid gap-1.5">
+          {failedItems.slice(0, 10).map((item) => (
+            <div className="rounded-lg border bg-muted/32 px-2.5 py-2 text-xs" key={item.id}>
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge size="sm" variant="error">#{item.item_index + 1}</Badge>
+                <span className="min-w-0 truncate text-muted-foreground" title={item.error_message || ""}>
+                  {item.error_message || "-"}
+                </span>
               </div>
             </div>
-            <Button onClick={() => onCancel(job.id)} size="sm" variant="outline">
-              取消
-            </Button>
-          </CardPanel>
-        </Card>
-      ))}
+          ))}
+        </div>
+      )}
     </div>
+  );
+}
+
+function ImportBatchTokenRow({ token }: { token: TokenItem }) {
+  const status = tokenStatusOf(token);
+  const title = tokenTitle(token);
+  return (
+    <TableRow>
+      <TableCell>
+        <div className="flex min-w-0 flex-col gap-1">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="min-w-0 truncate font-medium" title={title}>{title}</span>
+            <Badge size="sm" variant="outline">ID {token.id}</Badge>
+          </div>
+          <span className="min-w-0 truncate text-muted-foreground text-xs" title={token.remark || token.source_file || ""}>
+            {token.remark || token.source_file || "-"}
+          </span>
+        </div>
+      </TableCell>
+      <TableCell>
+        <div className="flex flex-wrap items-center gap-1">
+          <Badge size="sm" variant={statusBadge(status)}>{tokenStatusLabel(status)}</Badge>
+          <Badge className="max-w-24 truncate" size="sm" title={token.plan_type || "unknown"} variant="secondary">
+            {token.plan_type || "unknown"}
+          </Badge>
+        </div>
+      </TableCell>
+      <TableCell>
+        <div className="flex flex-wrap items-center gap-1 text-[11px]">
+          <TokenQuotaStrip quota={token.quota} />
+        </div>
+      </TableCell>
+      <TableCell>
+        <TokenConcurrency fallbackCap={Number(token.active_stream_cap || 0)} item={token} />
+      </TableCell>
+      <TableCell>
+        <TokenObservedCost value={token.observed_cost_usd} />
+      </TableCell>
+      <TableCell>
+        <div className="grid gap-1 text-muted-foreground text-xs">
+          <span className="oaix-tabular">使用 {formatDate(token.last_used_at)}</span>
+          <span className="oaix-tabular">冷却 {formatDate(token.cooldown_until)}</span>
+        </div>
+      </TableCell>
+    </TableRow>
   );
 }
 
@@ -1681,6 +1930,45 @@ function statusBadge(status: "active" | "cooling" | "disabled"): "success" | "wa
   return "error";
 }
 
+function importBatchStatusLabel(status?: string): string {
+  switch (String(status || "").toLowerCase()) {
+    case "completed":
+      return "已完成";
+    case "running":
+      return "运行中";
+    case "queued":
+      return "排队中";
+    case "failed":
+      return "失败";
+    case "canceled":
+    case "cancelled":
+      return "已取消";
+    default:
+      return status || "未知";
+  }
+}
+
+function importBatchBadge(status?: string): React.ComponentProps<typeof Badge>["variant"] {
+  switch (String(status || "").toLowerCase()) {
+    case "completed":
+      return "success";
+    case "failed":
+      return "error";
+    case "canceled":
+    case "cancelled":
+      return "secondary";
+    case "queued":
+    case "running":
+      return "warning";
+    default:
+      return "outline";
+  }
+}
+
+function importBatchCancelable(status?: string): boolean {
+  return ["queued", "running", "validating", "publishing"].includes(String(status || "").toLowerCase());
+}
+
 function quotaWindowFor(quota: NonNullable<TokenItem["quota"]>, label: "5h" | "7d"): TokenQuotaWindow | undefined {
   return quota.windows?.find((item) => item.label === label || item.id.endsWith(label));
 }
@@ -1705,6 +1993,14 @@ function formatUSD(value: number): string {
     minimumFractionDigits: fractionDigits,
     style: "currency",
   }).format(amount);
+}
+
+function formatUSDOptional(value: unknown): string {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) {
+    return "-";
+  }
+  return formatUSD(amount);
 }
 
 function probeOutcomeLabel(outcome?: string): string {
@@ -1791,20 +2087,30 @@ function applyTheme(preference: ThemePreference): void {
   meta?.setAttribute("content", resolved === "dark" ? "#0a0a0a" : "#ffffff");
 }
 
-async function collectImportEntries(raw: string, files?: FileList | null): Promise<string[]> {
+async function collectImportEntries(raw: string, files?: FileList | null): Promise<ImportEntry[]> {
   const values = [...parseTokenText(raw)];
   for (const file of Array.from(files || [])) {
     values.push(...parseTokenText(await file.text()));
   }
-  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  const seen = new Set<string>();
+  const out: ImportEntry[] = [];
+  for (const value of values) {
+    const key = importEntryKey(value);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
 }
 
-function parseTokenText(raw: string): string[] {
+function parseTokenText(raw: string): ImportEntry[] {
   const text = raw.trim();
   if (!text) {
     return [];
   }
-  const values: string[] = [];
+  const values: ImportEntry[] = [];
   try {
     collectFromJSON(JSON.parse(text), values);
     if (values.length) {
@@ -1818,8 +2124,10 @@ function parseTokenText(raw: string): string[] {
     }
     if (value.includes(",") && !value.includes(".")) {
       const parts = value.split(",").map((part) => part.trim()).filter(Boolean);
-      if (parts.length) {
-        values.push(parts.at(-1) || "");
+      if (parts.length >= 2) {
+        values.push({ account_id: parts[0], refresh_token: parts[parts.length - 1] });
+      } else if (parts.length) {
+        values.push(parts[0]);
       }
       continue;
     }
@@ -1828,7 +2136,7 @@ function parseTokenText(raw: string): string[] {
   return values;
 }
 
-function collectFromJSON(value: unknown, output: string[]): void {
+function collectFromJSON(value: unknown, output: ImportEntry[]): void {
   if (!value) {
     return;
   }
@@ -1837,22 +2145,53 @@ function collectFromJSON(value: unknown, output: string[]): void {
     return;
   }
   if (typeof value === "string") {
-    output.push(value);
+    const text = value.trim();
+    if (text) {
+      output.push(text);
+    }
     return;
   }
   if (typeof value === "object") {
     const record = value as Record<string, unknown>;
-    for (const key of ["access_token", "accessToken", "refresh_token", "refreshToken", "token"]) {
-      if (typeof record[key] === "string") {
-        output.push(record[key]);
-      }
+    const payload = importPayloadFromRecord(record);
+    if (payload) {
+      output.push(payload);
+      return;
     }
     for (const nested of Object.values(record)) {
-      if (Array.isArray(nested)) {
+      if (Array.isArray(nested) || (nested && typeof nested === "object")) {
         collectFromJSON(nested, output);
       }
     }
   }
+}
+
+function importPayloadFromRecord(record: Record<string, unknown>): Record<string, unknown> | null {
+  const payload: Record<string, unknown> = {};
+  for (const key of ["access_token", "accessToken", "refresh_token", "refreshToken", "token", "account_id", "chatgpt_account_id", "id_token", "idToken", "email", "plan_type", "type", "is_active"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      payload[key] = value.trim();
+    } else if (typeof value === "boolean") {
+      payload[key] = value;
+    }
+  }
+  return Object.keys(payload).some((key) => ["access_token", "accessToken", "refresh_token", "refreshToken", "token"].includes(key))
+    ? payload
+    : null;
+}
+
+function importEntryKey(value: ImportEntry): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  const sorted = Object.keys(value)
+    .sort()
+    .reduce<Record<string, unknown>>((acc, key) => {
+      acc[key] = value[key];
+      return acc;
+    }, {});
+  return JSON.stringify(sorted);
 }
 
 function errorMessage(error: unknown): string {

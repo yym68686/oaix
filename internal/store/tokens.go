@@ -43,11 +43,20 @@ type TokenCounts struct {
 }
 
 type ImportResult struct {
-	Created int     `json:"created"`
-	Updated int     `json:"updated"`
-	Skipped int     `json:"skipped"`
-	Failed  int     `json:"failed"`
-	Tokens  []Token `json:"tokens"`
+	Created int                `json:"created"`
+	Updated int                `json:"updated"`
+	Skipped int                `json:"skipped"`
+	Failed  int                `json:"failed"`
+	Tokens  []Token            `json:"tokens"`
+	Items   []ImportResultItem `json:"items,omitempty"`
+}
+
+type ImportResultItem struct {
+	Index        int    `json:"index"`
+	TokenID      *int64 `json:"token_id,omitempty"`
+	Action       string `json:"action,omitempty"`
+	Status       string `json:"status"`
+	ErrorMessage string `json:"error_message,omitempty"`
 }
 
 type TokenListOptions struct {
@@ -201,8 +210,16 @@ func (s *Store) TokenCounts(ctx context.Context) (TokenCounts, error) {
 }
 
 func (s *Store) UpsertAccessTokens(ctx context.Context, accessTokens []string, source string) (ImportResult, error) {
+	payloads := make([]map[string]any, 0, len(accessTokens))
+	for _, accessToken := range accessTokens {
+		payloads = append(payloads, map[string]any{"access_token": accessToken})
+	}
+	return s.UpsertTokenPayloads(ctx, payloads, source)
+}
+
+func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]any, source string) (ImportResult, error) {
 	result := ImportResult{}
-	if len(accessTokens) == 0 {
+	if len(payloads) == 0 {
 		return result, nil
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -210,14 +227,52 @@ func (s *Store) UpsertAccessTokens(ctx context.Context, accessTokens []string, s
 		return result, err
 	}
 	defer tx.Rollback(ctx)
-	for _, raw := range accessTokens {
-		accessToken := strings.TrimSpace(raw)
-		if accessToken == "" {
-			result.Skipped++
+	for index, rawPayload := range payloads {
+		payload := normalizeTokenPayload(rawPayload)
+		accessToken := stringFromPayload(payload, "access_token", "accessToken")
+		refreshToken := stringFromPayload(payload, "refresh_token", "refreshToken")
+		if refreshToken == "" && accessToken != "" {
+			refreshToken = "access:" + hashString(accessToken)
+			payload["refresh_token"] = refreshToken
+			payload["token_source"] = "access_token"
+		}
+		if refreshToken == "" {
+			result.Failed++
+			result.Items = append(result.Items, ImportResultItem{
+				Index:        index,
+				Action:       "failed",
+				ErrorMessage: "token payload missing refresh_token or access_token",
+				Status:       "failed",
+			})
 			continue
 		}
 		accountID, email, planType := parseAccessTokenClaims(accessToken)
-		refreshToken := "access:" + hashString(accessToken)
+		if value := stringFromPayload(payload, "account_id", "chatgpt_account_id"); value != "" {
+			accountID = &value
+		}
+		if value := stringFromPayload(payload, "email"); value != "" {
+			email = &value
+		}
+		if value := stringFromPayload(payload, "plan_type", "planType", "chatgpt_plan_type"); value != "" {
+			planType = &value
+		}
+		idToken := nullableString(stringFromPayload(payload, "id_token", "idToken"))
+		tokenType := stringFromPayload(payload, "type")
+		if tokenType == "" {
+			tokenType = "codex"
+		}
+		isActive := payloadBool(payload["is_active"], true)
+		lastError := nullableString(stringFromPayload(payload, "last_error"))
+		if isActive {
+			lastError = nil
+		}
+		if sourceValue := strings.TrimSpace(source); sourceValue != "" {
+			payload["source"] = sourceValue
+		}
+		if _, ok := payload["source"]; !ok && accessToken != "" {
+			payload["source"] = "access_token_import"
+		}
+
 		var existingID int64
 		err := tx.QueryRow(ctx, `select id from codex_tokens where refresh_token = $1 and merged_into_token_id is null limit 1`, refreshToken).Scan(&existingID)
 		if err != nil && err != pgx.ErrNoRows {
@@ -226,48 +281,97 @@ func (s *Store) UpsertAccessTokens(ctx context.Context, accessTokens []string, s
 		if existingID > 0 {
 			row := tx.QueryRow(ctx, `
 				update codex_tokens
-				set access_token = $2,
+				set access_token = coalesce(nullif($2, ''), access_token),
 				    account_id = coalesce($3, account_id),
 				    email = coalesce($4, email),
 				    plan_type = coalesce($5, plan_type),
 				    source_file = coalesce($6, source_file),
-				    is_active = true,
-				    disabled_at = null,
-				    last_error = null,
+				    id_token = coalesce($7, id_token),
+				    type = coalesce(nullif($8, ''), type, 'codex'),
+				    raw_payload = coalesce($9, raw_payload),
+				    is_active = $10,
+				    disabled_at = case when $10 then null else coalesce(disabled_at, now()) end,
+				    last_error = $11,
 				    updated_at = now()
 				where id = $1
 				returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 				          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
-			`, existingID, accessToken, accountID, email, planType, nullableString(source))
+			`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(payload), isActive, lastError)
 			token, scanErr := scanToken(row)
 			if scanErr != nil {
 				return result, scanErr
 			}
+			if err := recordTokenSecretAndRefreshHistory(ctx, tx, token.ID, accessToken, refreshToken, idToken); err != nil {
+				return result, err
+			}
+			action := "updated"
 			result.Updated++
 			result.Tokens = append(result.Tokens, token)
+			tokenID := token.ID
+			result.Items = append(result.Items, ImportResultItem{
+				Index:   index,
+				TokenID: &tokenID,
+				Action:  action,
+				Status:  "published",
+			})
 			continue
 		}
-		payload := map[string]any{"source": "access_token_import"}
+
 		row := tx.QueryRow(ctx, `
 			insert into codex_tokens (
-				email, account_id, access_token, refresh_token, raw_payload, plan_type, source_file,
-				is_active, created_at, updated_at
+				email, account_id, id_token, access_token, refresh_token, raw_payload, plan_type, source_file,
+				type, is_active, disabled_at, last_error, created_at, updated_at
 			)
-			values ($1, $2, $3, $4, $5, $6, $7, true, now(), now())
+			values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, case when $10 then null else now() end, $11, now(), now())
 			returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 			          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
-		`, email, accountID, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source))
+		`, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError)
 		token, scanErr := scanToken(row)
 		if scanErr != nil {
 			return result, scanErr
 		}
+		if err := recordTokenSecretAndRefreshHistory(ctx, tx, token.ID, accessToken, refreshToken, idToken); err != nil {
+			return result, err
+		}
 		result.Created++
 		result.Tokens = append(result.Tokens, token)
+		tokenID := token.ID
+		result.Items = append(result.Items, ImportResultItem{
+			Index:   index,
+			TokenID: &tokenID,
+			Action:  "created",
+			Status:  "published",
+		})
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return result, err
 	}
 	return result, nil
+}
+
+func recordTokenSecretAndRefreshHistory(ctx context.Context, tx pgx.Tx, tokenID int64, accessToken string, refreshToken string, idToken *string) error {
+	if strings.TrimSpace(refreshToken) != "" {
+		if _, err := tx.Exec(ctx, `
+			insert into token_refresh_history(token_id, refresh_token_hash, seen_at)
+			values ($1, $2, now())
+			on conflict (token_id, refresh_token_hash) do nothing
+		`, tokenID, hashString(refreshToken)); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(accessToken) == "" && strings.TrimSpace(refreshToken) == "" && idToken == nil {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		insert into token_secrets(token_id, access_token, refresh_token, id_token, updated_at)
+		values ($1, nullif($2, ''), nullif($3, ''), $4, now())
+		on conflict (token_id) do update
+		set access_token = coalesce(excluded.access_token, token_secrets.access_token),
+		    refresh_token = coalesce(excluded.refresh_token, token_secrets.refresh_token),
+		    id_token = coalesce(excluded.id_token, token_secrets.id_token),
+		    updated_at = now()
+	`, tokenID, accessToken, refreshToken, idToken)
+	return err
 }
 
 func (s *Store) TouchTokens(ctx context.Context, tokenIDs []int64, usedAt time.Time) error {
@@ -589,6 +693,66 @@ func nullableString(value string) *string {
 		return nil
 	}
 	return &value
+}
+
+func normalizeTokenPayload(payload map[string]any) map[string]any {
+	out := make(map[string]any, len(payload)+2)
+	for key, value := range payload {
+		out[key] = value
+	}
+	if out["access_token"] == nil {
+		if value := stringFromPayload(out, "accessToken"); value != "" {
+			out["access_token"] = value
+		}
+	}
+	if out["refresh_token"] == nil {
+		if value := stringFromPayload(out, "refreshToken"); value != "" {
+			out["refresh_token"] = value
+		}
+	}
+	if out["access_token"] == nil && out["refresh_token"] == nil {
+		if value := stringFromPayload(out, "token"); value != "" {
+			if looksLikeAccessToken(value) {
+				out["access_token"] = value
+			} else {
+				out["refresh_token"] = value
+			}
+		}
+	}
+	return out
+}
+
+func stringFromPayload(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func payloadBool(value any, fallback bool) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "1", "true", "yes", "on", "active", "enabled":
+			return true
+		case "0", "false", "no", "off", "inactive", "disabled":
+			return false
+		}
+	case float64:
+		return typed != 0
+	case int:
+		return typed != 0
+	}
+	return fallback
+}
+
+func looksLikeAccessToken(value string) bool {
+	value = strings.TrimSpace(value)
+	return strings.Count(value, ".") >= 2 || strings.HasPrefix(value, "eyJ")
 }
 
 func truncate(value string, max int) string {

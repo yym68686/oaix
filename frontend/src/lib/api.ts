@@ -82,15 +82,51 @@ export type TokenListResponse = {
 export type ImportBatch = {
   id: number;
   status: string;
+  import_queue_position?: string | null;
   submitted_at?: string | null;
   started_at?: string | null;
+  heartbeat_at?: string | null;
+  finished_at?: string | null;
   completed_at?: string | null;
   total_count?: number;
   processed_count?: number;
   created_count?: number;
   updated_count?: number;
+  skipped_count?: number;
   failed_count?: number;
+  token_count?: number;
+  available?: number;
+  cooling?: number;
+  disabled?: number;
+  missing?: number;
+  token_ids?: number[];
+  observed_cost_usd?: number | null;
+  average_observed_cost_usd?: number | null;
+  last_error?: string | null;
   error_message?: string | null;
+};
+
+export type ImportBatchItem = {
+  id: number;
+  job_id: number;
+  item_index: number;
+  status: string;
+  token_id?: number | null;
+  action?: string | null;
+  error_message?: string | null;
+  validation_ms?: number | null;
+  publish_ms?: number | null;
+  validation_started_at?: string | null;
+  validation_finished_at?: string | null;
+  published_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type ImportBatchDetail = {
+  job?: ImportBatch;
+  items?: ImportBatchItem[];
+  tokens?: TokenItem[];
 };
 
 export type RequestItem = {
@@ -229,6 +265,8 @@ export const api = {
     postJSON<Record<string, unknown>>("/admin/tokens/import", payload),
   importJobs: (limit = 50) =>
     requestJSON<{ items?: ImportBatch[] }>(`/admin/tokens/import-batches?limit=${limit}`),
+  importJob: (id: number) =>
+    requestJSON<ImportBatchDetail>(`/admin/tokens/import-jobs/${id}?include_quota=true`),
   cancelImportJob: (id: number) =>
     postJSON<Record<string, unknown>>(`/admin/tokens/import-jobs/${id}/cancel`, {}),
   requests: (limit = 80) =>

@@ -38,6 +38,23 @@ type App struct {
 	authKeys []string
 }
 
+type adminImportItem struct {
+	ID                 int64      `json:"id"`
+	JobID              int64      `json:"job_id"`
+	ItemIndex          int        `json:"item_index"`
+	Status             string     `json:"status"`
+	TokenID            *int64     `json:"token_id,omitempty"`
+	Action             *string    `json:"action,omitempty"`
+	ErrorMessage       *string    `json:"error_message,omitempty"`
+	ValidationMS       *int       `json:"validation_ms,omitempty"`
+	PublishMS          *int       `json:"publish_ms,omitempty"`
+	ValidationStarted  *time.Time `json:"validation_started_at,omitempty"`
+	ValidationFinished *time.Time `json:"validation_finished_at,omitempty"`
+	PublishedAt        *time.Time `json:"published_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+}
+
 func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenManager *tokens.Manager, logWriter *logs.Writer, pipeline *proxy.Pipeline) *App {
 	return &App{
 		cfg:      cfg,
@@ -364,14 +381,14 @@ func (a *App) importTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	payloads, tokensToImport, queuePosition, err := parseImportPayload(body)
+	payloads, queuePosition, err := parseImportPayload(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	result, err := a.store.UpsertAccessTokens(ctx, tokensToImport, "admin_api")
+	result, err := a.store.UpsertTokenPayloads(ctx, payloads, "admin_api")
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -424,7 +441,7 @@ func (a *App) getToken(w http.ResponseWriter, r *http.Request) {
 func (a *App) listImportBatches(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	items, err := a.store.ListImportJobs(ctx, queryInt(r, "limit", 30))
+	items, err := a.store.ListImportJobSummaries(ctx, queryInt(r, "limit", 30), true)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -440,7 +457,7 @@ func (a *App) getImportJob(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	job, err := a.store.GetImportJob(ctx, id)
+	job, err := a.store.GetImportJobSummary(ctx, id, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("import job not found"))
 		return
@@ -449,7 +466,23 @@ func (a *App) getImportJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"job": job})
+	importItems, err := a.store.ListImportJobItems(ctx, id)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	tokensByID, err := a.store.ListTokensByIDs(ctx, job.TokenIDs)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	adminItems, pendingIDs := a.adminTokenItems(r.Context(), orderTokensByID(tokensByID, job.TokenIDs), queryBool(r, "include_quota", false))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job":                       job,
+		"items":                     sanitizeImportItems(importItems),
+		"tokens":                    adminItems,
+		"quota_refresh_pending_ids": pendingIDs,
+	})
 }
 
 func (a *App) cancelImportJob(w http.ResponseWriter, r *http.Request) {
@@ -470,6 +503,53 @@ func (a *App) cancelImportJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"job": job})
+}
+
+func orderTokensByID(tokens []store.Token, ids []int64) []store.Token {
+	if len(tokens) == 0 || len(ids) == 0 {
+		return tokens
+	}
+	byID := make(map[int64]store.Token, len(tokens))
+	for _, token := range tokens {
+		byID[token.ID] = token
+	}
+	ordered := make([]store.Token, 0, len(tokens))
+	seen := make(map[int64]struct{}, len(tokens))
+	for _, id := range ids {
+		token, ok := byID[id]
+		if !ok {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ordered = append(ordered, token)
+	}
+	return ordered
+}
+
+func sanitizeImportItems(items []store.ImportItem) []adminImportItem {
+	out := make([]adminImportItem, 0, len(items))
+	for _, item := range items {
+		out = append(out, adminImportItem{
+			ID:                 item.ID,
+			JobID:              item.JobID,
+			ItemIndex:          item.ItemIndex,
+			Status:             item.Status,
+			TokenID:            item.TokenID,
+			Action:             item.Action,
+			ErrorMessage:       item.ErrorMessage,
+			ValidationMS:       item.ValidationMS,
+			PublishMS:          item.PublishMS,
+			ValidationStarted:  item.ValidationStarted,
+			ValidationFinished: item.ValidationFinished,
+			PublishedAt:        item.PublishedAt,
+			CreatedAt:          item.CreatedAt,
+			UpdatedAt:          item.UpdatedAt,
+		})
+	}
+	return out
 }
 
 func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
@@ -765,7 +845,7 @@ func (a *App) cors(next http.Handler) http.Handler {
 	})
 }
 
-func parseImportPayload(body any) ([]map[string]any, []string, string, error) {
+func parseImportPayload(body any) ([]map[string]any, string, error) {
 	queuePosition := "front"
 	var values []any
 	switch typed := body.(type) {
@@ -781,31 +861,66 @@ func parseImportPayload(body any) ([]map[string]any, []string, string, error) {
 	case []any:
 		values = typed
 	default:
-		return nil, nil, queuePosition, errors.New("body must be a token object, an array, or {tokens: [...]}")
+		return nil, queuePosition, errors.New("body must be a token object, an array, or {tokens: [...]}")
 	}
 	payloads := make([]map[string]any, 0, len(values))
-	accessTokens := make([]string, 0, len(values))
 	for _, value := range values {
 		switch item := value.(type) {
 		case string:
 			text := strings.TrimSpace(item)
 			if text != "" {
-				payloads = append(payloads, map[string]any{"access_token": text})
-				accessTokens = append(accessTokens, text)
+				payloads = append(payloads, importPayloadFromString(text))
 			}
 		case map[string]any:
-			payloads = append(payloads, item)
-			for _, key := range []string{"access_token", "accessToken", "token"} {
-				if text, ok := item[key].(string); ok && strings.TrimSpace(text) != "" {
-					accessTokens = append(accessTokens, strings.TrimSpace(text))
-					break
-				}
-			}
+			payloads = append(payloads, normalizeImportPayloadMap(item))
 		default:
-			return nil, nil, queuePosition, fmt.Errorf("unsupported token payload %T", value)
+			return nil, queuePosition, fmt.Errorf("unsupported token payload %T", value)
 		}
 	}
-	return payloads, accessTokens, queuePosition, nil
+	return payloads, queuePosition, nil
+}
+
+func importPayloadFromString(value string) map[string]any {
+	value = strings.TrimSpace(value)
+	if looksLikeAccessTokenText(value) {
+		return map[string]any{"access_token": value}
+	}
+	return map[string]any{"refresh_token": value}
+}
+
+func normalizeImportPayloadMap(payload map[string]any) map[string]any {
+	out := make(map[string]any, len(payload)+1)
+	for key, value := range payload {
+		out[key] = value
+	}
+	if _, hasAccess := out["access_token"]; !hasAccess {
+		if value, ok := out["accessToken"].(string); ok && strings.TrimSpace(value) != "" {
+			out["access_token"] = strings.TrimSpace(value)
+		}
+	}
+	if _, hasRefresh := out["refresh_token"]; !hasRefresh {
+		if value, ok := out["refreshToken"].(string); ok && strings.TrimSpace(value) != "" {
+			out["refresh_token"] = strings.TrimSpace(value)
+		}
+	}
+	if _, hasAccess := out["access_token"]; !hasAccess {
+		if _, hasRefresh := out["refresh_token"]; !hasRefresh {
+			if value, ok := out["token"].(string); ok && strings.TrimSpace(value) != "" {
+				text := strings.TrimSpace(value)
+				if looksLikeAccessTokenText(text) {
+					out["access_token"] = text
+				} else {
+					out["refresh_token"] = text
+				}
+			}
+		}
+	}
+	return out
+}
+
+func looksLikeAccessTokenText(value string) bool {
+	value = strings.TrimSpace(value)
+	return strings.Count(value, ".") >= 2 || strings.HasPrefix(value, "eyJ")
 }
 
 func requestStream(r *http.Request) bool {
