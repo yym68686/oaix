@@ -2,6 +2,8 @@ package oauth
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,6 +16,23 @@ func TestParseRefreshResponse(t *testing.T) {
 	}
 	if result.AccessToken != "at" || result.RefreshToken != "rt2" || result.ExpiresIn != 3600 {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestParseRefreshResponseReadsIDTokenIdentity(t *testing.T) {
+	idToken := testJWT(t, map[string]any{
+		"email": "jwt@example.com",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct-jwt",
+			"chatgpt_plan_type":  "pro",
+		},
+	})
+	result, err := ParseRefreshResponse([]byte(`{"access_token":"at","refresh_token":"rt2","id_token":"` + idToken + `"}`))
+	if err != nil {
+		t.Fatalf("ParseRefreshResponse returned error: %v", err)
+	}
+	if result.AccountID != "acct-jwt" || result.Email != "jwt@example.com" || result.PlanType != "pro" {
+		t.Fatalf("unexpected id_token identity: %#v", result)
 	}
 }
 
@@ -67,6 +86,36 @@ func TestHTTPClientRefreshRetries(t *testing.T) {
 	}
 }
 
+func TestHTTPClientExchangeAuthorizationCode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm: %v", err)
+		}
+		if r.Form.Get("grant_type") != "authorization_code" || r.Form.Get("client_id") != "client-fixture" {
+			t.Fatalf("unexpected oauth form: %v", r.Form)
+		}
+		if r.Form.Get("code") != "code-fixture" || r.Form.Get("redirect_uri") != "https://oaix.example/auth/callback" || r.Form.Get("code_verifier") != "verifier-fixture" {
+			t.Fatalf("unexpected oauth exchange params: %v", r.Form)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at","refresh_token":"rt2","expires_in":3600}`))
+	}))
+	defer server.Close()
+	client := NewHTTPClient(server.URL)
+	client.ClientID = "client-fixture"
+	result, err := client.ExchangeAuthorizationCode(context.Background(), AuthorizationCodeRequest{
+		Code:         "code-fixture",
+		RedirectURI:  "https://oaix.example/auth/callback",
+		CodeVerifier: "verifier-fixture",
+	})
+	if err != nil {
+		t.Fatalf("ExchangeAuthorizationCode returned error: %v", err)
+	}
+	if result.AccessToken != "at" || result.RefreshToken != "rt2" {
+		t.Fatalf("unexpected exchange result: %#v", result)
+	}
+}
+
 func TestDedupRefreshHistory(t *testing.T) {
 	got := DedupRefreshHistory([]string{"rt1", "rt2", "rt1", "", "rt3"})
 	want := []string{"rt1", "rt2", "rt3"}
@@ -78,4 +127,17 @@ func TestDedupRefreshHistory(t *testing.T) {
 			t.Fatalf("got %#v want %#v", got, want)
 		}
 	}
+}
+
+func testJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	header, err := json.Marshal(map[string]any{"alg": "none"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + "."
 }

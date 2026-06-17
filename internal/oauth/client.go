@@ -3,12 +3,14 @@ package oauth
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -21,6 +23,20 @@ type RefreshResult struct {
 	AccountID    string
 	Email        string
 	PlanType     string
+}
+
+type AuthorizationCodeRequest struct {
+	Code         string
+	RedirectURI  string
+	CodeVerifier string
+}
+
+type IDTokenIdentity struct {
+	AccountID      string
+	Email          string
+	PlanType       string
+	UserID         string
+	OrganizationID string
 }
 
 type Client interface {
@@ -108,6 +124,50 @@ func (c *HTTPClient) Stats() Metrics {
 	}
 }
 
+func (c *HTTPClient) ExchangeAuthorizationCode(ctx context.Context, request AuthorizationCodeRequest) (RefreshResult, error) {
+	if c == nil || c.TokenURL == "" {
+		return RefreshResult{}, errors.New("oauth token url is not configured")
+	}
+	if c.ClientID == "" {
+		return RefreshResult{}, errors.New("oauth client id is not configured")
+	}
+	if strings.TrimSpace(request.Code) == "" {
+		return RefreshResult{}, errors.New("oauth authorization code is required")
+	}
+	if strings.TrimSpace(request.RedirectURI) == "" {
+		return RefreshResult{}, errors.New("oauth redirect uri is required")
+	}
+	if strings.TrimSpace(request.CodeVerifier) == "" {
+		return RefreshResult{}, errors.New("oauth code verifier is required")
+	}
+	if c.HTTPClient == nil {
+		c.HTTPClient = &http.Client{Timeout: 15 * time.Second}
+	}
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("client_id", c.ClientID)
+	form.Set("code", strings.TrimSpace(request.Code))
+	form.Set("redirect_uri", strings.TrimSpace(request.RedirectURI))
+	form.Set("code_verifier", strings.TrimSpace(request.CodeVerifier))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.TokenURL, bytes.NewBufferString(form.Encode()))
+	if err != nil {
+		return RefreshResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "codex-cli/0.91.0")
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return RefreshResult{}, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return RefreshResult{}, fmt.Errorf("oauth authorization code exchange failed with status %d: %s", resp.StatusCode, string(body))
+	}
+	return ParseRefreshResponse(body)
+}
+
 func (c *HTTPClient) refreshOnce(ctx context.Context, refreshToken string) (RefreshResult, int, error) {
 	form := url.Values{}
 	if c.ClientID != "" {
@@ -124,6 +184,7 @@ func (c *HTTPClient) refreshOnce(ctx context.Context, refreshToken string) (Refr
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "codex-cli/0.91.0")
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return RefreshResult{}, 0, err
@@ -156,10 +217,71 @@ func ParseRefreshResponse(body []byte) (RefreshResult, error) {
 	if expires, ok := payload["expires_in"].(float64); ok {
 		result.ExpiresIn = int(expires)
 	}
+	if identity, err := ParseIDTokenIdentity(result.IDToken); err == nil {
+		if result.AccountID == "" {
+			result.AccountID = identity.AccountID
+		}
+		if result.Email == "" {
+			result.Email = identity.Email
+		}
+		if result.PlanType == "" {
+			result.PlanType = identity.PlanType
+		}
+	}
 	if result.AccessToken == "" {
 		return RefreshResult{}, errors.New("oauth response missing access_token")
 	}
 	return result, nil
+}
+
+func ParseIDTokenIdentity(idToken string) (IDTokenIdentity, error) {
+	parts := strings.Split(strings.TrimSpace(idToken), ".")
+	if len(parts) < 2 {
+		return IDTokenIdentity{}, errors.New("id_token is not a jwt")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return IDTokenIdentity{}, err
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return IDTokenIdentity{}, err
+	}
+	identity := IDTokenIdentity{
+		AccountID: stringField(claims, "account_id"),
+		Email:     stringField(claims, "email"),
+		PlanType:  stringField(claims, "plan_type"),
+		UserID:    stringField(claims, "user_id"),
+	}
+	if identity.AccountID == "" {
+		identity.AccountID = stringField(claims, "sub")
+	}
+	if identity.PlanType == "" {
+		identity.PlanType = stringField(claims, "plan")
+	}
+	if authClaims, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+		if value := stringField(authClaims, "chatgpt_account_id"); value != "" {
+			identity.AccountID = value
+		} else if value := stringField(authClaims, "account_id"); value != "" {
+			identity.AccountID = value
+		}
+		if value := stringField(authClaims, "chatgpt_user_id"); value != "" {
+			identity.UserID = value
+		} else if value := stringField(authClaims, "user_id"); value != "" {
+			identity.UserID = value
+		}
+		if value := stringField(authClaims, "chatgpt_plan_type"); value != "" {
+			identity.PlanType = value
+		} else if value := stringField(authClaims, "plan_type"); value != "" {
+			identity.PlanType = value
+		}
+		if orgs, ok := authClaims["organizations"].([]any); ok && len(orgs) > 0 {
+			if org, ok := orgs[0].(map[string]any); ok {
+				identity.OrganizationID = stringField(org, "id")
+			}
+		}
+	}
+	return identity, nil
 }
 
 func ClassifyStatus(status int) ErrorClass {

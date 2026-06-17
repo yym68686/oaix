@@ -1,4 +1,5 @@
 import {
+  ExternalLinkIcon,
   EyeIcon,
   SaveIcon,
   Trash2Icon,
@@ -78,7 +79,7 @@ function ImportForm({
 }) {
   const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
   const [tokenInput, setTokenInput] = useState("");
-  const [importSource, setImportSource] = useState<"paste" | "file">("paste");
+  const [importSource, setImportSource] = useState<"paste" | "file" | "oauth">("paste");
   const [queuePosition, setQueuePosition] = useState<"front" | "back">("front");
   const [importFeedback, setImportFeedback] = useState("等待导入。");
   const [importBusy, setImportBusy] = useState(false);
@@ -96,12 +97,38 @@ function ImportForm({
   }
 
   function changeImportSource(value: unknown) {
-    if (value === "paste" || value === "file") {
+    if (value === "paste" || value === "file" || value === "oauth") {
       setImportSource(value);
     }
   }
 
+  async function startOAuthImport() {
+    setImportBusy(true);
+    try {
+      if (serviceKeyDraft.trim()) {
+        setServiceKey(serviceKeyDraft);
+      }
+      setImportFeedback("正在打开 ChatGPT 授权...");
+      const result = await api.startOpenAIOAuth({
+        import_queue_position: queuePosition,
+        redirect_uri: `${window.location.origin}/auth/callback`,
+      });
+      if (!result.auth_url) {
+        throw new Error("授权地址为空");
+      }
+      window.location.assign(result.auth_url);
+    } catch (caught) {
+      setImportFeedback(errorMessage(caught));
+      pushToast(errorMessage(caught), "error");
+      setImportBusy(false);
+    }
+  }
+
   async function importTokens() {
+    if (importSource === "oauth") {
+      await startOAuthImport();
+      return;
+    }
     setImportBusy(true);
     try {
       setImportFeedback("正在解析导入内容...");
@@ -170,6 +197,9 @@ function ImportForm({
           <TabsTab className="flex-1 sm:flex-none" value="file">
             选择文件
           </TabsTab>
+          <TabsTab className="flex-1 sm:flex-none" value="oauth">
+            ChatGPT OAuth
+          </TabsTab>
         </TabsList>
         <TabsPanel className="grid min-w-0 gap-2" keepMounted value="paste">
           <Label htmlFor="token-json">粘贴 Key 数据</Label>
@@ -195,6 +225,13 @@ function ImportForm({
             type="file"
           />
         </TabsPanel>
+        <TabsPanel className="grid min-w-0 gap-3" keepMounted value="oauth">
+          <Alert variant="info">
+            <ExternalLinkIcon />
+            <AlertTitle>ChatGPT OAuth</AlertTitle>
+            <AlertDescription>跳转到 ChatGPT 授权后自动创建导入批次。</AlertDescription>
+          </Alert>
+        </TabsPanel>
       </Tabs>
       <div className="grid min-w-0 gap-2">
         <Label>导入位置</Label>
@@ -208,7 +245,8 @@ function ImportForm({
         </div>
       </div>
       <Button disabled={importBusy} loading={importBusy} onClick={() => void importTokens()}>
-        开始导入
+        {importSource === "oauth" && <ExternalLinkIcon />}
+        {importSource === "oauth" ? "打开 ChatGPT 授权" : "开始导入"}
       </Button>
       <Alert variant={importFeedback.includes("失败") || importFeedback.includes("错误") ? "error" : "info"}>
         <UploadIcon />
@@ -238,7 +276,7 @@ function ImportNewDialog({
             <UploadIcon className="size-5" />
             导入 Key
           </DialogTitle>
-          <DialogDescription>保存凭证并导入 access token / refresh token 数据。</DialogDescription>
+          <DialogDescription>保存凭证并导入 access token / refresh token 数据，或使用 ChatGPT OAuth 授权。</DialogDescription>
         </DialogHeader>
         <DialogPanel>
           <ImportForm onImported={onImported} pushToast={pushToast} />
@@ -268,6 +306,7 @@ function ImportBatchesPage({
   const [detailLoadingId, setDetailLoadingId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const handledOAuthResultRef = useRef("");
 
   const loadBatches = useCallback(async () => {
     setLoading(true);
@@ -305,6 +344,26 @@ function ImportBatchesPage({
   useEffect(() => {
     void loadBatches();
   }, [loadBatches, refreshNonce]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(route.search);
+    const jobID = params.get("oauth_job");
+    const oauthError = params.get("oauth_error");
+    if (!jobID && !oauthError) {
+      return;
+    }
+    if (handledOAuthResultRef.current === route.search) {
+      return;
+    }
+    handledOAuthResultRef.current = route.search;
+    if (oauthError) {
+      pushToast(`OAuth 导入失败：${oauthError}`, "error");
+    } else {
+      pushToast(`OAuth 导入已创建批次 #${jobID}`);
+    }
+    void loadBatches();
+    go("/imports", { replace: true });
+  }, [loadBatches, pushToast, route.search]);
 
   useEffect(() => {
     if (route.key === "import_new") {

@@ -138,6 +138,14 @@ export type ImportBatchDetail = {
   tokens?: TokenItem[];
 };
 
+export type OpenAIOAuthStartResponse = {
+  auth_url: string;
+  session_id?: string;
+  state?: string;
+  redirect_uri?: string;
+  expires_in_sec?: number;
+};
+
 export type RequestItem = {
   id?: number;
   started_at?: string | null;
@@ -280,6 +288,8 @@ export const api = {
     postJSON<Record<string, unknown>>("/admin/tokens/batch", payload),
   importTokens: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/tokens/import", payload),
+  startOpenAIOAuth: (payload: Record<string, unknown>) =>
+    postJSON<OpenAIOAuthStartResponse>("/admin/oauth/openai/start", payload),
   importJobs: (limit = 50) =>
     requestJSON<{ items?: ImportBatch[] }>(`/admin/tokens/import-batches?limit=${limit}`),
   importJob: (id: number) =>

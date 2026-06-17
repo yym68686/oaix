@@ -34,6 +34,7 @@ type App struct {
 	logs     *logs.Writer
 	proxy    *proxy.Pipeline
 	quota    *adminQuotaService
+	oauth    *openAIOAuthSessionStore
 	webDir   string
 	started  time.Time
 	authKeys []string
@@ -65,6 +66,7 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		logs:     logWriter,
 		proxy:    pipeline,
 		quota:    newAdminQuotaService(cfg, store),
+		oauth:    newOpenAIOAuthSessionStore(),
 		webDir:   filepath.Join("oaix_gateway", "web"),
 		started:  time.Now().UTC(),
 		authKeys: cfg.Auth.ServiceAPIKeys,
@@ -74,6 +76,7 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", a.index)
+	mux.HandleFunc("GET /auth/callback", a.openAIOAuthCallback)
 	mux.Handle("GET /assets/", a.assets())
 	mux.HandleFunc("GET /livez", a.livez)
 	mux.HandleFunc("GET /healthz", a.healthz)
@@ -86,6 +89,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/tokens/{token_id}", a.requireAuth(a.getToken))
 	mux.HandleFunc("GET /admin/tokens/quota", a.requireAuth(a.listTokenQuota))
 	mux.HandleFunc("POST /admin/tokens/import", a.requireAuth(a.importTokens))
+	mux.HandleFunc("POST /admin/oauth/openai/start", a.requireAuth(a.startOpenAIOAuth))
 	mux.HandleFunc("GET /admin/tokens/import-batches", a.requireAuth(a.listImportBatches))
 	mux.HandleFunc("GET /admin/tokens/import-jobs/{job_id}", a.requireAuth(a.getImportJob))
 	mux.HandleFunc("POST /admin/tokens/import-jobs/{job_id}/cancel", a.requireAuth(a.cancelImportJob))
@@ -396,32 +400,44 @@ func (a *App) importTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	originalPayloads := payloads
-	upsertPayloads, preflightResult := a.prepareImportPayloads(ctx, originalPayloads)
-	result, err := a.store.UpsertTokenPayloads(ctx, upsertPayloads, "admin_api")
+	job, result, err := a.completeTokenImport(ctx, payloads, queuePosition, "admin_api", "api")
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	result = mergeImportResults(preflightResult, result)
-	job, err := a.store.CreateCompletedImportJob(ctx, originalPayloads, queuePosition, result)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, err)
-		return
-	}
-	if err := a.tokens.Refresh(ctx); err != nil && a.logger != nil {
-		a.logger.Warn("token snapshot refresh after import failed", "error", err)
-	}
-	_ = a.store.WriteAuditLog(ctx, "token_import", "api", "import_job", strconv.FormatInt(job.ID, 10), map[string]any{
-		"created": result.Created,
-		"updated": result.Updated,
-		"skipped": result.Skipped,
-		"failed":  result.Failed,
-	})
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"job":    job,
 		"result": result,
 	})
+}
+
+func (a *App) completeTokenImport(ctx context.Context, payloads []map[string]any, queuePosition string, source string, auditActor string) (store.ImportJob, store.ImportResult, error) {
+	originalPayloads := payloads
+	upsertPayloads, preflightResult := a.prepareImportPayloads(ctx, originalPayloads)
+	result, err := a.store.UpsertTokenPayloads(ctx, upsertPayloads, source)
+	if err != nil {
+		return store.ImportJob{}, store.ImportResult{}, err
+	}
+	result = mergeImportResults(preflightResult, result)
+	job, err := a.store.CreateCompletedImportJob(ctx, originalPayloads, queuePosition, result)
+	if err != nil {
+		return store.ImportJob{}, store.ImportResult{}, err
+	}
+	if a.tokens != nil {
+		if err := a.tokens.Refresh(ctx); err != nil && a.logger != nil {
+			a.logger.Warn("token snapshot refresh after import failed", "error", err)
+		}
+	}
+	if a.store != nil {
+		_ = a.store.WriteAuditLog(ctx, "token_import", auditActor, "import_job", strconv.FormatInt(job.ID, 10), map[string]any{
+			"created": result.Created,
+			"updated": result.Updated,
+			"skipped": result.Skipped,
+			"failed":  result.Failed,
+			"source":  source,
+		})
+	}
+	return job, result, nil
 }
 
 func (a *App) prepareImportPayloads(ctx context.Context, payloads []map[string]any) ([]map[string]any, store.ImportResult) {
