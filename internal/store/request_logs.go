@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -73,6 +75,8 @@ type ModelStat struct {
 	Success   int    `json:"success"`
 	Failure   int    `json:"failure"`
 }
+
+const requestTokenCostReconcileSettingKey = "request_token_costs_go_recorded_reconciled_at"
 
 func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error {
 	if len(logs) == 0 {
@@ -404,6 +408,39 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 	if err != nil {
 		return 0, err
 	}
+	_, err = tx.Exec(ctx, `
+		with pending as (
+			select
+				token_id,
+				coalesce(estimated_cost_usd, 0) as estimated_cost_usd
+			from gateway_request_logs
+			where analytics_recorded_at is null
+			  and finished_at is not null
+			  and token_id is not null
+			  and estimated_cost_usd is not null
+			order by id
+			limit 5000
+			for update skip locked
+		),
+		agg as (
+			select
+				token_id,
+				count(*)::int as request_count,
+				sum(estimated_cost_usd)::float8 as estimated_cost_usd
+			from pending
+			group by token_id
+		)
+		insert into gateway_request_token_costs(token_id, request_count, estimated_cost_usd, updated_at)
+		select token_id, request_count, estimated_cost_usd, now()
+		from agg
+		on conflict (token_id) do update set
+			request_count = gateway_request_token_costs.request_count + excluded.request_count,
+			estimated_cost_usd = gateway_request_token_costs.estimated_cost_usd + excluded.estimated_cost_usd,
+			updated_at = now()
+	`)
+	if err != nil {
+		return 0, err
+	}
 	updated, err := tx.Exec(ctx, `
 		update gateway_request_logs
 		set analytics_recorded_at = now()
@@ -425,6 +462,341 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 		return updated.RowsAffected(), nil
 	}
 	return updated.RowsAffected(), nil
+}
+
+func (s *Store) TokenObservedCosts(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
+	result := make(map[int64]*float64, len(tokens))
+	requestedIDs := make([]int64, 0, len(tokens))
+	requested := map[int64]struct{}{}
+	tokenByID := map[int64]Token{}
+	for _, token := range tokens {
+		if token.ID <= 0 {
+			continue
+		}
+		if _, ok := requested[token.ID]; ok {
+			continue
+		}
+		requested[token.ID] = struct{}{}
+		requestedIDs = append(requestedIDs, token.ID)
+		tokenByID[token.ID] = token
+	}
+	if len(requestedIDs) == 0 {
+		return result, nil
+	}
+
+	canonicalByLogTokenID, err := s.canonicalTokenMap(ctx, requestedIDs, requested)
+	if err != nil {
+		return nil, err
+	}
+	if len(canonicalByLogTokenID) == 0 {
+		return result, nil
+	}
+
+	reconciled, err := s.RequestTokenCostsReconciled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if reconciled {
+		if err := s.addRequestCostsByTokenAggregate(ctx, canonicalByLogTokenID, result); err != nil {
+			return nil, err
+		}
+		if err := s.addRequestCostsByTokenLogs(ctx, canonicalByLogTokenID, result, true); err != nil {
+			return nil, err
+		}
+	} else if err := s.addRequestCostsByTokenLogs(ctx, canonicalByLogTokenID, result, false); err != nil {
+		return nil, err
+	}
+
+	if err := s.addRequestCostsByUniqueAccountFallback(ctx, tokenByID, result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *Store) addRequestCostsByUniqueAccountFallback(ctx context.Context, tokenByID map[int64]Token, result map[int64]*float64) error {
+	accountIDs := make([]string, 0)
+	accountSeen := map[string]struct{}{}
+	for _, token := range tokenByID {
+		if result[token.ID] != nil || token.AccountID == nil {
+			continue
+		}
+		accountID := strings.TrimSpace(*token.AccountID)
+		if accountID == "" {
+			continue
+		}
+		if _, ok := accountSeen[accountID]; ok {
+			continue
+		}
+		accountSeen[accountID] = struct{}{}
+		accountIDs = append(accountIDs, accountID)
+	}
+	if len(accountIDs) == 0 {
+		return nil
+	}
+
+	tokenCountsByAccount, err := s.tokenCountsByAccount(ctx, accountIDs)
+	if err != nil {
+		return err
+	}
+	costsByAccount, err := s.requestCostsByAccount(ctx, accountIDs)
+	if err != nil {
+		return err
+	}
+	for _, token := range tokenByID {
+		if result[token.ID] != nil || token.AccountID == nil {
+			continue
+		}
+		accountID := strings.TrimSpace(*token.AccountID)
+		if accountID == "" || tokenCountsByAccount[accountID] != 1 {
+			continue
+		}
+		cost, ok := costsByAccount[accountID]
+		if !ok {
+			continue
+		}
+		value := roundCostUSD(cost)
+		result[token.ID] = &value
+	}
+	return nil
+}
+
+func (s *Store) addRequestCostsByTokenAggregate(ctx context.Context, canonicalByLogTokenID map[int64]int64, result map[int64]*float64) error {
+	logTokenIDs := make([]int64, 0, len(canonicalByLogTokenID))
+	for tokenID := range canonicalByLogTokenID {
+		logTokenIDs = append(logTokenIDs, tokenID)
+	}
+	ids := postgresIntIDs(logTokenIDs)
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		select token_id, estimated_cost_usd
+		from gateway_request_token_costs
+		where token_id = any($1::integer[])
+	`, ids)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var logTokenID int64
+		var cost float64
+		if err := rows.Scan(&logTokenID, &cost); err != nil {
+			return err
+		}
+		addCanonicalCost(canonicalByLogTokenID, result, logTokenID, cost)
+	}
+	return rows.Err()
+}
+
+func (s *Store) addRequestCostsByTokenLogs(ctx context.Context, canonicalByLogTokenID map[int64]int64, result map[int64]*float64, pendingOnly bool) error {
+	logTokenIDs := make([]int64, 0, len(canonicalByLogTokenID))
+	for tokenID := range canonicalByLogTokenID {
+		logTokenIDs = append(logTokenIDs, tokenID)
+	}
+	ids := postgresIntIDs(logTokenIDs)
+	if len(ids) == 0 {
+		return nil
+	}
+	pendingClause := ""
+	if pendingOnly {
+		pendingClause = "and analytics_recorded_at is null"
+	}
+	rows, err := s.pool.Query(ctx, `
+		select token_id, coalesce(sum(estimated_cost_usd), 0)::float8
+		from gateway_request_logs
+		where token_id = any($1::integer[])
+		  and estimated_cost_usd is not null
+		  `+pendingClause+`
+		group by token_id
+	`, ids)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var logTokenID int64
+		var cost float64
+		if err := rows.Scan(&logTokenID, &cost); err != nil {
+			return err
+		}
+		addCanonicalCost(canonicalByLogTokenID, result, logTokenID, cost)
+	}
+	return rows.Err()
+}
+
+func addCanonicalCost(canonicalByLogTokenID map[int64]int64, result map[int64]*float64, logTokenID int64, cost float64) {
+	canonicalID, ok := canonicalByLogTokenID[logTokenID]
+	if !ok {
+		return
+	}
+	current := 0.0
+	if result[canonicalID] != nil {
+		current = *result[canonicalID]
+	}
+	total := roundCostUSD(current + cost)
+	result[canonicalID] = &total
+}
+
+func (s *Store) canonicalTokenMap(ctx context.Context, requestedIDs []int64, requested map[int64]struct{}) (map[int64]int64, error) {
+	rows, err := s.pool.Query(ctx, `
+		select id, merged_into_token_id
+		from codex_tokens
+		where id = any($1::integer[])
+		   or merged_into_token_id = any($1::integer[])
+	`, postgresIntIDs(requestedIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]int64{}
+	for rows.Next() {
+		var id int64
+		var mergedInto *int64
+		if err := rows.Scan(&id, &mergedInto); err != nil {
+			return nil, err
+		}
+		canonicalID := id
+		if mergedInto != nil {
+			if _, ok := requested[*mergedInto]; ok {
+				canonicalID = *mergedInto
+			}
+		}
+		if _, ok := requested[canonicalID]; ok {
+			out[id] = canonicalID
+		}
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) tokenCountsByAccount(ctx context.Context, accountIDs []string) (map[string]int, error) {
+	rows, err := s.pool.Query(ctx, `
+		select account_id, count(*)::int
+		from codex_tokens
+		where account_id = any($1::text[])
+		  and merged_into_token_id is null
+		group by account_id
+	`, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var accountID string
+		var count int
+		if err := rows.Scan(&accountID, &count); err != nil {
+			return nil, err
+		}
+		out[accountID] = count
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) requestCostsByAccount(ctx context.Context, accountIDs []string) (map[string]float64, error) {
+	rows, err := s.pool.Query(ctx, `
+		select account_id, coalesce(sum(estimated_cost_usd), 0)::float8
+		from gateway_request_logs
+		where account_id = any($1::text[])
+		  and estimated_cost_usd is not null
+		group by account_id
+	`, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]float64{}
+	for rows.Next() {
+		var accountID string
+		var cost float64
+		if err := rows.Scan(&accountID, &cost); err != nil {
+			return nil, err
+		}
+		out[accountID] = roundCostUSD(cost)
+	}
+	return out, rows.Err()
+}
+
+func roundCostUSD(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	if value < 0 {
+		return 0
+	}
+	return math.Round(value*1_000_000) / 1_000_000
+}
+
+func (s *Store) RequestTokenCostsReconciled(ctx context.Context) (bool, error) {
+	var completed bool
+	err := s.pool.QueryRow(ctx, `
+		select coalesce((value->>'completed')::boolean, false)
+		from gateway_settings
+		where key = $1
+	`, requestTokenCostReconcileSettingKey).Scan(&completed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return completed, err
+}
+
+func (s *Store) ReconcileRecordedTokenCosts(ctx context.Context) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var completed bool
+	err = tx.QueryRow(ctx, `
+		select coalesce((value->>'completed')::boolean, false)
+		from gateway_settings
+		where key = $1
+		for update
+	`, requestTokenCostReconcileSettingKey).Scan(&completed)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	if completed {
+		return false, tx.Commit(ctx)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		insert into gateway_request_token_costs(token_id, request_count, estimated_cost_usd, updated_at)
+		select
+			token_id,
+			count(*)::int as request_count,
+			coalesce(sum(estimated_cost_usd), 0)::float8 as estimated_cost_usd,
+			now()
+		from gateway_request_logs
+		where analytics_recorded_at is not null
+		  and token_id is not null
+		  and estimated_cost_usd is not null
+		group by token_id
+		on conflict (token_id) do update set
+			request_count = excluded.request_count,
+			estimated_cost_usd = excluded.estimated_cost_usd,
+			updated_at = excluded.updated_at
+	`); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `
+		insert into gateway_settings(key, value, updated_at)
+		values (
+			$1,
+			jsonb_build_object('completed', true, 'completed_at', now()),
+			now()
+		)
+		on conflict (key) do update set
+			value = excluded.value,
+			updated_at = excluded.updated_at
+	`, requestTokenCostReconcileSettingKey); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) DeleteOldRequestLogs(ctx context.Context, retentionDays int) (int64, error) {

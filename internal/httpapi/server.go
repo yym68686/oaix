@@ -64,6 +64,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/token-selection", a.requireAuth(a.updateTokenSelection))
 	mux.HandleFunc("GET /admin/tokens", a.requireAuth(a.listTokens))
 	mux.HandleFunc("POST /admin/tokens/batch", a.requireAuth(a.batchTokens))
+	mux.HandleFunc("GET /admin/tokens/costs", a.requireAuth(a.listTokenCosts))
 	mux.HandleFunc("GET /admin/tokens/{token_id}", a.requireAuth(a.getToken))
 	mux.HandleFunc("GET /admin/tokens/quota", a.requireAuth(a.listTokenQuota))
 	mux.HandleFunc("POST /admin/tokens/import", a.requireAuth(a.importTokens))
@@ -322,6 +323,38 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 		"items":                     adminItems,
 		"quota_refresh_pending_ids": pendingIDs,
 	})
+}
+
+func (a *App) listTokenCosts(w http.ResponseWriter, r *http.Request) {
+	ids, err := parseAdminTokenIDs(r.URL.Query().Get("ids"), 100)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(ids) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"items": []store.TokenObservedCost{}})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tokens, err := a.store.ListTokensByIDs(ctx, ids)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	costs, err := a.store.TokenObservedCosts(ctx, tokens)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	items := make([]store.TokenObservedCost, 0, len(tokens))
+	for _, token := range tokens {
+		items = append(items, store.TokenObservedCost{
+			ID:              token.ID,
+			ObservedCostUSD: costs[token.ID],
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (a *App) importTokens(w http.ResponseWriter, r *http.Request) {

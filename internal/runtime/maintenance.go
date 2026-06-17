@@ -95,6 +95,13 @@ func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Log
 		}
 		return nil
 	})
+	runStep(ctx, logger, "request token cost reconciliation", maxDuration(30*time.Second, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
+		reconciled, err := db.ReconcileRecordedTokenCosts(stepCtx)
+		if err == nil && reconciled && logger != nil {
+			logger.Info("request token costs reconciled")
+		}
+		return err
+	})
 	runStep(ctx, logger, "request log hourly aggregation", maxDuration(30*time.Second, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
 		aggregated, err := db.AggregateRequestHourlyStats(stepCtx)
 		if err == nil && aggregated > 0 && logger != nil {

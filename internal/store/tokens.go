@@ -30,6 +30,11 @@ type Token struct {
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
+type TokenObservedCost struct {
+	ID              int64    `json:"id"`
+	ObservedCostUSD *float64 `json:"observed_cost_usd"`
+}
+
 type TokenCounts struct {
 	Total     int `json:"total"`
 	Available int `json:"available"`
@@ -154,6 +159,25 @@ func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token,
 		return nil, 0, err
 	}
 	return items, total, nil
+}
+
+func (s *Store) ListTokensByIDs(ctx context.Context, tokenIDs []int64) ([]Token, error) {
+	ids := postgresIntIDs(tokenIDs)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		select id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		       is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		from codex_tokens
+		where id = any($1::integer[])
+		  and merged_into_token_id is null
+	`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTokens(rows)
 }
 
 func (s *Store) TokenCounts(ctx context.Context) (TokenCounts, error) {
@@ -573,4 +597,21 @@ func truncate(value string, max int) string {
 		return value[:max]
 	}
 	return value
+}
+
+func postgresIntIDs(ids []int64) []int32 {
+	out := make([]int32, 0, len(ids))
+	seen := map[int32]struct{}{}
+	for _, id := range ids {
+		if id <= 0 || id > 2147483647 {
+			continue
+		}
+		value := int32(id)
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }

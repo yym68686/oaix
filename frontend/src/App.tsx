@@ -1111,6 +1111,7 @@ function TokenCard({
               <div className="flex min-w-0 flex-wrap items-center gap-1">
                 <TokenQuotaStrip quota={item.quota} />
                 <TokenConcurrency fallbackCap={activeStreamCap} item={item} />
+                <TokenObservedCost value={item.observed_cost_usd} />
               </div>
               <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground">
                 <span className="oaix-tabular">最近 {formatDate(item.last_used_at)}</span>
@@ -1196,6 +1197,19 @@ function TokenConcurrency({ fallbackCap, item }: { fallbackCap: number; item: To
       <div className="h-1 w-8 overflow-hidden rounded-full bg-muted">
         <div className={cn("h-full rounded-full", used >= 90 ? "bg-warning" : "bg-info")} style={{ width: `${used}%` }} />
       </div>
+    </div>
+  );
+}
+
+function TokenObservedCost({ value }: { value?: number | null }) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) {
+    return null;
+  }
+  return (
+    <div className="inline-flex min-w-[5.6rem] items-center gap-1 rounded-md border bg-muted/32 px-2 py-0.5" title={`已使用金额 ${formatUSD(amount)}`}>
+      <span className="text-muted-foreground">已用</span>
+      <span className="oaix-tabular font-medium">{formatUSD(amount)}</span>
     </div>
   );
 }
@@ -1677,6 +1691,20 @@ function formatPercent(value: unknown): string {
     return "-";
   }
   return `${Math.round(clamp(number, 0, 100))}%`;
+}
+
+function formatUSD(value: number): string {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) {
+    return "-";
+  }
+  const fractionDigits = Math.abs(amount) > 0 && Math.abs(amount) < 1 ? 4 : 2;
+  return new Intl.NumberFormat("en-US", {
+    currency: "USD",
+    maximumFractionDigits: fractionDigits,
+    minimumFractionDigits: fractionDigits,
+    style: "currency",
+  }).format(amount);
 }
 
 function probeOutcomeLabel(outcome?: string): string {

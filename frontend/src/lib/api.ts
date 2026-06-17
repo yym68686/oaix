@@ -42,7 +42,13 @@ export type TokenItem = {
   updated_at?: string | null;
   active_streams?: number | null;
   active_stream_cap?: number | null;
+  observed_cost_usd?: number | null;
   quota?: TokenQuotaSnapshot | null;
+};
+
+export type TokenObservedCostItem = {
+  id: number;
+  observed_cost_usd?: number | null;
 };
 
 export type TokenProbeResponse = {
@@ -207,6 +213,8 @@ export const api = {
     postJSON<Record<string, unknown>>("/admin/token-selection", payload),
   listTokens: (params: URLSearchParams) =>
     requestJSON<TokenListResponse>(`/admin/tokens?${params.toString()}`),
+  tokenCosts: (ids: number[]) =>
+    requestJSON<{ items?: TokenObservedCostItem[] }>(`/admin/tokens/costs?ids=${ids.join(",")}`),
   updateActivation: (id: number, payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>(`/admin/tokens/${id}/activation`, payload),
   updateRemark: (id: number, remark: string) =>

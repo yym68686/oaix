@@ -33,6 +33,7 @@ type adminTokenItem struct {
 	store.Token
 	ActiveStreams   int64               `json:"active_streams"`
 	ActiveStreamCap int64               `json:"active_stream_cap"`
+	ObservedCostUSD *float64            `json:"observed_cost_usd"`
 	Quota           *codexQuotaSnapshot `json:"quota,omitempty"`
 }
 
@@ -110,6 +111,20 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 		quotaByID, pendingIDs = a.quota.collect(ctx, tokens)
 	}
 
+	observedCostByID := map[int64]*float64{}
+	if len(tokens) > 0 {
+		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+		defer cancel()
+		var err error
+		observedCostByID, err = a.store.TokenObservedCosts(ctx, tokens)
+		if err != nil {
+			observedCostByID = map[int64]*float64{}
+			if a.logger != nil {
+				a.logger.Warn("admin token observed costs load failed", "error", err)
+			}
+		}
+	}
+
 	activeByID := a.activeStreamsByTokenID(tokens)
 	cap := a.tokens.ActiveStreamCap()
 	items := make([]adminTokenItem, 0, len(tokens))
@@ -118,6 +133,7 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 			Token:           token,
 			ActiveStreams:   activeByID[token.ID],
 			ActiveStreamCap: cap,
+			ObservedCostUSD: observedCostByID[token.ID],
 			Quota:           quotaByID[token.ID],
 		})
 	}
