@@ -268,6 +268,14 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 		lastErr = err
 		action := classify(status, err)
+		if action == OutcomeClientCanceled {
+			message := "client canceled"
+			if err != nil {
+				message = err.Error()
+			}
+			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+			return
+		}
 		if action == OutcomeUpstream401Invalid || action == OutcomeUpstream403Invalid {
 			p.commitTokenError(claim.TokenID(), fmt.Sprintf("terminal upstream status %d", status), true, nil)
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
