@@ -92,14 +92,15 @@ type RefreshTokenIdentity struct {
 }
 
 type TokenSecretUpdate struct {
-	TokenID      int64
-	AccessToken  string
-	RefreshToken string
-	IDToken      string
-	ExpiresAt    *time.Time
-	AccountID    string
-	Email        string
-	PlanType     string
+	TokenID            int64
+	AccessToken        string
+	RefreshToken       string
+	IDToken            string
+	ExpiresAt          *time.Time
+	AccountID          string
+	Email              string
+	PlanType           string
+	PreserveActivation bool
 }
 
 func (s *Store) ListAvailableTokens(ctx context.Context) ([]Token, error) {
@@ -553,7 +554,12 @@ func (s *Store) TouchTokens(ctx context.Context, tokenIDs []int64, usedAt time.T
 func (s *Store) MarkTokenSuccess(ctx context.Context, tokenID int64) error {
 	_, err := s.pool.Exec(ctx, `
 		update codex_tokens
-		set last_used_at = now(), last_error = null, updated_at = now()
+		set is_active = true,
+		    cooldown_until = null,
+		    disabled_at = null,
+		    last_used_at = now(),
+		    last_error = null,
+		    updated_at = now()
 		where id = $1
 	`, tokenID)
 	if err != nil {
@@ -736,12 +742,12 @@ func (s *Store) UpdateTokenSecret(ctx context.Context, update TokenSecretUpdate)
 		    email = coalesce(nullif($7, ''), email),
 		    plan_type = coalesce(nullif($8, ''), plan_type),
 		    last_refresh = now(),
-		    last_error = null,
-		    is_active = true,
-		    disabled_at = null,
+		    last_error = case when $9 then last_error else null end,
+		    is_active = case when $9 then is_active else true end,
+		    disabled_at = case when $9 then disabled_at else null end,
 		    updated_at = now()
 		where id = $1 and merged_into_token_id is null
-	`, update.TokenID, update.AccessToken, update.RefreshToken, update.IDToken, update.ExpiresAt, update.AccountID, update.Email, update.PlanType)
+	`, update.TokenID, update.AccessToken, update.RefreshToken, update.IDToken, update.ExpiresAt, update.AccountID, update.Email, update.PlanType, update.PreserveActivation)
 	if err != nil {
 		return err
 	}
@@ -766,6 +772,32 @@ func (s *Store) UpdateTokenSecret(ctx context.Context, update TokenSecretUpdate)
 		if err != nil {
 			return err
 		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) ClearTokenAccess(ctx context.Context, tokenID int64) error {
+	if tokenID <= 0 {
+		return fmt.Errorf("token id is required")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		update codex_tokens
+		set access_token = null, updated_at = now()
+		where id = $1 and merged_into_token_id is null
+	`, tokenID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		update token_secrets
+		set access_token = null, updated_at = now()
+		where token_id = $1
+	`, tokenID); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }
