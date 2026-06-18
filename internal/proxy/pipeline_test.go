@@ -54,6 +54,25 @@ func TestWriteSSEError(t *testing.T) {
 	}
 }
 
+func TestWriteFinalErrorResponseDoesNotRewriteStartedStreamHeader(t *testing.T) {
+	recorder := &countingResponseRecorder{ResponseRecorder: httptest.NewRecorder()}
+	recorder.Header().Set("Content-Type", "text/event-stream")
+	recorder.WriteHeader(http.StatusOK)
+
+	writeFinalErrorResponse(recorder, true, true, http.StatusServiceUnavailable, "no token")
+
+	if recorder.writeHeaderCount != 1 {
+		t.Fatalf("WriteHeader called %d times, want 1", recorder.writeHeaderCount)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want original 200", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, "no token") {
+		t.Fatalf("unexpected SSE body: %q", body)
+	}
+}
+
 func TestCopyAndFlushStopsOnClientWriteError(t *testing.T) {
 	writer := failingWriter{failAfter: 5}
 	written, err := copyAndFlush(writer, strings.NewReader("hello world"), nil)
@@ -478,6 +497,16 @@ func defaultPromptCacheConfig() config.PromptCacheConfig {
 type failingWriter struct {
 	failAfter int
 	written   int
+}
+
+type countingResponseRecorder struct {
+	*httptest.ResponseRecorder
+	writeHeaderCount int
+}
+
+func (r *countingResponseRecorder) WriteHeader(status int) {
+	r.writeHeaderCount++
+	r.ResponseRecorder.WriteHeader(status)
 }
 
 func (w failingWriter) Header() http.Header {

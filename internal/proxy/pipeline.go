@@ -292,7 +292,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 	}
 	if errors.Is(lastErr, tokens.ErrNoToken) {
-		writeErrorResponse(w, intent.Stream, http.StatusServiceUnavailable, "no available token")
+		writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, http.StatusServiceUnavailable, "no available token")
 		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, len(excluded), selectedTokenID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 		return
 	}
@@ -300,7 +300,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	if lastErr != nil {
 		message = lastErr.Error()
 	}
-	writeErrorResponse(w, intent.Stream, finalStatus, message)
+	writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, finalStatus, message)
 	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, len(excluded), selectedTokenID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 }
 
@@ -627,7 +627,24 @@ func writeErrorResponse(w http.ResponseWriter, stream bool, status int, message 
 	writeJSONError(w, status, message)
 }
 
+func writeFinalErrorResponse(w http.ResponseWriter, stream bool, downstreamStarted bool, status int, message string) {
+	if stream && downstreamStarted {
+		writeSSEErrorEvent(w, status, message)
+		return
+	}
+	writeErrorResponse(w, stream, status, message)
+}
+
 func writeSSEError(w http.ResponseWriter, status int, message string) {
+	if status <= 0 {
+		status = http.StatusBadGateway
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(status)
+	writeSSEErrorEvent(w, status, message)
+}
+
+func writeSSEErrorEvent(w http.ResponseWriter, status int, message string) {
 	if status <= 0 {
 		status = http.StatusBadGateway
 	}
@@ -639,8 +656,6 @@ func writeSSEError(w http.ResponseWriter, status int, message string) {
 			"status":  status,
 		},
 	})
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.WriteHeader(status)
 	_, _ = w.Write(sse.Encode("error", payload))
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
