@@ -4,16 +4,21 @@ import {
   KeyRoundIcon,
   ListFilterIcon,
   RefreshCwIcon,
+  SaveIcon,
   Settings2Icon,
   ShieldCheckIcon,
   UploadIcon,
 } from "lucide-react";
+import { useEffect, useState } from "react";
 import type * as React from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
+import { Dialog, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
+import { Input } from "@/registry/default/ui/input";
+import { Label } from "@/registry/default/ui/label";
 import { cn } from "@/registry/default/lib/utils";
-import type { HealthResponse, TokenCounts } from "@/lib/api";
+import { getServiceKey, setServiceKey, type HealthResponse, type TokenCounts } from "@/lib/api";
 import { formatNumber } from "@/lib/format";
 import { ThemeButton } from "@/shared/components";
 import type { RouteKey, ThemePreference } from "@/shared/types";
@@ -62,6 +67,40 @@ export function AppShell({
   webVersion?: { hash: string; time: string };
 }) {
   const available = counts.available ?? counts.active ?? 0;
+  const [credentialDialogOpen, setCredentialDialogOpen] = useState(false);
+  const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
+  const [serviceKeyError, setServiceKeyError] = useState("");
+  const credentialRequired = authBlocked && protectedMode;
+  const credentialOpen = credentialRequired || credentialDialogOpen;
+
+  useEffect(() => {
+    if (credentialRequired) {
+      setServiceKeyDraft(getServiceKey());
+      setServiceKeyError("");
+      setCredentialDialogOpen(true);
+    }
+  }, [credentialRequired]);
+
+  function changeCredentialDialogOpen(open: boolean) {
+    if (credentialRequired) {
+      setCredentialDialogOpen(true);
+      return;
+    }
+    setCredentialDialogOpen(open);
+  }
+
+  function saveCredential() {
+    const key = serviceKeyDraft.trim();
+    if (!key) {
+      setServiceKeyError("请先填写 Service API Key。");
+      return;
+    }
+    setServiceKey(key);
+    setServiceKeyError("");
+    setCredentialDialogOpen(false);
+    onRefresh();
+  }
+
   return (
     <div className="min-h-screen text-foreground">
       <div className="mx-auto grid min-h-screen w-full max-w-[1600px] grid-cols-1 gap-0 px-3 py-3 lg:grid-cols-[220px_minmax(0,1fr)] lg:px-4">
@@ -122,6 +161,20 @@ export function AppShell({
                 <h1 className="font-heading text-2xl font-semibold tracking-normal">Key 池控制台</h1>
               </div>
               <div className="flex flex-wrap items-center gap-2 md:justify-end">
+                {protectedMode && (
+                  <Button
+                    onClick={() => {
+                      setServiceKeyDraft(getServiceKey());
+                      setServiceKeyError("");
+                      setCredentialDialogOpen(true);
+                    }}
+                    size="sm"
+                    variant="outline"
+                  >
+                    <ShieldCheckIcon />
+                    Service API Key
+                  </Button>
+                )}
                 <ThemeButton value="auto" current={theme} onSelect={onThemeChange} />
                 <ThemeButton value="light" current={theme} onSelect={onThemeChange} />
                 <ThemeButton value="dark" current={theme} onSelect={onThemeChange} />
@@ -137,7 +190,7 @@ export function AppShell({
             <Alert className="mb-4" variant="warning">
               <ShieldCheckIcon />
               <AlertTitle>管理接口需要 Service API Key</AlertTitle>
-              <AlertDescription>请进入导入页保存凭证，然后刷新管理数据。</AlertDescription>
+              <AlertDescription>请先填写 Service API Key，保存后会重新同步管理数据。</AlertDescription>
             </Alert>
           )}
 
@@ -149,6 +202,50 @@ export function AppShell({
           </footer>
         </div>
       </div>
+      <Dialog open={credentialOpen} onOpenChange={changeCredentialDialogOpen}>
+        <DialogPopup className="sm:max-w-md" showCloseButton={!credentialRequired}>
+          <DialogHeader>
+            <DialogTitle>填写 Service API Key</DialogTitle>
+            <DialogDescription>
+              当前管理接口启用了服务侧凭证，继续操作前需要先保存 Service API Key。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogPanel className="grid gap-2">
+            <Label htmlFor="global-service-key">Service API Key</Label>
+            <Input
+              autoFocus
+              id="global-service-key"
+              nativeInput
+              onChange={(event) => {
+                setServiceKeyDraft(event.currentTarget.value);
+                if (serviceKeyError) {
+                  setServiceKeyError("");
+                }
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  saveCredential();
+                }
+              }}
+              placeholder="请输入管理接口 Service API Key"
+              type="password"
+              value={serviceKeyDraft}
+            />
+            {serviceKeyError && <div className="text-destructive-foreground text-sm">{serviceKeyError}</div>}
+          </DialogPanel>
+          <DialogFooter>
+            {!credentialRequired && (
+              <Button onClick={() => setCredentialDialogOpen(false)} variant="ghost">
+                取消
+              </Button>
+            )}
+            <Button onClick={saveCredential}>
+              <SaveIcon />
+              保存并同步
+            </Button>
+          </DialogFooter>
+        </DialogPopup>
+      </Dialog>
     </div>
   );
 }
