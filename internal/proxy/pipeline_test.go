@@ -424,6 +424,42 @@ func TestWriteImageJSONResponseFromSSE(t *testing.T) {
 	}
 }
 
+func TestWriteImageJSONResponseTreatsEventStreamAcceptAsSSE(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := strings.Join([]string{
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"created_at":1710000001,"output":[{"type":"image_generation_call","result":"QUJD","output_format":"png"}],"tool_usage":{"image_gen":{"images":1}}}}`,
+		``,
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.writeImageJSONResponse(recorder, resp, Attempt{Intent: RequestIntent{
+		Model:               "gpt-image-2",
+		UpstreamAccept:      "text/event-stream",
+		ImageResponseFormat: "b64_json",
+		ImageStreamPrefix:   "image_generation",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Committed || result.Status != http.StatusOK {
+		t.Fatalf("expected committed image response: %+v", result)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	data := payload["data"].([]any)[0].(map[string]any)
+	if data["b64_json"] != "QUJD" {
+		t.Fatalf("event-stream body was not collected as image response: %v", payload)
+	}
+}
+
 func defaultPromptCacheConfig() config.PromptCacheConfig {
 	return config.PromptCacheConfig{
 		AffinityEnabled:       true,

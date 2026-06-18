@@ -1325,7 +1325,7 @@ func (p *Pipeline) writeImageJSONResponse(w http.ResponseWriter, resp *http.Resp
 	var response map[string]any
 	var firstTokenAt *time.Time
 	var err error
-	if isSSE(resp.Header.Get("Content-Type")) {
+	if shouldCollectImageResponseAsSSE(resp.Header.Get("Content-Type"), attempt.Intent) {
 		response, firstTokenAt, err = p.collectImageAPIResponseFromSSE(resp, attempt)
 	} else {
 		var payload map[string]any
@@ -1371,6 +1371,17 @@ func (p *Pipeline) writeImageJSONResponse(w http.ResponseWriter, resp *http.Resp
 		return result, writeErr
 	}
 	return result, nil
+}
+
+func shouldCollectImageResponseAsSSE(contentType string, intent RequestIntent) bool {
+	normalized := strings.ToLower(strings.TrimSpace(contentType))
+	if isSSE(normalized) {
+		return true
+	}
+	if strings.Contains(normalized, "application/json") {
+		return false
+	}
+	return intent.UpstreamAccept == "text/event-stream"
 }
 
 func transformImageStreamEvent(eventType string, payload map[string]any, responseFormat, streamPrefix string) ([][]byte, bool, error) {
