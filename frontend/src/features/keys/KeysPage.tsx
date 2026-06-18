@@ -59,6 +59,7 @@ import {
   TokenObservedCost,
   TokenProbeResult,
   TokenQuotaStrip,
+  TokenStatusPlan,
   statusBadge,
 } from "@/shared/components";
 import type { DeleteTarget, RemarkTarget, ToastMessage, TokenStatus } from "@/shared/types";
@@ -441,7 +442,7 @@ function TokenTable({
         <colgroup>
           <col className="w-9" />
           <col className="w-[28%]" />
-          <col className="w-[4.5rem]" />
+          <col className="w-[5.75rem]" />
           <col className="w-[8.75rem]" />
           <col className="w-[9.5rem]" />
           <col className="w-[9.75rem]" />
@@ -543,14 +544,7 @@ function TokenRow({
         </div>
       </TableCell>
       <TableCell>
-        <div className="flex max-h-6 flex-wrap items-center gap-1 overflow-hidden">
-          <Badge size="sm" variant={statusBadge(status)}>
-            {tokenStatusLabel(status)}
-          </Badge>
-          <Badge className="max-w-24 truncate" size="sm" title={planType} variant="secondary">
-            {planType}
-          </Badge>
-        </div>
+        <TokenStatusPlan plan={planType} status={status} />
       </TableCell>
       <TableCell className="px-1.5">
         <div className="flex max-h-11 min-w-0 flex-wrap items-center gap-1 overflow-hidden text-[11px]">

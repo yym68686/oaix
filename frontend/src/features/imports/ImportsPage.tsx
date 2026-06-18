@@ -39,7 +39,6 @@ import {
   planOptionsWithCounts,
   statusOptionsWithCounts,
   tokenPlanType,
-  tokenStatusLabel,
   tokenStatusOf,
   tokenTitle,
 } from "@/shared/domain";
@@ -50,9 +49,9 @@ import {
   SelectField,
   TokenConcurrency,
   TokenObservedCost,
+  TokenStatusPlan,
   TokenQuotaStrip,
   importBatchBadge,
-  statusBadge,
 } from "@/shared/components";
 import type { RouteState } from "@/app/router";
 import { navigateTo as go } from "@/app/router";
@@ -843,14 +842,7 @@ function ImportBatchTokenRow({ token }: { token: TokenItem }) {
         </div>
       </TableCell>
       <TableCell className="py-2 align-middle">
-        <div className="flex max-h-6 flex-wrap items-center gap-1 overflow-hidden">
-          <Badge size="sm" variant={statusBadge(status)}>
-            {tokenStatusLabel(status)}
-          </Badge>
-          <Badge className="max-w-24 truncate" size="sm" title={planType} variant="secondary">
-            {planType}
-          </Badge>
-        </div>
+        <TokenStatusPlan plan={planType} status={status} />
       </TableCell>
       <TableCell className="py-2 align-middle">
         <div className="flex max-h-11 flex-wrap items-center gap-1 overflow-hidden text-[11px]">

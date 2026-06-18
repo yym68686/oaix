@@ -25,6 +25,7 @@ import {
   formatUSD,
   probeOutcomeLabel,
   quotaWindowFor,
+  tokenStatusLabel,
 } from "./domain";
 import type { ThemePreference, ToastMessage } from "./types";
 
@@ -283,6 +284,26 @@ export function TokenProbeResult({ result }: { result: TokenProbeResponse }) {
       <span className="min-w-0 truncate text-muted-foreground" title={result.detail || text}>
         {text}
       </span>
+    </div>
+  );
+}
+
+export function TokenStatusPlan({
+  plan,
+  status,
+}: {
+  plan: string;
+  status: "active" | "cooling" | "disabled";
+}) {
+  const planLabel = plan || "unknown";
+  return (
+    <div className="inline-grid min-w-[4.75rem] max-w-full gap-1">
+      <Badge className="w-fit max-w-full" size="sm" variant={statusBadge(status)}>
+        {tokenStatusLabel(status)}
+      </Badge>
+      <Badge className="w-fit max-w-full truncate" size="sm" title={planLabel} variant="secondary">
+        {planLabel}
+      </Badge>
     </div>
   );
 }
