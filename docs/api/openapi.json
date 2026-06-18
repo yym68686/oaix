@@ -1,0 +1,66 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "oaix Admin API",
+    "version": "2026-06-19"
+  },
+  "servers": [
+    {
+      "url": "https://oaix.fugue.pro"
+    }
+  ],
+  "security": [
+    {
+      "serviceApiKey": []
+    }
+  ],
+  "paths": {
+    "/admin/openapi.json": {"get": {"responses": {"200": {"description": "OpenAPI snapshot"}}}},
+    "/admin/options": {"get": {"responses": {"200": {"description": "Filter options"}}}},
+    "/admin/tokens": {"get": {"responses": {"200": {"description": "Token list"}}}},
+    "/admin/tokens/export": {"get": {"responses": {"200": {"description": "Token export"}}}},
+    "/admin/tokens/{id}": {"get": {"responses": {"200": {"description": "Token detail"}}}, "patch": {"responses": {"200": {"description": "Update token metadata"}}}, "delete": {"responses": {"200": {"description": "Delete token"}}}},
+    "/admin/tokens/{id}/cooldown": {"post": {"responses": {"200": {"description": "Set cooldown"}}}},
+    "/admin/token-cooldown/{id}": {"delete": {"responses": {"200": {"description": "Clear cooldown"}}}},
+    "/admin/token-last-error/{id}": {"delete": {"responses": {"200": {"description": "Clear last error"}}}},
+    "/admin/tokens/{id}/secrets": {"post": {"responses": {"200": {"description": "Rotate secrets"}}}},
+    "/admin/tokens/{id}/refresh": {"post": {"responses": {"200": {"description": "Refresh access token"}}}},
+    "/admin/token-refresh-history/{id}": {"get": {"responses": {"200": {"description": "Refresh token history"}}}},
+    "/admin/tokens/{id}/merge": {"post": {"responses": {"200": {"description": "Merge token"}}}},
+    "/admin/tokens/{id}/unmerge": {"post": {"responses": {"200": {"description": "Unmerge token"}}}},
+    "/admin/token-quota-history/{id}": {"get": {"responses": {"200": {"description": "Quota snapshot history"}}}},
+    "/admin/tokens/quota-refresh": {"post": {"responses": {"202": {"description": "Create quota refresh job"}}}},
+    "/admin/tokens/quota-refresh/{job_id}": {"get": {"responses": {"200": {"description": "Quota refresh job"}}}},
+    "/admin/import/parse": {"post": {"responses": {"200": {"description": "Parse import payload"}}}},
+    "/admin/import/upload": {"post": {"responses": {"200": {"description": "Upload import file"}}}},
+    "/admin/import/jobs": {"get": {"responses": {"200": {"description": "Import jobs"}}}, "post": {"responses": {"202": {"description": "Create import job"}}}},
+    "/admin/import/jobs/{id}": {"get": {"responses": {"200": {"description": "Import job detail"}}}, "delete": {"responses": {"200": {"description": "Delete import job"}}}},
+    "/admin/import/jobs/{id}/items": {"get": {"responses": {"200": {"description": "Import job items"}}}},
+    "/admin/import/jobs/{id}/tokens": {"get": {"responses": {"200": {"description": "Import job tokens"}}}},
+    "/admin/import/jobs/{id}/failed-items": {"get": {"responses": {"200": {"description": "Failed import items"}}}},
+    "/admin/import/jobs/{id}/retry": {"post": {"responses": {"200": {"description": "Retry import job"}}}},
+    "/admin/import/items/{id}/retry": {"post": {"responses": {"200": {"description": "Retry import item"}}}},
+    "/admin/import/items/{id}/skip": {"post": {"responses": {"200": {"description": "Skip import item"}}}},
+    "/admin/oauth/openai/sessions": {"post": {"responses": {"200": {"description": "Create OAuth session"}}}},
+    "/admin/oauth/openai/sessions/{id}": {"get": {"responses": {"200": {"description": "OAuth session"}}}, "delete": {"responses": {"200": {"description": "Cancel OAuth session"}}}},
+    "/admin/oauth/openai/sessions/{id}/exchange": {"post": {"responses": {"200": {"description": "Exchange OAuth code"}}}},
+    "/admin/requests": {"get": {"responses": {"200": {"description": "Request logs"}}}},
+    "/admin/requests/{request_id}": {"get": {"responses": {"200": {"description": "Request detail"}}}},
+    "/admin/requests/export": {"get": {"responses": {"200": {"description": "Request export"}}}},
+    "/admin/analytics/models": {"get": {"responses": {"200": {"description": "Model analytics"}}}},
+    "/admin/analytics/cache": {"get": {"responses": {"200": {"description": "Cache analytics"}}}},
+    "/admin/analytics/errors": {"get": {"responses": {"200": {"description": "Error analytics"}}}},
+    "/admin/analytics/latency": {"get": {"responses": {"200": {"description": "Latency analytics"}}}},
+    "/admin/settings/{key}": {"get": {"responses": {"200": {"description": "Setting"}}}, "post": {"responses": {"200": {"description": "Update setting"}}}, "delete": {"responses": {"200": {"description": "Delete setting"}}}},
+    "/admin/audit-logs": {"get": {"responses": {"200": {"description": "Audit logs"}}}},
+    "/admin/api-keys": {"get": {"responses": {"200": {"description": "API key summaries"}}}, "post": {"responses": {"201": {"description": "Create API key"}}}}
+  },
+  "components": {
+    "securitySchemes": {
+      "serviceApiKey": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}

@@ -77,12 +77,24 @@ type ImportResultItem struct {
 }
 
 type TokenListOptions struct {
-	Limit  int
-	Offset int
-	Query  string
-	Status string
-	Plan   string
-	Sort   string
+	Limit          int
+	Offset         int
+	Cursor         string
+	Query          string
+	Status         string
+	Plan           string
+	Sort           string
+	ImportJobID    int64
+	Source         string
+	SourceFile     string
+	CreatedFrom    *time.Time
+	CreatedTo      *time.Time
+	LastUsedFrom   *time.Time
+	LastUsedTo     *time.Time
+	HasError       *bool
+	ErrorCode      string
+	CooldownReason string
+	QuotaState     string
 }
 
 type RefreshTokenIdentity struct {
@@ -141,10 +153,18 @@ func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token,
 	switch strings.ToLower(strings.TrimSpace(opts.Sort)) {
 	case "oldest":
 		orderBy = "id asc"
+	case "created_at":
+		orderBy = "id asc"
+	case "-created_at", "latest", "newest":
+		orderBy = "id desc"
 	case "last_used":
+		orderBy = "last_used_at desc nulls last, id desc"
+	case "-last_used_at":
 		orderBy = "last_used_at desc nulls last, id desc"
 	case "available":
 		orderBy = "is_active desc, cooldown_until asc nulls first, last_used_at asc nulls first"
+	case "status":
+		orderBy = "is_active desc, disabled_at asc nulls first, cooldown_until asc nulls first, id desc"
 	}
 	args = append(args, limit, offset)
 	query := fmt.Sprintf(`
@@ -196,6 +216,50 @@ func tokenListWhere(opts TokenListOptions, includePlan bool) (string, []any) {
 				filters = append(filters, fmt.Sprintf("lower(btrim(plan_type)) = %s", placeholder))
 			}
 		}
+	}
+	if opts.ImportJobID > 0 {
+		placeholder := arg(opts.ImportJobID)
+		filters = append(filters, fmt.Sprintf(`exists (
+			select 1
+			from token_import_items import_item
+			where import_item.token_id = codex_tokens.id
+			  and import_item.job_id = %s
+		)`, placeholder))
+	}
+	if source := strings.TrimSpace(opts.Source); source != "" {
+		placeholder := arg(source)
+		filters = append(filters, fmt.Sprintf("coalesce(raw_payload->>'source', '') = %s", placeholder))
+	}
+	if sourceFile := strings.TrimSpace(opts.SourceFile); sourceFile != "" {
+		placeholder := arg("%" + sourceFile + "%")
+		filters = append(filters, fmt.Sprintf("coalesce(source_file, '') ilike %s", placeholder))
+	}
+	if opts.CreatedFrom != nil {
+		filters = append(filters, fmt.Sprintf("created_at >= %s", arg(*opts.CreatedFrom)))
+	}
+	if opts.CreatedTo != nil {
+		filters = append(filters, fmt.Sprintf("created_at <= %s", arg(*opts.CreatedTo)))
+	}
+	if opts.LastUsedFrom != nil {
+		filters = append(filters, fmt.Sprintf("last_used_at >= %s", arg(*opts.LastUsedFrom)))
+	}
+	if opts.LastUsedTo != nil {
+		filters = append(filters, fmt.Sprintf("last_used_at <= %s", arg(*opts.LastUsedTo)))
+	}
+	if opts.HasError != nil {
+		if *opts.HasError {
+			filters = append(filters, "last_error is not null and btrim(last_error) <> ''")
+		} else {
+			filters = append(filters, "(last_error is null or btrim(last_error) = '')")
+		}
+	}
+	if errorCode := strings.TrimSpace(opts.ErrorCode); errorCode != "" {
+		placeholder := arg("%" + errorCode + "%")
+		filters = append(filters, fmt.Sprintf("coalesce(last_error, '') ilike %s", placeholder))
+	}
+	if reason := strings.TrimSpace(opts.CooldownReason); reason != "" {
+		placeholder := arg("%" + reason + "%")
+		filters = append(filters, fmt.Sprintf("coalesce(last_error, '') ilike %s", placeholder))
 	}
 	where := strings.Join(filters, " and ")
 	if where == "" {

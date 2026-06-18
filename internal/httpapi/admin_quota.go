@@ -283,6 +283,18 @@ func (s *adminQuotaService) cached(tokenID int64, now time.Time, includeStale bo
 	return cached.snapshot, fresh
 }
 
+func (s *adminQuotaService) clear(tokenIDs []int64) {
+	if s == nil || len(tokenIDs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range tokenIDs {
+		delete(s.cache, id)
+		delete(s.pending, id)
+	}
+}
+
 func (s *adminQuotaService) isPending(tokenID int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -492,6 +504,9 @@ func (s *adminQuotaService) refreshQuotaToken(ctx context.Context, token store.T
 }
 
 func (s *adminQuotaService) storeSnapshot(tokenID int64, snapshot *codexQuotaSnapshot) *codexQuotaSnapshot {
+	if s.store != nil && snapshot != nil {
+		_ = s.store.SaveQuotaSnapshot(context.Background(), tokenID, snapshot, snapshot.PlanType, snapshot.Error)
+	}
 	s.mu.Lock()
 	s.cache[tokenID] = cachedQuotaSnapshot{
 		snapshot:  snapshot,

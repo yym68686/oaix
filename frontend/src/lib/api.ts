@@ -138,6 +138,14 @@ export type ImportBatchDetail = {
   tokens?: TokenItem[];
 };
 
+export type ImportParseResponse = {
+  items?: Array<string | Record<string, unknown>>;
+  summary?: {
+    total?: number;
+    deduplicated?: boolean;
+  };
+};
+
 export type OpenAIOAuthStartResponse = {
   auth_url: string;
   session_id?: string;
@@ -263,6 +271,13 @@ function postJSON<T>(path: string, body: unknown): Promise<T> {
   });
 }
 
+function postForm<T>(path: string, body: FormData): Promise<T> {
+  return requestJSON<T>(path, {
+    body,
+    method: "POST",
+  });
+}
+
 export const api = {
   health: () => requestJSON<HealthResponse>("/healthz"),
   runtime: () => requestJSON<Record<string, unknown>>("/admin/runtime"),
@@ -291,6 +306,12 @@ export const api = {
     requestJSON<Record<string, unknown>>(`/admin/tokens/${id}`, { method: "DELETE" }),
   batchTokens: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/tokens/batch", payload),
+  parseImport: (payload: Record<string, unknown>) =>
+    postJSON<ImportParseResponse>("/admin/import/parse", payload),
+  uploadImport: (body: FormData) =>
+    postForm<ImportParseResponse>("/admin/import/upload", body),
+  createImportJob: (payload: Record<string, unknown>) =>
+    postJSON<Record<string, unknown>>("/admin/import/jobs", payload),
   importTokens: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/tokens/import", payload),
   startOpenAIOAuth: (payload: Record<string, unknown>) =>

@@ -35,6 +35,9 @@ func (a *App) listTokenQuota(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"items": []adminTokenItem{}})
 		return
 	}
+	if queryBool(r, "force_refresh", false) && a.quota != nil {
+		a.quota.clear(ids)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	tokens := make([]store.Token, 0, len(ids))

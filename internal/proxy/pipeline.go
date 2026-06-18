@@ -119,6 +119,13 @@ func (p *Pipeline) StateCommitFailures() int64 {
 	return p.commitFailures.Load()
 }
 
+func (p *Pipeline) CloseIdleConnections() {
+	if p == nil || p.transport == nil {
+		return
+	}
+	p.transport.CloseIdleConnections()
+}
+
 func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestIntent) {
 	started := time.Now().UTC()
 	requestID := requestID(r)

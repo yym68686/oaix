@@ -276,6 +276,51 @@ var migrationStatements = []string{
 		payload jsonb,
 		created_at timestamptz not null default now()
 	)`,
+	`create table if not exists admin_api_keys (
+		id bigserial primary key,
+		name varchar(128) not null,
+		key_hash varchar(64) not null unique,
+		role varchar(32) not null default 'admin',
+		created_by varchar(128),
+		created_at timestamptz not null default now(),
+		last_used_at timestamptz,
+		revoked_at timestamptz
+	)`,
+	`create index if not exists ix_admin_api_keys_revoked_at on admin_api_keys (revoked_at)`,
+	`create table if not exists admin_idempotency_keys (
+		key varchar(160) primary key,
+		method varchar(16) not null,
+		path text not null,
+		request_hash varchar(64) not null,
+		status_code integer not null,
+		response jsonb not null,
+		created_at timestamptz not null default now(),
+		expires_at timestamptz not null
+	)`,
+	`create index if not exists ix_admin_idempotency_keys_expires_at on admin_idempotency_keys (expires_at)`,
+	`create table if not exists openai_oauth_sessions (
+		session_id varchar(64) primary key,
+		state varchar(128) not null unique,
+		code_verifier text not null,
+		redirect_uri text not null,
+		import_queue_position varchar(16) not null default 'front',
+		status varchar(32) not null default 'pending',
+		import_job_id integer references token_import_jobs(id) on delete set null,
+		error_message text,
+		created_at timestamptz not null default now(),
+		expires_at timestamptz not null,
+		updated_at timestamptz not null default now()
+	)`,
+	`create index if not exists ix_openai_oauth_sessions_status on openai_oauth_sessions (status, expires_at)`,
+	`create table if not exists token_quota_snapshots (
+		id bigserial primary key,
+		token_id integer not null references codex_tokens(id) on delete cascade,
+		snapshot jsonb,
+		plan_type varchar(32),
+		error_message text,
+		fetched_at timestamptz not null default now()
+	)`,
+	`create index if not exists ix_token_quota_snapshots_token_fetched on token_quota_snapshots (token_id, fetched_at desc)`,
 }
 
 var onlineMigrationStatements = []string{
@@ -286,6 +331,10 @@ var onlineMigrationStatements = []string{
 }
 
 var downMigrationStatements = []string{
+	`drop table if exists token_quota_snapshots`,
+	`drop table if exists openai_oauth_sessions`,
+	`drop table if exists admin_idempotency_keys`,
+	`drop table if exists admin_api_keys`,
 	`drop table if exists admin_audit_logs`,
 	`drop table if exists token_import_items`,
 	`drop table if exists token_import_jobs`,

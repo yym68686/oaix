@@ -110,14 +110,29 @@ func (a *App) startOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	a.oauth.put(openAIOAuthSession{
+	session := openAIOAuthSession{
 		ID:            sessionID,
 		State:         state,
 		CodeVerifier:  codeVerifier,
 		RedirectURI:   redirectURI,
 		QueuePosition: queuePosition,
 		CreatedAt:     time.Now(),
-	})
+	}
+	a.oauth.put(session)
+	if a.store != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		_ = a.store.SaveOAuthSession(ctx, store.OAuthSession{
+			SessionID:           session.ID,
+			State:               session.State,
+			CodeVerifier:        session.CodeVerifier,
+			RedirectURI:         session.RedirectURI,
+			ImportQueuePosition: session.QueuePosition,
+			Status:              "pending",
+			CreatedAt:           session.CreatedAt.UTC(),
+			ExpiresAt:           session.CreatedAt.UTC().Add(openAIOAuthSessionTTL),
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"auth_url":       authURL,
 		"session_id":     sessionID,
@@ -141,15 +156,36 @@ func (a *App) openAIOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	session, ok := a.oauth.pop(state)
 	if !ok {
-		a.redirectOAuthResult(w, r, 0, "OAuth 会话已过期，请重新授权")
-		return
+		if a.store != nil {
+			if stored, storedErr := a.store.GetOAuthSessionByState(r.Context(), state); storedErr == nil && stored.ExpiresAt.After(time.Now()) {
+				session = openAIOAuthSession{
+					ID:            stored.SessionID,
+					State:         stored.State,
+					CodeVerifier:  stored.CodeVerifier,
+					RedirectURI:   stored.RedirectURI,
+					QueuePosition: stored.ImportQueuePosition,
+					CreatedAt:     stored.CreatedAt,
+				}
+				ok = true
+			}
+		}
+		if !ok {
+			a.redirectOAuthResult(w, r, 0, "OAuth 会话已过期，请重新授权")
+			return
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 	job, _, err := a.finishOpenAIOAuthImport(ctx, session, code)
 	if err != nil {
+		if a.store != nil {
+			_ = a.store.UpdateOAuthSessionStatus(context.Background(), session.ID, "failed", nil, sanitizeImportError(err))
+		}
 		a.redirectOAuthResult(w, r, 0, sanitizeImportError(err))
 		return
+	}
+	if a.store != nil {
+		_ = a.store.UpdateOAuthSessionStatus(context.Background(), session.ID, "completed", &job.ID, "")
 	}
 	a.redirectOAuthResult(w, r, job.ID, "")
 }
@@ -177,8 +213,23 @@ func (a *App) exchangeOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	session, ok := a.oauth.pop(state)
 	if !ok {
-		writeError(w, http.StatusBadRequest, errors.New("OAuth 会话已过期，请重新授权"))
-		return
+		if a.store != nil {
+			if stored, storedErr := a.store.GetOAuthSessionByState(r.Context(), state); storedErr == nil && stored.ExpiresAt.After(time.Now()) {
+				session = openAIOAuthSession{
+					ID:            stored.SessionID,
+					State:         stored.State,
+					CodeVerifier:  stored.CodeVerifier,
+					RedirectURI:   stored.RedirectURI,
+					QueuePosition: stored.ImportQueuePosition,
+					CreatedAt:     stored.CreatedAt,
+				}
+				ok = true
+			}
+		}
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("OAuth 会话已过期，请重新授权"))
+			return
+		}
 	}
 	if subtle.ConstantTimeCompare([]byte(session.ID), []byte(strings.TrimSpace(body.SessionID))) != 1 {
 		writeError(w, http.StatusBadRequest, errors.New("OAuth session_id 不匹配，请重新授权"))
@@ -188,8 +239,14 @@ func (a *App) exchangeOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	job, result, err := a.finishOpenAIOAuthImport(ctx, session, code)
 	if err != nil {
+		if a.store != nil {
+			_ = a.store.UpdateOAuthSessionStatus(context.Background(), session.ID, "failed", nil, sanitizeImportError(err))
+		}
 		writeError(w, http.StatusBadGateway, errors.New(sanitizeImportError(err)))
 		return
+	}
+	if a.store != nil {
+		_ = a.store.UpdateOAuthSessionStatus(context.Background(), session.ID, "completed", &job.ID, "")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"job":    job,

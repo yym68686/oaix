@@ -232,7 +232,7 @@ access_token_2
 access_token_3
 ```
 
-Go 版当前支持 access token 直接导入：导入接口会解码 JWT payload 中可用的账号、邮箱、套餐信息，并 upsert 到正式 `codex_tokens` 池，然后刷新内存 token snapshot。refresh token OAuth 验证接口已经预留，但 refresh worker 尚未启用；需要 refresh token 自动换 access token 的场景仍在 TODO 中。
+Go 版支持 access token 和 refresh token 导入。`POST /admin/import/parse` / `POST /admin/import/upload` 负责服务端解析预览，`POST /admin/import/jobs` 创建异步导入 job；旧 `POST /admin/tokens/import` 仍保留兼容，会同步完成一次导入并创建 completed job。refresh token 会在导入预处理或 worker 校验阶段换取 access token，并写入正式 `codex_tokens` 池。
 
 导入去重规则：
 
@@ -248,15 +248,23 @@ Go 版当前支持 access token 直接导入：导入接口会解码 JWT payload
 ## 接口
 
 - `GET /healthz`: 查看可用 key 数量与状态
-- `GET /admin/tokens`: 查看 key 列表与统计，支持 `limit` / `offset` 分页，以及 `q` / `status` / `plan_type` / `sort` / `import_batch_id` 查询
+- `GET /admin/openapi.json`: 查看管理 API OpenAPI 快照
+- `GET /admin/tokens`: 查看 key 列表与统计，支持 `limit` / `offset` 分页，以及 `q` / `status` / `plan` / `sort` / `import_job_id` / `import_batch_id` / `source` / `source_file` / 时间范围 / 错误筛选查询
 - `GET /admin/tokens/{id}`: 查看单个 key
+- `PATCH /admin/tokens/{id}`: 更新非 secret 元数据，例如备注、计划、邮箱、账号、来源
 - `POST /admin/tokens/{id}/activation`: 启用/禁用 key
 - `POST /admin/tokens/{id}/remark`: 更新 key 备注
-- `GET /admin/requests`: 查看请求次数汇总与最近请求日志
-- `POST /admin/tokens/import`: 导入单个 key、key 数组，或 `{"tokens": [...], "import_queue_position": "front|back"}` 批量导入
+- `POST /admin/tokens/{id}/cooldown` / `DELETE /admin/token-cooldown/{id}`: 设置/清除冷却
+- `POST /admin/tokens/{id}/secrets`: 安全写入/轮换 access token、refresh token、id token
+- `GET /admin/requests`: 查看请求次数汇总与请求日志，支持 request/model/endpoint/status/token/account/stream/time 筛选
+- `POST /admin/import/parse`: 服务端解析粘贴文本
+- `POST /admin/import/upload`: 服务端解析上传文件
+- `POST /admin/import/jobs`: 创建异步导入 job
+- `POST /admin/tokens/import`: 兼容旧导入接口，导入单个 key、key 数组，或 `{"tokens": [...], "import_queue_position": "front|back"}` 批量导入
 - `GET /admin/tokens/import-batches`: 查看导入批次
 - `GET /admin/tokens/import-jobs/{id}`: 查看导入 job
 - `POST /admin/tokens/import-jobs/{id}/cancel`: 取消导入 job
+- `GET /admin/import/jobs/{id}/items` / `GET /admin/import/jobs/{id}/tokens`: 分页查看批次 item 和关联 key
 - `GET /admin/settings` / `POST /admin/settings/{key}`: 查看/更新设置
 - `POST /v1/responses`: 代理到上游 Codex responses
 - `POST /v1/chat/completions`: 代理 chat completions
@@ -276,7 +284,7 @@ Go 版当前支持 access token 直接导入：导入接口会解码 JWT payload
 - `gpt-image-2` 上游返回 `429 rate_limit_exceeded` 且命中 `input-images` 速率桶时，只会对当前 key 的图片桶做短冷却并自动重试下一个 key，不影响该 key 处理其他模型
 - `/v1/responses/compact` 在上游 5xx 或传输错误时，会默认把当前 key 冷却 `60` 秒后切换下一把 key；可用 `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS=0` 关闭
 - 流式 `/v1/responses*` 会先预读开头的 SSE 状态事件；如果前缀已经是 `response.failed` / `type=error` / 不完整流 / 预读阶段网络错误，就不会先把坏流交给客户端，而是留在网关里切下一把 key
-- `/admin/tokens/import` 只写 staging，默认最多 16 并发做 OAuth 验证；验证成功后按小批短事务发布到正式 key 池，并刷新内存 token 池快照
+- 新 `/admin/import/jobs` 路由会创建异步 staging job，由 worker 校验 refresh token 并发布到正式 key 池；旧 `/admin/tokens/import` 保持同步兼容，会预处理 refresh token 后直接 upsert 并创建 completed job
 - 未验证或验证失败的 refresh token 不会进入正式池；正常请求最多只会感知到“新 key 稍后可用”，不会替导入任务试错
 - 如果上游返回 `429` 且 `error.type=usage_limit_reached`，会按 `resets_in_seconds` 或 `resets_at` 冷却当前 key，然后自动重试下一个 key
 - 如果上游返回 `402 {"detail":{"code":"deactivated_workspace"}}` 或 `401` 且 `error.code=account_deactivated`，会永久停用该 key

@@ -31,7 +31,6 @@ import {
 } from "@/lib/api";
 import { formatDate, formatNumber } from "@/lib/format";
 import {
-  collectImportEntries,
   errorMessage,
   formatUSDOptional,
   importBatchCancelable,
@@ -238,16 +237,23 @@ function ImportForm({
     setImportBusy(true);
     try {
       setImportFeedback("正在解析导入内容...");
-      const entries = await collectImportEntries(
-        importSource === "paste" ? tokenInput : "",
-        importSource === "file" ? fileInputRef.current?.files : undefined,
-      );
+      let parsed;
+      if (importSource === "file") {
+        const form = new FormData();
+        for (const file of Array.from(fileInputRef.current?.files || [])) {
+          form.append("files", file, file.name);
+        }
+        parsed = await api.uploadImport(form);
+      } else {
+        parsed = await api.parseImport({ text: tokenInput });
+      }
+      const entries = parsed.items || [];
       if (!entries.length) {
         setImportFeedback("没有可导入的 token。");
         return;
       }
       setImportFeedback(`正在提交 ${formatNumber(entries.length)} 条 token...`);
-      const result = await api.importTokens({
+      const result = await api.createImportJob({
         import_queue_position: queuePosition,
         tokens: entries,
       });

@@ -27,17 +27,18 @@ import (
 )
 
 type App struct {
-	cfg      config.Config
-	logger   *slog.Logger
-	store    *store.Store
-	tokens   *tokens.Manager
-	logs     *logs.Writer
-	proxy    *proxy.Pipeline
-	quota    *adminQuotaService
-	oauth    *openAIOAuthSessionStore
-	webDir   string
-	started  time.Time
-	authKeys []string
+	cfg       config.Config
+	logger    *slog.Logger
+	store     *store.Store
+	tokens    *tokens.Manager
+	logs      *logs.Writer
+	proxy     *proxy.Pipeline
+	quota     *adminQuotaService
+	quotaJobs *quotaRefreshRegistry
+	oauth     *openAIOAuthSessionStore
+	webDir    string
+	started   time.Time
+	authKeys  []string
 }
 
 type adminImportItem struct {
@@ -59,17 +60,18 @@ type adminImportItem struct {
 
 func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenManager *tokens.Manager, logWriter *logs.Writer, pipeline *proxy.Pipeline) *App {
 	return &App{
-		cfg:      cfg,
-		logger:   logger,
-		store:    store,
-		tokens:   tokenManager,
-		logs:     logWriter,
-		proxy:    pipeline,
-		quota:    newAdminQuotaService(cfg, store),
-		oauth:    newOpenAIOAuthSessionStore(),
-		webDir:   filepath.Join("oaix_gateway", "web"),
-		started:  time.Now().UTC(),
-		authKeys: cfg.Auth.ServiceAPIKeys,
+		cfg:       cfg,
+		logger:    logger,
+		store:     store,
+		tokens:    tokenManager,
+		logs:      logWriter,
+		proxy:     pipeline,
+		quota:     newAdminQuotaService(cfg, store),
+		quotaJobs: newQuotaRefreshRegistry(),
+		oauth:     newOpenAIOAuthSessionStore(),
+		webDir:    filepath.Join("oaix_gateway", "web"),
+		started:   time.Now().UTC(),
+		authKeys:  cfg.Auth.ServiceAPIKeys,
 	}
 }
 
@@ -104,6 +106,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/runtime", a.requireAuth(a.runtime))
 	mux.HandleFunc("GET /admin/settings", a.requireAuth(a.listSettings))
 	mux.HandleFunc("POST /admin/settings/{key}", a.requireAuth(a.updateSetting))
+	a.registerAdminAPIRoutes(mux)
 	mux.HandleFunc("POST /v1/responses", a.requireAuth(a.responses))
 	mux.HandleFunc("GET /v1/responses/{response_id}", a.requireAuth(a.getResponse))
 	mux.HandleFunc("DELETE /v1/responses/{response_id}", a.requireAuth(a.deleteResponse))
@@ -323,11 +326,8 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 	tokenOpts := store.TokenListOptions{
 		Limit:  limit,
 		Offset: offset,
-		Query:  r.URL.Query().Get("q"),
-		Status: r.URL.Query().Get("status"),
-		Plan:   r.URL.Query().Get("plan"),
-		Sort:   r.URL.Query().Get("sort"),
 	}
+	tokenOpts = tokenListOptionsFromRequest(r, tokenOpts)
 	items, total, err := a.store.ListTokens(ctx, tokenOpts)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
@@ -639,6 +639,28 @@ func (a *App) deleteImportJob(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
+	if queryBool(r, "dry_run", false) {
+		result, err := a.store.DeleteImportJobDryRun(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("import job not found"))
+			return
+		}
+		if err != nil {
+			if strings.Contains(err.Error(), "cannot delete") {
+				writeError(w, http.StatusConflict, err)
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"dry_run":        true,
+			"job":            result.ImportJob,
+			"token_ids":      result.TokenIDs,
+			"deleted_tokens": result.DeletedTokens,
+		})
+		return
+	}
 	result, err := a.store.DeleteImportJobWithTokens(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("import job not found"))
@@ -718,6 +740,9 @@ func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
 		TokenIDs      []int64 `json:"token_ids"`
 		Active        *bool   `json:"active"`
 		ClearCooldown bool    `json:"clear_cooldown"`
+		PlanType      string  `json:"plan_type"`
+		Remark        string  `json:"remark"`
+		Model         string  `json:"model"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -731,6 +756,7 @@ func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	var updated, deleted, failed int
+	var results []any
 	for _, id := range payload.TokenIDs {
 		if id <= 0 {
 			failed++
@@ -753,8 +779,59 @@ func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
 			} else {
 				deleted++
 			}
+		case "clear_cooldown":
+			if _, err := a.store.ClearTokenCooldown(ctx, id); err != nil {
+				failed++
+			} else {
+				updated++
+			}
+		case "set_plan":
+			plan := payload.PlanType
+			if _, err := a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{TokenID: id, PlanType: &plan}); err != nil {
+				failed++
+			} else {
+				updated++
+			}
+		case "set_remark":
+			remark := payload.Remark
+			if _, err := a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{TokenID: id, Remark: &remark}); err != nil {
+				failed++
+			} else {
+				updated++
+			}
+		case "probe":
+			token, err := a.store.GetToken(ctx, id)
+			if err != nil {
+				failed++
+				continue
+			}
+			results = append(results, a.probeTokenWithAccess(ctx, *token, payload.Model))
+			updated++
+		case "quota_refresh":
+			token, err := a.store.GetToken(ctx, id)
+			if err != nil {
+				failed++
+				continue
+			}
+			if a.quota != nil {
+				a.quota.clear([]int64{id})
+			}
+			items, _ := a.adminTokenItems(ctx, []store.Token{*token}, true)
+			if len(items) > 0 {
+				results = append(results, items[0])
+				updated++
+			} else {
+				failed++
+			}
+		case "export":
+			token, err := a.store.GetToken(ctx, id)
+			if err != nil {
+				failed++
+				continue
+			}
+			results = append(results, token)
 		default:
-			writeError(w, http.StatusBadRequest, errors.New("action must be activate, deactivate, set_active, or delete"))
+			writeError(w, http.StatusBadRequest, errors.New("action must be activate, deactivate, set_active, delete, probe, quota_refresh, clear_cooldown, set_plan, set_remark, or export"))
 			return
 		}
 	}
@@ -764,6 +841,7 @@ func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
 		"updated": updated,
 		"deleted": deleted,
 		"failed":  failed,
+		"results": results,
 	})
 }
 
@@ -853,12 +931,13 @@ func (a *App) listRequests(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	items, err := a.store.ListRequestLogs(ctx, queryInt(r, "limit", 100))
+	opts := requestLogOptionsFromRequest(r)
+	items, total, err := a.store.ListRequestLogsFiltered(ctx, opts)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "items": items})
+	writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "items": items, "pagination": pagination(opts.Limit, opts.Offset, len(items), total)})
 }
 
 func (a *App) analytics(w http.ResponseWriter, r *http.Request) {
@@ -974,6 +1053,15 @@ func (a *App) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
+		if a.store != nil && provided != "" {
+			ctx, cancel := context.WithTimeout(r.Context(), 800*time.Millisecond)
+			item, ok, err := a.store.ValidateAdminAPIKey(ctx, provided)
+			cancel()
+			if err == nil && ok && strings.TrimSpace(item.Role) != "" {
+				next(w, r)
+				return
+			}
+		}
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Invalid or missing service API key"})
 	}
 }
@@ -995,8 +1083,8 @@ func (a *App) recoverer(next http.Handler) http.Handler {
 func (a *App) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-API-Key,X-Request-ID")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-API-Key,X-Request-ID,Idempotency-Key")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -1132,5 +1220,43 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]any{"detail": err.Error()})
+	message := "request failed"
+	if err != nil && strings.TrimSpace(err.Error()) != "" {
+		message = err.Error()
+	}
+	writeJSON(w, status, map[string]any{
+		"detail": message,
+		"error": map[string]any{
+			"code":      httpStatusErrorCode(status),
+			"message":   message,
+			"retryable": status == http.StatusTooManyRequests || status >= 500,
+		},
+		"request_id": "",
+	})
+}
+
+func httpStatusErrorCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "bad_request"
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusConflict:
+		return "conflict"
+	case http.StatusTooManyRequests:
+		return "rate_limited"
+	case http.StatusServiceUnavailable:
+		return "service_unavailable"
+	case http.StatusBadGateway:
+		return "bad_gateway"
+	default:
+		if status >= 500 {
+			return "internal_error"
+		}
+		return "request_error"
+	}
 }
