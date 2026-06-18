@@ -164,7 +164,7 @@
 
 现状：
 
-- `GET /admin/requests?limit=N` 返回最近请求和 24h summary。
+- `GET /admin/requests?limit=N` 返回最近请求和 24h summary；默认不做全表精确 count，避免大表超时，确需精确总数时传 `include_total=true`。
 - `GET /admin/analytics?hours=N` 返回模型聚合。
 
 缺口：

@@ -256,7 +256,7 @@ Go 版支持 access token 和 refresh token 导入。`POST /admin/import/parse` 
 - `POST /admin/tokens/{id}/remark`: 更新 key 备注
 - `POST /admin/tokens/{id}/cooldown` / `DELETE /admin/token-cooldown/{id}`: 设置/清除冷却
 - `POST /admin/tokens/{id}/secrets`: 安全写入/轮换 access token、refresh token、id token
-- `GET /admin/requests`: 查看请求次数汇总与请求日志，支持 request/model/endpoint/status/token/account/stream/time 筛选
+- `GET /admin/requests`: 查看请求次数汇总与请求日志，支持 request/model/endpoint/status/token/account/stream/time 筛选；默认不做大表精确总数统计，传 `include_total=true` 才返回精确总数
 - `POST /admin/import/parse`: 服务端解析粘贴文本
 - `POST /admin/import/upload`: 服务端解析上传文件
 - `POST /admin/import/jobs`: 创建异步导入 job

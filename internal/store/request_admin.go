@@ -12,19 +12,20 @@ import (
 )
 
 type RequestLogListOptions struct {
-	Limit      int
-	Offset     int
-	RequestID  string
-	Model      string
-	Endpoint   string
-	StatusCode *int
-	Success    *bool
-	TokenID    int64
-	AccountID  string
-	Stream     *bool
-	From       *time.Time
-	To         *time.Time
-	QueryError string
+	Limit        int
+	Offset       int
+	IncludeTotal bool
+	RequestID    string
+	Model        string
+	Endpoint     string
+	StatusCode   *int
+	Success      *bool
+	TokenID      int64
+	AccountID    string
+	Stream       *bool
+	From         *time.Time
+	To           *time.Time
+	QueryError   string
 }
 
 type CostAggregate struct {
@@ -79,10 +80,15 @@ func (s *Store) ListRequestLogsFiltered(ctx context.Context, opts RequestLogList
 	}
 	where, args := requestLogWhere(opts)
 	var total int
-	if err := s.pool.QueryRow(ctx, "select count(*) from gateway_request_logs where "+where, args...).Scan(&total); err != nil {
-		return nil, 0, err
+	queryLimit := opts.Limit
+	if opts.IncludeTotal {
+		if err := s.pool.QueryRow(ctx, "select count(*) from gateway_request_logs where "+where, args...).Scan(&total); err != nil {
+			return nil, 0, err
+		}
+	} else {
+		queryLimit++
 	}
-	args = append(args, opts.Limit, opts.Offset)
+	args = append(args, queryLimit, opts.Offset)
 	rows, err := s.pool.Query(ctx, `
 		select request_id, endpoint, model, model_name, is_stream, status_code, success,
 		       attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
@@ -102,6 +108,17 @@ func (s *Store) ListRequestLogsFiltered(ctx context.Context, opts RequestLogList
 	}
 	defer rows.Close()
 	items, err := scanRequestLogs(rows)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !opts.IncludeTotal {
+		if len(items) > opts.Limit {
+			items = items[:opts.Limit]
+			total = opts.Offset + len(items) + 1
+		} else {
+			total = opts.Offset + len(items)
+		}
+	}
 	return items, total, err
 }
 
