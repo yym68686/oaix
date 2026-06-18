@@ -17,12 +17,14 @@ import (
 	"time"
 
 	"github.com/yym68686/oaix/internal/oauth"
+	"github.com/yym68686/oaix/internal/store"
 )
 
 const (
-	openAIOAuthAuthorizeURL = "https://auth.openai.com/oauth/authorize"
-	openAIOAuthSessionTTL   = 15 * time.Minute
-	openAIOAuthDefaultScope = "openid profile email offline_access"
+	openAIOAuthAuthorizeURL       = "https://auth.openai.com/oauth/authorize"
+	openAIOAuthDefaultRedirectURI = "http://localhost:1455/auth/callback"
+	openAIOAuthSessionTTL         = 30 * time.Minute
+	openAIOAuthDefaultScope       = "openid profile email offline_access"
 )
 
 type openAIOAuthSession struct {
@@ -144,6 +146,58 @@ func (a *App) openAIOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
+	job, _, err := a.finishOpenAIOAuthImport(ctx, session, code)
+	if err != nil {
+		a.redirectOAuthResult(w, r, 0, sanitizeImportError(err))
+		return
+	}
+	a.redirectOAuthResult(w, r, job.ID, "")
+}
+
+func (a *App) exchangeOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	var body struct {
+		SessionID   string `json:"session_id"`
+		Code        string `json:"code"`
+		State       string `json:"state"`
+		CallbackURL string `json:"callback_url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	code, stateFromInput := openAIOAuthCodeAndState(firstNonEmpty(body.CallbackURL, body.Code))
+	state := strings.TrimSpace(body.State)
+	if state == "" {
+		state = stateFromInput
+	}
+	if strings.TrimSpace(body.SessionID) == "" || code == "" || state == "" {
+		writeError(w, http.StatusBadRequest, errors.New("OAuth 兑换缺少 session_id、code 或 state"))
+		return
+	}
+	session, ok := a.oauth.pop(state)
+	if !ok {
+		writeError(w, http.StatusBadRequest, errors.New("OAuth 会话已过期，请重新授权"))
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(session.ID), []byte(strings.TrimSpace(body.SessionID))) != 1 {
+		writeError(w, http.StatusBadRequest, errors.New("OAuth session_id 不匹配，请重新授权"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	job, result, err := a.finishOpenAIOAuthImport(ctx, session, code)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, errors.New(sanitizeImportError(err)))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job":    job,
+		"result": result,
+	})
+}
+
+func (a *App) finishOpenAIOAuthImport(ctx context.Context, session openAIOAuthSession, code string) (store.ImportJob, store.ImportResult, error) {
 	client := oauth.NewHTTPClient(a.cfg.Upstream.OAuthTokenURL)
 	client.ClientID = a.cfg.Upstream.OAuthClientID
 	result, err := client.ExchangeAuthorizationCode(ctx, oauth.AuthorizationCodeRequest{
@@ -152,12 +206,10 @@ func (a *App) openAIOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		CodeVerifier: session.CodeVerifier,
 	})
 	if err != nil {
-		a.redirectOAuthResult(w, r, 0, sanitizeImportError(err))
-		return
+		return store.ImportJob{}, store.ImportResult{}, err
 	}
 	if strings.TrimSpace(result.RefreshToken) == "" {
-		a.redirectOAuthResult(w, r, 0, "OAuth 返回缺少 refresh_token")
-		return
+		return store.ImportJob{}, store.ImportResult{}, errors.New("OAuth 返回缺少 refresh_token")
 	}
 	payload := map[string]any{
 		"access_token":  result.AccessToken,
@@ -178,12 +230,7 @@ func (a *App) openAIOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if result.PlanType != "" {
 		payload["plan_type"] = result.PlanType
 	}
-	job, _, err := a.completeTokenImport(ctx, []map[string]any{payload}, session.QueuePosition, "chatgpt_oauth", "oauth")
-	if err != nil {
-		a.redirectOAuthResult(w, r, 0, sanitizeImportError(err))
-		return
-	}
-	a.redirectOAuthResult(w, r, job.ID, "")
+	return a.completeTokenImport(ctx, []map[string]any{payload}, session.QueuePosition, "chatgpt_oauth", "oauth")
 }
 
 func (a *App) redirectOAuthResult(w http.ResponseWriter, r *http.Request, jobID int64, errorMessage string) {
@@ -220,24 +267,23 @@ func (a *App) openAIAuthorizationURL(redirectURI string, state string, codeVerif
 }
 
 func (a *App) oauthRedirectURI(r *http.Request, requested string) string {
-	base := publicOrigin(r)
-	fallback := base + "/auth/callback"
 	requested = strings.TrimSpace(requested)
 	if requested == "" {
-		return fallback
+		return openAIOAuthDefaultRedirectURI
 	}
 	parsed, err := url.Parse(requested)
 	if err != nil || !parsed.IsAbs() || parsed.Path != "/auth/callback" {
-		return fallback
+		return openAIOAuthDefaultRedirectURI
 	}
-	origin, err := url.Parse(base)
-	if err != nil || !strings.EqualFold(parsed.Host, origin.Host) {
-		return fallback
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fallback
+	if parsed.Scheme != "http" || !isLocalOAuthRedirectHost(parsed.Hostname()) {
+		return openAIOAuthDefaultRedirectURI
 	}
 	return parsed.Scheme + "://" + parsed.Host + "/auth/callback"
+}
+
+func isLocalOAuthRedirectHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func publicOrigin(r *http.Request) string {
@@ -338,6 +384,36 @@ func openAIAuthorizationScope(scope string) string {
 		out = append(out, "offline_access")
 	}
 	return strings.Join(out, " ")
+}
+
+func openAIOAuthCodeAndState(input string) (string, string) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", ""
+	}
+	parseInput := input
+	if strings.HasPrefix(parseInput, "?") {
+		parseInput = openAIOAuthDefaultRedirectURI + parseInput
+	}
+	if strings.Contains(parseInput, "?") && strings.Contains(parseInput, "code=") {
+		if parsed, err := url.Parse(parseInput); err == nil {
+			code := strings.TrimSpace(parsed.Query().Get("code"))
+			state := strings.TrimSpace(parsed.Query().Get("state"))
+			if code != "" {
+				return code, state
+			}
+		}
+	}
+	return input, ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func randomHex(size int) (string, error) {

@@ -1,4 +1,6 @@
 import {
+  CheckIcon,
+  CopyIcon,
   ExternalLinkIcon,
   EyeIcon,
   SaveIcon,
@@ -57,6 +59,42 @@ import type { RouteState } from "@/app/router";
 import { navigateTo as go } from "@/app/router";
 import type { ToastMessage, TokenStatus } from "@/shared/types";
 
+function oauthStateFromURL(value: string): string {
+  try {
+    return new URL(value).searchParams.get("state") || "";
+  } catch {
+    return "";
+  }
+}
+
+function parseOAuthCallbackInput(value: string): { code: string; state: string } {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return { code: "", state: "" };
+  }
+  const candidate = trimmed.startsWith("?") ? `http://localhost:1455/auth/callback${trimmed}` : trimmed;
+  if (candidate.includes("code=")) {
+    try {
+      const parsed = new URL(candidate);
+      const code = parsed.searchParams.get("code")?.trim() || "";
+      const state = parsed.searchParams.get("state")?.trim() || "";
+      if (code) {
+        return { code, state };
+      }
+    } catch {
+      const code = candidate.match(/[?&]code=([^&]+)/)?.[1] || "";
+      const state = candidate.match(/[?&]state=([^&]+)/)?.[1] || "";
+      if (code) {
+        return {
+          code: decodeURIComponent(code).trim(),
+          state: decodeURIComponent(state).trim(),
+        };
+      }
+    }
+  }
+  return { code: trimmed, state: "" };
+}
+
 export function ImportsPage({
   pushToast,
   refreshNonce,
@@ -82,6 +120,14 @@ function ImportForm({
   const [queuePosition, setQueuePosition] = useState<"front" | "back">("front");
   const [importFeedback, setImportFeedback] = useState("等待导入。");
   const [importBusy, setImportBusy] = useState(false);
+  const [oauthSession, setOAuthSession] = useState<{
+    authUrl: string;
+    redirectUri?: string;
+    sessionId: string;
+    state: string;
+  } | null>(null);
+  const [oauthCallbackInput, setOAuthCallbackInput] = useState("");
+  const [oauthCopied, setOAuthCopied] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   async function saveServiceKey() {
@@ -107,25 +153,86 @@ function ImportForm({
       if (serviceKeyDraft.trim()) {
         setServiceKey(serviceKeyDraft);
       }
-      setImportFeedback("正在打开 ChatGPT 授权...");
+      setImportFeedback("正在生成 ChatGPT 授权链接...");
       const result = await api.startOpenAIOAuth({
         import_queue_position: queuePosition,
-        redirect_uri: `${window.location.origin}/auth/callback`,
       });
       if (!result.auth_url) {
         throw new Error("授权地址为空");
       }
-      window.location.assign(result.auth_url);
+      const state = oauthStateFromURL(result.auth_url) || result.state || "";
+      if (!result.session_id || !state) {
+        throw new Error("授权会话缺少 session_id 或 state");
+      }
+      setOAuthSession({
+        authUrl: result.auth_url,
+        redirectUri: result.redirect_uri,
+        sessionId: result.session_id,
+        state,
+      });
+      setOAuthCallbackInput("");
+      setImportFeedback("授权链接已生成。授权完成后粘贴回调 URL 或 code。");
+      window.open(result.auth_url, "_blank", "noopener,noreferrer");
     } catch (caught) {
       setImportFeedback(errorMessage(caught));
       pushToast(errorMessage(caught), "error");
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function copyOAuthURL() {
+    if (!oauthSession?.authUrl) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(oauthSession.authUrl);
+      setOAuthCopied(true);
+      window.setTimeout(() => setOAuthCopied(false), 1200);
+      pushToast("授权链接已复制");
+    } catch {
+      pushToast("复制失败，请手动复制", "error");
+    }
+  }
+
+  async function completeOAuthImport() {
+    if (!oauthSession) {
+      await startOAuthImport();
+      return;
+    }
+    const parsed = parseOAuthCallbackInput(oauthCallbackInput);
+    const code = parsed.code || oauthCallbackInput.trim();
+    const state = parsed.state || oauthSession.state;
+    if (!code || !state) {
+      setImportFeedback("请粘贴授权后的回调 URL 或 code。");
+      return;
+    }
+    setImportBusy(true);
+    try {
+      setImportFeedback("正在兑换 OAuth code 并创建导入批次...");
+      const result = await api.exchangeOpenAIOAuth({
+        callback_url: oauthCallbackInput.trim(),
+        code,
+        session_id: oauthSession.sessionId,
+        state,
+      });
+      const jobID = result.job?.id;
+      setImportFeedback(jobID ? `OAuth 导入已创建批次 #${jobID}。` : "OAuth 导入已提交。");
+      setOAuthSession(null);
+      setOAuthCallbackInput("");
+      pushToast(jobID ? `OAuth 导入已创建批次 #${jobID}` : "OAuth 导入已提交");
+      await onImported?.();
+    } catch (caught) {
+      setImportFeedback(errorMessage(caught));
+      pushToast(errorMessage(caught), "error");
+    } finally {
       setImportBusy(false);
     }
   }
 
   async function importTokens() {
     if (importSource === "oauth") {
-      await startOAuthImport();
+      await completeOAuthImport();
       return;
     }
     setImportBusy(true);
@@ -225,11 +332,56 @@ function ImportForm({
           />
         </TabsPanel>
         <TabsPanel className="grid min-w-0 gap-3" keepMounted value="oauth">
-          <Alert variant="info">
-            <ExternalLinkIcon />
-            <AlertTitle>ChatGPT OAuth</AlertTitle>
-            <AlertDescription>跳转到 ChatGPT 授权后自动创建导入批次。</AlertDescription>
-          </Alert>
+          {oauthSession ? (
+            <div className="grid min-w-0 gap-3 rounded-lg border bg-muted/30 p-3">
+              <div className="grid min-w-0 gap-2">
+                <Label htmlFor="oauth-url">授权链接</Label>
+                <div className="flex min-w-0 gap-2">
+                  <Input
+                    className="min-w-0 flex-1"
+                    id="oauth-url"
+                    nativeInput
+                    readOnly
+                    value={oauthSession.authUrl}
+                  />
+                  <Button onClick={copyOAuthURL} size="icon" title="复制授权链接" variant="outline">
+                    {oauthCopied ? <CheckIcon /> : <CopyIcon />}
+                  </Button>
+                  <Button onClick={() => window.open(oauthSession.authUrl, "_blank", "noopener,noreferrer")} variant="outline">
+                    <ExternalLinkIcon />
+                    打开
+                  </Button>
+                </div>
+              </div>
+              <div className="grid min-w-0 gap-2">
+                <Label htmlFor="oauth-callback">回调 URL / code</Label>
+                <Textarea
+                  className="block w-full min-w-0 max-w-full overflow-hidden"
+                  id="oauth-callback"
+                  onChange={(event) => setOAuthCallbackInput(event.currentTarget.value)}
+                  placeholder="http://localhost:1455/auth/callback?code=...&state=...，或仅粘贴 code"
+                  rows={4}
+                  spellCheck={false}
+                  value={oauthCallbackInput}
+                  wrap="soft"
+                />
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={() => void startOAuthImport()} variant="outline">
+                  重新生成
+                </Button>
+                <Button disabled={!oauthCallbackInput.trim() || importBusy} loading={importBusy} onClick={() => void completeOAuthImport()}>
+                  完成导入
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <Alert variant="info">
+              <ExternalLinkIcon />
+              <AlertTitle>ChatGPT OAuth</AlertTitle>
+              <AlertDescription>生成授权链接后，在 ChatGPT 授权页完成登录，再粘贴回调 URL 或 code。</AlertDescription>
+            </Alert>
+          )}
         </TabsPanel>
       </Tabs>
       <div className="grid min-w-0 gap-2">
@@ -245,7 +397,7 @@ function ImportForm({
       </div>
       <Button disabled={importBusy} loading={importBusy} onClick={() => void importTokens()}>
         {importSource === "oauth" && <ExternalLinkIcon />}
-        {importSource === "oauth" ? "打开 ChatGPT 授权" : "开始导入"}
+        {importSource === "oauth" ? (oauthSession ? "完成 OAuth 导入" : "生成并打开授权链接") : "开始导入"}
       </Button>
       <Alert variant={importFeedback.includes("失败") || importFeedback.includes("错误") ? "error" : "info"}>
         <UploadIcon />

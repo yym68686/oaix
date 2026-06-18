@@ -146,6 +146,11 @@ export type OpenAIOAuthStartResponse = {
   expires_in_sec?: number;
 };
 
+export type OpenAIOAuthExchangeResponse = {
+  job?: ImportBatch;
+  result?: Record<string, unknown>;
+};
+
 export type RequestItem = {
   id?: number;
   started_at?: string | null;
@@ -290,6 +295,8 @@ export const api = {
     postJSON<Record<string, unknown>>("/admin/tokens/import", payload),
   startOpenAIOAuth: (payload: Record<string, unknown>) =>
     postJSON<OpenAIOAuthStartResponse>("/admin/oauth/openai/start", payload),
+  exchangeOpenAIOAuth: (payload: Record<string, unknown>) =>
+    postJSON<OpenAIOAuthExchangeResponse>("/admin/oauth/openai/exchange", payload),
   importJobs: (limit = 50) =>
     requestJSON<{ items?: ImportBatch[] }>(`/admin/tokens/import-batches?limit=${limit}`),
   importJob: (id: number) =>

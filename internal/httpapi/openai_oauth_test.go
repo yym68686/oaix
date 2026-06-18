@@ -42,7 +42,7 @@ func TestStartOpenAIOAuthBuildsAuthorizationURL(t *testing.T) {
 	if query.Get("client_id") != "client-fixture" || query.Get("response_type") != "code" {
 		t.Fatalf("unexpected auth query: %s", authURL.RawQuery)
 	}
-	if query.Get("redirect_uri") != "https://oaix.example/auth/callback" {
+	if query.Get("redirect_uri") != openAIOAuthDefaultRedirectURI {
 		t.Fatalf("redirect_uri = %q", query.Get("redirect_uri"))
 	}
 	if !strings.Contains(query.Get("scope"), "offline_access") {
@@ -50,6 +50,41 @@ func TestStartOpenAIOAuthBuildsAuthorizationURL(t *testing.T) {
 	}
 	if query.Get("code_challenge") == "" || query.Get("code_challenge_method") != "S256" || query.Get("state") == "" {
 		t.Fatalf("missing pkce fields: %s", authURL.RawQuery)
+	}
+}
+
+func TestStartOpenAIOAuthIgnoresPublicRedirectURI(t *testing.T) {
+	app := NewApp(config.Config{
+		Upstream: config.UpstreamConfig{
+			OAuthClientID: "client-fixture",
+			OAuthScope:    "openid profile email",
+		},
+	}, nil, nil, nil, nil, nil)
+	body := strings.NewReader(`{"redirect_uri":"https://oaix.example/auth/callback"}`)
+	request := httptest.NewRequest(http.MethodPost, "/admin/oauth/openai/start", body)
+	request.Host = "oaix.example"
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	app.startOpenAIOAuth(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	authURL, _ := url.Parse(payload["auth_url"].(string))
+	if got := authURL.Query().Get("redirect_uri"); got != openAIOAuthDefaultRedirectURI {
+		t.Fatalf("redirect_uri = %q", got)
+	}
+}
+
+func TestOpenAIOAuthCodeAndStateExtractsCallbackURL(t *testing.T) {
+	code, state := openAIOAuthCodeAndState("http://localhost:1455/auth/callback?code=code-fixture&state=state-fixture")
+	if code != "code-fixture" || state != "state-fixture" {
+		t.Fatalf("code=%q state=%q", code, state)
 	}
 }
 
