@@ -1,650 +1,590 @@
-# oaix 终局 Go 重构方案
+# oaix Go 版终局架构收敛重构方案
 
 > 状态：待审阅  
-> 范围：仅 oaix 项目  
-> 目标：用 Go 重写 oaix 的核心网关、账号池调度、请求代理、日志写入、后台任务和管理面，形成可高并发横向扩展的终局架构。  
-> 非目标：不做 Python 单体的渐进式整理，不把现有 `api_server.py` 拆小后继续承载长期演进。
+> 最后更新：2026-06-18  
+> 范围：仅 `oaix` 项目。  
+> 当前基线：项目已经完成从旧 Python 单体到 Go 版主体实现的迁移，本方案不再描述“从 Python 重写到 Go”，而是描述当前 Go 版如何收敛到终局架构。  
+> 目标：系统性提升性能、降低冗余、提升灵活性、提升鲁棒性，并建立可验证的性能证据。  
+> 非目标：不再继续扩展旧 Python 运行时；旧 Python 仅作为行为参考、兼容 fixture 和历史回归依据。
 
-## 1. 背景与定位
+## 1. 执行摘要
 
-根据业务系统说明，生产链路为：
+当前 Go 版已经解决了 Python 单体最核心的问题：语言运行时、HTTP transport、基本 token 调度、request log、管理面和导入功能都已在 Go 中落地。但系统还没有完全达到终局状态，主要问题集中在：
 
-```text
-Client
--> Fugue edge
--> uni-api-web-api
--> uni-api-ember
--> oaix
--> upstream model providers
+- 热路径仍然偏宽，`proxy` 主流程同时处理请求体兼容、token claim、retry、stream、日志、状态提交。
+- 协议兼容层过大，`responses/chat/images/compact/SSE` 多种行为集中在少数文件中。
+- 导入链路存在同步导入和后台 job 两套路径，容易产生行为分叉。
+- gateway/admin/worker 的代码边界和运行边界还不够清晰。
+- prompt cache affinity、quota、request log、token selection 的性能和可靠性还有明确优化空间。
+- 前端已经使用 COSS 风格重构过，但 Key 页面、导入页面仍然偏大，组件边界需要继续收敛。
+
+结论：需要重构，但不是推倒当前 Go 版重写。终局方案是保留当前 Go 核心，做一次架构收敛型重构。
+
+## 2. 调研范围
+
+本轮调研覆盖以下路径：
+
+- Go gateway/proxy：`internal/proxy/pipeline.go`、`internal/proxy/compat_payload.go`、`internal/proxy/prompt_cache.go`
+- token 调度：`internal/tokens/snapshot.go`、`internal/tokens/selector.go`、`internal/tokens/affinity.go`
+- affinity 持久化：`internal/affinity/postgres.go`
+- store 层：`internal/store/tokens.go`、`internal/store/request_logs.go`、`internal/store/import_jobs.go`
+- runtime/worker：`internal/runtime/gateway.go`、`internal/runtime/maintenance.go`
+- admin API：`internal/httpapi/server.go`、`internal/httpapi/admin_quota.go`
+- frontend：`frontend/src/features/keys/KeysPage.tsx`、`frontend/src/features/imports/ImportsPage.tsx`
+- 旧 Python 行为参考：`oaix_gateway/*`
+- 现有文档：`README.md`、本文件旧版本
+
+检测到的主要技术栈：
+
+- Go 1.24，`pgx/v5`，`redis/go-redis/v9`
+- React 19，Vite 8，Tailwind 4，本地 COSS 风格组件
+- PostgreSQL 为主状态存储
+- 旧 Python FastAPI 代码保留为行为参考
+
+建议保留的验证命令：
+
+```bash
+go test ./...
+npm run build:web
+go run ./cmd/oaix-migrate
+go run ./cmd/oaix-bench
 ```
 
-oaix 在链路中的职责不是普通 API 转发，而是下游账号池网关：
+如需旧行为兼容回归：
 
-- 维护 OpenAI/Codex-like token 池。
-- 选择可用 token，并处理并发、冷却、失效和 quota。
-- 将请求代理到上游模型服务。
-- 支持 `/v1/responses`、chat completions、image generation/edit 等兼容接口。
-- 支持 refresh token 换 access token。
-- 记录请求日志、token 使用情况和失败原因。
-- 提供 token 管理、导入、日志查询等管理面。
-
-因此 oaix 的核心质量目标是：
-
-- 高并发流式转发稳定。
-- token 调度延迟稳定，不随 token 池规模线性劣化。
-- 上游失败分类准确，冷却/失效状态可靠落地。
-- 日志和状态写入可追溯，不依赖进程内 best-effort 队列。
-- 支持多实例横向扩展。
-- 管理面和热路径隔离，避免后台任务影响代理请求。
-
-## 2. 当前项目调研结论
-
-当前实现是 Python FastAPI 单体，主要代码集中在：
-
-- `oaix_gateway/api_server.py`：约 13000 行，包含 API 路由、代理、流式处理、token 选择、日志队列、后台任务、管理接口。
-- `oaix_gateway/token_store.py`：token 存储、状态写入、claim fallback、去重。
-- `oaix_gateway/request_store.py`：请求日志 upsert、统计聚合、清理。
-- `oaix_gateway/database.py`：SQLAlchemy engine、启动期建表/迁移/索引/backfill。
-- `oaix_gateway/token_import_jobs.py`：token 导入、校验、OAuth refresh、publish。
-- `oaix_gateway/web/app.js`：管理前端单文件。
-
-测试基线：
-
-```text
+```bash
 uv run pytest -q
-354 passed, 1 skipped
 ```
 
-测试较多直接 import 和 monkeypatch `oaix_gateway.api_server` 私有函数，这说明当前测试可以作为行为规格来源，但也说明 Python 内部结构已经被测试强绑定，不适合作为长期架构边界。
+复杂度扫描注意事项：
 
-## 3. 是否需要彻底重构
+- `analyze_complexity.py` 对仓库做过首轮扫描，但 `.codex-test-venv` 里的第三方依赖产生了大量噪声。
+- 后续使用扫描工具时必须排除虚拟环境、构建产物和 vendor/cache 目录。
 
-结论：需要。
+## 3. 当前主要热点与风险
 
-原因不是单纯代码行数大，而是当前结构已经把以下职责混在同一个运行时和大量长函数中：
+### 3.1 运行边界不够清晰
 
-- HTTP 路由。
-- 上游代理。
-- SSE 流式解析和生成。
-- token 调度。
-- prompt cache affinity。
-- OAuth refresh。
-- 429/401/403/5xx 错误分类。
-- request log start/final 合并。
-- token 状态异步写入。
-- admin API。
-- import worker。
-- schema migration。
-- observability 旁路。
+位置：
 
-这种耦合会带来四类长期问题：
+- `internal/runtime/gateway.go`
+- `internal/runtime/maintenance.go`
+- `internal/httpapi/server.go`
 
-1. 热路径无法稳定优化。每次功能变更都可能改到代理、日志、状态、错误分类的组合逻辑。
-2. 运行时不适配。当前已经出现针对 httpx/httpcore 私有结构和 `/proc/self/net/tcp` 的连接清理逻辑，说明 Python/httpx 层面对本项目的长连接高并发流式场景已不理想。
-3. 可靠性边界不清晰。关键状态和日志有多处进程内队列，崩溃或队列满时存在丢失。
-4. 横向扩展不足。prompt affinity、runtime cooldown、recent TTFT、active request 等状态多为单进程内存态，多实例后一致性边界需要重建。
+当前模式：
 
-## 4. 性能瓶颈清单
+- gateway 启动时同时组装 proxy、admin API、静态前端、token manager、log writer、embedded worker 和维护任务。
+- 小规模部署方便，但热路径、管理面和后台任务共享同一进程资源。
 
-| 模块 | 现状证据 | 风险 | Go 终局处理 |
-| --- | --- | --- | --- |
-| responses 流式代理 | `api_server.py:_responses_stream_keepalive_response` 约 962 行 | token claim、OAuth、SSE、日志、错误恢复耦合；难以保证取消和回滚一致 | 建统一 stream pipeline，SSE parser/writer 独立，状态提交独立 |
-| 通用 failover | `api_server.py:_execute_proxy_request_with_failover` 约 783 行 | 与 responses/image 逻辑重复，失败分类分散 | 建 `FailureClassifier` 和 `RetryPolicy`，所有路由共用 |
-| image stream | `api_server.py:_gpt_image_stream_keepalive_response` 约 641 行 | 与 responses stream 重复大量 keepalive/worker/terminal frame 逻辑 | image 只保留协议转换，代理内核共用 |
-| HTTP 连接池 | `api_server.py:_sweep_httpx_client_idle_connections` 触达 httpcore 私有结构 | 运行时补丁脆弱，升级 httpx/httpcore 风险高 | 使用 Go `net/http.Transport`，按上游 host/shard 明确配置 |
-| token snapshot lookup | prompt affinity 中按 token id 线性扫描 snapshot | token 池变大后调度延迟上升 | snapshot 内建 `map[tokenID]*Token`，claim 只做 O(1)/局部排序 |
-| prompt cache lane | 进程内 `OrderedDict`，lane candidate 可能全量扫描排序 | 多实例不一致；新 lane 请求成本高 | 本地 cache + Redis/Postgres TTL 后端，lane index 分片 |
-| request log writer | 进程内 queue，队列满会 drop start/final 任务 | 审计和计费相关日志可能丢失 | durable outbox + batch writer；重要 final log 不静默丢 |
-| request log stats | upsert 中混合日志写入和 hourly stats | 写路径承担统计副作用，失败处理复杂 | 日志主写入和统计聚合解耦，worker 异步聚合 |
-| token last_used_at | 每 token 单独 UPDATE | 高并发下 DB round-trip 放大 | `UPDATE ... FROM (VALUES ...)` 批量更新 |
-| token status write | token 状态写入进程内队列 | 崩溃丢 pending 状态；多实例同步弱 | 状态机 + durable event/outbox；关键状态同步提交 |
-| schema migration | gateway 启动期 create_all/migration/index/backfill | 多实例启动竞争；启动抖动；DDL 风险 | 标准路径使用独立 `oaix-migrate`；容器镜像可通过 `OAIX_AUTO_MIGRATE_ON_STARTUP=true` 做启动前幂等迁移以适配单容器平台 |
-| import worker | 每 item 多次 DB 状态更新，OAuth 并发和 publish 混合 | 后台任务 DB 写放大，可能影响热路径 | worker 独立进程，批量 claim/update/publish |
-| admin frontend | `web/app.js` 单文件 5000+ 行，多处全量 map/render | 管理面演进成本高，大列表性能差 | 前端模块化，列表虚拟化，管理 API 分页/增量 |
+风险：
 
-## 5. 终局架构原则
+- 导入、额度刷新、request log outbox、统计聚合可能和 `/v1/*` 转发争抢 DB pool、CPU、goroutine。
+- 线上问题定位时，很难判断是热路径问题还是后台任务问题。
+- 多实例部署时，哪些任务应该单实例、哪些任务可以多实例，边界不够显式。
 
-1. 热路径极简。
-   - 代理请求路径只做必要的认证、路由、token claim、上游请求、流式转发、最终状态提交。
-   - 统计、聚合、导入、修复、清理全部从热路径移出。
+终局改法：
 
-2. 状态边界显式。
-   - 进程内状态只能作为 cache。
-   - 冷却、禁用、quota、重要 request log 必须有可靠落点。
+- `oaix-gateway`：只承载 `/v1/*` 热路径和最小健康检查。
+- `oaix-admin`：只承载管理 API 和前端静态资源。
+- `oaix-worker`：只承载导入、refresh、quota refresh、log outbox、统计、清理任务。
+- 本地或单容器部署可以用同一个二进制的不同 mode 启动，但代码包和职责必须拆开。
 
-3. 协议处理统一。
-   - chat、responses、image 的上游代理共用同一套 transport、retry、failure classification、SSE 基础设施。
-   - 差异仅保留在 request/response codec 层。
+预期收益：
 
-4. 多实例优先。
-   - 任意 gateway 实例退出，不应丢关键 token 状态。
-   - 任意 gateway 实例新增，不应需要全局锁或长启动迁移。
+- 降低热路径延迟抖动。
+- 线上排障更清晰。
+- 后续可以单独扩 gateway 或 worker。
 
-5. 配置收敛。
-   - 兼容读取现有环境变量，但内部转换为结构化配置。
-   - 默认值按生产高并发场景设计，不用散落常量。
+风险等级：高收益，中等风险。
 
-6. 可观测性内建。
-   - 每个 request id、token id、upstream attempt、cooldown decision 都可追踪。
-   - 指标覆盖队列深度、stream 时长、TTFT、错误分类、DB batch 延迟。
+验证方式：
 
-## 6. Go 目标组件
+- 分离前后分别压测 `/v1/responses` 并观察 p50/p95/p99、DB pool wait、log queue depth。
+- worker 高负载导入时，gateway p95 TTFT 不应明显上升。
 
-### 6.1 二进制
+### 3.2 协议兼容层过大
+
+位置：
+
+- `internal/proxy/compat_payload.go`
+
+当前模式：
+
+- `responses`、`chat`、`images generations`、`images edits`、`compact`、`instructions`、`store=false`、`reasoning_content` 清理、SSE 兼容等逻辑集中在同一大文件。
+
+风险：
+
+- 过去线上多个 bug 都与请求体映射、image endpoint、SSE keepalive、failed retry、`instructions/store` 对齐有关。
+- 文件过大导致新增兼容规则时容易误伤其它 endpoint。
+- 旧 Python 行为没有被系统化成 golden fixture，依赖人工记忆对齐。
+
+终局改法：
+
+```text
+internal/protocol/openai/
+  responses/
+  chat/
+  images/
+  compact/
+  sse/
+  fixtures/
+```
+
+每个 codec 提供：
+
+- `NormalizeClientRequest`
+- `BuildUpstreamRequest`
+- `ParseUpstreamResponse`
+- `BuildClientResponse`
+- `ClassifyProtocolError`
+
+必须建立 fixture：
+
+- client request JSON/multipart
+- 旧 Python 上游请求体
+- Go 上游请求体
+- 上游 SSE input
+- 客户端 SSE output
+
+预期收益：
+
+- 兼容规则可测试、可审阅。
+- 修 image 不会影响 responses。
+- 修 stream keepalive 不会影响 non-stream。
+
+风险等级：高收益，高风险。必须先补 fixture。
+
+验证方式：
+
+- 每个历史线上 bug 对应一组 fixture。
+- `go test ./internal/protocol/openai/...` 必须独立覆盖。
+
+### 3.3 Proxy pipeline 仍然过宽
+
+位置：
+
+- `internal/proxy/pipeline.go`
+
+当前模式：
+
+- `Proxy` 主流程同时负责 body 读取、payload 处理、prompt cache、token claim、retry loop、上游请求、stream/non-stream 转发、错误分类、日志和状态提交。
+
+风险：
+
+- 单个改动的 blast radius 大。
+- retry、token release、final log、client cancel 的一致性难以局部验证。
+- 后续支持新 endpoint 时容易复制逻辑。
+
+终局改法：
+
+拆成以下内部模块：
+
+```text
+IntentParser
+PayloadPreparer
+PromptCachePlanner
+TokenClaimer
+AttemptRunner
+ResponseStreamer
+FailureClassifier
+TokenOutcomeCommitter
+RequestLogRecorder
+```
+
+热路径统一结构：
+
+```text
+auth
+-> parse intent
+-> normalize payload
+-> claim token
+-> run upstream attempt
+-> bridge response
+-> classify outcome
+-> commit token state
+-> write final log
+```
+
+预期收益：
+
+- endpoint 逻辑只关心 codec。
+- 状态提交和日志写入可以单测。
+- retry/failover 行为可复用。
+
+风险等级：中高收益，中等风险。
+
+验证方式：
+
+- 现有 `/v1/responses`、`/v1/chat/completions`、`/v1/images/*` 黑盒测试全部通过。
+- client cancel 后 `active_streams=0`。
+- final log loss count 为 0。
+
+### 3.4 导入链路存在双路径
+
+位置：
+
+- `internal/httpapi/server.go`
+- `internal/runtime/maintenance.go`
+- `internal/importer/worker.go`
+- `internal/store/import_jobs.go`
+
+当前模式：
+
+- Admin 同步导入可直接 prepare/refresh/publish。
+- import job/worker 也有自己的 validation/publish 路径。
+
+风险：
+
+- `account_id,refresh_token`、纯 `refresh_token`、OAuth callback、批量导入可能走到不同路径。
+- 同步导入请求可能长时间占用 admin handler。
+- 导入错误容易出现前端状态、job 状态、token 状态不一致。
+
+终局改法：
+
+- 所有导入都创建 `token_import_jobs`。
+- Admin API 只做解析、校验、落 staging item。
+- Worker 负责 refresh、校验、publish、quota 初始化、错误归档。
+- 小批量导入也走同一状态机，只是 job 很快完成。
+
+预期收益：
+
+- 导入行为唯一。
+- 前端批次页、job 状态、token 状态天然一致。
+- worker 可独立扩容和重试。
+
+风险等级：高收益，中高风险。
+
+验证方式：
+
+- 同一组输入通过粘贴、文件、OAuth 三种入口导入，最终 job/item/token 状态一致。
+- worker 重启后 job 可恢复。
+- 重复 refresh token 不产生脏数据。
+
+### 3.5 Token snapshot 与 selector 未来会遇到规模瓶颈
+
+位置：
+
+- `internal/tokens/snapshot.go`
+- `internal/tokens/selector.go`
+
+当前模式：
+
+- snapshot refresh 会排序并构建若干索引。
+- selector 对 ready tokens 做线性扫描。
+- 当前线上可用 key 数量小，这不是当前主要瓶颈。
+
+风险：
+
+- 如果数千个 token 同时可用，refresh 和 select 的 O(n) / O(n log n) 成本会变明显。
+- `Stats` 之类全量 ready tokens 汇总会放大高频读取成本。
+
+终局改法：
+
+- snapshot 构建时预生成按 `status/plan/model/scope/capacity` 的候选队列。
+- selector 从局部候选集取值，避免每次扫描全体。
+- active streams 聚合计数在 claim/release 时维护，不在查询时循环汇总。
+- 对 fill-first、quota-aware、latency-aware 建独立 selector index。
+
+预期收益：
+
+- 10k token 下 claim 延迟稳定。
+- snapshot refresh 成本可控。
+
+风险等级：中等收益，中等风险。当前不是第一优先级。
+
+验证方式：
+
+- 1k、10k、50k token benchmark。
+- 指标包括 claim p50/p95/p99、snapshot refresh duration、allocs/op。
+
+### 3.6 Prompt cache affinity 需要更强的工程化
+
+位置：
+
+- `internal/tokens/affinity.go`
+- `internal/affinity/postgres.go`
+
+当前模式：
+
+- 新 lane 创建可能扫描并排序 ready tokens。
+- Postgres LaneStore 删除 token 时会扫描未过期 lanes。
+- 部分 affinity 持久化错误被 fail-open 处理。
+
+风险：
+
+- prompt cache key 高基数时，lane 创建成本上升。
+- token 被禁用/删除时，lane 清理可能变慢。
+- fail-open 可以接受，但没有指标会导致线上缓存率下降时难以定位。
+
+终局改法：
+
+- gateway 本地 LRU cache + Postgres/Redis 持久化。
+- `prompt_affinity_lanes` 增加反向索引或独立 `prompt_affinity_token_index`。
+- lane 候选用 rendezvous top-k，不对全量 ready token 排序。
+- 所有 fail-open 都打 metrics 和 structured log。
+
+预期收益：
+
+- prompt cache 命中率稳定。
+- lane 清理成本下降。
+- 缓存率异常可追踪。
+
+风险等级：中高收益，中等风险。
+
+验证方式：
+
+- 构造 10k prompt cache keys、10k tokens 的 affinity benchmark。
+- 线上监控 cache hit rate、lane lookup latency、affinity fail-open count。
+
+### 3.7 Request log 与统计仍可提升
+
+位置：
+
+- `internal/logs/writer.go`
+- `internal/store/request_logs.go`
+
+当前模式：
+
+- 已有内存队列、batch upsert、outbox fallback。
+- 但 start/final log 的可靠性等级、统计聚合、outbox drain、批量 upsert 还可以进一步明确。
+
+风险：
+
+- DB 抖动时 final log 同步 fallback 可能影响热路径。
+- 大量日志写入和统计查询可能争抢同一表。
+- 管理面统计如果扫明细表，长期会变慢。
+
+终局改法：
+
+- final log durable 优先，必要时落 outbox，不静默丢。
+- request logs 按时间分区。
+- 统计由 worker 异步聚合到 hourly/materialized 表。
+- batch upsert 优先使用 `COPY` staging 或 `unnest`。
+
+预期收益：
+
+- 审计和计费相关日志可靠。
+- Admin 统计查询稳定。
+
+风险等级：中高收益，中等风险。
+
+验证方式：
+
+- DB 延迟/不可用故障注入。
+- final log loss count 必须为 0。
+- outbox backlog 可恢复到 0。
+
+### 3.8 Admin quota 状态应该持久化
+
+位置：
+
+- `internal/httpapi/admin_quota.go`
+
+当前模式：
+
+- Admin token list 可以触发 quota 查询。
+- quota cache 主要是进程内 cache/pending。
+- 额度错误可能影响 UI 状态判断。
+
+风险：
+
+- 前端打开页面才刷新额度，状态短暂不一致。
+- 多实例下 cache 不共享。
+- quota 错误分类如果只存在内存里，无法审计。
+
+终局改法：
+
+- Worker 周期刷新 quota snapshot。
+- DB 持久化 `quota_5h_remaining`、`quota_7d_remaining`、`quota_error_code`、`quota_checked_at`、`quota_state`。
+- `deactivated_workspace` 等明确错误由 worker 统一转为禁用或需要人工处理状态。
+- Admin UI 只读取快照，不在列表请求里做大量实时外部请求。
+
+预期收益：
+
+- Key 页面稳定。
+- quota 状态可审计。
+- 外部额度 API 抖动不会直接拖慢 Admin 页面。
+
+风险等级：中等收益，中等风险。
+
+验证方式：
+
+- fake quota server 覆盖 200、401、402、429、5xx、timeout。
+- 状态转换和前端展示一致。
+
+### 3.9 前端页面需要继续模块化
+
+位置：
+
+- `frontend/src/features/keys/KeysPage.tsx`
+- `frontend/src/features/imports/ImportsPage.tsx`
+
+当前模式：
+
+- 已经改成 COSS 风格，但页面文件仍接近 900 行。
+- 列表、筛选、批量操作、导入弹窗、批次详情 modal、状态管理还混在页面中。
+
+风险：
+
+- UI 修复容易互相影响。
+- 筛选状态、loading 状态、URL query 状态容易出现竞态。
+- 后续新增列或批量操作成本高。
+
+终局改法：
+
+```text
+frontend/src/features/keys/
+  api.ts
+  hooks/useTokenQuery.ts
+  hooks/useTokenSelection.ts
+  components/TokenFilters.tsx
+  components/TokenTable.tsx
+  components/QuotaMeter.tsx
+  components/BulkToolbar.tsx
+  components/RemarkDialog.tsx
+  components/ImportTokenModal.tsx
+
+frontend/src/features/imports/
+  api.ts
+  hooks/useImportJobs.ts
+  components/ImportJobsTable.tsx
+  components/ImportJobKeysModal.tsx
+  components/ImportJobFilters.tsx
+  components/DeleteImportJobDialog.tsx
+```
+
+预期收益：
+
+- 每个交互点可单独测试。
+- COSS 风格更一致。
+- 修窄屏、表格、modal、筛选时互不影响。
+
+风险等级：中等收益，低中风险。
+
+验证方式：
+
+- `npm run build:web`
+- in-app Browser 检查桌面、窄屏、modal、筛选、导入、批量操作。
+
+## 4. 终局架构
+
+### 4.1 目标二进制
 
 ```text
 cmd/oaix-gateway
-  热路径服务。
-  提供 OpenAI-compatible API、token claim、upstream proxy、SSE streaming。
+  只负责热路径：
+  - /v1/responses
+  - /v1/chat/completions
+  - /v1/images/generations
+  - /v1/images/edits
+  - minimal health/readiness
 
 cmd/oaix-admin
-  管理 API。
-  可独立部署，也可在小规模环境与 gateway 同进程启动，但代码边界独立。
+  只负责管理面：
+  - token list/detail/batch operations
+  - import jobs
+  - request logs
+  - settings
+  - quota snapshots
+  - static frontend
 
 cmd/oaix-worker
-  后台任务。
-  负责 OAuth refresh、token import、request log aggregation、retention、outbox drain。
+  只负责后台任务：
+  - import job validation/publish
+  - OAuth refresh
+  - quota refresh
+  - request log outbox drain
+  - hourly stats aggregation
+  - retention/cleanup
+  - repair/reconcile jobs
 
 cmd/oaix-migrate
-  数据库迁移工具。
-  部署前显式执行，gateway/worker/admin 启动时不做 DDL。
-  对没有 migration job 的单容器平台，可在容器镜像中打开 OAIX_AUTO_MIGRATE_ON_STARTUP=true 执行同一套幂等迁移。
+  只负责 schema migration。
 
 cmd/oaix-bench
-  压测和回归辅助工具。
-  模拟流式响应、上游 429/401/5xx、慢连接、中断连接。
+  只负责压测和回归验证。
 ```
 
-### 6.2 内部包
+### 4.2 目标包结构
 
 ```text
-internal/config
-  环境变量读取、配置校验、默认值。
-
-internal/httpapi
-  路由注册、中间件、request id、auth、response helpers。
-
-internal/proxy
-  代理主流程、attempt orchestration、retry/failover。
-
-internal/protocol/openai
-  OpenAI-compatible request/response model、codec、错误响应。
-
-internal/protocol/sse
-  SSE parser、writer、keepalive、terminal event。
-
-internal/tokens
-  token snapshot、selector、claim、cooldown、runtime state。
-
+internal/adminapi
 internal/affinity
-  prompt cache affinity、response owner、lane policy。
-
-internal/oauth
-  refresh token、access token lifecycle、provider-specific OAuth client。
-
-internal/transport
-  upstream HTTP client pool、transport tuning、timeout policy。
-
-internal/logs
-  request log writer、outbox、hourly aggregation。
-
-internal/store
-  pgx repository、transaction helpers、batch statements。
-
-internal/admin
-  token/admin/request/import/settings API。
-
+internal/config
 internal/importer
-  token import job state machine。
-
+internal/logs
 internal/observability
-  metrics、structured logs、traces、health/readiness。
-
-internal/testkit
-  fake upstream、SSE fixtures、DB fixtures、compatibility harness。
+internal/protocol/openai
+internal/protocol/openai/responses
+internal/protocol/openai/chat
+internal/protocol/openai/images
+internal/protocol/sse
+internal/proxy
+internal/quota
+internal/runtime
+internal/store
+internal/tokens
+internal/transport
+internal/worker
 ```
 
-## 7. 请求热路径设计
-
-目标流水线：
+### 4.3 请求热路径
 
 ```text
-HTTP request
--> auth and normalize
--> classify request intent
--> select token
--> build upstream attempt
--> stream upstream response
--> classify terminal outcome
--> commit token transition
--> enqueue/durably write request log
+client request
+-> auth
+-> parse request intent
+-> normalize payload with endpoint codec
+-> prompt cache planning
+-> token claim
+-> upstream attempt
+-> response bridge
+-> classify outcome
+-> token state commit
+-> final log durable write
 ```
 
-### 7.1 RequestIntent
+热路径规则：
 
-所有入口先归一化为 `RequestIntent`：
+- 不做 schema migration。
+- 不做导入。
+- 不做 quota 实时刷新。
+- 不做管理统计聚合。
+- 不阻塞等待非关键后台任务。
+- 所有可降级任务必须有 metrics。
 
-- endpoint：responses/chat/images。
-- model。
-- account scope。
-- stream/non-stream。
-- prompt cache key。
-- previous response id。
-- body size。
-- client request id。
-- retry budget。
-- requires non-free token。
+### 4.4 状态可靠性原则
 
-这样 token 选择不直接依赖 FastAPI/Go handler 的原始请求对象，也不重复解析 body。
+- 进程内状态只能作为 cache。
+- token disabled/cooling 必须写 DB。
+- final request log 必须 durable。
+- import job 状态必须可恢复。
+- prompt affinity 可以 fail-open，但必须有指标。
+- quota snapshot 应持久化，不应只在前端请求中临时存在。
 
-### 7.2 Claim
+## 5. 数据库终局设计
 
-token claim 结果必须包含：
+### 5.1 表职责
 
-- token id。
-- access token value 或 header material。
-- token capability/scope。
-- claim started timestamp。
-- max stream concurrency。
-- selected reason。
-- affinity lane id。
-- release callback。
-
-claim 成功后，active stream counter 必须递增。任何返回路径，包括上游连接失败、客户端断开、panic recovery，都必须 release。
-
-### 7.3 Attempt
-
-一次上游尝试包含：
-
-- claim。
-- upstream URL。
-- rewritten headers。
-- rewritten body reader。
-- timeout/deadline。
-- attempt index。
-- retry cause。
-
-attempt 结束后只输出结构化 outcome，不在 proxy 主流程里散落 token 状态更新。
-
-### 7.4 Outcome
-
-统一结果分类：
+建议保留或补齐以下职责边界：
 
 ```text
-Success
-ClientCanceled
-UpstreamTimeout
-Upstream429Cooldown
-Upstream401Invalid
-Upstream403Forbidden
-Upstream5xxRetryable
-UpstreamSchemaError
-TransportErrorRetryable
-TransportErrorTerminal
-```
-
-每种 outcome 映射到固定动作：
-
-- 是否重试。
-- 是否冷却 token。
-- 是否禁用 token。
-- 是否记录 quota。
-- 是否写 final log。
-- 是否向客户端透传 upstream error。
-- 是否生成兼容错误帧。
-
-## 8. token 池与调度设计
-
-### 8.1 Snapshot
-
-Go 版 snapshot 应为不可变结构，刷新后原子替换：
-
-```text
-TokenSnapshot
-  version
-  created_at
-  tokens_by_id
-  tokens_by_scope
-  tokens_by_model
-  enabled_tokens
-  cooldown_index
-  capability_index
-```
-
-要求：
-
-- 读路径无锁或极少锁。
-- token id lookup O(1)。
-- 按 scope/model 查候选不全量扫描。
-- snapshot refresh 不阻塞请求线程。
-- stale snapshot 有明确策略：短时间使用旧版本，超过硬 TTL 进入 degraded readiness。
-
-### 8.2 Selector
-
-选择策略拆成可替换接口：
-
-```text
-Selector
-  Select(ctx, intent, snapshot) -> ClaimCandidate
-```
-
-内置策略：
-
-- LRU。
-- fill-first。
-- prompt-affinity。
-- quota-aware。
-- latency-aware。
-- random-rendezvous。
-
-策略可以组合，但组合结果必须在局部候选集内完成，避免每个请求对所有 token 排序。
-
-### 8.3 并发计数
-
-每个 token runtime state：
-
-- active streams。
-- recent TTFT EWMA。
-- cooldown until。
-- last selected at。
-- last used at。
-- failure streak。
-- quota state。
-
-active streams 使用进程内 atomic counter；多实例并发限制如果需要强一致，使用 Redis/Postgres lease。默认建议：
-
-- 单 token soft limit：进程内快速判断。
-- 全局 hard limit：Redis token bucket 或 Postgres lease，可按部署规模启用。
-
-### 8.4 冷却与禁用
-
-冷却和禁用不能只保存在进程内。
-
-状态转换：
-
-```text
-active -> cooling
-active -> disabled
-cooling -> active
-disabled -> active only by admin/worker validation
-```
-
-每次转换写入：
-
-- `token_runtime_state`。
-- `token_state_events` 或 outbox。
-- metrics counter。
-- structured log。
-
-## 9. Prompt Cache Affinity 设计
-
-当前 prompt cache affinity 的目标是尽量让同一 prompt/response 后续请求命中相同 token，以利用上游缓存。
-
-Go 版目标：
-
-- lane lookup O(1)。
-- lane candidate 只在 lane 内部排序。
-- 多实例可共享。
-- token 被禁用/冷却后，lane 能快速剔除。
-
-### 9.1 Lane Store
-
-接口：
-
-```text
-LaneStore
-  Get(promptKey) -> Lane
-  Put(promptKey, Lane, ttl)
-  RemoveToken(tokenID)
-  BindResponseOwner(responseID, tokenID, ttl)
-  GetResponseOwner(responseID) -> tokenID
-```
-
-实现：
-
-- 本地内存实现：开发/单实例。
-- Redis/Dragonfly 实现：生产多实例推荐。
-- Postgres TTL 表实现：无 Redis 环境兜底。
-
-### 9.2 Lane 数据结构
-
-```text
-Lane
-  primary_token_id
-  secondary_token_ids
-  updated_at
-  expires_at
-  policy_version
-```
-
-选择顺序：
-
-1. previous response owner。
-2. primary lane token。
-3. secondary lane tokens。
-4. 新建 lane 候选。
-5. 普通 selector fallback。
-
-任何一步遇到 disabled/cooling/saturated token，都不全量扫描；只查询 token id map 和局部 fallback index。
-
-## 10. 上游 HTTP 与流式协议
-
-### 10.1 Transport
-
-Go `http.Transport` 按上游 provider/host/shard 管理：
-
-- `MaxIdleConns`
-- `MaxIdleConnsPerHost`
-- `MaxConnsPerHost`
-- `IdleConnTimeout`
-- `TLSHandshakeTimeout`
-- `ResponseHeaderTimeout`
-- `ExpectContinueTimeout`
-- `DisableCompression`
-- `ForceAttemptHTTP2`
-
-连接池不通过私有字段维护，不扫描 `/proc`。连接泄漏通过测试和 metrics 捕捉：
-
-- active requests。
-- idle connections。
-- dial count。
-- TLS handshake count。
-- response body close count。
-- goroutine count。
-
-### 10.2 SSE Parser
-
-统一 SSE parser：
-
-- 支持 `data:` 多行。
-- 支持 comment/keepalive。
-- 支持半包。
-- 支持大 event 限制。
-- 支持上下文取消。
-- 不使用反复字符串拼接。
-
-所有 stream endpoint 使用同一个 parser。
-
-### 10.3 SSE Writer
-
-统一 writer：
-
-- 支持 keepalive。
-- 支持 terminal error frame。
-- 支持 client disconnect detection。
-- 支持 flush error classification。
-- 支持 final usage/log extraction。
-
-### 10.4 Backpressure
-
-stream 期间不应无限缓冲。
-
-要求：
-
-- 读上游和写客户端在同一个受控 pipeline 中。
-- bounded channel。
-- 客户端慢写时触发上下文取消或 deadline。
-- 上游 body 关闭必须在所有退出路径执行。
-
-## 11. Request Log 终局设计
-
-### 11.1 日志主表
-
-建议 request log 分区：
-
-```text
-request_logs_YYYYMMDD
-```
-
-字段保留兼容当前查询所需信息：
-
-- request_id。
-- parent_request_id。
-- started_at。
-- finished_at。
-- endpoint。
-- model。
-- token_id。
-- status。
-- upstream_status。
-- error_code。
-- prompt_tokens。
-- completion_tokens。
-- cached_tokens。
-- image_count。
-- duration_ms。
-- ttft_ms。
-- retry_count。
-- client_ip hash。
-- metadata jsonb。
-
-### 11.2 写入模式
-
-写入分两类：
-
-- start log：可降级，但应尽量进入 batch。
-- final log：关键，必须 durable。
-
-设计：
-
-```text
-gateway
--> in-memory bounded batcher
--> Postgres batch upsert
--> on failure write outbox
--> worker drains outbox
-```
-
-策略：
-
-- final log 不静默 drop。
-- start log 队列满时可采样/降级，但必须有 metrics。
-- request_id 合并在 writer 内完成。
-- hourly stats 不在主写入事务中做。
-
-### 11.3 聚合统计
-
-worker 维护：
-
-- `request_hourly_stats`。
-- token hourly stats。
-- model hourly stats。
-- error hourly stats。
-
-查询管理面优先读聚合表；聚合缺口再读分区日志。
-
-### 11.4 Retention
-
-不用大范围 `DELETE`。
-
-方案：
-
-- 按天分区。
-- retention worker drop old partition。
-- 小表如 outbox/token events 可批量 delete with limit。
-
-## 12. Token Import 与 OAuth Worker
-
-### 12.1 Import Job 状态机
-
-```text
-created
--> staging
--> validating
--> publishing
--> completed
--> failed
--> canceled
-```
-
-item 状态：
-
-```text
-pending
--> claimed
--> validating
--> validated
--> publish_failed
--> published
--> failed
-```
-
-### 12.2 Worker 处理方式
-
-要求：
-
-- 批量 claim staged items。
-- OAuth refresh 使用固定并发池。
-- item 状态批量更新。
-- publish token 批量 upsert。
-- 重复 refresh token 归一化去重。
-- 每个 job 有进度快照。
-- worker 可重启恢复。
-
-### 12.3 OAuth
-
-OAuth client 独立包：
-
-- refresh request builder。
-- response parser。
-- retry policy。
-- error classifier。
-- token identity extraction。
-- refresh token history dedup。
-
-OAuth 失败不能污染 gateway 热路径；gateway 只读取可用 access token 和 runtime state。
-
-## 13. 数据库设计
-
-### 13.1 迁移策略
-
-只允许迁移模块修改 schema：标准部署显式运行 `oaix-migrate`，单容器平台可在 gateway 进程启动前通过 `OAIX_AUTO_MIGRATE_ON_STARTUP=true` 调用同一套幂等迁移。
-
-gateway/admin/worker 启动时：
-
-- 检查 schema version。
-- 默认不自动 create table。
-- 默认不自动 create index。
-- 默认不自动 backfill。
-- schema 不匹配时 readiness fail。
-
-### 13.2 推荐表
-
-```text
-schema_migrations
-
 tokens
 token_secrets
-token_scopes
 token_runtime_state
 token_state_events
 token_refresh_history
 
-request_logs_YYYYMMDD
-request_hourly_stats
+token_quota_snapshots
+
+request_logs
 request_log_outbox
+request_hourly_stats
+token_hourly_stats
+model_hourly_stats
 
 prompt_affinity_lanes
+prompt_affinity_token_index
 response_owner_bindings
 
 token_import_jobs
@@ -652,859 +592,499 @@ token_import_items
 
 admin_audit_logs
 settings
+schema_migrations
 ```
 
-### 13.3 批处理 SQL 原则
+### 5.2 SQL 性能原则
 
-- token last_used_at：`UPDATE ... FROM (VALUES ...)`。
-- request logs：batch upsert 或 copy 到 staging 后 merge。
-- token runtime state：按 token id 批量 update。
-- import item state：批量 update，不逐 item round-trip。
-- analytics 查询：优先聚合表和分区裁剪。
+- Token list：服务端分页，必要时 cursor pagination。
+- Token search：为 email/account_id/remark/source/error 做合适索引，必要时 `pg_trgm`。
+- Plan/status counts：从聚合或轻量索引读，不在高频请求里做复杂扫描。
+- Request logs：按时间分区或至少按时间索引。
+- Request stats：读 hourly stats，不直接扫明细。
+- Import publish：使用批量 upsert，不逐 item round-trip。
+- Quota snapshot：worker 批量刷新并批量写入。
 
-## 14. 管理面设计
+## 6. 可观测性与性能证据
 
-### 14.1 Admin API
+任何“性能优化完成”必须满足以下证据要求之一：
 
-管理 API 与 gateway API 分开注册。
+- 有 before/after benchmark。
+- 有线上或本地压测 p50/p95/p99 对比。
+- 有 `pg_stat_statements` 或 DB query timing 证明。
+- 有 Prometheus/metrics 指标证明。
+- 有浏览器 performance/profile 证明。
 
-模块：
+禁止用“理论上更快”作为完成依据。
 
-- token list/detail/update。
-- token enable/disable/cooldown。
-- token import jobs。
-- request logs。
-- analytics。
-- runtime health。
-- settings。
-- audit logs。
+### 6.1 必须补齐的指标
 
-要求：
+Gateway：
 
-- 所有列表分页。
-- 支持 cursor-based pagination。
-- 大字段按需加载。
-- 批量操作异步化。
-- 所有管理写操作写 admin audit log。
+- `oaix_gateway_requests_total`
+- `oaix_gateway_request_duration_seconds`
+- `oaix_gateway_ttft_seconds`
+- `oaix_gateway_active_streams`
+- `oaix_gateway_upstream_attempts_total`
+- `oaix_gateway_upstream_errors_total`
+- `oaix_gateway_client_canceled_total`
 
-### 14.2 Admin Frontend
+Token：
 
-当前 `web/app.js` 单文件应终局拆分：
-
-```text
-web/src/api
-web/src/state
-web/src/views/tokens
-web/src/views/requests
-web/src/views/imports
-web/src/views/settings
-web/src/components
-```
-
-性能要求：
-
-- token 大列表虚拟滚动。
-- request log 分页和服务端筛选。
-- 批量更新只 patch 局部 state。
-- 图表数据读聚合 API。
-- 不在浏览器端全量过滤/排序大数据集。
-
-## 15. 配置设计
-
-配置按结构收敛：
-
-```text
-server
-database
-request_log
-token_pool
-affinity
-upstream_transport
-oauth
-import_worker
-admin
-observability
-retention
-```
-
-兼容策略：
-
-- 第一版 Go 服务可以读取现有环境变量名。
-- 内部统一转换为 typed config。
-- 启动时输出 sanitized config summary。
-- 非法配置 fail fast。
-- 默认值集中维护，不散落在业务包中。
-
-## 16. 可观测性
-
-### 16.1 Metrics
-
-必须覆盖：
-
-- requests total by endpoint/model/status。
-- active streams。
-- stream duration histogram。
-- TTFT histogram。
-- upstream attempts total。
-- upstream status/error classification。
-- token claim latency。
-- token selector fallback count。
-- token cooldown/disable transitions。
-- request log queue depth。
-- request log batch latency。
-- outbox backlog。
-- DB pool acquire latency。
-- DB batch latency。
-- OAuth refresh success/failure。
-- import worker progress。
-- goroutine count。
-
-### 16.2 Logs
-
-结构化日志字段：
-
-- request_id。
-- endpoint。
-- model。
-- token_id。
-- upstream_attempt。
-- outcome。
-- error_class。
-- cooldown_until。
-- retry_count。
-- duration_ms。
-- ttft_ms。
-
-### 16.3 Tracing
-
-Span：
-
-- inbound request。
-- token select。
-- upstream attempt。
-- SSE first byte。
-- request log write。
-- token state commit。
-
-## 17. 鲁棒性要求
-
-### 17.1 取消传播
-
-客户端断开时：
-
-- context canceled。
-- upstream request canceled。
-- upstream body closed。
-- claim released。
-- final log 写入 canceled outcome。
-
-### 17.2 Panic Recovery
-
-gateway handler 层 recovery：
-
-- 返回兼容错误。
-- release claim。
-- 记录 final log。
-- metrics 计数。
-- 不让 panic 杀进程。
-
-### 17.3 队列满
-
-队列满不能静默。
-
-策略：
-
-- 关键状态：同步写或 outbox。
-- final log：outbox。
-- start log：可采样丢弃，但必须 metrics。
-- metrics/log 标记 degraded。
-
-### 17.4 DB 短暂不可用
-
-分级：
-
-- token snapshot 可短时间沿用旧版本。
-- request final log 进 outbox 或本地 WAL-like spool。
-- 关键 token disabled/cooldown 写失败时，请求 outcome 标记 `state_commit_failed`，并触发 readiness degraded。
-- 超过阈值后 gateway 不再接新流式请求。
-
-### 17.5 多实例
-
-要求：
-
-- token 禁用和冷却对所有实例可见。
-- prompt affinity 可共享或可明确声明为 best-effort。
-- request log 不因实例退出丢 final。
-- worker 任务使用 row lock / lease，避免重复处理。
-
-## 18. API 兼容范围
-
-Go 版必须兼容：
-
-- `GET /livez`
-- `GET /healthz`
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `GET /v1/responses/{id}`
-- `DELETE /v1/responses/{id}`
-- `POST /v1/responses/{id}/cancel`
-- `POST /v1/responses/compact`
-- `POST /v1/images/generations`
-- `POST /v1/images/edits`
-- 现有 admin token API。
-- 现有 admin request log API。
-- 现有 token import API。
-
-兼容不等于内部结构复制。所有 endpoint 应通过新的 RequestIntent / ProxyPipeline / Store 接口实现。
-
-## 19. 测试策略
-
-### 19.1 行为兼容测试
-
-把现有 Python 测试提炼为黑盒兼容用例：
-
-- token 选择。
-- 429 冷却。
-- 401/403 失效。
-- responses stream terminal event。
-- image stream synthetic completed event。
-- request log start/final 合并。
-- import job 去重。
-- refresh token alias/history。
-
-### 19.2 单元测试
-
-Go 包单元测试：
-
-- SSE parser 半包、多行、超大 event。
-- FailureClassifier。
-- RetryPolicy。
-- TokenSelector。
-- PromptAffinity。
-- RequestLogBatcher。
-- RuntimeStateMachine。
-
-### 19.3 集成测试
-
-使用 fake upstream：
-
-- 慢 headers。
-- 慢 body。
-- 中途断流。
-- 429 with retry-after。
-- 401/403。
-- 5xx 后成功。
-- SSE malformed。
-- 客户端中断。
-
-### 19.4 压测
-
-基准维度：
-
-- 1k tokens。
-- 10k tokens。
-- 100 concurrent streams。
-- 1k concurrent streams。
-- 10k short non-stream requests。
-- 上游 1%/5%/20% error rate。
-- request log DB 延迟注入。
-- worker backlog 注入。
-
-关键指标：
-
-- p50/p95/p99 claim latency。
-- p50/p95/p99 TTFT。
-- active goroutines 稳定性。
-- DB pool wait。
-- upstream connection reuse。
-- final log loss count 必须为 0。
-
-## 20. 终局建设顺序
-
-这不是对 Python 单体的渐进式改造，而是 Go 终局系统的建设顺序。每一阶段产物都以终局架构为目标，不把 Python 内部结构作为长期边界。
-
-1. 规格冻结。
-   - 固定外部 API、错误响应、SSE 行为、admin API 行为。
-   - 固定 token 状态机。
-   - 固定 request log schema。
-
-2. Go 基础骨架。
-   - 建 module、config、store、transport、observability。
-   - 建 fake upstream 和兼容测试框架。
-
-3. 热路径。
-   - 实现 token snapshot/selector。
-   - 实现 proxy pipeline。
-   - 实现 SSE parser/writer。
-   - 实现 responses/chat/image endpoints。
-
-4. 状态与日志。
-   - 实现 runtime state machine。
-   - 实现 durable request log writer。
-   - 实现 outbox/aggregation worker。
-
-5. 后台任务。
-   - 实现 OAuth refresh。
-   - 实现 token import worker。
-   - 实现 retention/repair worker。
-
-6. 管理面。
-   - 实现 admin API。
-   - 重建前端模块。
-   - 接入 audit log。
-
-7. 性能验收。
-   - 执行流式压测。
-   - 执行大 token 池调度压测。
-   - 执行 DB 故障和上游故障注入。
-
-8. 替换上线。
-   - Go 服务通过兼容测试和压测门槛后，作为 oaix 新实现替换 Python 单体。
-   - Python 项目保留为历史参考和回归样本，不继续承载新功能。
-
-## 21. 详细 TODO List
-
-### 21.1 架构决策
-
-- [x] 确认 Go 重写为终局方向，不继续对 Python 单体做长期结构演进。
-- [x] 确认 gateway/admin/worker/migrate 是否拆成独立二进制。
-- [x] 确认是否引入 Redis/Dragonfly 承载 prompt affinity 和全局并发 lease。
-- [x] 确认 Postgres 是否继续作为唯一强一致状态存储。
-- [x] 确认 request log 是否按天分区。
-- [x] 确认 final request log 是否必须零丢失。
-- [x] 确认 token cooldown/disabled 是否必须跨实例强一致。
-- [x] 确认 admin UI 是否随 Go 重构一起重建。
-
-### 21.2 API 规格冻结
-
-- [x] 梳理 `/v1/responses` 请求字段兼容范围。
-- [x] 梳理 `/v1/responses` 流式 event 兼容范围。
-- [x] 梳理 response id 查询、取消、删除行为。
-- [x] 梳理 `/v1/chat/completions` 兼容范围。
-- [x] 梳理 `/v1/images/generations` 兼容范围。
-- [x] 梳理 `/v1/images/edits` multipart 兼容范围。
-- [x] 梳理 admin token API。
-- [x] 梳理 admin request log API。
-- [x] 梳理 token import API。
-- [x] 固定错误响应格式。
-- [x] 固定 SSE terminal error frame 格式。
-- [x] 固定 health/readiness 响应格式。
-
-### 21.3 Go 工程骨架
-
-- [x] 创建 Go module。
-- [x] 建立 `cmd/oaix-gateway`。
-- [x] 建立 `cmd/oaix-admin`。
-- [x] 建立 `cmd/oaix-worker`。
-- [x] 建立 `cmd/oaix-migrate`。
-- [x] 建立 `internal/config`。
-- [x] 建立 `internal/store`。
-- [x] 建立 `internal/proxy`。
-- [x] 建立 `internal/tokens`。
-- [x] 建立 `internal/affinity`。
-- [x] 建立 `internal/transport`。
-- [x] 建立 `internal/logs`。
-- [x] 建立 `internal/oauth`。
-- [x] 建立 `internal/admin`。
-- [x] 建立 `internal/observability`。
-- [x] 建立 `internal/testkit`。
-- [x] 建立 lint/test/benchmark 命令。
-
-### 21.4 配置
-
-- [x] 收集当前所有 oaix 环境变量。
-- [x] 设计 typed config schema。
-- [x] 设计默认值集中表。
-- [x] 实现环境变量兼容读取。
-- [x] 实现配置校验。
-- [x] 实现 sanitized config logging。
-- [x] 实现配置单元测试。
-
-### 21.5 数据库与迁移
-
-- [x] 设计 `schema_migrations`。
-- [x] 设计 `tokens`。
-- [x] 设计 `token_secrets`。
-- [x] 设计 `token_scopes`。
-- [x] 设计 `token_runtime_state`。
-- [x] 设计 `token_state_events`。
-- [x] 设计 `token_refresh_history`。
-- [x] 设计 request log 分区表。
-- [x] 设计 `request_hourly_stats`。
-- [x] 设计 `request_log_outbox`。
-- [x] 设计 `prompt_affinity_lanes`。
-- [x] 设计 `response_owner_bindings`。
-- [x] 设计 `token_import_jobs`。
-- [x] 设计 `token_import_items`。
-- [x] 设计 `admin_audit_logs`。
-- [x] 编写 up migration。
-- [x] 编写 down migration。
-- [x] 编写迁移幂等测试。
-- [x] 移除 runtime DDL 依赖。
-
-### 21.6 Store 层
-
-- [x] 实现 pgxpool 初始化。
-- [x] 实现 workload-specific pool。
-- [x] 实现 token repository。
-- [x] 实现 runtime state repository。
-- [x] 实现 request log repository。
-- [x] 实现 import job repository。
-- [x] 实现 affinity repository。
-- [x] 实现 batch update token last_used_at。
-- [x] 实现 batch upsert request logs。
-- [x] 实现 outbox enqueue/drain。
-- [x] 实现 transaction helper。
-- [x] 实现 DB pool metrics。
-
-### 21.7 Token Snapshot
-
-- [x] 定义 TokenSnapshot。
-- [x] 建 `tokens_by_id`。
-- [x] 建 `tokens_by_scope`。
-- [x] 建 `tokens_by_model`。
-- [x] 建 cooldown index。
-- [x] 建 capability index。
-- [x] 实现 atomic snapshot swap。
-- [x] 实现 snapshot refresh loop。
-- [x] 实现 snapshot hard TTL。
-- [x] 实现 stale snapshot degraded readiness。
-- [x] 实现 snapshot metrics。
-- [x] 实现大 token 池 benchmark。
-
-### 21.8 Token Selector
-
-- [x] 定义 Selector 接口。
-- [x] 实现 LRU selector。
-- [x] 实现 fill-first selector。
-- [x] 实现 quota-aware selector。
-- [x] 实现 latency-aware selector。
-- [x] 实现 prompt-affinity selector adapter。
-- [x] 实现 excluded token set。
-- [x] 实现 max active stream limit。
-- [x] 实现 selected reason。
-- [x] 实现 selector fallback metrics。
-- [x] 实现 1k/10k token latency benchmark。
-
-### 21.9 Runtime State Machine
-
-- [x] 定义 token state transition。
-- [x] 定义 cooldown reason。
-- [x] 定义 disabled reason。
-- [x] 实现 active -> cooling。
-- [x] 实现 active -> disabled。
-- [x] 实现 cooling -> active。
-- [x] 实现 admin re-enable。
-- [x] 实现 state event 写入。
-- [x] 实现关键状态 durable commit。
-- [x] 实现 commit failure 处理。
-- [x] 实现 multi-instance visibility test。
-
-### 21.10 Prompt Affinity
-
-- [x] 定义 LaneStore 接口。
-- [x] 实现 in-memory LaneStore。
-- [x] 评估并实现 Redis/Dragonfly LaneStore。
-- [x] 实现 Postgres LaneStore 兜底。
-- [x] 实现 response owner binding。
-- [x] 实现 lane TTL。
-- [x] 实现 RemoveToken。
-- [x] 实现 primary/secondary lane selection。
-- [x] 实现 disabled/cooling token 剔除。
-- [x] 实现 affinity metrics。
-- [x] 实现多实例一致性测试。
-
-### 21.11 Upstream Transport
-
-- [x] 定义 upstream transport config。
-- [x] 实现 per-host client pool。
-- [x] 实现 shard 策略。
-- [x] 配置 MaxIdleConns。
-- [x] 配置 MaxConnsPerHost。
-- [x] 配置 IdleConnTimeout。
-- [x] 配置 ResponseHeaderTimeout。
-- [x] 配置 TLSHandshakeTimeout。
-- [x] 实现 request cloning/rewrite。
-- [x] 实现 body close guard。
-- [x] 实现 transport metrics。
-- [x] 实现连接泄漏测试。
-- [x] 实现客户端中断测试。
-
-### 21.12 SSE 与协议处理
-
-- [x] 实现 SSE parser。
-- [x] 支持半包。
-- [x] 支持多行 data。
-- [x] 支持 comment/keepalive。
-- [x] 支持 malformed event 分类。
-- [x] 实现 SSE writer。
-- [x] 实现 keepalive。
-- [x] 实现 terminal error frame。
-- [x] 实现 flush error 处理。
-- [x] 实现 responses codec。
-- [x] 实现 chat codec。
-- [x] 实现 image codec。
-- [x] 建立 SSE fixture tests。
-
-### 21.13 Proxy Pipeline
-
-- [x] 定义 RequestIntent。
-- [x] 定义 Claim。
-- [x] 定义 Attempt。
-- [x] 定义 Outcome。
-- [x] 定义 FailureClassifier。
-- [x] 定义 RetryPolicy。
-- [x] 实现 auth/normalize middleware。
-- [x] 实现 responses endpoint。
-- [x] 实现 chat completions endpoint。
-- [x] 实现 images generations endpoint。
-- [x] 实现 images edits endpoint。
-- [x] 实现 retry/failover。
-- [x] 实现 token release guarantee。
-- [x] 实现 client cancel propagation。
-- [x] 实现 final log hook。
-- [x] 实现 token state commit hook。
-
-### 21.14 Request Log
-
-- [x] 定义 request log model。
-- [x] 定义 start log。
-- [x] 定义 final log。
-- [x] 实现 in-memory bounded batcher。
-- [x] 实现 request_id 合并。
-- [x] 实现 batch upsert。
-- [x] 实现 final log durable fallback。
-- [x] 实现 request_log_outbox。
-- [x] 实现 outbox drain worker。
-- [x] 实现 queue full metrics。
-- [x] 实现 hourly aggregation worker。
-- [x] 实现 retention worker。
-- [x] 实现 log loss fault injection test。
-
-### 21.15 OAuth
-
-- [x] 定义 OAuth provider client。
-- [x] 实现 refresh request。
-- [x] 实现 refresh response parser。
-- [x] 实现 OAuth retry policy。
-- [x] 实现 OAuth error classification。
-- [x] 实现 refresh token identity。
-- [x] 实现 refresh history dedup。
-- [x] 实现 token secret update。
-- [x] 实现 OAuth metrics。
-- [x] 实现 fake OAuth server tests。
-
-### 21.16 Import Worker
-
-- [x] 定义 import job state machine。
-- [x] 定义 import item state machine。
-- [x] 实现 batch claim items。
-- [x] 实现 OAuth validation pool。
-- [x] 实现 batch item update。
-- [x] 实现 batch publish tokens。
-- [x] 实现 duplicate handling。
-- [x] 实现 cancel job。
-- [x] 实现 resume after crash。
-- [x] 实现 job progress snapshot。
-- [x] 实现 import worker metrics。
-
-### 21.17 Admin API
-
-- [x] 实现 admin auth。
-- [x] 实现 token list pagination。
-- [x] 实现 token detail。
-- [x] 实现 token enable/disable。
-- [x] 实现 token cooldown clear。
-- [x] 实现 batch token operation。
-- [x] 实现 request log query。
-- [x] 实现 analytics query。
-- [x] 实现 import job create/list/detail/cancel。
-- [x] 实现 runtime health API。
-- [x] 实现 settings API。
-- [x] 实现 admin audit log。
-
-### 21.18 Admin Frontend
-
-- [x] 确定前端技术栈。
-- [x] 拆分 API client。
-- [x] 拆分 token view。
-- [x] 拆分 request log view。
-- [x] 拆分 import view。
-- [x] 拆分 settings view。
-- [x] 实现 token 虚拟列表。
-- [x] 实现服务端分页。
-- [x] 实现批量操作交互。
-- [x] 实现 job progress view。
-- [x] 实现 analytics charts。
-- [x] 实现错误和 loading 状态。
-
-### 21.19 Observability
-
-- [x] 接入 structured logging。
-- [x] 接入 Prometheus metrics。
-- [x] 接入 tracing。
-- [x] 实现 request id propagation。
-- [x] 实现 upstream attempt span。
-- [x] 实现 token select span。
-- [x] 实现 request log write span。
-- [x] 实现 readiness checks。
-- [x] 实现 liveness checks。
-- [x] 实现 degraded state reporting。
-- [x] 建立 dashboard 指标清单。
-- [x] 建立 alert 规则清单。
-
-### 21.20 测试与验收
-
-- [x] 提炼 Python 行为测试为黑盒兼容测试。
-- [x] 建 fake upstream。
-- [x] 建 fake OAuth server。
-- [x] 建 Postgres integration test fixture。
-- [x] 建 Redis/Dragonfly integration test fixture。
-- [x] 覆盖 429 cooldown。
-- [x] 覆盖 401 invalid。
-- [x] 覆盖 403 forbidden。
-- [x] 覆盖 5xx retry。
-- [x] 覆盖 malformed SSE。
-- [x] 覆盖 client cancel。
-- [x] 覆盖 upstream timeout。
-- [x] 覆盖 DB unavailable。
-- [x] 覆盖 queue full。
-- [x] 覆盖 process restart recovery。
-- [x] 执行 1k token benchmark。
-- [x] 执行 10k token benchmark。
-- [x] 执行 1k concurrent streams benchmark。
-- [x] 验证 final log loss count 为 0。
-- [x] 验证 goroutine 无泄漏。
-- [x] 验证连接无泄漏。
-
-### 21.21 部署替换
-
-- [x] 定义 Go 服务镜像。
-- [x] 定义 migration job。
-- [x] 定义 gateway deployment。
-- [x] 定义 worker deployment。
-- [x] 定义 admin deployment。
-- [x] 定义 config/secrets。
-- [x] 定义 readiness/liveness probes。
-- [x] 定义 resource requests/limits。
-- [x] 定义 rollback 条件。
-- [x] 定义流量切换条件。
-- [x] 定义上线后观察指标。
-- [x] 定义 Python 旧实现冻结策略。
-
-## 22. 审阅重点
-
-建议重点审阅以下决策：
-
-1. 是否接受 Go 重写作为终局，不再投资 Python 单体长期演进。
-2. 是否接受 request final log 零丢失要求。
-3. 是否接受 token 冷却/禁用跨实例强一致要求。
-4. 是否引入 Redis/Dragonfly 作为多实例 affinity/lease 层。
-5. request log 是否按天分区。
-6. admin UI 是否一起重建。
-7. 上线替换时是否允许保留 Python 为只读参考实现。
-
-## 23. 目标终态
-
-最终 oaix 应成为：
-
-- Go 实现的高并发模型账号池网关。
-- 热路径小而稳定。
-- 状态机明确。
-- 流式协议统一。
-- 日志可靠。
-- 后台任务独立。
-- 多实例可横向扩展。
-- 管理面可维护。
-- 通过兼容测试、故障注入和性能压测后替换当前 Python 单体。
-
-## 24. 当前实现与验证记录
-
-### 24.1 已落地代码
-
-- Go module：`github.com/yym68686/oaix`。
-- 二进制入口：`cmd/oaix-gateway`、`cmd/oaix-admin`、`cmd/oaix-worker`、`cmd/oaix-migrate`、`cmd/oaix-bench`。
-- 核心包：`internal/config`、`internal/store`、`internal/tokens`、`internal/proxy`、`internal/transport`、`internal/logs`、`internal/affinity`、`internal/oauth`、`internal/httpapi`、`internal/observability`。
-- 多实例 affinity：`internal/affinity` 已提供 in-memory、Postgres、Redis/Dragonfly 三种 LaneStore；Postgres 为无 Redis 环境兜底，Redis/Dragonfly 为生产多实例推荐选项。
-- Request log：默认单 batch writer + 可重试 upsert，避免 1k 并发下 start/final upsert 死锁直接落 outbox；final log 仍保留 sync/outbox fallback。
-- Import worker：已定义 job/item 状态机，支持 batch claim、并发 validation、batch item update、batch publish、cancel job、stale job resume 和 worker metrics。
-- Admin frontend：运行入口切到 ES module，拆分为 `api.js`、`tokenView.js`、`requestView.js`、`importView.js`、`settingsView.js`、`charts.js`、`state.js`、`dom.js`；实现 token 虚拟列表、批量操作、job progress、analytics charts、loading/error 状态。
-- Docker：多阶段 Go 构建，runtime 使用 distroless；compose 增加 `migrate` 和 `worker` 服务。
-- runtime DDL：源码本地运行时 gateway 默认只检查 schema version；容器镜像默认 `OAIX_AUTO_MIGRATE_ON_STARTUP=true`，用于 Fugue 这类单容器部署启动前自举迁移，迁移逻辑仍复用 `oaix-migrate` 的幂等 SQL。
-
-### 24.2 本地功能验证
-
-验证环境：
-
-```text
-Postgres: docker compose postgres
-Gateway: go run ./cmd/oaix-gateway
-Migrate: go run ./cmd/oaix-migrate
-Fake upstream: 127.0.0.1:18081
-Token file: /Users/yanyuming/Downloads/at.txt
-Imported tokens: 10
-```
-
-已验证：
-
-- `GET /livez` 正常。
-- `GET /healthz` 正常，`available=10`。
-- `GET /admin/tokens?limit=3` 正常分页。
-- `POST /admin/tokens/import` 可导入/更新 access token。
-- `GET /admin/tokens/import-batches` 返回稳定数组。
-- `POST /admin/tokens/import-jobs/{id}/cancel` 正常返回 job 状态。
-- `POST /admin/tokens/{id}/activation` 可禁用并重新启用 token。
-- `GET /admin/tokens/{id}` 可查询 token detail。
-- `POST /admin/tokens/{id}/remark` 可更新备注。
-- `GET /admin/settings` / `POST /admin/settings/{key}` 正常。
-- 缺少 `SERVICE_API_KEYS` 鉴权时返回 401。
-- `POST /v1/responses` 非流式代理成功。
-- `POST /v1/responses` 流式代理成功，能收到 keepalive 和上游 SSE event。
-- `POST /v1/chat/completions` 代理成功。
-- `POST /v1/images/generations` 代理成功。
-- `POST /v1/images/edits` multipart 代理成功。
-- `GET /admin/requests` 能看到 start/final 合并后的日志。
-- 客户端中断后不会再发生已提交响应上的二次 `WriteHeader`。
-- 1000 并发 stream 压测后，`active_streams=0`、`upstream_active_requests=0`、`request_log_dropped_total=0`、`request_log_outbox_writes_total=0`、`token_state_commit_failures_total=0`。
-
-### 24.3 测试基线
-
-```text
-uv run pytest -q
-354 passed, 1 skipped
-
-go test ./...
-PASS
-
-docker compose build gateway migrate worker
-PASS
-
-node --check oaix_gateway/web/src/*.js
-PASS
-```
-
-### 24.4 性能证据
-
-命令：
-
-```text
-go test ./internal/tokens -bench='Benchmark(SnapshotByIDLookup10000|LinearTokenLookup10000|Claim10000)$' -benchmem -count=3
-```
-
-结果摘要：
-
-```text
-BenchmarkSnapshotByIDLookup10000: ~8.0-8.6 ns/op, 0 allocs/op
-BenchmarkLinearTokenLookup10000: ~4.3-8.2 us/op, 0 allocs/op
-BenchmarkClaim10000: ~148-507 ns/op, 2 allocs/op
-```
-
-结论：
-
-- 10k token 下，`tokens_by_id` map lookup 相比线性扫描约快 450x 以上。
-- claim 热路径移除 per-claim goroutine 后，从早期约 500ns/8 allocs 降到 148-507ns/2 allocs；接入 selector 接口后仍保持亚微秒级。
-- 这些数字来自本地 benchmark，不是推测。
-
-1k concurrent streams benchmark：
-
-```text
-go run ./cmd/oaix-bench \
-  -target http://127.0.0.1:18080 \
-  -api-key test-key \
-  -streams 1000 \
-  -concurrency 1000 \
-  -timeout 90s
-```
-
-结果：
-
-```json
-{
-  "total": 1000,
-  "ok": 1000,
-  "failed": 0,
-  "elapsed_ms": 674,
-  "p50_ms": 326,
-  "p95_ms": 642,
-  "p99_ms": 660,
-  "status_counts": {"200": 1000}
-}
-```
-
-压测后指标：
-
-```text
-oaix_token_active_streams 0
-oaix_upstream_active_requests 0
-oaix_upstream_errors_total 0
-oaix_request_log_dropped_total 0
-oaix_request_log_outbox_writes_total 0
-oaix_token_state_commit_failures_total 0
-```
-
-### 24.5 部署替换定义
-
-资源建议：
-
-```text
-gateway:
-  requests: cpu 500m, memory 512Mi
-  limits: cpu 2, memory 2Gi
-
-worker:
-  requests: cpu 100m, memory 256Mi
-  limits: cpu 1, memory 1Gi
-
-migrate:
-  requests: cpu 100m, memory 128Mi
-  limits: cpu 1, memory 512Mi
-```
-
-Rollback 条件：
-
-- `/healthz` 连续 3 次 degraded。
-- 5xx 比例 5 分钟内超过旧版 2 倍。
-- request final log outbox backlog 持续增长超过 5 分钟。
-- token available 数量异常下降超过 20%。
-- p95 TTFT 较旧版升高超过 30%。
-
-流量切换条件：
-
-- migration 成功。
-- gateway `/livez` 和 `/healthz` 正常。
-- 本地/预发 fake upstream 兼容测试通过。
-- 10k token selector benchmark 结果满足亚微秒 claim。
-- request log dropped total 为 0。
-
-上线后观察指标：
-
+- `oaix_token_claim_duration_seconds`
+- `oaix_token_claim_failures_total`
+- `oaix_token_snapshot_refresh_duration_seconds`
+- `oaix_token_snapshot_age_seconds`
 - `oaix_token_ready_tokens`
 - `oaix_token_active_streams`
-- `oaix_token_snapshot_age_ms`
+- `oaix_token_state_commit_failures_total`
+
+Affinity：
+
+- `oaix_affinity_lookup_duration_seconds`
+- `oaix_affinity_hit_total`
+- `oaix_affinity_miss_total`
+- `oaix_affinity_fail_open_total`
+- `oaix_affinity_lane_create_total`
+
+Logs：
+
 - `oaix_request_log_queue_depth`
 - `oaix_request_log_written_total`
 - `oaix_request_log_dropped_total`
 - `oaix_request_log_outbox_writes_total`
-- DB pool acquired/idle/acquire count
+- `oaix_request_log_outbox_backlog`
+- `oaix_request_log_batch_duration_seconds`
 
-Python 旧实现冻结策略：
+Worker：
 
-- Python 目录保留为行为参考和回归测试来源。
-- 新功能只进入 Go 实现。
-- Python 测试继续作为旧行为保护网，直到 Go 黑盒兼容测试完整覆盖后再移除。
+- `oaix_worker_jobs_claimed_total`
+- `oaix_worker_jobs_failed_total`
+- `oaix_worker_job_duration_seconds`
+- `oaix_import_items_published_total`
+- `oaix_import_items_failed_total`
+- `oaix_quota_refresh_duration_seconds`
+- `oaix_quota_refresh_errors_total`
 
-Dashboard 清单：
+### 6.2 必须保留的压测场景
 
-- Token pool：ready tokens、active streams、snapshot age、cooldown/disabled transition。
-- Request log：queue depth、written total、dropped total、outbox writes/backlog。
-- Gateway：request count、status class、stream duration、TTFT。
-- Upstream：attempt count、429/401/403/5xx classification。
-- DB：pool acquired/idle、acquire count、acquire duration。
+- 1k tokens claim benchmark。
+- 10k tokens claim benchmark。
+- 50k tokens snapshot refresh benchmark。
+- 100 concurrent streams。
+- 1k concurrent streams。
+- 10k short non-stream requests。
+- 上游 429/401/403/5xx 混合错误。
+- 上游 SSE 半包、慢 body、中途断流。
+- 客户端中断。
+- DB 延迟和短暂不可用。
+- Worker 高负载导入同时 gateway 转发。
 
-Alert 清单：
+## 7. 测试策略
 
-- `oaix_request_log_dropped_total` 5 分钟内增加。
-- `oaix_token_snapshot_age_ms` 超过 hard TTL。
-- `oaix_token_ready_tokens` 低于部署前基线 80%。
-- DB pool acquired 长时间接近 max。
-- 5xx 或 upstream retryable outcome 明显升高。
+### 7.1 协议兼容测试
+
+每个 endpoint 都需要 fixture：
+
+- `/v1/responses`
+- `/v1/responses/compact`
+- `/v1/chat/completions`
+- `/v1/images/generations`
+- `/v1/images/edits`
+
+必须覆盖：
+
+- `instructions` 缺失、空字符串、非空字符串。
+- `store` 缺失、true、false。
+- `reasoning_content` 在不同层级出现。
+- `gpt-image-2` 请求体转换。
+- multipart image edit。
+- response.created keepalive。
+- response.failed 自动重试。
+- 上游 terminal error frame。
+- non-stream 转 stream 的兼容行为。
+
+### 7.2 状态机测试
+
+必须覆盖：
+
+- active -> cooling。
+- active -> disabled。
+- cooling -> active。
+- disabled -> active by admin。
+- deactivated_workspace -> disabled。
+- quota_error -> visible but not falsely active。
+- state commit failure。
+- client cancel release claim。
+
+### 7.3 导入测试
+
+必须覆盖：
+
+- 粘贴 `account_id,refresh_token`。
+- 粘贴纯 `refresh_token`。
+- 文件导入。
+- OAuth callback 导入。
+- 重复 refresh token。
+- job cancel。
+- job delete with tokens。
+- worker crash/resume。
+- partial success。
+- OAuth refresh 429/401/5xx/timeout。
+
+### 7.4 前端测试和手工验收
+
+必须覆盖：
+
+- Key 页面默认有效状态。
+- 状态筛选、计划筛选、排序、搜索。
+- 筛选切换立刻显示 loading。
+- 不同状态下 key 都能显示。
+- 额度胶囊对齐。
+- 备注完整展示。
+- 窄屏表格行高正常。
+- 导入 modal tabs。
+- 导入批次表格。
+- 批次详情 modal 状态/计划筛选。
+- 批次删除确认。
+- 长 refresh token 输入不会撑破布局。
+
+## 8. 详细 TODO List
+
+### 8.1 立项与基线
+
+- [ ] 确认本文件作为后续 oaix Go 版重构唯一实施方案。
+- [ ] 冻结当前线上版本 commit。
+- [ ] 记录当前 Fugue 部署版本、构建号和启动时间。
+- [ ] 导出当前线上关键环境变量的 sanitized summary。
+- [ ] 记录当前线上 token 总数、有效数、冷却数、禁用数。
+- [ ] 记录当前线上 1 小时 request volume、错误率、缓存率。
+- [ ] 记录当前线上 request log outbox backlog。
+- [ ] 记录当前线上 DB pool 配置和连接数。
+- [ ] 记录当前线上 gateway CPU/memory 基线。
+- [ ] 建立重构分支。
+- [ ] 建立 rollback checklist。
+
+### 8.2 观测与性能证据
+
+- [ ] 补齐 gateway request duration 指标。
+- [ ] 补齐 TTFT 指标。
+- [ ] 补齐 token claim duration 指标。
+- [ ] 补齐 token snapshot refresh duration 指标。
+- [ ] 补齐 prompt affinity hit/miss/fail-open 指标。
+- [ ] 补齐 request log queue/outbox 指标。
+- [ ] 补齐 worker job duration 指标。
+- [ ] 补齐 quota refresh 指标。
+- [ ] 增加 pprof 或等价 profiling 入口，并限制 admin 权限。
+- [ ] 建立 `cmd/oaix-bench` 标准压测脚本。
+- [ ] 建立 100 并发 stream benchmark。
+- [ ] 建立 1k 并发 stream benchmark。
+- [ ] 建立 10k token selector benchmark。
+- [ ] 建立 50k token snapshot benchmark。
+- [ ] 建立 DB 故障注入 benchmark。
+- [ ] 建立上游错误注入 benchmark。
+- [ ] 建立前端 Lighthouse 或 browser smoke 脚本。
+- [ ] 写入 before/after 性能记录模板。
+
+### 8.3 协议兼容层拆分
+
+- [ ] 新建 `internal/protocol/openai` 根包。
+- [ ] 新建 responses codec 包。
+- [ ] 新建 chat codec 包。
+- [ ] 新建 images codec 包。
+- [ ] 新建 compact codec 包。
+- [ ] 新建 SSE protocol helper 包。
+- [ ] 从 `compat_payload.go` 抽出 `/v1/responses` normalize 逻辑。
+- [ ] 从 `compat_payload.go` 抽出 `/v1/chat/completions` normalize 逻辑。
+- [ ] 从 `compat_payload.go` 抽出 `/v1/images/generations` normalize 逻辑。
+- [ ] 从 `compat_payload.go` 抽出 `/v1/images/edits` multipart normalize 逻辑。
+- [ ] 抽出 `instructions` 默认注入逻辑。
+- [ ] 抽出 `store=false` 强制逻辑。
+- [ ] 抽出 `reasoning_content` 递归删除逻辑。
+- [ ] 抽出 `response.created` keepalive 兼容逻辑。
+- [ ] 抽出 `response.failed` 自动 retry 判断逻辑。
+- [ ] 为 gpt-image-2 generation 增加 golden fixture。
+- [ ] 为 gpt-image-2 edit 增加 golden fixture。
+- [ ] 为 missing instructions 增加 golden fixture。
+- [ ] 为 store true -> false 增加 golden fixture。
+- [ ] 为 reasoning_content 删除增加 golden fixture。
+- [ ] 为 response.created/failed SSE 增加 golden fixture。
+- [ ] 确认 `compat_payload.go` 缩小到 orchestration 或删除。
+- [ ] 跑通 `go test ./internal/protocol/openai/...`。
+
+### 8.4 Proxy pipeline 拆分
+
+- [ ] 定义 `RequestIntent` 独立类型和测试。
+- [ ] 定义 `PreparedPayload` 独立类型和测试。
+- [ ] 定义 `TokenClaim` 独立类型和 release contract。
+- [ ] 定义 `UpstreamAttempt` 独立类型。
+- [ ] 定义 `ProxyOutcome` 独立类型。
+- [ ] 定义 `FailureClassifier` 接口。
+- [ ] 定义 `RetryPolicy` 接口。
+- [ ] 抽出 auth/normalize 阶段。
+- [ ] 抽出 prompt cache planning 阶段。
+- [ ] 抽出 token claim 阶段。
+- [ ] 抽出 upstream request build 阶段。
+- [ ] 抽出 stream bridge 阶段。
+- [ ] 抽出 non-stream bridge 阶段。
+- [ ] 抽出 outcome classification 阶段。
+- [ ] 抽出 token state commit 阶段。
+- [ ] 抽出 request final log 阶段。
+- [ ] 为 client cancel 增加 release guarantee 测试。
+- [ ] 为 panic/recover 增加 release guarantee 测试。
+- [ ] 为 retry exhausted 增加 final log 测试。
+- [ ] 为 upstream 429 cooldown 增加状态提交测试。
+- [ ] 为 upstream 401/403 disabled 增加状态提交测试。
+- [ ] 确认 `pipeline.go` 单文件行数降到可维护范围。
+
+### 8.5 Gateway/Admin/Worker 边界
+
+- [ ] 定义 gateway mode 只注册 `/v1/*` 和 minimal health。
+- [ ] 定义 admin mode 只注册 `/admin/*` 和 frontend。
+- [ ] 定义 worker mode 只运行后台任务。
+- [ ] 将 `internal/httpapi` 拆成 public proxy API 和 admin API。
+- [ ] 将 embedded worker 默认关闭，单容器部署显式开启。
+- [ ] 把 worker 任务从 gateway runtime 依赖中抽离。
+- [ ] 为 gateway 增加 worker disabled 情况下的启动测试。
+- [ ] 为 admin 增加 proxy disabled 情况下的启动测试。
+- [ ] 为 worker 增加 no HTTP server 情况下的启动测试。
+- [ ] 更新 Dockerfile/entrypoint 支持 mode。
+- [ ] 更新 Fugue 部署配置说明。
+- [ ] 验证 worker 高负载时 gateway benchmark 不回退。
+
+### 8.6 导入链路统一
+
+- [ ] 定义唯一 import job 状态机。
+- [ ] 定义唯一 import item 状态机。
+- [ ] 粘贴导入改为创建 job。
+- [ ] 文件导入改为创建 job。
+- [ ] OAuth callback 导入改为创建 job。
+- [ ] 删除 Admin 同步 publish 路径。
+- [ ] Worker 实现 refresh token validation。
+- [ ] Worker 实现 access token validation。
+- [ ] Worker 实现 quota 初始化。
+- [ ] Worker 实现批量 item update。
+- [ ] Worker 实现批量 token publish。
+- [ ] Worker 实现重复 refresh token 合并。
+- [ ] Worker 实现 partial success。
+- [ ] Worker 实现 crash/resume。
+- [ ] Worker 实现 job delete with tokens。
+- [ ] Admin API 返回 job id 和 progress。
+- [ ] 前端导入 modal 轮询 job progress。
+- [ ] 导入批次详情 modal 使用 job item/token 统一数据源。
+- [ ] 覆盖 `account_id,refresh_token` 导入测试。
+- [ ] 覆盖纯 `refresh_token` 导入测试。
+- [ ] 覆盖 OAuth 导入测试。
+- [ ] 覆盖批次删除测试。
+
+### 8.7 Token selector 与 snapshot
+
+- [ ] 明确当前 selector 策略优先级。
+- [ ] 为 snapshot refresh 增加 duration 和 token count 指标。
+- [ ] 为 selector claim 增加 duration 和 candidate count 指标。
+- [ ] snapshot 增加按 status/plan/model/scope 的候选索引。
+- [ ] snapshot 增加 active aggregate 快照。
+- [ ] selector 使用局部候选集，避免全量 ready scan。
+- [ ] fill-first selector 使用稳定 priority queue 或 ring。
+- [ ] round-robin selector 使用按 scope/model 的 ring。
+- [ ] quota-aware selector 只在 quota-ready 候选中选择。
+- [ ] latency-aware selector 使用局部 top-k。
+- [ ] prompt-affinity fallback 不全量排序。
+- [ ] 支持 excluded token set O(1) 判断。
+- [ ] 1k token claim benchmark 通过。
+- [ ] 10k token claim benchmark 通过。
+- [ ] 50k token snapshot benchmark 通过。
+- [ ] 验证 selector 行为和当前线上策略一致。
+
+### 8.8 Prompt cache affinity
+
+- [ ] 梳理当前 prompt cache key 生成逻辑。
+- [ ] 为 prompt cache key 增加 fixture。
+- [ ] 为 response owner binding 增加测试。
+- [ ] 为 lane primary/secondary selection 增加测试。
+- [ ] 增加本地 LRU lane cache。
+- [ ] 增加 affinity fail-open metrics。
+- [ ] 增加 affinity lookup latency metrics。
+- [ ] 增加 `prompt_affinity_token_index` 或等价反向索引。
+- [ ] 改造 RemoveToken，避免扫描所有 lane。
+- [ ] lane 创建使用 rendezvous top-k。
+- [ ] disabled/cooling token 从 lane 中快速剔除。
+- [ ] token 删除时清理 lane index。
+- [ ] 多实例场景下验证 lane 共享。
+- [ ] 缓存率 benchmark 对比改造前后。
+- [ ] 线上观测 cache hit rate 无回退。
+
+### 8.9 Request log 与统计
+
+- [ ] 明确 start log 可降级策略。
+- [ ] 明确 final log 零丢失策略。
+- [ ] 为 final log 写入失败增加 outbox fallback 测试。
+- [ ] 为 queue full 增加 metrics 和测试。
+- [ ] 优化 batch upsert，评估 `COPY` staging 或 `unnest`。
+- [ ] request log 表增加时间分区方案。
+- [ ] worker 实现 request hourly stats 聚合。
+- [ ] worker 实现 token hourly stats 聚合。
+- [ ] worker 实现 model hourly stats 聚合。
+- [ ] Admin 统计 API 优先读聚合表。
+- [ ] request log retention 改为按分区或批量 limit 清理。
+- [ ] DB unavailable 注入下 final log 不丢。
+- [ ] outbox backlog 恢复到 0 的测试通过。
+- [ ] 压测下 `request_log_dropped_total=0`。
+
+### 8.10 Quota 与计划状态
+
+- [ ] 从 Admin API 中抽出 quota service 到 `internal/quota`。
+- [ ] 定义 quota snapshot DB model。
+- [ ] Worker 周期刷新 quota snapshot。
+- [ ] Worker 批量写 quota snapshot。
+- [ ] Admin token list 默认读取 quota snapshot。
+- [ ] 保留手动刷新 quota 按钮或 API。
+- [ ] `deactivated_workspace` 统一转换为 disabled 或明确不可用状态。
+- [ ] quota 402/401/429/5xx/timeout 分类明确。
+- [ ] quota 错误不应显示为有效额度。
+- [ ] plan/type 更新只由统一 quota/OAuth path 写入。
+- [ ] 计划筛选 counts 与状态筛选关系明确。
+- [ ] 为 plan count 增加独立测试。
+- [ ] 为 quota error 展示增加前端测试。
+
+### 8.11 Store 层批处理与索引
+
+- [ ] 审查 `ListTokens` 查询计划。
+- [ ] 审查 token counts 查询计划。
+- [ ] 审查 plan counts 查询计划。
+- [ ] 审查 request logs 查询计划。
+- [ ] 审查 import jobs 查询计划。
+- [ ] 为 token search 增加必要索引。
+- [ ] 为 status/plan/order 增加组合索引。
+- [ ] 为 request logs time/model/status 增加索引或分区。
+- [ ] 为 import job/item status 增加索引。
+- [ ] `UpsertTokenPayloads` 改为 staging/batch upsert。
+- [ ] token secrets/history 写入批量化。
+- [ ] token last_used_at 批量更新。
+- [ ] request log outbox drain 批量化。
+- [ ] 使用 `pg_stat_statements` 记录 before/after。
+
+### 8.12 Admin API
+
+- [ ] 将 admin token API 从 `server.go` 拆出。
+- [ ] 将 import job API 从 `server.go` 拆出。
+- [ ] 将 request log API 从 `server.go` 拆出。
+- [ ] 将 settings API 从 `server.go` 拆出。
+- [ ] 将 OAuth API 从 `server.go` 拆出。
+- [ ] 定义统一 API error envelope。
+- [ ] 所有列表 API 明确分页语义。
+- [ ] 批量操作返回 job 或 operation id。
+- [ ] 管理写操作写 audit log。
+- [ ] 增加 admin API integration tests。
+- [ ] `server.go` 缩小到路由装配和基础 middleware。
+
+### 8.13 Frontend COSS 管理台
+
+- [ ] 拆分 Key 页面 API client。
+- [ ] 拆分 `useTokenQuery`。
+- [ ] 拆分 `useTokenSelection`。
+- [ ] 拆分 `TokenFilters`。
+- [ ] 拆分 `TokenTable`。
+- [ ] 拆分 `QuotaMeter`。
+- [ ] 拆分 `BulkToolbar`。
+- [ ] 拆分 `RemarkDialog`。
+- [ ] 拆分 `ImportTokenModal`。
+- [ ] 拆分导入页面 API client。
+- [ ] 拆分 `useImportJobs`。
+- [ ] 拆分 `ImportJobsTable`。
+- [ ] 拆分 `ImportJobKeysModal`。
+- [ ] 拆分 `ImportJobFilters`。
+- [ ] 拆分 `DeleteImportJobDialog`。
+- [ ] 所有输入框长字符串不撑破布局。
+- [ ] 所有表格窄屏行高受控。
+- [ ] 备注列完整展示并不破坏表格。
+- [ ] 表格行最多显示两行内容的列保持一致。
+- [ ] 状态筛选切换立即进入 loading。
+- [ ] 计划筛选 counts 逻辑符合产品定义。
+- [ ] 批次详情 modal 支持状态筛选。
+- [ ] 批次详情 modal 支持计划筛选。
+- [ ] 导入 modal 使用粘贴/文件/OAuth tabs。
+- [ ] 删除无意义说明卡片。
+- [ ] `npm run build:web` 通过。
+- [ ] in-app Browser 桌面宽屏验收。
+- [ ] in-app Browser 窄屏验收。
+
+### 8.14 OAuth 导入
+
+- [ ] 梳理 `sub2api` OAuth 授权流程。
+- [ ] 明确 oaix OAuth callback URL 生成规则。
+- [ ] 明确 public host 强制 HTTPS 规则。
+- [ ] OAuth start API 创建 pending job 或 pending session。
+- [ ] OAuth callback 将 refresh token 写入 import job。
+- [ ] OAuth state 防 CSRF。
+- [ ] OAuth callback 错误可展示给前端。
+- [ ] OAuth 导入成功后跳转导入批次详情。
+- [ ] OAuth 导入失败后保留 job 错误。
+- [ ] OAuth refresh token 不在前端暴露。
+- [ ] OAuth 相关 secret 不进入日志。
+- [ ] OAuth 流程 integration test 通过。
+
+### 8.15 部署与回滚
+
+- [ ] 更新 Dockerfile 支持 gateway/admin/worker mode。
+- [ ] 更新 Fugue 构建说明。
+- [ ] 更新环境变量文档。
+- [ ] 定义 migration 执行顺序。
+- [ ] 定义 worker 单实例或多实例策略。
+- [ ] 定义 gateway readiness degraded 条件。
+- [ ] 定义 admin readiness 条件。
+- [ ] 定义 rollback 触发阈值。
+- [ ] 上线前备份关键表。
+- [ ] 上线后监控 30 分钟关键指标。
+- [ ] 确认缓存率无回退。
+- [ ] 确认 error rate 无回退。
+- [ ] 确认 request final log 不丢。
+- [ ] 确认 worker backlog 不持续增长。
+
+### 8.16 文档与维护
+
+- [ ] 更新 README 中过期的 refresh worker 描述。
+- [ ] 更新 architecture 文档。
+- [ ] 更新 admin API 文档。
+- [ ] 更新 import job 状态机文档。
+- [ ] 更新 quota state 文档。
+- [ ] 更新 prompt affinity 文档。
+- [ ] 更新 benchmark 使用说明。
+- [ ] 更新线上排障手册。
+- [ ] 记录旧 Python 行为 fixture 来源。
+- [ ] 标记旧 Python 运行时为 legacy/reference。
+
+## 9. 完成定义
+
+本次重构不能只以“代码写完”为完成。必须同时满足：
+
+- Go 测试通过。
+- 前端构建通过。
+- 协议兼容 fixture 通过。
+- 核心压测通过。
+- 有 before/after 性能证据。
+- 线上关键指标无回退。
+- 缓存率无异常下降。
+- request final log 无丢失。
+- token active streams 无泄漏。
+- worker backlog 可恢复。
+- Admin 前端关键路径可用。
+- 文档和 TODO 勾选状态同步更新。
+
+## 10. 建议执行顺序
+
+建议按以下顺序实施，避免一开始就动最大风险模块：
+
+1. 观测与 benchmark 先行。
+2. 协议兼容 fixture 先行。
+3. 拆 protocol codec。
+4. 拆 proxy pipeline。
+5. 统一 import job。
+6. 持久化 quota snapshot。
+7. 拆 gateway/admin/worker 边界。
+8. 优化 token selector 和 affinity。
+9. 优化 request log 和统计。
+10. 前端继续模块化。
+11. 部署、压测、线上观察、逐项勾选。
+
+每个阶段都必须保持线上业务可用，并且不得依赖猜测判断性能是否提升。
