@@ -35,9 +35,11 @@ type ImportBatchSummary struct {
 	Disabled               int      `json:"disabled"`
 	Missing                int      `json:"missing"`
 	TokenIDs               []int64  `json:"token_ids"`
-	ObservedCostUSD        float64  `json:"observed_cost_usd"`
+	ObservedCostUSD        *float64 `json:"observed_cost_usd"`
 	AverageObservedCostUSD *float64 `json:"average_observed_cost_usd,omitempty"`
 }
+
+const importSummaryObservedCostTimeout = 2 * time.Second
 
 type DeletedImportJob struct {
 	ImportJob
@@ -524,11 +526,9 @@ func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includ
 	}
 
 	costByTokenID := map[int64]*float64{}
+	observedCostLoaded := false
 	if includeObservedCost && len(tokens) > 0 {
-		costByTokenID, err = s.TokenObservedCosts(ctx, tokens)
-		if err != nil {
-			return nil, err
-		}
+		costByTokenID, observedCostLoaded = s.importSummaryObservedCosts(ctx, tokens)
 	}
 
 	now := time.Now()
@@ -557,8 +557,9 @@ func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includ
 			}
 		}
 		summaries[index].TokenCount = present
-		if includeObservedCost {
-			summaries[index].ObservedCostUSD = totalCost
+		if includeObservedCost && observedCostLoaded {
+			observedCost := totalCost
+			summaries[index].ObservedCostUSD = &observedCost
 			if present > 0 {
 				average := totalCost / float64(present)
 				summaries[index].AverageObservedCostUSD = &average
@@ -566,6 +567,19 @@ func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includ
 		}
 	}
 	return summaries, nil
+}
+
+func (s *Store) importSummaryObservedCosts(ctx context.Context, tokens []Token) (map[int64]*float64, bool) {
+	if len(tokens) == 0 {
+		return map[int64]*float64{}, true
+	}
+	costCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importSummaryObservedCostTimeout)
+	defer cancel()
+	costs, err := s.TokenObservedCosts(costCtx, tokens)
+	if err != nil {
+		return map[int64]*float64{}, false
+	}
+	return costs, true
 }
 
 func (s *Store) importJobTokenIDsFromItems(ctx context.Context, jobIDs []int64) (map[int64][]int64, error) {
