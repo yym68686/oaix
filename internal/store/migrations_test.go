@@ -31,6 +31,7 @@ func TestMigrationRepairsImportJobAndTokenDefaults(t *testing.T) {
 		"alter table token_import_jobs add column if not exists yielded_to_response_traffic_count integer",
 		"alter table token_import_jobs alter column yielded_to_response_traffic_count set default 0",
 		"alter table token_import_jobs alter column response_traffic_timeout_count set default 0",
+		"alter table token_import_items alter column status set default 'queued'",
 	}
 	for _, fragment := range required {
 		if !strings.Contains(joined, fragment) {

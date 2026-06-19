@@ -343,6 +343,10 @@ var migrationStatements = []string{
 		updated_at timestamptz not null default now(),
 		unique(job_id, item_index)
 	)`,
+	`alter table token_import_items add column if not exists status varchar(32)`,
+	`update token_import_items set status = 'queued' where status is null`,
+	`alter table token_import_items alter column status set default 'queued'`,
+	`alter table token_import_items alter column status set not null`,
 	`create table if not exists admin_audit_logs (
 		id bigserial primary key,
 		action varchar(128) not null,

@@ -185,11 +185,11 @@ func (s *Store) CreateQueuedImportJobForOwner(ctx context.Context, ownerUserID i
 		hash := refreshHashFromPayload(payload)
 		args = append(args, index, encoded, hash)
 		base := 3 + index*3
-		batchValues = append(batchValues, fmt.Sprintf("($1, $2, $%d, $%d, $%d)", base, base+1, base+2))
+		batchValues = append(batchValues, fmt.Sprintf("($1, $2, $%d, 'queued', $%d, $%d)", base, base+1, base+2))
 	}
 	if len(batchValues) > 0 {
 		_, err = tx.Exec(ctx, `
-			insert into token_import_items(job_id, owner_user_id, item_index, payload, refresh_token_hash)
+			insert into token_import_items(job_id, owner_user_id, item_index, status, payload, refresh_token_hash)
 			values `+strings.Join(batchValues, ",")+`
 		`, args...)
 		if err != nil {
