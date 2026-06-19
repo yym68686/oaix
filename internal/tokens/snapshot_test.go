@@ -125,6 +125,23 @@ func TestManagerActiveStreamCapCanUpdateAtRuntime(t *testing.T) {
 	}
 }
 
+func TestManagerStatsIncludesOwnerSnapshotActiveStreams(t *testing.T) {
+	rows := makeTokens(2)
+	rows[0].OwnerUserID = 10
+	rows[1].OwnerUserID = 10
+	manager := NewManager(&fakeSource{tokens: rows}, nil, time.Second, time.Second, 10)
+
+	claim, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10})
+	if err != nil {
+		t.Fatalf("Claim returned error: %v", err)
+	}
+	defer claim.Release()
+
+	if stats := manager.Stats(); stats.ActiveStreams != 1 {
+		t.Fatalf("Stats.ActiveStreams = %d, want 1", stats.ActiveStreams)
+	}
+}
+
 func TestManagerClaimLoadsOwnerSnapshotLazily(t *testing.T) {
 	rows := makeTokens(4)
 	rows[0].OwnerUserID = 10

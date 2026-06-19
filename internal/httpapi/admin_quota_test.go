@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/yym68686/oaix/internal/store"
+	"github.com/yym68686/oaix/internal/tokens"
 )
 
 func TestParseCodexQuotaPayloadExtracts5HAnd7DWindows(t *testing.T) {
@@ -103,6 +104,56 @@ func TestQuotaResponseShouldDisableOnlyForDeactivatedWorkspace(t *testing.T) {
 	if quotaResponseShouldDisable(http.StatusTooManyRequests, []byte(`{"error":{"code":"deactivated_workspace"}}`)) {
 		t.Fatal("non-402 should not disable token")
 	}
+}
+
+func TestActiveStreamsByTokenIDUsesOwnerSnapshot(t *testing.T) {
+	rows := []store.Token{
+		{ID: 101, OwnerUserID: 1, AccessToken: "access-101", RefreshToken: "refresh-101", IsActive: true},
+	}
+	manager := tokens.NewManager(&adminActiveStreamSource{tokens: rows}, nil, time.Minute, time.Minute, 10)
+	claim, err := manager.Claim(context.Background(), tokens.Intent{OwnerUserID: 1})
+	if err != nil {
+		t.Fatalf("Claim returned error: %v", err)
+	}
+	defer claim.Release()
+
+	app := &App{tokens: manager}
+	activeByID := app.activeStreamsByTokenID(rows)
+	if activeByID[101] != 1 {
+		t.Fatalf("active streams for token 101 = %d, want 1", activeByID[101])
+	}
+}
+
+type adminActiveStreamSource struct {
+	tokens []store.Token
+}
+
+func (s *adminActiveStreamSource) ListAvailableTokens(context.Context) ([]store.Token, error) {
+	out := make([]store.Token, len(s.tokens))
+	copy(out, s.tokens)
+	return out, nil
+}
+
+func (s *adminActiveStreamSource) ListAvailableTokensScoped(_ context.Context, scope store.ResourceScope) ([]store.Token, error) {
+	out := make([]store.Token, 0, len(s.tokens))
+	for _, token := range s.tokens {
+		if scope.AllowAll || (scope.OwnerUserID != nil && token.OwnerUserID == *scope.OwnerUserID) {
+			out = append(out, token)
+		}
+	}
+	return out, nil
+}
+
+func (s *adminActiveStreamSource) TouchTokens(context.Context, []int64, time.Time) error {
+	return nil
+}
+
+func (s *adminActiveStreamSource) MarkTokenSuccess(context.Context, int64) error {
+	return nil
+}
+
+func (s *adminActiveStreamSource) MarkTokenError(context.Context, int64, string, bool, *time.Time) error {
+	return nil
 }
 
 func TestQuotaErrorSnapshotMarksDeactivatedWorkspace(t *testing.T) {

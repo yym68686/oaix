@@ -207,16 +207,13 @@ func (a *App) syncQuotaPlanTypes(parent context.Context, quotaByID map[int64]*co
 	}
 }
 
-func (a *App) activeStreamsByTokenID(tokens []store.Token) map[int64]int64 {
-	values := make(map[int64]int64, len(tokens))
+func (a *App) activeStreamsByTokenID(tokenRows []store.Token) map[int64]int64 {
+	values := make(map[int64]int64, len(tokenRows))
 	if a.tokens == nil {
 		return values
 	}
-	snapshot := a.tokens.Snapshot()
-	for _, token := range tokens {
-		if runtimeToken := snapshot.ByID[token.ID]; runtimeToken != nil {
-			values[token.ID] = runtimeToken.Active.Load()
-		}
+	for _, token := range tokenRows {
+		values[token.ID] = a.tokens.ActiveStreamsForToken(token.ID, token.OwnerUserID)
 	}
 	return values
 }

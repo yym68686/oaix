@@ -268,10 +268,6 @@ func (m *Manager) SnapshotForOwner(ownerUserID int64) *Snapshot {
 func (m *Manager) Stats() Stats {
 	snapshot := m.Snapshot()
 	now := time.Now().UTC()
-	var active int64
-	for _, token := range snapshot.Ready {
-		active += token.Active.Load()
-	}
 	age := now.Sub(snapshot.LoadedAt)
 	if snapshot.LoadedAt.IsZero() {
 		age = 0
@@ -281,10 +277,66 @@ func (m *Manager) Stats() Stats {
 		LoadedAt:      snapshot.LoadedAt,
 		AgeMs:         age.Milliseconds(),
 		ReadyTokens:   len(snapshot.Ready),
-		ActiveStreams: active,
+		ActiveStreams: m.ActiveStreams(),
 		ActiveCap:     m.ActiveStreamCap(),
 		Stale:         snapshot.LoadedAt.IsZero() || now.Sub(snapshot.LoadedAt) > m.maxAge,
 	}
+}
+
+func (m *Manager) ActiveStreams() int64 {
+	if m == nil {
+		return 0
+	}
+	active := snapshotActiveStreams(m.Snapshot())
+	m.ownerSnapshots.Range(func(_, value any) bool {
+		state, ok := value.(*ownerSnapshotState)
+		if !ok || state == nil {
+			return true
+		}
+		active += snapshotActiveStreams(state.snapshotValue())
+		return true
+	})
+	return active
+}
+
+func (m *Manager) ActiveStreamsForToken(tokenID int64, ownerUserID int64) int64 {
+	if m == nil || tokenID == 0 {
+		return 0
+	}
+	var active int64
+	active += snapshotTokenActive(m.Snapshot(), tokenID)
+	if ownerUserID > 0 {
+		if value, ok := m.ownerSnapshots.Load(ownerUserID); ok {
+			if state, ok := value.(*ownerSnapshotState); ok && state != nil {
+				active += snapshotTokenActive(state.snapshotValue(), tokenID)
+			}
+		}
+	}
+	return active
+}
+
+func snapshotActiveStreams(snapshot *Snapshot) int64 {
+	if snapshot == nil {
+		return 0
+	}
+	var active int64
+	for _, token := range snapshot.Ready {
+		if token != nil {
+			active += token.Active.Load()
+		}
+	}
+	return active
+}
+
+func snapshotTokenActive(snapshot *Snapshot, tokenID int64) int64 {
+	if snapshot == nil {
+		return 0
+	}
+	token := snapshot.ByID[tokenID]
+	if token == nil {
+		return 0
+	}
+	return token.Active.Load()
 }
 
 func (m *Manager) Claim(ctx context.Context, intent Intent) (*Claim, error) {
