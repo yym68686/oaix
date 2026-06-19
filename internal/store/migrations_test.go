@@ -23,6 +23,11 @@ func TestMigrationRepairsImportJobAndTokenDefaults(t *testing.T) {
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
 	required := []string{
 		"alter table codex_tokens alter column type set default 'codex'",
+		"alter table token_import_jobs alter column processed_count set default 0",
+		"alter table token_import_jobs alter column created_count set default 0",
+		"alter table token_import_jobs alter column updated_count set default 0",
+		"alter table token_import_jobs alter column skipped_count set default 0",
+		"alter table token_import_jobs alter column failed_count set default 0",
 		"alter table token_import_jobs add column if not exists yielded_to_response_traffic_count integer",
 		"alter table token_import_jobs alter column yielded_to_response_traffic_count set default 0",
 		"alter table token_import_jobs alter column response_traffic_timeout_count set default 0",

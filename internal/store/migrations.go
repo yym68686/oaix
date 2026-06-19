@@ -283,6 +283,32 @@ var migrationStatements = []string{
 		heartbeat_at timestamptz,
 		finished_at timestamptz
 	)`,
+	`alter table token_import_jobs add column if not exists processed_count integer`,
+	`alter table token_import_jobs add column if not exists created_count integer`,
+	`alter table token_import_jobs add column if not exists updated_count integer`,
+	`alter table token_import_jobs add column if not exists skipped_count integer`,
+	`alter table token_import_jobs add column if not exists failed_count integer`,
+	`update token_import_jobs
+		set processed_count = coalesce(processed_count, 0),
+		    created_count = coalesce(created_count, 0),
+		    updated_count = coalesce(updated_count, 0),
+		    skipped_count = coalesce(skipped_count, 0),
+		    failed_count = coalesce(failed_count, 0)
+		where processed_count is null
+		   or created_count is null
+		   or updated_count is null
+		   or skipped_count is null
+		   or failed_count is null`,
+	`alter table token_import_jobs alter column processed_count set default 0`,
+	`alter table token_import_jobs alter column created_count set default 0`,
+	`alter table token_import_jobs alter column updated_count set default 0`,
+	`alter table token_import_jobs alter column skipped_count set default 0`,
+	`alter table token_import_jobs alter column failed_count set default 0`,
+	`alter table token_import_jobs alter column processed_count set not null`,
+	`alter table token_import_jobs alter column created_count set not null`,
+	`alter table token_import_jobs alter column updated_count set not null`,
+	`alter table token_import_jobs alter column skipped_count set not null`,
+	`alter table token_import_jobs alter column failed_count set not null`,
 	`alter table token_import_jobs add column if not exists yielded_to_response_traffic_count integer`,
 	`alter table token_import_jobs add column if not exists response_traffic_timeout_count integer`,
 	`update token_import_jobs

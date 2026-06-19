@@ -162,10 +162,11 @@ func (s *Store) CreateQueuedImportJobForOwner(ctx context.Context, ownerUserID i
 	row := tx.QueryRow(ctx, `
 			insert into token_import_jobs (
 				owner_user_id, status, import_queue_position, payloads, total_count,
+				processed_count, created_count, updated_count, skipped_count, failed_count,
 				yielded_to_response_traffic_count, response_traffic_timeout_count,
 				submitted_at, heartbeat_at
 			)
-			values ($1, 'queued', $2, $3, $4, 0, 0, now(), now())
+			values ($1, 'queued', $2, $3, $4, 0, 0, 0, 0, 0, 0, 0, now(), now())
 			returning id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 			          created_count, updated_count, skipped_count, failed_count, last_error,
 			          submitted_at, started_at, heartbeat_at, finished_at
