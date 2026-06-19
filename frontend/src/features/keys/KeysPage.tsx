@@ -453,12 +453,12 @@ function TokenTable({
       <Table className="table-fixed">
         <colgroup>
           <col className="w-9" />
-          <col className="w-[28%]" />
+          <col className="w-[26%]" />
           <col className="w-[5.75rem]" />
-          <col className="w-[8.75rem]" />
+          <col className="w-[8rem]" />
           <col className="w-[9.5rem]" />
           <col className="w-[9.75rem]" />
-          <col />
+          <col className="w-[17rem]" />
           <col className="w-[13rem]" />
         </colgroup>
         <TableHeader>
@@ -575,7 +575,7 @@ function TokenRow({
           <span className="oaix-tabular text-muted-foreground">冷却 {formatDate(item.cooldown_until)}</span>
         </div>
       </TableCell>
-      <TableCell className="min-w-0 max-w-[18rem] align-top">
+      <TableCell className="min-w-[14rem] max-w-[24rem] align-top">
         <span className="block min-w-0 whitespace-pre-wrap break-words text-muted-foreground text-xs leading-relaxed [overflow-wrap:anywhere]" title={secondaryText}>
           {secondaryText}
         </span>
