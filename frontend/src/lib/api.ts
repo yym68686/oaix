@@ -302,6 +302,11 @@ export function isAdminPrincipal(value: MeResponse | null = currentAuth): boolea
   return role === "admin" || role === "readonly_admin" || role === "service" || Boolean(value?.capabilities?.some((item) => item.startsWith("admin:")));
 }
 
+export function isServicePrincipal(value: MeResponse | null = currentAuth): boolean {
+  const role = String(value?.role || value?.user?.role || "").toLowerCase();
+  return value?.principal_type === "service" || role === "service";
+}
+
 export function isSelfUserMode(): boolean {
   return Boolean(currentAuth?.user?.id) && !isAdminPrincipal(currentAuth);
 }

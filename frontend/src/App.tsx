@@ -116,7 +116,7 @@ export function App(): React.ReactElement {
   } else if (route.key === "account") {
     page = <AccountPage me={me} refreshNonce={refreshNonce} />;
   } else if (route.key === "account_api_keys") {
-    page = <AccountAPIKeysPage pushToast={pushToast} refreshNonce={refreshNonce} />;
+    page = <AccountAPIKeysPage me={me} pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_users") {
     page = <AdminUsersPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_user_detail") {

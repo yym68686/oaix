@@ -1,4 +1,4 @@
-import { KeyRoundIcon, UserRoundIcon } from "lucide-react";
+import { KeyRoundIcon, ShieldCheckIcon, UserRoundIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
@@ -6,7 +6,7 @@ import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } f
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
-import { api, type APIKeyItem, type CreatedAPIKey, type MeResponse, type PoolSummaryResponse, type UsageSummary } from "@/lib/api";
+import { api, isServicePrincipal, type APIKeyItem, type CreatedAPIKey, type MeResponse, type PoolSummaryResponse, type UsageSummary } from "@/lib/api";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert, MiniMetric } from "@/shared/components";
 import { errorMessage, planOptionsWithCounts } from "@/shared/domain";
@@ -16,17 +16,28 @@ export function AccountPage({ me, refreshNonce }: { me: MeResponse | null; refre
   const [usage, setUsage] = useState<UsageSummary>({});
   const [pool, setPool] = useState<PoolSummaryResponse>({});
   const [error, setError] = useState("");
+  const serviceOnly = Boolean(me && isServicePrincipal(me) && !me.user?.id);
 
   const load = useCallback(async () => {
     setError("");
     try {
+      if (!me) {
+        setUsage({});
+        setPool({});
+        return;
+      }
+      if (serviceOnly) {
+        setUsage({});
+        setPool(await api.adminPoolSummary());
+        return;
+      }
       const [usagePayload, poolPayload] = await Promise.all([api.myUsage(24), api.myPoolSummary()]);
       setUsage(usagePayload.usage || {});
       setPool(poolPayload);
     } catch (caught) {
       setError(errorMessage(caught));
     }
-  }, []);
+  }, [me, serviceOnly]);
 
   useEffect(() => {
     void load();
@@ -34,33 +45,37 @@ export function AccountPage({ me, refreshNonce }: { me: MeResponse | null; refre
 
   const user = me?.user;
   const cachePercent = Number(usage.cache_hit_ratio || 0) * 100;
+  const title = serviceOnly ? "平台服务凭证" : "我的账号";
+  const description = serviceOnly ? "当前使用 Service API Key，拥有平台级管理权限，不对应注册用户。" : "当前 API Key 对应的用户身份、请求概况和账号池摘要。";
   return (
     <div className="grid gap-4">
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <UserRoundIcon className="size-5" />
-            我的账号
+            {serviceOnly ? <ShieldCheckIcon className="size-5" /> : <UserRoundIcon className="size-5" />}
+            {title}
           </CardTitle>
-          <CardDescription>当前 API Key 对应的用户身份、请求概况和账号池摘要。</CardDescription>
+          <CardDescription>{description}</CardDescription>
         </CardHeader>
         <CardPanel className="grid gap-4">
           {error && <ErrorAlert title="账号数据载入失败" message={error} />}
           <div className="grid gap-3 md:grid-cols-4">
-            <MiniMetric label="邮箱" value={user?.email || "-"} />
+            <MiniMetric label={serviceOnly ? "凭证" : "邮箱"} value={serviceOnly ? "Service API Key" : user?.email || "-"} />
             <MiniMetric label="角色" value={me?.role || user?.role || "-"} />
-            <MiniMetric label="状态" value={user?.status || "-"} />
+            <MiniMetric label="状态" value={serviceOnly ? "platform" : user?.status || "-"} />
             <MiniMetric label="用户 ID" value={user?.id || "-"} />
           </div>
-          <div className="grid gap-3 md:grid-cols-5">
-            <MiniMetric label="24h 请求" value={usage.total || 0} />
-            <MiniMetric label="成功" value={usage.success || 0} />
-            <MiniMetric label="失败" value={usage.failure || 0} />
-            <MiniMetric label="缓存率" value={`${Math.round(cachePercent)}%`} />
-            <MiniMetric label="成本" value={formatCurrency(usage.estimated_cost_usd || 0)} />
-          </div>
+          {!serviceOnly && (
+            <div className="grid gap-3 md:grid-cols-5">
+              <MiniMetric label="24h 请求" value={usage.total || 0} />
+              <MiniMetric label="成功" value={usage.success || 0} />
+              <MiniMetric label="失败" value={usage.failure || 0} />
+              <MiniMetric label="缓存率" value={`${Math.round(cachePercent)}%`} />
+              <MiniMetric label="成本" value={formatCurrency(usage.estimated_cost_usd || 0)} />
+            </div>
+          )}
           <div className="grid gap-3 md:grid-cols-4">
-            <MiniMetric label="Key 总数" value={pool.counts?.total || 0} />
+            <MiniMetric label={serviceOnly ? "全局 Key 总数" : "Key 总数"} value={pool.counts?.total || 0} />
             <MiniMetric label="有效" value={pool.counts?.available ?? pool.counts?.active ?? 0} />
             <MiniMetric label="冷却" value={pool.counts?.cooling || 0} />
             <MiniMetric label="禁用" value={pool.counts?.disabled || 0} />
@@ -78,14 +93,20 @@ export function AccountPage({ me, refreshNonce }: { me: MeResponse | null; refre
   );
 }
 
-export function AccountAPIKeysPage({ pushToast, refreshNonce }: { pushToast: (title: string, variant?: ToastMessage["variant"]) => void; refreshNonce: number }) {
+export function AccountAPIKeysPage({ me, pushToast, refreshNonce }: { me: MeResponse | null; pushToast: (title: string, variant?: ToastMessage["variant"]) => void; refreshNonce: number }) {
   const [items, setItems] = useState<APIKeyItem[]>([]);
   const [created, setCreated] = useState<CreatedAPIKey | null>(null);
   const [name, setName] = useState("web");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const serviceOnly = Boolean(me && isServicePrincipal(me) && !me.user?.id);
 
   const load = useCallback(async () => {
+    if (!me || serviceOnly) {
+      setItems([]);
+      setError("");
+      return;
+    }
     setError("");
     try {
       const payload = await api.myAPIKeys();
@@ -93,7 +114,7 @@ export function AccountAPIKeysPage({ pushToast, refreshNonce }: { pushToast: (ti
     } catch (caught) {
       setError(errorMessage(caught));
     }
-  }, []);
+  }, [me, serviceOnly]);
 
   useEffect(() => {
     void load();
@@ -121,6 +142,22 @@ export function AccountAPIKeysPage({ pushToast, refreshNonce }: { pushToast: (ti
   }
 
   const plaintext = created?.plaintext_key || created?.value || "";
+  if (serviceOnly) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldCheckIcon className="size-5" />
+            平台服务凭证
+          </CardTitle>
+          <CardDescription>当前凭证来自 Service API Key，不对应注册用户；用户 API Key 请在管理员用户状态中为具体用户创建。</CardDescription>
+        </CardHeader>
+        <CardPanel>
+          <EmptyState title="没有个人 API Key" description="Service API Key 是平台级凭证，不在个人 API Key 列表中创建或撤销。" />
+        </CardPanel>
+      </Card>
+    );
+  }
   return (
     <Card>
       <CardHeader>

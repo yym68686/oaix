@@ -20,7 +20,7 @@ import { Dialog, DialogDescription, DialogFooter, DialogHeader, DialogPanel, Dia
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { cn } from "@/registry/default/lib/utils";
-import { api, getServiceKey, isAdminPrincipal, setServiceKey, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
+import { api, getServiceKey, isAdminPrincipal, isServicePrincipal, setServiceKey, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
 import { formatNumber } from "@/lib/format";
 import { ThemeButton } from "@/shared/components";
 import type { RouteKey, ThemePreference } from "@/shared/types";
@@ -104,6 +104,8 @@ export function AppShell({
   const credentialRequired = authBlocked && protectedMode;
   const credentialOpen = credentialRequired || credentialDialogOpen;
   const admin = isAdminPrincipal(me);
+  const serviceOnly = Boolean(me && isServicePrincipal(me) && !me.user?.id);
+  const principalSubtitle = me?.user?.email || (serviceOnly ? "Service API Key" : protectedMode ? "API Key required" : "local");
 
   useEffect(() => {
     if (credentialRequired) {
@@ -168,18 +170,18 @@ export function AppShell({
             </div>
             <div className="min-w-0">
               <div className="font-heading text-lg font-semibold leading-none">oaix</div>
-              <div className="mt-1 truncate text-muted-foreground text-xs">{me?.user?.email || (protectedMode ? "API Key required" : "local")}</div>
+              <div className="mt-1 truncate text-muted-foreground text-xs">{principalSubtitle}</div>
             </div>
           </div>
           <nav className="mt-4 grid gap-4">
             {NAV_GROUPS.map((group) => {
-              const items = group.items.filter((item) => !item.adminOnly || admin);
+              const items = group.items.filter((item) => !item.adminOnly || admin).filter((item) => !(serviceOnly && item.key === "account_api_keys"));
               if (!items.length) {
                 return null;
               }
               return (
                 <div className="grid gap-1" key={group.label}>
-                  <div className="px-2 text-muted-foreground text-xs">{group.label}</div>
+                  <div className="px-2 text-muted-foreground text-xs">{serviceOnly && group.label === "账号" ? "平台" : group.label}</div>
                   <div className="flex gap-1 overflow-x-auto lg:grid lg:overflow-visible">
                     {items.map((item) => {
                       const active =
@@ -196,7 +198,7 @@ export function AppShell({
                           variant={active ? "secondary" : "ghost"}
                         >
                           {item.icon}
-                          {item.label}
+                          {serviceOnly && item.key === "account" ? "平台凭证" : item.label}
                         </Button>
                       );
                     })}
