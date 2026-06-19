@@ -32,12 +32,12 @@ type RequestLogListOptions struct {
 
 type RequestUsageSummary struct {
 	Hours             int     `json:"hours"`
-	Total             int     `json:"total"`
-	Success           int     `json:"success"`
-	Failure           int     `json:"failure"`
-	InputTokens       int     `json:"input_tokens"`
-	CachedInputTokens int     `json:"cached_input_tokens"`
-	TotalTokens       int     `json:"total_tokens"`
+	Total             int64   `json:"total"`
+	Success           int64   `json:"success"`
+	Failure           int64   `json:"failure"`
+	InputTokens       int64   `json:"input_tokens"`
+	CachedInputTokens int64   `json:"cached_input_tokens"`
+	TotalTokens       int64   `json:"total_tokens"`
 	EstimatedCostUSD  float64 `json:"estimated_cost_usd"`
 	CacheHitRatio     float64 `json:"cache_hit_ratio"`
 	AverageTTFTMS     float64 `json:"average_ttft_ms"`
@@ -47,13 +47,13 @@ type RequestUsageSummary struct {
 type OwnerUsageSummary struct {
 	OwnerUserID       int64   `json:"owner_user_id"`
 	Hours             int     `json:"hours"`
-	RequestCount      int     `json:"request_count"`
-	SuccessCount      int     `json:"success_count"`
-	FailureCount      int     `json:"failure_count"`
-	StreamingCount    int     `json:"streaming_count"`
-	InputTokens       int     `json:"input_tokens"`
-	CachedInputTokens int     `json:"cached_input_tokens"`
-	TotalTokens       int     `json:"total_tokens"`
+	RequestCount      int64   `json:"request_count"`
+	SuccessCount      int64   `json:"success_count"`
+	FailureCount      int64   `json:"failure_count"`
+	StreamingCount    int64   `json:"streaming_count"`
+	InputTokens       int64   `json:"input_tokens"`
+	CachedInputTokens int64   `json:"cached_input_tokens"`
+	TotalTokens       int64   `json:"total_tokens"`
 	EstimatedCostUSD  float64 `json:"estimated_cost_usd"`
 	SuccessRate       float64 `json:"success_rate"`
 	CacheHitRatio     float64 `json:"cache_hit_ratio"`
@@ -63,21 +63,21 @@ type CostAggregate struct {
 	Key              string  `json:"key"`
 	TokenID          *int64  `json:"token_id,omitempty"`
 	AccountID        *string `json:"account_id,omitempty"`
-	RequestCount     int     `json:"request_count"`
+	RequestCount     int64   `json:"request_count"`
 	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
-	SuccessCount     int     `json:"success_count"`
-	FailureCount     int     `json:"failure_count"`
+	SuccessCount     int64   `json:"success_count"`
+	FailureCount     int64   `json:"failure_count"`
 }
 
 type CacheAnalytics struct {
-	Hours              int            `json:"hours"`
-	TotalRequests      int            `json:"total_requests"`
-	RequestsWithUsage  int            `json:"requests_with_usage"`
-	InputTokens        int            `json:"input_tokens"`
-	CachedInputTokens  int            `json:"cached_input_tokens"`
-	CacheHitRatio      float64        `json:"cache_hit_ratio"`
-	PromptCacheSources map[string]int `json:"prompt_cache_sources"`
-	AffinityResults    map[string]int `json:"affinity_results"`
+	Hours              int              `json:"hours"`
+	TotalRequests      int64            `json:"total_requests"`
+	RequestsWithUsage  int64            `json:"requests_with_usage"`
+	InputTokens        int64            `json:"input_tokens"`
+	CachedInputTokens  int64            `json:"cached_input_tokens"`
+	CacheHitRatio      float64          `json:"cache_hit_ratio"`
+	PromptCacheSources map[string]int64 `json:"prompt_cache_sources"`
+	AffinityResults    map[string]int64 `json:"affinity_results"`
 }
 
 type ErrorAnalyticsItem struct {
@@ -85,7 +85,7 @@ type ErrorAnalyticsItem struct {
 	ModelName string `json:"model_name"`
 	Endpoint  string `json:"endpoint"`
 	TokenID   *int64 `json:"token_id,omitempty"`
-	Count     int    `json:"count"`
+	Count     int64  `json:"count"`
 }
 
 type LatencyAnalytics struct {
@@ -264,12 +264,12 @@ func (s *Store) RequestUsageSummaryScoped(ctx context.Context, scope ResourceSco
 	out.Hours = hours
 	err := s.pool.QueryRow(ctx, `
 		select
-			count(*)::int,
-			count(*) filter (where success = true)::int,
-			count(*) filter (where success = false)::int,
-			coalesce(sum(input_tokens), 0)::int,
-			coalesce(sum(cached_input_tokens), 0)::int,
-			coalesce(sum(total_tokens), 0)::int,
+			count(*)::bigint,
+			count(*) filter (where success = true)::bigint,
+			count(*) filter (where success = false)::bigint,
+			coalesce(sum(input_tokens), 0)::bigint,
+			coalesce(sum(cached_input_tokens), 0)::bigint,
+			coalesce(sum(total_tokens), 0)::bigint,
 			coalesce(sum(estimated_cost_usd), 0)::float8,
 			coalesce(avg(ttft_ms) filter (where ttft_ms is not null), 0)::float8,
 			coalesce(avg(duration_ms) filter (where duration_ms is not null), 0)::float8
@@ -298,13 +298,13 @@ func (s *Store) RequestUsageByOwner(ctx context.Context, ownerIDs []int64, hours
 	rows, err := s.pool.Query(ctx, `
 		select
 			owner_user_id,
-			coalesce(sum(request_count), 0)::int,
-			coalesce(sum(success_count), 0)::int,
-			coalesce(sum(failure_count), 0)::int,
-			coalesce(sum(streaming_count), 0)::int,
-			coalesce(sum(input_tokens), 0)::int,
-			coalesce(sum(cached_input_tokens), 0)::int,
-			coalesce(sum(total_tokens), 0)::int,
+			coalesce(sum(request_count), 0)::bigint,
+			coalesce(sum(success_count), 0)::bigint,
+			coalesce(sum(failure_count), 0)::bigint,
+			coalesce(sum(streaming_count), 0)::bigint,
+			coalesce(sum(input_tokens), 0)::bigint,
+			coalesce(sum(cached_input_tokens), 0)::bigint,
+			coalesce(sum(total_tokens), 0)::bigint,
 			coalesce(sum(estimated_cost_usd), 0)::float8
 		from gateway_request_hourly_stats
 		where owner_user_id = any($1)
@@ -387,10 +387,10 @@ func (s *Store) costAggregatesScoped(ctx context.Context, scope ResourceScope, o
 	args = append(args, opts.Limit, opts.Offset)
 	rows, err := s.pool.Query(ctx, `
 		select `+keyExpr+` as key,
-		       count(*)::int,
+		       count(*)::bigint,
 		       coalesce(sum(estimated_cost_usd), 0)::float8,
-		       count(*) filter (where success = true)::int,
-		       count(*) filter (where success = false)::int
+		       count(*) filter (where success = true)::bigint,
+		       count(*) filter (where success = false)::bigint
 		from gateway_request_logs
 		where `+where+` and `+nullClause+`
 		group by 1
@@ -432,17 +432,17 @@ func (s *Store) CacheAnalyticsScoped(ctx context.Context, scope ResourceScope, h
 	where, args := requestLogWhereScoped(RequestLogListOptions{From: &from}, scope)
 	rows, err := s.pool.Query(ctx, `
 		select
-			count(*)::int,
-			count(*) filter (where input_tokens is not null)::int,
-			coalesce(sum(input_tokens), 0)::int,
-			coalesce(sum(cached_input_tokens), 0)::int
+			count(*)::bigint,
+			count(*) filter (where input_tokens is not null)::bigint,
+			coalesce(sum(input_tokens), 0)::bigint,
+			coalesce(sum(cached_input_tokens), 0)::bigint
 		from gateway_request_logs
 		where `+where, args...)
 	if err != nil {
 		return CacheAnalytics{}, err
 	}
 	defer rows.Close()
-	out := CacheAnalytics{Hours: hours, PromptCacheSources: map[string]int{}, AffinityResults: map[string]int{}}
+	out := CacheAnalytics{Hours: hours, PromptCacheSources: map[string]int64{}, AffinityResults: map[string]int64{}}
 	if rows.Next() {
 		if err := rows.Scan(&out.TotalRequests, &out.RequestsWithUsage, &out.InputTokens, &out.CachedInputTokens); err != nil {
 			return CacheAnalytics{}, err
@@ -461,11 +461,11 @@ func (s *Store) CacheAnalyticsScoped(ctx context.Context, scope ResourceScope, h
 	return out, nil
 }
 
-func (s *Store) fillStringCountMap(ctx context.Context, column string, hours int, out map[string]int) error {
+func (s *Store) fillStringCountMap(ctx context.Context, column string, hours int, out map[string]int64) error {
 	return s.fillStringCountMapScoped(ctx, AllResources(), column, hours, out)
 }
 
-func (s *Store) fillStringCountMapScoped(ctx context.Context, scope ResourceScope, column string, hours int, out map[string]int) error {
+func (s *Store) fillStringCountMapScoped(ctx context.Context, scope ResourceScope, column string, hours int, out map[string]int64) error {
 	if column != "prompt_cache_source" && column != "cache_affinity_result" {
 		return fmt.Errorf("invalid analytics column")
 	}
@@ -475,7 +475,7 @@ func (s *Store) fillStringCountMapScoped(ctx context.Context, scope ResourceScop
 	from := time.Now().Add(-time.Duration(hours) * time.Hour)
 	where, args := requestLogWhereScoped(RequestLogListOptions{From: &from}, scope)
 	rows, err := s.pool.Query(ctx, `
-		select coalesce(`+column+`, 'unknown'), count(*)::int
+		select coalesce(`+column+`, 'unknown'), count(*)::bigint
 		from gateway_request_logs
 		where `+where+`
 		group by 1
@@ -486,7 +486,7 @@ func (s *Store) fillStringCountMapScoped(ctx context.Context, scope ResourceScop
 	defer rows.Close()
 	for rows.Next() {
 		var key string
-		var count int
+		var count int64
 		if err := rows.Scan(&key, &count); err != nil {
 			return err
 		}
@@ -514,7 +514,7 @@ func (s *Store) ErrorAnalyticsScoped(ctx context.Context, scope ResourceScope, h
 		       coalesce(model_name, model, '') as model_name,
 		       endpoint,
 		       token_id,
-		       count(*)::int
+		       count(*)::bigint
 		from gateway_request_logs
 		where `+where+`
 		group by 1,2,3,4

@@ -59,9 +59,9 @@ type RequestLog struct {
 }
 
 type RequestLogSummary struct {
-	Total        int     `json:"total"`
-	Success      int     `json:"success"`
-	Failure      int     `json:"failure"`
+	Total        int64   `json:"total"`
+	Success      int64   `json:"success"`
+	Failure      int64   `json:"failure"`
 	AverageTTFT  float64 `json:"average_ttft_ms"`
 	AverageDurMS float64 `json:"average_duration_ms"`
 }
@@ -74,9 +74,9 @@ type RequestAnalytics struct {
 
 type ModelStat struct {
 	ModelName string `json:"model_name"`
-	Requests  int    `json:"requests"`
-	Success   int    `json:"success"`
-	Failure   int    `json:"failure"`
+	Requests  int64  `json:"requests"`
+	Success   int64  `json:"success"`
+	Failure   int64  `json:"failure"`
 }
 
 const requestTokenCostReconcileSettingKey = "request_token_costs_go_recorded_reconciled_at"
@@ -327,9 +327,9 @@ func (s *Store) RequestLogSummary(ctx context.Context, hours int) (RequestLogSum
 	var summary RequestLogSummary
 	err := s.pool.QueryRow(ctx, `
 		select
-			coalesce(sum(request_count), 0)::int,
-			coalesce(sum(success_count), 0)::int,
-			coalesce(sum(failure_count), 0)::int,
+			coalesce(sum(request_count), 0)::bigint,
+			coalesce(sum(success_count), 0)::bigint,
+			coalesce(sum(failure_count), 0)::bigint,
 			case when coalesce(sum(ttft_count), 0) > 0
 				then coalesce(sum(ttft_ms_sum), 0)::float8 / sum(ttft_count)
 				else 0
@@ -378,19 +378,19 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 				bucket_start,
 				owner_user_id,
 				model_name,
-				count(*)::int as request_count,
-				count(*) filter (where success = true)::int as success_count,
-				count(*) filter (where success = false)::int as failure_count,
-				count(*) filter (where is_stream = true)::int as streaming_count,
-				sum(input_tokens)::int as input_tokens,
-				sum(cached_input_tokens)::int as cached_input_tokens,
-				sum(output_tokens)::int as output_tokens,
-				sum(total_tokens)::int as total_tokens,
+				count(*)::bigint as request_count,
+				count(*) filter (where success = true)::bigint as success_count,
+				count(*) filter (where success = false)::bigint as failure_count,
+				count(*) filter (where is_stream = true)::bigint as streaming_count,
+				coalesce(sum(input_tokens), 0)::bigint as input_tokens,
+				coalesce(sum(cached_input_tokens), 0)::bigint as cached_input_tokens,
+				coalesce(sum(output_tokens), 0)::bigint as output_tokens,
+				coalesce(sum(total_tokens), 0)::bigint as total_tokens,
 				sum(estimated_cost_usd)::float8 as estimated_cost_usd,
-				coalesce(sum(ttft_ms) filter (where ttft_ms is not null), 0)::int as ttft_ms_sum,
-				count(ttft_ms)::int as ttft_count,
-				coalesce(sum(duration_ms) filter (where duration_ms is not null), 0)::int as duration_ms_sum,
-				count(duration_ms)::int as duration_count
+				coalesce(sum(ttft_ms) filter (where ttft_ms is not null), 0)::bigint as ttft_ms_sum,
+				count(ttft_ms)::bigint as ttft_count,
+				coalesce(sum(duration_ms) filter (where duration_ms is not null), 0)::bigint as duration_ms_sum,
+				count(duration_ms)::bigint as duration_count
 			from pending
 			where owner_user_id is not null
 			group by owner_user_id, bucket_start, model_name
@@ -443,7 +443,7 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 			select
 				token_id,
 				owner_user_id,
-				count(*)::int as request_count,
+				count(*)::bigint as request_count,
 				sum(estimated_cost_usd)::float8 as estimated_cost_usd
 			from pending
 			group by token_id, owner_user_id
@@ -784,7 +784,7 @@ func (s *Store) ReconcileRecordedTokenCosts(ctx context.Context) (bool, error) {
 		insert into gateway_request_token_costs(token_id, request_count, estimated_cost_usd, updated_at)
 		select
 			token_id,
-			count(*)::int as request_count,
+			count(*)::bigint as request_count,
 			coalesce(sum(estimated_cost_usd), 0)::float8 as estimated_cost_usd,
 			now()
 		from gateway_request_logs
@@ -907,9 +907,9 @@ func (s *Store) RequestAnalyticsScoped(ctx context.Context, scope ResourceScope,
 	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
 		select model_name,
-		       coalesce(sum(request_count), 0)::int,
-		       coalesce(sum(success_count), 0)::int,
-		       coalesce(sum(failure_count), 0)::int
+		       coalesce(sum(request_count), 0)::bigint,
+		       coalesce(sum(success_count), 0)::bigint,
+		       coalesce(sum(failure_count), 0)::bigint
 		from gateway_request_hourly_stats
 		where bucket_start >= date_trunc('hour', now() - make_interval(hours => $1))
 		  and `+ownerWhere+`

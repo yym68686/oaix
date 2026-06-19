@@ -344,13 +344,6 @@ export function AdminPoolsPage({ refreshNonce }: { refreshNonce: number }) {
             </Badge>
           ))}
         </div>
-        <div className="flex flex-wrap gap-2">
-          {(summary.error_counts || []).map((item) => (
-            <Badge key={item.error_type} variant="warning">
-              {item.error_type} {formatNumber(item.count)}
-            </Badge>
-          ))}
-        </div>
         <div className="overflow-hidden rounded-lg border">
           <Table>
             <TableHeader>
