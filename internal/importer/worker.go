@@ -145,6 +145,29 @@ func (AccessTokenValidator) Validate(ctx context.Context, item store.ImportItem)
 	return ValidatedItem{}, fmt.Errorf("import item %d does not contain an access token", item.ID)
 }
 
+type TokenPayloadValidator struct {
+	Access  Validator
+	Refresh Validator
+}
+
+func (v TokenPayloadValidator) Validate(ctx context.Context, item store.ImportItem) (ValidatedItem, error) {
+	if hasPayloadString(item.Payload, "access_token", "accessToken", "token") {
+		access := v.Access
+		if access == nil {
+			access = AccessTokenValidator{}
+		}
+		return access.Validate(ctx, item)
+	}
+	if hasPayloadString(item.Payload, "refresh_token", "refreshToken") {
+		refresh := v.Refresh
+		if refresh == nil {
+			return ValidatedItem{}, fmt.Errorf("oauth client is not configured")
+		}
+		return refresh.Validate(ctx, item)
+	}
+	return AccessTokenValidator{}.Validate(ctx, item)
+}
+
 type OAuthRefreshValidator struct {
 	Client oauth.Client
 }
@@ -175,6 +198,15 @@ func (v OAuthRefreshValidator) Validate(ctx context.Context, item store.ImportIt
 		PlanType:     result.PlanType,
 		Action:       "oauth_refresh",
 	}, nil
+}
+
+func hasPayloadString(payload map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func firstNonEmpty(values ...string) string {

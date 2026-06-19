@@ -430,19 +430,41 @@ func (s *Store) RetryImportJob(ctx context.Context, jobID int64) (ImportJob, err
 		update token_import_items
 		set status = 'queued',
 		    error_message = null,
+		    validated_payload = null,
+		    token_id = null,
+		    action = null,
 		    validation_started_at = null,
 		    validation_finished_at = null,
+		    validation_ms = null,
+		    publish_ms = null,
+		    published_at = null,
 		    updated_at = now()
 		where job_id = $1 and status in ('failed', 'skipped', 'canceled')
 	`, jobID); err != nil {
 		return ImportJob{}, err
 	}
 	row := tx.QueryRow(ctx, `
+		with item_counts as (
+			select
+				count(*) filter (where status in ('published', 'skipped', 'failed', 'canceled'))::int as processed,
+				count(*) filter (where status = 'published' and action = 'created')::int as created,
+				count(*) filter (where status = 'published' and action = 'updated')::int as updated,
+				count(*) filter (where status = 'skipped')::int as skipped,
+				count(*) filter (where status = 'failed')::int as failed
+			from token_import_items
+			where job_id = $1
+		)
 		update token_import_jobs
 		set status = 'queued',
+		    processed_count = item_counts.processed,
+		    created_count = item_counts.created,
+		    updated_count = item_counts.updated,
+		    skipped_count = item_counts.skipped,
+		    failed_count = item_counts.failed,
 		    last_error = null,
 		    heartbeat_at = now(),
 		    finished_at = null
+		from item_counts
 		where id = $1
 		returning id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 		          created_count, updated_count, skipped_count, failed_count, last_error,

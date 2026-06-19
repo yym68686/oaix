@@ -854,7 +854,23 @@ func (s *Store) PublishImportTokens(ctx context.Context, jobID int64, accessToke
 	if err != nil {
 		return result, err
 	}
-	_, err = s.pool.Exec(ctx, `
+	return result, s.recordImportPublishResult(ctx, jobID, result)
+}
+
+func (s *Store) PublishImportPayloads(ctx context.Context, jobID int64, payloads []map[string]any, source string) (ImportResult, error) {
+	job, err := s.GetImportJob(ctx, jobID)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	result, err := s.UpsertTokenPayloadsForOwner(ctx, job.OwnerUserID, payloads, source)
+	if err != nil {
+		return result, err
+	}
+	return result, s.recordImportPublishResult(ctx, jobID, result)
+}
+
+func (s *Store) recordImportPublishResult(ctx context.Context, jobID int64, result ImportResult) error {
+	_, err := s.pool.Exec(ctx, `
 		update token_import_jobs
 		set processed_count = processed_count + $2,
 		    created_count = created_count + $3,
@@ -870,9 +886,9 @@ func (s *Store) PublishImportTokens(ctx context.Context, jobID int64, accessToke
 		      when processed_count + $2 >= total_count then now()
 		      else finished_at
 		    end
-		where id = $1
-	`, jobID, result.Created+result.Updated+result.Skipped+result.Failed, result.Created, result.Updated, result.Skipped, result.Failed)
-	return result, err
+			where id = $1
+		`, jobID, result.Created+result.Updated+result.Skipped+result.Failed, result.Created, result.Updated, result.Skipped, result.Failed)
+	return err
 }
 
 func (s *Store) ResumeStaleImportJobs(ctx context.Context, staleAfter time.Duration) (int64, error) {

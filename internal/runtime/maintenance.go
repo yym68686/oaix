@@ -7,6 +7,7 @@ import (
 
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/importer"
+	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/tokens"
 )
@@ -20,7 +21,7 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	importWorker := &importer.Worker{MaxConcurrency: cfg.Import.MaxConcurrency}
+	importWorker := newImportWorker(cfg)
 	go func() {
 		defer close(done)
 		runMaintenanceOnce(workerCtx, cfg, logger, db, tokenManager, importWorker, true)
@@ -56,6 +57,18 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 		case <-done:
 		case <-shutdownCtx.Done():
 		}
+	}
+}
+
+func newImportWorker(cfg config.Config) *importer.Worker {
+	oauthClient := oauth.NewHTTPClient(cfg.Upstream.OAuthTokenURL)
+	oauthClient.ClientID = cfg.Upstream.OAuthClientID
+	oauthClient.Scope = cfg.Upstream.OAuthScope
+	return &importer.Worker{
+		MaxConcurrency: cfg.Import.MaxConcurrency,
+		Validator: importer.TokenPayloadValidator{
+			Refresh: importer.OAuthRefreshValidator{Client: oauthClient},
+		},
 	}
 }
 
@@ -140,23 +153,22 @@ func publishValidatedAccessTokens(ctx context.Context, db *store.Store, items []
 	for _, item := range items {
 		jobByItemID[item.ID] = item.JobID
 	}
-	tokensByJob := make(map[int64][]string)
+	payloadsByJob := make(map[int64][]map[string]any)
 	updatesByJob := make(map[int64][]store.ImportItemUpdate)
 	for _, update := range updates {
 		if update.Status != string(importer.ItemValidated) {
 			continue
 		}
-		token, _ := update.ValidatedPayload["access_token"].(string)
-		if token == "" {
+		if len(update.ValidatedPayload) == 0 {
 			continue
 		}
 		jobID := jobByItemID[update.ID]
-		tokensByJob[jobID] = append(tokensByJob[jobID], token)
+		payloadsByJob[jobID] = append(payloadsByJob[jobID], update.ValidatedPayload)
 		updatesByJob[jobID] = append(updatesByJob[jobID], update)
 	}
 	published := 0
-	for jobID, accessTokens := range tokensByJob {
-		result, err := db.PublishImportTokens(ctx, jobID, accessTokens, "embedded_import_worker")
+	for jobID, payloads := range payloadsByJob {
+		result, err := db.PublishImportPayloads(ctx, jobID, payloads, "embedded_import_worker")
 		if err != nil {
 			if logger != nil {
 				logger.Warn("import token publish failed", "job_id", jobID, "error", err)
@@ -165,13 +177,22 @@ func publishValidatedAccessTokens(ctx context.Context, db *store.Store, items []
 		}
 		publishedUpdates := make([]store.ImportItemUpdate, 0, len(updatesByJob[jobID]))
 		for index, update := range updatesByJob[jobID] {
-			update.Status = string(importer.ItemPublished)
-			update.Published = true
 			if index < len(result.Items) {
-				update.TokenID = result.Items[index].TokenID
-				if result.Items[index].Action != "" {
-					update.Action = result.Items[index].Action
+				itemResult := result.Items[index]
+				update.TokenID = itemResult.TokenID
+				if itemResult.Action != "" {
+					update.Action = itemResult.Action
 				}
+				if itemResult.Status == "failed" {
+					update.Status = string(importer.ItemFailed)
+					update.ErrorMessage = itemResult.ErrorMessage
+				} else {
+					update.Status = string(importer.ItemPublished)
+					update.Published = true
+				}
+			} else {
+				update.Status = string(importer.ItemPublished)
+				update.Published = true
 			}
 			publishedUpdates = append(publishedUpdates, update)
 		}
