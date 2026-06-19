@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -114,6 +115,31 @@ func TestPromptCacheContextInjectsKeyAndStableSession(t *testing.T) {
 	ctx2, _ := buildPromptCacheContext(headers, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.4"}, body, defaultPromptCacheConfig())
 	if ctx.SessionID == "" || ctx.SessionID != ctx2.SessionID {
 		t.Fatalf("session id is not stable: %q vs %q", ctx.SessionID, ctx2.SessionID)
+	}
+}
+
+func TestPromptCacheContextOwnerScopesAffinityOnly(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_shared","input":"hello"}`)
+	ctxA, upstreamA := buildPromptCacheContext(http.Header{}, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.4", OwnerUserID: 10}, body, defaultPromptCacheConfig())
+	ctxB, upstreamB := buildPromptCacheContext(http.Header{}, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.4", OwnerUserID: 11}, body, defaultPromptCacheConfig())
+	if ctxA == nil || ctxB == nil {
+		t.Fatal("expected prompt cache contexts")
+	}
+	if ctxA.AffinityKey == "" || ctxA.AffinityKey == ctxB.AffinityKey {
+		t.Fatalf("affinity key must be owner scoped: %q vs %q", ctxA.AffinityKey, ctxB.AffinityKey)
+	}
+	if ctxA.PreviousResponseID == ctxB.PreviousResponseID || !strings.Contains(ctxA.PreviousResponseID, "resp_shared") {
+		t.Fatalf("previous response owner key must be owner scoped: %q vs %q", ctxA.PreviousResponseID, ctxB.PreviousResponseID)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(upstreamA, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["previous_response_id"] != "resp_shared" {
+		t.Fatalf("upstream previous_response_id should stay raw, got %v", payload["previous_response_id"])
+	}
+	if !bytes.Equal(upstreamA, upstreamB) {
+		t.Fatal("owner namespace should not change upstream payload")
 	}
 }
 

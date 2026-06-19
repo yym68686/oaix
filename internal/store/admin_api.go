@@ -88,6 +88,7 @@ type CreatedAdminAPIKey struct {
 
 type OAuthSession struct {
 	SessionID           string    `json:"session_id"`
+	OwnerUserID         int64     `json:"owner_user_id"`
 	State               string    `json:"state,omitempty"`
 	CodeVerifier        string    `json:"-"`
 	RedirectURI         string    `json:"redirect_uri"`
@@ -159,7 +160,7 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		    end,
 		    updated_at = now()
 		where id = $1 and merged_into_token_id is null
-		returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 	`, update.TokenID,
 		update.Remark != nil, stringPtrValue(update.Remark),
@@ -186,7 +187,7 @@ func (s *Store) SetTokenCooldown(ctx context.Context, tokenID int64, until time.
 		    disabled_at = null,
 		    updated_at = now()
 		where id = $1 and merged_into_token_id is null
-		returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 	`, tokenID, until, truncate(reason, 4000))
 	token, err := scanToken(row)
@@ -205,7 +206,7 @@ func (s *Store) ClearTokenCooldown(ctx context.Context, tokenID int64) (*Token, 
 		update codex_tokens
 		set cooldown_until = null, updated_at = now()
 		where id = $1 and merged_into_token_id is null
-		returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 	`, tokenID)
 	token, err := scanToken(row)
@@ -221,7 +222,7 @@ func (s *Store) ClearTokenLastError(ctx context.Context, tokenID int64) (*Token,
 		update codex_tokens
 		set last_error = null, updated_at = now()
 		where id = $1 and merged_into_token_id is null
-		returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 	`, tokenID)
 	token, err := scanToken(row)
@@ -286,7 +287,7 @@ func (s *Store) UnmergeToken(ctx context.Context, tokenID int64) (*Token, error)
 		    disabled_at = null,
 		    updated_at = now()
 		where id = $1
-		returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 	`, tokenID)
 	token, err := scanToken(row)
@@ -297,13 +298,17 @@ func (s *Store) UnmergeToken(ctx context.Context, tokenID int64) (*Token, error)
 }
 
 func (s *Store) ListImportJobsFiltered(ctx context.Context, opts ImportJobListOptions) ([]ImportJob, int, error) {
+	return s.ListImportJobsFilteredScoped(ctx, AllResources(), opts)
+}
+
+func (s *Store) ListImportJobsFilteredScoped(ctx context.Context, scope ResourceScope, opts ImportJobListOptions) ([]ImportJob, int, error) {
 	if opts.Limit <= 0 || opts.Limit > 500 {
 		opts.Limit = 50
 	}
 	if opts.Offset < 0 {
 		opts.Offset = 0
 	}
-	where, args := importJobWhere(opts)
+	where, args := importJobWhereScoped(opts, scope)
 	var total int
 	if err := s.pool.QueryRow(ctx, "select count(*) from token_import_jobs where "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -314,7 +319,7 @@ func (s *Store) ListImportJobsFiltered(ctx context.Context, opts ImportJobListOp
 	}
 	args = append(args, opts.Limit, opts.Offset)
 	rows, err := s.pool.Query(ctx, `
-		select id, status, import_queue_position, total_count, processed_count,
+		select id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 		       created_count, updated_count, skipped_count, failed_count, last_error,
 		       submitted_at, started_at, heartbeat_at, finished_at
 		from token_import_jobs
@@ -338,12 +343,17 @@ func (s *Store) ListImportJobsFiltered(ctx context.Context, opts ImportJobListOp
 }
 
 func importJobWhere(opts ImportJobListOptions) (string, []any) {
+	return importJobWhereScoped(opts, AllResources())
+}
+
+func importJobWhereScoped(opts ImportJobListOptions, scope ResourceScope) (string, []any) {
 	filters := []string{"true"}
 	args := []any{}
 	arg := func(value any) string {
 		args = append(args, value)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	filters = append(filters, scope.ownerFilter("owner_user_id", &args))
 	if status := strings.TrimSpace(opts.Status); status != "" && status != "all" {
 		filters = append(filters, fmt.Sprintf("status = %s", arg(status)))
 	}
@@ -360,6 +370,10 @@ func importJobWhere(opts ImportJobListOptions) (string, []any) {
 }
 
 func (s *Store) ListImportJobItemsFiltered(ctx context.Context, jobID int64, opts ImportItemListOptions) ([]ImportItem, int, error) {
+	return s.ListImportJobItemsFilteredScoped(ctx, AllResources(), jobID, opts)
+}
+
+func (s *Store) ListImportJobItemsFilteredScoped(ctx context.Context, scope ResourceScope, jobID int64, opts ImportItemListOptions) ([]ImportItem, int, error) {
 	if opts.Limit <= 0 || opts.Limit > 1000 {
 		opts.Limit = 100
 	}
@@ -372,6 +386,7 @@ func (s *Store) ListImportJobItemsFiltered(ctx context.Context, jobID int64, opt
 		args = append(args, value)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	filters = append(filters, scope.ownerFilter("owner_user_id", &args))
 	if status := strings.TrimSpace(opts.Status); status != "" && status != "all" {
 		filters = append(filters, fmt.Sprintf("status = %s", arg(status)))
 	}
@@ -388,7 +403,7 @@ func (s *Store) ListImportJobItemsFiltered(ctx context.Context, jobID int64, opt
 	}
 	args = append(args, opts.Limit, opts.Offset)
 	rows, err := s.pool.Query(ctx, `
-		select id, job_id, item_index, status, refresh_token_hash, payload,
+		select id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
 		       validated_payload, token_id, action, error_message, validation_ms,
 		       publish_ms, validation_started_at, validation_finished_at,
 		       published_at, created_at, updated_at
@@ -429,7 +444,7 @@ func (s *Store) RetryImportJob(ctx context.Context, jobID int64) (ImportJob, err
 		    heartbeat_at = now(),
 		    finished_at = null
 		where id = $1
-		returning id, status, import_queue_position, total_count, processed_count,
+		returning id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 		          created_count, updated_count, skipped_count, failed_count, last_error,
 		          submitted_at, started_at, heartbeat_at, finished_at
 	`, jobID)
@@ -438,6 +453,13 @@ func (s *Store) RetryImportJob(ctx context.Context, jobID int64) (ImportJob, err
 		return ImportJob{}, err
 	}
 	return job, tx.Commit(ctx)
+}
+
+func (s *Store) RetryImportJobScoped(ctx context.Context, scope ResourceScope, jobID int64) (ImportJob, error) {
+	if _, err := s.GetImportJobScoped(ctx, scope, jobID); err != nil {
+		return ImportJob{}, err
+	}
+	return s.RetryImportJob(ctx, jobID)
 }
 
 func (s *Store) RetryImportItem(ctx context.Context, itemID int64) (ImportItem, error) {
@@ -449,12 +471,19 @@ func (s *Store) RetryImportItem(ctx context.Context, itemID int64) (ImportItem, 
 		    validation_finished_at = null,
 		    updated_at = now()
 		where id = $1
-		returning id, job_id, item_index, status, refresh_token_hash, payload,
+		returning id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
 		          validated_payload, token_id, action, error_message, validation_ms,
 		          publish_ms, validation_started_at, validation_finished_at,
 		          published_at, created_at, updated_at
 	`, itemID)
 	return scanImportItem(row)
+}
+
+func (s *Store) RetryImportItemScoped(ctx context.Context, scope ResourceScope, itemID int64) (ImportItem, error) {
+	if err := s.ensureImportItemInScope(ctx, scope, itemID); err != nil {
+		return ImportItem{}, err
+	}
+	return s.RetryImportItem(ctx, itemID)
 }
 
 func (s *Store) SkipImportItem(ctx context.Context, itemID int64, reason string) (ImportItem, error) {
@@ -464,12 +493,30 @@ func (s *Store) SkipImportItem(ctx context.Context, itemID int64, reason string)
 		    error_message = nullif($2, ''),
 		    updated_at = now()
 		where id = $1
-		returning id, job_id, item_index, status, refresh_token_hash, payload,
+		returning id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
 		          validated_payload, token_id, action, error_message, validation_ms,
 		          publish_ms, validation_started_at, validation_finished_at,
 		          published_at, created_at, updated_at
 	`, itemID, truncate(reason, 1000))
 	return scanImportItem(row)
+}
+
+func (s *Store) SkipImportItemScoped(ctx context.Context, scope ResourceScope, itemID int64, reason string) (ImportItem, error) {
+	if err := s.ensureImportItemInScope(ctx, scope, itemID); err != nil {
+		return ImportItem{}, err
+	}
+	return s.SkipImportItem(ctx, itemID, reason)
+}
+
+func (s *Store) ensureImportItemInScope(ctx context.Context, scope ResourceScope, itemID int64) error {
+	args := []any{itemID}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	var id int64
+	return s.pool.QueryRow(ctx, `
+		select id
+		from token_import_items
+		where id = $1
+		  and `+ownerWhere, args...).Scan(&id)
 }
 
 func (s *Store) DeleteImportJobDryRun(ctx context.Context, id int64) (DeletedImportJob, error) {
@@ -696,11 +743,12 @@ func (s *Store) SaveOAuthSession(ctx context.Context, session OAuthSession) erro
 	}
 	_, err := s.pool.Exec(ctx, `
 		insert into openai_oauth_sessions(
-			session_id, state, code_verifier, redirect_uri, import_queue_position,
+			session_id, owner_user_id, state, code_verifier, redirect_uri, import_queue_position,
 			status, import_job_id, error_message, created_at, expires_at, updated_at
 		)
-		values ($1,$2,$3,$4,$5,$6,$7,$8,coalesce($9, now()),$10,now())
+		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,coalesce($10, now()),$11,now())
 		on conflict (session_id) do update set
+			owner_user_id = excluded.owner_user_id,
 			state = excluded.state,
 			code_verifier = excluded.code_verifier,
 			redirect_uri = excluded.redirect_uri,
@@ -710,7 +758,7 @@ func (s *Store) SaveOAuthSession(ctx context.Context, session OAuthSession) erro
 			error_message = excluded.error_message,
 			expires_at = excluded.expires_at,
 			updated_at = now()
-	`, session.SessionID, session.State, session.CodeVerifier, session.RedirectURI, session.ImportQueuePosition,
+	`, session.SessionID, session.OwnerUserID, session.State, session.CodeVerifier, session.RedirectURI, session.ImportQueuePosition,
 		firstString(session.Status, "pending"), session.ImportJobID, session.ErrorMessage, session.CreatedAt, session.ExpiresAt)
 	return err
 }
@@ -729,11 +777,11 @@ func (s *Store) getOAuthSession(ctx context.Context, column string, value string
 		return item, fmt.Errorf("invalid oauth session lookup")
 	}
 	err := s.pool.QueryRow(ctx, `
-		select session_id, state, code_verifier, redirect_uri, import_queue_position,
+		select session_id, coalesce(owner_user_id, 0), state, code_verifier, redirect_uri, import_queue_position,
 		       status, import_job_id, error_message, created_at, expires_at, updated_at
 		from openai_oauth_sessions
 		where `+column+` = $1
-	`, value).Scan(&item.SessionID, &item.State, &item.CodeVerifier, &item.RedirectURI, &item.ImportQueuePosition,
+	`, value).Scan(&item.SessionID, &item.OwnerUserID, &item.State, &item.CodeVerifier, &item.RedirectURI, &item.ImportQueuePosition,
 		&item.Status, &item.ImportJobID, &item.ErrorMessage, &item.CreatedAt, &item.ExpiresAt, &item.UpdatedAt)
 	return item, err
 }
@@ -915,6 +963,7 @@ func scanImportItem(row rowScanner) (ImportItem, error) {
 	var validated []byte
 	err := row.Scan(
 		&item.ID,
+		&item.OwnerUserID,
 		&item.JobID,
 		&item.ItemIndex,
 		&item.Status,

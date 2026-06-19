@@ -45,6 +45,8 @@ type tokenStateStore interface {
 type RequestIntent struct {
 	Endpoint            string
 	Model               string
+	OwnerUserID         int64
+	APIKeyID            *int64
 	Stream              bool
 	Compact             bool
 	Method              string
@@ -156,6 +158,8 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	}
 	p.logs.Submit(r.Context(), store.RequestLog{
 		RequestID:                     requestID,
+		OwnerUserID:                   ptrInt64(intent.OwnerUserID),
+		APIKeyID:                      intent.APIKeyID,
 		Endpoint:                      intent.Endpoint,
 		Model:                         nullable(intent.Model),
 		ModelName:                     nullable(intent.Model),
@@ -194,6 +198,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		tokenIntent := tokens.Intent{
 			Endpoint:        intent.Endpoint,
 			Model:           intent.Model,
+			OwnerUserID:     intent.OwnerUserID,
 			ExcludeTokenIDs: excluded,
 		}
 		if promptCacheContext != nil {
@@ -513,6 +518,9 @@ func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent Reques
 	trace := updatePromptTrace(promptCacheContext, affinityResult, usage, upstreamResponseID, status)
 	p.logs.Submit(ctx, store.RequestLog{
 		RequestID:                     requestID,
+		OwnerUserID:                   ptrInt64(intent.OwnerUserID),
+		APIKeyID:                      intent.APIKeyID,
+		TokenOwnerUserID:              ptrInt64(intent.OwnerUserID),
 		Endpoint:                      intent.Endpoint,
 		Model:                         nullable(intent.Model),
 		ModelName:                     nullable(intent.Model),

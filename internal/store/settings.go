@@ -25,9 +25,11 @@ const (
 var defaultTokenPlanOrder = []string{"free", "plus", "team", "pro"}
 
 type Setting struct {
-	Key       string          `json:"key"`
-	Value     json.RawMessage `json:"value"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	Key         string          `json:"key"`
+	OwnerUserID *int64          `json:"owner_user_id,omitempty"`
+	Scope       string          `json:"scope,omitempty"`
+	Value       json.RawMessage `json:"value"`
+	UpdatedAt   time.Time       `json:"updated_at"`
 }
 
 type TokenSelectionSettings struct {
@@ -48,6 +50,7 @@ func (s *Store) ListSettings(ctx context.Context) ([]Setting, error) {
 	items := make([]Setting, 0)
 	for rows.Next() {
 		var item Setting
+		item.Scope = "global"
 		if err := rows.Scan(&item.Key, &item.Value, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -64,8 +67,65 @@ func (s *Store) UpsertSetting(ctx context.Context, key string, value json.RawMes
 		returning key, coalesce(value::jsonb, '{}'::jsonb), updated_at
 	`, key, value)
 	var item Setting
+	item.Scope = "global"
 	err := row.Scan(&item.Key, &item.Value, &item.UpdatedAt)
 	return item, err
+}
+
+func (s *Store) ListUserSettings(ctx context.Context, ownerUserID int64) ([]Setting, error) {
+	rows, err := s.pool.Query(ctx, `
+		select key, coalesce(value::jsonb, '{}'::jsonb), updated_at
+		from user_settings
+		where owner_user_id = $1
+		order by key
+	`, ownerUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]Setting, 0)
+	for rows.Next() {
+		var item Setting
+		item.OwnerUserID = &ownerUserID
+		item.Scope = "user"
+		if err := rows.Scan(&item.Key, &item.Value, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) GetUserSetting(ctx context.Context, ownerUserID int64, key string) (Setting, error) {
+	item := Setting{OwnerUserID: &ownerUserID, Scope: "user"}
+	err := s.pool.QueryRow(ctx, `
+		select key, coalesce(value::jsonb, '{}'::jsonb), updated_at
+		from user_settings
+		where owner_user_id = $1 and key = $2
+	`, ownerUserID, key).Scan(&item.Key, &item.Value, &item.UpdatedAt)
+	return item, err
+}
+
+func (s *Store) UpsertUserSetting(ctx context.Context, ownerUserID int64, key string, value json.RawMessage) (Setting, error) {
+	item := Setting{OwnerUserID: &ownerUserID, Scope: "user"}
+	err := s.pool.QueryRow(ctx, `
+		insert into user_settings(owner_user_id, key, value, created_at, updated_at)
+		values ($1, $2, $3, now(), now())
+		on conflict (owner_user_id, key) do update set value = excluded.value, updated_at = now()
+		returning key, coalesce(value::jsonb, '{}'::jsonb), updated_at
+	`, ownerUserID, key, value).Scan(&item.Key, &item.Value, &item.UpdatedAt)
+	return item, err
+}
+
+func (s *Store) DeleteUserSetting(ctx context.Context, ownerUserID int64, key string) error {
+	tag, err := s.pool.Exec(ctx, `delete from user_settings where owner_user_id = $1 and key = $2`, ownerUserID, key)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
 }
 
 func (s *Store) GetTokenSelectionSettings(ctx context.Context, fallbackCap int64) (TokenSelectionSettings, error) {

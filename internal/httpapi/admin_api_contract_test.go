@@ -22,6 +22,13 @@ func TestAdminOpenAPISpecContainsAPIizedResources(t *testing.T) {
 		"/admin/prompt-cache/lanes",
 		"/admin/audit-logs",
 		"/admin/api-keys",
+		"/api/auth/register",
+		"/api/me/settings/{key}",
+		"/api/tokens/{token_id}",
+		"/api/import/jobs/{job_id}/tokens",
+		"/api/admin/users/{user_id}/tokens",
+		"/api/admin/pool-summary/by-user",
+		"/api/admin/requests/export",
 	}
 	for _, path := range required {
 		if _, ok := paths[path]; !ok {

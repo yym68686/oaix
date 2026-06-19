@@ -25,6 +25,7 @@ var primaryPlanOrder = []string{planFree, planPlus, planTeam, planPro}
 
 type Token struct {
 	ID            int64      `json:"id"`
+	OwnerUserID   int64      `json:"owner_user_id"`
 	Email         *string    `json:"email,omitempty"`
 	AccountID     *string    `json:"account_id,omitempty"`
 	AccessToken   string     `json:"-"`
@@ -57,6 +58,11 @@ type TokenPlanCount struct {
 	Plan  string `json:"plan"`
 	Label string `json:"label"`
 	Count int    `json:"count"`
+}
+
+type TokenErrorCount struct {
+	ErrorType string `json:"error_type"`
+	Count     int    `json:"count"`
 }
 
 type ImportResult struct {
@@ -116,18 +122,25 @@ type TokenSecretUpdate struct {
 }
 
 func (s *Store) ListAvailableTokens(ctx context.Context) ([]Token, error) {
+	return s.ListAvailableTokensScoped(ctx, AllResources())
+}
+
+func (s *Store) ListAvailableTokensScoped(ctx context.Context, scope ResourceScope) ([]Token, error) {
+	args := []any{}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
-		select id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		       is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where is_active = true
 		  and merged_into_token_id is null
+		  and `+ownerWhere+`
 		  and access_token is not null
 		  and access_token <> ''
 		  and (cooldown_until is null or cooldown_until <= now())
 		  and disabled_at is null
 		order by coalesce(last_used_at, 'epoch'::timestamptz) asc, id asc
-	`)
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +149,10 @@ func (s *Store) ListAvailableTokens(ctx context.Context) ([]Token, error) {
 }
 
 func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token, int, error) {
+	return s.ListTokensScoped(ctx, AllResources(), opts)
+}
+
+func (s *Store) ListTokensScoped(ctx context.Context, scope ResourceScope, opts TokenListOptions) ([]Token, int, error) {
 	limit := opts.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -144,7 +161,7 @@ func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token,
 	if offset < 0 {
 		offset = 0
 	}
-	where, args := tokenListWhere(opts, true)
+	where, args := tokenListWhereScoped(opts, true, scope)
 	var total int
 	if err := s.pool.QueryRow(ctx, "select count(*) from codex_tokens where "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -168,7 +185,7 @@ func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token,
 	}
 	args = append(args, limit, offset)
 	query := fmt.Sprintf(`
-		select id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		       is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where %s
@@ -188,6 +205,10 @@ func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token,
 }
 
 func tokenListWhere(opts TokenListOptions, includePlan bool) (string, []any) {
+	return tokenListWhereScoped(opts, includePlan, AllResources())
+}
+
+func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope ResourceScope) (string, []any) {
 	var filters []string
 	var args []any
 	arg := func(value any) string {
@@ -195,6 +216,7 @@ func tokenListWhere(opts TokenListOptions, includePlan bool) (string, []any) {
 		return fmt.Sprintf("$%d", len(args))
 	}
 	filters = append(filters, "merged_into_token_id is null")
+	filters = append(filters, scope.ownerFilter("owner_user_id", &args))
 	if q := strings.TrimSpace(opts.Query); q != "" {
 		placeholder := arg("%" + q + "%")
 		filters = append(filters, fmt.Sprintf("(email ilike %s or account_id ilike %s or remark ilike %s)", placeholder, placeholder, placeholder))
@@ -269,17 +291,23 @@ func tokenListWhere(opts TokenListOptions, includePlan bool) (string, []any) {
 }
 
 func (s *Store) ListTokensByIDs(ctx context.Context, tokenIDs []int64) ([]Token, error) {
+	return s.ListTokensByIDsScoped(ctx, AllResources(), tokenIDs)
+}
+
+func (s *Store) ListTokensByIDsScoped(ctx context.Context, scope ResourceScope, tokenIDs []int64) ([]Token, error) {
 	ids := postgresIntIDs(tokenIDs)
 	if len(ids) == 0 {
 		return nil, nil
 	}
+	args := []any{ids}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
-		select id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		       is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where id = any($1::integer[])
 		  and merged_into_token_id is null
-	`, ids)
+		  and `+ownerWhere, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +316,13 @@ func (s *Store) ListTokensByIDs(ctx context.Context, tokenIDs []int64) ([]Token,
 }
 
 func (s *Store) TokenCounts(ctx context.Context) (TokenCounts, error) {
+	return s.TokenCountsScoped(ctx, AllResources())
+}
+
+func (s *Store) TokenCountsScoped(ctx context.Context, scope ResourceScope) (TokenCounts, error) {
 	var counts TokenCounts
+	args := []any{}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	err := s.pool.QueryRow(ctx, `
 		select
 			count(*)::int as total,
@@ -303,12 +337,16 @@ func (s *Store) TokenCounts(ctx context.Context) (TokenCounts, error) {
 			count(*) filter (where is_active = false or disabled_at is not null)::int as disabled
 		from codex_tokens
 		where merged_into_token_id is null
-	`).Scan(&counts.Total, &counts.Available, &counts.Cooling, &counts.Disabled)
+		  and `+ownerWhere, args...).Scan(&counts.Total, &counts.Available, &counts.Cooling, &counts.Disabled)
 	return counts, err
 }
 
 func (s *Store) TokenPlanCounts(ctx context.Context, opts TokenListOptions) ([]TokenPlanCount, error) {
-	where, args := tokenListWhere(opts, false)
+	return s.TokenPlanCountsScoped(ctx, AllResources(), opts)
+}
+
+func (s *Store) TokenPlanCountsScoped(ctx context.Context, scope ResourceScope, opts TokenListOptions) ([]TokenPlanCount, error) {
+	where, args := tokenListWhereScoped(opts, false, scope)
 	rows, err := s.pool.Query(ctx, `
 		with normalized as (
 			select case
@@ -343,6 +381,50 @@ func (s *Store) TokenPlanCounts(ctx context.Context, opts TokenListOptions) ([]T
 		return nil, err
 	}
 	return buildPlanCounts(countByPlan), nil
+}
+
+func (s *Store) TokenErrorCountsScoped(ctx context.Context, scope ResourceScope, limit int) ([]TokenErrorCount, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	args := []any{}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, `
+		select
+			case
+				when lower(last_error) like '%deactivated_workspace%' then 'deactivated_workspace'
+				when lower(last_error) like '%invalid_grant%' then 'invalid_grant'
+				when lower(last_error) like '%unauthorized%' or lower(last_error) like '%401%' then 'unauthorized'
+				when lower(last_error) like '%forbidden%' or lower(last_error) like '%403%' then 'forbidden'
+				when lower(last_error) like '%rate_limit%' or lower(last_error) like '%429%' then 'rate_limit'
+				when lower(last_error) like '%quota%' or lower(last_error) like '%402%' then 'quota_or_billing'
+				when lower(last_error) like '%timeout%' then 'timeout'
+				else left(regexp_replace(lower(coalesce(last_error, 'unknown')), '\s+', ' ', 'g'), 120)
+			end as error_type,
+			count(*)::int
+		from codex_tokens
+		where merged_into_token_id is null
+		  and last_error is not null
+		  and btrim(last_error) <> ''
+		  and `+ownerWhere+`
+		group by 1
+		order by count(*) desc, error_type asc
+		limit $`+fmt.Sprint(len(args))+`
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TokenErrorCount{}
+	for rows.Next() {
+		var item TokenErrorCount
+		if err := rows.Scan(&item.ErrorType, &item.Count); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func buildPlanCounts(countByPlan map[string]int) []TokenPlanCount {
@@ -409,17 +491,36 @@ func planLabel(plan string) string {
 }
 
 func (s *Store) UpsertAccessTokens(ctx context.Context, accessTokens []string, source string) (ImportResult, error) {
+	ownerID, err := s.BootstrapUserID(ctx)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	return s.UpsertAccessTokensForOwner(ctx, ownerID, accessTokens, source)
+}
+
+func (s *Store) UpsertAccessTokensForOwner(ctx context.Context, ownerUserID int64, accessTokens []string, source string) (ImportResult, error) {
 	payloads := make([]map[string]any, 0, len(accessTokens))
 	for _, accessToken := range accessTokens {
 		payloads = append(payloads, map[string]any{"access_token": accessToken})
 	}
-	return s.UpsertTokenPayloads(ctx, payloads, source)
+	return s.UpsertTokenPayloadsForOwner(ctx, ownerUserID, payloads, source)
 }
 
 func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]any, source string) (ImportResult, error) {
+	ownerID, err := s.BootstrapUserID(ctx)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	return s.UpsertTokenPayloadsForOwner(ctx, ownerID, payloads, source)
+}
+
+func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int64, payloads []map[string]any, source string) (ImportResult, error) {
 	result := ImportResult{}
 	if len(payloads) == 0 {
 		return result, nil
+	}
+	if ownerUserID <= 0 {
+		return result, fmt.Errorf("owner user id is required")
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -480,10 +581,11 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 					select id
 					from codex_tokens
 					where merged_into_token_id is null
+					  and owner_user_id = $3
 					  and refresh_token = any($1::text[])
 					order by case when $2 <> '' and refresh_token = $2 then 0 else 1 end, id desc
 					limit 1
-				`, postgresTextArray(refreshToken, previousRefreshToken), strings.TrimSpace(previousRefreshToken)).Scan(&existingID)
+				`, postgresTextArray(refreshToken, previousRefreshToken), strings.TrimSpace(previousRefreshToken), ownerUserID).Scan(&existingID)
 		if err != nil && err != pgx.ErrNoRows {
 			return result, err
 		}
@@ -505,14 +607,14 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 					    last_refresh = coalesce($13, last_refresh),
 					    updated_at = now()
 					where id = $1
-					returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+					returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 					          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(payload), isActive, lastError, refreshToken, lastRefresh)
 			token, scanErr := scanToken(row)
 			if scanErr != nil {
 				return result, scanErr
 			}
-			if err := recordTokenSecretAndRefreshHistory(ctx, tx, token.ID, accessToken, refreshToken, idToken); err != nil {
+			if err := recordTokenSecretAndRefreshHistory(ctx, tx, ownerUserID, token.ID, accessToken, refreshToken, idToken); err != nil {
 				return result, err
 			}
 			action := "updated"
@@ -530,18 +632,18 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 
 		row := tx.QueryRow(ctx, `
 				insert into codex_tokens (
-					email, account_id, id_token, access_token, refresh_token, raw_payload, plan_type, source_file,
+					owner_user_id, email, account_id, id_token, access_token, refresh_token, raw_payload, plan_type, source_file,
 					type, is_active, disabled_at, last_error, last_refresh, created_at, updated_at
 				)
-				values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, case when $10 then null else now() end, $11, $12, now(), now())
-				returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+				values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, case when $11 then null else now() end, $12, $13, now(), now())
+				returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 				          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
-			`, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh)
+			`, ownerUserID, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh)
 		token, scanErr := scanToken(row)
 		if scanErr != nil {
 			return result, scanErr
 		}
-		if err := recordTokenSecretAndRefreshHistory(ctx, tx, token.ID, accessToken, refreshToken, idToken); err != nil {
+		if err := recordTokenSecretAndRefreshHistory(ctx, tx, ownerUserID, token.ID, accessToken, refreshToken, idToken); err != nil {
 			return result, err
 		}
 		result.Created++
@@ -560,13 +662,13 @@ func (s *Store) UpsertTokenPayloads(ctx context.Context, payloads []map[string]a
 	return result, nil
 }
 
-func recordTokenSecretAndRefreshHistory(ctx context.Context, tx pgx.Tx, tokenID int64, accessToken string, refreshToken string, idToken *string) error {
+func recordTokenSecretAndRefreshHistory(ctx context.Context, tx pgx.Tx, ownerUserID int64, tokenID int64, accessToken string, refreshToken string, idToken *string) error {
 	if strings.TrimSpace(refreshToken) != "" {
 		if _, err := tx.Exec(ctx, `
-			insert into token_refresh_history(token_id, refresh_token_hash, seen_at)
-			values ($1, $2, now())
+			insert into token_refresh_history(token_id, owner_user_id, refresh_token_hash, seen_at)
+			values ($1, $2, $3, now())
 			on conflict (token_id, refresh_token_hash) do nothing
-		`, tokenID, hashString(refreshToken)); err != nil {
+		`, tokenID, ownerUserID, hashString(refreshToken)); err != nil {
 			return err
 		}
 	}
@@ -574,14 +676,15 @@ func recordTokenSecretAndRefreshHistory(ctx context.Context, tx pgx.Tx, tokenID 
 		return nil
 	}
 	_, err := tx.Exec(ctx, `
-		insert into token_secrets(token_id, access_token, refresh_token, id_token, updated_at)
-		values ($1, nullif($2, ''), nullif($3, ''), $4, now())
+		insert into token_secrets(token_id, owner_user_id, access_token, refresh_token, id_token, updated_at)
+		values ($1, $2, nullif($3, ''), nullif($4, ''), $5, now())
 		on conflict (token_id) do update
-		set access_token = coalesce(excluded.access_token, token_secrets.access_token),
+		set owner_user_id = coalesce(excluded.owner_user_id, token_secrets.owner_user_id),
+		    access_token = coalesce(excluded.access_token, token_secrets.access_token),
 		    refresh_token = coalesce(excluded.refresh_token, token_secrets.refresh_token),
 		    id_token = coalesce(excluded.id_token, token_secrets.id_token),
 		    updated_at = now()
-	`, tokenID, accessToken, refreshToken, idToken)
+	`, tokenID, ownerUserID, accessToken, refreshToken, idToken)
 	return err
 }
 
@@ -686,6 +789,12 @@ func (s *Store) MarkTokenError(ctx context.Context, tokenID int64, message strin
 }
 
 func (s *Store) SetTokenActive(ctx context.Context, tokenID int64, active bool, clearCooldown bool) (*Token, error) {
+	return s.SetTokenActiveScoped(ctx, AllResources(), tokenID, active, clearCooldown)
+}
+
+func (s *Store) SetTokenActiveScoped(ctx context.Context, scope ResourceScope, tokenID int64, active bool, clearCooldown bool) (*Token, error) {
+	args := []any{tokenID, active, clearCooldown || !active}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	row := s.pool.QueryRow(ctx, `
 		update codex_tokens
 		set is_active = $2,
@@ -693,9 +802,10 @@ func (s *Store) SetTokenActive(ctx context.Context, tokenID int64, active bool, 
 		    cooldown_until = case when $3 then null else cooldown_until end,
 		    updated_at = now()
 		where id = $1
-		returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		  and `+ownerWhere+`
+		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
-	`, tokenID, active, clearCooldown || !active)
+	`, args...)
 	token, err := scanToken(row)
 	if err != nil {
 		return nil, err
@@ -704,12 +814,18 @@ func (s *Store) SetTokenActive(ctx context.Context, tokenID int64, active bool, 
 }
 
 func (s *Store) GetToken(ctx context.Context, tokenID int64) (*Token, error) {
+	return s.GetTokenScoped(ctx, AllResources(), tokenID)
+}
+
+func (s *Store) GetTokenScoped(ctx context.Context, scope ResourceScope, tokenID int64) (*Token, error) {
+	args := []any{tokenID}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	row := s.pool.QueryRow(ctx, `
-		select id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		       is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where id = $1 and merged_into_token_id is null
-	`, tokenID)
+		  and `+ownerWhere, args...)
 	token, err := scanToken(row)
 	if err != nil {
 		return nil, err
@@ -718,13 +834,20 @@ func (s *Store) GetToken(ctx context.Context, tokenID int64) (*Token, error) {
 }
 
 func (s *Store) UpdateTokenRemark(ctx context.Context, tokenID int64, remark string) (*Token, error) {
+	return s.UpdateTokenRemarkScoped(ctx, AllResources(), tokenID, remark)
+}
+
+func (s *Store) UpdateTokenRemarkScoped(ctx context.Context, scope ResourceScope, tokenID int64, remark string) (*Token, error) {
+	args := []any{tokenID, truncate(remark, 2000)}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	row := s.pool.QueryRow(ctx, `
 		update codex_tokens
 		set remark = nullif($2, ''), updated_at = now()
 		where id = $1 and merged_into_token_id is null
-		returning id, email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		  and `+ownerWhere+`
+		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
-	`, tokenID, truncate(remark, 2000))
+	`, args...)
 	token, err := scanToken(row)
 	if err != nil {
 		return nil, err
@@ -763,7 +886,13 @@ func (s *Store) UpdateTokenPlanTypes(ctx context.Context, planByTokenID map[int6
 }
 
 func (s *Store) DeleteToken(ctx context.Context, tokenID int64) error {
-	tag, err := s.pool.Exec(ctx, `delete from codex_tokens where id = $1 or merged_into_token_id = $1`, tokenID)
+	return s.DeleteTokenScoped(ctx, AllResources(), tokenID)
+}
+
+func (s *Store) DeleteTokenScoped(ctx context.Context, scope ResourceScope, tokenID int64) error {
+	args := []any{tokenID}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	tag, err := s.pool.Exec(ctx, `delete from codex_tokens where (id = $1 or merged_into_token_id = $1) and `+ownerWhere, args...)
 	if err != nil {
 		return err
 	}
@@ -888,6 +1017,7 @@ func scanToken(row rowScanner) (Token, error) {
 	var refreshToken sql.NullString
 	err := row.Scan(
 		&token.ID,
+		&token.OwnerUserID,
 		&token.Email,
 		&token.AccountID,
 		&accessToken,

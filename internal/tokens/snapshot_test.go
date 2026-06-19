@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,19 +12,40 @@ import (
 )
 
 type fakeSource struct {
-	tokens []store.Token
-	err    error
+	tokens      []store.Token
+	err         error
+	allCalls    atomic.Int64
+	scopedCalls int
+	scopedOwner int64
 }
 
 const testMaxAge = time.Second
 const testRefreshInterval = time.Second
 
 func (f *fakeSource) ListAvailableTokens(context.Context) ([]store.Token, error) {
+	f.allCalls.Add(1)
 	if f.err != nil {
 		return nil, f.err
 	}
 	out := make([]store.Token, len(f.tokens))
 	copy(out, f.tokens)
+	return out, nil
+}
+
+func (f *fakeSource) ListAvailableTokensScoped(_ context.Context, scope store.ResourceScope) ([]store.Token, error) {
+	f.scopedCalls++
+	if scope.OwnerUserID != nil {
+		f.scopedOwner = *scope.OwnerUserID
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([]store.Token, 0, len(f.tokens))
+	for _, token := range f.tokens {
+		if scope.AllowAll || (scope.OwnerUserID != nil && token.OwnerUserID == *scope.OwnerUserID) {
+			out = append(out, token)
+		}
+	}
 	return out, nil
 }
 
@@ -100,6 +122,77 @@ func TestManagerActiveStreamCapCanUpdateAtRuntime(t *testing.T) {
 	}
 	if stats := manager.Stats(); stats.ActiveCap != 10 {
 		t.Fatalf("Stats.ActiveCap = %d, want 10", stats.ActiveCap)
+	}
+}
+
+func TestManagerClaimLoadsOwnerSnapshotLazily(t *testing.T) {
+	rows := makeTokens(4)
+	rows[0].OwnerUserID = 10
+	rows[1].OwnerUserID = 10
+	rows[2].OwnerUserID = 20
+	rows[3].OwnerUserID = 20
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, slog.Default(), time.Second, time.Second, 1)
+
+	claim, err := manager.Claim(context.Background(), Intent{OwnerUserID: 20})
+	if err != nil {
+		t.Fatalf("Claim returned error: %v", err)
+	}
+	defer claim.Release()
+	if claim.Token.Token.OwnerUserID != 20 {
+		t.Fatalf("claimed owner = %d, want 20", claim.Token.Token.OwnerUserID)
+	}
+	if source.scopedCalls == 0 || source.scopedOwner != 20 {
+		t.Fatalf("scoped source calls=%d owner=%d, want owner scoped call for 20", source.scopedCalls, source.scopedOwner)
+	}
+	if got := len(manager.SnapshotForOwner(20).Ready); got != 2 {
+		t.Fatalf("owner snapshot ready = %d, want 2", got)
+	}
+}
+
+func TestManagerRefreshActiveOwnersOnlyRecentOwners(t *testing.T) {
+	rows := makeTokens(4)
+	rows[0].OwnerUserID = 10
+	rows[1].OwnerUserID = 10
+	rows[2].OwnerUserID = 20
+	rows[3].OwnerUserID = 20
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, nil, time.Second, time.Second, 1)
+
+	claim, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10})
+	if err != nil {
+		t.Fatalf("Claim returned error: %v", err)
+	}
+	claim.Release()
+	source.scopedCalls = 0
+	refreshed, err := manager.RefreshActiveOwners(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshActiveOwners returned error: %v", err)
+	}
+	if refreshed != 1 {
+		t.Fatalf("refreshed owners = %d, want 1", refreshed)
+	}
+	if source.scopedCalls != 1 || source.scopedOwner != 10 {
+		t.Fatalf("scoped source calls=%d owner=%d, want one refresh for owner 10", source.scopedCalls, source.scopedOwner)
+	}
+}
+
+func TestManagerStartRefreshesGlobalSnapshotPeriodically(t *testing.T) {
+	source := &fakeSource{tokens: makeTokens(2)}
+	manager := NewManager(source, nil, time.Second, 10*time.Millisecond, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager.Start(ctx)
+	defer manager.Stop()
+
+	deadline := time.After(250 * time.Millisecond)
+	for source.allCalls.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("global snapshot refresh calls = %d, want at least 2", source.allCalls.Load())
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
 }
 

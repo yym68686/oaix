@@ -14,6 +14,9 @@ import (
 
 type RequestLog struct {
 	RequestID                     string         `json:"request_id"`
+	OwnerUserID                   *int64         `json:"owner_user_id,omitempty"`
+	APIKeyID                      *int64         `json:"api_key_id,omitempty"`
+	TokenOwnerUserID              *int64         `json:"token_owner_user_id,omitempty"`
 	Endpoint                      string         `json:"endpoint"`
 	Model                         *string        `json:"model,omitempty"`
 	ModelName                     *string        `json:"model_name,omitempty"`
@@ -95,7 +98,7 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 		promptTrace := jsonBytes(item.PromptCacheTrace)
 		batch.Queue(`
 			insert into gateway_request_logs (
-				request_id, endpoint, model, model_name, is_stream, status_code, success,
+				request_id, owner_user_id, api_key_id, token_owner_user_id, endpoint, model, model_name, is_stream, status_code, success,
 				attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
 				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, cached_input_tokens,
 				output_tokens, total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
@@ -104,8 +107,11 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
 				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43)
 			on conflict (request_id) do update set
+				owner_user_id = coalesce(excluded.owner_user_id, gateway_request_logs.owner_user_id),
+				api_key_id = coalesce(excluded.api_key_id, gateway_request_logs.api_key_id),
+				token_owner_user_id = coalesce(excluded.token_owner_user_id, gateway_request_logs.token_owner_user_id),
 				endpoint = excluded.endpoint,
 				model = coalesce(excluded.model, gateway_request_logs.model),
 				model_name = coalesce(excluded.model_name, gateway_request_logs.model_name, gateway_request_logs.model),
@@ -146,7 +152,7 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				prompt_cache_trace = coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace),
 				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message)
 		`,
-			item.RequestID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
+			item.RequestID, item.OwnerUserID, item.APIKeyID, item.TokenOwnerUserID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
 			item.FinishedAt, item.FirstTokenAt, item.TTFTMs, item.DurationMs, timing, item.InputTokens,
 			item.CachedInputTokens, item.OutputTokens, item.TotalTokens, item.EstimatedCostUSD, item.RequestPayloadHash,
@@ -251,7 +257,7 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 		promptTrace := jsonBytes(item.PromptCacheTrace)
 		_, err := tx.Exec(ctx, `
 			insert into gateway_request_logs (
-				request_id, endpoint, model, model_name, is_stream, status_code, success,
+				request_id, owner_user_id, api_key_id, token_owner_user_id, endpoint, model, model_name, is_stream, status_code, success,
 				attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
 				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, cached_input_tokens,
 				output_tokens, total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
@@ -260,8 +266,11 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
 				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43)
 			on conflict (request_id) do update set
+				owner_user_id = coalesce(excluded.owner_user_id, gateway_request_logs.owner_user_id),
+				api_key_id = coalesce(excluded.api_key_id, gateway_request_logs.api_key_id),
+				token_owner_user_id = coalesce(excluded.token_owner_user_id, gateway_request_logs.token_owner_user_id),
 				status_code = coalesce(excluded.status_code, gateway_request_logs.status_code),
 				success = coalesce(excluded.success, gateway_request_logs.success),
 				attempt_count = greatest(gateway_request_logs.attempt_count, excluded.attempt_count),
@@ -294,7 +303,7 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				prompt_cache_trace = coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace),
 				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message)
 		`,
-			item.RequestID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
+			item.RequestID, item.OwnerUserID, item.APIKeyID, item.TokenOwnerUserID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
 			item.FinishedAt, item.FirstTokenAt, item.TTFTMs, item.DurationMs, jsonBytes(item.TimingSpans),
 			item.InputTokens, item.CachedInputTokens, item.OutputTokens, item.TotalTokens, item.EstimatedCostUSD,
@@ -345,11 +354,13 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 		with pending as (
 			select
 				id,
+				owner_user_id,
 				date_trunc('hour', started_at) as bucket_start,
 				coalesce(model_name, model, '') as model_name,
 				success,
 				is_stream,
 				coalesce(input_tokens, 0) as input_tokens,
+				coalesce(cached_input_tokens, 0) as cached_input_tokens,
 				coalesce(output_tokens, 0) as output_tokens,
 				coalesce(total_tokens, 0) as total_tokens,
 				coalesce(estimated_cost_usd, 0) as estimated_cost_usd,
@@ -365,12 +376,14 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 		agg as (
 			select
 				bucket_start,
+				owner_user_id,
 				model_name,
 				count(*)::int as request_count,
 				count(*) filter (where success = true)::int as success_count,
 				count(*) filter (where success = false)::int as failure_count,
 				count(*) filter (where is_stream = true)::int as streaming_count,
 				sum(input_tokens)::int as input_tokens,
+				sum(cached_input_tokens)::int as cached_input_tokens,
 				sum(output_tokens)::int as output_tokens,
 				sum(total_tokens)::int as total_tokens,
 				sum(estimated_cost_usd)::float8 as estimated_cost_usd,
@@ -379,23 +392,25 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 				coalesce(sum(duration_ms) filter (where duration_ms is not null), 0)::int as duration_ms_sum,
 				count(duration_ms)::int as duration_count
 			from pending
-			group by bucket_start, model_name
+			where owner_user_id is not null
+			group by owner_user_id, bucket_start, model_name
 		)
 		insert into gateway_request_hourly_stats (
-			bucket_start, model_name, request_count, success_count, failure_count, streaming_count,
-			input_tokens, output_tokens, total_tokens, estimated_cost_usd,
+			owner_user_id, bucket_start, model_name, request_count, success_count, failure_count, streaming_count,
+			input_tokens, cached_input_tokens, output_tokens, total_tokens, estimated_cost_usd,
 			ttft_ms_sum, ttft_count, duration_ms_sum, duration_count, updated_at
 		)
-		select bucket_start, model_name, request_count, success_count, failure_count, streaming_count,
-		       input_tokens, output_tokens, total_tokens, estimated_cost_usd,
+		select owner_user_id, bucket_start, model_name, request_count, success_count, failure_count, streaming_count,
+		       input_tokens, cached_input_tokens, output_tokens, total_tokens, estimated_cost_usd,
 		       ttft_ms_sum, ttft_count, duration_ms_sum, duration_count, now()
 		from agg
-		on conflict (bucket_start, model_name) do update set
+		on conflict (owner_user_id, bucket_start, model_name) do update set
 			request_count = gateway_request_hourly_stats.request_count + excluded.request_count,
 			success_count = gateway_request_hourly_stats.success_count + excluded.success_count,
 			failure_count = gateway_request_hourly_stats.failure_count + excluded.failure_count,
 			streaming_count = gateway_request_hourly_stats.streaming_count + excluded.streaming_count,
 			input_tokens = gateway_request_hourly_stats.input_tokens + excluded.input_tokens,
+			cached_input_tokens = gateway_request_hourly_stats.cached_input_tokens + excluded.cached_input_tokens,
 			output_tokens = gateway_request_hourly_stats.output_tokens + excluded.output_tokens,
 			total_tokens = gateway_request_hourly_stats.total_tokens + excluded.total_tokens,
 			estimated_cost_usd = gateway_request_hourly_stats.estimated_cost_usd + excluded.estimated_cost_usd,
@@ -412,11 +427,13 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 		with pending as (
 			select
 				token_id,
+				owner_user_id,
 				coalesce(estimated_cost_usd, 0) as estimated_cost_usd
 			from gateway_request_logs
 			where analytics_recorded_at is null
 			  and finished_at is not null
 			  and token_id is not null
+			  and owner_user_id is not null
 			  and estimated_cost_usd is not null
 			order by id
 			limit 5000
@@ -425,15 +442,17 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 		agg as (
 			select
 				token_id,
+				owner_user_id,
 				count(*)::int as request_count,
 				sum(estimated_cost_usd)::float8 as estimated_cost_usd
 			from pending
-			group by token_id
+			group by token_id, owner_user_id
 		)
-		insert into gateway_request_token_costs(token_id, request_count, estimated_cost_usd, updated_at)
-		select token_id, request_count, estimated_cost_usd, now()
+		insert into gateway_request_token_costs(token_id, owner_user_id, request_count, estimated_cost_usd, updated_at)
+		select token_id, owner_user_id, request_count, estimated_cost_usd, now()
 		from agg
 		on conflict (token_id) do update set
+			owner_user_id = coalesce(excluded.owner_user_id, gateway_request_token_costs.owner_user_id),
 			request_count = gateway_request_token_costs.request_count + excluded.request_count,
 			estimated_cost_usd = gateway_request_token_costs.estimated_cost_usd + excluded.estimated_cost_usd,
 			updated_at = now()
@@ -824,6 +843,7 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 	}
 	rows, err := s.pool.Query(ctx, `
 		select request_id, endpoint, model, model_name, is_stream, status_code, success,
+		       owner_user_id, api_key_id, token_owner_user_id,
 		       attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
 		       first_token_at, ttft_ms, duration_ms, input_tokens, cached_input_tokens, output_tokens,
 		       total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
@@ -845,7 +865,7 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 		var promptTrace []byte
 		if err := rows.Scan(
 			&item.RequestID, &item.Endpoint, &item.Model, &item.ModelName, &item.IsStream, &item.StatusCode,
-			&item.Success, &item.AttemptCount, &item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
+			&item.Success, &item.OwnerUserID, &item.APIKeyID, &item.TokenOwnerUserID, &item.AttemptCount, &item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
 			&item.StartedAt, &item.FinishedAt, &item.FirstTokenAt, &item.TTFTMs, &item.DurationMs,
 			&item.InputTokens, &item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,
 			&item.RequestPayloadHash, &item.UpstreamPayloadHash, &item.PromptTemplateHash, &item.PromptDynamicHash,
@@ -865,13 +885,26 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 }
 
 func (s *Store) RequestAnalytics(ctx context.Context, hours int) (RequestAnalytics, error) {
+	return s.RequestAnalyticsScoped(ctx, AllResources(), hours)
+}
+
+func (s *Store) RequestAnalyticsScoped(ctx context.Context, scope ResourceScope, hours int) (RequestAnalytics, error) {
 	if hours <= 0 {
 		hours = 24
 	}
-	summary, err := s.RequestLogSummary(ctx, hours)
+	usage, err := s.RequestUsageSummaryScoped(ctx, scope, hours)
 	if err != nil {
 		return RequestAnalytics{}, err
 	}
+	summary := RequestLogSummary{
+		Total:        usage.Total,
+		Success:      usage.Success,
+		Failure:      usage.Failure,
+		AverageTTFT:  usage.AverageTTFTMS,
+		AverageDurMS: usage.AverageDurationMS,
+	}
+	args := []any{hours}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
 		select model_name,
 		       coalesce(sum(request_count), 0)::int,
@@ -879,10 +912,11 @@ func (s *Store) RequestAnalytics(ctx context.Context, hours int) (RequestAnalyti
 		       coalesce(sum(failure_count), 0)::int
 		from gateway_request_hourly_stats
 		where bucket_start >= date_trunc('hour', now() - make_interval(hours => $1))
+		  and `+ownerWhere+`
 		group by model_name
 		order by coalesce(sum(request_count), 0) desc
 		limit 20
-	`, hours)
+	`, args...)
 	if err != nil {
 		return RequestAnalytics{}, err
 	}

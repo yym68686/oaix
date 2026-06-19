@@ -29,6 +29,7 @@ const (
 
 type openAIOAuthSession struct {
 	ID            string
+	OwnerUserID   int64
 	State         string
 	CodeVerifier  string
 	RedirectURI   string
@@ -89,6 +90,22 @@ func (a *App) startOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
 	queuePosition := normalizeImportQueuePosition(body.ImportQueuePosition)
+	auth := authFromContext(r.Context())
+	var ownerID int64
+	var err error
+	if auth != nil {
+		ownerID, err = auth.proxyOwner(r.Context(), a.store)
+		if err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]any{"detail": err.Error()})
+			return
+		}
+	} else if a.store != nil {
+		ownerID, err = a.store.BootstrapUserID(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+	}
 	redirectURI := a.oauthRedirectURI(r, body.RedirectURI)
 	state, err := randomHex(32)
 	if err != nil {
@@ -112,6 +129,7 @@ func (a *App) startOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	session := openAIOAuthSession{
 		ID:            sessionID,
+		OwnerUserID:   ownerID,
 		State:         state,
 		CodeVerifier:  codeVerifier,
 		RedirectURI:   redirectURI,
@@ -124,6 +142,7 @@ func (a *App) startOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		_ = a.store.SaveOAuthSession(ctx, store.OAuthSession{
 			SessionID:           session.ID,
+			OwnerUserID:         session.OwnerUserID,
 			State:               session.State,
 			CodeVerifier:        session.CodeVerifier,
 			RedirectURI:         session.RedirectURI,
@@ -132,6 +151,7 @@ func (a *App) startOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:           session.CreatedAt.UTC(),
 			ExpiresAt:           session.CreatedAt.UTC().Add(openAIOAuthSessionTTL),
 		})
+		_ = a.store.WriteAuditLog(ctx, "oauth_session_create", "api", "oauth_session", session.ID, map[string]any{"owner_user_id": session.OwnerUserID, "queue_position": session.QueuePosition})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"auth_url":       authURL,
@@ -160,6 +180,7 @@ func (a *App) openAIOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			if stored, storedErr := a.store.GetOAuthSessionByState(r.Context(), state); storedErr == nil && stored.ExpiresAt.After(time.Now()) {
 				session = openAIOAuthSession{
 					ID:            stored.SessionID,
+					OwnerUserID:   stored.OwnerUserID,
 					State:         stored.State,
 					CodeVerifier:  stored.CodeVerifier,
 					RedirectURI:   stored.RedirectURI,
@@ -180,12 +201,14 @@ func (a *App) openAIOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if a.store != nil {
 			_ = a.store.UpdateOAuthSessionStatus(context.Background(), session.ID, "failed", nil, sanitizeImportError(err))
+			_ = a.store.WriteAuditLog(context.Background(), "oauth_callback_failed", "oauth", "oauth_session", session.ID, map[string]any{"owner_user_id": session.OwnerUserID, "error": sanitizeImportError(err)})
 		}
 		a.redirectOAuthResult(w, r, 0, sanitizeImportError(err))
 		return
 	}
 	if a.store != nil {
 		_ = a.store.UpdateOAuthSessionStatus(context.Background(), session.ID, "completed", &job.ID, "")
+		_ = a.store.WriteAuditLog(context.Background(), "oauth_callback_completed", "oauth", "oauth_session", session.ID, map[string]any{"owner_user_id": session.OwnerUserID, "job_id": job.ID})
 	}
 	a.redirectOAuthResult(w, r, job.ID, "")
 }
@@ -217,6 +240,7 @@ func (a *App) exchangeOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
 			if stored, storedErr := a.store.GetOAuthSessionByState(r.Context(), state); storedErr == nil && stored.ExpiresAt.After(time.Now()) {
 				session = openAIOAuthSession{
 					ID:            stored.SessionID,
+					OwnerUserID:   stored.OwnerUserID,
 					State:         stored.State,
 					CodeVerifier:  stored.CodeVerifier,
 					RedirectURI:   stored.RedirectURI,
@@ -235,18 +259,24 @@ func (a *App) exchangeOpenAIOAuth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("OAuth session_id 不匹配，请重新授权"))
 		return
 	}
+	if !authCanAccessOwner(authFromContext(r.Context()), session.OwnerUserID) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "OAuth session not found"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 	job, result, err := a.finishOpenAIOAuthImport(ctx, session, code)
 	if err != nil {
 		if a.store != nil {
 			_ = a.store.UpdateOAuthSessionStatus(context.Background(), session.ID, "failed", nil, sanitizeImportError(err))
+			_ = a.store.WriteAuditLog(context.Background(), "oauth_exchange_failed", "api", "oauth_session", session.ID, map[string]any{"owner_user_id": session.OwnerUserID, "error": sanitizeImportError(err)})
 		}
 		writeError(w, http.StatusBadGateway, errors.New(sanitizeImportError(err)))
 		return
 	}
 	if a.store != nil {
 		_ = a.store.UpdateOAuthSessionStatus(context.Background(), session.ID, "completed", &job.ID, "")
+		_ = a.store.WriteAuditLog(context.Background(), "oauth_exchange_completed", "api", "oauth_session", session.ID, map[string]any{"owner_user_id": session.OwnerUserID, "job_id": job.ID})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"job":    job,
@@ -287,7 +317,7 @@ func (a *App) finishOpenAIOAuthImport(ctx context.Context, session openAIOAuthSe
 	if result.PlanType != "" {
 		payload["plan_type"] = result.PlanType
 	}
-	return a.completeTokenImport(ctx, []map[string]any{payload}, session.QueuePosition, "chatgpt_oauth", "oauth")
+	return a.completeTokenImportForOwner(ctx, session.OwnerUserID, []map[string]any{payload}, session.QueuePosition, "chatgpt_oauth", "oauth")
 }
 
 func (a *App) redirectOAuthResult(w http.ResponseWriter, r *http.Request, jobID int64, errorMessage string) {

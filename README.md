@@ -116,6 +116,31 @@ go run ./cmd/oaix-gateway
 http://127.0.0.1:8000/
 ```
 
+## 多用户鉴权模型
+
+oaix 现在区分三类 API Key：
+
+- `SERVICE_API_KEYS` 环境变量：最高权限 Service API Key，可调用全部 `/admin/*`、`/api/admin/*`、`/api/*` 和 `/v1/*`。直接代理 `/v1/*` 时默认使用 bootstrap 用户池；如需指定用户池，传 `X-OAIX-Act-As-User: <user_id>`。
+- 平台用户 API Key：用户注册或登录后创建，只能操作自己的 `/api/*` 资源和自己的 `/v1/*` 代理流量。
+- 管理员 API Key：数据库 `api_keys` 中 role 为 `admin` / `readonly_admin` / `service` 的 key。`readonly_admin` 可以读取管理资源，但不能执行 POST/PATCH/DELETE。
+
+资源归属以 `owner_user_id` 为边界。用户导入的 key、OAuth 会话、导入批次、请求日志、成本聚合和 prompt-cache 亲和状态都会写入 owner 维度。管理员读取全局资源时使用 `/api/admin/*` 或旧 `/admin/*`；普通用户自助管理使用 `/api/*`。
+
+注册只需要邮箱和密码：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/auth/register \
+  -H 'Content-Type: application/json' \
+  --data '{"email":"user@example.com","password":"change-me"}'
+```
+
+用户拿到返回的 `api_key.plaintext_key` 后即可调用自己的接口：
+
+```bash
+curl http://127.0.0.1:8000/api/tokens \
+  -H "Authorization: Bearer $OAIX_USER_KEY"
+```
+
 根路径现在带一个前端控制台，可展示：
 
 - 当前有效 key 数量

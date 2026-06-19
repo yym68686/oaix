@@ -30,6 +30,7 @@ import { Textarea } from "@/registry/default/ui/textarea";
 import { cn } from "@/registry/default/lib/utils";
 import {
   api,
+  getAuthContext,
   type TokenCounts,
   type TokenItem,
   type TokenPlanCount,
@@ -62,6 +63,7 @@ import {
   TokenStatusPlan,
   statusBadge,
 } from "@/shared/components";
+import { TokenFilters } from "@/shared/resourceTables";
 import type { DeleteTarget, RemarkTarget, ToastMessage, TokenStatus } from "@/shared/types";
 import { navigateTo, type RouteState, useRouteSearch } from "@/app/router";
 
@@ -131,6 +133,7 @@ function KeyListPage({
   const tableLoading = loading && (!tokens.length || loadedQueryKey !== queryKey);
   const pageIds = tokens.map((item) => item.id);
   const allSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.has(id));
+  const canMutate = String(getAuthContext()?.role || getAuthContext()?.user?.role || "").toLowerCase() !== "readonly_admin";
 
   const beginQueryLoading = useCallback(() => {
     requestSeq.current += 1;
@@ -322,8 +325,16 @@ function KeyListPage({
                 />
               </div>
             </div>
-            <SelectField label="状态" onChange={(value) => updateQuery({ page: 1, status: value })} options={statusOptions} value={status} />
-            <SelectField label="计划" onChange={(value) => updateQuery({ page: 1, plan: value })} options={planOptions} value={plan} />
+            <div className="xl:col-span-2">
+              <TokenFilters
+                onPlanChange={(value) => updateQuery({ page: 1, plan: value })}
+                onStatusChange={(value) => updateQuery({ page: 1, status: value })}
+                plan={plan}
+                planOptions={planOptions}
+                status={status}
+                statusOptions={statusOptions}
+              />
+            </div>
             <SelectField label="排序" onChange={(value) => updateQuery({ page: 1, sort: value })} options={SORT_OPTIONS} value={sort} />
           </div>
 
@@ -331,6 +342,7 @@ function KeyListPage({
             <div className="flex flex-wrap items-center gap-2">
               <Label className="rounded-lg border bg-background px-3 py-2">
                 <Checkbox
+                  disabled={!canMutate}
                   checked={allSelected}
                   onCheckedChange={(checked) => {
                     const next = new Set(selectedIds);
@@ -344,14 +356,14 @@ function KeyListPage({
                 />
                 全选本页
               </Label>
-              <Button disabled={!selectedIds.size} onClick={() => void runBatchActivation(true)} variant="outline">
+              <Button disabled={!canMutate || !selectedIds.size} onClick={() => void runBatchActivation(true)} variant="outline">
                 启用
               </Button>
-              <Button disabled={!selectedIds.size} onClick={() => void runBatchActivation(false)} variant="outline">
+              <Button disabled={!canMutate || !selectedIds.size} onClick={() => void runBatchActivation(false)} variant="outline">
                 禁用
               </Button>
               <Button
-                disabled={!selectedIds.size}
+                disabled={!canMutate || !selectedIds.size}
                 onClick={() =>
                   setDeleteTarget({
                     description: "批量删除后会从调度池和最近列表移除。此操作不可撤销。",

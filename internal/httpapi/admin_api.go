@@ -219,6 +219,24 @@ func adminOpenAPISpec() map[string]any {
 		"GET /admin/settings/schema", "GET /admin/audit-logs", "GET /admin/audit-logs/{audit_id}",
 		"GET /admin/api-keys", "POST /admin/api-keys", "POST /admin/api-keys/{key_id}/rotate",
 		"DELETE /admin/api-keys/{key_id}",
+		"POST /api/auth/register", "POST /api/auth/login", "GET /api/me", "GET /api/me/api-keys",
+		"POST /api/me/api-keys", "DELETE /api/me/api-keys/{key_id}", "GET /api/me/usage",
+		"GET /api/me/pool-summary", "GET /api/me/settings", "GET /api/me/settings/{key}",
+		"POST /api/me/settings/{key}", "DELETE /api/me/settings/{key}",
+		"GET /api/tokens", "GET /api/tokens/{token_id}", "PATCH /api/tokens/{token_id}",
+		"DELETE /api/tokens/{token_id}", "POST /api/tokens/{token_id}/probe",
+		"POST /api/import/parse", "POST /api/import/upload", "POST /api/import/jobs",
+		"GET /api/import/jobs", "GET /api/import/jobs/{job_id}", "POST /api/import/jobs/{job_id}/cancel",
+		"DELETE /api/import/jobs/{job_id}", "GET /api/import/jobs/{job_id}/items",
+		"GET /api/import/jobs/{job_id}/tokens", "GET /api/requests",
+		"GET /api/admin/users", "POST /api/admin/users", "GET /api/admin/users/{user_id}",
+		"PATCH /api/admin/users/{user_id}", "GET /api/admin/users/{user_id}/api-keys",
+		"POST /api/admin/users/{user_id}/api-keys", "DELETE /api/admin/users/{user_id}/api-keys/{key_id}",
+		"GET /api/admin/users/{user_id}/tokens", "GET /api/admin/users/{user_id}/import/jobs",
+		"GET /api/admin/users/{user_id}/requests", "GET /api/admin/users/{user_id}/usage",
+		"GET /api/admin/pool-summary", "GET /api/admin/pool-summary/by-user",
+		"GET /api/admin/analytics/users", "GET /api/admin/requests", "GET /api/admin/requests/export",
+		"GET /api/admin/audit-logs", "GET /api/admin/audit-logs/{audit_id}",
 	}
 	paths := map[string]any{}
 	for _, route := range routes {
@@ -592,6 +610,7 @@ func (a *App) createQuotaRefreshJob(w http.ResponseWriter, r *http.Request) {
 	job := &quotaRefreshJob{ID: jobID, Status: "running", Total: len(tokens), CreatedAt: time.Now().UTC()}
 	a.quotaJobs.put(job)
 	go a.runQuotaRefreshJob(jobID, tokens)
+	_ = a.store.WriteAuditLog(ctx, "quota_refresh_job_create", "api", "quota_refresh_job", jobID, map[string]any{"token_count": len(ids), "all": payload.All})
 	writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
 }
 
@@ -922,6 +941,7 @@ func (a *App) retryImportItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	_ = a.store.WriteAuditLog(ctx, "token_import_item_retry", "api", "import_item", strconv.FormatInt(id, 10), map[string]any{"job_id": item.JobID})
 	writeJSON(w, http.StatusOK, map[string]any{"item": sanitizeImportItems([]store.ImportItem{item})[0]})
 }
 
@@ -941,6 +961,7 @@ func (a *App) skipImportItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	_ = a.store.WriteAuditLog(ctx, "token_import_item_skip", "api", "import_item", strconv.FormatInt(id, 10), map[string]any{"job_id": item.JobID, "reason": payload.Reason})
 	writeJSON(w, http.StatusOK, map[string]any{"item": sanitizeImportItems([]store.ImportItem{item})[0]})
 }
 
@@ -976,6 +997,10 @@ func (a *App) getOpenAIOAuthSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	if !authCanAccessOwner(authFromContext(r.Context()), session.OwnerUserID) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "OAuth session not found"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"session": session})
 }
 
@@ -983,13 +1008,23 @@ func (a *App) cancelOpenAIOAuthSession(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("session_id"))
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	if err := a.store.CancelOAuthSession(ctx, id); errors.Is(err, pgx.ErrNoRows) {
+	session, err := a.store.GetOAuthSession(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("OAuth session not found"))
 		return
 	} else if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	if !authCanAccessOwner(authFromContext(r.Context()), session.OwnerUserID) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "OAuth session not found"})
+		return
+	}
+	if err := a.store.CancelOAuthSession(ctx, id); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	_ = a.store.WriteAuditLog(ctx, "oauth_session_cancel", "api", "oauth_session", id, map[string]any{"owner_user_id": session.OwnerUserID})
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": id, "status": "canceled"})
 }
 
@@ -1211,6 +1246,7 @@ func (a *App) deletePromptCacheLane(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	_ = a.store.WriteAuditLog(ctx, "prompt_cache_lane_delete", "api", "prompt_cache_lane", hash, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "prompt_key_hash": hash})
 }
 
@@ -1238,6 +1274,7 @@ func (a *App) deleteResponseOwner(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	_ = a.store.WriteAuditLog(ctx, "prompt_cache_response_owner_delete", "api", "response_owner", hash, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "response_id_hash": hash})
 }
 
@@ -1253,6 +1290,7 @@ func (a *App) deleteTokenResponseOwners(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	_ = a.store.WriteAuditLog(ctx, "token_response_owners_delete", "api", "token", strconv.FormatInt(id, 10), map[string]any{"deleted": count})
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": count})
 }
 
@@ -1519,6 +1557,8 @@ func requestLogOptionsFromRequest(r *http.Request) store.RequestLogListOptions {
 		RequestID: r.URL.Query().Get("request_id"), Model: r.URL.Query().Get("model"),
 		Endpoint: r.URL.Query().Get("endpoint"), TokenID: queryInt64(r, "token_id", 0),
 		AccountID: r.URL.Query().Get("account_id"), From: queryTime(r, "from"), To: queryTime(r, "to"),
+		OwnerUserID:  queryInt64(r, "user_id", 0),
+		APIKeyID:     queryInt64(r, "api_key_id", 0),
 		QueryError:   firstNonEmpty(r.URL.Query().Get("error"), r.URL.Query().Get("q")),
 		IncludeTotal: strings.EqualFold(r.URL.Query().Get("include_total"), "true"),
 	}

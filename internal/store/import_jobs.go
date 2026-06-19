@@ -12,6 +12,7 @@ import (
 
 type ImportJob struct {
 	ID                  int64      `json:"id"`
+	OwnerUserID         int64      `json:"owner_user_id"`
 	Status              string     `json:"status"`
 	ImportQueuePosition string     `json:"import_queue_position"`
 	TotalCount          int        `json:"total_count"`
@@ -49,6 +50,7 @@ type DeletedImportJob struct {
 
 type ImportItem struct {
 	ID                 int64          `json:"id"`
+	OwnerUserID        int64          `json:"owner_user_id"`
 	JobID              int64          `json:"job_id"`
 	ItemIndex          int            `json:"item_index"`
 	Status             string         `json:"status"`
@@ -88,6 +90,17 @@ type ImportWorkerMetrics struct {
 }
 
 func (s *Store) CreateCompletedImportJob(ctx context.Context, payloads []map[string]any, queuePosition string, result ImportResult) (ImportJob, error) {
+	ownerID, err := s.BootstrapUserID(ctx)
+	if err != nil {
+		return ImportJob{}, err
+	}
+	return s.CreateCompletedImportJobForOwner(ctx, ownerID, payloads, queuePosition, result)
+}
+
+func (s *Store) CreateCompletedImportJobForOwner(ctx context.Context, ownerUserID int64, payloads []map[string]any, queuePosition string, result ImportResult) (ImportJob, error) {
+	if ownerUserID <= 0 {
+		return ImportJob{}, fmt.Errorf("owner user id is required")
+	}
 	data, err := json.Marshal(payloads)
 	if err != nil {
 		return ImportJob{}, err
@@ -99,21 +112,21 @@ func (s *Store) CreateCompletedImportJob(ctx context.Context, payloads []map[str
 	defer tx.Rollback(ctx)
 	row := tx.QueryRow(ctx, `
 			insert into token_import_jobs (
-				status, import_queue_position, payloads, total_count, processed_count,
+				owner_user_id, status, import_queue_position, payloads, total_count, processed_count,
 				created_count, updated_count, skipped_count, failed_count,
 				yielded_to_response_traffic_count, response_traffic_timeout_count,
 				submitted_at, started_at, heartbeat_at, finished_at
 			)
-			values ('completed', $1, $2, $3, $4, $5, $6, $7, $8, 0, 0, now(), now(), now(), now())
-			returning id, status, import_queue_position, total_count, processed_count,
+			values ($1, 'completed', $2, $3, $4, $5, $6, $7, $8, $9, 0, 0, now(), now(), now(), now())
+			returning id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 			          created_count, updated_count, skipped_count, failed_count, last_error,
 			          submitted_at, started_at, heartbeat_at, finished_at
-	`, queuePosition, data, len(payloads), result.Created+result.Updated+result.Skipped+result.Failed, result.Created, result.Updated, result.Skipped, result.Failed)
+	`, ownerUserID, queuePosition, data, len(payloads), result.Created+result.Updated+result.Skipped+result.Failed, result.Created, result.Updated, result.Skipped, result.Failed)
 	job, err := scanImportJob(row)
 	if err != nil {
 		return ImportJob{}, err
 	}
-	if err := s.insertCompletedImportItems(ctx, tx, job.ID, payloads, result); err != nil {
+	if err := s.insertCompletedImportItems(ctx, tx, ownerUserID, job.ID, payloads, result); err != nil {
 		return ImportJob{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -123,6 +136,17 @@ func (s *Store) CreateCompletedImportJob(ctx context.Context, payloads []map[str
 }
 
 func (s *Store) CreateQueuedImportJob(ctx context.Context, payloads []map[string]any, queuePosition string) (ImportJob, error) {
+	ownerID, err := s.BootstrapUserID(ctx)
+	if err != nil {
+		return ImportJob{}, err
+	}
+	return s.CreateQueuedImportJobForOwner(ctx, ownerID, payloads, queuePosition)
+}
+
+func (s *Store) CreateQueuedImportJobForOwner(ctx context.Context, ownerUserID int64, payloads []map[string]any, queuePosition string) (ImportJob, error) {
+	if ownerUserID <= 0 {
+		return ImportJob{}, fmt.Errorf("owner user id is required")
+	}
 	if strings.TrimSpace(queuePosition) == "" {
 		queuePosition = "front"
 	}
@@ -137,21 +161,21 @@ func (s *Store) CreateQueuedImportJob(ctx context.Context, payloads []map[string
 	defer tx.Rollback(ctx)
 	row := tx.QueryRow(ctx, `
 			insert into token_import_jobs (
-				status, import_queue_position, payloads, total_count,
+				owner_user_id, status, import_queue_position, payloads, total_count,
 				yielded_to_response_traffic_count, response_traffic_timeout_count,
 				submitted_at, heartbeat_at
 			)
-			values ('queued', $1, $2, $3, 0, 0, now(), now())
-			returning id, status, import_queue_position, total_count, processed_count,
+			values ($1, 'queued', $2, $3, $4, 0, 0, now(), now())
+			returning id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 			          created_count, updated_count, skipped_count, failed_count, last_error,
 			          submitted_at, started_at, heartbeat_at, finished_at
-	`, queuePosition, data, len(payloads))
+	`, ownerUserID, queuePosition, data, len(payloads))
 	job, err := scanImportJob(row)
 	if err != nil {
 		return ImportJob{}, err
 	}
 	batchValues := make([]string, 0, len(payloads))
-	args := []any{job.ID}
+	args := []any{job.ID, ownerUserID}
 	for index, payload := range payloads {
 		encoded, err := json.Marshal(payload)
 		if err != nil {
@@ -159,12 +183,12 @@ func (s *Store) CreateQueuedImportJob(ctx context.Context, payloads []map[string
 		}
 		hash := refreshHashFromPayload(payload)
 		args = append(args, index, encoded, hash)
-		base := 2 + index*3
-		batchValues = append(batchValues, fmt.Sprintf("($1, $%d, $%d, $%d)", base, base+1, base+2))
+		base := 3 + index*3
+		batchValues = append(batchValues, fmt.Sprintf("($1, $2, $%d, $%d, $%d)", base, base+1, base+2))
 	}
 	if len(batchValues) > 0 {
 		_, err = tx.Exec(ctx, `
-			insert into token_import_items(job_id, item_index, payload, refresh_token_hash)
+			insert into token_import_items(job_id, owner_user_id, item_index, payload, refresh_token_hash)
 			values `+strings.Join(batchValues, ",")+`
 		`, args...)
 		if err != nil {
@@ -178,13 +202,19 @@ func (s *Store) CreateQueuedImportJob(ctx context.Context, payloads []map[string
 }
 
 func (s *Store) GetImportJob(ctx context.Context, id int64) (ImportJob, error) {
+	return s.GetImportJobScoped(ctx, AllResources(), id)
+}
+
+func (s *Store) GetImportJobScoped(ctx context.Context, scope ResourceScope, id int64) (ImportJob, error) {
+	args := []any{id}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	row := s.pool.QueryRow(ctx, `
-		select id, status, import_queue_position, total_count, processed_count,
+		select id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 		       created_count, updated_count, skipped_count, failed_count, last_error,
 		       submitted_at, started_at, heartbeat_at, finished_at
 		from token_import_jobs
 		where id = $1
-	`, id)
+		  and `+ownerWhere, args...)
 	return scanImportJob(row)
 }
 
@@ -200,7 +230,7 @@ func (s *Store) CancelImportJob(ctx context.Context, id int64) (ImportJob, error
 		    finished_at = case when finished_at is null then now() else finished_at end,
 		    heartbeat_at = now()
 		where id = $1
-		returning id, status, import_queue_position, total_count, processed_count,
+		returning id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 		          created_count, updated_count, skipped_count, failed_count, last_error,
 		          submitted_at, started_at, heartbeat_at, finished_at
 	`, id)
@@ -229,7 +259,7 @@ func (s *Store) DeleteImportJobWithTokens(ctx context.Context, id int64) (Delete
 	defer tx.Rollback(ctx)
 
 	row := tx.QueryRow(ctx, `
-		select id, status, import_queue_position, total_count, processed_count,
+		select id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 		       created_count, updated_count, skipped_count, failed_count, last_error,
 		       submitted_at, started_at, heartbeat_at, finished_at
 		from token_import_jobs
@@ -356,17 +386,24 @@ func importJobDeleteBlocked(status string) bool {
 }
 
 func (s *Store) ListImportJobs(ctx context.Context, limit int) ([]ImportJob, error) {
+	return s.ListImportJobsScoped(ctx, AllResources(), limit)
+}
+
+func (s *Store) ListImportJobsScoped(ctx context.Context, scope ResourceScope, limit int) ([]ImportJob, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 30
 	}
+	args := []any{limit}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
-		select id, status, import_queue_position, total_count, processed_count,
+		select id, coalesce(owner_user_id, 0), status, import_queue_position, total_count, processed_count,
 		       created_count, updated_count, skipped_count, failed_count, last_error,
 		       submitted_at, started_at, heartbeat_at, finished_at
 		from token_import_jobs
+		where `+ownerWhere+`
 		order by id desc
 		limit $1
-	`, limit)
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -383,7 +420,11 @@ func (s *Store) ListImportJobs(ctx context.Context, limit int) ([]ImportJob, err
 }
 
 func (s *Store) ListImportJobSummaries(ctx context.Context, limit int, includeObservedCost bool) ([]ImportBatchSummary, error) {
-	jobs, err := s.ListImportJobs(ctx, limit)
+	return s.ListImportJobSummariesScoped(ctx, AllResources(), limit, includeObservedCost)
+}
+
+func (s *Store) ListImportJobSummariesScoped(ctx context.Context, scope ResourceScope, limit int, includeObservedCost bool) ([]ImportBatchSummary, error) {
+	jobs, err := s.ListImportJobsScoped(ctx, scope, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -391,7 +432,11 @@ func (s *Store) ListImportJobSummaries(ctx context.Context, limit int, includeOb
 }
 
 func (s *Store) GetImportJobSummary(ctx context.Context, id int64, includeObservedCost bool) (*ImportBatchSummary, error) {
-	job, err := s.GetImportJob(ctx, id)
+	return s.GetImportJobSummaryScoped(ctx, AllResources(), id, includeObservedCost)
+}
+
+func (s *Store) GetImportJobSummaryScoped(ctx context.Context, scope ResourceScope, id int64, includeObservedCost bool) (*ImportBatchSummary, error) {
+	job, err := s.GetImportJobScoped(ctx, scope, id)
 	if err != nil {
 		return nil, err
 	}
@@ -406,15 +451,22 @@ func (s *Store) GetImportJobSummary(ctx context.Context, id int64, includeObserv
 }
 
 func (s *Store) ListImportJobItems(ctx context.Context, jobID int64) ([]ImportItem, error) {
+	return s.ListImportJobItemsScoped(ctx, AllResources(), jobID)
+}
+
+func (s *Store) ListImportJobItemsScoped(ctx context.Context, scope ResourceScope, jobID int64) ([]ImportItem, error) {
+	args := []any{jobID}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
-		select id, job_id, item_index, status, refresh_token_hash, payload,
+		select id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
 		       validated_payload, token_id, action, error_message, validation_ms,
 		       publish_ms, validation_started_at, validation_finished_at,
 		       published_at, created_at, updated_at
 		from token_import_items
 		where job_id = $1
+		  and `+ownerWhere+`
 		order by item_index asc, id asc
-	`, jobID)
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -422,11 +474,11 @@ func (s *Store) ListImportJobItems(ctx context.Context, jobID int64) ([]ImportIt
 	return scanImportItems(rows)
 }
 
-func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, jobID int64, payloads []map[string]any, result ImportResult) error {
+func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, ownerUserID int64, jobID int64, payloads []map[string]any, result ImportResult) error {
 	if len(payloads) == 0 || len(result.Items) == 0 {
 		return nil
 	}
-	args := []any{jobID}
+	args := []any{jobID, ownerUserID}
 	values := make([]string, 0, len(result.Items))
 	for _, item := range result.Items {
 		if item.Index < 0 || item.Index >= len(payloads) {
@@ -446,7 +498,7 @@ func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, jobID
 		base := len(args) + 1
 		args = append(args, item.Index, status, payloadData, payloadData, hash, item.TokenID, item.Action, item.ErrorMessage)
 		values = append(values, fmt.Sprintf(
-			"($1, $%d, $%d, $%d, $%d, $%d, $%d, nullif($%d, ''), nullif($%d, ''), now(), now())",
+			"($1, $2, $%d, $%d, $%d, $%d, $%d, $%d, nullif($%d, ''), nullif($%d, ''), now(), now())",
 			base, base+1, base+2, base+3, base+4, base+5, base+6, base+7,
 		))
 	}
@@ -455,7 +507,7 @@ func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, jobID
 	}
 	_, err := tx.Exec(ctx, `
 		insert into token_import_items(
-			job_id, item_index, status, payload, validated_payload,
+			job_id, owner_user_id, item_index, status, payload, validated_payload,
 			refresh_token_hash, token_id, action, error_message, published_at, updated_at
 		)
 		values `+strings.Join(values, ",")+`
@@ -708,7 +760,7 @@ func (s *Store) ClaimImportItems(ctx context.Context, limit int) ([]ImportItem, 
 		    updated_at = now()
 		from claimed
 		where i.id = claimed.id
-		returning i.id, i.job_id, i.item_index, i.status, i.refresh_token_hash, i.payload,
+		returning i.id, coalesce(i.owner_user_id, 0), i.job_id, i.item_index, i.status, i.refresh_token_hash, i.payload,
 		          i.validated_payload, i.token_id, i.action, i.error_message, i.validation_ms,
 		          i.publish_ms, i.validation_started_at, i.validation_finished_at,
 		          i.published_at, i.created_at, i.updated_at
@@ -793,7 +845,11 @@ func (s *Store) UpdateImportItems(ctx context.Context, updates []ImportItemUpdat
 }
 
 func (s *Store) PublishImportTokens(ctx context.Context, jobID int64, accessTokens []string, source string) (ImportResult, error) {
-	result, err := s.UpsertAccessTokens(ctx, accessTokens, source)
+	job, err := s.GetImportJob(ctx, jobID)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	result, err := s.UpsertAccessTokensForOwner(ctx, job.OwnerUserID, accessTokens, source)
 	if err != nil {
 		return result, err
 	}
@@ -884,6 +940,7 @@ func scanImportJob(row rowScanner) (ImportJob, error) {
 	var job ImportJob
 	err := row.Scan(
 		&job.ID,
+		&job.OwnerUserID,
 		&job.Status,
 		&job.ImportQueuePosition,
 		&job.TotalCount,
@@ -909,6 +966,7 @@ func scanImportItems(rows pgx.Rows) ([]ImportItem, error) {
 		var validated []byte
 		if err := rows.Scan(
 			&item.ID,
+			&item.OwnerUserID,
 			&item.JobID,
 			&item.ItemIndex,
 			&item.Status,

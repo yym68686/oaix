@@ -6,9 +6,11 @@ import { KeysPage } from "@/features/keys/KeysPage";
 import { RequestsPage } from "@/features/requests/RequestsPage";
 import { RuntimePage } from "@/features/runtime/RuntimePage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
-import { api, hasServiceKey, type HealthResponse, type TokenCounts } from "@/lib/api";
+import { AccountAPIKeysPage, AccountPage } from "@/features/account/AccountPages";
+import { AdminAuditPage, AdminPoolsPage, AdminRequestsPage, AdminUserDetailPage, AdminUsersPage } from "@/features/admin/AdminPages";
+import { api, hasServiceKey, isAdminPrincipal, isSelfUserMode, setAuthContext, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
 import { applyTheme, errorMessage, readThemePreference } from "@/shared/domain";
-import { ToastStack } from "@/shared/components";
+import { EmptyState, ToastStack } from "@/shared/components";
 import type { ThemePreference, ToastMessage } from "@/shared/types";
 
 declare global {
@@ -27,6 +29,7 @@ export function App(): React.ReactElement {
   const [counts, setCounts] = useState<TokenCounts>({});
   const [protectedMode, setProtectedMode] = useState(false);
   const [authBlocked, setAuthBlocked] = useState(false);
+  const [me, setMe] = useState<MeResponse | null>(null);
   const [syncText, setSyncText] = useState("等待同步");
   const [loading, setLoading] = useState(true);
   const [refreshNonce, setRefreshNonce] = useState(0);
@@ -50,20 +53,44 @@ export function App(): React.ReactElement {
       setCounts(healthPayload.counts || {});
       setProtectedMode(Boolean(healthPayload.service_key_protected));
       if (healthPayload.service_key_protected && !hasServiceKey()) {
+        setAuthContext(null);
+        setMe(null);
         setAuthBlocked(true);
         setSyncText(`需要凭证 · ${new Date().toLocaleTimeString("zh-CN")}`);
         return;
       }
+      let mePayload: MeResponse | null = null;
+      if (hasServiceKey()) {
+        mePayload = await api.me();
+        setAuthContext(mePayload);
+        setMe(mePayload);
+      } else {
+        setAuthContext(null);
+        setMe(null);
+      }
       setAuthBlocked(false);
-      try {
-        const selection = await api.tokenSelection();
-        const cap = Number(selection.active_stream_cap || 10);
-        setStreamCap(Number.isFinite(cap) ? Math.max(1, Math.min(10, cap)) : 10);
-      } catch {}
+      if (mePayload && !isAdminPrincipal(mePayload) && isSelfUserMode()) {
+        try {
+          const pool = await api.myPoolSummary();
+          setCounts(pool.counts || {});
+        } catch {}
+      }
+      if (!mePayload || isAdminPrincipal(mePayload)) {
+        try {
+          const selection = await api.tokenSelection();
+          const cap = Number(selection.active_stream_cap || 10);
+          setStreamCap(Number.isFinite(cap) ? Math.max(1, Math.min(10, cap)) : 10);
+        } catch {}
+      }
       setRefreshNonce((value) => value + 1);
       setSyncText(`已同步 ${new Date().toLocaleTimeString("zh-CN")}`);
     } catch (caught) {
       setHealth(null);
+      setAuthContext(null);
+      setMe(null);
+      if (hasServiceKey()) {
+        setAuthBlocked(true);
+      }
       pushToast(errorMessage(caught), "error");
       setSyncText(`同步失败 ${new Date().toLocaleTimeString("zh-CN")}`);
     } finally {
@@ -82,7 +109,25 @@ export function App(): React.ReactElement {
   }, [refreshAll]);
 
   let page: React.ReactElement;
-  if (route.key === "imports" || route.key === "import_new") {
+  const adminRoute = route.key.startsWith("admin_") || route.key === "settings" || route.key === "runtime";
+  const admin = isAdminPrincipal(me);
+  if (adminRoute && !admin && !loading) {
+    page = <EmptyState title="无权限" description="当前 API Key 没有管理员权限。" />;
+  } else if (route.key === "account") {
+    page = <AccountPage me={me} refreshNonce={refreshNonce} />;
+  } else if (route.key === "account_api_keys") {
+    page = <AccountAPIKeysPage pushToast={pushToast} refreshNonce={refreshNonce} />;
+  } else if (route.key === "admin_users") {
+    page = <AdminUsersPage pushToast={pushToast} refreshNonce={refreshNonce} />;
+  } else if (route.key === "admin_user_detail") {
+    page = <AdminUserDetailPage pushToast={pushToast} refreshNonce={refreshNonce} route={route} />;
+  } else if (route.key === "admin_pools") {
+    page = <AdminPoolsPage refreshNonce={refreshNonce} />;
+  } else if (route.key === "admin_requests") {
+    page = <AdminRequestsPage refreshNonce={refreshNonce} />;
+  } else if (route.key === "admin_audit") {
+    page = <AdminAuditPage refreshNonce={refreshNonce} />;
+  } else if (route.key === "imports" || route.key === "import_new") {
     page = <ImportsPage pushToast={pushToast} refreshNonce={refreshNonce} route={route} />;
   } else if (route.key === "requests") {
     page = <RequestsPage refreshNonce={refreshNonce} />;
@@ -100,6 +145,7 @@ export function App(): React.ReactElement {
       counts={counts}
       health={health}
       loading={loading}
+      me={me}
       onRefresh={() => void refreshAll()}
       onThemeChange={setTheme}
       protectedMode={protectedMode}

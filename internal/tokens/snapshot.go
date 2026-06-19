@@ -46,10 +46,24 @@ type Manager struct {
 	selectorMisses  atomic.Int64
 	version         atomic.Int64
 	snapshot        atomic.Value
+	ownerSnapshots  sync.Map
 	cursor          atomic.Uint64
 	stopOnce        sync.Once
 	stopCh          chan struct{}
 	refreshMu       sync.Mutex
+}
+
+type TokenPoolManager = Manager
+
+type scopedSource interface {
+	ListAvailableTokensScoped(ctx context.Context, scope store.ResourceScope) ([]store.Token, error)
+}
+
+type ownerSnapshotState struct {
+	ownerID      int64
+	snapshot     atomic.Value
+	cursor       atomic.Uint64
+	lastUsedUnix atomic.Int64
 }
 
 type Stats struct {
@@ -65,6 +79,7 @@ type Stats struct {
 type Intent struct {
 	Endpoint           string
 	Model              string
+	OwnerUserID        int64
 	PromptCacheKeyHash string
 	ExcludeTokenIDs    map[int64]struct{}
 	RequireNonFree     bool
@@ -93,16 +108,7 @@ func NewManager(source Source, logger *slog.Logger, maxAge, refreshInterval time
 		stopCh:          make(chan struct{}),
 	}
 	manager.SetActiveStreamCap(activeCap)
-	manager.snapshot.Store(&Snapshot{
-		Version:  0,
-		LoadedAt: time.Time{},
-		ByID:     map[int64]*RuntimeToken{},
-		ByScope:  map[string][]*RuntimeToken{},
-		ByModel:  map[string][]*RuntimeToken{},
-		ByPlan:   map[string][]*RuntimeToken{},
-		Cooling:  map[int64]time.Time{},
-		Ready:    nil,
-	})
+	manager.snapshot.Store(emptySnapshot())
 	return manager
 }
 
@@ -143,6 +149,11 @@ func (m *Manager) Start(ctx context.Context) {
 				if err := m.Refresh(ctx); err != nil && m.logger != nil {
 					m.logger.Warn("token snapshot refresh failed", "error", err)
 				}
+				if refreshed, err := m.RefreshActiveOwners(ctx); err != nil && m.logger != nil {
+					m.logger.Warn("active owner token snapshot refresh failed", "error", err)
+				} else if refreshed > 0 && m.logger != nil {
+					m.logger.Debug("active owner token snapshots refreshed", "owners", refreshed)
+				}
 			}
 		}
 	}()
@@ -157,77 +168,101 @@ func (m *Manager) Stop() {
 func (m *Manager) Refresh(ctx context.Context) error {
 	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
-	rows, err := m.source.ListAvailableTokens(ctx)
+	rows, err := m.listAvailableTokens(ctx, store.AllResources())
 	if err != nil {
 		return err
 	}
-	sort.SliceStable(rows, func(i, j int) bool {
-		left := rows[i].LastUsedAt
-		right := rows[j].LastUsedAt
-		if left == nil && right != nil {
-			return true
-		}
-		if left != nil && right == nil {
-			return false
-		}
-		if left != nil && right != nil && !left.Equal(*right) {
-			return left.Before(*right)
-		}
-		return rows[i].ID < rows[j].ID
-	})
-	current := m.Snapshot()
-	nextByID := make(map[int64]*RuntimeToken, len(rows))
-	nextByScope := make(map[string][]*RuntimeToken)
-	nextByModel := make(map[string][]*RuntimeToken)
-	nextByPlan := make(map[string][]*RuntimeToken)
-	nextCooling := make(map[int64]time.Time)
-	ready := make([]*RuntimeToken, 0, len(rows))
-	for _, token := range rows {
-		runtimeToken := current.ByID[token.ID]
-		if runtimeToken == nil {
-			runtimeToken = &RuntimeToken{}
-		}
-		runtimeToken.Token = token
-		nextByID[token.ID] = runtimeToken
-		nextByScope["default"] = append(nextByScope["default"], runtimeToken)
-		nextByModel["*"] = append(nextByModel["*"], runtimeToken)
-		if token.PlanType != nil && *token.PlanType != "" {
-			nextByPlan[*token.PlanType] = append(nextByPlan[*token.PlanType], runtimeToken)
-		}
-		if token.CooldownUntil != nil {
-			nextCooling[token.ID] = *token.CooldownUntil
-		}
-		ready = append(ready, runtimeToken)
-	}
 	version := m.version.Add(1)
-	m.snapshot.Store(&Snapshot{
-		Version:  version,
-		LoadedAt: time.Now().UTC(),
-		ByID:     nextByID,
-		ByScope:  nextByScope,
-		ByModel:  nextByModel,
-		ByPlan:   nextByPlan,
-		Cooling:  nextCooling,
-		Ready:    ready,
-	})
+	next := buildSnapshot(rows, m.Snapshot(), version)
+	m.snapshot.Store(next)
 	if m.logger != nil {
-		m.logger.Info("token snapshot refreshed", "version", version, "ready_tokens", len(ready))
+		m.logger.Info("token snapshot refreshed", "version", version, "ready_tokens", len(next.Ready))
 	}
 	return nil
+}
+
+func (m *Manager) RefreshOwner(ctx context.Context, ownerUserID int64) error {
+	if ownerUserID <= 0 {
+		return m.Refresh(ctx)
+	}
+	state := m.ownerState(ownerUserID)
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	rows, err := m.listAvailableTokens(ctx, store.OwnerResources(ownerUserID))
+	if err != nil {
+		return err
+	}
+	version := m.version.Add(1)
+	next := buildSnapshot(rows, state.snapshotValue(), version)
+	state.snapshot.Store(next)
+	if m.logger != nil {
+		m.logger.Debug("owner token snapshot refreshed", "owner_user_id", ownerUserID, "version", version, "ready_tokens", len(next.Ready))
+	}
+	return nil
+}
+
+func (m *Manager) RefreshActiveOwners(ctx context.Context) (int, error) {
+	if m == nil {
+		return 0, nil
+	}
+	now := time.Now().UTC()
+	refreshWindow := m.refreshInterval * 10
+	if refreshWindow < 5*time.Minute {
+		refreshWindow = 5 * time.Minute
+	}
+	retentionWindow := refreshWindow * 6
+	refreshed := 0
+	var firstErr error
+	m.ownerSnapshots.Range(func(key, value any) bool {
+		state, ok := value.(*ownerSnapshotState)
+		if !ok || state == nil {
+			m.ownerSnapshots.Delete(key)
+			return true
+		}
+		lastUsedUnix := state.lastUsedUnix.Load()
+		if lastUsedUnix <= 0 {
+			return true
+		}
+		lastUsed := time.Unix(lastUsedUnix, 0).UTC()
+		age := now.Sub(lastUsed)
+		if age > retentionWindow {
+			m.ownerSnapshots.Delete(key)
+			return true
+		}
+		if age > refreshWindow {
+			return true
+		}
+		if err := m.RefreshOwner(ctx, state.ownerID); err != nil {
+			firstErr = err
+			return false
+		}
+		refreshed++
+		return true
+	})
+	return refreshed, firstErr
 }
 
 func (m *Manager) Snapshot() *Snapshot {
 	snapshot, _ := m.snapshot.Load().(*Snapshot)
 	if snapshot == nil {
-		return &Snapshot{
-			ByID:    map[int64]*RuntimeToken{},
-			ByScope: map[string][]*RuntimeToken{},
-			ByModel: map[string][]*RuntimeToken{},
-			ByPlan:  map[string][]*RuntimeToken{},
-			Cooling: map[int64]time.Time{},
-		}
+		return emptySnapshot()
 	}
 	return snapshot
+}
+
+func (m *Manager) SnapshotForOwner(ownerUserID int64) *Snapshot {
+	if ownerUserID <= 0 {
+		return m.Snapshot()
+	}
+	state, ok := m.ownerSnapshots.Load(ownerUserID)
+	if !ok {
+		return emptySnapshot()
+	}
+	ownerState, ok := state.(*ownerSnapshotState)
+	if !ok || ownerState == nil {
+		return emptySnapshot()
+	}
+	return ownerState.snapshotValue()
 }
 
 func (m *Manager) Stats() Stats {
@@ -253,37 +288,20 @@ func (m *Manager) Stats() Stats {
 }
 
 func (m *Manager) Claim(ctx context.Context, intent Intent) (*Claim, error) {
-	snapshot := m.Snapshot()
-	if m.snapshotStale(snapshot) {
-		if err := m.Refresh(ctx); err != nil {
-			if m.logger != nil {
-				m.logger.Warn("stale token snapshot refresh failed", "error", err)
-			}
-			if m.snapshotStale(snapshot) {
-				return nil, ErrSnapshotStale
-			}
-		}
-		snapshot = m.Snapshot()
+	claimSnapshot, cursorState, err := m.snapshotForClaim(ctx, intent)
+	if err != nil {
+		return nil, err
 	}
-	if len(snapshot.Ready) == 0 {
-		if err := m.Refresh(ctx); err != nil && m.logger != nil {
-			m.logger.Warn("token snapshot refresh during claim failed", "error", err)
-		}
-		snapshot = m.Snapshot()
-	}
-	if len(snapshot.Ready) == 0 {
-		return nil, ErrNoToken
-	}
-	total := uint64(len(snapshot.Ready))
+	total := uint64(len(claimSnapshot.Ready))
 	selector := m.selector
 	if selector == nil {
 		selector = RoundRobinSelector{}
 	}
 	activeCap := m.ActiveStreamCap()
-	cursor := m.cursor.Load()
+	cursor := cursorState.Load()
 	for offset := uint64(0); offset < total; offset++ {
-		candidate, reason := selector.Select(ctx, snapshot, intent, activeCap, &cursor)
-		m.cursor.Store(cursor)
+		candidate, reason := selector.Select(ctx, claimSnapshot, intent, activeCap, &cursor)
+		cursorState.Store(cursor)
 		if candidate == nil {
 			break
 		}
@@ -348,4 +366,135 @@ var ErrSnapshotStale = errors.New("token snapshot is stale")
 
 func (m *Manager) SelectorMisses() int64 {
 	return m.selectorMisses.Load()
+}
+
+func (m *Manager) snapshotForIntent(intent Intent) *Snapshot {
+	if intent.OwnerUserID > 0 {
+		return m.SnapshotForOwner(intent.OwnerUserID)
+	}
+	return m.Snapshot()
+}
+
+func (m *Manager) refreshSnapshotForIntent(ctx context.Context, intent Intent) error {
+	if intent.OwnerUserID > 0 {
+		return m.RefreshOwner(ctx, intent.OwnerUserID)
+	}
+	return m.Refresh(ctx)
+}
+
+func (m *Manager) ownerState(ownerUserID int64) *ownerSnapshotState {
+	if ownerUserID <= 0 {
+		return nil
+	}
+	if value, ok := m.ownerSnapshots.Load(ownerUserID); ok {
+		if state, ok := value.(*ownerSnapshotState); ok && state != nil {
+			return state
+		}
+	}
+	state := &ownerSnapshotState{ownerID: ownerUserID}
+	state.snapshot.Store(emptySnapshot())
+	actual, _ := m.ownerSnapshots.LoadOrStore(ownerUserID, state)
+	if stored, ok := actual.(*ownerSnapshotState); ok && stored != nil {
+		return stored
+	}
+	return state
+}
+
+func (s *ownerSnapshotState) snapshotValue() *Snapshot {
+	if s == nil {
+		return emptySnapshot()
+	}
+	snapshot, _ := s.snapshot.Load().(*Snapshot)
+	if snapshot == nil {
+		return emptySnapshot()
+	}
+	return snapshot
+}
+
+func (m *Manager) listAvailableTokens(ctx context.Context, scope store.ResourceScope) ([]store.Token, error) {
+	if m == nil || m.source == nil {
+		return nil, ErrNoToken
+	}
+	if !scope.AllowAll {
+		if scoped, ok := m.source.(scopedSource); ok {
+			return scoped.ListAvailableTokensScoped(ctx, scope)
+		}
+	}
+	rows, err := m.source.ListAvailableTokens(ctx)
+	if err != nil || scope.AllowAll || scope.OwnerUserID == nil {
+		return rows, err
+	}
+	filtered := make([]store.Token, 0, len(rows))
+	for _, row := range rows {
+		if row.OwnerUserID == *scope.OwnerUserID {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered, nil
+}
+
+func buildSnapshot(rows []store.Token, current *Snapshot, version int64) *Snapshot {
+	sort.SliceStable(rows, func(i, j int) bool {
+		left := rows[i].LastUsedAt
+		right := rows[j].LastUsedAt
+		if left == nil && right != nil {
+			return true
+		}
+		if left != nil && right == nil {
+			return false
+		}
+		if left != nil && right != nil && !left.Equal(*right) {
+			return left.Before(*right)
+		}
+		return rows[i].ID < rows[j].ID
+	})
+	if current == nil {
+		current = emptySnapshot()
+	}
+	nextByID := make(map[int64]*RuntimeToken, len(rows))
+	nextByScope := make(map[string][]*RuntimeToken)
+	nextByModel := make(map[string][]*RuntimeToken)
+	nextByPlan := make(map[string][]*RuntimeToken)
+	nextCooling := make(map[int64]time.Time)
+	ready := make([]*RuntimeToken, 0, len(rows))
+	for _, token := range rows {
+		runtimeToken := current.ByID[token.ID]
+		if runtimeToken == nil {
+			runtimeToken = &RuntimeToken{}
+		}
+		runtimeToken.Token = token
+		nextByID[token.ID] = runtimeToken
+		nextByScope["default"] = append(nextByScope["default"], runtimeToken)
+		nextByModel["*"] = append(nextByModel["*"], runtimeToken)
+		if token.PlanType != nil && *token.PlanType != "" {
+			nextByPlan[*token.PlanType] = append(nextByPlan[*token.PlanType], runtimeToken)
+		}
+		if token.CooldownUntil != nil {
+			nextCooling[token.ID] = *token.CooldownUntil
+		}
+		ready = append(ready, runtimeToken)
+	}
+	return &Snapshot{
+		Version:  version,
+		LoadedAt: time.Now().UTC(),
+		ByID:     nextByID,
+		ByScope:  nextByScope,
+		ByModel:  nextByModel,
+		ByPlan:   nextByPlan,
+		Cooling:  nextCooling,
+		Ready:    ready,
+	}
+}
+
+func emptySnapshot() *Snapshot {
+	return &Snapshot{
+		Version:  0,
+		LoadedAt: time.Time{},
+		ByID:     map[int64]*RuntimeToken{},
+		ByScope:  map[string][]*RuntimeToken{},
+		ByModel:  map[string][]*RuntimeToken{},
+		ByPlan:   map[string][]*RuntimeToken{},
+		Cooling:  map[int64]time.Time{},
+		Ready:    nil,
+	}
 }

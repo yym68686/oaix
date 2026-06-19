@@ -15,6 +15,11 @@ export type TokenPlanCount = {
   count: number;
 };
 
+export type TokenErrorCount = {
+  error_type: string;
+  count: number;
+};
+
 export type TokenQuotaWindow = {
   id: string;
   label: string;
@@ -161,6 +166,9 @@ export type OpenAIOAuthExchangeResponse = {
 
 export type RequestItem = {
   id?: number;
+  request_id?: string;
+  owner_user_id?: number | null;
+  api_key_id?: number | null;
   started_at?: string | null;
   endpoint?: string | null;
   model?: string | null;
@@ -170,6 +178,7 @@ export type RequestItem = {
   success?: boolean | null;
   ttft_ms?: number | null;
   attempt_count?: number | null;
+  estimated_cost_usd?: number | null;
   error_message?: string | null;
 };
 
@@ -180,6 +189,88 @@ export type RequestSummary = {
   total_tokens?: number;
   estimated_cost_usd?: number;
   average_ttft_ms?: number;
+};
+
+export type PlatformUser = {
+  id: number;
+  email: string;
+  display_name?: string | null;
+  role: "service" | "admin" | "readonly_admin" | "user" | string;
+  status: "active" | "disabled" | "suspended" | "deleted" | string;
+  plan?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  last_seen_at?: string | null;
+  last_login_at?: string | null;
+};
+
+export type APIKeyItem = {
+  id: number;
+  user_id?: number | null;
+  name?: string | null;
+  prefix?: string | null;
+  key_prefix?: string | null;
+  kind?: string | null;
+  role?: string | null;
+  scopes?: string[];
+  created_at?: string | null;
+  last_used_at?: string | null;
+  expires_at?: string | null;
+  revoked_at?: string | null;
+};
+
+export type CreatedAPIKey = APIKeyItem & {
+  value?: string;
+  plaintext_key?: string;
+};
+
+export type MeResponse = {
+  principal_type?: string;
+  user?: PlatformUser | null;
+  role?: string;
+  scopes?: string[];
+  capabilities?: string[];
+  act_as_user_id?: number | null;
+};
+
+export type PoolSummaryResponse = {
+  counts?: TokenCounts;
+  plan_counts?: TokenPlanCount[];
+  error_counts?: TokenErrorCount[];
+};
+
+export type UsageSummary = {
+  hours?: number;
+  total?: number;
+  success?: number;
+  failure?: number;
+  input_tokens?: number;
+  cached_input_tokens?: number;
+  total_tokens?: number;
+  estimated_cost_usd?: number;
+  cache_hit_ratio?: number;
+  average_ttft_ms?: number;
+  average_duration_ms?: number;
+};
+
+export type OwnerUsageSummary = {
+  owner_user_id?: number;
+  hours?: number;
+  request_count?: number;
+  success_count?: number;
+  failure_count?: number;
+  streaming_count?: number;
+  input_tokens?: number;
+  cached_input_tokens?: number;
+  total_tokens?: number;
+  estimated_cost_usd?: number;
+  success_rate?: number;
+  cache_hit_ratio?: number;
+};
+
+export type AdminUserListResponse = {
+  items?: PlatformUser[];
+  pagination?: Pagination;
 };
 
 export type SettingItem = {
@@ -195,6 +286,25 @@ export type HealthResponse = {
   counts?: TokenCounts;
   token_pool?: Record<string, unknown>;
 };
+
+let currentAuth: MeResponse | null = null;
+
+export function setAuthContext(value: MeResponse | null): void {
+  currentAuth = value;
+}
+
+export function getAuthContext(): MeResponse | null {
+  return currentAuth;
+}
+
+export function isAdminPrincipal(value: MeResponse | null = currentAuth): boolean {
+  const role = String(value?.role || value?.user?.role || "").toLowerCase();
+  return role === "admin" || role === "readonly_admin" || role === "service" || Boolean(value?.capabilities?.some((item) => item.startsWith("admin:")));
+}
+
+export function isSelfUserMode(): boolean {
+  return Boolean(currentAuth?.user?.id) && !isAdminPrincipal(currentAuth);
+}
 
 export function getServiceKey(): string {
   try {
@@ -278,59 +388,189 @@ function postForm<T>(path: string, body: FormData): Promise<T> {
   });
 }
 
+function deleteJSON<T>(path: string): Promise<T> {
+  return requestJSON<T>(path, { method: "DELETE" });
+}
+
+function patchJSON<T>(path: string, body: unknown): Promise<T> {
+  return requestJSON<T>(path, {
+    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+    method: "PATCH",
+  });
+}
+
+function scopedPath(userPath: string, adminPath: string): string {
+  return isSelfUserMode() ? userPath : adminPath;
+}
+
+function oauthBase(): string {
+  return isSelfUserMode() ? "/api/oauth/openai" : "/admin/oauth/openai";
+}
+
 export const api = {
   health: () => requestJSON<HealthResponse>("/healthz"),
+  me: () => requestJSON<MeResponse>("/api/me"),
+  register: (payload: Record<string, unknown>) =>
+    postJSON<{ user?: PlatformUser; api_key?: CreatedAPIKey }>("/api/auth/register", payload),
+  login: (payload: Record<string, unknown>) =>
+    postJSON<{ user?: PlatformUser; api_key?: CreatedAPIKey }>("/api/auth/login", payload),
+  myAPIKeys: () => requestJSON<{ items?: APIKeyItem[] }>("/api/me/api-keys"),
+  createMyAPIKey: (payload: Record<string, unknown>) =>
+    postJSON<{ api_key?: CreatedAPIKey }>("/api/me/api-keys", payload),
+  revokeMyAPIKey: (id: number) => deleteJSON<Record<string, unknown>>(`/api/me/api-keys/${id}`),
+  myUsage: (hours = 24) => requestJSON<{ usage?: UsageSummary }>(`/api/me/usage?hours=${hours}`),
+  myPoolSummary: () => requestJSON<PoolSummaryResponse>("/api/me/pool-summary"),
   runtime: () => requestJSON<Record<string, unknown>>("/admin/runtime"),
   tokenSelection: () => requestJSON<Record<string, unknown>>("/admin/token-selection"),
   updateTokenSelection: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/token-selection", payload),
   listTokens: (params: URLSearchParams) =>
-    requestJSON<TokenListResponse>(`/admin/tokens?${params.toString()}`),
+    requestJSON<TokenListResponse>(`${scopedPath("/api/tokens", "/admin/tokens")}?${params.toString()}`),
   getToken: (id: number, includeQuota = false) => {
     const params = new URLSearchParams();
     if (includeQuota) {
       params.set("include_quota", "true");
     }
     const query = params.toString();
-    return requestJSON<TokenItem>(`/admin/tokens/${id}${query ? `?${query}` : ""}`);
+    return requestJSON<TokenItem>(`${scopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`)}${query ? `?${query}` : ""}`);
   },
   tokenCosts: (ids: number[]) =>
     requestJSON<{ items?: TokenObservedCostItem[] }>(`/admin/tokens/costs?ids=${ids.join(",")}`),
-  updateActivation: (id: number, payload: Record<string, unknown>) =>
-    postJSON<Record<string, unknown>>(`/admin/tokens/${id}/activation`, payload),
-  updateRemark: (id: number, remark: string) =>
-    postJSON<Record<string, unknown>>(`/admin/tokens/${id}/remark`, { remark }),
+  updateActivation: (id: number, payload: Record<string, unknown>) => {
+    if (isSelfUserMode()) {
+      return patchJSON<Record<string, unknown>>(`/api/tokens/${id}`, { is_active: Boolean(payload.active) });
+    }
+    return postJSON<Record<string, unknown>>(`/admin/tokens/${id}/activation`, payload);
+  },
+  updateRemark: (id: number, remark: string) => {
+    if (isSelfUserMode()) {
+      return patchJSON<Record<string, unknown>>(`/api/tokens/${id}`, { remark });
+    }
+    return postJSON<Record<string, unknown>>(`/admin/tokens/${id}/remark`, { remark });
+  },
   probeToken: (id: number, payload: Record<string, unknown> = {}) =>
-    postJSON<TokenProbeResponse>(`/admin/tokens/${id}/probe`, payload),
+    postJSON<TokenProbeResponse>(scopedPath(`/api/tokens/${id}/probe`, `/admin/tokens/${id}/probe`), payload),
   deleteToken: (id: number) =>
-    requestJSON<Record<string, unknown>>(`/admin/tokens/${id}`, { method: "DELETE" }),
-  batchTokens: (payload: Record<string, unknown>) =>
-    postJSON<Record<string, unknown>>("/admin/tokens/batch", payload),
+    deleteJSON<Record<string, unknown>>(scopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`)),
+  batchTokens: async (payload: Record<string, unknown>) => {
+    if (!isSelfUserMode()) {
+      return postJSON<Record<string, unknown>>("/admin/tokens/batch", payload);
+    }
+    const ids = Array.isArray(payload.token_ids) ? payload.token_ids.map(Number).filter(Boolean) : [];
+    const action = String(payload.action || "");
+    if (action === "delete") {
+      await Promise.all(ids.map((id) => api.deleteToken(id)));
+    } else if (action === "enable" || action === "disable") {
+      await Promise.all(ids.map((id) => api.updateActivation(id, { active: action === "enable" })));
+    }
+    return { ok: true, count: ids.length };
+  },
   parseImport: (payload: Record<string, unknown>) =>
-    postJSON<ImportParseResponse>("/admin/import/parse", payload),
+    postJSON<ImportParseResponse>(scopedPath("/api/import/parse", "/admin/import/parse"), payload),
   uploadImport: (body: FormData) =>
-    postForm<ImportParseResponse>("/admin/import/upload", body),
+    postForm<ImportParseResponse>(scopedPath("/api/import/upload", "/admin/import/upload"), body),
   createImportJob: (payload: Record<string, unknown>) =>
-    postJSON<Record<string, unknown>>("/admin/import/jobs", payload),
+    postJSON<Record<string, unknown>>(scopedPath("/api/import/jobs", "/admin/import/jobs"), payload),
   importTokens: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/tokens/import", payload),
   startOpenAIOAuth: (payload: Record<string, unknown>) =>
-    postJSON<OpenAIOAuthStartResponse>("/admin/oauth/openai/start", payload),
-  exchangeOpenAIOAuth: (payload: Record<string, unknown>) =>
-    postJSON<OpenAIOAuthExchangeResponse>("/admin/oauth/openai/exchange", payload),
+    postJSON<OpenAIOAuthStartResponse>(`${oauthBase()}/sessions`, payload),
+  exchangeOpenAIOAuth: (payload: Record<string, unknown>) => {
+    const sessionID = String(payload.session_id || "");
+    return postJSON<OpenAIOAuthExchangeResponse>(`${oauthBase()}/sessions/${encodeURIComponent(sessionID)}/exchange`, payload);
+  },
   importJobs: (limit = 50) =>
-    requestJSON<{ items?: ImportBatch[] }>(`/admin/tokens/import-batches?limit=${limit}`),
-  importJob: (id: number) =>
-    requestJSON<ImportBatchDetail>(`/admin/tokens/import-jobs/${id}?include_quota=true`),
+    requestJSON<{ items?: ImportBatch[] }>(isSelfUserMode() ? `/api/import/jobs?limit=${limit}` : `/admin/tokens/import-batches?limit=${limit}`),
+  importJob: async (id: number) => {
+    if (!isSelfUserMode()) {
+      return requestJSON<ImportBatchDetail>(`/admin/tokens/import-jobs/${id}?include_quota=true`);
+    }
+    const [jobPayload, itemPayload, tokenPayload] = await Promise.all([
+      requestJSON<ImportBatch | { job?: ImportBatch }>(`/api/import/jobs/${id}`),
+      requestJSON<{ items?: ImportBatchItem[] }>(`/api/import/jobs/${id}/items?limit=500`),
+      requestJSON<TokenListResponse>(`/api/import/jobs/${id}/tokens?include_quota=true&limit=500`),
+    ]);
+    return {
+      job: (jobPayload as { job?: ImportBatch }).job || (jobPayload as ImportBatch),
+      items: itemPayload.items || [],
+      tokens: tokenPayload.items || [],
+    } satisfies ImportBatchDetail;
+  },
   cancelImportJob: (id: number) =>
-    postJSON<Record<string, unknown>>(`/admin/tokens/import-jobs/${id}/cancel`, {}),
+    postJSON<Record<string, unknown>>(scopedPath(`/api/import/jobs/${id}/cancel`, `/admin/tokens/import-jobs/${id}/cancel`), {}),
   deleteImportJob: (id: number) =>
-    requestJSON<Record<string, unknown>>(`/admin/tokens/import-jobs/${id}`, { method: "DELETE" }),
-  requests: (limit = 80) =>
-    requestJSON<{ items?: RequestItem[]; summary?: RequestSummary }>(`/admin/requests?limit=${limit}`),
-  analytics: (hours = 24) =>
-    requestJSON<Record<string, unknown>>(`/admin/analytics?hours=${hours}`),
+    deleteJSON<Record<string, unknown>>(scopedPath(`/api/import/jobs/${id}`, `/admin/tokens/import-jobs/${id}`)),
+  requests: async (limit = 80) => {
+    if (!isSelfUserMode()) {
+      return requestJSON<{ items?: RequestItem[]; summary?: RequestSummary }>(`/admin/requests?limit=${limit}`);
+    }
+    const [requestPayload, usagePayload] = await Promise.all([
+      requestJSON<{ items?: RequestItem[]; pagination?: Pagination }>(`/api/requests?limit=${limit}&include_total=true`),
+      api.myUsage(24),
+    ]);
+    const usage = usagePayload.usage || {};
+    return {
+      items: requestPayload.items || [],
+      summary: {
+        total: usage.total || 0,
+        success: usage.success || 0,
+        failure: usage.failure || 0,
+        total_tokens: usage.total_tokens || 0,
+        estimated_cost_usd: usage.estimated_cost_usd || 0,
+        average_ttft_ms: usage.average_ttft_ms || 0,
+      },
+    };
+  },
+  analytics: (hours = 24) => {
+    if (isSelfUserMode()) {
+      return Promise.resolve({ hours, models: [] });
+    }
+    return requestJSON<Record<string, unknown>>(`/admin/analytics?hours=${hours}`);
+  },
   settings: () => requestJSON<{ items?: SettingItem[] }>("/admin/settings"),
   updateSetting: (key: string, value: unknown) =>
     postJSON<Record<string, unknown>>(`/admin/settings/${encodeURIComponent(key)}`, value),
+  adminUsers: (params = new URLSearchParams()) =>
+    requestJSON<AdminUserListResponse>(`/api/admin/users${params.toString() ? `?${params.toString()}` : ""}`),
+  adminCreateUser: (payload: Record<string, unknown>) =>
+    postJSON<{ user?: PlatformUser; api_key?: CreatedAPIKey }>("/api/admin/users", payload),
+  adminUser: (id: number) => requestJSON<{ user?: PlatformUser }>(`/api/admin/users/${id}`),
+  adminUpdateUser: (id: number, payload: Record<string, unknown>) =>
+    patchJSON<{ user?: PlatformUser }>(`/api/admin/users/${id}`, payload),
+  adminUserAPIKeys: (id: number) =>
+    requestJSON<{ items?: APIKeyItem[] }>(`/api/admin/users/${id}/api-keys`),
+  adminUserTokens: (id: number, params = new URLSearchParams({ limit: "50" })) =>
+    requestJSON<TokenListResponse>(`/api/admin/users/${id}/tokens?${params.toString()}`),
+  adminUserImportJobs: (id: number, params = new URLSearchParams({ limit: "50" })) =>
+    requestJSON<{ items?: ImportBatch[]; pagination?: Pagination }>(`/api/admin/users/${id}/import/jobs?${params.toString()}`),
+  adminUserRequests: (id: number, params = new URLSearchParams({ limit: "80", include_total: "true" })) =>
+    requestJSON<{ items?: RequestItem[]; pagination?: Pagination }>(`/api/admin/users/${id}/requests?${params.toString()}`),
+  adminUserUsage: (id: number, hours = 24) =>
+    requestJSON<{ pool?: TokenCounts; usage?: OwnerUsageSummary }>(`/api/admin/users/${id}/usage?hours=${hours}`),
+  adminCreateUserAPIKey: (id: number, payload: Record<string, unknown>) =>
+    postJSON<{ api_key?: CreatedAPIKey }>(`/api/admin/users/${id}/api-keys`, payload),
+  adminRevokeUserAPIKey: (userID: number, keyID: number) =>
+    deleteJSON<Record<string, unknown>>(`/api/admin/users/${userID}/api-keys/${keyID}`),
+  adminPoolSummary: () => requestJSON<PoolSummaryResponse>("/api/admin/pool-summary"),
+  adminPoolSummaryByUser: (paramsOrLimit: URLSearchParams | number = 100) => {
+    const params = paramsOrLimit instanceof URLSearchParams ? new URLSearchParams(paramsOrLimit) : new URLSearchParams({ limit: String(paramsOrLimit) });
+    if (!params.has("limit")) {
+      params.set("limit", "100");
+    }
+    return requestJSON<{ items?: Array<{ user?: PlatformUser; counts?: TokenCounts; plan_counts?: TokenPlanCount[]; usage?: OwnerUsageSummary }>; pagination?: Pagination }>(
+      `/api/admin/pool-summary/by-user?${params.toString()}`,
+    );
+  },
+  adminRequests: (paramsOrLimit: URLSearchParams | number = 120) => {
+    const params = paramsOrLimit instanceof URLSearchParams ? new URLSearchParams(paramsOrLimit) : new URLSearchParams({ limit: String(paramsOrLimit) });
+    if (!params.has("limit")) {
+      params.set("limit", "120");
+    }
+    params.set("include_total", "true");
+    return requestJSON<{ items?: RequestItem[]; pagination?: Pagination }>(`/api/admin/requests?${params.toString()}`);
+  },
+  adminRequestsExportURL: (params = new URLSearchParams()) => `/api/admin/requests/export?${params.toString()}`,
+  adminAuditLogs: (limit = 100) =>
+    requestJSON<{ items?: Array<Record<string, unknown>>; pagination?: Pagination }>(`/api/admin/audit-logs?limit=${limit}`),
 };

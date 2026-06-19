@@ -3,7 +3,6 @@ package httpapi
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,6 +82,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /livez", a.livez)
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /metrics", a.metrics)
+	a.registerUserAPIRoutes(mux)
+	a.registerPlatformAdminAPIRoutes(mux)
 	mux.HandleFunc("GET /admin/token-selection", a.requireAuth(a.tokenSelection))
 	mux.HandleFunc("POST /admin/token-selection", a.requireAuth(a.updateTokenSelection))
 	mux.HandleFunc("GET /admin/tokens", a.requireAuth(a.listTokens))
@@ -413,14 +414,22 @@ func (a *App) importTokens(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) completeTokenImport(ctx context.Context, payloads []map[string]any, queuePosition string, source string, auditActor string) (store.ImportJob, store.ImportResult, error) {
+	ownerID, err := a.store.BootstrapUserID(ctx)
+	if err != nil {
+		return store.ImportJob{}, store.ImportResult{}, err
+	}
+	return a.completeTokenImportForOwner(ctx, ownerID, payloads, queuePosition, source, auditActor)
+}
+
+func (a *App) completeTokenImportForOwner(ctx context.Context, ownerUserID int64, payloads []map[string]any, queuePosition string, source string, auditActor string) (store.ImportJob, store.ImportResult, error) {
 	originalPayloads := payloads
 	upsertPayloads, preflightResult := a.prepareImportPayloads(ctx, originalPayloads)
-	result, err := a.store.UpsertTokenPayloads(ctx, upsertPayloads, source)
+	result, err := a.store.UpsertTokenPayloadsForOwner(ctx, ownerUserID, upsertPayloads, source)
 	if err != nil {
 		return store.ImportJob{}, store.ImportResult{}, err
 	}
 	result = mergeImportResults(preflightResult, result)
-	job, err := a.store.CreateCompletedImportJob(ctx, originalPayloads, queuePosition, result)
+	job, err := a.store.CreateCompletedImportJobForOwner(ctx, ownerUserID, originalPayloads, queuePosition, result)
 	if err != nil {
 		return store.ImportJob{}, store.ImportResult{}, err
 	}
@@ -1003,67 +1012,54 @@ func (a *App) updateSetting(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) responses(w http.ResponseWriter, r *http.Request) {
-	a.proxy.Proxy(w, r, proxy.RequestIntent{Endpoint: "/v1/responses", Stream: requestStream(r)})
+	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/responses", Stream: requestStream(r)})
 }
 
 func (a *App) getResponse(w http.ResponseWriter, r *http.Request) {
 	responseID := strings.TrimSpace(r.PathValue("response_id"))
-	a.proxy.Proxy(w, r, proxy.RequestIntent{Endpoint: "/v1/responses/{id}", Method: http.MethodGet, UpstreamSuffix: responseID})
+	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/responses/{id}", Method: http.MethodGet, UpstreamSuffix: responseID})
 }
 
 func (a *App) deleteResponse(w http.ResponseWriter, r *http.Request) {
 	responseID := strings.TrimSpace(r.PathValue("response_id"))
-	a.proxy.Proxy(w, r, proxy.RequestIntent{Endpoint: "/v1/responses/{id}", Method: http.MethodDelete, UpstreamSuffix: responseID})
+	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/responses/{id}", Method: http.MethodDelete, UpstreamSuffix: responseID})
 }
 
 func (a *App) cancelResponse(w http.ResponseWriter, r *http.Request) {
 	responseID := strings.TrimSpace(r.PathValue("response_id"))
-	a.proxy.Proxy(w, r, proxy.RequestIntent{Endpoint: "/v1/responses/{id}/cancel", Method: http.MethodPost, UpstreamSuffix: responseID + "/cancel"})
+	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/responses/{id}/cancel", Method: http.MethodPost, UpstreamSuffix: responseID + "/cancel"})
 }
 
 func (a *App) responsesCompact(w http.ResponseWriter, r *http.Request) {
-	a.proxy.Proxy(w, r, proxy.RequestIntent{Endpoint: "/v1/responses/compact", Stream: requestStream(r), Compact: true})
+	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/responses/compact", Stream: requestStream(r), Compact: true})
 }
 
 func (a *App) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	a.proxy.Proxy(w, r, proxy.RequestIntent{Endpoint: "/v1/chat/completions", Stream: requestStream(r)})
+	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/chat/completions", Stream: requestStream(r)})
 }
 
 func (a *App) imagesGenerations(w http.ResponseWriter, r *http.Request) {
-	a.proxy.Proxy(w, r, proxy.RequestIntent{Endpoint: "/v1/images/generations", Stream: requestStream(r), Model: "gpt-image-2"})
+	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/images/generations", Stream: requestStream(r), Model: "gpt-image-2"})
 }
 
 func (a *App) imagesEdits(w http.ResponseWriter, r *http.Request) {
-	a.proxy.Proxy(w, r, proxy.RequestIntent{Endpoint: "/v1/images/edits", Stream: requestStream(r), Model: "gpt-image-2"})
+	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/images/edits", Stream: requestStream(r), Model: "gpt-image-2"})
 }
 
-func (a *App) requireAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if len(a.authKeys) == 0 {
-			next(w, r)
-			return
-		}
-		provided := bearerToken(r)
-		if provided == "" {
-			provided = strings.TrimSpace(r.Header.Get("X-API-Key"))
-		}
-		for _, key := range a.authKeys {
-			if subtle.ConstantTimeCompare([]byte(provided), []byte(key)) == 1 {
-				next(w, r)
-				return
-			}
-		}
-		if a.store != nil && provided != "" {
-			ctx, cancel := context.WithTimeout(r.Context(), 800*time.Millisecond)
-			item, ok, err := a.store.ValidateAdminAPIKey(ctx, provided)
-			cancel()
-			if err == nil && ok && strings.TrimSpace(item.Role) != "" {
-				next(w, r)
-				return
-			}
-		}
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Invalid or missing service API key"})
+func (a *App) proxyRequest(w http.ResponseWriter, r *http.Request, intent proxy.RequestIntent) {
+	auth := authFromContext(r.Context())
+	if auth == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Invalid or missing API key"})
+		return
 	}
+	ownerID, err := auth.proxyOwner(r.Context(), a.store)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]any{"detail": err.Error()})
+		return
+	}
+	intent.OwnerUserID = ownerID
+	intent.APIKeyID = auth.APIKeyID
+	a.proxy.Proxy(w, r, intent)
 }
 
 func (a *App) recoverer(next http.Handler) http.Handler {

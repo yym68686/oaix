@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/blake2b"
@@ -38,7 +39,7 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 	if opts.MaxLanesPerKey <= 0 {
 		opts.MaxLanesPerKey = 3
 	}
-	snapshot, err := m.snapshotForClaim(ctx)
+	snapshot, _, err := m.snapshotForClaim(ctx, intent)
 	if err != nil {
 		return nil, PromptAffinityResult{Result: "snapshot_unavailable"}, err
 	}
@@ -150,29 +151,36 @@ func (m *Manager) RemovePromptAffinityToken(store affinity.Store, tokenID int64)
 	store.RemoveToken(tokenID)
 }
 
-func (m *Manager) snapshotForClaim(ctx context.Context) (*Snapshot, error) {
+func (m *Manager) snapshotForClaim(ctx context.Context, intent Intent) (*Snapshot, *atomic.Uint64, error) {
+	cursorState := &m.cursor
 	snapshot := m.Snapshot()
+	if intent.OwnerUserID > 0 {
+		ownerState := m.ownerState(intent.OwnerUserID)
+		ownerState.lastUsedUnix.Store(time.Now().UTC().Unix())
+		cursorState = &ownerState.cursor
+		snapshot = ownerState.snapshotValue()
+	}
 	if m.snapshotStale(snapshot) {
-		if err := m.Refresh(ctx); err != nil {
+		if err := m.refreshSnapshotForIntent(ctx, intent); err != nil {
 			if m.logger != nil {
 				m.logger.Warn("stale token snapshot refresh failed", "error", err)
 			}
 			if m.snapshotStale(snapshot) {
-				return nil, ErrSnapshotStale
+				return nil, nil, ErrSnapshotStale
 			}
 		}
-		snapshot = m.Snapshot()
+		snapshot = m.snapshotForIntent(intent)
 	}
 	if len(snapshot.Ready) == 0 {
-		if err := m.Refresh(ctx); err != nil && m.logger != nil {
+		if err := m.refreshSnapshotForIntent(ctx, intent); err != nil && m.logger != nil {
 			m.logger.Warn("token snapshot refresh during claim failed", "error", err)
 		}
-		snapshot = m.Snapshot()
+		snapshot = m.snapshotForIntent(intent)
 	}
 	if len(snapshot.Ready) == 0 {
-		return nil, ErrNoToken
+		return nil, nil, ErrNoToken
 	}
-	return snapshot, nil
+	return snapshot, cursorState, nil
 }
 
 func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent Intent, tokenID int64, wait time.Duration, reason string) *Claim {
@@ -227,6 +235,9 @@ func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent 
 
 func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 	if candidate == nil {
+		return false
+	}
+	if intent.OwnerUserID > 0 && candidate.Token.OwnerUserID != intent.OwnerUserID {
 		return false
 	}
 	if intent.RequireNonFree && candidate.Token.PlanType != nil && *candidate.Token.PlanType == "free" {

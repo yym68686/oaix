@@ -19,7 +19,7 @@ import (
 	"github.com/yym68686/oaix/internal/config"
 )
 
-const SchemaVersion = 6
+const SchemaVersion = 8
 
 type Workload string
 
@@ -33,6 +33,30 @@ const (
 type Store struct {
 	pool          *pgxpool.Pool
 	workloadPools map[Workload]*pgxpool.Pool
+}
+
+type ResourceScope struct {
+	OwnerUserID *int64
+	AllowAll    bool
+}
+
+func AllResources() ResourceScope {
+	return ResourceScope{AllowAll: true}
+}
+
+func OwnerResources(ownerUserID int64) ResourceScope {
+	return ResourceScope{OwnerUserID: &ownerUserID}
+}
+
+func (s ResourceScope) ownerFilter(column string, args *[]any) string {
+	if s.AllowAll {
+		return "true"
+	}
+	if s.OwnerUserID == nil || *s.OwnerUserID <= 0 {
+		return "false"
+	}
+	*args = append(*args, *s.OwnerUserID)
+	return fmt.Sprintf("%s = $%d", column, len(*args))
 }
 
 type Health struct {

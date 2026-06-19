@@ -2,7 +2,21 @@ import type { TokenItem } from "@/lib/api";
 
 export type ThemePreference = "auto" | "light" | "dark";
 export type TokenStatus = "all" | "available" | "cooling" | "disabled";
-export type RouteKey = "keys" | "key_detail" | "imports" | "import_new" | "requests" | "settings" | "runtime";
+export type RouteKey =
+  | "account"
+  | "account_api_keys"
+  | "keys"
+  | "key_detail"
+  | "imports"
+  | "import_new"
+  | "requests"
+  | "settings"
+  | "runtime"
+  | "admin_users"
+  | "admin_user_detail"
+  | "admin_pools"
+  | "admin_requests"
+  | "admin_audit";
 
 export type ToastMessage = {
   id: number;

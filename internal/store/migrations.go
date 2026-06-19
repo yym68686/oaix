@@ -12,6 +12,46 @@ var migrationStatements = []string{
 		version integer not null,
 		updated_at timestamptz not null default now()
 	)`,
+	`create table if not exists platform_users (
+		id bigserial primary key,
+		email varchar(320) unique,
+		password_hash text,
+		display_name varchar(128),
+		role varchar(32) not null default 'user',
+		status varchar(32) not null default 'active',
+		plan varchar(32),
+		notes text,
+		created_by_user_id bigint references platform_users(id),
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now(),
+		last_seen_at timestamptz,
+		disabled_at timestamptz
+	)`,
+	`create index if not exists ix_platform_users_status_role on platform_users(status, role)`,
+	`insert into platform_users(email, display_name, role, status)
+	 values ('platform@oaix.local', 'Platform Bootstrap', 'admin', 'active')
+	 on conflict (email) do update
+	 set role = case when platform_users.role = '' then excluded.role else platform_users.role end,
+	     status = case when platform_users.status in ('deleted', '') then excluded.status else platform_users.status end,
+	     updated_at = now()`,
+	`create table if not exists api_keys (
+		id bigserial primary key,
+		user_id bigint references platform_users(id) on delete cascade,
+		kind varchar(32) not null default 'user',
+		name varchar(128) not null,
+		role varchar(32) not null default 'user',
+		key_prefix varchar(32) not null,
+		key_hash varchar(128) not null unique,
+		scopes jsonb,
+		last_used_at timestamptz,
+		expires_at timestamptz,
+		revoked_at timestamptz,
+		created_by_user_id bigint references platform_users(id),
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now()
+	)`,
+	`create index if not exists ix_api_keys_user_active on api_keys(user_id, revoked_at, expires_at)`,
+	`create index if not exists ix_api_keys_kind_role on api_keys(kind, role)`,
 	`create table if not exists codex_tokens (
 		id serial primary key,
 		email varchar(320),
@@ -143,6 +183,7 @@ var migrationStatements = []string{
 		failure_count integer not null default 0,
 		streaming_count integer not null default 0,
 		input_tokens integer not null default 0,
+		cached_input_tokens integer not null default 0,
 		output_tokens integer not null default 0,
 		total_tokens integer not null default 0,
 		estimated_cost_usd double precision not null default 0,
@@ -164,6 +205,15 @@ var migrationStatements = []string{
 		value jsonb,
 		updated_at timestamptz not null default now()
 	)`,
+	`create table if not exists user_settings (
+		owner_user_id bigint not null references platform_users(id) on delete cascade,
+		key varchar(128) not null,
+		value jsonb,
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now(),
+		primary key(owner_user_id, key)
+	)`,
+	`create index if not exists ix_user_settings_owner_updated on user_settings(owner_user_id, updated_at desc)`,
 	`create table if not exists token_runtime_state (
 		token_id integer primary key references codex_tokens(id) on delete cascade,
 		active_streams integer not null default 0,
@@ -321,6 +371,57 @@ var migrationStatements = []string{
 		fetched_at timestamptz not null default now()
 	)`,
 	`create index if not exists ix_token_quota_snapshots_token_fetched on token_quota_snapshots (token_id, fetched_at desc)`,
+	`insert into api_keys(user_id, kind, name, role, key_prefix, key_hash, last_used_at, revoked_at, created_at, updated_at)
+	 select (select id from platform_users where email = 'platform@oaix.local'),
+	        'service', name, role, left(key_hash, 24), key_hash, last_used_at, revoked_at, created_at, now()
+	 from admin_api_keys
+	 on conflict (key_hash) do nothing`,
+	`alter table codex_tokens add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table token_secrets add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table token_scopes add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table token_refresh_history add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table codex_token_scoped_cooldowns add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table token_runtime_state add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table token_state_events add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table token_import_jobs add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table token_import_items add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table openai_oauth_sessions add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table token_quota_snapshots add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table gateway_request_logs add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table gateway_request_logs add column if not exists api_key_id bigint references api_keys(id)`,
+	`alter table gateway_request_logs add column if not exists token_owner_user_id bigint references platform_users(id)`,
+	`alter table gateway_request_token_costs add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table gateway_request_hourly_stats add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table gateway_request_hourly_stats add column if not exists cached_input_tokens integer not null default 0`,
+	`alter table prompt_affinity_lanes add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table response_owner_bindings add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table admin_audit_logs add column if not exists actor_user_id bigint references platform_users(id)`,
+	`alter table admin_audit_logs add column if not exists actor_api_key_id bigint references api_keys(id)`,
+	`alter table admin_audit_logs add column if not exists actor_role varchar(32)`,
+	`alter table admin_audit_logs add column if not exists target_user_id bigint references platform_users(id)`,
+	`alter table admin_audit_logs add column if not exists ip varchar(64)`,
+	`alter table admin_audit_logs add column if not exists user_agent varchar(512)`,
+	`update codex_tokens set owner_user_id = (select id from platform_users where email = 'platform@oaix.local') where owner_user_id is null`,
+	`update token_import_jobs set owner_user_id = (select id from platform_users where email = 'platform@oaix.local') where owner_user_id is null`,
+	`update token_import_items i set owner_user_id = coalesce(j.owner_user_id, (select id from platform_users where email = 'platform@oaix.local'))
+	 from token_import_jobs j
+	 where j.id = i.job_id and i.owner_user_id is null`,
+	`update token_secrets s set owner_user_id = t.owner_user_id from codex_tokens t where t.id = s.token_id and s.owner_user_id is null`,
+	`update token_scopes s set owner_user_id = t.owner_user_id from codex_tokens t where t.id = s.token_id and s.owner_user_id is null`,
+	`update token_refresh_history h set owner_user_id = t.owner_user_id from codex_tokens t where t.id = h.token_id and h.owner_user_id is null`,
+	`update codex_token_scoped_cooldowns c set owner_user_id = t.owner_user_id from codex_tokens t where t.id = c.token_id and c.owner_user_id is null`,
+	`update token_runtime_state r set owner_user_id = t.owner_user_id from codex_tokens t where t.id = r.token_id and r.owner_user_id is null`,
+	`update token_state_events e set owner_user_id = t.owner_user_id from codex_tokens t where t.id = e.token_id and e.owner_user_id is null`,
+	`update token_quota_snapshots q set owner_user_id = t.owner_user_id from codex_tokens t where t.id = q.token_id and q.owner_user_id is null`,
+	`update gateway_request_hourly_stats set owner_user_id = (select id from platform_users where email = 'platform@oaix.local') where owner_user_id is null`,
+	`update gateway_request_token_costs c set owner_user_id = t.owner_user_id from codex_tokens t where t.id = c.token_id and c.owner_user_id is null`,
+	`alter table gateway_request_hourly_stats drop constraint if exists gateway_request_hourly_stats_bucket_start_model_name_key`,
+	`alter table gateway_request_hourly_stats alter column owner_user_id set not null`,
+	`create unique index if not exists ux_gateway_request_hourly_stats_owner_bucket_model on gateway_request_hourly_stats(owner_user_id, bucket_start, model_name)`,
+	`create index if not exists ix_codex_tokens_owner_active_ready on codex_tokens(owner_user_id, is_active, cooldown_until, last_used_at, id) where merged_into_token_id is null`,
+	`create index if not exists ix_codex_tokens_owner_plan on codex_tokens(owner_user_id, plan_type)`,
+	`create index if not exists ix_token_import_jobs_owner_submitted on token_import_jobs(owner_user_id, submitted_at desc)`,
+	`create index if not exists ix_token_import_items_owner_job_status on token_import_items(owner_user_id, job_id, status)`,
 }
 
 var onlineMigrationStatements = []string{
@@ -344,6 +445,7 @@ var downMigrationStatements = []string{
 	`drop table if exists request_log_outbox`,
 	`drop table if exists token_state_events`,
 	`drop table if exists token_runtime_state`,
+	`drop table if exists user_settings`,
 	`drop table if exists token_refresh_history`,
 	`drop table if exists token_scopes`,
 	`drop table if exists token_secrets`,

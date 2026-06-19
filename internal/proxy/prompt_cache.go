@@ -129,7 +129,25 @@ func buildPromptCacheContext(headers http.Header, intent RequestIntent, body []b
 		PreviousResponseIDHash:        previousHash,
 	}
 	ctx.PromptCacheTrace = buildPromptCacheTrace(ctx)
+	ctx.ApplyOwnerNamespace(intent.OwnerUserID)
 	return ctx, []byte(upstreamBody)
+}
+
+func (ctx *PromptCacheContext) ApplyOwnerNamespace(ownerUserID int64) {
+	if ctx == nil || ownerUserID <= 0 {
+		return
+	}
+	namespace := fmt.Sprintf("owner:%d", ownerUserID)
+	if ctx.AffinityKey != "" {
+		ctx.AffinityKey = shortHash(namespace+":"+ctx.AffinityKey, 32)
+	}
+	if ctx.PreviousResponseID != "" {
+		ctx.PreviousResponseID = namespace + ":" + ctx.PreviousResponseID
+	}
+	if ctx.PromptCacheTrace != nil {
+		ctx.PromptCacheTrace["owner_user_id"] = ownerUserID
+		ctx.PromptCacheTrace["affinity_owner_scoped"] = true
+	}
 }
 
 func deriveResponsesPromptCacheKey(payload map[string]any) string {

@@ -144,10 +144,25 @@ func TestTokenListWhereCanSkipPlanFilterForPlanCounts(t *testing.T) {
 	}
 }
 
+func TestTokenListWhereScopedAddsOwnerFilter(t *testing.T) {
+	ownerID := int64(42)
+	where, args := tokenListWhereScoped(TokenListOptions{Status: "available"}, true, OwnerResources(ownerID))
+	if len(args) != 1 || args[0] != ownerID {
+		t.Fatalf("args = %#v, want owner id", args)
+	}
+	if !strings.Contains(where, "owner_user_id = $1") {
+		t.Fatalf("owner filter missing: %s", where)
+	}
+	if !strings.Contains(where, "is_active = true") {
+		t.Fatalf("status filter missing: %s", where)
+	}
+}
+
 func TestScanTokenAllowsMissingSecretColumns(t *testing.T) {
 	now := time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC)
 	token, err := scanToken(fakeTokenRow{values: []any{
 		int64(1),
+		int64(0),
 		nil,
 		nil,
 		nil,

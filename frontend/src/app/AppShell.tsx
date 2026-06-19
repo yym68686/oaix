@@ -8,6 +8,8 @@ import {
   Settings2Icon,
   ShieldCheckIcon,
   UploadIcon,
+  UserRoundIcon,
+  UsersRoundIcon,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type * as React from "react";
@@ -18,25 +20,47 @@ import { Dialog, DialogDescription, DialogFooter, DialogHeader, DialogPanel, Dia
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { cn } from "@/registry/default/lib/utils";
-import { getServiceKey, setServiceKey, type HealthResponse, type TokenCounts } from "@/lib/api";
+import { api, getServiceKey, isAdminPrincipal, setServiceKey, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
 import { formatNumber } from "@/lib/format";
 import { ThemeButton } from "@/shared/components";
 import type { RouteKey, ThemePreference } from "@/shared/types";
 import { navigateTo } from "./router";
 
 type NavItem = {
+  adminOnly?: boolean;
   key: RouteKey;
   href: string;
   icon: React.ReactNode;
   label: string;
 };
 
-const NAV_ITEMS: NavItem[] = [
-  { key: "keys", href: "/keys?status=available", icon: <KeyRoundIcon />, label: "Key" },
-  { key: "imports", href: "/imports", icon: <UploadIcon />, label: "导入" },
-  { key: "requests", href: "/requests", icon: <ListFilterIcon />, label: "请求" },
-  { key: "settings", href: "/settings", icon: <Settings2Icon />, label: "设置" },
-  { key: "runtime", href: "/runtime", icon: <ActivityIcon />, label: "运行" },
+const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
+  {
+    label: "账号",
+    items: [
+      { key: "account", href: "/account", icon: <UserRoundIcon />, label: "我的账号" },
+      { key: "account_api_keys", href: "/account/api-keys", icon: <ShieldCheckIcon />, label: "我的 API Key" },
+    ],
+  },
+  {
+    label: "用户",
+    items: [
+      { key: "keys", href: "/keys?status=available", icon: <KeyRoundIcon />, label: "Key" },
+      { key: "imports", href: "/imports", icon: <UploadIcon />, label: "导入" },
+      { key: "requests", href: "/requests", icon: <ListFilterIcon />, label: "请求" },
+    ],
+  },
+  {
+    label: "管理员",
+    items: [
+      { adminOnly: true, key: "admin_users", href: "/admin/users", icon: <UsersRoundIcon />, label: "用户状态" },
+      { adminOnly: true, key: "admin_pools", href: "/admin/pools", icon: <DatabaseIcon />, label: "号池总览" },
+      { adminOnly: true, key: "admin_requests", href: "/admin/requests", icon: <ListFilterIcon />, label: "全局请求" },
+      { adminOnly: true, key: "admin_audit", href: "/admin/audit", icon: <ShieldCheckIcon />, label: "审计" },
+      { adminOnly: true, key: "settings", href: "/settings", icon: <Settings2Icon />, label: "设置" },
+      { adminOnly: true, key: "runtime", href: "/runtime", icon: <ActivityIcon />, label: "运行" },
+    ],
+  },
 ];
 
 export function AppShell({
@@ -45,6 +69,7 @@ export function AppShell({
   counts,
   health,
   loading,
+  me,
   onRefresh,
   onThemeChange,
   protectedMode,
@@ -58,6 +83,7 @@ export function AppShell({
   counts: TokenCounts;
   health: HealthResponse | null;
   loading: boolean;
+  me: MeResponse | null;
   onRefresh: () => void;
   onThemeChange: (theme: ThemePreference) => void;
   protectedMode: boolean;
@@ -70,8 +96,14 @@ export function AppShell({
   const [credentialDialogOpen, setCredentialDialogOpen] = useState(false);
   const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
   const [serviceKeyError, setServiceKeyError] = useState("");
+  const [authMode, setAuthMode] = useState<"api_key" | "login" | "register">("api_key");
+  const [emailDraft, setEmailDraft] = useState("");
+  const [passwordDraft, setPasswordDraft] = useState("");
+  const [displayNameDraft, setDisplayNameDraft] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
   const credentialRequired = authBlocked && protectedMode;
   const credentialOpen = credentialRequired || credentialDialogOpen;
+  const admin = isAdminPrincipal(me);
 
   useEffect(() => {
     if (credentialRequired) {
@@ -92,13 +124,38 @@ export function AppShell({
   function saveCredential() {
     const key = serviceKeyDraft.trim();
     if (!key) {
-      setServiceKeyError("请先填写 Service API Key。");
+      setServiceKeyError("请先填写 API Key。");
       return;
     }
     setServiceKey(key);
     setServiceKeyError("");
     setCredentialDialogOpen(false);
     onRefresh();
+  }
+
+  async function submitPasswordAuth(kind: "login" | "register") {
+    if (!emailDraft.trim() || !passwordDraft) {
+      setServiceKeyError("请填写邮箱和密码。");
+      return;
+    }
+    setAuthBusy(true);
+    setServiceKeyError("");
+    try {
+      const result = kind === "login"
+        ? await api.login({ email: emailDraft.trim(), password: passwordDraft, name: "web" })
+        : await api.register({ email: emailDraft.trim(), password: passwordDraft, display_name: displayNameDraft.trim() });
+      const key = result.api_key?.plaintext_key || result.api_key?.value || "";
+      if (!key) {
+        throw new Error("服务端没有返回一次性 API Key");
+      }
+      setServiceKey(key);
+      setCredentialDialogOpen(false);
+      onRefresh();
+    } catch (caught) {
+      setServiceKeyError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setAuthBusy(false);
+    }
   }
 
   return (
@@ -111,23 +168,40 @@ export function AppShell({
             </div>
             <div className="min-w-0">
               <div className="font-heading text-lg font-semibold leading-none">oaix</div>
-              <div className="mt-1 truncate text-muted-foreground text-xs">admin console</div>
+              <div className="mt-1 truncate text-muted-foreground text-xs">{me?.user?.email || (protectedMode ? "API Key required" : "local")}</div>
             </div>
           </div>
-          <nav className="mt-4 flex gap-1 overflow-x-auto lg:grid lg:overflow-visible">
-            {NAV_ITEMS.map((item) => {
-              const active = routeKey === item.key || (routeKey === "key_detail" && item.key === "keys") || (routeKey === "import_new" && item.key === "imports");
+          <nav className="mt-4 grid gap-4">
+            {NAV_GROUPS.map((group) => {
+              const items = group.items.filter((item) => !item.adminOnly || admin);
+              if (!items.length) {
+                return null;
+              }
               return (
-                <Button
-                  className={cn("justify-start", active && "bg-secondary")}
-                  key={item.href}
-                  onClick={() => navigateTo(item.href)}
-                  size="sm"
-                  variant={active ? "secondary" : "ghost"}
-                >
-                  {item.icon}
-                  {item.label}
-                </Button>
+                <div className="grid gap-1" key={group.label}>
+                  <div className="px-2 text-muted-foreground text-xs">{group.label}</div>
+                  <div className="flex gap-1 overflow-x-auto lg:grid lg:overflow-visible">
+                    {items.map((item) => {
+                      const active =
+                        routeKey === item.key ||
+                        (routeKey === "key_detail" && item.key === "keys") ||
+                        (routeKey === "import_new" && item.key === "imports") ||
+                        (routeKey === "admin_user_detail" && item.key === "admin_users");
+                      return (
+                        <Button
+                          className={cn("justify-start", active && "bg-secondary")}
+                          key={item.href}
+                          onClick={() => navigateTo(item.href)}
+                          size="sm"
+                          variant={active ? "secondary" : "ghost"}
+                        >
+                          {item.icon}
+                          {item.label}
+                        </Button>
+                      );
+                    })}
+                  </div>
+                </div>
               );
             })}
           </nav>
@@ -153,7 +227,7 @@ export function AppShell({
               <div className="min-w-0">
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   <Badge variant={protectedMode ? "success" : "warning"}>
-                    {protectedMode ? "Service API Key 已启用" : "未启用服务侧凭证"}
+                    {protectedMode ? "API Key 已启用" : "未启用服务侧凭证"}
                   </Badge>
                   <Badge variant={health?.ok === false ? "warning" : "secondary"}>{syncText}</Badge>
                   <Badge variant="outline">总量 {formatNumber(counts.total)}</Badge>
@@ -172,7 +246,7 @@ export function AppShell({
                     variant="outline"
                   >
                     <ShieldCheckIcon />
-                    Service API Key
+                    API Key
                   </Button>
                 )}
                 <ThemeButton value="auto" current={theme} onSelect={onThemeChange} />
@@ -189,15 +263,15 @@ export function AppShell({
           {authBlocked && (
             <Alert className="mb-4" variant="warning">
               <ShieldCheckIcon />
-              <AlertTitle>管理接口需要 Service API Key</AlertTitle>
-              <AlertDescription>请先填写 Service API Key，保存后会重新同步管理数据。</AlertDescription>
+              <AlertTitle>需要 API Key</AlertTitle>
+              <AlertDescription>请先填写 API Key，或使用邮箱密码登录/注册后继续。</AlertDescription>
             </Alert>
           )}
 
           <main className="min-w-0">{children}</main>
 
           <footer className="flex flex-wrap items-center justify-between gap-2 py-4 text-muted-foreground text-xs">
-            <span>oaix admin console</span>
+            <span>oaix platform</span>
             <span title={`资源版本 ${webVersion?.hash || "-"}`}>前端版本 {webVersion?.time || "-"}</span>
           </footer>
         </div>
@@ -205,32 +279,64 @@ export function AppShell({
       <Dialog open={credentialOpen} onOpenChange={changeCredentialDialogOpen}>
         <DialogPopup className="sm:max-w-md" showCloseButton={!credentialRequired}>
           <DialogHeader>
-            <DialogTitle>填写 Service API Key</DialogTitle>
+            <DialogTitle>连接 oaix</DialogTitle>
             <DialogDescription>
-              当前管理接口启用了服务侧凭证，继续操作前需要先保存 Service API Key。
+              使用已有 API Key，或用邮箱密码登录/注册。注册只需要邮箱和密码。
             </DialogDescription>
           </DialogHeader>
           <DialogPanel className="grid gap-2">
-            <Label htmlFor="global-service-key">Service API Key</Label>
-            <Input
-              autoFocus
-              id="global-service-key"
-              nativeInput
-              onChange={(event) => {
-                setServiceKeyDraft(event.currentTarget.value);
-                if (serviceKeyError) {
-                  setServiceKeyError("");
-                }
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  saveCredential();
-                }
-              }}
-              placeholder="请输入管理接口 Service API Key"
-              type="password"
-              value={serviceKeyDraft}
-            />
+            <div className="flex rounded-lg bg-muted p-1">
+              {[
+                ["api_key", "API Key"],
+                ["login", "登录"],
+                ["register", "注册"],
+              ].map(([value, label]) => (
+                <Button className="flex-1" key={value} onClick={() => setAuthMode(value as typeof authMode)} size="sm" variant={authMode === value ? "secondary" : "ghost"}>
+                  {label}
+                </Button>
+              ))}
+            </div>
+            {authMode === "api_key" ? (
+              <>
+                <Label htmlFor="global-service-key">API Key</Label>
+                <Input
+                  autoFocus
+                  id="global-service-key"
+                  nativeInput
+                  onChange={(event) => {
+                    setServiceKeyDraft(event.currentTarget.value);
+                    if (serviceKeyError) {
+                      setServiceKeyError("");
+                    }
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      saveCredential();
+                    }
+                  }}
+                  placeholder="oaix_user_... / oaix_service_..."
+                  type="password"
+                  value={serviceKeyDraft}
+                />
+              </>
+            ) : (
+              <div className="grid gap-3">
+                <div className="grid gap-2">
+                  <Label htmlFor="auth-email">邮箱</Label>
+                  <Input id="auth-email" nativeInput onChange={(event) => setEmailDraft(event.currentTarget.value)} type="email" value={emailDraft} />
+                </div>
+                {authMode === "register" && (
+                  <div className="grid gap-2">
+                    <Label htmlFor="auth-name">显示名</Label>
+                    <Input id="auth-name" nativeInput onChange={(event) => setDisplayNameDraft(event.currentTarget.value)} value={displayNameDraft} />
+                  </div>
+                )}
+                <div className="grid gap-2">
+                  <Label htmlFor="auth-password">密码</Label>
+                  <Input id="auth-password" nativeInput onChange={(event) => setPasswordDraft(event.currentTarget.value)} type="password" value={passwordDraft} />
+                </div>
+              </div>
+            )}
             {serviceKeyError && <div className="text-destructive-foreground text-sm">{serviceKeyError}</div>}
           </DialogPanel>
           <DialogFooter>
@@ -239,10 +345,17 @@ export function AppShell({
                 取消
               </Button>
             )}
+            {authMode === "api_key" ? (
             <Button onClick={saveCredential}>
               <SaveIcon />
               保存并同步
             </Button>
+            ) : (
+              <Button loading={authBusy} onClick={() => void submitPasswordAuth(authMode)}>
+                <SaveIcon />
+                {authMode === "login" ? "登录并同步" : "注册并同步"}
+              </Button>
+            )}
           </DialogFooter>
         </DialogPopup>
       </Dialog>
