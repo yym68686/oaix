@@ -7,13 +7,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+	"github.com/yym68686/oaix/internal/affinity"
 	"github.com/yym68686/oaix/internal/config"
+	"github.com/yym68686/oaix/internal/logs"
+	"github.com/yym68686/oaix/internal/store"
+	"github.com/yym68686/oaix/internal/tokens"
+	"github.com/yym68686/oaix/internal/transport"
 )
 
 func TestClassifyUpstreamFailures(t *testing.T) {
@@ -82,6 +89,165 @@ func TestCopyAndFlushStopsOnClientWriteError(t *testing.T) {
 	}
 	if written == 0 {
 		t.Fatal("expected partial write count")
+	}
+}
+
+func TestReadProxyRequestBodyDecodesZstd(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","input":"hello"}`)
+	compressed := zstdEncodeForTest(t, body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(compressed))
+	req.Header.Set("Content-Encoding", "zstd")
+
+	got, status, message, err := readProxyRequestBody(req, 1<<20)
+	if err != nil {
+		t.Fatalf("readProxyRequestBody returned status=%d message=%q err=%v", status, message, err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("decoded body = %q, want %q", got, body)
+	}
+}
+
+func TestReadProxyRequestBodyRejectsInvalidZstd(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("not zstd"))
+	req.Header.Set("Content-Encoding", "zstd")
+
+	_, status, message, err := readProxyRequestBody(req, 1<<20)
+	if err == nil {
+		t.Fatal("expected invalid zstd error")
+	}
+	if status != http.StatusBadRequest || message != "invalid zstd body" {
+		t.Fatalf("status/message = %d %q", status, message)
+	}
+}
+
+func TestReadProxyRequestBodyRejectsUnsupportedEncoding(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("body"))
+	req.Header.Set("Content-Encoding", "gzip")
+
+	_, status, message, err := readProxyRequestBody(req, 1<<20)
+	if err == nil {
+		t.Fatal("expected unsupported encoding error")
+	}
+	if status != http.StatusUnsupportedMediaType || !strings.Contains(message, "unsupported content encoding: gzip") {
+		t.Fatalf("status/message = %d %q", status, message)
+	}
+}
+
+func TestReadProxyRequestBodyRejectsOversizedDecodedZstd(t *testing.T) {
+	compressed := zstdEncodeForTest(t, []byte("0123456789"))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(compressed))
+	req.Header.Set("Content-Encoding", "zstd")
+
+	_, status, message, err := readProxyRequestBody(req, 5)
+	if err == nil {
+		t.Fatal("expected oversized body error")
+	}
+	if status != http.StatusRequestEntityTooLarge || message != "request body too large" {
+		t.Fatalf("status/message = %d %q", status, message)
+	}
+}
+
+func TestCopyProxyHeadersStripsBodyEncodingHeaders(t *testing.T) {
+	src := http.Header{}
+	src.Set("Content-Encoding", "zstd")
+	src.Set("Accept-Encoding", "zstd")
+	src.Set("Authorization", "Bearer client")
+	src.Set("X-Custom", "ok")
+	dst := http.Header{}
+
+	copyProxyHeaders(dst, src)
+
+	if got := dst.Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding forwarded as %q", got)
+	}
+	if got := dst.Get("Accept-Encoding"); got != "" {
+		t.Fatalf("Accept-Encoding forwarded as %q", got)
+	}
+	if got := dst.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization forwarded as %q", got)
+	}
+	if got := dst.Get("X-Custom"); got != "ok" {
+		t.Fatalf("X-Custom = %q", got)
+	}
+}
+
+func TestProxyDecodesZstdRequestBeforeForwarding(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","input":"hello","stream":false}`)
+	compressed := zstdEncodeForTest(t, body)
+	var upstreamBody []byte
+	var upstreamContentEncoding string
+	var upstreamAcceptEncoding string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamContentEncoding = r.Header.Get("Content-Encoding")
+		upstreamAcceptEncoding = r.Header.Get("Accept-Encoding")
+		var err error
+		upstreamBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: response.completed`,
+			`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","model":"gpt-5.5","status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+			``,
+		}, "\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                1,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{tokens: []store.Token{{
+		ID:          1,
+		AccessToken: "upstream-token",
+		IsActive:    true,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}}}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(compressed))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+	req.Header.Set("Accept-Encoding", "zstd")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses"})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamContentEncoding != "" {
+		t.Fatalf("upstream Content-Encoding = %q", upstreamContentEncoding)
+	}
+	if upstreamAcceptEncoding != "" {
+		t.Fatalf("upstream Accept-Encoding = %q", upstreamAcceptEncoding)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(upstreamBody, &payload); err != nil {
+		t.Fatalf("upstream body was not decoded JSON: %v body=%q", err, upstreamBody)
+	}
+	if payload["model"] != "gpt-5.5" || payload["input"] != "hello" {
+		t.Fatalf("unexpected upstream payload: %v", payload)
 	}
 }
 
@@ -520,6 +686,22 @@ func defaultPromptCacheConfig() config.PromptCacheConfig {
 	}
 }
 
+func zstdEncodeForTest(t *testing.T, body []byte) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	encoder, err := zstd.NewWriter(&compressed, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(3)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := encoder.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return compressed.Bytes()
+}
+
 type failingWriter struct {
 	failAfter int
 	written   int
@@ -528,6 +710,34 @@ type failingWriter struct {
 type countingResponseRecorder struct {
 	*httptest.ResponseRecorder
 	writeHeaderCount int
+}
+
+type fakeProxyStore struct {
+	tokens []store.Token
+}
+
+func (s *fakeProxyStore) ListAvailableTokens(context.Context) ([]store.Token, error) {
+	return append([]store.Token(nil), s.tokens...), nil
+}
+
+func (s *fakeProxyStore) TouchTokens(context.Context, []int64, time.Time) error {
+	return nil
+}
+
+func (s *fakeProxyStore) MarkTokenSuccess(context.Context, int64) error {
+	return nil
+}
+
+func (s *fakeProxyStore) MarkTokenError(context.Context, int64, string, bool, *time.Time) error {
+	return nil
+}
+
+func (s *fakeProxyStore) UpsertRequestLogs(context.Context, []store.RequestLog) error {
+	return nil
+}
+
+func (s *fakeProxyStore) EnqueueRequestLogOutbox(context.Context, store.RequestLog) error {
+	return nil
 }
 
 func (r *countingResponseRecorder) WriteHeader(status int) {

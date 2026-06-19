@@ -132,12 +132,11 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	started := time.Now().UTC()
 	requestID := requestID(r)
 	w.Header().Set("X-Request-ID", requestID)
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, p.cfg.Upstream.NonStreamMaxResponseBytes))
+	bodyBytes, bodyStatus, bodyMessage, err := readProxyRequestBody(r, p.cfg.Upstream.NonStreamMaxResponseBytes)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "failed to read request body")
+		writeJSONError(w, bodyStatus, bodyMessage)
 		return
 	}
-	_ = r.Body.Close()
 	bodyBytes, _ = sanitizeReasoningContentBody(bodyBytes)
 	intent = normalizeIntent(intent, bodyBytes)
 	var status int
@@ -573,7 +572,7 @@ func (p *Pipeline) recordPromptCacheSuccess(promptCacheContext *PromptCacheConte
 func copyProxyHeaders(dst, src http.Header) {
 	for key, values := range src {
 		lower := strings.ToLower(key)
-		if lower == "host" || lower == "authorization" || lower == "content-length" || strings.HasPrefix(lower, "x-oaix-") {
+		if lower == "host" || lower == "authorization" || lower == "content-length" || lower == "content-encoding" || lower == "accept-encoding" || strings.HasPrefix(lower, "x-oaix-") {
 			continue
 		}
 		for _, value := range values {
