@@ -1115,6 +1115,9 @@ func parseImportPayload(body any) ([]map[string]any, string, error) {
 		if qp, ok := typed["import_queue_position"].(string); ok && strings.TrimSpace(qp) != "" {
 			queuePosition = strings.TrimSpace(qp)
 		}
+		if payloads, ok := sub2APIImportPayloads(typed); ok {
+			return payloads, queuePosition, nil
+		}
 		if list, ok := typed["tokens"].([]any); ok {
 			values = list
 		} else {
@@ -1140,6 +1143,75 @@ func parseImportPayload(body any) ([]map[string]any, string, error) {
 		}
 	}
 	return payloads, queuePosition, nil
+}
+
+func sub2APIImportPayloads(record map[string]any) ([]map[string]any, bool) {
+	if strings.TrimSpace(stringFromAny(record["type"])) != "sub2api-data" {
+		return nil, false
+	}
+	accounts, ok := record["accounts"].([]any)
+	if !ok {
+		return nil, false
+	}
+	payloads := make([]map[string]any, 0, len(accounts))
+	for _, item := range accounts {
+		account, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		payload, ok := sub2APIAccountImportPayload(account)
+		if ok {
+			payloads = append(payloads, payload)
+		}
+	}
+	return payloads, true
+}
+
+func sub2APIAccountImportPayload(account map[string]any) (map[string]any, bool) {
+	credentials, ok := account["credentials"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	refreshToken := strings.TrimSpace(stringFromAny(credentials["refresh_token"]))
+	accessToken := strings.TrimSpace(stringFromAny(credentials["access_token"]))
+	if refreshToken == "" && accessToken == "" {
+		return nil, false
+	}
+	payload := map[string]any{}
+	if refreshToken != "" {
+		payload["refresh_token"] = refreshToken
+	} else {
+		payload["access_token"] = accessToken
+	}
+	copyStringField(payload, credentials, "account_id", "account_id")
+	copyStringField(payload, credentials, "chatgpt_account_id", "chatgpt_account_id")
+	copyStringField(payload, credentials, "chatgpt_user_id", "chatgpt_user_id")
+	copyStringField(payload, credentials, "organization_id", "organization_id")
+	copyStringField(payload, credentials, "email", "email")
+	copyStringField(payload, credentials, "id_token", "id_token")
+	copyStringField(payload, credentials, "type", "type")
+	copyStringField(payload, account, "platform", "platform")
+	copyStringField(payload, account, "type", "account_type")
+	if payload["email"] == nil {
+		copyStringField(payload, account, "name", "email")
+	}
+	if disabled, ok := boolFromAny(credentials["disabled"]); ok && disabled {
+		payload["is_active"] = false
+	}
+	return payload, true
+}
+
+func copyStringField(dst map[string]any, src map[string]any, srcKey string, dstKey string) {
+	if value := strings.TrimSpace(stringFromAny(src[srcKey])); value != "" {
+		dst[dstKey] = value
+	}
+}
+
+func boolFromAny(value any) (bool, bool) {
+	if flag, ok := value.(bool); ok {
+		return flag, true
+	}
+	return false, false
 }
 
 func importPayloadFromString(value string) map[string]any {

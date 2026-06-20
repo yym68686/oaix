@@ -43,6 +43,71 @@ func TestParseImportPayloadPreservesRefreshTokenInputs(t *testing.T) {
 	}
 }
 
+func TestParseImportTextPayloadsExpandsSub2APIDataExport(t *testing.T) {
+	payloads, err := parseImportTextPayloads(`{
+		"type": "sub2api-data",
+		"version": 1,
+		"accounts": [
+			{
+				"name": "first@example.com",
+				"platform": "openai",
+				"type": "oauth",
+				"credentials": {
+					"access_token": "eyJhbGciOi.first.signature",
+					"refresh_token": "rt-first",
+					"id_token": "id-first",
+					"account_id": "acct-first",
+					"chatgpt_account_id": "acct-first",
+					"chatgpt_user_id": "user-first",
+					"organization_id": "org-first",
+					"email": "first@example.com",
+					"type": "codex",
+					"disabled": false
+				}
+			},
+			{
+				"name": "second@example.com",
+				"platform": "openai",
+				"type": "oauth",
+				"credentials": {
+					"access_token": "eyJhbGciOi.second.signature",
+					"disabled": true
+				}
+			},
+			{
+				"name": "empty@example.com",
+				"credentials": {}
+			}
+		]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("payload count = %d: %#v", len(payloads), payloads)
+	}
+	first := payloads[0]
+	if first["refresh_token"] != "rt-first" {
+		t.Fatalf("first refresh token = %#v", first)
+	}
+	if _, ok := first["access_token"]; ok {
+		t.Fatalf("refresh-capable sub2api account should not import stale access token: %#v", first)
+	}
+	if first["account_id"] != "acct-first" || first["chatgpt_account_id"] != "acct-first" || first["email"] != "first@example.com" {
+		t.Fatalf("first identity metadata = %#v", first)
+	}
+	if first["id_token"] != "id-first" || first["type"] != "codex" || first["platform"] != "openai" || first["account_type"] != "oauth" {
+		t.Fatalf("first metadata = %#v", first)
+	}
+	second := payloads[1]
+	if second["access_token"] != "eyJhbGciOi.second.signature" {
+		t.Fatalf("second access token = %#v", second)
+	}
+	if second["email"] != "second@example.com" || second["is_active"] != false {
+		t.Fatalf("second fallback metadata = %#v", second)
+	}
+}
+
 func TestPrepareImportPayloadsRefreshesRefreshTokens(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {

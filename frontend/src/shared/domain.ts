@@ -322,6 +322,9 @@ function collectFromJSON(value: unknown, output: ImportEntry[]): void {
   }
   if (typeof value === "object") {
     const record = value as Record<string, unknown>;
+    if (collectSub2APIData(record, output)) {
+      return;
+    }
     const payload = importPayloadFromRecord(record);
     if (payload) {
       output.push(payload);
@@ -333,6 +336,56 @@ function collectFromJSON(value: unknown, output: ImportEntry[]): void {
       }
     }
   }
+}
+
+function collectSub2APIData(record: Record<string, unknown>, output: ImportEntry[]): boolean {
+  if (record.type !== "sub2api-data" || !Array.isArray(record.accounts)) {
+    return false;
+  }
+  for (const item of record.accounts) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const payload = importPayloadFromSub2APIAccount(item);
+    if (payload) {
+      output.push(payload);
+    }
+  }
+  return true;
+}
+
+function importPayloadFromSub2APIAccount(account: Record<string, unknown>): Record<string, unknown> | null {
+  if (!isRecord(account.credentials)) {
+    return null;
+  }
+  const credentials = account.credentials;
+  const refreshToken = stringField(credentials, "refresh_token");
+  const accessToken = stringField(credentials, "access_token");
+  if (!refreshToken && !accessToken) {
+    return null;
+  }
+  const payload: Record<string, unknown> = {};
+  if (refreshToken) {
+    payload.refresh_token = refreshToken;
+  } else {
+    payload.access_token = accessToken;
+  }
+  copyStringField(payload, credentials, "account_id", "account_id");
+  copyStringField(payload, credentials, "chatgpt_account_id", "chatgpt_account_id");
+  copyStringField(payload, credentials, "chatgpt_user_id", "chatgpt_user_id");
+  copyStringField(payload, credentials, "organization_id", "organization_id");
+  copyStringField(payload, credentials, "email", "email");
+  copyStringField(payload, credentials, "id_token", "id_token");
+  copyStringField(payload, credentials, "type", "type");
+  copyStringField(payload, account, "platform", "platform");
+  copyStringField(payload, account, "type", "account_type");
+  if (!payload.email) {
+    copyStringField(payload, account, "name", "email");
+  }
+  if (credentials.disabled === true) {
+    payload.is_active = false;
+  }
+  return payload;
 }
 
 function importPayloadFromRecord(record: Record<string, unknown>): Record<string, unknown> | null {
@@ -362,6 +415,22 @@ function importPayloadFromRecord(record: Record<string, unknown>): Record<string
   return Object.keys(payload).some((key) => ["access_token", "accessToken", "refresh_token", "refreshToken", "token"].includes(key))
     ? payload
     : null;
+}
+
+function copyStringField(payload: Record<string, unknown>, source: Record<string, unknown>, sourceKey: string, targetKey: string): void {
+  const value = stringField(source, sourceKey);
+  if (value) {
+    payload[targetKey] = value;
+  }
+}
+
+function stringField(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function importEntryKey(value: ImportEntry): string {
