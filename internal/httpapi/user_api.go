@@ -586,11 +586,18 @@ func (a *App) probeMyToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func userScope(w http.ResponseWriter, auth *AuthContext) (store.ResourceScope, bool) {
-	if auth == nil || auth.UserID == nil {
+	if auth == nil {
 		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
 		return store.ResourceScope{}, false
 	}
-	return store.OwnerResources(*auth.UserID), true
+	if auth.UserID != nil {
+		return store.OwnerResources(*auth.UserID), true
+	}
+	if (auth.IsService || auth.IsAdmin) && auth.ActAsUserID != nil && *auth.ActAsUserID > 0 {
+		return store.OwnerResources(*auth.ActAsUserID), true
+	}
+	writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
+	return store.ResourceScope{}, false
 }
 
 func (a *App) createMyImportJob(w http.ResponseWriter, r *http.Request) {

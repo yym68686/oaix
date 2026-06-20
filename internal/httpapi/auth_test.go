@@ -26,6 +26,28 @@ func TestAuthContextResourceScope(t *testing.T) {
 	}
 }
 
+func TestUserScopeAllowsServiceActAsOwner(t *testing.T) {
+	actAsID := int64(42)
+	rec := httptest.NewRecorder()
+	scope, ok := userScope(rec, &AuthContext{IsService: true, IsAdmin: true, ActAsUserID: &actAsID})
+	if !ok {
+		t.Fatalf("userScope rejected service act-as: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if scope.OwnerUserID == nil || *scope.OwnerUserID != actAsID {
+		t.Fatalf("scope = %#v, want owner %d", scope, actAsID)
+	}
+}
+
+func TestUserScopeRejectsServiceWithoutActAs(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if _, ok := userScope(rec, &AuthContext{IsService: true, IsAdmin: true}); ok {
+		t.Fatal("userScope accepted service without act-as")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+}
+
 func TestRequireAuthServiceKeyHasAdminContext(t *testing.T) {
 	app := NewApp(config.Config{Auth: config.AuthConfig{ServiceAPIKeys: []string{"service-key"}}}, nil, nil, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/admin/runtime", nil)
