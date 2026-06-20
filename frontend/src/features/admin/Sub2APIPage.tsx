@@ -5,13 +5,14 @@ import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
 import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
 import { Checkbox } from "@/registry/default/ui/checkbox";
+import { Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
-import { api, type PlatformUser, type Sub2APIGroup, type Sub2APIRun, type Sub2APITarget } from "@/lib/api";
+import { api, type PlatformUser, type Sub2APIGroup, type Sub2APIRun, type Sub2APITarget, type TokenPlanCount } from "@/lib/api";
 import { formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert, MiniMetric, SelectField } from "@/shared/components";
-import { errorMessage } from "@/shared/domain";
+import { errorMessage, normalizePlanValue, planLabel } from "@/shared/domain";
 import type { ToastMessage } from "@/shared/types";
 
 type Draft = {
@@ -30,21 +31,13 @@ type Draft = {
   auto_sync_new: boolean;
 };
 
-const PLAN_OPTIONS = [
-  { label: "Free", value: "free" },
-  { label: "Plus", value: "plus" },
-  { label: "Team", value: "team" },
-  { label: "Pro", value: "pro" },
-  { label: "Unknown", value: "unknown" },
-];
-
 const EMPTY_DRAFT: Draft = {
   name: "",
   base_url: "",
   admin_key: "",
   enabled: true,
   owner_user_id: 0,
-  plan_filters: ["pro", "plus", "team"],
+  plan_filters: [],
   target_group_ids: [],
   target_group_names: [],
   check_interval_seconds: 300,
@@ -64,7 +57,15 @@ export function AdminSub2APIPage({
   const [runs, setRuns] = useState<Sub2APIRun[]>([]);
   const [users, setUsers] = useState<PlatformUser[]>([]);
   const [groups, setGroups] = useState<Sub2APIGroup[]>([]);
+  const [globalPlanCounts, setGlobalPlanCounts] = useState<TokenPlanCount[]>([]);
+  const [planCountsByUser, setPlanCountsByUser] = useState<Record<number, TokenPlanCount[]>>({});
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
+  const [restoreDraftAfterCreate, setRestoreDraftAfterCreate] = useState<{
+    draft: Draft;
+    groups: Sub2APIGroup[];
+    groupError: string;
+  } | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [groupLoading, setGroupLoading] = useState(false);
@@ -85,18 +86,34 @@ export function AdminSub2APIPage({
     return draft.target_group_ids.map((id, index) => byID.get(id) || draft.target_group_names[index] || `Group #${id}`);
   }, [draft.target_group_ids, draft.target_group_names, groups]);
 
+  const planOptions = useMemo(() => {
+    const sourceCounts = draft.owner_user_id > 0 ? planCountsByUser[draft.owner_user_id] || [] : globalPlanCounts;
+    return planOptionsFromPool(sourceCounts, draft.plan_filters);
+  }, [draft.owner_user_id, draft.plan_filters, globalPlanCounts, planCountsByUser]);
+
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      const [targetPayload, runPayload, userPayload] = await Promise.all([
+      const userParams = new URLSearchParams({ limit: "200", status: "active" });
+      const [targetPayload, runPayload, userPayload, poolPayload, poolByUserPayload] = await Promise.all([
         api.sub2APITargets(),
         api.sub2APIRuns(undefined, 80),
-        api.adminUsers(new URLSearchParams({ limit: "200", status: "active" })),
+        api.adminUsers(userParams),
+        api.adminPoolSummary(),
+        api.adminPoolSummaryByUser(userParams),
       ]);
       setTargets(targetPayload.items || []);
       setRuns(runPayload.items || []);
       setUsers(userPayload.items || []);
+      setGlobalPlanCounts(poolPayload.plan_counts || []);
+      const nextPlanCountsByUser: Record<number, TokenPlanCount[]> = {};
+      for (const item of poolByUserPayload.items || []) {
+        if (item.user?.id) {
+          nextPlanCountsByUser[item.user.id] = item.plan_counts || [];
+        }
+      }
+      setPlanCountsByUser(nextPlanCountsByUser);
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -113,6 +130,8 @@ export function AdminSub2APIPage({
   }
 
   function editTarget(target: Sub2APITarget) {
+    setCreateDialogOpen(false);
+    setRestoreDraftAfterCreate(null);
     setGroupError("");
     setGroups([]);
     setDraft({
@@ -132,10 +151,31 @@ export function AdminSub2APIPage({
     });
   }
 
-  function newTarget() {
+  function resetDraft() {
     setDraft({ ...EMPTY_DRAFT });
     setGroups([]);
     setGroupError("");
+  }
+
+  function openCreateDialog() {
+    setRestoreDraftAfterCreate(draft.id ? { draft, groups, groupError } : null);
+    resetDraft();
+    setCreateDialogOpen(true);
+  }
+
+  function changeCreateDialogOpen(open: boolean) {
+    if (!open && saving) return;
+    setCreateDialogOpen(open);
+    if (!open && !draft.id) {
+      if (restoreDraftAfterCreate) {
+        setDraft(restoreDraftAfterCreate.draft);
+        setGroups(restoreDraftAfterCreate.groups);
+        setGroupError(restoreDraftAfterCreate.groupError);
+      } else {
+        resetDraft();
+      }
+      setRestoreDraftAfterCreate(null);
+    }
   }
 
   async function fetchGroups() {
@@ -183,6 +223,10 @@ export function AdminSub2APIPage({
       if (result.target) {
         editTarget(result.target);
       }
+      if (!draft.id) {
+        setCreateDialogOpen(false);
+        setRestoreDraftAfterCreate(null);
+      }
       pushToast(draft.id ? "Sub2API 配置已更新" : "Sub2API 配置已创建");
       await load();
     } catch (caught) {
@@ -197,7 +241,7 @@ export function AdminSub2APIPage({
     setBusyID(target.id);
     try {
       await api.deleteSub2APITarget(target.id);
-      if (draft.id === target.id) newTarget();
+      if (draft.id === target.id) resetDraft();
       pushToast("Sub2API 配置已删除");
       await load();
     } catch (caught) {
@@ -249,147 +293,186 @@ export function AdminSub2APIPage({
 
   const canSave = Boolean(draft.name.trim() && draft.base_url.trim() && draft.owner_user_id > 0 && draft.target_group_ids.length && (draft.id || draft.admin_key.trim()));
 
-  return (
-    <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(360px,460px)]">
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <SendIcon className="size-5" />
-            Sub2API 推送
-          </CardTitle>
-          <CardDescription>管理多个 Sub2API 目标和自动补充策略。</CardDescription>
-          <CardAction>
-            <Button onClick={newTarget} variant="outline">
-              <PlusIcon />
-              新增
+  function renderTargetForm(resetLabel: string) {
+    return (
+      <div className="grid gap-4">
+        <div className="grid gap-3">
+          <Field label="名称">
+            <Input nativeInput onChange={(event) => updateDraft({ name: event.currentTarget.value })} placeholder="s2a-prod" value={draft.name} />
+          </Field>
+          <Field label="Base URL">
+            <Input nativeInput onChange={(event) => updateDraft({ base_url: event.currentTarget.value })} placeholder="https://s2a.example.com" value={draft.base_url} />
+          </Field>
+          <Field label={draft.id ? "Admin Key（留空保留）" : "Admin Key"}>
+            <Input nativeInput onChange={(event) => updateDraft({ admin_key: event.currentTarget.value })} placeholder="admin-..." type="password" value={draft.admin_key} />
+          </Field>
+          <SelectField label="OAIX 用户" onChange={(value) => updateDraft({ owner_user_id: Number(value) })} options={userOptions} value={String(draft.owner_user_id || "0")} />
+        </div>
+
+        <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Label>计划</Label>
+            <Button onClick={() => updateDraft({ plan_filters: [] })} size="xs" variant={!draft.plan_filters.length ? "secondary" : "outline"}>
+              全部计划
             </Button>
-          </CardAction>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
-          {error && <ErrorAlert title="Sub2API 载入失败" message={error} />}
-          <div className="grid gap-3 md:grid-cols-4">
-            <MiniMetric label="目标" value={targets.length} />
-            <MiniMetric label="启用" value={targets.filter((item) => item.enabled).length} />
-            <MiniMetric label="最近同步" value={runs[0] ? formatDate(runs[0].finished_at || runs[0].started_at) : "-"} />
-            <MiniMetric label="最近结果" value={runs[0]?.status || "-"} />
           </div>
-          <TargetTable
-            busyID={busyID}
-            items={targets}
-            onCheck={(target) => void runTarget(target, "check")}
-            onDelete={(target) => void deleteTarget(target)}
-            onEdit={editTarget}
-            onSync={(target) => void runTarget(target, "sync")}
-          />
-          <RunTable items={runs.slice(0, 12)} />
-        </CardPanel>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <CheckCircle2Icon className="size-5" />
-            {draft.id ? "编辑目标" : "新增目标"}
-          </CardTitle>
-          <CardDescription>{draft.id ? `ID ${draft.id}` : "保存后会进入定时检查队列。"}</CardDescription>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
-          <div className="grid gap-3">
-            <Field label="名称">
-              <Input nativeInput onChange={(event) => updateDraft({ name: event.currentTarget.value })} placeholder="s2a-prod" value={draft.name} />
-            </Field>
-            <Field label="Base URL">
-              <Input nativeInput onChange={(event) => updateDraft({ base_url: event.currentTarget.value })} placeholder="https://s2a.example.com" value={draft.base_url} />
-            </Field>
-            <Field label={draft.id ? "Admin Key（留空保留）" : "Admin Key"}>
-              <Input nativeInput onChange={(event) => updateDraft({ admin_key: event.currentTarget.value })} placeholder="admin-..." type="password" value={draft.admin_key} />
-            </Field>
-            <SelectField label="OAIX 用户" onChange={(value) => updateDraft({ owner_user_id: Number(value) })} options={userOptions} value={String(draft.owner_user_id || "0")} />
+          <div className="flex flex-wrap gap-2">
+            {planOptions.map((plan) => (
+              <Label className="rounded-lg border bg-background px-3 py-2" key={plan.value}>
+                <Checkbox checked={draft.plan_filters.includes(plan.value)} onCheckedChange={() => togglePlan(plan.value)} />
+                <span>{plan.label}</span>
+                <span className="text-muted-foreground text-xs">{formatNumber(plan.count)}</span>
+              </Label>
+            ))}
+            {!planOptions.length && <div className="text-muted-foreground text-sm">当前号池没有可选计划。</div>}
           </div>
+        </div>
 
-          <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <Label>计划</Label>
-              <Button onClick={() => updateDraft({ plan_filters: [] })} size="xs" variant={!draft.plan_filters.length ? "secondary" : "outline"}>
-                全部计划
-              </Button>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {PLAN_OPTIONS.map((plan) => (
-                <Label className="rounded-lg border bg-background px-3 py-2" key={plan.value}>
-                  <Checkbox checked={draft.plan_filters.includes(plan.value)} onCheckedChange={() => togglePlan(plan.value)} />
-                  {plan.label}
+        <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Label>Sub2API 分组</Label>
+            <Button disabled={groupLoading || (!draft.id && !draft.admin_key.trim())} onClick={() => void fetchGroups()} size="xs" variant="outline">
+              <RefreshCwIcon />
+              获取分组
+            </Button>
+          </div>
+          {groupError && (
+            <Alert variant="error">
+              <AlertTitle>分组读取失败</AlertTitle>
+              <AlertDescription>{groupError}</AlertDescription>
+            </Alert>
+          )}
+          {groups.length ? (
+            <div className="grid max-h-60 gap-2 overflow-auto pr-1">
+              {groups.map((group) => (
+                <Label className="rounded-lg border bg-background px-3 py-2" key={group.id}>
+                  <Checkbox checked={draft.target_group_ids.includes(group.id)} onCheckedChange={() => toggleGroup(group)} />
+                  <span className="min-w-0 truncate">{group.name}</span>
+                  <Badge variant={group.status === "active" ? "success" : "secondary"}>{group.id}</Badge>
                 </Label>
               ))}
             </div>
-          </div>
-
-          <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <Label>Sub2API 分组</Label>
-              <Button disabled={groupLoading || (!draft.id && !draft.admin_key.trim())} onClick={() => void fetchGroups()} size="xs" variant="outline">
-                <RefreshCwIcon />
-                获取分组
-              </Button>
+          ) : (
+            <div className="rounded-lg border bg-background p-3 text-muted-foreground text-sm">
+              {selectedGroupNames.length ? selectedGroupNames.join(" · ") : "尚未选择分组"}
             </div>
-            {groupError && (
-              <Alert variant="error">
-                <AlertTitle>分组读取失败</AlertTitle>
-                <AlertDescription>{groupError}</AlertDescription>
-              </Alert>
-            )}
-            {groups.length ? (
-              <div className="grid max-h-60 gap-2 overflow-auto pr-1">
-                {groups.map((group) => (
-                  <Label className="rounded-lg border bg-background px-3 py-2" key={group.id}>
-                    <Checkbox checked={draft.target_group_ids.includes(group.id)} onCheckedChange={() => toggleGroup(group)} />
-                    <span className="min-w-0 truncate">{group.name}</span>
-                    <Badge variant={group.status === "active" ? "success" : "secondary"}>{group.id}</Badge>
-                  </Label>
-                ))}
-              </div>
+          )}
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-3">
+          <Field label="检查间隔（秒）">
+            <Input min={60} nativeInput onChange={(event) => updateDraft({ check_interval_seconds: Number(event.currentTarget.value) })} type="number" value={draft.check_interval_seconds} />
+          </Field>
+          <Field label="低于数量">
+            <Input min={0} nativeInput onChange={(event) => updateDraft({ min_available: Number(event.currentTarget.value) })} type="number" value={draft.min_available} />
+          </Field>
+          <Field label="每次最多">
+            <Input min={1} nativeInput onChange={(event) => updateDraft({ top_up_batch_size: Number(event.currentTarget.value) })} type="number" value={draft.top_up_batch_size} />
+          </Field>
+        </div>
+
+        <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
+          <Label className="rounded-lg border bg-background px-3 py-2">
+            <Checkbox checked={draft.enabled} onCheckedChange={(value) => updateDraft({ enabled: Boolean(value) })} />
+            启用定时检查
+          </Label>
+          <Label className="rounded-lg border bg-background px-3 py-2">
+            <Checkbox checked={draft.auto_sync_new} onCheckedChange={(value) => updateDraft({ auto_sync_new: Boolean(value) })} />
+            新账号入池后自动同步
+          </Label>
+        </div>
+
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button onClick={resetDraft} variant="outline">
+            {resetLabel}
+          </Button>
+          <Button disabled={!canSave || saving} onClick={() => void saveTarget()}>
+            {saving ? <RefreshCwIcon className="animate-spin" /> : <CheckCircle2Icon />}
+            保存
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(360px,460px)]">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <SendIcon className="size-5" />
+              Sub2API 推送
+            </CardTitle>
+            <CardDescription>管理多个 Sub2API 目标和自动补充策略。</CardDescription>
+            <CardAction>
+              <Button onClick={openCreateDialog} variant="outline">
+                <PlusIcon />
+                新增目标
+              </Button>
+            </CardAction>
+          </CardHeader>
+          <CardPanel className="grid gap-4">
+            {error && <ErrorAlert title="Sub2API 载入失败" message={error} />}
+            <div className="grid gap-3 md:grid-cols-4">
+              <MiniMetric label="目标" value={targets.length} />
+              <MiniMetric label="启用" value={targets.filter((item) => item.enabled).length} />
+              <MiniMetric label="最近同步" value={runs[0] ? formatDate(runs[0].finished_at || runs[0].started_at) : "-"} />
+              <MiniMetric label="最近结果" value={runs[0]?.status || "-"} />
+            </div>
+            <TargetTable
+              busyID={busyID}
+              items={targets}
+              onCheck={(target) => void runTarget(target, "check")}
+              onDelete={(target) => void deleteTarget(target)}
+              onEdit={editTarget}
+              onSync={(target) => void runTarget(target, "sync")}
+            />
+            <RunTable items={runs.slice(0, 12)} />
+          </CardPanel>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <CheckCircle2Icon className="size-5" />
+              {draft.id ? "编辑目标" : "目标详情"}
+            </CardTitle>
+            <CardDescription>{draft.id ? `ID ${draft.id}` : "选择目标编辑，或新增 Sub2API 目标。"}</CardDescription>
+          </CardHeader>
+          <CardPanel>
+            {draft.id ? (
+              renderTargetForm("取消编辑")
             ) : (
-              <div className="rounded-lg border bg-background p-3 text-muted-foreground text-sm">
-                {selectedGroupNames.length ? selectedGroupNames.join(" · ") : "尚未选择分组"}
+              <div className="grid gap-4">
+                <EmptyState compact title="未选择目标" description="从左侧表格点击编辑，新增配置请使用页面顶部按钮。" />
+                <div className="flex justify-end">
+                  <Button onClick={openCreateDialog} variant="outline">
+                    <PlusIcon />
+                    新增目标
+                  </Button>
+                </div>
               </div>
             )}
-          </div>
+          </CardPanel>
+        </Card>
+      </div>
 
-          <div className="grid gap-3 md:grid-cols-3">
-            <Field label="检查间隔（秒）">
-              <Input min={60} nativeInput onChange={(event) => updateDraft({ check_interval_seconds: Number(event.currentTarget.value) })} type="number" value={draft.check_interval_seconds} />
-            </Field>
-            <Field label="低于数量">
-              <Input min={0} nativeInput onChange={(event) => updateDraft({ min_available: Number(event.currentTarget.value) })} type="number" value={draft.min_available} />
-            </Field>
-            <Field label="每次最多">
-              <Input min={1} nativeInput onChange={(event) => updateDraft({ top_up_batch_size: Number(event.currentTarget.value) })} type="number" value={draft.top_up_batch_size} />
-            </Field>
-          </div>
-
-          <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
-            <Label className="rounded-lg border bg-background px-3 py-2">
-              <Checkbox checked={draft.enabled} onCheckedChange={(value) => updateDraft({ enabled: Boolean(value) })} />
-              启用定时检查
-            </Label>
-            <Label className="rounded-lg border bg-background px-3 py-2">
-              <Checkbox checked={draft.auto_sync_new} onCheckedChange={(value) => updateDraft({ auto_sync_new: Boolean(value) })} />
-              新账号入池后自动同步
-            </Label>
-          </div>
-
-          <div className="flex flex-wrap justify-end gap-2">
-            <Button onClick={newTarget} variant="outline">
-              清空
-            </Button>
-            <Button disabled={!canSave || saving} onClick={() => void saveTarget()}>
-              {saving ? <RefreshCwIcon className="animate-spin" /> : <CheckCircle2Icon />}
-              保存
-            </Button>
-          </div>
-        </CardPanel>
-      </Card>
-    </div>
+      <Dialog open={createDialogOpen} onOpenChange={changeCreateDialogOpen}>
+        <DialogPopup className="max-h-[min(88vh,760px)] max-w-[min(52rem,calc(100vw-2rem))]">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <PlusIcon className="size-5" />
+              新增 Sub2API 目标
+            </DialogTitle>
+            <DialogDescription>保存后会进入定时检查队列。</DialogDescription>
+          </DialogHeader>
+          <DialogPanel className="max-h-[min(70vh,600px)] overflow-y-auto pr-1">
+            {renderTargetForm("清空")}
+          </DialogPanel>
+        </DialogPopup>
+      </Dialog>
+    </>
   );
 }
 
@@ -400,6 +483,29 @@ function Field({ children, label }: { children: React.ReactNode; label: string }
       {children}
     </div>
   );
+}
+
+function planOptionsFromPool(planCounts: TokenPlanCount[], selectedPlans: string[]): Array<{ count: number; label: string; value: string }> {
+  const options: Array<{ count: number; label: string; value: string }> = [];
+  const seen = new Set<string>();
+  for (const item of planCounts) {
+    const value = normalizePlanValue(item.plan);
+    const count = Number(item.count) || 0;
+    if (!value || seen.has(value) || count <= 0) {
+      continue;
+    }
+    seen.add(value);
+    options.push({ count, label: item.label || planLabel(value), value });
+  }
+  for (const selected of selectedPlans) {
+    const value = normalizePlanValue(selected);
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    options.push({ count: 0, label: planLabel(value), value });
+  }
+  return options;
 }
 
 function TargetTable({
