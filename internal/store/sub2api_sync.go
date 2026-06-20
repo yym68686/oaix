@@ -18,6 +18,10 @@ const (
 	Sub2APISyncStatusCompleted = "completed"
 	Sub2APISyncStatusSkipped   = "skipped"
 	Sub2APISyncStatusFailed    = "failed"
+
+	Sub2APITokenStatusAvailable = "available"
+	Sub2APITokenStatusCooling   = "cooling"
+	Sub2APITokenStatusDisabled  = "disabled"
 )
 
 type Sub2APISyncTarget struct {
@@ -30,6 +34,7 @@ type Sub2APISyncTarget struct {
 	OwnerUserID          int64      `json:"owner_user_id"`
 	OwnerEmail           *string    `json:"owner_email,omitempty"`
 	PlanFilters          []string   `json:"plan_filters"`
+	TokenStatusFilters   []string   `json:"token_status_filters"`
 	TargetGroupIDs       []int64    `json:"target_group_ids"`
 	TargetGroupNames     []string   `json:"target_group_names"`
 	CheckIntervalSeconds int        `json:"check_interval_seconds"`
@@ -54,6 +59,7 @@ type Sub2APISyncTargetInput struct {
 	Enabled              *bool
 	OwnerUserID          int64
 	PlanFilters          []string
+	TokenStatusFilters   []string
 	TargetGroupIDs       []int64
 	TargetGroupNames     []string
 	CheckIntervalSeconds int
@@ -114,7 +120,7 @@ type Sub2APITokenCandidateOptions struct {
 func (s *Store) ListSub2APISyncTargets(ctx context.Context) ([]Sub2APISyncTarget, error) {
 	rows, err := s.pool.Query(ctx, `
 		select t.id, t.name, t.base_url, t.admin_key, t.enabled, coalesce(t.owner_user_id, 0), u.email,
-		       t.plan_filters, t.target_group_ids, t.target_group_names,
+		       t.plan_filters, t.token_status_filters, t.target_group_ids, t.target_group_names,
 		       t.check_interval_seconds, t.min_available, t.top_up_batch_size, t.auto_sync_new,
 		       t.last_checked_at, t.last_synced_at, t.last_status, t.last_error,
 		       t.last_remote_count, t.last_synced_count, t.last_run_id,
@@ -141,7 +147,7 @@ func (s *Store) ListSub2APISyncTargets(ctx context.Context) ([]Sub2APISyncTarget
 func (s *Store) GetSub2APISyncTarget(ctx context.Context, id int64) (Sub2APISyncTarget, error) {
 	row := s.pool.QueryRow(ctx, `
 		select t.id, t.name, t.base_url, t.admin_key, t.enabled, coalesce(t.owner_user_id, 0), u.email,
-		       t.plan_filters, t.target_group_ids, t.target_group_names,
+		       t.plan_filters, t.token_status_filters, t.target_group_ids, t.target_group_names,
 		       t.check_interval_seconds, t.min_available, t.top_up_batch_size, t.auto_sync_new,
 		       t.last_checked_at, t.last_synced_at, t.last_status, t.last_error,
 		       t.last_remote_count, t.last_synced_count, t.last_run_id,
@@ -163,15 +169,15 @@ func (s *Store) CreateSub2APISyncTarget(ctx context.Context, input Sub2APISyncTa
 	}
 	row := s.pool.QueryRow(ctx, `
 		insert into sub2api_sync_targets(
-			name, base_url, admin_key, enabled, owner_user_id, plan_filters, target_group_ids, target_group_names,
+			name, base_url, admin_key, enabled, owner_user_id, plan_filters, token_status_filters, target_group_ids, target_group_names,
 			check_interval_seconds, min_available, top_up_batch_size, auto_sync_new,
 			last_status, updated_at
 		)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'idle', now())
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'idle', now())
 		returning id
 	`, normalizedSub2APIName(input.Name), normalizeSub2APIBaseURL(input.BaseURL), adminKey,
 		boolValue(input.Enabled, true), input.OwnerUserID,
-		normalizePlanFilters(input.PlanFilters), normalizeInt64IDs(input.TargetGroupIDs), normalizeStringList(input.TargetGroupNames),
+		normalizePlanFilters(input.PlanFilters), normalizeTokenStatusFilters(input.TokenStatusFilters), normalizeInt64IDs(input.TargetGroupIDs), normalizeStringList(input.TargetGroupNames),
 		normalizeCheckInterval(input.CheckIntervalSeconds), normalizeNonNegative(input.MinAvailable, 10), normalizePositive(input.TopUpBatchSize, 10),
 		boolValue(input.AutoSyncNew, false),
 	)
@@ -200,18 +206,19 @@ func (s *Store) UpdateSub2APISyncTarget(ctx context.Context, id int64, input Sub
 		    enabled = $6,
 		    owner_user_id = $7,
 		    plan_filters = $8,
-		    target_group_ids = $9,
-		    target_group_names = $10,
-		    check_interval_seconds = $11,
-		    min_available = $12,
-		    top_up_batch_size = $13,
-		    auto_sync_new = $14,
+		    token_status_filters = $9,
+		    target_group_ids = $10,
+		    target_group_names = $11,
+		    check_interval_seconds = $12,
+		    min_available = $13,
+		    top_up_batch_size = $14,
+		    auto_sync_new = $15,
 		    updated_at = now()
 		where id = $1
 		returning id
 	`, id, normalizedSub2APIName(input.Name), normalizeSub2APIBaseURL(input.BaseURL),
 		hasAdminKey, adminKey, boolValue(input.Enabled, true), input.OwnerUserID,
-		normalizePlanFilters(input.PlanFilters), normalizeInt64IDs(input.TargetGroupIDs), normalizeStringList(input.TargetGroupNames),
+		normalizePlanFilters(input.PlanFilters), normalizeTokenStatusFilters(input.TokenStatusFilters), normalizeInt64IDs(input.TargetGroupIDs), normalizeStringList(input.TargetGroupNames),
 		normalizeCheckInterval(input.CheckIntervalSeconds), normalizeNonNegative(input.MinAvailable, 10), normalizePositive(input.TopUpBatchSize, 10),
 		boolValue(input.AutoSyncNew, false),
 	)
@@ -262,7 +269,7 @@ func (s *Store) ClaimDueSub2APISyncTargets(ctx context.Context, limit int) ([]Su
 		where t.id = due.id
 		returning t.id, t.name, t.base_url, t.admin_key, t.enabled, coalesce(t.owner_user_id, 0),
 		          (select email from platform_users where id = t.owner_user_id),
-		          t.plan_filters, t.target_group_ids, t.target_group_names,
+		          t.plan_filters, t.token_status_filters, t.target_group_ids, t.target_group_names,
 		          t.check_interval_seconds, t.min_available, t.top_up_batch_size, t.auto_sync_new,
 		          t.last_checked_at, t.last_synced_at, t.last_status, t.last_error,
 		          t.last_remote_count, t.last_synced_count, t.last_run_id,
@@ -367,9 +374,6 @@ func (s *Store) ListSub2APITokenCandidates(ctx context.Context, target Sub2APISy
 	filters := []string{
 		"t.merged_into_token_id is null",
 		"t.owner_user_id = $2",
-		"t.is_active = true",
-		"t.disabled_at is null",
-		"(t.cooldown_until is null or t.cooldown_until <= now())",
 		"coalesce(t.access_token, '') <> ''",
 		"coalesce(t.refresh_token, '') <> ''",
 		`not exists (
@@ -380,6 +384,8 @@ func (s *Store) ListSub2APITokenCandidates(ctx context.Context, target Sub2APISy
 			  and m.status = 'synced'
 		)`,
 	}
+	statuses := normalizeTokenStatusFilters(target.TokenStatusFilters)
+	filters = append(filters, tokenStatusFilterSQL(statuses))
 	plans := normalizePlanFilters(target.PlanFilters)
 	if len(plans) > 0 {
 		args = append(args, plans)
@@ -483,7 +489,7 @@ func scanSub2APISyncTarget(row rowScanner) (Sub2APISyncTarget, error) {
 	var ownerEmail sql.NullString
 	err := row.Scan(
 		&item.ID, &item.Name, &item.BaseURL, &item.AdminKey, &item.Enabled, &item.OwnerUserID, &ownerEmail,
-		&item.PlanFilters, &item.TargetGroupIDs, &item.TargetGroupNames,
+		&item.PlanFilters, &item.TokenStatusFilters, &item.TargetGroupIDs, &item.TargetGroupNames,
 		&item.CheckIntervalSeconds, &item.MinAvailable, &item.TopUpBatchSize, &item.AutoSyncNew,
 		&item.LastCheckedAt, &item.LastSyncedAt, &item.LastStatus, &item.LastError,
 		&item.LastRemoteCount, &item.LastSyncedCount, &item.LastRunID,
@@ -494,6 +500,7 @@ func scanSub2APISyncTarget(row rowScanner) (Sub2APISyncTarget, error) {
 		item.OwnerEmail = &ownerEmail.String
 	}
 	item.PlanFilters = normalizePlanFilters(item.PlanFilters)
+	item.TokenStatusFilters = normalizeTokenStatusFilters(item.TokenStatusFilters)
 	item.TargetGroupIDs = normalizeInt64IDs(item.TargetGroupIDs)
 	item.TargetGroupNames = normalizeStringList(item.TargetGroupNames)
 	item.CheckIntervalSeconds = normalizeCheckInterval(item.CheckIntervalSeconds)
@@ -602,6 +609,58 @@ func normalizePlanFilters(values []string) []string {
 		out = append(out, plan)
 	}
 	return out
+}
+
+func normalizeTokenStatusFilters(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		status := normalizeTokenStatusFilter(value)
+		if status == "" {
+			continue
+		}
+		if _, ok := seen[status]; ok {
+			continue
+		}
+		seen[status] = struct{}{}
+		out = append(out, status)
+	}
+	if len(out) == 0 {
+		return []string{Sub2APITokenStatusAvailable, Sub2APITokenStatusCooling}
+	}
+	return out
+}
+
+func normalizeTokenStatusFilter(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case Sub2APITokenStatusAvailable, "active", "ready":
+		return Sub2APITokenStatusAvailable
+	case Sub2APITokenStatusCooling, "cooldown":
+		return Sub2APITokenStatusCooling
+	case Sub2APITokenStatusDisabled, "inactive":
+		return Sub2APITokenStatusDisabled
+	default:
+		return ""
+	}
+}
+
+func tokenStatusFilterSQL(statuses []string) string {
+	statuses = normalizeTokenStatusFilters(statuses)
+	conditions := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		switch status {
+		case Sub2APITokenStatusAvailable:
+			conditions = append(conditions, "(t.is_active = true and t.disabled_at is null and (t.cooldown_until is null or t.cooldown_until <= now()))")
+		case Sub2APITokenStatusCooling:
+			conditions = append(conditions, "(t.is_active = true and t.disabled_at is null and t.cooldown_until > now())")
+		case Sub2APITokenStatusDisabled:
+			conditions = append(conditions, "(t.is_active = false or t.disabled_at is not null)")
+		}
+	}
+	if len(conditions) == 0 {
+		return "false"
+	}
+	return "(" + strings.Join(conditions, " or ") + ")"
 }
 
 func normalizeInt64IDs(values []int64) []int64 {

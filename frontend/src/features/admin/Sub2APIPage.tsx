@@ -23,6 +23,7 @@ type Draft = {
   enabled: boolean;
   owner_user_id: number;
   plan_filters: string[];
+  token_status_filters: string[];
   target_group_ids: number[];
   target_group_names: string[];
   check_interval_seconds: number;
@@ -31,6 +32,16 @@ type Draft = {
   auto_sync_new: boolean;
 };
 
+const DEFAULT_TOKEN_STATUS_FILTERS = ["available", "cooling"];
+
+const TOKEN_STATUS_OPTIONS = [
+  { label: "可用", value: "available" },
+  { label: "冷却", value: "cooling" },
+  { label: "禁用", value: "disabled" },
+] as const;
+
+const TOKEN_STATUS_LABELS: Record<string, string> = Object.fromEntries(TOKEN_STATUS_OPTIONS.map((item) => [item.value, item.label]));
+
 const EMPTY_DRAFT: Draft = {
   name: "",
   base_url: "",
@@ -38,6 +49,7 @@ const EMPTY_DRAFT: Draft = {
   enabled: true,
   owner_user_id: 0,
   plan_filters: [],
+  token_status_filters: [...DEFAULT_TOKEN_STATUS_FILTERS],
   target_group_ids: [],
   target_group_names: [],
   check_interval_seconds: 300,
@@ -142,6 +154,7 @@ export function AdminSub2APIPage({
       enabled: Boolean(target.enabled),
       owner_user_id: Number(target.owner_user_id || 0),
       plan_filters: target.plan_filters || [],
+      token_status_filters: target.token_status_filters?.length ? target.token_status_filters : [...DEFAULT_TOKEN_STATUS_FILTERS],
       target_group_ids: target.target_group_ids || [],
       target_group_names: target.target_group_names || [],
       check_interval_seconds: Number(target.check_interval_seconds || 300),
@@ -207,6 +220,7 @@ export function AdminSub2APIPage({
         enabled: draft.enabled,
         owner_user_id: draft.owner_user_id,
         plan_filters: draft.plan_filters,
+        token_status_filters: draft.token_status_filters,
         target_group_ids: draft.target_group_ids,
         target_group_names: selectedGroupNames,
         check_interval_seconds: Number(draft.check_interval_seconds || 300),
@@ -279,6 +293,16 @@ export function AdminSub2APIPage({
     updateDraft({ plan_filters: Array.from(selected) });
   }
 
+  function toggleTokenStatus(value: string) {
+    const selected = new Set(draft.token_status_filters);
+    if (selected.has(value)) {
+      selected.delete(value);
+    } else {
+      selected.add(value);
+    }
+    updateDraft({ token_status_filters: Array.from(selected) });
+  }
+
   function toggleGroup(group: Sub2APIGroup) {
     const selected = new Set(draft.target_group_ids);
     if (selected.has(group.id)) {
@@ -291,7 +315,14 @@ export function AdminSub2APIPage({
     updateDraft({ target_group_ids: ids, target_group_names: ids.map((id) => nameByID.get(id) || `Group #${id}`) });
   }
 
-  const canSave = Boolean(draft.name.trim() && draft.base_url.trim() && draft.owner_user_id > 0 && draft.target_group_ids.length && (draft.id || draft.admin_key.trim()));
+  const canSave = Boolean(
+    draft.name.trim() &&
+      draft.base_url.trim() &&
+      draft.owner_user_id > 0 &&
+      draft.token_status_filters.length &&
+      draft.target_group_ids.length &&
+      (draft.id || draft.admin_key.trim()),
+  );
 
   function renderTargetForm(resetLabel: string) {
     return (
@@ -326,6 +357,22 @@ export function AdminSub2APIPage({
             ))}
             {!planOptions.length && <div className="text-muted-foreground text-sm">当前号池没有可选计划。</div>}
           </div>
+        </div>
+
+        <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Label>Key 状态</Label>
+            <span className="text-muted-foreground text-xs">默认同步可用和冷却</span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {TOKEN_STATUS_OPTIONS.map((status) => (
+              <Label className="rounded-lg border bg-background px-3 py-2" key={status.value}>
+                <Checkbox checked={draft.token_status_filters.includes(status.value)} onCheckedChange={() => toggleTokenStatus(status.value)} />
+                <span>{status.label}</span>
+              </Label>
+            ))}
+          </div>
+          {!draft.token_status_filters.length && <div className="text-destructive-foreground text-xs">至少选择一个 Key 状态。</div>}
         </div>
 
         <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
@@ -508,6 +555,12 @@ function planOptionsFromPool(planCounts: TokenPlanCount[], selectedPlans: string
   return options;
 }
 
+function tokenStatusLabels(values?: string[] | null): string {
+  const selected = values?.length ? values : DEFAULT_TOKEN_STATUS_FILTERS;
+  const labels = selected.map((value) => TOKEN_STATUS_LABELS[value] || value).filter(Boolean);
+  return labels.length ? labels.join(" · ") : "可用 · 冷却";
+}
+
 function TargetTable({
   busyID,
   items,
@@ -559,6 +612,7 @@ function TargetTable({
               </TableCell>
               <TableCell className="text-sm">
                 <div>低于 {formatNumber(target.min_available)} 补充</div>
+                <div className="text-muted-foreground text-xs">状态 {tokenStatusLabels(target.token_status_filters)}</div>
                 <div className="text-muted-foreground text-xs">{formatNumber(target.check_interval_seconds)}s · 每次 {formatNumber(target.top_up_batch_size)} · {target.auto_sync_new ? "入池同步" : "按阈值"}</div>
               </TableCell>
               <TableCell className="text-sm">

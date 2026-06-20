@@ -487,6 +487,7 @@ var migrationStatements = []string{
 		enabled boolean not null default true,
 		owner_user_id bigint references platform_users(id),
 		plan_filters text[] not null default '{}',
+		token_status_filters text[] not null default array['available','cooling']::text[],
 		target_group_ids bigint[] not null default '{}',
 		target_group_names text[] not null default '{}',
 		check_interval_seconds integer not null default 300,
@@ -503,6 +504,7 @@ var migrationStatements = []string{
 		created_at timestamptz not null default now(),
 		updated_at timestamptz not null default now()
 	)`,
+	`alter table sub2api_sync_targets add column if not exists token_status_filters text[] not null default array['available','cooling']::text[]`,
 	`create index if not exists ix_sub2api_sync_targets_enabled_check on sub2api_sync_targets(enabled, last_checked_at)`,
 	`create table if not exists sub2api_sync_runs (
 		id bigserial primary key,

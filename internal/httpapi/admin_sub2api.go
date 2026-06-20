@@ -20,6 +20,7 @@ type sub2APITargetPayload struct {
 	Enabled              *bool    `json:"enabled"`
 	OwnerUserID          int64    `json:"owner_user_id"`
 	PlanFilters          []string `json:"plan_filters"`
+	TokenStatusFilters   []string `json:"token_status_filters"`
 	TargetGroupIDs       []int64  `json:"target_group_ids"`
 	TargetGroupNames     []string `json:"target_group_names"`
 	CheckIntervalSeconds int      `json:"check_interval_seconds"`
@@ -278,6 +279,7 @@ func sub2APITargetInput(payload sub2APITargetPayload) store.Sub2APISyncTargetInp
 		Enabled:              payload.Enabled,
 		OwnerUserID:          payload.OwnerUserID,
 		PlanFilters:          payload.PlanFilters,
+		TokenStatusFilters:   payload.TokenStatusFilters,
 		TargetGroupIDs:       payload.TargetGroupIDs,
 		TargetGroupNames:     payload.TargetGroupNames,
 		CheckIntervalSeconds: payload.CheckIntervalSeconds,
@@ -295,6 +297,7 @@ func redactSub2APIPayload(payload sub2APITargetPayload) map[string]any {
 		"enabled":                payload.Enabled,
 		"owner_user_id":          payload.OwnerUserID,
 		"plan_filters":           payload.PlanFilters,
+		"token_status_filters":   payload.TokenStatusFilters,
 		"target_group_ids":       payload.TargetGroupIDs,
 		"target_group_names":     payload.TargetGroupNames,
 		"check_interval_seconds": payload.CheckIntervalSeconds,

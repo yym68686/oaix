@@ -288,6 +288,7 @@ export type Sub2APITarget = {
   owner_user_id: number;
   owner_email?: string | null;
   plan_filters?: string[];
+  token_status_filters?: string[];
   target_group_ids?: number[];
   target_group_names?: string[];
   check_interval_seconds: number;
