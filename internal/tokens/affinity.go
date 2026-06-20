@@ -155,7 +155,7 @@ func (m *Manager) RemovePromptAffinityToken(store affinity.Store, tokenID int64)
 func (m *Manager) snapshotForClaim(ctx context.Context, intent Intent) (*Snapshot, *atomic.Uint64, error) {
 	cursorState := &m.cursor
 	snapshot := m.Snapshot()
-	if intent.OwnerUserID > 0 {
+	if !isMarketplaceSelection(intent.SelectionMode) && intent.OwnerUserID > 0 {
 		ownerState := m.ownerState(intent.OwnerUserID)
 		ownerState.lastUsedUnix.Store(time.Now().UTC().Unix())
 		cursorState = &ownerState.cursor

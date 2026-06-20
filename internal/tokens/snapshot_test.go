@@ -167,6 +167,43 @@ func TestManagerClaimLoadsOwnerSnapshotLazily(t *testing.T) {
 	}
 }
 
+func TestManagerMarketplaceClaimUsesGlobalSnapshot(t *testing.T) {
+	rows := makeTokens(2)
+	rows[0].OwnerUserID = 1
+	rows[0].ShareEnabled = true
+	rows[0].ShareStatus = "active"
+	rows[1].OwnerUserID = 63910
+	rows[1].ShareEnabled = true
+	rows[1].ShareStatus = "active"
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, slog.Default(), time.Second, time.Second, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	claim, err := manager.Claim(context.Background(), Intent{
+		OwnerUserID:        1,
+		SelectionMode:      "marketplace",
+		ExcludeOwnerUserID: 1,
+	})
+	if err != nil {
+		t.Fatalf("Claim returned error: %v", err)
+	}
+	defer claim.Release()
+	if claim.Token.Token.ID != 2 {
+		t.Fatalf("claimed token = %d, want shared non-owner token 2", claim.Token.Token.ID)
+	}
+	if claim.Token.Token.OwnerUserID != 63910 {
+		t.Fatalf("claimed owner = %d, want 63910", claim.Token.Token.OwnerUserID)
+	}
+	if source.scopedCalls != 0 {
+		t.Fatalf("scoped source calls = %d, want marketplace to use global snapshot", source.scopedCalls)
+	}
+	if got := len(manager.SnapshotForOwner(1).Ready); got != 0 {
+		t.Fatalf("owner snapshot ready = %d, want no owner snapshot for marketplace", got)
+	}
+}
+
 func TestManagerRefreshActiveOwnersOnlyRecentOwners(t *testing.T) {
 	rows := makeTokens(4)
 	rows[0].OwnerUserID = 10
