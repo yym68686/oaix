@@ -310,13 +310,18 @@ func (a *App) patchToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		Remark     *string `json:"remark"`
-		PlanType   *string `json:"plan_type"`
-		Email      *string `json:"email"`
-		AccountID  *string `json:"account_id"`
-		Source     *string `json:"source"`
-		SourceFile *string `json:"source_file"`
-		IsActive   *bool   `json:"is_active"`
+		Remark              *string `json:"remark"`
+		PlanType            *string `json:"plan_type"`
+		Email               *string `json:"email"`
+		AccountID           *string `json:"account_id"`
+		Source              *string `json:"source"`
+		SourceFile          *string `json:"source_file"`
+		IsActive            *bool   `json:"is_active"`
+		ShareEnabled        *bool   `json:"share_enabled"`
+		ShareEnabledCamel   *bool   `json:"shareEnabled"`
+		ShareStatus         *string `json:"share_status"`
+		ShareStatusCamel    *string `json:"shareStatus"`
+		ShareDisabledReason *string `json:"share_disabled_reason"`
 	}
 	if err := decodeJSON(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -335,6 +340,25 @@ func (a *App) patchToken(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
+	}
+	shareEnabled := payload.ShareEnabled
+	if shareEnabled == nil {
+		shareEnabled = payload.ShareEnabledCamel
+	}
+	if shareEnabled != nil {
+		status := stringPtr(payload.ShareStatus)
+		if status == "" {
+			status = stringPtr(payload.ShareStatusCamel)
+		}
+		token, err = a.store.SetTokenSharingScoped(ctx, store.AllResources(), id, *shareEnabled, status, stringPtr(payload.ShareDisabledReason))
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("token not found"))
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 	}
 	_ = a.tokens.Refresh(ctx)
 	_ = a.store.WriteAuditLog(ctx, "token_metadata_update", "api", "token", strconv.FormatInt(id, 10), payload)

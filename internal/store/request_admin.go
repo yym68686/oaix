@@ -126,7 +126,7 @@ func (s *Store) ListRequestLogsFilteredScoped(ctx context.Context, scope Resourc
 	args = append(args, queryLimit, opts.Offset)
 	rows, err := s.pool.Query(ctx, `
 		select request_id, endpoint, model, model_name, is_stream, status_code, success,
-		       owner_user_id, api_key_id, token_owner_user_id,
+		       owner_user_id, api_key_id, token_owner_user_id, selection_mode, caller_owner_user_id,
 		       attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
 		       first_token_at, ttft_ms, duration_ms, input_tokens, cached_input_tokens, output_tokens,
 		       total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
@@ -234,7 +234,8 @@ func scanRequestLogs(rows pgxRows) ([]RequestLog, error) {
 		var promptTrace []byte
 		if err := rows.Scan(
 			&item.RequestID, &item.Endpoint, &item.Model, &item.ModelName, &item.IsStream, &item.StatusCode,
-			&item.Success, &item.OwnerUserID, &item.APIKeyID, &item.TokenOwnerUserID, &item.AttemptCount,
+			&item.Success, &item.OwnerUserID, &item.APIKeyID, &item.TokenOwnerUserID, &item.SelectionMode,
+			&item.CallerOwnerUserID, &item.AttemptCount,
 			&item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
 			&item.StartedAt, &item.FinishedAt, &item.FirstTokenAt, &item.TTFTMs, &item.DurationMs,
 			&item.InputTokens, &item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,

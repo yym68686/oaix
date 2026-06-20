@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -237,13 +238,29 @@ func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 	if candidate == nil {
 		return false
 	}
-	if intent.OwnerUserID > 0 && candidate.Token.OwnerUserID != intent.OwnerUserID {
+	if strings.EqualFold(strings.TrimSpace(intent.SelectionMode), "marketplace") {
+		if !candidate.Token.ShareEnabled || !shareStatusSelectable(candidate.Token.ShareStatus) {
+			return false
+		}
+		if intent.ExcludeOwnerUserID > 0 && candidate.Token.OwnerUserID == intent.ExcludeOwnerUserID {
+			return false
+		}
+	} else if intent.OwnerUserID > 0 && candidate.Token.OwnerUserID != intent.OwnerUserID {
 		return false
 	}
 	if intent.RequireNonFree && candidate.Token.PlanType != nil && *candidate.Token.PlanType == "free" {
 		return false
 	}
 	return true
+}
+
+func shareStatusSelectable(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "", "active", "enabled", "approved":
+		return true
+	default:
+		return false
+	}
 }
 
 func sortedLaneCandidates(affinityKey string, snapshot *Snapshot, intent Intent, tokenIDs []int64) []int64 {

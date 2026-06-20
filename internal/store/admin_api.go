@@ -161,7 +161,9 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		    updated_at = now()
 		where id = $1 and merged_into_token_id is null
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		          is_active, cooldown_until, disabled_at,
+		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		          last_used_at, last_error, created_at, updated_at
 	`, update.TokenID,
 		update.Remark != nil, stringPtrValue(update.Remark),
 		update.PlanType != nil, stringPtrValue(update.PlanType),
@@ -171,7 +173,7 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		update.IsActive != nil, boolPtrValue(update.IsActive),
 		jsonBytes(sourcePayload),
 	)
-	token, err := scanToken(row)
+	token, err := scanTokenWithSharing(row)
 	if err != nil {
 		return nil, err
 	}

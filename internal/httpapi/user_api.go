@@ -489,15 +489,30 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		Remark   *string `json:"remark"`
-		IsActive *bool   `json:"is_active"`
+		Remark              *string `json:"remark"`
+		IsActive            *bool   `json:"is_active"`
+		ShareEnabled        *bool   `json:"share_enabled"`
+		ShareEnabledCamel   *bool   `json:"shareEnabled"`
+		ShareStatus         *string `json:"share_status"`
+		ShareStatusCamel    *string `json:"shareStatus"`
+		ShareDisabledReason *string `json:"share_disabled_reason"`
 	}
 	_ = decodeJSON(r, &payload)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	var token *store.Token
 	var err error
-	if payload.Remark != nil {
+	shareEnabled := payload.ShareEnabled
+	if shareEnabled == nil {
+		shareEnabled = payload.ShareEnabledCamel
+	}
+	if shareEnabled != nil {
+		status := stringPtr(payload.ShareStatus)
+		if status == "" {
+			status = stringPtr(payload.ShareStatusCamel)
+		}
+		token, err = a.store.SetTokenSharingScoped(ctx, scope, id, *shareEnabled, status, stringPtr(payload.ShareDisabledReason))
+	} else if payload.Remark != nil {
 		token, err = a.store.UpdateTokenRemarkScoped(ctx, scope, id, *payload.Remark)
 	} else if payload.IsActive != nil {
 		token, err = a.store.SetTokenActiveScoped(ctx, scope, id, *payload.IsActive, *payload.IsActive)
@@ -512,7 +527,7 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	_ = a.store.WriteAuditLog(ctx, "user_token_update", "self", "token", strconv.FormatInt(id, 10), map[string]any{"user_id": *scope.OwnerUserID, "remark": payload.Remark != nil, "is_active": payload.IsActive})
+	_ = a.store.WriteAuditLog(ctx, "user_token_update", "self", "token", strconv.FormatInt(id, 10), map[string]any{"user_id": *scope.OwnerUserID, "remark": payload.Remark != nil, "is_active": payload.IsActive, "share_enabled": shareEnabled})
 	_ = a.tokens.Refresh(ctx)
 	writeJSON(w, http.StatusOK, map[string]any{"token": token})
 }

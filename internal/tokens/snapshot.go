@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,6 +81,8 @@ type Intent struct {
 	Endpoint           string
 	Model              string
 	OwnerUserID        int64
+	SelectionMode      string
+	ExcludeOwnerUserID int64
 	PromptCacheKeyHash string
 	ExcludeTokenIDs    map[int64]struct{}
 	RequireNonFree     bool
@@ -421,6 +424,9 @@ func (m *Manager) SelectorMisses() int64 {
 }
 
 func (m *Manager) snapshotForIntent(intent Intent) *Snapshot {
+	if isMarketplaceSelection(intent.SelectionMode) {
+		return m.Snapshot()
+	}
 	if intent.OwnerUserID > 0 {
 		return m.SnapshotForOwner(intent.OwnerUserID)
 	}
@@ -428,10 +434,17 @@ func (m *Manager) snapshotForIntent(intent Intent) *Snapshot {
 }
 
 func (m *Manager) refreshSnapshotForIntent(ctx context.Context, intent Intent) error {
+	if isMarketplaceSelection(intent.SelectionMode) {
+		return m.Refresh(ctx)
+	}
 	if intent.OwnerUserID > 0 {
 		return m.RefreshOwner(ctx, intent.OwnerUserID)
 	}
 	return m.Refresh(ctx)
+}
+
+func isMarketplaceSelection(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), "marketplace")
 }
 
 func (m *Manager) ownerState(ownerUserID int64) *ownerSnapshotState {

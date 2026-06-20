@@ -24,22 +24,27 @@ const (
 var primaryPlanOrder = []string{planFree, planPlus, planTeam, planPro}
 
 type Token struct {
-	ID            int64      `json:"id"`
-	OwnerUserID   int64      `json:"owner_user_id"`
-	Email         *string    `json:"email,omitempty"`
-	AccountID     *string    `json:"account_id,omitempty"`
-	AccessToken   string     `json:"-"`
-	RefreshToken  string     `json:"-"`
-	PlanType      *string    `json:"plan_type,omitempty"`
-	Remark        *string    `json:"remark,omitempty"`
-	SourceFile    *string    `json:"source_file,omitempty"`
-	IsActive      bool       `json:"is_active"`
-	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
-	DisabledAt    *time.Time `json:"disabled_at,omitempty"`
-	LastUsedAt    *time.Time `json:"last_used_at,omitempty"`
-	LastError     *string    `json:"last_error,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID              int64      `json:"id"`
+	OwnerUserID     int64      `json:"owner_user_id"`
+	Email           *string    `json:"email,omitempty"`
+	AccountID       *string    `json:"account_id,omitempty"`
+	AccessToken     string     `json:"-"`
+	RefreshToken    string     `json:"-"`
+	PlanType        *string    `json:"plan_type,omitempty"`
+	Remark          *string    `json:"remark,omitempty"`
+	SourceFile      *string    `json:"source_file,omitempty"`
+	IsActive        bool       `json:"is_active"`
+	CooldownUntil   *time.Time `json:"cooldown_until,omitempty"`
+	DisabledAt      *time.Time `json:"disabled_at,omitempty"`
+	ShareEnabled    bool       `json:"share_enabled"`
+	ShareStatus     string     `json:"share_status,omitempty"`
+	ShareReason     *string    `json:"share_disabled_reason,omitempty"`
+	ShareEnabledAt  *time.Time `json:"share_enabled_at,omitempty"`
+	ShareDisabledAt *time.Time `json:"share_disabled_at,omitempty"`
+	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
+	LastError       *string    `json:"last_error,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type TokenObservedCost struct {
@@ -130,7 +135,9 @@ func (s *Store) ListAvailableTokensScoped(ctx context.Context, scope ResourceSco
 	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
 		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		       is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		       is_active, cooldown_until, disabled_at,
+		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		       last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where is_active = true
 		  and merged_into_token_id is null
@@ -145,7 +152,7 @@ func (s *Store) ListAvailableTokensScoped(ctx context.Context, scope ResourceSco
 		return nil, err
 	}
 	defer rows.Close()
-	return scanTokens(rows)
+	return scanAvailableTokens(rows)
 }
 
 func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token, int, error) {
@@ -186,7 +193,9 @@ func (s *Store) ListTokensScoped(ctx context.Context, scope ResourceScope, opts 
 	args = append(args, limit, offset)
 	query := fmt.Sprintf(`
 		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		       is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		       is_active, cooldown_until, disabled_at,
+		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		       last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where %s
 		order by %s
@@ -197,7 +206,7 @@ func (s *Store) ListTokensScoped(ctx context.Context, scope ResourceScope, opts 
 		return nil, 0, err
 	}
 	defer rows.Close()
-	items, err := scanTokens(rows)
+	items, err := scanAvailableTokens(rows)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -303,7 +312,9 @@ func (s *Store) ListTokensByIDsScoped(ctx context.Context, scope ResourceScope, 
 	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
 		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		       is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		       is_active, cooldown_until, disabled_at,
+		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		       last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where id = any($1::integer[])
 		  and merged_into_token_id is null
@@ -312,7 +323,7 @@ func (s *Store) ListTokensByIDsScoped(ctx context.Context, scope ResourceScope, 
 		return nil, err
 	}
 	defer rows.Close()
-	return scanTokens(rows)
+	return scanAvailableTokens(rows)
 }
 
 func (s *Store) TokenCounts(ctx context.Context) (TokenCounts, error) {
@@ -608,9 +619,11 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 					    updated_at = now()
 					where id = $1
 					returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-					          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+					          is_active, cooldown_until, disabled_at,
+					          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+					          last_used_at, last_error, created_at, updated_at
 				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(payload), isActive, lastError, refreshToken, lastRefresh)
-			token, scanErr := scanToken(row)
+			token, scanErr := scanTokenWithSharing(row)
 			if scanErr != nil {
 				return result, scanErr
 			}
@@ -637,9 +650,11 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 				)
 				values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, case when $11 then null else now() end, $12, $13, now(), now())
 				returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-				          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+				          is_active, cooldown_until, disabled_at,
+				          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+				          last_used_at, last_error, created_at, updated_at
 			`, ownerUserID, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh)
-		token, scanErr := scanToken(row)
+		token, scanErr := scanTokenWithSharing(row)
 		if scanErr != nil {
 			return result, scanErr
 		}
@@ -804,9 +819,11 @@ func (s *Store) SetTokenActiveScoped(ctx context.Context, scope ResourceScope, t
 		where id = $1
 		  and `+ownerWhere+`
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		          is_active, cooldown_until, disabled_at,
+		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		          last_used_at, last_error, created_at, updated_at
 	`, args...)
-	token, err := scanToken(row)
+	token, err := scanTokenWithSharing(row)
 	if err != nil {
 		return nil, err
 	}
@@ -822,11 +839,13 @@ func (s *Store) GetTokenScoped(ctx context.Context, scope ResourceScope, tokenID
 	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	row := s.pool.QueryRow(ctx, `
 		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		       is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		       is_active, cooldown_until, disabled_at,
+		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		       last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where id = $1 and merged_into_token_id is null
 		  and `+ownerWhere, args...)
-	token, err := scanToken(row)
+	token, err := scanTokenWithSharing(row)
 	if err != nil {
 		return nil, err
 	}
@@ -846,9 +865,36 @@ func (s *Store) UpdateTokenRemarkScoped(ctx context.Context, scope ResourceScope
 		where id = $1 and merged_into_token_id is null
 		  and `+ownerWhere+`
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		          is_active, cooldown_until, disabled_at,
+		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		          last_used_at, last_error, created_at, updated_at
 	`, args...)
-	token, err := scanToken(row)
+	token, err := scanTokenWithSharing(row)
+	if err != nil {
+		return nil, err
+	}
+	return &token, nil
+}
+
+func (s *Store) SetTokenSharingScoped(ctx context.Context, scope ResourceScope, tokenID int64, enabled bool, status string, reason string) (*Token, error) {
+	args := []any{tokenID, enabled, normalizeShareStatus(enabled, status), truncate(reason, 1000)}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	row := s.pool.QueryRow(ctx, `
+		update codex_tokens
+		set share_enabled = $2,
+		    share_status = $3,
+		    share_disabled_reason = case when $2 then null else nullif($4, '') end,
+		    share_enabled_at = case when $2 then coalesce(share_enabled_at, now()) else share_enabled_at end,
+		    share_disabled_at = case when $2 then null else now() end,
+		    updated_at = now()
+		where id = $1 and merged_into_token_id is null
+		  and `+ownerWhere+`
+		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+		          is_active, cooldown_until, disabled_at,
+		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		          last_used_at, last_error, created_at, updated_at
+	`, args...)
+	token, err := scanTokenWithSharing(row)
 	if err != nil {
 		return nil, err
 	}
@@ -1007,6 +1053,53 @@ func scanTokens(rows pgx.Rows) ([]Token, error) {
 	return tokens, rows.Err()
 }
 
+func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
+	var tokens []Token
+	for rows.Next() {
+		var token Token
+		var accessToken sql.NullString
+		var refreshToken sql.NullString
+		var shareStatus sql.NullString
+		err := rows.Scan(
+			&token.ID,
+			&token.OwnerUserID,
+			&token.Email,
+			&token.AccountID,
+			&accessToken,
+			&refreshToken,
+			&token.PlanType,
+			&token.Remark,
+			&token.SourceFile,
+			&token.IsActive,
+			&token.CooldownUntil,
+			&token.DisabledAt,
+			&token.ShareEnabled,
+			&shareStatus,
+			&token.ShareReason,
+			&token.ShareEnabledAt,
+			&token.ShareDisabledAt,
+			&token.LastUsedAt,
+			&token.LastError,
+			&token.CreatedAt,
+			&token.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if accessToken.Valid {
+			token.AccessToken = accessToken.String
+		}
+		if refreshToken.Valid {
+			token.RefreshToken = refreshToken.String
+		}
+		if shareStatus.Valid {
+			token.ShareStatus = shareStatus.String
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, rows.Err()
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -1040,6 +1133,62 @@ func scanToken(row rowScanner) (Token, error) {
 		token.RefreshToken = refreshToken.String
 	}
 	return token, err
+}
+
+func scanTokenWithSharing(row rowScanner) (Token, error) {
+	var token Token
+	var accessToken sql.NullString
+	var refreshToken sql.NullString
+	var shareStatus sql.NullString
+	err := row.Scan(
+		&token.ID,
+		&token.OwnerUserID,
+		&token.Email,
+		&token.AccountID,
+		&accessToken,
+		&refreshToken,
+		&token.PlanType,
+		&token.Remark,
+		&token.SourceFile,
+		&token.IsActive,
+		&token.CooldownUntil,
+		&token.DisabledAt,
+		&token.ShareEnabled,
+		&shareStatus,
+		&token.ShareReason,
+		&token.ShareEnabledAt,
+		&token.ShareDisabledAt,
+		&token.LastUsedAt,
+		&token.LastError,
+		&token.CreatedAt,
+		&token.UpdatedAt,
+	)
+	if accessToken.Valid {
+		token.AccessToken = accessToken.String
+	}
+	if refreshToken.Valid {
+		token.RefreshToken = refreshToken.String
+	}
+	if shareStatus.Valid {
+		token.ShareStatus = shareStatus.String
+	}
+	return token, err
+}
+
+func normalizeShareStatus(enabled bool, status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if enabled {
+		switch status {
+		case "active", "enabled", "approved":
+			return "active"
+		default:
+			return "active"
+		}
+	}
+	if status == "" || status == "active" || status == "enabled" || status == "approved" {
+		return "private"
+	}
+	return truncate(status, 32)
 }
 
 func parseAccessTokenClaims(token string) (*string, *string, *string) {

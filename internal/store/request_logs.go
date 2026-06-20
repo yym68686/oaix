@@ -17,6 +17,8 @@ type RequestLog struct {
 	OwnerUserID                   *int64         `json:"owner_user_id,omitempty"`
 	APIKeyID                      *int64         `json:"api_key_id,omitempty"`
 	TokenOwnerUserID              *int64         `json:"token_owner_user_id,omitempty"`
+	SelectionMode                 *string        `json:"selection_mode,omitempty"`
+	CallerOwnerUserID             *int64         `json:"caller_owner_user_id,omitempty"`
 	Endpoint                      string         `json:"endpoint"`
 	Model                         *string        `json:"model,omitempty"`
 	ModelName                     *string        `json:"model_name,omitempty"`
@@ -105,13 +107,16 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
 				prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
 				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
-				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message
+				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message,
+				selection_mode, caller_owner_user_id
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
 			on conflict (request_id) do update set
 				owner_user_id = coalesce(excluded.owner_user_id, gateway_request_logs.owner_user_id),
 				api_key_id = coalesce(excluded.api_key_id, gateway_request_logs.api_key_id),
 				token_owner_user_id = coalesce(excluded.token_owner_user_id, gateway_request_logs.token_owner_user_id),
+				selection_mode = coalesce(excluded.selection_mode, gateway_request_logs.selection_mode),
+				caller_owner_user_id = coalesce(excluded.caller_owner_user_id, gateway_request_logs.caller_owner_user_id),
 				endpoint = excluded.endpoint,
 				model = coalesce(excluded.model, gateway_request_logs.model),
 				model_name = coalesce(excluded.model_name, gateway_request_logs.model_name, gateway_request_logs.model),
@@ -160,6 +165,7 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 			item.PromptCacheKeyHash, item.PromptCacheRetentionRequested, item.PromptCacheRetentionSent,
 			item.SessionIDHash, item.SessionIDSource, item.PreviousResponseIDHash, item.UpstreamResponseID,
 			item.CacheHitRatio, item.CacheAffinityResult, item.CacheAffinityLaneIndex, promptTrace, item.ErrorMessage,
+			item.SelectionMode, item.CallerOwnerUserID,
 		)
 	}
 	br := s.pool.SendBatch(ctx, batch)
@@ -264,13 +270,16 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
 				prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
 				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
-				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message
+				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message,
+				selection_mode, caller_owner_user_id
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
 			on conflict (request_id) do update set
 				owner_user_id = coalesce(excluded.owner_user_id, gateway_request_logs.owner_user_id),
 				api_key_id = coalesce(excluded.api_key_id, gateway_request_logs.api_key_id),
 				token_owner_user_id = coalesce(excluded.token_owner_user_id, gateway_request_logs.token_owner_user_id),
+				selection_mode = coalesce(excluded.selection_mode, gateway_request_logs.selection_mode),
+				caller_owner_user_id = coalesce(excluded.caller_owner_user_id, gateway_request_logs.caller_owner_user_id),
 				status_code = coalesce(excluded.status_code, gateway_request_logs.status_code),
 				success = coalesce(excluded.success, gateway_request_logs.success),
 				attempt_count = greatest(gateway_request_logs.attempt_count, excluded.attempt_count),
@@ -311,7 +320,7 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 			item.PromptCacheSource, item.PromptCacheKeyHash, item.PromptCacheRetentionRequested,
 			item.PromptCacheRetentionSent, item.SessionIDHash, item.SessionIDSource, item.PreviousResponseIDHash,
 			item.UpstreamResponseID, item.CacheHitRatio, item.CacheAffinityResult, item.CacheAffinityLaneIndex,
-			promptTrace, item.ErrorMessage,
+			promptTrace, item.ErrorMessage, item.SelectionMode, item.CallerOwnerUserID,
 		)
 		if err != nil {
 			return err
@@ -843,7 +852,7 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 	}
 	rows, err := s.pool.Query(ctx, `
 		select request_id, endpoint, model, model_name, is_stream, status_code, success,
-		       owner_user_id, api_key_id, token_owner_user_id,
+		       owner_user_id, api_key_id, token_owner_user_id, selection_mode, caller_owner_user_id,
 		       attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
 		       first_token_at, ttft_ms, duration_ms, input_tokens, cached_input_tokens, output_tokens,
 		       total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
@@ -865,7 +874,8 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 		var promptTrace []byte
 		if err := rows.Scan(
 			&item.RequestID, &item.Endpoint, &item.Model, &item.ModelName, &item.IsStream, &item.StatusCode,
-			&item.Success, &item.OwnerUserID, &item.APIKeyID, &item.TokenOwnerUserID, &item.AttemptCount, &item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
+			&item.Success, &item.OwnerUserID, &item.APIKeyID, &item.TokenOwnerUserID, &item.SelectionMode,
+			&item.CallerOwnerUserID, &item.AttemptCount, &item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
 			&item.StartedAt, &item.FinishedAt, &item.FirstTokenAt, &item.TTFTMs, &item.DurationMs,
 			&item.InputTokens, &item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,
 			&item.RequestPayloadHash, &item.UpstreamPayloadHash, &item.PromptTemplateHash, &item.PromptDynamicHash,

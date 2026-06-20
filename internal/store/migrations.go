@@ -72,12 +72,18 @@ var migrationStatements = []string{
 		is_active boolean not null default true,
 		cooldown_until timestamptz,
 		disabled_at timestamptz,
+		share_enabled boolean not null default false,
+		share_status varchar(32) not null default 'private',
+		share_disabled_reason text,
+		share_enabled_at timestamptz,
+		share_disabled_at timestamptz,
 		last_used_at timestamptz,
 		last_error text,
 		created_at timestamptz not null default now(),
 		updated_at timestamptz not null default now()
 	)`,
 	`create index if not exists ix_codex_tokens_active_ready on codex_tokens (is_active, cooldown_until, last_used_at, id) where merged_into_token_id is null`,
+	`create index if not exists ix_codex_tokens_shared_ready on codex_tokens (share_enabled, share_status, is_active, cooldown_until, last_used_at, id) where merged_into_token_id is null`,
 	`create index if not exists ix_codex_tokens_account_id on codex_tokens (account_id)`,
 	`create index if not exists ix_codex_tokens_plan_type on codex_tokens (plan_type)`,
 	`create index if not exists ix_codex_tokens_refresh_token on codex_tokens (refresh_token)`,
@@ -160,6 +166,8 @@ var migrationStatements = []string{
 		cache_affinity_result varchar(64),
 		cache_affinity_lane_index integer,
 		prompt_cache_trace jsonb,
+		selection_mode varchar(32),
+		caller_owner_user_id bigint,
 		error_message text,
 		analytics_recorded_at timestamptz
 	)`,
@@ -407,6 +415,11 @@ var migrationStatements = []string{
 	 from admin_api_keys
 	 on conflict (key_hash) do nothing`,
 	`alter table codex_tokens add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table codex_tokens add column if not exists share_enabled boolean not null default false`,
+	`alter table codex_tokens add column if not exists share_status varchar(32) not null default 'private'`,
+	`alter table codex_tokens add column if not exists share_disabled_reason text`,
+	`alter table codex_tokens add column if not exists share_enabled_at timestamptz`,
+	`alter table codex_tokens add column if not exists share_disabled_at timestamptz`,
 	`alter table token_secrets add column if not exists owner_user_id bigint references platform_users(id)`,
 	`alter table token_scopes add column if not exists owner_user_id bigint references platform_users(id)`,
 	`alter table token_refresh_history add column if not exists owner_user_id bigint references platform_users(id)`,
@@ -420,6 +433,8 @@ var migrationStatements = []string{
 	`alter table gateway_request_logs add column if not exists owner_user_id bigint references platform_users(id)`,
 	`alter table gateway_request_logs add column if not exists api_key_id bigint references api_keys(id)`,
 	`alter table gateway_request_logs add column if not exists token_owner_user_id bigint references platform_users(id)`,
+	`alter table gateway_request_logs add column if not exists selection_mode varchar(32)`,
+	`alter table gateway_request_logs add column if not exists caller_owner_user_id bigint references platform_users(id)`,
 	`alter table gateway_request_token_costs add column if not exists owner_user_id bigint references platform_users(id)`,
 	`alter table gateway_request_hourly_stats add column if not exists owner_user_id bigint references platform_users(id)`,
 	`alter table gateway_request_hourly_stats add column if not exists cached_input_tokens bigint not null default 0`,
@@ -472,6 +487,7 @@ var onlineMigrationStatements = []string{
 	`create index concurrently if not exists ix_gateway_request_logs_token_cost on gateway_request_logs (token_id, estimated_cost_usd) where token_id is not null and estimated_cost_usd is not null`,
 	`create index concurrently if not exists ix_gateway_request_logs_account_cost on gateway_request_logs (account_id, estimated_cost_usd) where account_id is not null and estimated_cost_usd is not null`,
 	`create index concurrently if not exists ix_gateway_request_hourly_stats_bucket_start on gateway_request_hourly_stats (bucket_start desc)`,
+	`create index concurrently if not exists ix_codex_tokens_shared_ready on codex_tokens (share_enabled, share_status, is_active, cooldown_until, last_used_at, id) where merged_into_token_id is null`,
 }
 
 var downMigrationStatements = []string{

@@ -47,6 +47,9 @@ type RequestIntent struct {
 	Model               string
 	OwnerUserID         int64
 	APIKeyID            *int64
+	SelectionMode       string
+	CallerOwnerUserID   int64
+	ExcludeOwnerUserID  int64
 	Stream              bool
 	Compact             bool
 	Method              string
@@ -155,10 +158,21 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		timing["prompt_cache_key_hash"] = promptCacheContext.PromptCacheKeyHash
 		timing["prompt_cache_source"] = promptCacheContext.Source
 	}
+	if strings.TrimSpace(intent.SelectionMode) != "" {
+		timing["selection_mode"] = strings.TrimSpace(intent.SelectionMode)
+	}
+	if intent.CallerOwnerUserID > 0 {
+		timing["caller_owner_user_id"] = intent.CallerOwnerUserID
+	}
+	if intent.ExcludeOwnerUserID > 0 {
+		timing["exclude_owner_user_id"] = intent.ExcludeOwnerUserID
+	}
 	p.logs.Submit(r.Context(), store.RequestLog{
 		RequestID:                     requestID,
 		OwnerUserID:                   ptrInt64(intent.OwnerUserID),
 		APIKeyID:                      intent.APIKeyID,
+		SelectionMode:                 nullable(strings.TrimSpace(intent.SelectionMode)),
+		CallerOwnerUserID:             ptrPositiveInt64(intent.CallerOwnerUserID),
 		Endpoint:                      intent.Endpoint,
 		Model:                         nullable(intent.Model),
 		ModelName:                     nullable(intent.Model),
@@ -186,6 +200,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var lastErr error
 	var finalStatus = http.StatusBadGateway
 	var selectedTokenID *int64
+	var selectedTokenOwnerID *int64
 	var accountID *string
 	var lastAffinityResult tokens.PromptAffinityResult
 	var lastUsage *UsageMetrics
@@ -195,10 +210,12 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	for attempt := 1; attempt <= p.cfg.Upstream.MaxRetries; attempt++ {
 		selectStarted := time.Now()
 		tokenIntent := tokens.Intent{
-			Endpoint:        intent.Endpoint,
-			Model:           intent.Model,
-			OwnerUserID:     intent.OwnerUserID,
-			ExcludeTokenIDs: excluded,
+			Endpoint:           intent.Endpoint,
+			Model:              intent.Model,
+			OwnerUserID:        intent.OwnerUserID,
+			SelectionMode:      intent.SelectionMode,
+			ExcludeOwnerUserID: intent.ExcludeOwnerUserID,
+			ExcludeTokenIDs:    excluded,
 		}
 		if promptCacheContext != nil {
 			tokenIntent.PromptCacheKeyHash = promptCacheContext.PromptCacheKeyHash
@@ -221,6 +238,9 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			break
 		}
 		selectedTokenID = ptrInt64(claim.TokenID())
+		if claim.Token != nil {
+			selectedTokenOwnerID = ptrInt64(claim.Token.Token.OwnerUserID)
+		}
 		accountID = claim.AccountID()
 		attemptStarted := time.Now()
 		attemptSpec := Attempt{
@@ -264,7 +284,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				text := err.Error()
 				msg = &text
 			}
-			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, accountID, msg, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, selectedTokenOwnerID, accountID, msg, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 			if success {
 				p.commitSuccess(claim.TokenID())
 				p.recordPromptCacheSuccess(promptCacheContext, claim.TokenID(), lastResponseID)
@@ -274,7 +294,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		if err == nil && status >= 200 && status < 400 {
 			p.commitSuccess(claim.TokenID())
 			p.recordPromptCacheSuccess(promptCacheContext, claim.TokenID(), lastResponseID)
-			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, accountID, nil, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, selectedTokenOwnerID, accountID, nil, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 			return
 		}
 		lastErr = err
@@ -284,7 +304,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			if err != nil {
 				message = err.Error()
 			}
-			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 			return
 		}
 		if action == OutcomeUpstream401Invalid || action == OutcomeUpstream403Invalid {
@@ -304,7 +324,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	}
 	if errors.Is(lastErr, tokens.ErrNoToken) {
 		writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, http.StatusServiceUnavailable, "no available token")
-		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, len(excluded), selectedTokenID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 		return
 	}
 	message := "upstream request failed"
@@ -312,7 +332,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		message = lastErr.Error()
 	}
 	writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, finalStatus, message)
-	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, len(excluded), selectedTokenID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 }
 
 func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {
@@ -373,7 +393,11 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		return AttemptResult{Status: resp.StatusCode, Retry: retry}, fmt.Errorf("%s", detail)
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
+	w.Header().Set("X-OAIX-Request-ID", attempt.RequestID)
 	w.Header().Set("X-OAIX-Token-ID", fmt.Sprint(attempt.Claim.TokenID()))
+	if attempt.Claim != nil && attempt.Claim.Token != nil {
+		w.Header().Set("X-OAIX-Token-Owner-User-ID", fmt.Sprint(attempt.Claim.Token.Token.OwnerUserID))
+	}
 	if attempt.Intent.ImageResponseFormat != "" {
 		if attempt.Intent.Stream {
 			return p.streamImageResponse(w, resp, attempt)
@@ -507,7 +531,7 @@ func (p *Pipeline) withCommitRetry(ctx context.Context, fn func(context.Context)
 	return lastErr
 }
 
-func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent RequestIntent, started time.Time, status int, success bool, attempts int, tokenID *int64, accountID *string, errMsg *string, timing map[string]any, promptCacheContext *PromptCacheContext, affinityResult tokens.PromptAffinityResult, usage *UsageMetrics, upstreamResponseID string, firstTokenAt *time.Time) {
+func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent RequestIntent, started time.Time, status int, success bool, attempts int, tokenID *int64, tokenOwnerUserID *int64, accountID *string, errMsg *string, timing map[string]any, promptCacheContext *PromptCacheContext, affinityResult tokens.PromptAffinityResult, usage *UsageMetrics, upstreamResponseID string, firstTokenAt *time.Time) {
 	finished := time.Now().UTC()
 	duration := int(finished.Sub(started).Milliseconds())
 	if timing == nil {
@@ -519,7 +543,9 @@ func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent Reques
 		RequestID:                     requestID,
 		OwnerUserID:                   ptrInt64(intent.OwnerUserID),
 		APIKeyID:                      intent.APIKeyID,
-		TokenOwnerUserID:              ptrInt64(intent.OwnerUserID),
+		TokenOwnerUserID:              tokenOwnerUserID,
+		SelectionMode:                 nullable(strings.TrimSpace(intent.SelectionMode)),
+		CallerOwnerUserID:             ptrPositiveInt64(intent.CallerOwnerUserID),
 		Endpoint:                      intent.Endpoint,
 		Model:                         nullable(intent.Model),
 		ModelName:                     nullable(intent.Model),
@@ -763,6 +789,13 @@ func ptrInt(value int) *int {
 }
 
 func ptrInt64(value int64) *int64 {
+	return &value
+}
+
+func ptrPositiveInt64(value int64) *int64 {
+	if value <= 0 {
+		return nil
+	}
 	return &value
 }
 
