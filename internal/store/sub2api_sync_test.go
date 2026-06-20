@@ -53,3 +53,13 @@ func TestTokenStatusFilterSQL(t *testing.T) {
 		t.Fatalf("expected default SQL %q to exclude disabled-token condition", defaultSQL)
 	}
 }
+
+func TestSub2APITokenCandidateQueryCastsRawPayloadToJSONB(t *testing.T) {
+	expr := sub2APIRawPayloadSelectSQL()
+	if !strings.Contains(expr, "t.raw_payload::jsonb") {
+		t.Fatal("sub2api candidate query must cast raw_payload to jsonb before coalesce")
+	}
+	if strings.Contains(expr, "coalesce(t.raw_payload, '{}'::jsonb)") {
+		t.Fatal("sub2api candidate query must not coalesce json raw_payload directly with jsonb")
+	}
+}

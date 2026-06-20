@@ -155,8 +155,8 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		    is_active = case when $12::boolean then $13 else is_active end,
 		    disabled_at = case when $12::boolean and $13 then null when $12::boolean and not $13 then coalesce(disabled_at, now()) else disabled_at end,
 		    raw_payload = case
-		      when $14::jsonb <> '{}'::jsonb then coalesce(raw_payload, '{}'::jsonb) || $14::jsonb
-		      else raw_payload
+		      when $14::jsonb <> '{}'::jsonb then coalesce(raw_payload::jsonb, '{}'::jsonb) || $14::jsonb
+		      else raw_payload::jsonb
 		    end,
 		    updated_at = now()
 		where id = $1 and merged_into_token_id is null

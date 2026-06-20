@@ -72,12 +72,7 @@ export function AdminSub2APIPage({
   const [globalPlanCounts, setGlobalPlanCounts] = useState<TokenPlanCount[]>([]);
   const [planCountsByUser, setPlanCountsByUser] = useState<Record<number, TokenPlanCount[]>>({});
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
-  const [createDialogOpen, setCreateDialogOpen] = useState(false);
-  const [restoreDraftAfterCreate, setRestoreDraftAfterCreate] = useState<{
-    draft: Draft;
-    groups: Sub2APIGroup[];
-    groupError: string;
-  } | null>(null);
+  const [targetDialogOpen, setTargetDialogOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [groupLoading, setGroupLoading] = useState(false);
@@ -142,8 +137,6 @@ export function AdminSub2APIPage({
   }
 
   function editTarget(target: Sub2APITarget) {
-    setCreateDialogOpen(false);
-    setRestoreDraftAfterCreate(null);
     setGroupError("");
     setGroups([]);
     setDraft({
@@ -162,6 +155,7 @@ export function AdminSub2APIPage({
       top_up_batch_size: Number(target.top_up_batch_size || 10),
       auto_sync_new: Boolean(target.auto_sync_new),
     });
+    setTargetDialogOpen(true);
   }
 
   function resetDraft() {
@@ -171,23 +165,15 @@ export function AdminSub2APIPage({
   }
 
   function openCreateDialog() {
-    setRestoreDraftAfterCreate(draft.id ? { draft, groups, groupError } : null);
     resetDraft();
-    setCreateDialogOpen(true);
+    setTargetDialogOpen(true);
   }
 
-  function changeCreateDialogOpen(open: boolean) {
+  function changeTargetDialogOpen(open: boolean) {
     if (!open && saving) return;
-    setCreateDialogOpen(open);
-    if (!open && !draft.id) {
-      if (restoreDraftAfterCreate) {
-        setDraft(restoreDraftAfterCreate.draft);
-        setGroups(restoreDraftAfterCreate.groups);
-        setGroupError(restoreDraftAfterCreate.groupError);
-      } else {
-        resetDraft();
-      }
-      setRestoreDraftAfterCreate(null);
+    setTargetDialogOpen(open);
+    if (!open) {
+      resetDraft();
     }
   }
 
@@ -213,6 +199,7 @@ export function AdminSub2APIPage({
   async function saveTarget() {
     setSaving(true);
     setError("");
+    const editing = Boolean(draft.id);
     try {
       const payload: Record<string, unknown> = {
         name: draft.name.trim(),
@@ -231,17 +218,14 @@ export function AdminSub2APIPage({
       if (draft.admin_key.trim()) {
         payload.admin_key = draft.admin_key.trim();
       }
-      const result = draft.id
-        ? await api.updateSub2APITarget(draft.id, payload)
-        : await api.createSub2APITarget(payload);
-      if (result.target) {
-        editTarget(result.target);
+      if (draft.id) {
+        await api.updateSub2APITarget(draft.id, payload);
+      } else {
+        await api.createSub2APITarget(payload);
       }
-      if (!draft.id) {
-        setCreateDialogOpen(false);
-        setRestoreDraftAfterCreate(null);
-      }
-      pushToast(draft.id ? "Sub2API 配置已更新" : "Sub2API 配置已创建");
+      setTargetDialogOpen(false);
+      resetDraft();
+      pushToast(editing ? "Sub2API 配置已更新" : "Sub2API 配置已创建");
       await load();
     } catch (caught) {
       setError(errorMessage(caught));
@@ -255,7 +239,10 @@ export function AdminSub2APIPage({
     setBusyID(target.id);
     try {
       await api.deleteSub2APITarget(target.id);
-      if (draft.id === target.id) resetDraft();
+      if (draft.id === target.id) {
+        setTargetDialogOpen(false);
+        resetDraft();
+      }
       pushToast("Sub2API 配置已删除");
       await load();
     } catch (caught) {
@@ -430,7 +417,7 @@ export function AdminSub2APIPage({
         </div>
 
         <div className="flex flex-wrap justify-end gap-2">
-          <Button onClick={resetDraft} variant="outline">
+          <Button onClick={draft.id ? () => changeTargetDialogOpen(false) : resetDraft} variant="outline">
             {resetLabel}
           </Button>
           <Button disabled={!canSave || saving} onClick={() => void saveTarget()}>
@@ -444,7 +431,7 @@ export function AdminSub2APIPage({
 
   return (
     <>
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(360px,460px)]">
+      <div className="grid gap-4">
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -478,44 +465,19 @@ export function AdminSub2APIPage({
             <RunTable items={runs.slice(0, 12)} />
           </CardPanel>
         </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <CheckCircle2Icon className="size-5" />
-              {draft.id ? "编辑目标" : "目标详情"}
-            </CardTitle>
-            <CardDescription>{draft.id ? `ID ${draft.id}` : "选择目标编辑，或新增 Sub2API 目标。"}</CardDescription>
-          </CardHeader>
-          <CardPanel>
-            {draft.id ? (
-              renderTargetForm("取消编辑")
-            ) : (
-              <div className="grid gap-4">
-                <EmptyState compact title="未选择目标" description="从左侧表格点击编辑，新增配置请使用页面顶部按钮。" />
-                <div className="flex justify-end">
-                  <Button onClick={openCreateDialog} variant="outline">
-                    <PlusIcon />
-                    新增目标
-                  </Button>
-                </div>
-              </div>
-            )}
-          </CardPanel>
-        </Card>
       </div>
 
-      <Dialog open={createDialogOpen} onOpenChange={changeCreateDialogOpen}>
+      <Dialog open={targetDialogOpen} onOpenChange={changeTargetDialogOpen}>
         <DialogPopup className="max-h-[min(88vh,760px)] max-w-[min(52rem,calc(100vw-2rem))]">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <PlusIcon className="size-5" />
-              新增 Sub2API 目标
+              {draft.id ? <CheckCircle2Icon className="size-5" /> : <PlusIcon className="size-5" />}
+              {draft.id ? "编辑 Sub2API 目标" : "新增 Sub2API 目标"}
             </DialogTitle>
-            <DialogDescription>保存后会进入定时检查队列。</DialogDescription>
+            <DialogDescription>{draft.id ? `ID ${draft.id}` : "保存后会进入定时检查队列。"}</DialogDescription>
           </DialogHeader>
           <DialogPanel className="max-h-[min(70vh,600px)] overflow-y-auto pr-1">
-            {renderTargetForm("清空")}
+            {renderTargetForm(draft.id ? "取消编辑" : "清空")}
           </DialogPanel>
         </DialogPopup>
       </Dialog>

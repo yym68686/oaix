@@ -403,9 +403,10 @@ func (s *Store) ListSub2APITokenCandidates(ctx context.Context, target Sub2APISy
 		filters = append(filters, fmt.Sprintf("not (t.id = any($%d::integer[]))", len(args)))
 	}
 	args = append(args, opts.Limit)
+	rawPayloadExpr := sub2APIRawPayloadSelectSQL()
 	rows, err := s.pool.Query(ctx, `
 		select t.id, coalesce(t.owner_user_id, 0), t.email, t.account_id, t.id_token,
-		       t.access_token, t.refresh_token, t.plan_type, coalesce(t.raw_payload, '{}'::jsonb),
+		       t.access_token, t.refresh_token, t.plan_type, `+rawPayloadExpr+`,
 		       t.created_at, t.updated_at
 		from codex_tokens t
 		where `+strings.Join(filters, " and ")+`
@@ -661,6 +662,10 @@ func tokenStatusFilterSQL(statuses []string) string {
 		return "false"
 	}
 	return "(" + strings.Join(conditions, " or ") + ")"
+}
+
+func sub2APIRawPayloadSelectSQL() string {
+	return "coalesce(t.raw_payload::jsonb, '{}'::jsonb)"
 }
 
 func normalizeInt64IDs(values []int64) []int64 {
