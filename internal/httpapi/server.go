@@ -1064,7 +1064,7 @@ func (a *App) proxyRequest(w http.ResponseWriter, r *http.Request, intent proxy.
 			writeJSON(w, http.StatusForbidden, map[string]any{"detail": "marketplace selection requires service or admin auth"})
 			return
 		}
-		excludeOwnerID := ownerID
+		var excludeOwnerID int64
 		if value := strings.TrimSpace(r.Header.Get("X-OAIX-Exclude-Owner")); value != "" {
 			parsed, parseErr := strconv.ParseInt(value, 10, 64)
 			if parseErr != nil || parsed <= 0 {

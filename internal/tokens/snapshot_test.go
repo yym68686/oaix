@@ -168,33 +168,47 @@ func TestManagerClaimLoadsOwnerSnapshotLazily(t *testing.T) {
 }
 
 func TestManagerMarketplaceClaimUsesGlobalSnapshot(t *testing.T) {
-	rows := makeTokens(2)
+	rows := makeTokens(3)
 	rows[0].OwnerUserID = 1
-	rows[0].ShareEnabled = true
-	rows[0].ShareStatus = "active"
+	rows[0].ShareEnabled = false
 	rows[1].OwnerUserID = 63910
-	rows[1].ShareEnabled = true
-	rows[1].ShareStatus = "active"
+	rows[1].ShareEnabled = false
+	rows[2].OwnerUserID = 63911
+	rows[2].ShareEnabled = true
+	rows[2].ShareStatus = "active"
 	source := &fakeSource{tokens: rows}
 	manager := NewManager(source, slog.Default(), time.Second, time.Second, 1)
+	manager.selector = FillFirstSelector{}
 	if err := manager.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh returned error: %v", err)
 	}
 
 	claim, err := manager.Claim(context.Background(), Intent{
+		OwnerUserID:   1,
+		SelectionMode: "marketplace",
+	})
+	if err != nil {
+		t.Fatalf("Claim returned error: %v", err)
+	}
+	if claim.Token.Token.ID != 1 {
+		t.Fatalf("claimed token = %d, want owner private token 1", claim.Token.Token.ID)
+	}
+	if claim.Token.Token.OwnerUserID != 1 {
+		t.Fatalf("claimed owner = %d, want 1", claim.Token.Token.OwnerUserID)
+	}
+	claim.Release()
+
+	claim, err = manager.Claim(context.Background(), Intent{
 		OwnerUserID:        1,
 		SelectionMode:      "marketplace",
 		ExcludeOwnerUserID: 1,
 	})
 	if err != nil {
-		t.Fatalf("Claim returned error: %v", err)
+		t.Fatalf("Claim with owner exclusion returned error: %v", err)
 	}
 	defer claim.Release()
-	if claim.Token.Token.ID != 2 {
-		t.Fatalf("claimed token = %d, want shared non-owner token 2", claim.Token.Token.ID)
-	}
-	if claim.Token.Token.OwnerUserID != 63910 {
-		t.Fatalf("claimed owner = %d, want 63910", claim.Token.Token.OwnerUserID)
+	if claim.Token.Token.ID != 3 {
+		t.Fatalf("claimed token = %d, want shared non-owner token 3", claim.Token.Token.ID)
 	}
 	if source.scopedCalls != 0 {
 		t.Fatalf("scoped source calls = %d, want marketplace to use global snapshot", source.scopedCalls)

@@ -239,12 +239,16 @@ func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 		return false
 	}
 	if strings.EqualFold(strings.TrimSpace(intent.SelectionMode), "marketplace") {
-		if !candidate.Token.ShareEnabled || !shareStatusSelectable(candidate.Token.ShareStatus) {
-			return false
-		}
 		if intent.ExcludeOwnerUserID > 0 && candidate.Token.OwnerUserID == intent.ExcludeOwnerUserID {
 			return false
 		}
+		if intent.OwnerUserID > 0 && candidate.Token.OwnerUserID == intent.OwnerUserID {
+			return true
+		}
+		if candidate.Token.ShareEnabled && shareStatusSelectable(candidate.Token.ShareStatus) {
+			return true
+		}
+		return false
 	} else if intent.OwnerUserID > 0 && candidate.Token.OwnerUserID != intent.OwnerUserID {
 		return false
 	}

@@ -65,11 +65,10 @@ func TestPromptAffinitySelectorSkipsExcludedPreferredToken(t *testing.T) {
 	}
 }
 
-func TestMarketplaceSelectionRequiresSharedTokenAndExcludesOwner(t *testing.T) {
+func TestMarketplaceSelectionIncludesOwnerPrivateAndSharedTokens(t *testing.T) {
 	rows := makeTokens(3)
 	rows[0].OwnerUserID = 10
-	rows[0].ShareEnabled = true
-	rows[0].ShareStatus = "active"
+	rows[0].ShareEnabled = false
 	rows[1].OwnerUserID = 20
 	rows[1].ShareEnabled = false
 	rows[2].OwnerUserID = 30
@@ -81,6 +80,16 @@ func TestMarketplaceSelectionRequiresSharedTokenAndExcludesOwner(t *testing.T) {
 	}
 	var cursor uint64
 	token, reason := FillFirstSelector{}.Select(context.Background(), manager.Snapshot(), Intent{
+		OwnerUserID:   10,
+		SelectionMode: "marketplace",
+	}, 1, &cursor)
+	if token == nil || token.Token.ID != 1 {
+		t.Fatalf("selected token=%v reason=%s, want owner private token 1", token, reason)
+	}
+
+	cursor = 0
+	token, reason = FillFirstSelector{}.Select(context.Background(), manager.Snapshot(), Intent{
+		OwnerUserID:        10,
 		SelectionMode:      "marketplace",
 		ExcludeOwnerUserID: 10,
 	}, 1, &cursor)
