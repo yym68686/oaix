@@ -279,6 +279,56 @@ export type SettingItem = {
   updated_at?: string | null;
 };
 
+export type Sub2APITarget = {
+  id: number;
+  name: string;
+  base_url: string;
+  admin_key_set?: boolean;
+  enabled: boolean;
+  owner_user_id: number;
+  owner_email?: string | null;
+  plan_filters?: string[];
+  target_group_ids?: number[];
+  target_group_names?: string[];
+  check_interval_seconds: number;
+  min_available: number;
+  top_up_batch_size: number;
+  auto_sync_new: boolean;
+  last_checked_at?: string | null;
+  last_synced_at?: string | null;
+  last_status?: string | null;
+  last_error?: string | null;
+  last_remote_count?: number | null;
+  last_synced_count?: number;
+  last_run_id?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type Sub2APIGroup = {
+  id: number;
+  name: string;
+  platform?: string;
+  status?: string;
+};
+
+export type Sub2APIRun = {
+  id: number;
+  target_id: number;
+  trigger: string;
+  status: string;
+  remote_count: number;
+  threshold: number;
+  needed_count: number;
+  selected_count: number;
+  synced_count: number;
+  failed_count: number;
+  error_message?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  details?: Record<string, unknown>;
+};
+
 export type HealthResponse = {
   ok?: boolean;
   degraded?: boolean;
@@ -578,4 +628,24 @@ export const api = {
   adminRequestsExportURL: (params = new URLSearchParams()) => `/api/admin/requests/export?${params.toString()}`,
   adminAuditLogs: (limit = 100) =>
     requestJSON<{ items?: Array<Record<string, unknown>>; pagination?: Pagination }>(`/api/admin/audit-logs?limit=${limit}`),
+  sub2APITargets: () => requestJSON<{ items?: Sub2APITarget[] }>("/api/admin/sub2api/targets"),
+  createSub2APITarget: (payload: Record<string, unknown>) =>
+    postJSON<{ target?: Sub2APITarget }>("/api/admin/sub2api/targets", payload),
+  updateSub2APITarget: (id: number, payload: Record<string, unknown>) =>
+    patchJSON<{ target?: Sub2APITarget }>(`/api/admin/sub2api/targets/${id}`, payload),
+  deleteSub2APITarget: (id: number) =>
+    deleteJSON<Record<string, unknown>>(`/api/admin/sub2api/targets/${id}`),
+  sub2APITargetGroups: (id: number) =>
+    requestJSON<{ items?: Sub2APIGroup[] }>(`/api/admin/sub2api/targets/${id}/groups`),
+  probeSub2APIGroups: (payload: Record<string, unknown>) =>
+    postJSON<{ items?: Sub2APIGroup[] }>("/api/admin/sub2api/probe-groups", payload),
+  checkSub2APITarget: (id: number) =>
+    postJSON<{ run?: Sub2APIRun }>(`/api/admin/sub2api/targets/${id}/check`, {}),
+  syncSub2APITarget: (id: number) =>
+    postJSON<{ run?: Sub2APIRun }>(`/api/admin/sub2api/targets/${id}/sync`, {}),
+  sub2APIRuns: (targetID?: number, limit = 80) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (targetID) params.set("target_id", String(targetID));
+    return requestJSON<{ items?: Sub2APIRun[] }>(`/api/admin/sub2api/runs?${params.toString()}`);
+  },
 };

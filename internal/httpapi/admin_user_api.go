@@ -31,6 +31,7 @@ func (a *App) registerPlatformAdminAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/requests/export", a.requireAuth(a.exportRequests))
 	mux.HandleFunc("GET /api/admin/audit-logs", a.requireAuth(a.listPlatformAuditLogs))
 	mux.HandleFunc("GET /api/admin/audit-logs/{audit_id}", a.requireAuth(a.getPlatformAuditLog))
+	a.registerSub2APIAdminRoutes(mux)
 }
 
 func requirePlatformAdmin(w http.ResponseWriter, r *http.Request) (*AuthContext, bool) {

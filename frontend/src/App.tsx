@@ -8,6 +8,7 @@ import { RuntimePage } from "@/features/runtime/RuntimePage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
 import { AccountAPIKeysPage, AccountPage } from "@/features/account/AccountPages";
 import { AdminAuditPage, AdminPoolsPage, AdminRequestsPage, AdminUserDetailPage, AdminUsersPage } from "@/features/admin/AdminPages";
+import { AdminSub2APIPage } from "@/features/admin/Sub2APIPage";
 import { api, hasServiceKey, isAdminPrincipal, isSelfUserMode, setAuthContext, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
 import { applyTheme, errorMessage, readThemePreference } from "@/shared/domain";
 import { EmptyState, ToastStack } from "@/shared/components";
@@ -127,6 +128,8 @@ export function App(): React.ReactElement {
     page = <AdminRequestsPage refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_audit") {
     page = <AdminAuditPage refreshNonce={refreshNonce} />;
+  } else if (route.key === "admin_sub2api") {
+    page = <AdminSub2APIPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "imports" || route.key === "import_new") {
     page = <ImportsPage pushToast={pushToast} refreshNonce={refreshNonce} route={route} />;
   } else if (route.key === "requests") {

@@ -479,6 +479,60 @@ var migrationStatements = []string{
 	`create index if not exists ix_codex_tokens_owner_plan on codex_tokens(owner_user_id, plan_type)`,
 	`create index if not exists ix_token_import_jobs_owner_submitted on token_import_jobs(owner_user_id, submitted_at desc)`,
 	`create index if not exists ix_token_import_items_owner_job_status on token_import_items(owner_user_id, job_id, status)`,
+	`create table if not exists sub2api_sync_targets (
+		id bigserial primary key,
+		name varchar(128) not null,
+		base_url text not null,
+		admin_key text not null,
+		enabled boolean not null default true,
+		owner_user_id bigint references platform_users(id),
+		plan_filters text[] not null default '{}',
+		target_group_ids bigint[] not null default '{}',
+		target_group_names text[] not null default '{}',
+		check_interval_seconds integer not null default 300,
+		min_available integer not null default 10,
+		top_up_batch_size integer not null default 10,
+		auto_sync_new boolean not null default false,
+		last_checked_at timestamptz,
+		last_synced_at timestamptz,
+		last_status varchar(32),
+		last_error text,
+		last_remote_count integer,
+		last_synced_count integer not null default 0,
+		last_run_id bigint,
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now()
+	)`,
+	`create index if not exists ix_sub2api_sync_targets_enabled_check on sub2api_sync_targets(enabled, last_checked_at)`,
+	`create table if not exists sub2api_sync_runs (
+		id bigserial primary key,
+		target_id bigint not null references sub2api_sync_targets(id) on delete cascade,
+		trigger varchar(32) not null,
+		status varchar(32) not null,
+		remote_count integer not null default 0,
+		threshold integer not null default 0,
+		needed_count integer not null default 0,
+		selected_count integer not null default 0,
+		synced_count integer not null default 0,
+		failed_count integer not null default 0,
+		error_message text,
+		started_at timestamptz not null default now(),
+		finished_at timestamptz,
+		details jsonb
+	)`,
+	`create index if not exists ix_sub2api_sync_runs_target_started on sub2api_sync_runs(target_id, started_at desc)`,
+	`create table if not exists sub2api_sync_mappings (
+		target_id bigint not null references sub2api_sync_targets(id) on delete cascade,
+		token_id integer not null references codex_tokens(id) on delete cascade,
+		remote_account_id bigint,
+		last_run_id bigint references sub2api_sync_runs(id) on delete set null,
+		status varchar(32) not null default 'synced',
+		error_message text,
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now(),
+		primary key(target_id, token_id)
+	)`,
+	`create index if not exists ix_sub2api_sync_mappings_token on sub2api_sync_mappings(token_id)`,
 }
 
 var onlineMigrationStatements = []string{
@@ -490,6 +544,9 @@ var onlineMigrationStatements = []string{
 }
 
 var downMigrationStatements = []string{
+	`drop table if exists sub2api_sync_mappings`,
+	`drop table if exists sub2api_sync_runs`,
+	`drop table if exists sub2api_sync_targets`,
 	`drop table if exists token_quota_snapshots`,
 	`drop table if exists openai_oauth_sessions`,
 	`drop table if exists admin_idempotency_keys`,

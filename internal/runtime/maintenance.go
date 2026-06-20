@@ -9,6 +9,7 @@ import (
 	"github.com/yym68686/oaix/internal/importer"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
+	"github.com/yym68686/oaix/internal/sub2api"
 	"github.com/yym68686/oaix/internal/tokens"
 )
 
@@ -22,9 +23,10 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 	workerCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	importWorker := newImportWorker(cfg)
+	sub2apiSyncer := sub2api.NewSyncer(db, nil, logger, cfg.Upstream.OAuthClientID)
 	go func() {
 		defer close(done)
-		runMaintenanceOnce(workerCtx, cfg, logger, db, tokenManager, importWorker, true)
+		runMaintenanceOnce(workerCtx, cfg, logger, db, tokenManager, importWorker, sub2apiSyncer, true)
 		aggregationInterval := cfg.RequestLog.AggregationWindow
 		if aggregationInterval <= 0 {
 			aggregationInterval = time.Minute
@@ -42,7 +44,7 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 			case <-workerCtx.Done():
 				return
 			case <-ticker.C:
-				runMaintenanceOnce(workerCtx, cfg, logger, db, tokenManager, importWorker, false)
+				runMaintenanceOnce(workerCtx, cfg, logger, db, tokenManager, importWorker, sub2apiSyncer, false)
 			case <-cleanupTicker.C:
 				runRequestLogCleanup(workerCtx, cfg, logger, db)
 			}
@@ -72,7 +74,7 @@ func newImportWorker(cfg config.Config) *importer.Worker {
 	}
 }
 
-func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Logger, db *store.Store, tokenManager *tokens.Manager, importWorker *importer.Worker, includeCleanup bool) {
+func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Logger, db *store.Store, tokenManager *tokens.Manager, importWorker *importer.Worker, sub2apiSyncer *sub2api.Syncer, includeCleanup bool) {
 	runStep(ctx, logger, "request log outbox drain", 30*time.Second, func(stepCtx context.Context) error {
 		drained, err := db.DrainRequestLogOutbox(stepCtx, cfg.RequestLog.OutboxDrainBatch)
 		if err == nil && drained > 0 && logger != nil {
@@ -112,6 +114,16 @@ func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Log
 		reconciled, err := db.ReconcileRecordedTokenCosts(stepCtx)
 		if err == nil && reconciled && logger != nil {
 			logger.Info("request token costs reconciled")
+		}
+		return err
+	})
+	runStep(ctx, logger, "sub2api sync", maxDuration(30*time.Second, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
+		if sub2apiSyncer == nil {
+			return nil
+		}
+		runs, err := sub2apiSyncer.RunDueTargets(stepCtx)
+		if err == nil && len(runs) > 0 && logger != nil {
+			logger.Info("sub2api sync processed", "count", len(runs))
 		}
 		return err
 	})
@@ -167,6 +179,7 @@ func publishValidatedAccessTokens(ctx context.Context, db *store.Store, items []
 		updatesByJob[jobID] = append(updatesByJob[jobID], update)
 	}
 	published := 0
+	publishedJobIDs := make([]int64, 0, len(payloadsByJob))
 	for jobID, payloads := range payloadsByJob {
 		result, err := db.PublishImportPayloads(ctx, jobID, payloads, "embedded_import_worker")
 		if err != nil {
@@ -201,7 +214,15 @@ func publishValidatedAccessTokens(ctx context.Context, db *store.Store, items []
 				logger.Warn("import item publish status update failed", "job_id", jobID, "error", err)
 			}
 		}
-		published += result.Created + result.Updated
+		if result.Created+result.Updated > 0 {
+			published += result.Created + result.Updated
+			publishedJobIDs = append(publishedJobIDs, jobID)
+		}
+	}
+	if published > 0 {
+		if err := db.MarkSub2APITargetsDueForImportJobs(ctx, publishedJobIDs); err != nil && logger != nil {
+			logger.Warn("sub2api sync due mark failed", "error", err)
+		}
 	}
 	return published
 }

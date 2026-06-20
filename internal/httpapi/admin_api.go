@@ -237,6 +237,12 @@ func adminOpenAPISpec() map[string]any {
 		"GET /api/admin/pool-summary", "GET /api/admin/pool-summary/by-user",
 		"GET /api/admin/analytics/users", "GET /api/admin/requests", "GET /api/admin/requests/export",
 		"GET /api/admin/audit-logs", "GET /api/admin/audit-logs/{audit_id}",
+		"GET /api/admin/sub2api/targets", "POST /api/admin/sub2api/targets",
+		"GET /api/admin/sub2api/targets/{target_id}", "PATCH /api/admin/sub2api/targets/{target_id}",
+		"DELETE /api/admin/sub2api/targets/{target_id}", "GET /api/admin/sub2api/targets/{target_id}/groups",
+		"POST /api/admin/sub2api/targets/{target_id}/check", "POST /api/admin/sub2api/targets/{target_id}/sync",
+		"GET /api/admin/sub2api/targets/{target_id}/runs", "POST /api/admin/sub2api/probe-groups",
+		"GET /api/admin/sub2api/runs",
 	}
 	paths := map[string]any{}
 	for _, route := range routes {

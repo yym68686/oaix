@@ -16,7 +16,8 @@ export type RouteKey =
   | "admin_user_detail"
   | "admin_pools"
   | "admin_requests"
-  | "admin_audit";
+  | "admin_audit"
+  | "admin_sub2api";
 
 export type ToastMessage = {
   id: number;
