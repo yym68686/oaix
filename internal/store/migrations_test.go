@@ -52,6 +52,19 @@ func TestOnlineMigrationStatementsUseConcurrentIndexes(t *testing.T) {
 	}
 }
 
+func TestSharedTokenIndexRunsAfterShareColumnsExist(t *testing.T) {
+	for index, statement := range migrationStatements {
+		normalized := strings.ToLower(strings.Join(strings.Fields(statement), " "))
+		if strings.Contains(normalized, "ix_codex_tokens_shared_ready") {
+			t.Fatalf("migration statement %d creates shared token index before share columns are guaranteed to exist", index+1)
+		}
+	}
+	joinedOnline := strings.ToLower(strings.Join(onlineMigrationStatements, "\n"))
+	if !strings.Contains(joinedOnline, "ix_codex_tokens_shared_ready") {
+		t.Fatal("online migrations must create shared token readiness index")
+	}
+}
+
 func TestDownMigrationIsExplicitlyDestructive(t *testing.T) {
 	if len(downMigrationStatements) == 0 {
 		t.Fatal("down migration statements are empty")

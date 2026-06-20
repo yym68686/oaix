@@ -83,7 +83,6 @@ var migrationStatements = []string{
 		updated_at timestamptz not null default now()
 	)`,
 	`create index if not exists ix_codex_tokens_active_ready on codex_tokens (is_active, cooldown_until, last_used_at, id) where merged_into_token_id is null`,
-	`create index if not exists ix_codex_tokens_shared_ready on codex_tokens (share_enabled, share_status, is_active, cooldown_until, last_used_at, id) where merged_into_token_id is null`,
 	`create index if not exists ix_codex_tokens_account_id on codex_tokens (account_id)`,
 	`create index if not exists ix_codex_tokens_plan_type on codex_tokens (plan_type)`,
 	`create index if not exists ix_codex_tokens_refresh_token on codex_tokens (refresh_token)`,
