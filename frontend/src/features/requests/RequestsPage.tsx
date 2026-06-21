@@ -12,7 +12,7 @@ export function RequestsPage({ refreshNonce }: { refreshNonce: number }) {
   const [requests, setRequests] = useState<RequestItem[]>([]);
   const [summary, setSummary] = useState<RequestSummary>({});
   const [modelStats, setModelStats] = useState<Array<Record<string, unknown>>>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const loadRequests = useCallback(async () => {

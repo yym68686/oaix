@@ -5,7 +5,7 @@ import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from "@/regis
 import { Skeleton } from "@/registry/default/ui/skeleton";
 import { api, type HealthResponse, type TokenCounts } from "@/lib/api";
 import { formatNumber } from "@/lib/format";
-import { ErrorAlert, MiniMetric } from "@/shared/components";
+import { ErrorAlert, LoadingState, MiniMetric } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
 
 export function RuntimePage({
@@ -18,7 +18,7 @@ export function RuntimePage({
   refreshNonce: number;
 }) {
   const [runtime, setRuntime] = useState<Record<string, unknown> | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const statusCounts = useMemo(() => {
     const total = Math.max(1, counts.total || 0);
@@ -89,6 +89,8 @@ export function RuntimePage({
         <CardPanel className="grid gap-4">
           {error ? (
             <ErrorAlert title="Runtime 载入失败" message={error} />
+          ) : loading && !runtime ? (
+            <LoadingState label="正在载入 Runtime" />
           ) : (
             <>
               <div className="grid gap-3 sm:grid-cols-3">

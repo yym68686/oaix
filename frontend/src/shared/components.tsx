@@ -11,12 +11,11 @@ import type * as React from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
-import { Card, CardPanel } from "@/registry/default/ui/card";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/registry/default/ui/empty";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "@/registry/default/ui/select";
-import { Skeleton } from "@/registry/default/ui/skeleton";
+import { Spinner } from "@/registry/default/ui/spinner";
 import { cn } from "@/registry/default/lib/utils";
 import type { TokenItem, TokenProbeResponse, TokenQuotaWindow } from "@/lib/api";
 import { clamp, formatDate, formatNumber } from "@/lib/format";
@@ -162,20 +161,31 @@ export function ErrorAlert({ message, title }: { message: string; title: string 
   );
 }
 
-export function LoadingRows({ rows = 3 }: { rows?: number }) {
+export function LoadingState({
+  compact = false,
+  label = "正在载入数据",
+}: {
+  compact?: boolean;
+  label?: string;
+}) {
   return (
-    <div className="grid gap-3">
-      {Array.from({ length: rows }, (_, index) => (
-        <Card key={index} className="block">
-          <CardPanel className="grid flex-none gap-3 p-4">
-            <Skeleton className="h-5 w-56" />
-            <Skeleton className="h-4 w-full" />
-            <Skeleton className="h-4 w-3/4" />
-          </CardPanel>
-        </Card>
-      ))}
+    <div
+      aria-live="polite"
+      className={cn(
+        "flex min-h-40 flex-col items-center justify-center gap-3 rounded-lg border border-dashed bg-muted/24 text-muted-foreground",
+        compact ? "py-8" : "py-14",
+      )}
+      role="status"
+    >
+      <Spinner className="size-6 text-foreground" />
+      <span className="text-sm">{label}</span>
     </div>
   );
+}
+
+export function LoadingRows({ rows = 3 }: { rows?: number }) {
+  void rows;
+  return <LoadingState />;
 }
 
 export function ToastStack({ items }: { items: ToastMessage[] }) {

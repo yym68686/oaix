@@ -8,17 +8,19 @@ import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { api, isServicePrincipal, type APIKeyItem, type CreatedAPIKey, type MeResponse, type PoolSummaryResponse, type UsageSummary } from "@/lib/api";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
-import { EmptyState, ErrorAlert, MiniMetric } from "@/shared/components";
+import { EmptyState, ErrorAlert, LoadingState, MiniMetric } from "@/shared/components";
 import { errorMessage, planOptionsWithCounts } from "@/shared/domain";
 import type { ToastMessage } from "@/shared/types";
 
 export function AccountPage({ me, refreshNonce }: { me: MeResponse | null; refreshNonce: number }) {
   const [usage, setUsage] = useState<UsageSummary>({});
   const [pool, setPool] = useState<PoolSummaryResponse>({});
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const serviceOnly = Boolean(me && isServicePrincipal(me) && !me.user?.id);
 
   const load = useCallback(async () => {
+    setLoading(true);
     setError("");
     try {
       if (!me) {
@@ -36,6 +38,8 @@ export function AccountPage({ me, refreshNonce }: { me: MeResponse | null; refre
       setPool(poolPayload);
     } catch (caught) {
       setError(errorMessage(caught));
+    } finally {
+      setLoading(false);
     }
   }, [me, serviceOnly]);
 
@@ -59,6 +63,7 @@ export function AccountPage({ me, refreshNonce }: { me: MeResponse | null; refre
         </CardHeader>
         <CardPanel className="grid gap-4">
           {error && <ErrorAlert title="账号数据载入失败" message={error} />}
+          {loading && !pool.counts && !usage.total ? <LoadingState compact label="正在载入账号数据" /> : null}
           <div className="grid gap-3 md:grid-cols-4">
             <MiniMetric label={serviceOnly ? "凭证" : "邮箱"} value={serviceOnly ? "Service API Key" : user?.email || "-"} />
             <MiniMetric label="角色" value={me?.role || user?.role || "-"} />
@@ -98,13 +103,16 @@ export function AccountAPIKeysPage({ me, pushToast, refreshNonce }: { me: MeResp
   const [created, setCreated] = useState<CreatedAPIKey | null>(null);
   const [name, setName] = useState("web");
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const serviceOnly = Boolean(me && isServicePrincipal(me) && !me.user?.id);
 
   const load = useCallback(async () => {
+    setLoading(true);
     if (!me || serviceOnly) {
       setItems([]);
       setError("");
+      setLoading(false);
       return;
     }
     setError("");
@@ -113,6 +121,8 @@ export function AccountAPIKeysPage({ me, pushToast, refreshNonce }: { me: MeResp
       setItems(payload.items || []);
     } catch (caught) {
       setError(errorMessage(caught));
+    } finally {
+      setLoading(false);
     }
   }, [me, serviceOnly]);
 
@@ -195,7 +205,9 @@ export function AccountAPIKeysPage({ me, pushToast, refreshNonce }: { me: MeResp
             </div>
           </div>
         )}
-        {!items.length ? (
+        {loading && !items.length ? (
+          <LoadingState label="正在载入 API Key" />
+        ) : !items.length ? (
           <EmptyState title="暂无 API Key" description="创建后会显示 key prefix、角色和使用时间。" />
         ) : (
           <div className="overflow-hidden rounded-lg border">

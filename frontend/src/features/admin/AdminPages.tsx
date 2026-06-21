@@ -9,7 +9,7 @@ import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { api, type APIKeyItem, type CreatedAPIKey, type ImportBatch, type OwnerUsageSummary, type PlatformUser, type PoolSummaryResponse, type RequestItem, type TokenCounts, type TokenItem, type TokenPlanCount } from "@/lib/api";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
-import { EmptyState, ErrorAlert, MiniMetric, SelectField } from "@/shared/components";
+import { EmptyState, ErrorAlert, LoadingState, MiniMetric, SelectField } from "@/shared/components";
 import { errorMessage, planOptionsWithCounts, statusOptionsWithCounts } from "@/shared/domain";
 import { ApiKeyTable, ImportJobsTable, PoolSummaryCards, RequestLogsTable, TokenTable, UserSelector } from "@/shared/resourceTables";
 import type { ToastMessage } from "@/shared/types";
@@ -26,7 +26,7 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
   const [newEmail, setNewEmail] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [createdKey, setCreatedKey] = useState<CreatedAPIKey | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
@@ -112,59 +112,63 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
             <Input className="md:col-span-3" nativeInput readOnly value={createdKey.plaintext_key} />
           )}
         </div>
-        <div className="overflow-hidden rounded-lg border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>用户</TableHead>
-                <TableHead>角色</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>计划</TableHead>
-                <TableHead>账号池</TableHead>
-                <TableHead>请求</TableHead>
-                <TableHead>缓存 / 成本</TableHead>
-                <TableHead>最近活跃</TableHead>
-                <TableHead className="text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {users.map((user) => {
-                const counts = poolByUser[user.id] || {};
-                const usage = usageByUser[user.id] || {};
-                return (
-                <TableRow key={user.id}>
-                  <TableCell>
-                    <div className="grid gap-1">
-                      <strong>{user.email || `User #${user.id}`}</strong>
-                      <span className="text-muted-foreground text-xs">ID {user.id}</span>
-                    </div>
-                  </TableCell>
-                  <TableCell>{user.role}</TableCell>
-                  <TableCell>
-                    <Badge variant={user.status === "active" ? "success" : "warning"}>{user.status}</Badge>
-                  </TableCell>
-                  <TableCell>{user.plan || "-"}</TableCell>
-                  <TableCell className="text-xs">
-                    总 {formatNumber(counts.total)} · 有效 {formatNumber(counts.available ?? counts.active)} · 冷却 {formatNumber(counts.cooling)} · 禁用 {formatNumber(counts.disabled)}
-                  </TableCell>
-                  <TableCell className="text-xs">
-                    请求 {formatNumber(usage.request_count)} · 成功 {formatPercent(usage.success_rate)}
-                  </TableCell>
-                  <TableCell className="text-xs">
-                    缓存 {formatPercent(usage.cache_hit_ratio)} · {formatCurrency(usage.estimated_cost_usd || 0)}
-                  </TableCell>
-                  <TableCell>{formatDate(user.last_seen_at || user.last_login_at)}</TableCell>
-                  <TableCell className="text-right">
-                    <Button onClick={() => navigateTo(`/admin/users/${user.id}`)} size="xs" variant="outline">
-                      查看
-                    </Button>
-                  </TableCell>
+        {loading && !users.length ? (
+          <LoadingState label="正在载入用户" />
+        ) : (
+          <div className="overflow-hidden rounded-lg border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>用户</TableHead>
+                  <TableHead>角色</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead>计划</TableHead>
+                  <TableHead>账号池</TableHead>
+                  <TableHead>请求</TableHead>
+                  <TableHead>缓存 / 成本</TableHead>
+                  <TableHead>最近活跃</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
                 </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        </div>
+              </TableHeader>
+              <TableBody>
+                {users.map((user) => {
+                  const counts = poolByUser[user.id] || {};
+                  const usage = usageByUser[user.id] || {};
+                  return (
+                    <TableRow key={user.id}>
+                      <TableCell>
+                        <div className="grid gap-1">
+                          <strong>{user.email || `User #${user.id}`}</strong>
+                          <span className="text-muted-foreground text-xs">ID {user.id}</span>
+                        </div>
+                      </TableCell>
+                      <TableCell>{user.role}</TableCell>
+                      <TableCell>
+                        <Badge variant={user.status === "active" ? "success" : "warning"}>{user.status}</Badge>
+                      </TableCell>
+                      <TableCell>{user.plan || "-"}</TableCell>
+                      <TableCell className="text-xs">
+                        总 {formatNumber(counts.total)} · 有效 {formatNumber(counts.available ?? counts.active)} · 冷却 {formatNumber(counts.cooling)} · 禁用 {formatNumber(counts.disabled)}
+                      </TableCell>
+                      <TableCell className="text-xs">
+                        请求 {formatNumber(usage.request_count)} · 成功 {formatPercent(usage.success_rate)}
+                      </TableCell>
+                      <TableCell className="text-xs">
+                        缓存 {formatPercent(usage.cache_hit_ratio)} · {formatCurrency(usage.estimated_cost_usd || 0)}
+                      </TableCell>
+                      <TableCell>{formatDate(user.last_seen_at || user.last_login_at)}</TableCell>
+                      <TableCell className="text-right">
+                        <Button onClick={() => navigateTo(`/admin/users/${user.id}`)} size="xs" variant="outline">
+                          查看
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </div>
+        )}
         {!loading && !users.length && <EmptyState title="暂无用户" description="创建用户后会在这里显示。" />}
       </CardPanel>
     </Card>
@@ -183,10 +187,15 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
   const [auditItems, setAuditItems] = useState<Array<Record<string, unknown>>>([]);
   const [tab, setTab] = useState<"overview" | "tokens" | "imports" | "requests" | "api_keys" | "audit">("overview");
   const [createdKey, setCreatedKey] = useState<CreatedAPIKey | null>(null);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
-    if (!userID) return;
+    if (!userID) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     setError("");
     try {
       const [userResult, keysResult, tokenResult, importResult, requestResult, usageResult, auditResult] = await Promise.allSettled([
@@ -231,10 +240,13 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
       }
     } catch (caught) {
       setError(errorMessage(caught));
+    } finally {
+      setLoading(false);
     }
   }, [userID]);
 
   useEffect(() => {
+    setLoading(true);
     setUser(null);
     setAPIKeys([]);
     setTokens([]);
@@ -281,12 +293,16 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
         </CardHeader>
         <CardPanel className="grid gap-4">
           {error && <ErrorAlert title={error.startsWith("部分") ? "用户详情部分载入失败" : "用户详情载入失败"} message={error} />}
-          <div className="grid gap-3 md:grid-cols-4">
-            <MiniMetric label="角色" value={user?.role || "-"} />
-            <MiniMetric label="状态" value={user?.status || "-"} />
-            <MiniMetric label="Key 总数" value={pool.counts?.total || 0} />
-            <MiniMetric label="有效 Key" value={pool.counts?.available ?? pool.counts?.active ?? 0} />
-          </div>
+          {loading && !user ? (
+            <LoadingState compact label="正在载入用户详情" />
+          ) : (
+            <div className="grid gap-3 md:grid-cols-4">
+              <MiniMetric label="角色" value={user?.role || "-"} />
+              <MiniMetric label="状态" value={user?.status || "-"} />
+              <MiniMetric label="Key 总数" value={pool.counts?.total || 0} />
+              <MiniMetric label="有效 Key" value={pool.counts?.available ?? pool.counts?.active ?? 0} />
+            </div>
+          )}
         </CardPanel>
       </Card>
       <div className="flex flex-wrap gap-2">
@@ -316,9 +332,9 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
           </CardPanel>
         </Card>
       )}
-      {tab === "tokens" && <TokenTable items={tokens} scope={{ kind: "user", userId: userID }} />}
-      {tab === "imports" && <ImportJobsTable items={imports} scope={{ kind: "user", userId: userID }} />}
-      {tab === "requests" && <RequestLogsTable items={requests} scope={{ kind: "user", userId: userID }} />}
+      {tab === "tokens" && <TokenTable items={tokens} loading={loading && !tokens.length} scope={{ kind: "user", userId: userID }} />}
+      {tab === "imports" && <ImportJobsTable items={imports} loading={loading && !imports.length} scope={{ kind: "user", userId: userID }} />}
+      {tab === "requests" && <RequestLogsTable items={requests} loading={loading && !requests.length} scope={{ kind: "user", userId: userID }} />}
       {tab === "api_keys" && (
         <Card>
           <CardHeader>
@@ -331,11 +347,11 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
           </CardHeader>
           <CardPanel className="grid gap-3">
             {createdKey?.plaintext_key && <Input nativeInput readOnly value={createdKey.plaintext_key} />}
-            <ApiKeyTable items={apiKeys} onRevoke={(id) => void revokeAPIKey(id)} scope={{ kind: "user", userId: userID }} />
+            <ApiKeyTable items={apiKeys} loading={loading && !apiKeys.length} onRevoke={(id) => void revokeAPIKey(id)} scope={{ kind: "user", userId: userID }} />
           </CardPanel>
         </Card>
       )}
-      {tab === "audit" && <AuditMiniTable items={auditItems} />}
+      {tab === "audit" && <AuditMiniTable items={auditItems} loading={loading && !auditItems.length} />}
     </div>
   );
 }
@@ -343,9 +359,11 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
 export function AdminPoolsPage({ refreshNonce }: { refreshNonce: number }) {
   const [summary, setSummary] = useState<PoolSummaryResponse>({});
   const [byUser, setByUser] = useState<Array<{ user?: PlatformUser; counts?: TokenCounts; plan_counts?: TokenPlanCount[]; usage?: OwnerUsageSummary }>>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
+    setLoading(true);
     setError("");
     try {
       const params = new URLSearchParams({ limit: "100", hours: "24" });
@@ -354,6 +372,8 @@ export function AdminPoolsPage({ refreshNonce }: { refreshNonce: number }) {
       setByUser(users.items || []);
     } catch (caught) {
       setError(errorMessage(caught));
+    } finally {
+      setLoading(false);
     }
   }, []);
 
@@ -380,30 +400,36 @@ export function AdminPoolsPage({ refreshNonce }: { refreshNonce: number }) {
             </Badge>
           ))}
         </div>
-        <div className="overflow-hidden rounded-lg border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>用户</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>计划</TableHead>
-                <TableHead>请求</TableHead>
-                <TableHead>缓存 / 成本</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {byUser.map((item) => (
-                <TableRow key={item.user?.id}>
-                  <TableCell>{item.user?.email || `User #${item.user?.id}`}</TableCell>
-                  <TableCell>{statusOptionsWithCounts(item.counts || {}).map((option) => option.label).join(" · ")}</TableCell>
-                  <TableCell>{planOptionsWithCounts(item.plan_counts || []).slice(1, 5).map((option) => option.label).join(" · ")}</TableCell>
-                  <TableCell>请求 {formatNumber(item.usage?.request_count)} · 成功 {formatPercent(item.usage?.success_rate)}</TableCell>
-                  <TableCell>缓存 {formatPercent(item.usage?.cache_hit_ratio)} · {formatCurrency(item.usage?.estimated_cost_usd || 0)}</TableCell>
+        {loading && !byUser.length ? (
+          <LoadingState label="正在载入号池数据" />
+        ) : byUser.length ? (
+          <div className="overflow-hidden rounded-lg border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>用户</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead>计划</TableHead>
+                  <TableHead>请求</TableHead>
+                  <TableHead>缓存 / 成本</TableHead>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
+              </TableHeader>
+              <TableBody>
+                {byUser.map((item) => (
+                  <TableRow key={item.user?.id}>
+                    <TableCell>{item.user?.email || `User #${item.user?.id}`}</TableCell>
+                    <TableCell>{statusOptionsWithCounts(item.counts || {}).map((option) => option.label).join(" · ")}</TableCell>
+                    <TableCell>{planOptionsWithCounts(item.plan_counts || []).slice(1, 5).map((option) => option.label).join(" · ")}</TableCell>
+                    <TableCell>请求 {formatNumber(item.usage?.request_count)} · 成功 {formatPercent(item.usage?.success_rate)}</TableCell>
+                    <TableCell>缓存 {formatPercent(item.usage?.cache_hit_ratio)} · {formatCurrency(item.usage?.estimated_cost_usd || 0)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        ) : (
+          <EmptyState title="暂无用户号池" description="用户导入 Key 后会在这里显示。" />
+        )}
       </CardPanel>
     </Card>
   );
@@ -414,6 +440,7 @@ export function AdminRequestsPage({ refreshNonce }: { refreshNonce: number }) {
   const [userID, setUserID] = useState("");
   const [apiKeyID, setAPIKeyID] = useState("");
   const [model, setModel] = useState("");
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const requestParams = useCallback(() => {
@@ -425,12 +452,15 @@ export function AdminRequestsPage({ refreshNonce }: { refreshNonce: number }) {
   }, [apiKeyID, model, userID]);
 
   const load = useCallback(async () => {
+    setLoading(true);
     setError("");
     try {
       const payload = await api.adminRequests(requestParams());
       setItems(payload.items || []);
     } catch (caught) {
       setError(errorMessage(caught));
+    } finally {
+      setLoading(false);
     }
   }, [requestParams]);
 
@@ -460,7 +490,7 @@ export function AdminRequestsPage({ refreshNonce }: { refreshNonce: number }) {
           onUserIDChange={setUserID}
           userID={userID}
         />
-        <RequestLogsTable items={items} scope={{ kind: "all" }} />
+        <RequestLogsTable items={items} loading={loading && !items.length} scope={{ kind: "all" }} />
       </CardPanel>
     </Card>
   );
@@ -468,15 +498,19 @@ export function AdminRequestsPage({ refreshNonce }: { refreshNonce: number }) {
 
 export function AdminAuditPage({ refreshNonce }: { refreshNonce: number }) {
   const [items, setItems] = useState<Array<Record<string, unknown>>>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
+    setLoading(true);
     setError("");
     try {
       const payload = await api.adminAuditLogs(120);
       setItems(payload.items || []);
     } catch (caught) {
       setError(errorMessage(caught));
+    } finally {
+      setLoading(false);
     }
   }, []);
 
@@ -495,28 +529,34 @@ export function AdminAuditPage({ refreshNonce }: { refreshNonce: number }) {
       </CardHeader>
       <CardPanel className="grid gap-3">
         {error && <ErrorAlert title="审计日志载入失败" message={error} />}
-        <div className="overflow-hidden rounded-lg border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>时间</TableHead>
-                <TableHead>动作</TableHead>
-                <TableHead>Actor</TableHead>
-                <TableHead>目标</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {items.map((item, index) => (
-                <TableRow key={String(item.id || index)}>
-                  <TableCell>{formatDate(String(item.created_at || ""))}</TableCell>
-                  <TableCell>{String(item.action || "-")}</TableCell>
-                  <TableCell>{String(item.actor || "-")}</TableCell>
-                  <TableCell>{String(item.target_type || "-")} {String(item.target_id || "")}</TableCell>
+        {loading && !items.length ? (
+          <LoadingState label="正在载入审计日志" />
+        ) : items.length ? (
+          <div className="overflow-hidden rounded-lg border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>时间</TableHead>
+                  <TableHead>动作</TableHead>
+                  <TableHead>Actor</TableHead>
+                  <TableHead>目标</TableHead>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
+              </TableHeader>
+              <TableBody>
+                {items.map((item, index) => (
+                  <TableRow key={String(item.id || index)}>
+                    <TableCell>{formatDate(String(item.created_at || ""))}</TableCell>
+                    <TableCell>{String(item.action || "-")}</TableCell>
+                    <TableCell>{String(item.actor || "-")}</TableCell>
+                    <TableCell>{String(item.target_type || "-")} {String(item.target_id || "")}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        ) : (
+          <EmptyState title="暂无审计记录" description="用户、API Key、导入和管理操作会在这里显示。" />
+        )}
       </CardPanel>
     </Card>
   );
@@ -591,7 +631,10 @@ function ImportJobsMiniTable({ items }: { items: ImportBatch[] }) {
   );
 }
 
-function AuditMiniTable({ items }: { items: Array<Record<string, unknown>> }) {
+function AuditMiniTable({ items, loading = false }: { items: Array<Record<string, unknown>>; loading?: boolean }) {
+  if (loading && !items.length) {
+    return <LoadingState label="正在载入审计记录" />;
+  }
   if (!items.length) {
     return <EmptyState title="暂无审计记录" description="该用户相关操作会在这里显示。" />;
   }

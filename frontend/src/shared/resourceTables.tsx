@@ -5,7 +5,7 @@ import { Input } from "@/registry/default/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import type { APIKeyItem, ImportBatch, PoolSummaryResponse, RequestItem, TokenItem } from "@/lib/api";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
-import { EmptyState, MiniMetric, SelectField } from "@/shared/components";
+import { EmptyState, LoadingState, MiniMetric, SelectField } from "@/shared/components";
 
 export type ResourceScope = { kind: "all" } | { kind: "user"; userId: number };
 
@@ -75,8 +75,21 @@ export function UserSelector({
   );
 }
 
-export function ApiKeyTable({ items, onRevoke, scope }: { items: APIKeyItem[]; onRevoke?: (id: number) => void; scope?: ResourceScope }) {
+export function ApiKeyTable({
+  items,
+  loading = false,
+  onRevoke,
+  scope,
+}: {
+  items: APIKeyItem[];
+  loading?: boolean;
+  onRevoke?: (id: number) => void;
+  scope?: ResourceScope;
+}) {
   void scope;
+  if (loading && !items.length) {
+    return <LoadingState label="正在载入 API Key" />;
+  }
   if (!items.length) {
     return <EmptyState title="暂无 API Key" description="新建后会在这里显示。" />;
   }
@@ -114,8 +127,19 @@ export function ApiKeyTable({ items, onRevoke, scope }: { items: APIKeyItem[]; o
   );
 }
 
-export function ImportJobsTable({ items, scope }: { items: ImportBatch[]; scope?: ResourceScope }) {
+export function ImportJobsTable({
+  items,
+  loading = false,
+  scope,
+}: {
+  items: ImportBatch[];
+  loading?: boolean;
+  scope?: ResourceScope;
+}) {
   void scope;
+  if (loading && !items.length) {
+    return <LoadingState label="正在载入导入批次" />;
+  }
   if (!items.length) {
     return <EmptyState title="暂无导入批次" description="没有匹配的导入任务。" />;
   }
@@ -149,8 +173,19 @@ export function ImportJobsTable({ items, scope }: { items: ImportBatch[]; scope?
   );
 }
 
-export function RequestLogsTable({ items, scope }: { items: RequestItem[]; scope?: ResourceScope }) {
+export function RequestLogsTable({
+  items,
+  loading = false,
+  scope,
+}: {
+  items: RequestItem[];
+  loading?: boolean;
+  scope?: ResourceScope;
+}) {
   void scope;
+  if (loading && !items.length) {
+    return <LoadingState label="正在载入请求" />;
+  }
   if (!items.length) {
     return <EmptyState title="暂无请求" description="有流量后会在这里显示。" />;
   }
@@ -186,8 +221,19 @@ export function RequestLogsTable({ items, scope }: { items: RequestItem[]; scope
   );
 }
 
-export function TokenTable({ items, scope }: { items: TokenItem[]; scope?: ResourceScope }) {
+export function TokenTable({
+  items,
+  loading = false,
+  scope,
+}: {
+  items: TokenItem[];
+  loading?: boolean;
+  scope?: ResourceScope;
+}) {
   void scope;
+  if (loading && !items.length) {
+    return <LoadingState label="正在载入 Key" />;
+  }
   if (!items.length) {
     return <EmptyState title="暂无 Key" description="没有匹配的 Key。" />;
   }

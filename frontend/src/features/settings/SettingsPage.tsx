@@ -9,7 +9,7 @@ import { Textarea } from "@/registry/default/ui/textarea";
 import { cn } from "@/registry/default/lib/utils";
 import { api, type SettingItem } from "@/lib/api";
 import { clamp } from "@/lib/format";
-import { EmptyState, ErrorAlert } from "@/shared/components";
+import { EmptyState, ErrorAlert, LoadingState } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
 import type { ToastMessage } from "@/shared/types";
 
@@ -28,7 +28,7 @@ export function SettingsPage({
   const [selectionSummary, setSelectionSummary] = useState("等待载入");
   const [settingKey, setSettingKey] = useState("");
   const [settingValue, setSettingValue] = useState("{\n  \"enabled\": true\n}");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const loadTokenSelection = useCallback(async () => {
@@ -143,6 +143,7 @@ export function SettingsPage({
             <ErrorAlert title="设置载入失败" message={error} />
           ) : (
             <div className="grid gap-2">
+              {loading && !items.length && <LoadingState compact label="正在载入设置项" />}
               {items.map((item) => (
                 <div className="rounded-lg border bg-muted/40 p-3" key={item.key}>
                   <div className="font-medium text-sm">{item.key}</div>

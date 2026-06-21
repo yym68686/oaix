@@ -117,7 +117,7 @@ function KeyListPage({
   const [tokenTotal, setTokenTotal] = useState(0);
   const [counts, setCounts] = useState<TokenCounts>({});
   const [planCounts, setPlanCounts] = useState<TokenPlanCount[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
   const [probeBusyIds, setProbeBusyIds] = useState<Set<number>>(() => new Set());
@@ -636,7 +636,7 @@ function KeyDetailPage({
 }) {
   const [token, setToken] = useState<TokenItem | null>(null);
   const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [probeBusy, setProbeBusy] = useState(false);
   const [probeResult, setProbeResult] = useState<TokenProbeResponse | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
@@ -644,6 +644,7 @@ function KeyDetailPage({
   const loadToken = useCallback(async () => {
     if (!Number.isFinite(id) || id <= 0) {
       setError("无效的 Token ID");
+      setLoading(false);
       return;
     }
     setLoading(true);

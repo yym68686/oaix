@@ -461,7 +461,7 @@ function ImportBatchesPage({
   const [details, setDetails] = useState<Record<number, ImportBatchDetail>>({});
   const [detailErrors, setDetailErrors] = useState<Record<number, string>>({});
   const [detailLoadingId, setDetailLoadingId] = useState<number | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const handledOAuthResultRef = useRef("");
 

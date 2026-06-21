@@ -11,7 +11,7 @@ import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { api, type PlatformUser, type Sub2APIGroup, type Sub2APIRun, type Sub2APITarget, type TokenPlanCount } from "@/lib/api";
 import { formatDate, formatNumber } from "@/lib/format";
-import { EmptyState, ErrorAlert, MiniMetric, SelectField } from "@/shared/components";
+import { EmptyState, ErrorAlert, LoadingState, MiniMetric, SelectField } from "@/shared/components";
 import { errorMessage, normalizePlanValue, planLabel } from "@/shared/domain";
 import type { ToastMessage } from "@/shared/types";
 
@@ -73,7 +73,7 @@ export function AdminSub2APIPage({
   const [planCountsByUser, setPlanCountsByUser] = useState<Record<number, TokenPlanCount[]>>({});
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [targetDialogOpen, setTargetDialogOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [groupLoading, setGroupLoading] = useState(false);
   const [busyID, setBusyID] = useState<number | null>(null);
@@ -457,12 +457,13 @@ export function AdminSub2APIPage({
             <TargetTable
               busyID={busyID}
               items={targets}
+              loading={loading && !targets.length}
               onCheck={(target) => void runTarget(target, "check")}
               onDelete={(target) => void deleteTarget(target)}
               onEdit={editTarget}
               onSync={(target) => void runTarget(target, "sync")}
             />
-            <RunTable items={runs.slice(0, 12)} />
+            <RunTable items={runs.slice(0, 12)} loading={loading && !runs.length} />
           </CardPanel>
         </Card>
       </div>
@@ -526,6 +527,7 @@ function tokenStatusLabels(values?: string[] | null): string {
 function TargetTable({
   busyID,
   items,
+  loading,
   onCheck,
   onDelete,
   onEdit,
@@ -533,11 +535,15 @@ function TargetTable({
 }: {
   busyID: number | null;
   items: Sub2APITarget[];
+  loading: boolean;
   onCheck: (target: Sub2APITarget) => void;
   onDelete: (target: Sub2APITarget) => void;
   onEdit: (target: Sub2APITarget) => void;
   onSync: (target: Sub2APITarget) => void;
 }) {
+  if (loading && !items.length) {
+    return <LoadingState label="正在载入 Sub2API 目标" />;
+  }
   if (!items.length) {
     return <EmptyState title="暂无 Sub2API 目标" description="新增目标后会在这里显示。" />;
   }
@@ -610,7 +616,10 @@ function TargetTable({
   );
 }
 
-function RunTable({ items }: { items: Sub2APIRun[] }) {
+function RunTable({ items, loading }: { items: Sub2APIRun[]; loading: boolean }) {
+  if (loading && !items.length) {
+    return <LoadingState compact label="正在载入同步记录" />;
+  }
   if (!items.length) {
     return <EmptyState compact title="暂无同步记录" description="检查或同步后会生成运行记录。" />;
   }
