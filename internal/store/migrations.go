@@ -543,6 +543,8 @@ var onlineMigrationStatements = []string{
 	`create index concurrently if not exists ix_gateway_request_logs_account_cost on gateway_request_logs (account_id, estimated_cost_usd) where account_id is not null and estimated_cost_usd is not null`,
 	`create index concurrently if not exists ix_gateway_request_hourly_stats_bucket_start on gateway_request_hourly_stats (bucket_start desc)`,
 	`create index concurrently if not exists ix_codex_tokens_shared_ready on codex_tokens (share_enabled, share_status, is_active, cooldown_until, last_used_at, id) where merged_into_token_id is null`,
+	`create index concurrently if not exists ix_gateway_request_logs_owner_started on gateway_request_logs(owner_user_id, started_at desc) where owner_user_id is not null`,
+	`create index concurrently if not exists ix_gateway_request_logs_token_owner_started on gateway_request_logs(token_owner_user_id, started_at desc) where token_owner_user_id is not null`,
 }
 
 var downMigrationStatements = []string{

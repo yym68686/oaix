@@ -1587,10 +1587,11 @@ func requestLogOptionsFromRequest(r *http.Request) store.RequestLogListOptions {
 		RequestID: r.URL.Query().Get("request_id"), Model: r.URL.Query().Get("model"),
 		Endpoint: r.URL.Query().Get("endpoint"), TokenID: queryInt64(r, "token_id", 0),
 		AccountID: r.URL.Query().Get("account_id"), From: queryTime(r, "from"), To: queryTime(r, "to"),
-		OwnerUserID:  queryInt64(r, "user_id", 0),
-		APIKeyID:     queryInt64(r, "api_key_id", 0),
-		QueryError:   firstNonEmpty(r.URL.Query().Get("error"), r.URL.Query().Get("q")),
-		IncludeTotal: strings.EqualFold(r.URL.Query().Get("include_total"), "true"),
+		OwnerUserID:      queryInt64(r, "user_id", 0),
+		TokenOwnerUserID: queryInt64(r, "token_owner_user_id", 0),
+		APIKeyID:         queryInt64(r, "api_key_id", 0),
+		QueryError:       firstNonEmpty(r.URL.Query().Get("error"), r.URL.Query().Get("q")),
+		IncludeTotal:     strings.EqualFold(r.URL.Query().Get("include_total"), "true"),
 	}
 	if status := queryInt(r, "status_code", 0); status > 0 {
 		opts.StatusCode = &status

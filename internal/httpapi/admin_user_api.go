@@ -263,7 +263,16 @@ func (a *App) listPlatformUserRequests(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	a.writeRequestList(w, r, store.OwnerResources(userID))
+	opts := requestLogOptionsFromRequest(r)
+	opts.TokenOwnerUserID = userID
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	items, total, err := a.store.ListRequestLogsFilteredScoped(ctx, store.AllResources(), opts)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "pagination": pagination(opts.Limit, opts.Offset, len(items), total)})
 }
 
 func (a *App) listPlatformRequests(w http.ResponseWriter, r *http.Request) {
@@ -298,7 +307,7 @@ func (a *App) platformUserUsage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	counts, _ := a.store.TokenCountsScoped(ctx, store.OwnerResources(userID))
-	usageByOwner, _ := a.store.RequestUsageByOwner(ctx, []int64{userID}, queryInt(r, "hours", 24))
+	usageByOwner, _ := a.store.RequestUsageByTokenOwner(ctx, []int64{userID}, queryInt(r, "hours", 24))
 	writeJSON(w, http.StatusOK, map[string]any{"pool": counts, "usage": usageByOwner[userID]})
 }
 
@@ -344,7 +353,7 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 	for _, user := range users {
 		ownerIDs = append(ownerIDs, user.ID)
 	}
-	usageByOwner, _ := a.store.RequestUsageByOwner(ctx, ownerIDs, queryInt(r, "hours", 24))
+	usageByOwner, _ := a.store.RequestUsageByTokenOwner(ctx, ownerIDs, queryInt(r, "hours", 24))
 	items := make([]map[string]any, 0, len(users))
 	for _, user := range users {
 		counts, _ := a.store.TokenCountsScoped(ctx, store.OwnerResources(user.ID))

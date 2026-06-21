@@ -189,7 +189,7 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
     if (!userID) return;
     setError("");
     try {
-      const [userPayload, keysPayload, tokenPayload, importPayload, requestPayload, usagePayload, auditPayload] = await Promise.all([
+      const [userResult, keysResult, tokenResult, importResult, requestResult, usageResult, auditResult] = await Promise.allSettled([
         api.adminUser(userID),
         api.adminUserAPIKeys(userID),
         api.adminUserTokens(userID, new URLSearchParams({ limit: "50", include_quota: "true" })),
@@ -198,17 +198,53 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
         api.adminUserUsage(userID, 24),
         api.adminAuditLogs(200),
       ]);
-      setUser(userPayload.user || null);
-      setAPIKeys(keysPayload.items || []);
-      setTokens(tokenPayload.items || []);
-      setImports(importPayload.items || []);
-      setPool({ counts: tokenPayload.counts, plan_counts: tokenPayload.plan_counts });
-      setUsage(usagePayload.usage || {});
-      setRequests(requestPayload.items || []);
-      setAuditItems((auditPayload.items || []).filter((item) => String(item.target_id || "") === String(userID) || String((item.payload as any)?.user_id || "") === String(userID)).slice(0, 40));
+      const failures: string[] = [];
+      const read = <T,>(result: PromiseSettledResult<T>, label: string): T | null => {
+        if (result.status === "fulfilled") {
+          return result.value;
+        }
+        failures.push(`${label}: ${errorMessage(result.reason)}`);
+        return null;
+      };
+      const userPayload = read(userResult, "用户");
+      const keysPayload = read(keysResult, "API Key");
+      const tokenPayload = read(tokenResult, "Key");
+      const importPayload = read(importResult, "导入");
+      const requestPayload = read(requestResult, "请求");
+      const usagePayload = read(usageResult, "用量");
+      const auditPayload = read(auditResult, "审计");
+
+      if (userPayload) setUser(userPayload.user || null);
+      if (keysPayload) setAPIKeys(keysPayload.items || []);
+      if (tokenPayload) {
+        setTokens(tokenPayload.items || []);
+        setPool({ counts: tokenPayload.counts, plan_counts: tokenPayload.plan_counts });
+      }
+      if (importPayload) setImports(importPayload.items || []);
+      if (usagePayload) setUsage(usagePayload.usage || {});
+      if (requestPayload) setRequests(requestPayload.items || []);
+      if (auditPayload) {
+        setAuditItems((auditPayload.items || []).filter((item) => String(item.target_id || "") === String(userID) || String((item.payload as any)?.user_id || "") === String(userID)).slice(0, 40));
+      }
+      if (failures.length) {
+        setError(`部分用户详情载入失败：${failures.join("；")}`);
+      }
     } catch (caught) {
       setError(errorMessage(caught));
     }
+  }, [userID]);
+
+  useEffect(() => {
+    setUser(null);
+    setAPIKeys([]);
+    setTokens([]);
+    setImports([]);
+    setPool({});
+    setUsage({});
+    setRequests([]);
+    setAuditItems([]);
+    setCreatedKey(null);
+    setError("");
   }, [userID]);
 
   useEffect(() => {
@@ -244,7 +280,7 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
           </CardAction>
         </CardHeader>
         <CardPanel className="grid gap-4">
-          {error && <ErrorAlert title="用户详情载入失败" message={error} />}
+          {error && <ErrorAlert title={error.startsWith("部分") ? "用户详情部分载入失败" : "用户详情载入失败"} message={error} />}
           <div className="grid gap-3 md:grid-cols-4">
             <MiniMetric label="角色" value={user?.role || "-"} />
             <MiniMetric label="状态" value={user?.status || "-"} />

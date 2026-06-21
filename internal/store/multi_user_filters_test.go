@@ -7,12 +7,15 @@ import (
 
 func TestRequestLogWhereScopedSupportsOwnerAndAPIKeyFilters(t *testing.T) {
 	ownerID := int64(17)
-	where, args := requestLogWhereScoped(RequestLogListOptions{OwnerUserID: ownerID, APIKeyID: 23}, AllResources())
-	if len(args) != 2 || args[0] != ownerID || args[1] != int64(23) {
+	tokenOwnerID := int64(19)
+	where, args := requestLogWhereScoped(RequestLogListOptions{OwnerUserID: ownerID, TokenOwnerUserID: tokenOwnerID, APIKeyID: 23}, AllResources())
+	if len(args) != 3 || args[0] != ownerID || args[1] != tokenOwnerID || args[2] != int64(23) {
 		t.Fatalf("args = %#v", args)
 	}
-	if !strings.Contains(where, "owner_user_id = $1") || !strings.Contains(where, "api_key_id = $2") {
-		t.Fatalf("expected owner/api key filters in where: %s", where)
+	for _, fragment := range []string{"owner_user_id = $1", "token_owner_user_id = $2", "api_key_id = $3"} {
+		if !strings.Contains(where, fragment) {
+			t.Fatalf("missing %q in where: %s", fragment, where)
+		}
 	}
 }
 

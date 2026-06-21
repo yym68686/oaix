@@ -12,22 +12,23 @@ import (
 )
 
 type RequestLogListOptions struct {
-	Limit        int
-	Offset       int
-	IncludeTotal bool
-	RequestID    string
-	OwnerUserID  int64
-	APIKeyID     int64
-	Model        string
-	Endpoint     string
-	StatusCode   *int
-	Success      *bool
-	TokenID      int64
-	AccountID    string
-	Stream       *bool
-	From         *time.Time
-	To           *time.Time
-	QueryError   string
+	Limit            int
+	Offset           int
+	IncludeTotal     bool
+	RequestID        string
+	OwnerUserID      int64
+	TokenOwnerUserID int64
+	APIKeyID         int64
+	Model            string
+	Endpoint         string
+	StatusCode       *int
+	Success          *bool
+	TokenID          int64
+	AccountID        string
+	Stream           *bool
+	From             *time.Time
+	To               *time.Time
+	QueryError       string
 }
 
 type RequestUsageSummary struct {
@@ -191,6 +192,9 @@ func requestLogWhereScoped(opts RequestLogListOptions, scope ResourceScope) (str
 	if opts.OwnerUserID > 0 {
 		filters = append(filters, fmt.Sprintf("owner_user_id = %s", arg(opts.OwnerUserID)))
 	}
+	if opts.TokenOwnerUserID > 0 {
+		filters = append(filters, fmt.Sprintf("token_owner_user_id = %s", arg(opts.TokenOwnerUserID)))
+	}
 	if opts.APIKeyID > 0 {
 		filters = append(filters, fmt.Sprintf("api_key_id = %s", arg(opts.APIKeyID)))
 	}
@@ -311,6 +315,70 @@ func (s *Store) RequestUsageByOwner(ctx context.Context, ownerIDs []int64, hours
 		where owner_user_id = any($1)
 		  and bucket_start >= date_trunc('hour', now() - make_interval(hours => $2))
 		group by owner_user_id
+	`, ownerIDs, hours)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		item := OwnerUsageSummary{Hours: hours}
+		if err := rows.Scan(
+			&item.OwnerUserID, &item.RequestCount, &item.SuccessCount, &item.FailureCount,
+			&item.StreamingCount, &item.InputTokens, &item.CachedInputTokens, &item.TotalTokens,
+			&item.EstimatedCostUSD,
+		); err != nil {
+			return nil, err
+		}
+		if item.RequestCount > 0 {
+			item.SuccessRate = float64(item.SuccessCount) / float64(item.RequestCount)
+		}
+		if item.InputTokens > 0 {
+			item.CacheHitRatio = float64(item.CachedInputTokens) / float64(item.InputTokens)
+		}
+		out[item.OwnerUserID] = item
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, ownerID := range ownerIDs {
+		if _, ok := out[ownerID]; !ok {
+			out[ownerID] = OwnerUsageSummary{OwnerUserID: ownerID, Hours: hours}
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) RequestUsageByTokenOwner(ctx context.Context, ownerIDs []int64, hours int) (map[int64]OwnerUsageSummary, error) {
+	return s.requestUsageByRequestLogUserColumn(ctx, "token_owner_user_id", ownerIDs, hours)
+}
+
+func (s *Store) requestUsageByRequestLogUserColumn(ctx context.Context, column string, ownerIDs []int64, hours int) (map[int64]OwnerUsageSummary, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	out := make(map[int64]OwnerUsageSummary, len(ownerIDs))
+	if len(ownerIDs) == 0 {
+		return out, nil
+	}
+	if column != "owner_user_id" && column != "token_owner_user_id" {
+		return nil, fmt.Errorf("unsupported request usage column %q", column)
+	}
+	rows, err := s.pool.Query(ctx, `
+		select
+			`+column+`,
+			count(*)::bigint,
+			count(*) filter (where success = true)::bigint,
+			count(*) filter (where success = false)::bigint,
+			count(*) filter (where is_stream = true)::bigint,
+			coalesce(sum(input_tokens), 0)::bigint,
+			coalesce(sum(cached_input_tokens), 0)::bigint,
+			coalesce(sum(total_tokens), 0)::bigint,
+			coalesce(sum(estimated_cost_usd), 0)::float8
+		from gateway_request_logs
+		where `+column+` = any($1)
+		  and started_at >= now() - make_interval(hours => $2)
+		  and finished_at is not null
+		group by `+column+`
 	`, ownerIDs, hours)
 	if err != nil {
 		return nil, err

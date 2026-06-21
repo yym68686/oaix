@@ -306,6 +306,8 @@ func TestMultiUserAPIIsolationWithDatabase(t *testing.T) {
 func TestMultiUserAdminAndReadonlyPermissionsWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userB, _ := h.createUser(t, "admin-read-target")
+	tokenOwner, _ := h.createUser(t, "admin-token-owner")
+	caller, _ := h.createUser(t, "admin-caller")
 	readonlyUser, err := h.db.CreatePlatformUserWithPassword(context.Background(), "oaix-ro-"+strconv.FormatInt(time.Now().UnixNano(), 10)+"@example.test", "password123", "readonly", "user")
 	if err != nil {
 		t.Fatal(err)
@@ -318,6 +320,34 @@ func TestMultiUserAdminAndReadonlyPermissionsWithDatabase(t *testing.T) {
 	expectStatus(t, h.request(t, http.MethodGet, "/api/admin/users?limit=5", "service-test-key", ""), http.StatusOK)
 	expectStatus(t, h.request(t, http.MethodGet, "/api/admin/pool-summary", "service-test-key", ""), http.StatusOK)
 	expectStatus(t, h.request(t, http.MethodPatch, "/api/admin/users/"+strconv.FormatInt(userB.ID, 10), readonlyKey.PlaintextKey, `{"status":"disabled"}`), http.StatusForbidden)
+
+	now := time.Now().UTC()
+	success := true
+	tokenOwnerRequestID := "req-token-owner-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if err := h.db.UpsertRequestLogs(context.Background(), []store.RequestLog{{
+		RequestID:        tokenOwnerRequestID,
+		OwnerUserID:      &caller.ID,
+		TokenOwnerUserID: &tokenOwner.ID,
+		Endpoint:         "/v1/responses",
+		Model:            testStringPtr("gpt-5.5"),
+		IsStream:         true,
+		StatusCode:       testIntPtr(http.StatusOK),
+		Success:          &success,
+		StartedAt:        now,
+		FinishedAt:       &now,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	usagePayload := expectStatus(t, h.request(t, http.MethodGet, "/api/admin/users/"+strconv.FormatInt(tokenOwner.ID, 10)+"/usage", "service-test-key", ""), http.StatusOK)
+	usage, _ := usagePayload["usage"].(map[string]any)
+	if got := int64(usage["request_count"].(float64)); got != 1 {
+		t.Fatalf("token owner request_count = %d, want 1", got)
+	}
+	requestPayload := expectStatus(t, h.request(t, http.MethodGet, "/api/admin/users/"+strconv.FormatInt(tokenOwner.ID, 10)+"/requests?include_total=true", "service-test-key", ""), http.StatusOK)
+	items, _ := requestPayload["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("token owner request items = %d, want 1 payload=%v", len(items), requestPayload)
+	}
 }
 
 func TestMultiUserAPIKeyRevocationAndDisabledUserWithDatabase(t *testing.T) {
