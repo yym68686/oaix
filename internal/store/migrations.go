@@ -473,6 +473,7 @@ var migrationStatements = []string{
 	`update gateway_request_hourly_stats set owner_user_id = (select id from platform_users where email = 'platform@oaix.local') where owner_user_id is null`,
 	`update gateway_request_token_costs c set owner_user_id = t.owner_user_id from codex_tokens t where t.id = c.token_id and c.owner_user_id is null`,
 	`alter table gateway_request_hourly_stats drop constraint if exists gateway_request_hourly_stats_bucket_start_model_name_key`,
+	`alter table gateway_request_hourly_stats drop constraint if exists uq_gateway_request_hourly_stats_bucket_model`,
 	`alter table gateway_request_hourly_stats alter column owner_user_id set not null`,
 	`create unique index if not exists ux_gateway_request_hourly_stats_owner_bucket_model on gateway_request_hourly_stats(owner_user_id, bucket_start, model_name)`,
 	`create index if not exists ix_codex_tokens_owner_active_ready on codex_tokens(owner_user_id, is_active, cooldown_until, last_used_at, id) where merged_into_token_id is null`,

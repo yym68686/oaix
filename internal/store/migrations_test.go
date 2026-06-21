@@ -65,6 +65,20 @@ func TestSharedTokenIndexRunsAfterShareColumnsExist(t *testing.T) {
 	}
 }
 
+func TestMigrationDropsLegacyHourlyStatsConstraints(t *testing.T) {
+	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	required := []string{
+		"alter table gateway_request_hourly_stats drop constraint if exists gateway_request_hourly_stats_bucket_start_model_name_key",
+		"alter table gateway_request_hourly_stats drop constraint if exists uq_gateway_request_hourly_stats_bucket_model",
+		"create unique index if not exists ux_gateway_request_hourly_stats_owner_bucket_model",
+	}
+	for _, fragment := range required {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing hourly stats migration fragment %q", fragment)
+		}
+	}
+}
+
 func TestDownMigrationIsExplicitlyDestructive(t *testing.T) {
 	if len(downMigrationStatements) == 0 {
 		t.Fatal("down migration statements are empty")
