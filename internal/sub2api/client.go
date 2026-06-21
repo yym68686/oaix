@@ -27,6 +27,16 @@ type Group struct {
 	Status   string `json:"status"`
 }
 
+type Proxy struct {
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	Protocol     string `json:"protocol"`
+	Host         string `json:"host,omitempty"`
+	Port         int    `json:"port,omitempty"`
+	Status       string `json:"status"`
+	AccountCount int64  `json:"account_count,omitempty"`
+}
+
 type Account struct {
 	ID          int64          `json:"id"`
 	Name        string         `json:"name"`
@@ -53,6 +63,7 @@ type CreateAccountRequest struct {
 	Type                    string         `json:"type"`
 	Credentials             map[string]any `json:"credentials"`
 	Extra                   map[string]any `json:"extra,omitempty"`
+	ProxyID                 *int64         `json:"proxy_id,omitempty"`
 	Concurrency             int            `json:"concurrency"`
 	Priority                int            `json:"priority"`
 	GroupIDs                []int64        `json:"group_ids"`
@@ -94,6 +105,14 @@ func (c *Client) ListGroups(ctx context.Context, baseURL string, adminKey string
 		return nil, err
 	}
 	return groups, nil
+}
+
+func (c *Client) ListProxies(ctx context.Context, baseURL string, adminKey string) ([]Proxy, error) {
+	var proxies []Proxy
+	if err := c.doJSON(ctx, http.MethodGet, baseURL, adminKey, "/admin/proxies/all?with_count=true", nil, &proxies); err != nil {
+		return nil, err
+	}
+	return proxies, nil
 }
 
 func (c *Client) ListAccountsPage(ctx context.Context, baseURL string, adminKey string, groupID int64, page int, pageSize int) (AccountPage, error) {

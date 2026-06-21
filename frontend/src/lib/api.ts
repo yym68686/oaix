@@ -294,6 +294,9 @@ export type Sub2APITarget = {
   check_interval_seconds: number;
   min_available: number;
   top_up_batch_size: number;
+  account_concurrency: number;
+  account_priority: number;
+  proxy_id: number;
   auto_sync_new: boolean;
   last_checked_at?: string | null;
   last_synced_at?: string | null;
@@ -311,6 +314,16 @@ export type Sub2APIGroup = {
   name: string;
   platform?: string;
   status?: string;
+};
+
+export type Sub2APIProxy = {
+  id: number;
+  name: string;
+  protocol?: string;
+  host?: string;
+  port?: number;
+  status?: string;
+  account_count?: number;
 };
 
 export type Sub2APIRun = {
@@ -638,8 +651,12 @@ export const api = {
     deleteJSON<Record<string, unknown>>(`/api/admin/sub2api/targets/${id}`),
   sub2APITargetGroups: (id: number) =>
     requestJSON<{ items?: Sub2APIGroup[] }>(`/api/admin/sub2api/targets/${id}/groups`),
+  sub2APITargetProxies: (id: number) =>
+    requestJSON<{ items?: Sub2APIProxy[] }>(`/api/admin/sub2api/targets/${id}/proxies`),
   probeSub2APIGroups: (payload: Record<string, unknown>) =>
     postJSON<{ items?: Sub2APIGroup[] }>("/api/admin/sub2api/probe-groups", payload),
+  probeSub2APIProxies: (payload: Record<string, unknown>) =>
+    postJSON<{ items?: Sub2APIProxy[] }>("/api/admin/sub2api/probe-proxies", payload),
   checkSub2APITarget: (id: number) =>
     postJSON<{ run?: Sub2APIRun }>(`/api/admin/sub2api/targets/${id}/check`, {}),
   syncSub2APITarget: (id: number) =>

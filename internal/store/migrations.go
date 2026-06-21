@@ -494,6 +494,9 @@ var migrationStatements = []string{
 		check_interval_seconds integer not null default 300,
 		min_available integer not null default 10,
 		top_up_batch_size integer not null default 10,
+		account_concurrency integer not null default 10,
+		account_priority integer not null default 50,
+		proxy_id bigint not null default 0,
 		auto_sync_new boolean not null default false,
 		last_checked_at timestamptz,
 		last_synced_at timestamptz,
@@ -506,6 +509,9 @@ var migrationStatements = []string{
 		updated_at timestamptz not null default now()
 	)`,
 	`alter table sub2api_sync_targets add column if not exists token_status_filters text[] not null default array['available','cooling']::text[]`,
+	`alter table sub2api_sync_targets add column if not exists account_concurrency integer not null default 10`,
+	`alter table sub2api_sync_targets add column if not exists account_priority integer not null default 50`,
+	`alter table sub2api_sync_targets add column if not exists proxy_id bigint not null default 0`,
 	`create index if not exists ix_sub2api_sync_targets_enabled_check on sub2api_sync_targets(enabled, last_checked_at)`,
 	`create table if not exists sub2api_sync_runs (
 		id bigserial primary key,

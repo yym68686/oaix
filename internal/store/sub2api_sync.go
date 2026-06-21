@@ -22,6 +22,9 @@ const (
 	Sub2APITokenStatusAvailable = "available"
 	Sub2APITokenStatusCooling   = "cooling"
 	Sub2APITokenStatusDisabled  = "disabled"
+
+	Sub2APIDefaultAccountConcurrency = 10
+	Sub2APIDefaultAccountPriority    = 50
 )
 
 type Sub2APISyncTarget struct {
@@ -40,6 +43,9 @@ type Sub2APISyncTarget struct {
 	CheckIntervalSeconds int        `json:"check_interval_seconds"`
 	MinAvailable         int        `json:"min_available"`
 	TopUpBatchSize       int        `json:"top_up_batch_size"`
+	AccountConcurrency   int        `json:"account_concurrency"`
+	AccountPriority      int        `json:"account_priority"`
+	ProxyID              int64      `json:"proxy_id"`
 	AutoSyncNew          bool       `json:"auto_sync_new"`
 	LastCheckedAt        *time.Time `json:"last_checked_at,omitempty"`
 	LastSyncedAt         *time.Time `json:"last_synced_at,omitempty"`
@@ -65,6 +71,9 @@ type Sub2APISyncTargetInput struct {
 	CheckIntervalSeconds int
 	MinAvailable         int
 	TopUpBatchSize       int
+	AccountConcurrency   int
+	AccountPriority      *int
+	ProxyID              int64
 	AutoSyncNew          *bool
 }
 
@@ -121,7 +130,7 @@ func (s *Store) ListSub2APISyncTargets(ctx context.Context) ([]Sub2APISyncTarget
 	rows, err := s.pool.Query(ctx, `
 		select t.id, t.name, t.base_url, t.admin_key, t.enabled, coalesce(t.owner_user_id, 0), u.email,
 		       t.plan_filters, t.token_status_filters, t.target_group_ids, t.target_group_names,
-		       t.check_interval_seconds, t.min_available, t.top_up_batch_size, t.auto_sync_new,
+		       t.check_interval_seconds, t.min_available, t.top_up_batch_size, t.account_concurrency, t.account_priority, t.proxy_id, t.auto_sync_new,
 		       t.last_checked_at, t.last_synced_at, t.last_status, t.last_error,
 		       t.last_remote_count, t.last_synced_count, t.last_run_id,
 		       t.created_at, t.updated_at
@@ -148,7 +157,7 @@ func (s *Store) GetSub2APISyncTarget(ctx context.Context, id int64) (Sub2APISync
 	row := s.pool.QueryRow(ctx, `
 		select t.id, t.name, t.base_url, t.admin_key, t.enabled, coalesce(t.owner_user_id, 0), u.email,
 		       t.plan_filters, t.token_status_filters, t.target_group_ids, t.target_group_names,
-		       t.check_interval_seconds, t.min_available, t.top_up_batch_size, t.auto_sync_new,
+		       t.check_interval_seconds, t.min_available, t.top_up_batch_size, t.account_concurrency, t.account_priority, t.proxy_id, t.auto_sync_new,
 		       t.last_checked_at, t.last_synced_at, t.last_status, t.last_error,
 		       t.last_remote_count, t.last_synced_count, t.last_run_id,
 		       t.created_at, t.updated_at
@@ -170,15 +179,17 @@ func (s *Store) CreateSub2APISyncTarget(ctx context.Context, input Sub2APISyncTa
 	row := s.pool.QueryRow(ctx, `
 		insert into sub2api_sync_targets(
 			name, base_url, admin_key, enabled, owner_user_id, plan_filters, token_status_filters, target_group_ids, target_group_names,
-			check_interval_seconds, min_available, top_up_batch_size, auto_sync_new,
+			check_interval_seconds, min_available, top_up_batch_size, account_concurrency, account_priority, proxy_id, auto_sync_new,
 			last_status, updated_at
 		)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'idle', now())
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'idle', now())
 		returning id
 	`, normalizedSub2APIName(input.Name), normalizeSub2APIBaseURL(input.BaseURL), adminKey,
 		boolValue(input.Enabled, true), input.OwnerUserID,
 		normalizePlanFilters(input.PlanFilters), normalizeTokenStatusFilters(input.TokenStatusFilters), normalizeInt64IDs(input.TargetGroupIDs), normalizeStringList(input.TargetGroupNames),
 		normalizeCheckInterval(input.CheckIntervalSeconds), normalizeNonNegative(input.MinAvailable, 10), normalizePositive(input.TopUpBatchSize, 10),
+		normalizePositive(input.AccountConcurrency, Sub2APIDefaultAccountConcurrency),
+		normalizeSub2APIAccountPriority(input.AccountPriority), normalizeSub2APIProxyID(input.ProxyID),
 		boolValue(input.AutoSyncNew, false),
 	)
 	var id int64
@@ -212,7 +223,10 @@ func (s *Store) UpdateSub2APISyncTarget(ctx context.Context, id int64, input Sub
 		    check_interval_seconds = $12,
 		    min_available = $13,
 		    top_up_batch_size = $14,
-		    auto_sync_new = $15,
+		    account_concurrency = $15,
+		    account_priority = $16,
+		    proxy_id = $17,
+		    auto_sync_new = $18,
 		    updated_at = now()
 		where id = $1
 		returning id
@@ -220,6 +234,8 @@ func (s *Store) UpdateSub2APISyncTarget(ctx context.Context, id int64, input Sub
 		hasAdminKey, adminKey, boolValue(input.Enabled, true), input.OwnerUserID,
 		normalizePlanFilters(input.PlanFilters), normalizeTokenStatusFilters(input.TokenStatusFilters), normalizeInt64IDs(input.TargetGroupIDs), normalizeStringList(input.TargetGroupNames),
 		normalizeCheckInterval(input.CheckIntervalSeconds), normalizeNonNegative(input.MinAvailable, 10), normalizePositive(input.TopUpBatchSize, 10),
+		normalizePositive(input.AccountConcurrency, Sub2APIDefaultAccountConcurrency),
+		normalizeSub2APIAccountPriority(input.AccountPriority), normalizeSub2APIProxyID(input.ProxyID),
 		boolValue(input.AutoSyncNew, false),
 	)
 	var returnedID int64
@@ -270,7 +286,7 @@ func (s *Store) ClaimDueSub2APISyncTargets(ctx context.Context, limit int) ([]Su
 		returning t.id, t.name, t.base_url, t.admin_key, t.enabled, coalesce(t.owner_user_id, 0),
 		          (select email from platform_users where id = t.owner_user_id),
 		          t.plan_filters, t.token_status_filters, t.target_group_ids, t.target_group_names,
-		          t.check_interval_seconds, t.min_available, t.top_up_batch_size, t.auto_sync_new,
+		          t.check_interval_seconds, t.min_available, t.top_up_batch_size, t.account_concurrency, t.account_priority, t.proxy_id, t.auto_sync_new,
 		          t.last_checked_at, t.last_synced_at, t.last_status, t.last_error,
 		          t.last_remote_count, t.last_synced_count, t.last_run_id,
 		          t.created_at, t.updated_at
@@ -482,6 +498,12 @@ func validateSub2APISyncTargetInput(input Sub2APISyncTargetInput, requireAdminKe
 	if len(normalizeInt64IDs(input.TargetGroupIDs)) == 0 {
 		return errors.New("target_group_ids is required")
 	}
+	if input.AccountPriority != nil && *input.AccountPriority < 0 {
+		return errors.New("account_priority must be >= 0")
+	}
+	if input.ProxyID < 0 {
+		return errors.New("proxy_id must be >= 0")
+	}
 	return nil
 }
 
@@ -491,7 +513,7 @@ func scanSub2APISyncTarget(row rowScanner) (Sub2APISyncTarget, error) {
 	err := row.Scan(
 		&item.ID, &item.Name, &item.BaseURL, &item.AdminKey, &item.Enabled, &item.OwnerUserID, &ownerEmail,
 		&item.PlanFilters, &item.TokenStatusFilters, &item.TargetGroupIDs, &item.TargetGroupNames,
-		&item.CheckIntervalSeconds, &item.MinAvailable, &item.TopUpBatchSize, &item.AutoSyncNew,
+		&item.CheckIntervalSeconds, &item.MinAvailable, &item.TopUpBatchSize, &item.AccountConcurrency, &item.AccountPriority, &item.ProxyID, &item.AutoSyncNew,
 		&item.LastCheckedAt, &item.LastSyncedAt, &item.LastStatus, &item.LastError,
 		&item.LastRemoteCount, &item.LastSyncedCount, &item.LastRunID,
 		&item.CreatedAt, &item.UpdatedAt,
@@ -507,6 +529,9 @@ func scanSub2APISyncTarget(row rowScanner) (Sub2APISyncTarget, error) {
 	item.CheckIntervalSeconds = normalizeCheckInterval(item.CheckIntervalSeconds)
 	item.MinAvailable = normalizeNonNegative(item.MinAvailable, 10)
 	item.TopUpBatchSize = normalizePositive(item.TopUpBatchSize, 10)
+	item.AccountConcurrency = normalizePositive(item.AccountConcurrency, Sub2APIDefaultAccountConcurrency)
+	item.AccountPriority = normalizeNonNegative(item.AccountPriority, Sub2APIDefaultAccountPriority)
+	item.ProxyID = normalizeSub2APIProxyID(item.ProxyID)
 	return item, err
 }
 
@@ -727,6 +752,20 @@ func normalizePositive(value int, fallback int) int {
 	}
 	if value > 500 {
 		return 500
+	}
+	return value
+}
+
+func normalizeSub2APIAccountPriority(value *int) int {
+	if value == nil {
+		return Sub2APIDefaultAccountPriority
+	}
+	return normalizeNonNegative(*value, Sub2APIDefaultAccountPriority)
+}
+
+func normalizeSub2APIProxyID(value int64) int64 {
+	if value <= 0 {
+		return 0
 	}
 	return value
 }

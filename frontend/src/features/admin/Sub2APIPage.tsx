@@ -9,7 +9,7 @@ import { Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, Dial
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
-import { api, type PlatformUser, type Sub2APIGroup, type Sub2APIRun, type Sub2APITarget, type TokenPlanCount } from "@/lib/api";
+import { api, type PlatformUser, type Sub2APIGroup, type Sub2APIProxy, type Sub2APIRun, type Sub2APITarget, type TokenPlanCount } from "@/lib/api";
 import { formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert, LoadingState, MiniMetric, SelectField } from "@/shared/components";
 import { errorMessage, normalizePlanValue, planLabel } from "@/shared/domain";
@@ -29,6 +29,9 @@ type Draft = {
   check_interval_seconds: number;
   min_available: number;
   top_up_batch_size: number;
+  account_concurrency: number;
+  account_priority: number;
+  proxy_id: number;
   auto_sync_new: boolean;
 };
 
@@ -55,6 +58,9 @@ const EMPTY_DRAFT: Draft = {
   check_interval_seconds: 300,
   min_available: 10,
   top_up_batch_size: 10,
+  account_concurrency: 10,
+  account_priority: 50,
+  proxy_id: 0,
   auto_sync_new: false,
 };
 
@@ -69,6 +75,7 @@ export function AdminSub2APIPage({
   const [runs, setRuns] = useState<Sub2APIRun[]>([]);
   const [users, setUsers] = useState<PlatformUser[]>([]);
   const [groups, setGroups] = useState<Sub2APIGroup[]>([]);
+  const [proxies, setProxies] = useState<Sub2APIProxy[]>([]);
   const [globalPlanCounts, setGlobalPlanCounts] = useState<TokenPlanCount[]>([]);
   const [planCountsByUser, setPlanCountsByUser] = useState<Record<number, TokenPlanCount[]>>({});
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
@@ -76,9 +83,11 @@ export function AdminSub2APIPage({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [groupLoading, setGroupLoading] = useState(false);
+  const [proxyLoading, setProxyLoading] = useState(false);
   const [busyID, setBusyID] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [groupError, setGroupError] = useState("");
+  const [proxyError, setProxyError] = useState("");
 
   const userOptions = useMemo(() => {
     const options = users.map((user) => ({ label: `${user.email || `User #${user.id}`} · ${user.id}`, value: String(user.id) }));
@@ -97,6 +106,20 @@ export function AdminSub2APIPage({
     const sourceCounts = draft.owner_user_id > 0 ? planCountsByUser[draft.owner_user_id] || [] : globalPlanCounts;
     return planOptionsFromPool(sourceCounts, draft.plan_filters);
   }, [draft.owner_user_id, draft.plan_filters, globalPlanCounts, planCountsByUser]);
+
+  const proxyOptions = useMemo(() => {
+    const options = [{ label: "不使用代理", value: "0" }];
+    const seen = new Set<number>();
+    for (const proxy of proxies) {
+      if (!proxy.id || seen.has(proxy.id)) continue;
+      seen.add(proxy.id);
+      options.push({ label: proxyOptionLabel(proxy), value: String(proxy.id) });
+    }
+    if (draft.proxy_id > 0 && !seen.has(draft.proxy_id)) {
+      options.push({ label: `Proxy #${draft.proxy_id}`, value: String(draft.proxy_id) });
+    }
+    return options;
+  }, [draft.proxy_id, proxies]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -138,7 +161,9 @@ export function AdminSub2APIPage({
 
   function editTarget(target: Sub2APITarget) {
     setGroupError("");
+    setProxyError("");
     setGroups([]);
+    setProxies([]);
     setDraft({
       id: target.id,
       name: target.name || "",
@@ -153,15 +178,21 @@ export function AdminSub2APIPage({
       check_interval_seconds: Number(target.check_interval_seconds || 300),
       min_available: Number(target.min_available ?? 10),
       top_up_batch_size: Number(target.top_up_batch_size || 10),
+      account_concurrency: Number(target.account_concurrency || 10),
+      account_priority: Number(target.account_priority ?? 50),
+      proxy_id: Number(target.proxy_id || 0),
       auto_sync_new: Boolean(target.auto_sync_new),
     });
     setTargetDialogOpen(true);
+    void fetchProxiesFor({ targetID: target.id });
   }
 
   function resetDraft() {
     setDraft({ ...EMPTY_DRAFT });
     setGroups([]);
+    setProxies([]);
     setGroupError("");
+    setProxyError("");
   }
 
   function openCreateDialog() {
@@ -175,6 +206,11 @@ export function AdminSub2APIPage({
     if (!open) {
       resetDraft();
     }
+  }
+
+  function autoFetchProxiesFromFields(baseURL: string, adminKey: string) {
+    if (!baseURL.trim() || !adminKey.trim()) return;
+    void fetchProxiesFor({ baseURL, adminKey });
   }
 
   async function fetchGroups() {
@@ -196,6 +232,28 @@ export function AdminSub2APIPage({
     }
   }
 
+  async function fetchProxiesFor(params?: { targetID?: number; baseURL?: string; adminKey?: string }) {
+    setProxyLoading(true);
+    setProxyError("");
+    try {
+      const targetID = params?.targetID ?? draft.id;
+      const adminKey = params?.adminKey ?? draft.admin_key;
+      const baseURL = params?.baseURL ?? draft.base_url;
+      const payload = targetID && !adminKey.trim()
+        ? await api.sub2APITargetProxies(targetID)
+        : await api.probeSub2APIProxies({ base_url: baseURL, admin_key: adminKey });
+      const nextProxies = (payload.items || []).filter((proxy) => !proxy.status || proxy.status === "active");
+      setProxies(nextProxies);
+      if (!nextProxies.length) {
+        setProxyError("没有读取到可用代理。");
+      }
+    } catch (caught) {
+      setProxyError(errorMessage(caught));
+    } finally {
+      setProxyLoading(false);
+    }
+  }
+
   async function saveTarget() {
     setSaving(true);
     setError("");
@@ -213,6 +271,9 @@ export function AdminSub2APIPage({
         check_interval_seconds: Number(draft.check_interval_seconds || 300),
         min_available: Number(draft.min_available || 0),
         top_up_batch_size: Number(draft.top_up_batch_size || 10),
+        account_concurrency: Number(draft.account_concurrency || 10),
+        account_priority: Number(draft.account_priority ?? 50),
+        proxy_id: Number(draft.proxy_id || 0),
         auto_sync_new: draft.auto_sync_new,
       };
       if (draft.admin_key.trim()) {
@@ -319,10 +380,23 @@ export function AdminSub2APIPage({
             <Input nativeInput onChange={(event) => updateDraft({ name: event.currentTarget.value })} placeholder="s2a-prod" value={draft.name} />
           </Field>
           <Field label="Base URL">
-            <Input nativeInput onChange={(event) => updateDraft({ base_url: event.currentTarget.value })} placeholder="https://s2a.example.com" value={draft.base_url} />
+            <Input
+              nativeInput
+              onBlur={(event) => autoFetchProxiesFromFields(event.currentTarget.value, draft.admin_key)}
+              onChange={(event) => updateDraft({ base_url: event.currentTarget.value })}
+              placeholder="https://s2a.example.com"
+              value={draft.base_url}
+            />
           </Field>
           <Field label={draft.id ? "Admin Key（留空保留）" : "Admin Key"}>
-            <Input nativeInput onChange={(event) => updateDraft({ admin_key: event.currentTarget.value })} placeholder="admin-..." type="password" value={draft.admin_key} />
+            <Input
+              nativeInput
+              onBlur={(event) => autoFetchProxiesFromFields(draft.base_url, event.currentTarget.value)}
+              onChange={(event) => updateDraft({ admin_key: event.currentTarget.value })}
+              placeholder="admin-..."
+              type="password"
+              value={draft.admin_key}
+            />
           </Field>
           <SelectField label="OAIX 用户" onChange={(value) => updateDraft({ owner_user_id: Number(value) })} options={userOptions} value={String(draft.owner_user_id || "0")} />
         </div>
@@ -365,7 +439,7 @@ export function AdminSub2APIPage({
         <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <Label>Sub2API 分组</Label>
-            <Button disabled={groupLoading || (!draft.id && !draft.admin_key.trim())} onClick={() => void fetchGroups()} size="xs" variant="outline">
+            <Button disabled={groupLoading || (!draft.id && (!draft.base_url.trim() || !draft.admin_key.trim()))} onClick={() => void fetchGroups()} size="xs" variant="outline">
               <RefreshCwIcon />
               获取分组
             </Button>
@@ -393,7 +467,24 @@ export function AdminSub2APIPage({
           )}
         </div>
 
-        <div className="grid gap-3 md:grid-cols-3">
+        <div className="grid gap-2 rounded-lg border bg-muted/32 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Label>Sub2API 代理</Label>
+            <Button disabled={proxyLoading || (!draft.id && (!draft.base_url.trim() || !draft.admin_key.trim()))} onClick={() => void fetchProxiesFor()} size="xs" variant="outline">
+              <RefreshCwIcon />
+              获取代理
+            </Button>
+          </div>
+          {proxyError && (
+            <Alert variant="error">
+              <AlertTitle>代理读取失败</AlertTitle>
+              <AlertDescription>{proxyError}</AlertDescription>
+            </Alert>
+          )}
+          <SelectField label="代理" onChange={(value) => updateDraft({ proxy_id: Number(value) })} options={proxyOptions} value={String(draft.proxy_id || 0)} />
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-5">
           <Field label="检查间隔（秒）">
             <Input min={60} nativeInput onChange={(event) => updateDraft({ check_interval_seconds: Number(event.currentTarget.value) })} type="number" value={draft.check_interval_seconds} />
           </Field>
@@ -402,6 +493,12 @@ export function AdminSub2APIPage({
           </Field>
           <Field label="每次最多">
             <Input min={1} nativeInput onChange={(event) => updateDraft({ top_up_batch_size: Number(event.currentTarget.value) })} type="number" value={draft.top_up_batch_size} />
+          </Field>
+          <Field label="账号并发">
+            <Input min={1} nativeInput onChange={(event) => updateDraft({ account_concurrency: Number(event.currentTarget.value) })} type="number" value={draft.account_concurrency} />
+          </Field>
+          <Field label="账号优先级">
+            <Input min={0} nativeInput onChange={(event) => updateDraft({ account_priority: Number(event.currentTarget.value) })} type="number" value={draft.account_priority} />
           </Field>
         </div>
 
@@ -524,6 +621,13 @@ function tokenStatusLabels(values?: string[] | null): string {
   return labels.length ? labels.join(" · ") : "可用 · 冷却";
 }
 
+function proxyOptionLabel(proxy: Sub2APIProxy): string {
+  const name = proxy.name || `Proxy #${proxy.id}`;
+  const protocol = proxy.protocol ? proxy.protocol.toUpperCase() : "";
+  const count = typeof proxy.account_count === "number" ? ` · ${formatNumber(proxy.account_count)} 账号` : "";
+  return [name, protocol].filter(Boolean).join(" · ") + count;
+}
+
 function TargetTable({
   busyID,
   items,
@@ -581,7 +685,10 @@ function TargetTable({
               <TableCell className="text-sm">
                 <div>低于 {formatNumber(target.min_available)} 补充</div>
                 <div className="text-muted-foreground text-xs">状态 {tokenStatusLabels(target.token_status_filters)}</div>
-                <div className="text-muted-foreground text-xs">{formatNumber(target.check_interval_seconds)}s · 每次 {formatNumber(target.top_up_batch_size)} · {target.auto_sync_new ? "入池同步" : "按阈值"}</div>
+                <div className="text-muted-foreground text-xs">
+                  {formatNumber(target.check_interval_seconds)}s · 每次 {formatNumber(target.top_up_batch_size)} · 并发 {formatNumber(target.account_concurrency || 10)} · 优先级 {formatNumber(target.account_priority ?? 50)}
+                </div>
+                <div className="text-muted-foreground text-xs">{target.proxy_id ? `代理 #${target.proxy_id}` : "直连"} · {target.auto_sync_new ? "入池同步" : "按阈值"}</div>
               </TableCell>
               <TableCell className="text-sm">
                 <Badge variant={statusVariant(target.last_status)}>{target.last_status || "idle"}</Badge>

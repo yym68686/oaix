@@ -26,6 +26,9 @@ type sub2APITargetPayload struct {
 	CheckIntervalSeconds int      `json:"check_interval_seconds"`
 	MinAvailable         int      `json:"min_available"`
 	TopUpBatchSize       int      `json:"top_up_batch_size"`
+	AccountConcurrency   int      `json:"account_concurrency"`
+	AccountPriority      *int     `json:"account_priority"`
+	ProxyID              int64    `json:"proxy_id"`
 	AutoSyncNew          *bool    `json:"auto_sync_new"`
 }
 
@@ -36,10 +39,12 @@ func (a *App) registerSub2APIAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/admin/sub2api/targets/{target_id}", a.requireAuth(a.updateSub2APITarget))
 	mux.HandleFunc("DELETE /api/admin/sub2api/targets/{target_id}", a.requireAuth(a.deleteSub2APITarget))
 	mux.HandleFunc("GET /api/admin/sub2api/targets/{target_id}/groups", a.requireAuth(a.getSub2APITargetGroups))
+	mux.HandleFunc("GET /api/admin/sub2api/targets/{target_id}/proxies", a.requireAuth(a.getSub2APITargetProxies))
 	mux.HandleFunc("POST /api/admin/sub2api/targets/{target_id}/check", a.requireAuth(a.checkSub2APITarget))
 	mux.HandleFunc("POST /api/admin/sub2api/targets/{target_id}/sync", a.requireAuth(a.syncSub2APITarget))
 	mux.HandleFunc("GET /api/admin/sub2api/targets/{target_id}/runs", a.requireAuth(a.listSub2APITargetRuns))
 	mux.HandleFunc("POST /api/admin/sub2api/probe-groups", a.requireAuth(a.probeSub2APIGroups))
+	mux.HandleFunc("POST /api/admin/sub2api/probe-proxies", a.requireAuth(a.probeSub2APIProxies))
 	mux.HandleFunc("GET /api/admin/sub2api/runs", a.requireAuth(a.listSub2APIRuns))
 }
 
@@ -182,6 +187,33 @@ func (a *App) getSub2APITargetGroups(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": groups})
 }
 
+func (a *App) getSub2APITargetProxies(w http.ResponseWriter, r *http.Request) {
+	if _, ok := requirePlatformAdmin(w, r); !ok {
+		return
+	}
+	id, ok := pathInt64(w, r, "target_id")
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	target, err := a.store.GetSub2APISyncTarget(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("sub2api target not found"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	proxies, err := a.sub2APISyncer().ListProxies(ctx, target)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": proxies})
+}
+
 func (a *App) probeSub2APIGroups(w http.ResponseWriter, r *http.Request) {
 	if _, ok := requirePlatformAdmin(w, r); !ok {
 		return
@@ -202,6 +234,28 @@ func (a *App) probeSub2APIGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": groups})
+}
+
+func (a *App) probeSub2APIProxies(w http.ResponseWriter, r *http.Request) {
+	if _, ok := requirePlatformAdmin(w, r); !ok {
+		return
+	}
+	var payload struct {
+		BaseURL  string `json:"base_url"`
+		AdminKey string `json:"admin_key"`
+	}
+	if err := decodeJSON(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	proxies, err := a.sub2APISyncer().ProbeProxies(ctx, payload.BaseURL, payload.AdminKey)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": proxies})
 }
 
 func (a *App) checkSub2APITarget(w http.ResponseWriter, r *http.Request) {
@@ -285,6 +339,9 @@ func sub2APITargetInput(payload sub2APITargetPayload) store.Sub2APISyncTargetInp
 		CheckIntervalSeconds: payload.CheckIntervalSeconds,
 		MinAvailable:         payload.MinAvailable,
 		TopUpBatchSize:       payload.TopUpBatchSize,
+		AccountConcurrency:   payload.AccountConcurrency,
+		AccountPriority:      payload.AccountPriority,
+		ProxyID:              payload.ProxyID,
 		AutoSyncNew:          payload.AutoSyncNew,
 	}
 }
@@ -303,6 +360,9 @@ func redactSub2APIPayload(payload sub2APITargetPayload) map[string]any {
 		"check_interval_seconds": payload.CheckIntervalSeconds,
 		"min_available":          payload.MinAvailable,
 		"top_up_batch_size":      payload.TopUpBatchSize,
+		"account_concurrency":    payload.AccountConcurrency,
+		"account_priority":       payload.AccountPriority,
+		"proxy_id":               payload.ProxyID,
 		"auto_sync_new":          payload.AutoSyncNew,
 	}
 }

@@ -40,6 +40,14 @@ func (s *Syncer) ProbeGroups(ctx context.Context, baseURL string, adminKey strin
 	return s.Client.ListGroups(ctx, baseURL, adminKey, "openai")
 }
 
+func (s *Syncer) ListProxies(ctx context.Context, target store.Sub2APISyncTarget) ([]Proxy, error) {
+	return s.Client.ListProxies(ctx, target.BaseURL, target.AdminKey)
+}
+
+func (s *Syncer) ProbeProxies(ctx context.Context, baseURL string, adminKey string) ([]Proxy, error) {
+	return s.Client.ListProxies(ctx, baseURL, adminKey)
+}
+
 func (s *Syncer) RunDueTargets(ctx context.Context) ([]store.Sub2APISyncRun, error) {
 	targets, err := s.Store.ClaimDueSub2APISyncTargets(ctx, 10)
 	if err != nil || len(targets) == 0 {
@@ -248,6 +256,19 @@ func (s *Syncer) createAccountRequest(target store.Sub2APISyncTarget, candidate 
 	notes := fmt.Sprintf("Synced from oaix target %d, owner %d, token %d", target.ID, candidate.OwnerUserID, candidate.ID)
 	autoPause := true
 	confirmMixedChannelRisk := true
+	accountConcurrency := target.AccountConcurrency
+	if accountConcurrency <= 0 {
+		accountConcurrency = store.Sub2APIDefaultAccountConcurrency
+	}
+	accountPriority := target.AccountPriority
+	if accountPriority < 0 {
+		accountPriority = store.Sub2APIDefaultAccountPriority
+	}
+	var proxyID *int64
+	if target.ProxyID > 0 {
+		id := target.ProxyID
+		proxyID = &id
+	}
 	return CreateAccountRequest{
 		Name:                    name,
 		Notes:                   &notes,
@@ -255,8 +276,9 @@ func (s *Syncer) createAccountRequest(target store.Sub2APISyncTarget, candidate 
 		Type:                    "oauth",
 		Credentials:             credentials,
 		Extra:                   extra,
-		Concurrency:             1,
-		Priority:                50,
+		ProxyID:                 proxyID,
+		Concurrency:             accountConcurrency,
+		Priority:                accountPriority,
 		GroupIDs:                target.TargetGroupIDs,
 		AutoPauseOnExpired:      &autoPause,
 		ConfirmMixedChannelRisk: &confirmMixedChannelRisk,

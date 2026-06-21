@@ -89,6 +89,37 @@ func TestClientCreateAccountsUnwrapsBatchResult(t *testing.T) {
 	}
 }
 
+func TestClientListProxiesUsesActiveProxyEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/admin/proxies/all" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("with_count") != "true" {
+			t.Fatalf("unexpected query %s", r.URL.RawQuery)
+		}
+		writeSub2APISuccess(t, w, []map[string]any{{
+			"id":            7,
+			"name":          "ush1",
+			"protocol":      "http",
+			"host":          "proxy.example.com",
+			"port":          8080,
+			"status":        "active",
+			"account_count": 42,
+			"password":      "secret",
+		}})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	proxies, err := client.ListProxies(t.Context(), server.URL, "admin-fixture")
+	if err != nil {
+		t.Fatalf("ListProxies returned error: %v", err)
+	}
+	if len(proxies) != 1 || proxies[0].ID != 7 || proxies[0].Name != "ush1" || proxies[0].AccountCount != 42 {
+		t.Fatalf("proxies = %#v", proxies)
+	}
+}
+
 func TestClientReportsSub2APIEnvelopeError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeSub2APIResponse(t, w, map[string]any{"code": 401, "message": "bad admin key"})
