@@ -627,6 +627,15 @@ func deepCloneMap(input map[string]any) map[string]any {
 
 func decodeUpstreamError(reader io.Reader) string {
 	raw, _ := io.ReadAll(io.LimitReader(reader, 256*1024))
+	return decodeUpstreamErrorBytes(raw)
+}
+
+func readUpstreamError(reader io.Reader) (string, []byte) {
+	raw, _ := io.ReadAll(io.LimitReader(reader, 256*1024))
+	return decodeUpstreamErrorBytes(raw), raw
+}
+
+func decodeUpstreamErrorBytes(raw []byte) string {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return "upstream request failed"
 	}
@@ -1066,7 +1075,7 @@ func (p *Pipeline) collectResponsesJSONFromSSE(resp *http.Response, attempt Atte
 		payload := parseEventPayload(event)
 		typ := eventType(event, payload)
 		if status, message, failed := responseFailureStatus(payload); failed {
-			return streamPreflightError{status: status, message: message}
+			return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
 		}
 		if firstTokenAt == nil && typ != "" && !isPreflightResponseEvent(typ) {
 			now := time.Now().UTC()
@@ -1126,6 +1135,7 @@ func (p *Pipeline) writeResponsesJSONFromSSE(w http.ResponseWriter, resp *http.R
 		if errors.As(err, &preflight) {
 			result.Status = preflight.status
 			result.Retry = retryableStatus(preflight.status)
+			result.ErrorBody = preflight.raw
 			return result, errors.New(preflight.message)
 		}
 		result.Status = http.StatusBadGateway
@@ -1280,7 +1290,7 @@ func (p *Pipeline) collectImageAPIResponseFromSSE(resp *http.Response, attempt A
 		payload := parseEventPayload(event)
 		typ := eventType(event, payload)
 		if status, message, failed := responseFailureStatus(payload); failed {
-			return streamPreflightError{status: status, message: message}
+			return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
 		}
 		if firstTokenAt == nil && typ != "" && !isPreflightResponseEvent(typ) {
 			now := time.Now().UTC()
@@ -1332,7 +1342,7 @@ func (p *Pipeline) writeImageJSONResponse(w http.ResponseWriter, resp *http.Resp
 		if decodeErr := json.NewDecoder(io.LimitReader(resp.Body, p.cfg.Upstream.NonStreamMaxResponseBytes)).Decode(&payload); decodeErr != nil {
 			err = decodeErr
 		} else if status, message, failed := responseFailureStatus(payload); failed {
-			err = streamPreflightError{status: status, message: message}
+			err = streamPreflightError{status: status, message: message, raw: rawJSON(payload)}
 		} else {
 			if text(payload["type"]) != "response.completed" {
 				payload = map[string]any{"type": "response.completed", "response": payload}
@@ -1351,6 +1361,7 @@ func (p *Pipeline) writeImageJSONResponse(w http.ResponseWriter, resp *http.Resp
 		if errors.As(err, &preflight) {
 			result.Status = preflight.status
 			result.Retry = retryableStatus(preflight.status)
+			result.ErrorBody = preflight.raw
 			return result, errors.New(preflight.message)
 		}
 		result.Status = http.StatusBadGateway
@@ -1484,7 +1495,7 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 		typ := eventType(event, payload)
 		if status, message, failed := responseFailureStatus(payload); failed {
 			if !committed {
-				return streamPreflightError{status: status, message: message}
+				return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
 			}
 			data, _ := openai.EncodeJSON(map[string]any{"error": map[string]any{"message": message, "status": status}})
 			if err := writeEvents([][]byte{sse.Encode("error", data)}); err != nil {
@@ -1530,6 +1541,7 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 		if errors.As(err, &preflight) {
 			result.Status = preflight.status
 			result.Retry = retryableStatus(preflight.status)
+			result.ErrorBody = preflight.raw
 			return result, errors.New(preflight.message)
 		}
 		if committed {
@@ -1579,7 +1591,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		payload := parseEventPayload(event)
 		typ := eventType(event, payload)
 		if status, message, failed := responseFailureStatus(payload); failed && !committed {
-			return streamPreflightError{status: status, message: message}
+			return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
 		}
 		if !committed && isPreflightResponseEvent(typ) {
 			if typ == "response.created" {
@@ -1632,6 +1644,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		if errors.As(err, &preflight) {
 			result.Status = preflight.status
 			result.Retry = retryableStatus(preflight.status)
+			result.ErrorBody = preflight.raw
 			return result, errors.New(preflight.message)
 		}
 		if committed {
@@ -1663,10 +1676,26 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 type streamPreflightError struct {
 	status  int
 	message string
+	raw     []byte
 }
 
 func (e streamPreflightError) Error() string {
 	return e.message
+}
+
+func cloneBytes(input []byte) []byte {
+	if len(input) == 0 {
+		return nil
+	}
+	return append([]byte(nil), input...)
+}
+
+func rawJSON(value any) []byte {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 func firstNonNilTime(values ...*time.Time) *time.Time {

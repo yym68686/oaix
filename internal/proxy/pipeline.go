@@ -18,6 +18,7 @@ import (
 
 	"github.com/yym68686/oaix/internal/affinity"
 	"github.com/yym68686/oaix/internal/config"
+	"github.com/yym68686/oaix/internal/cooldown"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/protocol/openai"
 	"github.com/yym68686/oaix/internal/protocol/sse"
@@ -84,6 +85,7 @@ type AttemptResult struct {
 	Usage        *UsageMetrics
 	ResponseID   string
 	FirstTokenAt *time.Time
+	ErrorBody    []byte
 }
 
 type StreamAttemptState struct {
@@ -311,8 +313,20 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), fmt.Sprintf("terminal upstream status %d", status), true, nil)
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 		} else if action == OutcomeUpstream429Cooldown {
-			cooldown := time.Now().UTC().Add(p.cfg.TokenPool.DefaultCooldown)
-			p.commitTokenError(claim.TokenID(), "upstream 429 cooldown", false, &cooldown)
+			now := time.Now().UTC()
+			cooldownUntil := cooldown.UsageLimitUntil(status, result.ErrorBody, now, p.cfg.TokenPool.DefaultCooldown)
+			message := "upstream 429 cooldown"
+			if cooldownUntil == nil {
+				fallback := p.cfg.TokenPool.DefaultCooldown
+				if fallback <= 0 {
+					fallback = 300 * time.Second
+				}
+				until := now.Add(fallback)
+				cooldownUntil = &until
+			} else {
+				message = "upstream usage limit cooldown"
+			}
+			p.commitTokenError(claim.TokenID(), message, false, cooldownUntil)
 		} else if action == OutcomeUpstream5xx || action == OutcomeTransportError {
 			cooldown := time.Now().UTC().Add(5 * time.Second)
 			p.commitTokenError(claim.TokenID(), fmt.Sprintf("retryable upstream failure: %v", err), false, &cooldown)
@@ -385,12 +399,12 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		detail := decodeUpstreamError(resp.Body)
+		detail, raw := readUpstreamError(resp.Body)
 		retry := resp.StatusCode == http.StatusUnauthorized ||
 			resp.StatusCode == http.StatusForbidden ||
 			resp.StatusCode == http.StatusTooManyRequests ||
 			resp.StatusCode >= 500
-		return AttemptResult{Status: resp.StatusCode, Retry: retry}, fmt.Errorf("%s", detail)
+		return AttemptResult{Status: resp.StatusCode, Retry: retry, ErrorBody: raw}, fmt.Errorf("%s", detail)
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("X-OAIX-Request-ID", attempt.RequestID)

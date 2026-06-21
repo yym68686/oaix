@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/yym68686/oaix/internal/cooldown"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/protocol/sse"
 	"github.com/yym68686/oaix/internal/store"
@@ -152,17 +153,17 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 	detail := responseErrorDetail(resp.StatusCode, respBody)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		streamDetail, responseModel := extractProbeStreamResult(parent, respBody)
+		streamDetail, streamRaw, responseModel := extractProbeStreamResult(parent, respBody)
 		if streamDetail != "" {
 			if isProbeUsageLimit(resp.StatusCode, streamDetail) {
-				cooldown := a.cfg.TokenPool.DefaultCooldown
-				if cooldown <= 0 {
-					cooldown = 300 * time.Second
+				now := time.Now().UTC()
+				until := cooldown.UsageLimitUntil(http.StatusTooManyRequests, []byte(streamRaw), now, a.cfg.TokenPool.DefaultCooldown)
+				if until == nil {
+					until = defaultCooldownUntil(now, a.cfg.TokenPool.DefaultCooldown)
 				}
-				until := time.Now().UTC().Add(cooldown)
-				a.markProbeError(token.ID, streamDetail, false, &until, false)
+				a.markProbeError(token.ID, streamDetail, false, until, false)
 				result := tokenProbeResult(token.ID, "cooling", http.StatusTooManyRequests, "测试结果：上游返回额度限制，当前已转为冷却。", streamDetail, model)
-				result["cooldown_seconds"] = int(cooldown.Seconds())
+				result["cooldown_seconds"] = cooldownSeconds(now, until)
 				return result
 			}
 			if isPermanentProbeDisableError(resp.StatusCode, streamDetail) {
@@ -183,14 +184,14 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 	}
 
 	if isUsageLimitError(resp.StatusCode, detail) {
-		cooldown := a.cfg.TokenPool.DefaultCooldown
-		if cooldown <= 0 {
-			cooldown = 300 * time.Second
+		now := time.Now().UTC()
+		until := cooldown.UsageLimitUntil(resp.StatusCode, respBody, now, a.cfg.TokenPool.DefaultCooldown)
+		if until == nil {
+			until = defaultCooldownUntil(now, a.cfg.TokenPool.DefaultCooldown)
 		}
-		until := time.Now().UTC().Add(cooldown)
-		a.markProbeError(token.ID, detail, false, &until, false)
+		a.markProbeError(token.ID, detail, false, until, false)
 		result := tokenProbeResult(token.ID, "cooling", resp.StatusCode, "测试结果：上游返回额度限制，当前已转为冷却。", detail, model)
-		result["cooldown_seconds"] = int(cooldown.Seconds())
+		result["cooldown_seconds"] = cooldownSeconds(now, until)
 		return result
 	}
 
@@ -345,6 +346,25 @@ func isUsageLimitError(status int, detail string) bool {
 	return strings.Contains(lowered, "usage_limit_reached") || strings.Contains(lowered, "usage limit")
 }
 
+func defaultCooldownUntil(now time.Time, duration time.Duration) *time.Time {
+	if duration <= 0 {
+		duration = 300 * time.Second
+	}
+	until := now.UTC().Add(duration)
+	return &until
+}
+
+func cooldownSeconds(now time.Time, until *time.Time) int {
+	if until == nil {
+		return 0
+	}
+	seconds := int(until.Sub(now.UTC()).Seconds())
+	if seconds < 0 {
+		return 0
+	}
+	return seconds
+}
+
 func isProbeUsageLimit(status int, detail string) bool {
 	if isUsageLimitError(status, detail) {
 		return true
@@ -423,11 +443,12 @@ func isPermanentlyInvalidRefreshTokenError(status int, detail string) bool {
 	return false
 }
 
-func extractProbeStreamResult(ctx context.Context, body []byte) (string, string) {
+func extractProbeStreamResult(ctx context.Context, body []byte) (string, string, string) {
 	if !bytes.Contains(body, []byte("data:")) && !bytes.Contains(body, []byte("event:")) {
-		return "", ""
+		return "", "", ""
 	}
 	var failure string
+	var failureRaw string
 	var responseModel string
 	_ = sse.NewParser(defaultAdminProbeBodyLimit).Parse(ctx, bytes.NewReader(body), func(event sse.Event) error {
 		var payload map[string]any
@@ -440,6 +461,7 @@ func extractProbeStreamResult(ctx context.Context, body []byte) (string, string)
 		}
 		if eventType == "response.failed" {
 			failure = probeFailureDetail(http.StatusOK, event.Data)
+			failureRaw = string(event.Data)
 			return nil
 		}
 		if eventType == "response.completed" {
@@ -453,7 +475,7 @@ func extractProbeStreamResult(ctx context.Context, body []byte) (string, string)
 		}
 		return nil
 	})
-	return failure, responseModel
+	return failure, failureRaw, responseModel
 }
 
 func probeFailureDetail(status int, body []byte) string {

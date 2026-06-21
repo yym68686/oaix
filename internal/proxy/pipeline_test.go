@@ -251,6 +251,71 @@ func TestProxyDecodesZstdRequestBeforeForwarding(t *testing.T) {
 	}
 }
 
+func TestProxyUsageLimitUsesOfficialCooldown(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached","resets_in_seconds":3600,"message":"usage limit reached"}}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                1,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{{
+			ID:          1,
+			AccessToken: "upstream-token",
+			IsActive:    true,
+			CreatedAt:   time.Now().UTC(),
+			UpdatedAt:   time.Now().UTC(),
+		}},
+		tokenErrorCh: make(chan *time.Time, 1),
+	}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+	start := time.Now().UTC()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5"})
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case until := <-fakes.tokenErrorCh:
+		if until == nil {
+			t.Fatal("expected cooldown")
+		}
+		if got := until.Sub(start); got < 3590*time.Second {
+			t.Fatalf("cooldown = %s, want official reset near 3600s", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for token error commit")
+	}
+}
+
 func TestPromptCacheContextInjectsKeyAndStableSession(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","instructions":"You are terse.","input":[{"role":"user","content":"Explain build"}]}`)
 	headers := http.Header{}
@@ -713,7 +778,8 @@ type countingResponseRecorder struct {
 }
 
 type fakeProxyStore struct {
-	tokens []store.Token
+	tokens       []store.Token
+	tokenErrorCh chan *time.Time
 }
 
 func (s *fakeProxyStore) ListAvailableTokens(context.Context) ([]store.Token, error) {
@@ -728,7 +794,10 @@ func (s *fakeProxyStore) MarkTokenSuccess(context.Context, int64) error {
 	return nil
 }
 
-func (s *fakeProxyStore) MarkTokenError(context.Context, int64, string, bool, *time.Time) error {
+func (s *fakeProxyStore) MarkTokenError(_ context.Context, _ int64, _ string, _ bool, cooldownUntil *time.Time) error {
+	if s.tokenErrorCh != nil {
+		s.tokenErrorCh <- cooldownUntil
+	}
 	return nil
 }
 

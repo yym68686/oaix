@@ -124,3 +124,22 @@ func TestProbeTokenDisablesPermanentlyInvalidRefreshToken(t *testing.T) {
 		t.Fatalf("message = %q", result["message"])
 	}
 }
+
+func TestExtractProbeStreamResultPreservesFailureRawPayload(t *testing.T) {
+	body := []byte(strings.Join([]string{
+		"event: response.failed",
+		`data: {"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":120}}}`,
+		"",
+	}, "\n"))
+
+	detail, raw, model := extractProbeStreamResult(t.Context(), body)
+	if detail == "" || !strings.Contains(detail, "usage limit reached") {
+		t.Fatalf("detail = %q", detail)
+	}
+	if model != "" {
+		t.Fatalf("model = %q", model)
+	}
+	if !strings.Contains(raw, `"resets_in_seconds":120`) {
+		t.Fatalf("raw failure payload lost reset metadata: %q", raw)
+	}
+}
