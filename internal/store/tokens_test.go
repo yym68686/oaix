@@ -144,6 +144,22 @@ func TestTokenListWhereCanSkipPlanFilterForPlanCounts(t *testing.T) {
 	}
 }
 
+func TestTokenListWhereCoolingExcludesDisabledTokens(t *testing.T) {
+	where, args := tokenListWhere(TokenListOptions{Status: "cooling"}, true)
+	if len(args) != 0 {
+		t.Fatalf("args = %#v", args)
+	}
+	for _, fragment := range []string{
+		"is_active = true",
+		"disabled_at is null",
+		"cooldown_until > now()",
+	} {
+		if !strings.Contains(where, fragment) {
+			t.Fatalf("cooling filter missing %q: %s", fragment, where)
+		}
+	}
+}
+
 func TestTokenListWhereScopedAddsOwnerFilter(t *testing.T) {
 	ownerID := int64(42)
 	where, args := tokenListWhereScoped(TokenListOptions{Status: "available"}, true, OwnerResources(ownerID))

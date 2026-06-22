@@ -234,7 +234,7 @@ func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope Resourc
 	case "available", "active":
 		filters = append(filters, "is_active = true and disabled_at is null and (cooldown_until is null or cooldown_until <= now())")
 	case "cooling", "cooldown":
-		filters = append(filters, "cooldown_until > now()")
+		filters = append(filters, "is_active = true and disabled_at is null and cooldown_until > now()")
 	case "disabled", "inactive":
 		filters = append(filters, "(is_active = false or disabled_at is not null)")
 	}
@@ -344,7 +344,7 @@ func (s *Store) TokenCountsScoped(ctx context.Context, scope ResourceScope) (Tok
 				  and access_token <> ''
 				  and (cooldown_until is null or cooldown_until <= now())
 			)::int as available,
-			count(*) filter (where cooldown_until > now())::int as cooling,
+			count(*) filter (where is_active = true and disabled_at is null and cooldown_until > now())::int as cooling,
 			count(*) filter (where is_active = false or disabled_at is not null)::int as disabled
 		from codex_tokens
 		where merged_into_token_id is null
