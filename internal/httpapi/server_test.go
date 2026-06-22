@@ -7,7 +7,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yym68686/oaix/internal/config"
 )
+
+func TestHandlerRegistersRoutes(t *testing.T) {
+	app := NewApp(config.Config{Auth: config.AuthConfig{ServiceAPIKeys: []string{"service-key"}}}, nil, nil, nil, nil, nil)
+	_ = app.Handler()
+}
 
 func TestIndexInjectsVersionedAssets(t *testing.T) {
 	webDir := t.TempDir()

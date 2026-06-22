@@ -90,7 +90,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/tokens/batch", a.requireAuth(a.batchTokens))
 	mux.HandleFunc("GET /admin/tokens/costs", a.requireAuth(a.listTokenCosts))
 	mux.HandleFunc("GET /admin/tokens/{token_id}", a.requireAuth(a.getToken))
-	mux.HandleFunc("GET /admin/tokens/{token_id}/refresh-token", a.requireAuth(a.getTokenRefreshToken))
+	mux.HandleFunc("GET /admin/token-refresh-tokens/{token_id}", a.requireAuth(a.getTokenRefreshToken))
 	mux.HandleFunc("GET /admin/tokens/quota", a.requireAuth(a.listTokenQuota))
 	mux.HandleFunc("POST /admin/tokens/import", a.requireAuth(a.importTokens))
 	mux.HandleFunc("POST /admin/oauth/openai/start", a.requireAuth(a.startOpenAIOAuth))

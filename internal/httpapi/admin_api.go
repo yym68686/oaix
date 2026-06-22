@@ -191,7 +191,7 @@ func (a *App) openapiSpec(w http.ResponseWriter, r *http.Request) {
 func adminOpenAPISpec() map[string]any {
 	routes := []string{
 		"GET /admin/openapi.json", "GET /admin/options",
-		"GET /admin/tokens", "GET /admin/tokens/{token_id}/refresh-token", "PATCH /admin/tokens/{token_id}", "GET /admin/tokens/export",
+		"GET /admin/tokens", "GET /admin/token-refresh-tokens/{token_id}", "PATCH /admin/tokens/{token_id}", "GET /admin/tokens/export",
 		"POST /admin/tokens/{token_id}/cooldown", "DELETE /admin/token-cooldown/{token_id}",
 		"DELETE /admin/token-last-error/{token_id}", "POST /admin/tokens/{token_id}/secrets",
 		"POST /admin/tokens/{token_id}/refresh", "GET /admin/token-refresh-history/{token_id}",

@@ -505,7 +505,7 @@ export const api = {
     return requestJSON<TokenItem>(`${scopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`)}${query ? `?${query}` : ""}`);
   },
   tokenRefreshToken: (id: number) =>
-    requestJSON<{ refresh_token?: string }>(scopedPath(`/api/tokens/${id}/refresh-token`, `/admin/tokens/${id}/refresh-token`)),
+    requestJSON<{ refresh_token?: string }>(scopedPath(`/api/tokens/${id}/refresh-token`, `/admin/token-refresh-tokens/${id}`)),
   tokenCosts: (ids: number[]) =>
     requestJSON<{ items?: TokenObservedCostItem[] }>(`/admin/tokens/costs?ids=${ids.join(",")}`),
   updateActivation: (id: number, payload: Record<string, unknown>) => {
