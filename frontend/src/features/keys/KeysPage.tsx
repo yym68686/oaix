@@ -1,6 +1,7 @@
 import {
   ActivityIcon,
   ChevronLeftIcon,
+  CopyIcon,
   KeyRoundIcon,
   LoaderCircleIcon,
   SearchIcon,
@@ -638,6 +639,7 @@ function KeyDetailPage({
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [probeBusy, setProbeBusy] = useState(false);
+  const [copyRefreshBusy, setCopyRefreshBusy] = useState(false);
   const [probeResult, setProbeResult] = useState<TokenProbeResponse | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
 
@@ -676,6 +678,29 @@ function KeyDetailPage({
       pushToast(errorMessage(caught), "error");
     } finally {
       setProbeBusy(false);
+    }
+  }
+
+  async function copyRefreshToken() {
+    if (!token) {
+      return;
+    }
+    setCopyRefreshBusy(true);
+    try {
+      const payload = await api.tokenRefreshToken(token.id);
+      const refreshToken = payload.refresh_token?.trim();
+      if (!refreshToken) {
+        throw new Error("refresh_token 为空");
+      }
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("当前浏览器不支持剪贴板写入");
+      }
+      await navigator.clipboard.writeText(refreshToken);
+      pushToast("refresh_token 已复制");
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setCopyRefreshBusy(false);
     }
   }
 
@@ -732,6 +757,10 @@ function KeyDetailPage({
               <Button loading={probeBusy} onClick={() => void runProbe()} size="sm" variant="outline">
                 <ActivityIcon />
                 测试
+              </Button>
+              <Button loading={copyRefreshBusy} onClick={() => void copyRefreshToken()} size="sm" variant="outline">
+                <CopyIcon />
+                复制 refresh_token
               </Button>
               <Button
                 onClick={() =>

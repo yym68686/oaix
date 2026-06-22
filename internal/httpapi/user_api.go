@@ -32,6 +32,7 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tokens/quota", a.requireAuth(a.listMyTokenQuota))
 	mux.HandleFunc("POST /api/tokens/quota-refresh", a.requireAuth(a.createMyQuotaRefreshJob))
 	mux.HandleFunc("GET /api/tokens/{token_id}", a.requireAuth(a.getMyToken))
+	mux.HandleFunc("GET /api/tokens/{token_id}/refresh-token", a.requireAuth(a.getMyTokenRefreshToken))
 	mux.HandleFunc("PATCH /api/tokens/{token_id}", a.requireAuth(a.patchMyToken))
 	mux.HandleFunc("DELETE /api/tokens/{token_id}", a.requireAuth(a.deleteMyToken))
 	mux.HandleFunc("POST /api/tokens/{token_id}/probe", a.requireAuth(a.probeMyToken))
@@ -408,6 +409,44 @@ func (a *App) getMyToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, token)
+}
+
+func (a *App) getMyTokenRefreshToken(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	scope, ok := userScope(w, auth)
+	if !ok {
+		return
+	}
+	id, ok := pathInt64(w, r, "token_id")
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	token, err := a.store.GetTokenScoped(ctx, scope, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "token not found"})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	refreshToken := strings.TrimSpace(token.RefreshToken)
+	if refreshToken == "" {
+		writeError(w, http.StatusNotFound, errors.New("refresh_token not found"))
+		return
+	}
+	actor := "self"
+	if auth != nil {
+		actor = firstNonEmpty(auth.Role, actor)
+	}
+	details := map[string]any{}
+	if scope.OwnerUserID != nil {
+		details["user_id"] = *scope.OwnerUserID
+	}
+	_ = a.store.WriteAuditLog(ctx, "user_token_refresh_token_read", actor, "token", strconv.FormatInt(token.ID, 10), details)
+	writeJSON(w, http.StatusOK, map[string]any{"refresh_token": refreshToken})
 }
 
 func (a *App) listMyTokenQuota(w http.ResponseWriter, r *http.Request) {

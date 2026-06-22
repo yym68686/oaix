@@ -90,6 +90,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/tokens/batch", a.requireAuth(a.batchTokens))
 	mux.HandleFunc("GET /admin/tokens/costs", a.requireAuth(a.listTokenCosts))
 	mux.HandleFunc("GET /admin/tokens/{token_id}", a.requireAuth(a.getToken))
+	mux.HandleFunc("GET /admin/tokens/{token_id}/refresh-token", a.requireAuth(a.getTokenRefreshToken))
 	mux.HandleFunc("GET /admin/tokens/quota", a.requireAuth(a.listTokenQuota))
 	mux.HandleFunc("POST /admin/tokens/import", a.requireAuth(a.importTokens))
 	mux.HandleFunc("POST /admin/oauth/openai/start", a.requireAuth(a.startOpenAIOAuth))
@@ -571,6 +572,36 @@ func (a *App) getToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, token)
+}
+
+func (a *App) getTokenRefreshToken(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	id, ok := pathInt64(w, r, "token_id")
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	token, err := a.store.GetToken(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("token not found"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	refreshToken := strings.TrimSpace(token.RefreshToken)
+	if refreshToken == "" {
+		writeError(w, http.StatusNotFound, errors.New("refresh_token not found"))
+		return
+	}
+	actor := "api"
+	if auth != nil {
+		actor = firstNonEmpty(auth.Role, actor)
+	}
+	_ = a.store.WriteAuditLog(ctx, "token_refresh_token_read", actor, "token", strconv.FormatInt(token.ID, 10), map[string]any{"owner_user_id": token.OwnerUserID})
+	writeJSON(w, http.StatusOK, map[string]any{"refresh_token": refreshToken})
 }
 
 func (a *App) listImportBatches(w http.ResponseWriter, r *http.Request) {
