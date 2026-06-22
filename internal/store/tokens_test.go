@@ -95,6 +95,20 @@ func TestPostgresTextArrayDeduplicates(t *testing.T) {
 	}
 }
 
+func TestImportIdentityNormalizesEmailAndAccountID(t *testing.T) {
+	email := "  User@Example.COM  "
+	accountID := "  acct-123  "
+	if got := normalizedImportEmail(&email); got != "user@example.com" {
+		t.Fatalf("normalizedImportEmail = %q", got)
+	}
+	if got := importStringValue(&accountID); got != "acct-123" {
+		t.Fatalf("importStringValue = %q", got)
+	}
+	if got := normalizedImportEmail(nil); got != "" {
+		t.Fatalf("nil email normalized to %q", got)
+	}
+}
+
 func TestBuildPlanCountsIncludesCommonPlansAndExtras(t *testing.T) {
 	got := buildPlanCounts(map[string]int{
 		"pro":        12,

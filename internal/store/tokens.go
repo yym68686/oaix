@@ -587,17 +587,8 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 			payload["source"] = "access_token_import"
 		}
 
-		var existingID int64
-		err := tx.QueryRow(ctx, `
-					select id
-					from codex_tokens
-					where merged_into_token_id is null
-					  and owner_user_id = $3
-					  and refresh_token = any($1::text[])
-					order by case when $2 <> '' and refresh_token = $2 then 0 else 1 end, id desc
-					limit 1
-				`, postgresTextArray(refreshToken, previousRefreshToken), strings.TrimSpace(previousRefreshToken), ownerUserID).Scan(&existingID)
-		if err != nil && err != pgx.ErrNoRows {
+		existingID, err := findExistingTokenForImport(ctx, tx, ownerUserID, refreshToken, previousRefreshToken, accountID, email)
+		if err != nil {
 			return result, err
 		}
 		if existingID > 0 {
@@ -675,6 +666,62 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 		return result, err
 	}
 	return result, nil
+}
+
+func findExistingTokenForImport(ctx context.Context, tx pgx.Tx, ownerUserID int64, refreshToken string, previousRefreshToken string, accountID *string, email *string) (int64, error) {
+	var existingID int64
+	err := tx.QueryRow(ctx, `
+		select id
+		from codex_tokens
+		where merged_into_token_id is null
+		  and owner_user_id = $3
+		  and refresh_token = any($1::text[])
+		order by case when $2 <> '' and refresh_token = $2 then 0 else 1 end, id desc
+		limit 1
+	`, postgresTextArray(refreshToken, previousRefreshToken), strings.TrimSpace(previousRefreshToken), ownerUserID).Scan(&existingID)
+	if err == nil {
+		return existingID, nil
+	}
+	if err != pgx.ErrNoRows {
+		return 0, err
+	}
+
+	emailKey := normalizedImportEmail(email)
+	if emailKey == "" {
+		return 0, nil
+	}
+	accountKey := importStringValue(accountID)
+	err = tx.QueryRow(ctx, `
+		select id
+		from codex_tokens
+		where merged_into_token_id is null
+		  and owner_user_id = $1
+		  and lower(btrim(email)) = $2
+		  and ($3 = '' or account_id is null or btrim(account_id) = '' or btrim(account_id) = $3)
+		order by
+		  case when is_active = true and disabled_at is null then 0 else 1 end,
+		  case when $3 <> '' and btrim(account_id) = $3 then 0 else 1 end,
+		  id desc
+		limit 1
+	`, ownerUserID, emailKey, accountKey).Scan(&existingID)
+	if err == pgx.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return existingID, nil
+}
+
+func normalizedImportEmail(value *string) string {
+	return strings.ToLower(importStringValue(value))
+}
+
+func importStringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
 }
 
 func recordTokenSecretAndRefreshHistory(ctx context.Context, tx pgx.Tx, ownerUserID int64, tokenID int64, accessToken string, refreshToken string, idToken *string) error {
