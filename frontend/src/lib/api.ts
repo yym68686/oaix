@@ -30,12 +30,38 @@ export type TokenQuotaWindow = {
   exhausted?: boolean;
 };
 
+export type TokenQuotaResetCredits = {
+  available_count?: number | null;
+};
+
 export type TokenQuotaSnapshot = {
   fetched_at?: string | null;
   error?: string | null;
   plan_type?: string | null;
   disabled?: boolean;
   windows?: TokenQuotaWindow[];
+  rate_limit_reset_credits?: TokenQuotaResetCredits | null;
+};
+
+export type TokenQuotaResetCreditsResponse = {
+  quota?: TokenQuotaSnapshot | null;
+  rate_limit_reset_credits?: TokenQuotaResetCredits | null;
+};
+
+export type TokenQuotaResetCredit = {
+  id?: string;
+  reset_type?: string;
+  status?: string;
+  granted_at?: string;
+  expires_at?: string;
+  redeem_started_at?: string;
+  redeemed_at?: string;
+};
+
+export type TokenQuotaResetResult = {
+  code?: string;
+  credit?: TokenQuotaResetCredit | null;
+  windows_reset?: number;
 };
 
 export type TokenItem = {
@@ -506,6 +532,10 @@ export const api = {
   },
   tokenRefreshToken: (id: number) =>
     requestJSON<{ refresh_token?: string }>(scopedPath(`/api/tokens/${id}/refresh-token`, `/admin/token-refresh-tokens/${id}`)),
+  tokenQuotaResetCredits: (id: number) =>
+    requestJSON<TokenQuotaResetCreditsResponse>(scopedPath(`/api/tokens/${id}/quota-reset-credits`, `/admin/token-quota-reset-credits/${id}`)),
+  resetTokenQuota: (id: number) =>
+    postJSON<TokenQuotaResetResult>(scopedPath(`/api/tokens/${id}/quota-reset`, `/admin/token-quota-reset/${id}`), {}),
   tokenCosts: (ids: number[]) =>
     requestJSON<{ items?: TokenObservedCostItem[] }>(`/admin/tokens/costs?ids=${ids.join(",")}`),
   updateActivation: (id: number, payload: Record<string, unknown>) => {

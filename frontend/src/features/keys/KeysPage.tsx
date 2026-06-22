@@ -4,6 +4,8 @@ import {
   CopyIcon,
   KeyRoundIcon,
   LoaderCircleIcon,
+  RefreshCwIcon,
+  RotateCcwIcon,
   SearchIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -624,6 +626,18 @@ function TokenRow({
   );
 }
 
+function quotaResetCreditCount(quota?: TokenItem["quota"] | null): number | null {
+  const raw = quota?.rate_limit_reset_credits?.available_count;
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+  return Math.max(0, Math.floor(value));
+}
+
 function KeyDetailPage({
   activeStreamCap,
   id,
@@ -640,6 +654,9 @@ function KeyDetailPage({
   const [loading, setLoading] = useState(true);
   const [probeBusy, setProbeBusy] = useState(false);
   const [copyRefreshBusy, setCopyRefreshBusy] = useState(false);
+  const [quotaCreditBusy, setQuotaCreditBusy] = useState(false);
+  const [quotaResetBusy, setQuotaResetBusy] = useState(false);
+  const [quotaCreditCount, setQuotaCreditCount] = useState<number | null>(null);
   const [probeResult, setProbeResult] = useState<TokenProbeResponse | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
 
@@ -652,7 +669,9 @@ function KeyDetailPage({
     setLoading(true);
     setError("");
     try {
-      setToken(await api.getToken(id, true));
+      const nextToken = await api.getToken(id, true);
+      setToken(nextToken);
+      setQuotaCreditCount(quotaResetCreditCount(nextToken.quota));
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -663,6 +682,11 @@ function KeyDetailPage({
   useEffect(() => {
     void loadToken();
   }, [loadToken, refreshNonce]);
+
+  useEffect(() => {
+    setQuotaCreditCount(null);
+    setProbeResult(null);
+  }, [id]);
 
   async function runProbe() {
     if (!token) {
@@ -701,6 +725,67 @@ function KeyDetailPage({
       pushToast(errorMessage(caught), "error");
     } finally {
       setCopyRefreshBusy(false);
+    }
+  }
+
+  function applyQuotaCreditPayload(payload: Awaited<ReturnType<typeof api.tokenQuotaResetCredits>>, tokenID: number): number {
+    const count = quotaResetCreditCount(payload.quota) ?? Math.max(0, Math.floor(Number(payload.rate_limit_reset_credits?.available_count ?? 0)));
+    setQuotaCreditCount(Number.isFinite(count) ? count : 0);
+    if (payload.quota) {
+      setToken((current) => (current && current.id === tokenID ? { ...current, quota: payload.quota } : current));
+    }
+    return Number.isFinite(count) ? count : 0;
+  }
+
+  async function queryQuotaResetCredits() {
+    if (!token) {
+      return;
+    }
+    setQuotaCreditBusy(true);
+    try {
+      const payload = await api.tokenQuotaResetCredits(token.id);
+      const count = applyQuotaCreditPayload(payload, token.id);
+      if (payload.quota?.error) {
+        pushToast(payload.quota.error, "warning");
+      } else {
+        pushToast(`剩余重置次数 ${formatNumber(count)}`);
+      }
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setQuotaCreditBusy(false);
+    }
+  }
+
+  async function resetQuotaCredit() {
+    if (!token) {
+      return;
+    }
+    if (quotaCreditCount === null) {
+      pushToast("请先查询次数", "warning");
+      return;
+    }
+    if (quotaCreditCount <= 0) {
+      pushToast("没有可用的重置次数", "warning");
+      return;
+    }
+    setQuotaResetBusy(true);
+    try {
+      const result = await api.resetTokenQuota(token.id);
+      let refreshedCount = 0;
+      try {
+        const payload = await api.tokenQuotaResetCredits(token.id);
+        refreshedCount = applyQuotaCreditPayload(payload, token.id);
+      } catch (caught) {
+        setQuotaCreditCount(null);
+        pushToast(`重置完成，次数刷新失败：${errorMessage(caught)}`, "warning");
+        return;
+      }
+      pushToast(`已重置 ${formatNumber(result.windows_reset ?? 0)} 个窗口，剩余 ${formatNumber(refreshedCount)}`);
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setQuotaResetBusy(false);
     }
   }
 
@@ -761,6 +846,28 @@ function KeyDetailPage({
               <Button loading={copyRefreshBusy} onClick={() => void copyRefreshToken()} size="sm" variant="outline">
                 <CopyIcon />
                 复制 refresh_token
+              </Button>
+              <Button
+                disabled={quotaResetBusy}
+                loading={quotaCreditBusy}
+                onClick={() => void queryQuotaResetCredits()}
+                size="sm"
+                title={quotaCreditCount === null ? "查询重置次数" : "刷新重置次数"}
+                variant="outline"
+              >
+                <RefreshCwIcon />
+                {quotaCreditCount === null ? "次数" : `次数 ${formatNumber(quotaCreditCount)}`}
+              </Button>
+              <Button
+                disabled={quotaCreditBusy || quotaCreditCount === null || quotaCreditCount <= 0}
+                loading={quotaResetBusy}
+                onClick={() => void resetQuotaCredit()}
+                size="sm"
+                title={quotaCreditCount === null ? "先查询次数" : quotaCreditCount <= 0 ? "没有可用的重置次数" : "消耗 1 次重置额度"}
+                variant="outline"
+              >
+                <RotateCcwIcon />
+                重置
               </Button>
               <Button
                 onClick={() =>

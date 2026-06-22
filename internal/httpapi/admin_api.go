@@ -192,6 +192,7 @@ func adminOpenAPISpec() map[string]any {
 	routes := []string{
 		"GET /admin/openapi.json", "GET /admin/options",
 		"GET /admin/tokens", "GET /admin/token-refresh-tokens/{token_id}", "PATCH /admin/tokens/{token_id}", "GET /admin/tokens/export",
+		"GET /admin/token-quota-reset-credits/{token_id}", "POST /admin/token-quota-reset/{token_id}",
 		"POST /admin/tokens/{token_id}/cooldown", "DELETE /admin/token-cooldown/{token_id}",
 		"DELETE /admin/token-last-error/{token_id}", "POST /admin/tokens/{token_id}/secrets",
 		"POST /admin/tokens/{token_id}/refresh", "GET /admin/token-refresh-history/{token_id}",
@@ -223,7 +224,8 @@ func adminOpenAPISpec() map[string]any {
 		"POST /api/me/api-keys", "DELETE /api/me/api-keys/{key_id}", "GET /api/me/usage",
 		"GET /api/me/pool-summary", "GET /api/me/settings", "GET /api/me/settings/{key}",
 		"POST /api/me/settings/{key}", "DELETE /api/me/settings/{key}",
-		"GET /api/tokens", "GET /api/tokens/{token_id}", "GET /api/tokens/{token_id}/refresh-token", "PATCH /api/tokens/{token_id}",
+		"GET /api/tokens", "GET /api/tokens/{token_id}", "GET /api/tokens/{token_id}/refresh-token",
+		"GET /api/tokens/{token_id}/quota-reset-credits", "POST /api/tokens/{token_id}/quota-reset", "PATCH /api/tokens/{token_id}",
 		"DELETE /api/tokens/{token_id}", "POST /api/tokens/{token_id}/probe",
 		"POST /api/import/parse", "POST /api/import/upload", "POST /api/import/jobs",
 		"GET /api/import/jobs", "GET /api/import/jobs/{job_id}", "POST /api/import/jobs/{job_id}/cancel",

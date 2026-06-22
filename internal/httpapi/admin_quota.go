@@ -1,7 +1,10 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
@@ -21,7 +26,10 @@ import (
 
 const (
 	defaultWHAMUsageURL      = "https://chatgpt.com/backend-api/wham/usage"
+	defaultWHAMResetURL      = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 	defaultWHAMUserAgent     = "codex_cli_rs/0.125.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	defaultWHAMOriginator    = "Codex Desktop"
+	defaultWHAMLanguage      = "zh-CN"
 	quotaWindow5HSeconds     = 5 * 60 * 60
 	quotaWindow7DSeconds     = 7 * 24 * 60 * 60
 	defaultQuotaTTLSeconds   = 60
@@ -51,12 +59,33 @@ type codexQuotaWindow struct {
 	Exhausted          bool       `json:"exhausted"`
 }
 
+type codexQuotaResetCredits struct {
+	AvailableCount int `json:"available_count"`
+}
+
 type codexQuotaSnapshot struct {
-	FetchedAt time.Time          `json:"fetched_at"`
-	Error     *string            `json:"error"`
-	PlanType  *string            `json:"plan_type"`
-	Disabled  bool               `json:"disabled,omitempty"`
-	Windows   []codexQuotaWindow `json:"windows"`
+	FetchedAt             time.Time               `json:"fetched_at"`
+	Error                 *string                 `json:"error"`
+	PlanType              *string                 `json:"plan_type"`
+	Disabled              bool                    `json:"disabled,omitempty"`
+	Windows               []codexQuotaWindow      `json:"windows"`
+	RateLimitResetCredits *codexQuotaResetCredits `json:"rate_limit_reset_credits,omitempty"`
+}
+
+type codexQuotaResetCredit struct {
+	ID              string `json:"id,omitempty"`
+	ResetType       string `json:"reset_type,omitempty"`
+	Status          string `json:"status,omitempty"`
+	GrantedAt       string `json:"granted_at,omitempty"`
+	ExpiresAt       string `json:"expires_at,omitempty"`
+	RedeemStartedAt string `json:"redeem_started_at,omitempty"`
+	RedeemedAt      string `json:"redeemed_at,omitempty"`
+}
+
+type codexQuotaResetResult struct {
+	Code         string                 `json:"code"`
+	Credit       *codexQuotaResetCredit `json:"credit,omitempty"`
+	WindowsReset int                    `json:"windows_reset"`
 }
 
 type cachedQuotaSnapshot struct {
@@ -69,6 +98,7 @@ type adminQuotaService struct {
 	oauthClient       oauth.Client
 	store             *store.Store
 	usageURL          string
+	resetURL          string
 	userAgent         string
 	ttl               time.Duration
 	concurrency       int
@@ -103,6 +133,7 @@ func newAdminQuotaService(cfg config.Config, tokenStore *store.Store) *adminQuot
 		oauthClient:       oauthClient,
 		store:             tokenStore,
 		usageURL:          firstEnv("OAIX_WHAM_USAGE_URL", "WHAM_USAGE_URL", defaultWHAMUsageURL),
+		resetURL:          firstEnv("OAIX_WHAM_RATE_LIMIT_RESET_URL", "WHAM_RATE_LIMIT_RESET_URL", defaultWHAMResetURL),
 		userAgent:         firstEnv("OAIX_WHAM_USER_AGENT", "WHAM_USER_AGENT", defaultWHAMUserAgent),
 		ttl:               time.Duration(ttlSeconds) * time.Second,
 		concurrency:       concurrency,
@@ -265,6 +296,21 @@ func quotaEligible(token store.Token) bool {
 	return token.IsActive && token.DisabledAt == nil && (strings.TrimSpace(token.AccessToken) != "" || strings.TrimSpace(token.RefreshToken) != "")
 }
 
+func quotaActionEligible(token store.Token) bool {
+	return strings.TrimSpace(token.AccessToken) != "" || strings.TrimSpace(token.RefreshToken) != ""
+}
+
+var errQuotaTokenUnavailable = errors.New("token has no usable access or refresh token")
+
+type quotaUpstreamError struct {
+	status int
+	detail string
+}
+
+func (e *quotaUpstreamError) Error() string {
+	return e.detail
+}
+
 func (s *adminQuotaService) cached(tokenID int64, now time.Time, includeStale bool) (*codexQuotaSnapshot, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -417,6 +463,72 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 	return s.storeSnapshot(token.ID, snapshot)
 }
 
+func (s *adminQuotaService) queryResetCredits(ctx context.Context, token store.Token) (*codexQuotaSnapshot, error) {
+	if s == nil {
+		return nil, errors.New("quota service is not configured")
+	}
+	if !quotaActionEligible(token) {
+		return nil, errQuotaTokenUnavailable
+	}
+	snapshot := s.fetchSnapshot(ctx, token)
+	if snapshot == nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("quota query did not complete")
+	}
+	return snapshot, nil
+}
+
+func (s *adminQuotaService) resetCredit(ctx context.Context, token store.Token) (*codexQuotaResetResult, error) {
+	if s == nil {
+		return nil, errors.New("quota service is not configured")
+	}
+	if !quotaActionEligible(token) {
+		return nil, errQuotaTokenUnavailable
+	}
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	if strings.TrimSpace(token.AccessToken) == "" {
+		refreshed, err := s.refreshQuotaToken(ctx, token)
+		if err != nil {
+			return nil, err
+		}
+		token = refreshed
+	}
+
+	redeemRequestID, err := generateQuotaRedeemRequestID()
+	if err != nil {
+		return nil, err
+	}
+	statusCode, body, result, err := s.requestResetCredit(ctx, token, redeemRequestID)
+	if err != nil {
+		return nil, err
+	}
+	if quotaStatusShouldRefresh(statusCode) {
+		if refreshed, refreshErr := s.refreshQuotaToken(ctx, token); refreshErr == nil {
+			token = refreshed
+			statusCode, body, result, err = s.requestResetCredit(ctx, token, redeemRequestID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if statusCode < 200 || statusCode >= 300 {
+		return nil, &quotaUpstreamError{status: quotaUpstreamHTTPStatus(statusCode), detail: responseErrorDetail(statusCode, body)}
+	}
+	if result == nil {
+		return nil, errors.New("quota reset endpoint returned an empty response")
+	}
+	s.clear([]int64{token.ID})
+	return result, nil
+}
+
 func (s *adminQuotaService) requestUsage(ctx context.Context, token store.Token) (int, []byte, error) {
 	accessToken := strings.TrimSpace(token.AccessToken)
 	if accessToken == "" {
@@ -426,12 +538,7 @@ func (s *adminQuotaService) requestUsage(ctx context.Context, token store.Token)
 	if err != nil {
 		return 0, nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", s.userAgent)
-	if token.AccountID != nil && strings.TrimSpace(*token.AccountID) != "" {
-		req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(*token.AccountID))
-	}
+	s.setWHAMHeaders(req, token, true)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -442,8 +549,86 @@ func (s *adminQuotaService) requestUsage(ctx context.Context, token store.Token)
 	return resp.StatusCode, body, nil
 }
 
+func (s *adminQuotaService) requestResetCredit(ctx context.Context, token store.Token, redeemRequestID string) (int, []byte, *codexQuotaResetResult, error) {
+	accessToken := strings.TrimSpace(token.AccessToken)
+	if accessToken == "" {
+		return 0, nil, nil, fmt.Errorf("token has no access token")
+	}
+	bodyBytes, err := json.Marshal(map[string]string{"redeem_request_id": redeemRequestID})
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.resetURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	s.setWHAMHeaders(req, token, true)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, defaultQuotaBodyMaxBytes))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp.StatusCode, responseBody, nil, nil
+	}
+	var payload codexQuotaResetResult
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return resp.StatusCode, responseBody, nil, fmt.Errorf("quota reset endpoint returned invalid JSON")
+	}
+	return resp.StatusCode, responseBody, &payload, nil
+}
+
+func (s *adminQuotaService) setWHAMHeaders(req *http.Request, token store.Token, contentJSON bool) {
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token.AccessToken))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", s.userAgent)
+	req.Header.Set("Oai-Language", defaultWHAMLanguage)
+	req.Header.Set("Originator", defaultWHAMOriginator)
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-Mode", "no-cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Priority", "u=4, i")
+	if contentJSON {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token.AccountID != nil && strings.TrimSpace(*token.AccountID) != "" {
+		req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(*token.AccountID))
+	}
+}
+
 func quotaStatusShouldRefresh(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusNotFound
+}
+
+func quotaUpstreamHTTPStatus(status int) int {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return status
+	case status == http.StatusTooManyRequests:
+		return http.StatusTooManyRequests
+	case status >= 400 && status < 500:
+		return http.StatusBadGateway
+	case status >= 500:
+		return http.StatusBadGateway
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+func quotaErrorHTTPStatus(err error) int {
+	if errors.Is(err, errQuotaTokenUnavailable) {
+		return http.StatusBadRequest
+	}
+	if contextError(err) {
+		return http.StatusGatewayTimeout
+	}
+	var upstream *quotaUpstreamError
+	if errors.As(err, &upstream) && upstream.status > 0 {
+		return upstream.status
+	}
+	return http.StatusBadGateway
 }
 
 func contextError(err error) bool {
@@ -498,6 +683,137 @@ func (s *adminQuotaService) refreshQuotaToken(ctx context.Context, token store.T
 		token.PlanType = &value
 	}
 	return token, nil
+}
+
+func (a *App) getTokenQuotaResetCredits(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathInt64(w, r, "token_id")
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	token, err := a.store.GetToken(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("token not found"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	a.writeTokenQuotaResetCredits(w, r, *token)
+}
+
+func (a *App) getMyTokenQuotaResetCredits(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	scope, ok := userScope(w, auth)
+	if !ok {
+		return
+	}
+	id, ok := pathInt64(w, r, "token_id")
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	token, err := a.store.GetTokenScoped(ctx, scope, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "token not found"})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	a.writeTokenQuotaResetCredits(w, r, *token)
+}
+
+func (a *App) writeTokenQuotaResetCredits(w http.ResponseWriter, r *http.Request, token store.Token) {
+	if a.quota == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("quota service is not configured"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	snapshot, err := a.quota.queryResetCredits(ctx, token)
+	if err != nil {
+		writeError(w, quotaErrorHTTPStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"quota":                    snapshot,
+		"rate_limit_reset_credits": snapshot.RateLimitResetCredits,
+	})
+}
+
+func (a *App) resetTokenQuotaCredit(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathInt64(w, r, "token_id")
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	token, err := a.store.GetToken(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, errors.New("token not found"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	a.writeTokenQuotaReset(w, r, *token, "api", map[string]any{"owner_user_id": token.OwnerUserID})
+}
+
+func (a *App) resetMyTokenQuotaCredit(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	scope, ok := userScope(w, auth)
+	if !ok {
+		return
+	}
+	id, ok := pathInt64(w, r, "token_id")
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	token, err := a.store.GetTokenScoped(ctx, scope, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "token not found"})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	details := map[string]any{}
+	if scope.OwnerUserID != nil {
+		details["user_id"] = *scope.OwnerUserID
+	}
+	a.writeTokenQuotaReset(w, r, *token, "self", details)
+}
+
+func (a *App) writeTokenQuotaReset(w http.ResponseWriter, r *http.Request, token store.Token, actor string, details map[string]any) {
+	if a.quota == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("quota service is not configured"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	result, err := a.quota.resetCredit(ctx, token)
+	if err != nil {
+		writeError(w, quotaErrorHTTPStatus(err), err)
+		return
+	}
+	if details == nil {
+		details = map[string]any{}
+	}
+	details["windows_reset"] = result.WindowsReset
+	details["code"] = result.Code
+	auditCtx, auditCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer auditCancel()
+	_ = a.store.WriteAuditLog(auditCtx, "token_quota_reset_credit_consume", actor, "token", strconv.FormatInt(token.ID, 10), details)
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *adminQuotaService) storeSnapshot(tokenID int64, snapshot *codexQuotaSnapshot) *codexQuotaSnapshot {
@@ -578,11 +894,28 @@ func parseCodexQuotaPayload(payload map[string]any, now time.Time) (*codexQuotaS
 	}
 	planType := normalizePlanType(firstValue(payload, "plan_type", "planType"))
 	return &codexQuotaSnapshot{
-		FetchedAt: now,
-		Error:     nil,
-		PlanType:  planType,
-		Windows:   windows,
+		FetchedAt:             now,
+		Error:                 nil,
+		PlanType:              planType,
+		Windows:               windows,
+		RateLimitResetCredits: parseQuotaResetCredits(payload),
 	}, nil
+}
+
+func parseQuotaResetCredits(payload map[string]any) *codexQuotaResetCredits {
+	credits := firstMapping(payload, "rate_limit_reset_credits", "rateLimitResetCredits")
+	if credits == nil {
+		return nil
+	}
+	count := coerceInt(firstValue(credits, "available_count", "availableCount"))
+	if count == nil {
+		return nil
+	}
+	available := *count
+	if available < 0 {
+		available = 0
+	}
+	return &codexQuotaResetCredits{AvailableCount: available}
 }
 
 func findCodexWindows(rateLimit map[string]any) (map[string]any, map[string]any) {
@@ -851,6 +1184,17 @@ func clampPercent(value float64) float64 {
 
 func boolIs(value *bool, expected bool) bool {
 	return value != nil && *value == expected
+}
+
+func generateQuotaRedeemRequestID() (string, error) {
+	data := make([]byte, 16)
+	if _, err := rand.Read(data); err != nil {
+		return "", err
+	}
+	data[6] = (data[6] & 0x0f) | 0x40
+	data[8] = (data[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(data)
+	return fmt.Sprintf("%s-%s-%s-%s-%s", encoded[0:8], encoded[8:12], encoded[12:16], encoded[16:20], encoded[20:]), nil
 }
 
 func shortenError(value string, limit int) string {

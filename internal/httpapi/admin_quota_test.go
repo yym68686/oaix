@@ -14,6 +14,9 @@ func TestParseCodexQuotaPayloadExtracts5HAnd7DWindows(t *testing.T) {
 	now := time.Date(2026, 6, 17, 4, 0, 0, 0, time.UTC)
 	payload := map[string]any{
 		"plan_type": "chatgpt_pro",
+		"rate_limit_reset_credits": map[string]any{
+			"available_count": 2,
+		},
 		"rate_limit": map[string]any{
 			"allowed": false,
 			"primary_window": map[string]any{
@@ -50,6 +53,9 @@ func TestParseCodexQuotaPayloadExtracts5HAnd7DWindows(t *testing.T) {
 	if snapshot.Windows[1].Label != "7d" || snapshot.Windows[1].LimitWindowSeconds == nil || *snapshot.Windows[1].LimitWindowSeconds != quotaWindow7DSeconds {
 		t.Fatalf("7d window = %+v", snapshot.Windows[1])
 	}
+	if snapshot.RateLimitResetCredits == nil || snapshot.RateLimitResetCredits.AvailableCount != 2 {
+		t.Fatalf("reset credits = %+v", snapshot.RateLimitResetCredits)
+	}
 }
 
 func TestParseCodexQuotaPayloadDeducesExhaustedWindow(t *testing.T) {
@@ -75,6 +81,34 @@ func TestParseCodexQuotaPayloadDeducesExhaustedWindow(t *testing.T) {
 	}
 	if !window.Exhausted {
 		t.Fatalf("expected exhausted window: %+v", window)
+	}
+}
+
+func TestParseCodexQuotaPayloadExtractsCamelCaseResetCredits(t *testing.T) {
+	snapshot, err := parseCodexQuotaPayload(map[string]any{
+		"rateLimitResetCredits": map[string]any{
+			"availableCount": 3,
+		},
+	}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.RateLimitResetCredits == nil || snapshot.RateLimitResetCredits.AvailableCount != 3 {
+		t.Fatalf("reset credits = %+v", snapshot.RateLimitResetCredits)
+	}
+}
+
+func TestParseCodexQuotaPayloadClampsNegativeResetCredits(t *testing.T) {
+	snapshot, err := parseCodexQuotaPayload(map[string]any{
+		"rate_limit_reset_credits": map[string]any{
+			"available_count": -4,
+		},
+	}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.RateLimitResetCredits == nil || snapshot.RateLimitResetCredits.AvailableCount != 0 {
+		t.Fatalf("reset credits = %+v", snapshot.RateLimitResetCredits)
 	}
 }
 

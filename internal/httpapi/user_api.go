@@ -33,6 +33,8 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/tokens/quota-refresh", a.requireAuth(a.createMyQuotaRefreshJob))
 	mux.HandleFunc("GET /api/tokens/{token_id}", a.requireAuth(a.getMyToken))
 	mux.HandleFunc("GET /api/tokens/{token_id}/refresh-token", a.requireAuth(a.getMyTokenRefreshToken))
+	mux.HandleFunc("GET /api/tokens/{token_id}/quota-reset-credits", a.requireAuth(a.getMyTokenQuotaResetCredits))
+	mux.HandleFunc("POST /api/tokens/{token_id}/quota-reset", a.requireAuth(a.resetMyTokenQuotaCredit))
 	mux.HandleFunc("PATCH /api/tokens/{token_id}", a.requireAuth(a.patchMyToken))
 	mux.HandleFunc("DELETE /api/tokens/{token_id}", a.requireAuth(a.deleteMyToken))
 	mux.HandleFunc("POST /api/tokens/{token_id}/probe", a.requireAuth(a.probeMyToken))
