@@ -56,6 +56,7 @@ type OwnerUsageSummary struct {
 	CachedInputTokens int64   `json:"cached_input_tokens"`
 	TotalTokens       int64   `json:"total_tokens"`
 	EstimatedCostUSD  float64 `json:"estimated_cost_usd"`
+	ObservedCostUSD   float64 `json:"observed_cost_usd"`
 	SuccessRate       float64 `json:"success_rate"`
 	CacheHitRatio     float64 `json:"cache_hit_ratio"`
 }
@@ -350,6 +351,116 @@ func (s *Store) RequestUsageByOwner(ctx context.Context, ownerIDs []int64, hours
 
 func (s *Store) RequestUsageByTokenOwner(ctx context.Context, ownerIDs []int64, hours int) (map[int64]OwnerUsageSummary, error) {
 	return s.requestUsageByRequestLogUserColumn(ctx, "token_owner_user_id", ownerIDs, hours)
+}
+
+func (s *Store) TokenObservedCostsByOwner(ctx context.Context, ownerIDs []int64) (map[int64]float64, error) {
+	ids := uniquePositiveInt64s(ownerIDs)
+	out := make(map[int64]float64, len(ids))
+	for _, id := range ids {
+		out[id] = 0
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+
+	reconciled, err := s.RequestTokenCostsReconciled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if reconciled {
+		if err := s.addObservedCostsByOwnerAggregate(ctx, ids, out); err != nil {
+			return nil, err
+		}
+		if err := s.addObservedCostsByOwnerLogs(ctx, ids, out, true); err != nil {
+			return nil, err
+		}
+	} else if err := s.addObservedCostsByOwnerLogs(ctx, ids, out, false); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) addObservedCostsByOwnerAggregate(ctx context.Context, ownerIDs []int64, out map[int64]float64) error {
+	rows, err := s.pool.Query(ctx, `
+		select cost_owner_user_id, coalesce(sum(estimated_cost_usd), 0)::float8
+		from (
+			select coalesce(parent.owner_user_id, token.owner_user_id, costs.owner_user_id) as cost_owner_user_id,
+			       costs.estimated_cost_usd
+			from gateway_request_token_costs costs
+			left join codex_tokens token on token.id = costs.token_id
+			left join codex_tokens parent on parent.id = token.merged_into_token_id
+			where coalesce(parent.owner_user_id, token.owner_user_id, costs.owner_user_id) = any($1::bigint[])
+		) owner_costs
+		group by cost_owner_user_id
+	`, ownerIDs)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ownerID int64
+		var cost float64
+		if err := rows.Scan(&ownerID, &cost); err != nil {
+			return err
+		}
+		addOwnerObservedCost(out, ownerID, cost)
+	}
+	return rows.Err()
+}
+
+func (s *Store) addObservedCostsByOwnerLogs(ctx context.Context, ownerIDs []int64, out map[int64]float64, pendingOnly bool) error {
+	pendingClause := ""
+	if pendingOnly {
+		pendingClause = "and logs.analytics_recorded_at is null"
+	}
+	ownerExpr := "coalesce(logs.token_owner_user_id, parent.owner_user_id, token.owner_user_id)"
+	rows, err := s.pool.Query(ctx, `
+		select `+ownerExpr+` as cost_owner_user_id,
+		       coalesce(sum(logs.estimated_cost_usd), 0)::float8
+		from gateway_request_logs logs
+		left join codex_tokens token on token.id = logs.token_id
+		left join codex_tokens parent on parent.id = token.merged_into_token_id
+		where `+ownerExpr+` = any($1::bigint[])
+		  and logs.finished_at is not null
+		  and logs.estimated_cost_usd is not null
+		  `+pendingClause+`
+		group by `+ownerExpr, ownerIDs)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ownerID int64
+		var cost float64
+		if err := rows.Scan(&ownerID, &cost); err != nil {
+			return err
+		}
+		addOwnerObservedCost(out, ownerID, cost)
+	}
+	return rows.Err()
+}
+
+func addOwnerObservedCost(out map[int64]float64, ownerID int64, cost float64) {
+	if ownerID <= 0 {
+		return
+	}
+	out[ownerID] = roundCostUSD(out[ownerID] + cost)
+}
+
+func uniquePositiveInt64s(ids []int64) []int64 {
+	out := make([]int64, 0, len(ids))
+	seen := map[int64]struct{}{}
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 func (s *Store) requestUsageByRequestLogUserColumn(ctx context.Context, column string, ownerIDs []int64, hours int) (map[int64]OwnerUsageSummary, error) {

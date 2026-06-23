@@ -290,6 +290,7 @@ export type OwnerUsageSummary = {
   cached_input_tokens?: number;
   total_tokens?: number;
   estimated_cost_usd?: number;
+  observed_cost_usd?: number;
   success_rate?: number;
   cache_hit_ratio?: number;
 };

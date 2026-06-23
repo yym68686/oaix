@@ -308,7 +308,10 @@ func (a *App) platformUserUsage(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	counts, _ := a.store.TokenCountsScoped(ctx, store.OwnerResources(userID))
 	usageByOwner, _ := a.store.RequestUsageByTokenOwner(ctx, []int64{userID}, queryInt(r, "hours", 24))
-	writeJSON(w, http.StatusOK, map[string]any{"pool": counts, "usage": usageByOwner[userID]})
+	observedCostsByOwner, _ := a.store.TokenObservedCostsByOwner(ctx, []int64{userID})
+	usage := usageByOwner[userID]
+	usage.ObservedCostUSD = observedCostsByOwner[userID]
+	writeJSON(w, http.StatusOK, map[string]any{"pool": counts, "usage": usage})
 }
 
 func (a *App) platformPoolSummary(w http.ResponseWriter, r *http.Request) {
@@ -354,11 +357,14 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 		ownerIDs = append(ownerIDs, user.ID)
 	}
 	usageByOwner, _ := a.store.RequestUsageByTokenOwner(ctx, ownerIDs, queryInt(r, "hours", 24))
+	observedCostsByOwner, _ := a.store.TokenObservedCostsByOwner(ctx, ownerIDs)
 	items := make([]map[string]any, 0, len(users))
 	for _, user := range users {
 		counts, _ := a.store.TokenCountsScoped(ctx, store.OwnerResources(user.ID))
 		plans, _ := a.store.TokenPlanCountsScoped(ctx, store.OwnerResources(user.ID), store.TokenListOptions{})
-		items = append(items, map[string]any{"user": user, "counts": counts, "plan_counts": plans, "usage": usageByOwner[user.ID]})
+		usage := usageByOwner[user.ID]
+		usage.ObservedCostUSD = observedCostsByOwner[user.ID]
+		items = append(items, map[string]any{"user": user, "counts": counts, "plan_counts": plans, "usage": usage})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "pagination": pagination(opts.Limit, opts.Offset, len(items), total)})
 }

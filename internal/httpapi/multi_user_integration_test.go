@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -350,6 +352,86 @@ func TestMultiUserAdminAndReadonlyPermissionsWithDatabase(t *testing.T) {
 	}
 }
 
+func TestAdminUserUsageIncludesObservedCostByTokenOwnerWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	tokenOwner, _ := h.createUser(t, "observed-token-owner")
+	caller, _ := h.createUser(t, "observed-caller")
+	token := h.createToken(t, tokenOwner.ID, "observed-owner")
+
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour)
+	success := true
+	tokenID := token.ID
+	statusOK := http.StatusOK
+	inputTokens := 100
+	cachedInputTokens := 25
+	totalTokens := 110
+	oldCost := 12.5
+	recentCost := 1.25
+	requestSuffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	if err := h.db.UpsertRequestLogs(context.Background(), []store.RequestLog{
+		{
+			RequestID:         "req-observed-old-" + requestSuffix,
+			OwnerUserID:       &caller.ID,
+			TokenOwnerUserID:  &tokenOwner.ID,
+			Endpoint:          "/v1/responses",
+			Model:             testStringPtr("gpt-5.5"),
+			IsStream:          true,
+			StatusCode:        &statusOK,
+			Success:           &success,
+			TokenID:           &tokenID,
+			StartedAt:         old,
+			FinishedAt:        &old,
+			InputTokens:       &inputTokens,
+			CachedInputTokens: &cachedInputTokens,
+			TotalTokens:       &totalTokens,
+			EstimatedCostUSD:  &oldCost,
+		},
+		{
+			RequestID:         "req-observed-recent-" + requestSuffix,
+			OwnerUserID:       &caller.ID,
+			TokenOwnerUserID:  &tokenOwner.ID,
+			Endpoint:          "/v1/responses",
+			Model:             testStringPtr("gpt-5.5"),
+			IsStream:          true,
+			StatusCode:        &statusOK,
+			Success:           &success,
+			TokenID:           &tokenID,
+			StartedAt:         now,
+			FinishedAt:        &now,
+			InputTokens:       &inputTokens,
+			CachedInputTokens: &cachedInputTokens,
+			TotalTokens:       &totalTokens,
+			EstimatedCostUSD:  &recentCost,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := h.db.AggregateRequestHourlyStats(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.ReconcileRecordedTokenCosts(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	usagePayload := expectStatus(t, h.request(t, http.MethodGet, "/api/admin/users/"+strconv.FormatInt(tokenOwner.ID, 10)+"/usage?hours=24", "service-test-key", ""), http.StatusOK)
+	assertObservedUsageCost(t, usagePayload["usage"], recentCost, oldCost+recentCost)
+
+	if tokenOwner.Email == nil {
+		t.Fatal("token owner email is nil")
+	}
+	usersPayload := expectStatus(t, h.request(t, http.MethodGet, "/api/admin/analytics/users?limit=5&q="+url.QueryEscape(*tokenOwner.Email), "service-test-key", ""), http.StatusOK)
+	items, _ := usersPayload["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("admin analytics users items = %d, want 1 payload=%v", len(items), usersPayload)
+	}
+	item, _ := items[0].(map[string]any)
+	assertObservedUsageCost(t, item["usage"], recentCost, oldCost+recentCost)
+}
+
 func TestMultiUserAPIKeyRevocationAndDisabledUserWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userA, keyA := h.createUser(t, "revoke-a")
@@ -396,4 +478,20 @@ func testStringPtr(value string) *string {
 
 func testIntPtr(value int) *int {
 	return &value
+}
+
+func assertObservedUsageCost(t *testing.T, raw any, wantRecent float64, wantObserved float64) {
+	t.Helper()
+	usage, _ := raw.(map[string]any)
+	if usage == nil {
+		t.Fatalf("usage payload missing: %#v", raw)
+	}
+	recent, _ := usage["estimated_cost_usd"].(float64)
+	if math.Abs(recent-wantRecent) > 0.000001 {
+		t.Fatalf("estimated_cost_usd = %f, want %f usage=%v", recent, wantRecent, usage)
+	}
+	observed, _ := usage["observed_cost_usd"].(float64)
+	if math.Abs(observed-wantObserved) > 0.000001 {
+		t.Fatalf("observed_cost_usd = %f, want %f usage=%v", observed, wantObserved, usage)
+	}
 }

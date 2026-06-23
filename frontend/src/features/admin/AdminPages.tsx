@@ -125,7 +125,7 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
                   <TableHead>计划</TableHead>
                   <TableHead>账号池</TableHead>
                   <TableHead>请求</TableHead>
-                  <TableHead>缓存 / 成本</TableHead>
+                  <TableHead>24h 缓存 / 累计成本</TableHead>
                   <TableHead>最近活跃</TableHead>
                   <TableHead className="text-right">操作</TableHead>
                 </TableRow>
@@ -154,7 +154,7 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
                         请求 {formatNumber(usage.request_count)} · 成功 {formatPercent(usage.success_rate)}
                       </TableCell>
                       <TableCell className="text-xs">
-                        缓存 {formatPercent(usage.cache_hit_ratio)} · {formatCurrency(usage.estimated_cost_usd || 0)}
+                        缓存 {formatPercent(usage.cache_hit_ratio)} · {formatCurrency(readObservedCostUSD(usage))}
                       </TableCell>
                       <TableCell>{formatDate(user.last_seen_at || user.last_login_at)}</TableCell>
                       <TableCell className="text-right">
@@ -328,7 +328,8 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
             <MiniMetric label="请求量" value={usage.request_count || 0} />
             <MiniMetric label="成功率" value={formatPercent(usage.success_rate)} />
             <MiniMetric label="缓存率" value={formatPercent(usage.cache_hit_ratio)} />
-            <MiniMetric label="成本" value={formatCurrency(usage.estimated_cost_usd || 0)} />
+            <MiniMetric label="24h 成本" value={formatCurrency(usage.estimated_cost_usd || 0)} />
+            <MiniMetric label="累计成本" value={formatCurrency(readObservedCostUSD(usage))} />
           </CardPanel>
         </Card>
       )}
@@ -411,7 +412,7 @@ export function AdminPoolsPage({ refreshNonce }: { refreshNonce: number }) {
                   <TableHead>状态</TableHead>
                   <TableHead>计划</TableHead>
                   <TableHead>请求</TableHead>
-                  <TableHead>缓存 / 成本</TableHead>
+                  <TableHead>24h 缓存 / 累计成本</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -421,7 +422,7 @@ export function AdminPoolsPage({ refreshNonce }: { refreshNonce: number }) {
                     <TableCell>{statusOptionsWithCounts(item.counts || {}).map((option) => option.label).join(" · ")}</TableCell>
                     <TableCell>{planOptionsWithCounts(item.plan_counts || []).slice(1, 5).map((option) => option.label).join(" · ")}</TableCell>
                     <TableCell>请求 {formatNumber(item.usage?.request_count)} · 成功 {formatPercent(item.usage?.success_rate)}</TableCell>
-                    <TableCell>缓存 {formatPercent(item.usage?.cache_hit_ratio)} · {formatCurrency(item.usage?.estimated_cost_usd || 0)}</TableCell>
+                    <TableCell>缓存 {formatPercent(item.usage?.cache_hit_ratio)} · {formatCurrency(readObservedCostUSD(item.usage))}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -732,6 +733,15 @@ function RequestMiniTable({ items }: { items: RequestItem[] }) {
       </Table>
     </div>
   );
+}
+
+function readObservedCostUSD(usage: OwnerUsageSummary | null | undefined): number {
+  const observed = usage?.observed_cost_usd;
+  if (typeof observed === "number" && Number.isFinite(observed)) {
+    return observed;
+  }
+  const recent = usage?.estimated_cost_usd;
+  return typeof recent === "number" && Number.isFinite(recent) ? recent : 0;
 }
 
 function formatPercent(value: unknown): string {
