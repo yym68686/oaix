@@ -3,7 +3,6 @@ import {
   CopyIcon,
   ExternalLinkIcon,
   EyeIcon,
-  SaveIcon,
   Trash2Icon,
   UploadIcon,
 } from "lucide-react";
@@ -15,14 +14,11 @@ import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } f
 import { Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
-import { Separator } from "@/registry/default/ui/separator";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/registry/default/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { Textarea } from "@/registry/default/ui/textarea";
 import {
   api,
-  getServiceKey,
-  setServiceKey,
   type ImportBatch,
   type ImportBatchDetail,
   type TokenCounts,
@@ -113,7 +109,6 @@ function ImportForm({
   onImported?: () => void | Promise<void>;
   pushToast: (title: string, variant?: ToastMessage["variant"]) => void;
 }) {
-  const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
   const [tokenInput, setTokenInput] = useState("");
   const [importSource, setImportSource] = useState<"paste" | "file" | "oauth">("paste");
   const [queuePosition, setQueuePosition] = useState<"front" | "back">("front");
@@ -129,17 +124,6 @@ function ImportForm({
   const [oauthCopied, setOAuthCopied] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  async function saveServiceKey() {
-    setServiceKey(serviceKeyDraft);
-    pushToast("凭证已保存");
-  }
-
-  function clearServiceKey() {
-    setServiceKey("");
-    setServiceKeyDraft("");
-    pushToast("凭证已清空", "info");
-  }
-
   function changeImportSource(value: unknown) {
     if (value === "paste" || value === "file" || value === "oauth") {
       setImportSource(value);
@@ -149,9 +133,6 @@ function ImportForm({
   async function startOAuthImport() {
     setImportBusy(true);
     try {
-      if (serviceKeyDraft.trim()) {
-        setServiceKey(serviceKeyDraft);
-      }
       setImportFeedback("正在生成 ChatGPT 授权链接...");
       const result = await api.startOpenAIOAuth({
         import_queue_position: queuePosition,
@@ -280,27 +261,6 @@ function ImportForm({
 
   return (
     <div className="grid min-w-0 gap-4">
-      <div className="grid min-w-0 gap-2">
-        <Label htmlFor="service-key">Service API Key</Label>
-        <Input
-          id="service-key"
-          nativeInput
-          onChange={(event) => setServiceKeyDraft(event.currentTarget.value)}
-          placeholder="如果启用了 SERVICE_API_KEYS，请填在这里"
-          type="password"
-          value={serviceKeyDraft}
-        />
-      </div>
-      <div className="flex flex-wrap gap-2">
-        <Button onClick={() => void saveServiceKey()}>
-          <SaveIcon />
-          保存凭证
-        </Button>
-        <Button onClick={clearServiceKey} variant="outline">
-          清空
-        </Button>
-      </div>
-      <Separator />
       <Tabs className="min-w-0" onValueChange={changeImportSource} value={importSource}>
         <TabsList className="w-full sm:w-fit">
           <TabsTab className="flex-1 sm:flex-none" value="paste">
@@ -414,7 +374,7 @@ function ImportForm({
   );
 }
 
-function ImportNewDialog({
+export function ImportNewDialog({
   onImported,
   onOpenChange,
   open,
@@ -433,7 +393,7 @@ function ImportNewDialog({
             <UploadIcon className="size-5" />
             导入 Key
           </DialogTitle>
-          <DialogDescription>保存凭证并导入 access token / refresh token 数据，或使用 ChatGPT OAuth 授权。</DialogDescription>
+          <DialogDescription>导入 access token / refresh token 数据，或使用 ChatGPT OAuth 授权。</DialogDescription>
         </DialogHeader>
         <DialogPanel>
           <ImportForm onImported={onImported} pushToast={pushToast} />
@@ -535,6 +495,14 @@ function ImportBatchesPage({
     }
   }
 
+  async function handleImported() {
+    await loadBatches();
+    setImportDialogOpen(false);
+    if (route.key === "import_new") {
+      go("/imports", { replace: true });
+    }
+  }
+
   async function cancelJob(id: number) {
     await api.cancelImportJob(id);
     pushToast("已发送取消导入请求");
@@ -627,7 +595,7 @@ function ImportBatchesPage({
               target={deleteTarget}
             />
             <ImportNewDialog
-              onImported={loadBatches}
+              onImported={handleImported}
               onOpenChange={changeImportDialogOpen}
               open={importDialogOpen}
               pushToast={pushToast}

@@ -40,6 +40,7 @@ import {
   type TokenPlanCount,
   type TokenProbeResponse,
 } from "@/lib/api";
+import { ImportNewDialog } from "@/features/imports/ImportsPage";
 import { clamp, formatDate, formatNumber } from "@/lib/format";
 import {
   PAGE_SIZE,
@@ -148,6 +149,7 @@ export function KeyListPage({
   const [probeBusyIds, setProbeBusyIds] = useState<Set<number>>(() => new Set());
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
   const requestSeq = useRef(0);
 
   const totalPages = Math.max(1, Math.ceil(tokenTotal / PAGE_SIZE));
@@ -161,7 +163,7 @@ export function KeyListPage({
   const canMutate = String(getAuthContext()?.role || getAuthContext()?.user?.role || "").toLowerCase() !== "readonly_admin";
   const apiScope = config.apiScope || "auto";
   const basePath = config.basePath || "/keys";
-  const importHref = config.importHref === undefined ? "/imports/new" : config.importHref;
+  const importMode = config.importHref === undefined ? "dialog" : config.importHref ? "route" : "hidden";
   const searchId = config.searchId || "token-search";
   const title = config.title || "Key 状态";
   const description = config.description || `显示 ${formatNumber(tokens.length)} / ${formatNumber(tokenTotal)} 个 key`;
@@ -326,6 +328,19 @@ export function KeyListPage({
     await loadTokens();
   }
 
+  async function handleImported() {
+    setImportDialogOpen(false);
+    await loadTokens();
+  }
+
+  function openImport() {
+    if (config.importHref) {
+      navigateTo(config.importHref);
+      return;
+    }
+    setImportDialogOpen(true);
+  }
+
   return (
     <div className="grid min-w-0 gap-4">
       <Card>
@@ -335,9 +350,9 @@ export function KeyListPage({
             {title}
           </CardTitle>
           <CardDescription>{description}</CardDescription>
-          {importHref && (
+          {importMode !== "hidden" && (
             <CardAction>
-              <Button onClick={() => navigateTo(importHref)} size="sm" variant="outline">
+              <Button onClick={openImport} size="sm" variant="outline">
                 导入 Key
               </Button>
             </CardAction>
@@ -449,6 +464,14 @@ export function KeyListPage({
         onOpenChange={(open) => !open && setRemarkTarget(null)}
         onSave={() => void saveRemark()}
       />
+      {importMode === "dialog" && (
+        <ImportNewDialog
+          onImported={handleImported}
+          onOpenChange={setImportDialogOpen}
+          open={importDialogOpen}
+          pushToast={pushToast}
+        />
+      )}
     </div>
   );
 }
@@ -839,9 +862,11 @@ export function KeyDetailPage({
         refreshedCount = applyQuotaCreditPayload(payload, token.id);
       } catch (caught) {
         setQuotaCreditCount(null);
+        await loadToken();
         pushToast(`重置完成，次数刷新失败：${errorMessage(caught)}`, "warning");
         return;
       }
+      await loadToken();
       pushToast(`已重置 ${formatNumber(result.windows_reset ?? 0)} 个窗口，剩余 ${formatNumber(refreshedCount)}`);
     } catch (caught) {
       pushToast(errorMessage(caught), "error");

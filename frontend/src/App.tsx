@@ -6,7 +6,6 @@ import { KeyDetailPage, KeysPage } from "@/features/keys/KeysPage";
 import { RequestsPage } from "@/features/requests/RequestsPage";
 import { RuntimePage } from "@/features/runtime/RuntimePage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
-import { AccountAPIKeysPage, AccountPage } from "@/features/account/AccountPages";
 import { AdminAuditPage, AdminPoolsPage, AdminRequestsPage, AdminUserDetailPage, AdminUsersPage } from "@/features/admin/AdminPages";
 import { AdminSub2APIPage } from "@/features/admin/Sub2APIPage";
 import { api, hasServiceKey, isAdminPrincipal, isSelfUserMode, setAuthContext, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
@@ -114,10 +113,6 @@ export function App(): React.ReactElement {
   const admin = isAdminPrincipal(me);
   if (adminRoute && !admin && !loading) {
     page = <EmptyState title="无权限" description="当前 API Key 没有管理员权限。" />;
-  } else if (route.key === "account") {
-    page = <AccountPage me={me} refreshNonce={refreshNonce} />;
-  } else if (route.key === "account_api_keys") {
-    page = <AccountAPIKeysPage me={me} pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_users") {
     page = <AdminUsersPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_user_detail") {

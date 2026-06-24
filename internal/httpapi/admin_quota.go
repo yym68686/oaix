@@ -808,12 +808,44 @@ func (a *App) writeTokenQuotaReset(w http.ResponseWriter, r *http.Request, token
 	if details == nil {
 		details = map[string]any{}
 	}
+	activationCtx, activationCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	activatedToken, activationErr := a.store.SetTokenActiveScoped(activationCtx, tokenQuotaActivationScope(token), token.ID, true, true)
+	activationCancel()
+	if activationErr != nil {
+		details["auto_available"] = false
+		details["auto_available_error"] = activationErr.Error()
+		if a.logger != nil {
+			a.logger.Warn("token quota reset auto-enable failed", "token_id", token.ID, "owner_user_id", token.OwnerUserID, "error", activationErr)
+		}
+	} else {
+		token = *activatedToken
+		details["auto_available"] = true
+		refreshCtx, refreshCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if a.tokens != nil {
+			if err := a.tokens.Refresh(refreshCtx); err != nil && a.logger != nil {
+				a.logger.Warn("token pool refresh after quota reset failed", "token_id", token.ID, "error", err)
+			}
+			if token.OwnerUserID > 0 {
+				if err := a.tokens.RefreshOwner(refreshCtx, token.OwnerUserID); err != nil && a.logger != nil {
+					a.logger.Warn("owner token pool refresh after quota reset failed", "token_id", token.ID, "owner_user_id", token.OwnerUserID, "error", err)
+				}
+			}
+		}
+		refreshCancel()
+	}
 	details["windows_reset"] = result.WindowsReset
 	details["code"] = result.Code
 	auditCtx, auditCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer auditCancel()
 	_ = a.store.WriteAuditLog(auditCtx, "token_quota_reset_credit_consume", actor, "token", strconv.FormatInt(token.ID, 10), details)
 	writeJSON(w, http.StatusOK, result)
+}
+
+func tokenQuotaActivationScope(token store.Token) store.ResourceScope {
+	if token.OwnerUserID > 0 {
+		return store.OwnerResources(token.OwnerUserID)
+	}
+	return store.AllResources()
 }
 
 func (s *adminQuotaService) storeSnapshot(tokenID int64, snapshot *codexQuotaSnapshot) *codexQuotaSnapshot {

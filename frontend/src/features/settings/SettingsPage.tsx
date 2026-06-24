@@ -1,4 +1,4 @@
-import { DatabaseIcon, RefreshCwIcon, SaveIcon, Settings2Icon } from "lucide-react";
+import { DatabaseIcon, RefreshCwIcon, SaveIcon, Settings2Icon, ShieldCheckIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Button } from "@/registry/default/ui/button";
@@ -7,7 +7,7 @@ import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Textarea } from "@/registry/default/ui/textarea";
 import { cn } from "@/registry/default/lib/utils";
-import { api, type SettingItem } from "@/lib/api";
+import { api, getServiceKey, setServiceKey, type SettingItem } from "@/lib/api";
 import { clamp } from "@/lib/format";
 import { EmptyState, ErrorAlert, LoadingState } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
@@ -28,6 +28,7 @@ export function SettingsPage({
   const [selectionSummary, setSelectionSummary] = useState("等待载入");
   const [settingKey, setSettingKey] = useState("");
   const [settingValue, setSettingValue] = useState("{\n  \"enabled\": true\n}");
+  const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -78,40 +79,85 @@ export function SettingsPage({
     await loadSettings();
   }
 
+  function saveServiceKey() {
+    setServiceKey(serviceKeyDraft);
+    pushToast("Service API Key 已保存");
+  }
+
+  function clearServiceKey() {
+    setServiceKey("");
+    setServiceKeyDraft("");
+    pushToast("Service API Key 已清空", "info");
+  }
+
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(320px,.7fr)_minmax(0,1fr)]">
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Settings2Icon className="size-5" />
-            调度设置
-          </CardTitle>
-          <CardDescription>Key 分发、每 Key 并发和当前 selector 状态。</CardDescription>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
-          <Alert variant="info">
-            <DatabaseIcon />
-            <AlertTitle>{selectionSummary}</AlertTitle>
-            <AlertDescription>Go 网关按 snapshot selector 调度，保存后由后端配置决定是否立即生效。</AlertDescription>
-          </Alert>
-          <div className="grid gap-2">
-            <Label htmlFor="stream-cap">每 Key 并发</Label>
-            <Input
-              id="stream-cap"
-              max={10}
-              min={1}
-              nativeInput
-              onChange={(event) => onStreamCapChange(clamp(Number(event.currentTarget.value || 1), 1, 10))}
-              type="number"
-              value={streamCap}
-            />
-          </div>
-          <Button onClick={() => void saveStreamCap()}>
-            <SaveIcon />
-            保存调度设置
-          </Button>
-        </CardPanel>
-      </Card>
+      <div className="grid gap-4">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Settings2Icon className="size-5" />
+              调度设置
+            </CardTitle>
+            <CardDescription>Key 分发、每 Key 并发和当前 selector 状态。</CardDescription>
+          </CardHeader>
+          <CardPanel className="grid gap-4">
+            <Alert variant="info">
+              <DatabaseIcon />
+              <AlertTitle>{selectionSummary}</AlertTitle>
+              <AlertDescription>Go 网关按 snapshot selector 调度，保存后由后端配置决定是否立即生效。</AlertDescription>
+            </Alert>
+            <div className="grid gap-2">
+              <Label htmlFor="stream-cap">每 Key 并发</Label>
+              <Input
+                id="stream-cap"
+                max={10}
+                min={1}
+                nativeInput
+                onChange={(event) => onStreamCapChange(clamp(Number(event.currentTarget.value || 1), 1, 10))}
+                type="number"
+                value={streamCap}
+              />
+            </div>
+            <Button onClick={() => void saveStreamCap()}>
+              <SaveIcon />
+              保存调度设置
+            </Button>
+          </CardPanel>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <ShieldCheckIcon className="size-5" />
+              Service API Key
+            </CardTitle>
+            <CardDescription>保存本浏览器访问受保护接口使用的管理员凭证。</CardDescription>
+          </CardHeader>
+          <CardPanel className="grid gap-3">
+            <div className="grid gap-2">
+              <Label htmlFor="settings-service-key">Service API Key</Label>
+              <Input
+                id="settings-service-key"
+                nativeInput
+                onChange={(event) => setServiceKeyDraft(event.currentTarget.value)}
+                placeholder="oaix_service_..."
+                type="password"
+                value={serviceKeyDraft}
+              />
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={saveServiceKey}>
+                <SaveIcon />
+                保存凭证
+              </Button>
+              <Button onClick={clearServiceKey} variant="outline">
+                清空
+              </Button>
+            </div>
+          </CardPanel>
+        </Card>
+      </div>
 
       <Card>
         <CardHeader>

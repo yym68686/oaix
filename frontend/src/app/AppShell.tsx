@@ -9,7 +9,6 @@ import {
   Settings2Icon,
   ShieldCheckIcon,
   UploadIcon,
-  UserRoundIcon,
   UsersRoundIcon,
 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -36,13 +35,6 @@ type NavItem = {
 };
 
 const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
-  {
-    label: "账号",
-    items: [
-      { key: "account", href: "/account", icon: <UserRoundIcon />, label: "我的账号" },
-      { key: "account_api_keys", href: "/account/api-keys", icon: <ShieldCheckIcon />, label: "我的 API Key" },
-    ],
-  },
   {
     label: "用户",
     items: [
@@ -177,13 +169,13 @@ export function AppShell({
           </div>
           <nav className="mt-4 grid gap-4">
             {NAV_GROUPS.map((group) => {
-              const items = group.items.filter((item) => !item.adminOnly || admin).filter((item) => !(serviceOnly && item.key === "account_api_keys"));
+              const items = group.items.filter((item) => !item.adminOnly || admin);
               if (!items.length) {
                 return null;
               }
               return (
                 <div className="grid gap-1" key={group.label}>
-                  <div className="px-2 text-muted-foreground text-xs">{serviceOnly && group.label === "账号" ? "平台" : group.label}</div>
+                  <div className="px-2 text-muted-foreground text-xs">{group.label}</div>
                   <div className="flex gap-1 overflow-x-auto lg:grid lg:overflow-visible">
                     {items.map((item) => {
                       const active =
@@ -201,7 +193,7 @@ export function AppShell({
                           variant={active ? "secondary" : "ghost"}
                         >
                           {item.icon}
-                          {serviceOnly && item.key === "account" ? "平台凭证" : item.label}
+                          {item.label}
                         </Button>
                       );
                     })}

@@ -15,12 +15,6 @@ export function currentRoute(): RouteState {
 export function parseRoute(pathname: string, search = ""): RouteState {
   const path = normalizePath(pathname);
   const segments = path.split("/").filter(Boolean);
-  if (segments[0] === "account" && segments[1] === "api-keys") {
-    return { key: "account_api_keys", params: {}, path, search };
-  }
-  if (segments[0] === "account") {
-    return { key: "account", params: {}, path, search };
-  }
   if (segments[0] === "admin" && segments[1] === "users" && segments[2]) {
     return { key: "admin_user_detail", params: { id: segments[2] }, path, search };
   }
@@ -88,8 +82,8 @@ export function useRouteState(): RouteState {
     };
   }, []);
   useEffect(() => {
-    if (window.location.pathname === "/") {
-      navigateTo("/account", { replace: true });
+    if (window.location.pathname === "/" || window.location.pathname === "/account" || window.location.pathname === "/account/api-keys") {
+      navigateTo("/keys?status=available", { replace: true });
     }
   }, []);
   return route;
