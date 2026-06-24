@@ -525,7 +525,7 @@ function TokenTable({
   }
   return (
     <div className="min-w-0 overflow-hidden rounded-lg border">
-      <Table className="table-fixed">
+      <Table className="min-w-[86rem] table-fixed">
         <colgroup>
           <col className="w-9" />
           <col className="w-[26%]" />
