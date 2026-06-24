@@ -84,9 +84,7 @@ type KeyListPageConfig = {
   emptyDescription?: string;
   importHref?: string | null;
   ownerFilterOptions?: OwnerFilterOption[];
-  ownerLabelByID?: Record<number, string>;
   searchId?: string;
-  showOwnerColumn?: boolean;
   title?: string;
 };
 
@@ -104,11 +102,12 @@ export function KeysPage({
   route: RouteState;
 }) {
   if (route.key === "key_detail") {
-    return <KeyDetailPage activeStreamCap={activeStreamCap} id={Number(route.params.id)} pushToast={pushToast} refreshNonce={refreshNonce} />;
+    return <KeyDetailPage activeStreamCap={activeStreamCap} apiScope="self" id={Number(route.params.id)} pushToast={pushToast} refreshNonce={refreshNonce} />;
   }
   return (
     <KeyListPage
       activeStreamCap={activeStreamCap}
+      config={{ apiScope: "self" }}
       onCountsChange={onCountsChange}
       pushToast={pushToast}
       refreshNonce={refreshNonce}
@@ -436,10 +435,8 @@ export function KeyListPage({
             onRemark={setRemarkTarget}
             onSelectedChange={setSelectedIds}
             onToggleActivation={(id, active) => void updateActivation(id, active)}
-            ownerLabelByID={config.ownerLabelByID}
             probeBusyIds={probeBusyIds}
             selectedIds={selectedIds}
-            showOwnerColumn={Boolean(config.showOwnerColumn)}
             tokens={tokens}
           />
           <Pagination page={page} totalPages={totalPages} onPageChange={(next) => updateQuery({ page: clamp(next, 1, totalPages) }, false)} total={tokenTotal} />
@@ -468,10 +465,8 @@ function TokenTable({
   onRemark,
   onSelectedChange,
   onToggleActivation,
-  ownerLabelByID,
   probeBusyIds,
   selectedIds,
-  showOwnerColumn,
   tokens,
 }: {
   activeStreamCap: number;
@@ -485,10 +480,8 @@ function TokenTable({
   onRemark: (target: RemarkTarget) => void;
   onSelectedChange: (selected: Set<number>) => void;
   onToggleActivation: (id: number, active: boolean) => void;
-  ownerLabelByID?: Record<number, string>;
   probeBusyIds: Set<number>;
   selectedIds: Set<number>;
-  showOwnerColumn: boolean;
   tokens: TokenItem[];
 }) {
   if (error) {
@@ -513,7 +506,6 @@ function TokenTable({
         <colgroup>
           <col className="w-9" />
           <col className="w-[26%]" />
-          {showOwnerColumn && <col className="w-[12rem]" />}
           <col className="w-[5.75rem]" />
           <col className="w-[8rem]" />
           <col className="w-[9.5rem]" />
@@ -525,7 +517,6 @@ function TokenTable({
           <TableRow>
             <TableHead className="w-9" />
             <TableHead>Key</TableHead>
-            {showOwnerColumn && <TableHead>账号</TableHead>}
             <TableHead>状态</TableHead>
             <TableHead className="px-1.5">额度</TableHead>
             <TableHead className="px-1.5">并发 / 金额</TableHead>
@@ -547,10 +538,8 @@ function TokenTable({
               onRemark={onRemark}
               onSelectedChange={onSelectedChange}
               onToggleActivation={onToggleActivation}
-              ownerLabel={ownerLabelByID?.[Number(item.owner_user_id || 0)]}
               probeBusy={probeBusyIds.has(item.id)}
               selectedIds={selectedIds}
-              showOwnerColumn={showOwnerColumn}
             />
           ))}
         </TableBody>
@@ -569,10 +558,8 @@ function TokenRow({
   onRemark,
   onSelectedChange,
   onToggleActivation,
-  ownerLabel,
   probeBusy,
   selectedIds,
-  showOwnerColumn,
 }: {
   activeStreamCap: number;
   detailBasePath: string;
@@ -583,10 +570,8 @@ function TokenRow({
   onRemark: (target: RemarkTarget) => void;
   onSelectedChange: (selected: Set<number>) => void;
   onToggleActivation: (id: number, active: boolean) => void;
-  ownerLabel?: string;
   probeBusy: boolean;
   selectedIds: Set<number>;
-  showOwnerColumn: boolean;
 }) {
   const status = tokenStatusOf(item);
   const title = tokenTitle(item);
@@ -628,18 +613,6 @@ function TokenRow({
           </div>
         </div>
       </TableCell>
-      {showOwnerColumn && (
-        <TableCell className="min-w-[10rem] max-w-[14rem]">
-          <div className="grid min-w-0 gap-1">
-            <span className="truncate text-sm" title={ownerLabel || undefined}>
-              {ownerLabel || (item.owner_user_id ? `User #${item.owner_user_id}` : "-")}
-            </span>
-            {item.owner_user_id ? (
-              <span className="text-muted-foreground text-xs">ID {item.owner_user_id}</span>
-            ) : null}
-          </div>
-        </TableCell>
-      )}
       <TableCell>
         <TokenStatusPlan plan={planType} status={status} />
       </TableCell>

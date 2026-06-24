@@ -706,7 +706,7 @@ func (a *App) getTokenQuotaResetCredits(w http.ResponseWriter, r *http.Request) 
 
 func (a *App) getMyTokenQuotaResetCredits(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}
@@ -767,7 +767,7 @@ func (a *App) resetTokenQuotaCredit(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) resetMyTokenQuotaCredit(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}

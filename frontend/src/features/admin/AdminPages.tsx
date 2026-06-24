@@ -401,13 +401,6 @@ export function AdminPoolsPage({
     ],
     [loadingUsers, users],
   );
-  const ownerLabelByID = useMemo(() => {
-    const labels: Record<number, string> = {};
-    for (const user of users) {
-      labels[user.id] = user.email || `User #${user.id}`;
-    }
-    return labels;
-  }, [users]);
 
   return (
     <div className="grid gap-4">
@@ -422,9 +415,7 @@ export function AdminPoolsPage({
           emptyDescription: "调整账号、搜索、状态、计划或排序后再试。",
           importHref: "/imports/new",
           ownerFilterOptions: ownerOptions,
-          ownerLabelByID,
           searchId: "admin-token-search",
-          showOwnerColumn: true,
           title: "号池 Key 状态",
         }}
         pushToast={pushToast}

@@ -357,7 +357,7 @@ func (a *App) deleteMySetting(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) listMyTokens(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}
@@ -386,7 +386,7 @@ func (a *App) listMyTokens(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) getMyToken(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}
@@ -415,7 +415,7 @@ func (a *App) getMyToken(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) getMyTokenRefreshToken(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}
@@ -453,7 +453,7 @@ func (a *App) getMyTokenRefreshToken(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) listMyTokenQuota(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}
@@ -482,7 +482,7 @@ func (a *App) listMyTokenQuota(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) createMyQuotaRefreshJob(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}
@@ -521,7 +521,7 @@ func (a *App) createMyQuotaRefreshJob(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}
@@ -575,7 +575,7 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) deleteMyToken(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}
@@ -599,7 +599,7 @@ func (a *App) deleteMyToken(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) probeMyToken(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	scope, ok := userScope(w, auth)
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
 	if !ok {
 		return
 	}
@@ -636,6 +636,33 @@ func userScope(w http.ResponseWriter, auth *AuthContext) (store.ResourceScope, b
 	}
 	if (auth.IsService || auth.IsAdmin) && auth.ActAsUserID != nil && *auth.ActAsUserID > 0 {
 		return store.OwnerResources(*auth.ActAsUserID), true
+	}
+	writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
+	return store.ResourceScope{}, false
+}
+
+func (a *App) tokenSelfScope(ctx context.Context, w http.ResponseWriter, auth *AuthContext) (store.ResourceScope, bool) {
+	if auth == nil {
+		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
+		return store.ResourceScope{}, false
+	}
+	if auth.UserID != nil {
+		return store.OwnerResources(*auth.UserID), true
+	}
+	if (auth.IsService || auth.IsAdmin) && auth.ActAsUserID != nil && *auth.ActAsUserID > 0 {
+		return store.OwnerResources(*auth.ActAsUserID), true
+	}
+	if auth.IsService || auth.IsAdmin {
+		if a == nil || a.store == nil {
+			writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
+			return store.ResourceScope{}, false
+		}
+		ownerID, err := a.store.BootstrapUserID(ctx)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return store.ResourceScope{}, false
+		}
+		return store.OwnerResources(ownerID), true
 	}
 	writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
 	return store.ResourceScope{}, false

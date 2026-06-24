@@ -36,10 +36,22 @@ func TestFrontendAdminPagesContract(t *testing.T) {
 		"KeyListPage",
 		`apiScope: "admin"`,
 		"ownerFilterOptions",
-		"ownerLabelByID",
+		`detailBasePath: "/admin/pools"`,
 	} {
 		if !strings.Contains(adminPages, required) {
 			t.Fatalf("AdminPages must expose user status and admin pool key list data path %q", required)
+		}
+	}
+}
+
+func TestFrontendKeysPageUsesSelfScope(t *testing.T) {
+	keysPage := readFrontendFile(t, "src", "features", "keys", "KeysPage.tsx")
+	for _, required := range []string{
+		`config={{ apiScope: "self" }}`,
+		`apiScope="self"`,
+	} {
+		if !strings.Contains(keysPage, required) {
+			t.Fatalf("KeysPage must force normal key routes through self token APIs: missing %q", required)
 		}
 	}
 }
