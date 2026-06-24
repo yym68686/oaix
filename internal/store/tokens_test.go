@@ -134,16 +134,21 @@ func TestBuildPlanCountsIncludesCommonPlansAndExtras(t *testing.T) {
 }
 
 func TestTokenListWhereCanSkipPlanFilterForPlanCounts(t *testing.T) {
+	asOf := time.Date(2026, 6, 24, 6, 32, 3, 0, time.UTC)
 	where, args := tokenListWhere(TokenListOptions{
-		Query:  "acct",
-		Status: "available",
-		Plan:   "pro",
+		Query:      "acct",
+		Status:     "available",
+		Plan:       "pro",
+		StatusAsOf: &asOf,
 	}, false)
-	if len(args) != 1 || args[0] != "%acct%" {
+	if len(args) != 2 || args[0] != "%acct%" || args[1] != asOf {
 		t.Fatalf("args = %#v", args)
 	}
 	if !strings.Contains(where, "is_active = true") {
 		t.Fatalf("status filter missing: %s", where)
+	}
+	if !strings.Contains(where, "cooldown_until <= $2") {
+		t.Fatalf("status filter should use fixed timestamp parameter: %s", where)
 	}
 	if strings.Contains(where, "plan_type") {
 		t.Fatalf("plan filter should be skipped: %s", where)
@@ -159,14 +164,15 @@ func TestTokenListWhereCanSkipPlanFilterForPlanCounts(t *testing.T) {
 }
 
 func TestTokenListWhereCoolingExcludesDisabledTokens(t *testing.T) {
-	where, args := tokenListWhere(TokenListOptions{Status: "cooling"}, true)
-	if len(args) != 0 {
+	asOf := time.Date(2026, 6, 24, 6, 32, 3, 0, time.UTC)
+	where, args := tokenListWhere(TokenListOptions{Status: "cooling", StatusAsOf: &asOf}, true)
+	if len(args) != 1 || args[0] != asOf {
 		t.Fatalf("args = %#v", args)
 	}
 	for _, fragment := range []string{
 		"is_active = true",
 		"disabled_at is null",
-		"cooldown_until > now()",
+		"cooldown_until > $1",
 	} {
 		if !strings.Contains(where, fragment) {
 			t.Fatalf("cooling filter missing %q: %s", fragment, where)
@@ -176,8 +182,9 @@ func TestTokenListWhereCoolingExcludesDisabledTokens(t *testing.T) {
 
 func TestTokenListWhereScopedAddsOwnerFilter(t *testing.T) {
 	ownerID := int64(42)
-	where, args := tokenListWhereScoped(TokenListOptions{Status: "available"}, true, OwnerResources(ownerID))
-	if len(args) != 1 || args[0] != ownerID {
+	asOf := time.Date(2026, 6, 24, 6, 32, 3, 0, time.UTC)
+	where, args := tokenListWhereScoped(TokenListOptions{Status: "available", StatusAsOf: &asOf}, true, OwnerResources(ownerID))
+	if len(args) != 2 || args[0] != ownerID || args[1] != asOf {
 		t.Fatalf("args = %#v, want owner id", args)
 	}
 	if !strings.Contains(where, "owner_user_id = $1") {
@@ -185,6 +192,9 @@ func TestTokenListWhereScopedAddsOwnerFilter(t *testing.T) {
 	}
 	if !strings.Contains(where, "is_active = true") {
 		t.Fatalf("status filter missing: %s", where)
+	}
+	if !strings.Contains(where, "cooldown_until <= $2") {
+		t.Fatalf("status filter should use scoped fixed timestamp parameter: %s", where)
 	}
 }
 

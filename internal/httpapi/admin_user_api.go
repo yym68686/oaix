@@ -380,8 +380,9 @@ func (a *App) writeTokenList(w http.ResponseWriter, r *http.Request, scope store
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	adminItems, pendingIDs := a.adminTokenItems(r.Context(), tokens, queryBool(r, "include_quota", false))
-	counts, _ := a.store.TokenCountsScoped(ctx, scope)
+	asOf := store.TokenListStatusAsOf(opts)
+	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), tokens, queryBool(r, "include_quota", false), asOf)
+	counts, _ := a.store.TokenCountsScopedAt(ctx, scope, asOf)
 	planCounts, _ := a.store.TokenPlanCountsScoped(ctx, scope, opts)
 	writeJSON(w, http.StatusOK, map[string]any{"items": adminItems, "pagination": pagination(limit, offset, len(adminItems), total), "counts": counts, "plan_counts": planCounts, "quota_refresh_pending_ids": pendingIDs})
 }

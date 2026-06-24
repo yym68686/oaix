@@ -160,6 +160,10 @@ func (a *App) registerAdminAPIRoutes(mux *http.ServeMux) {
 
 func tokenListOptionsFromRequest(r *http.Request, opts store.TokenListOptions) store.TokenListOptions {
 	query := r.URL.Query()
+	if opts.StatusAsOf == nil {
+		asOf := time.Now().UTC()
+		opts.StatusAsOf = &asOf
+	}
 	opts.Query = query.Get("q")
 	opts.Status = query.Get("status")
 	opts.Plan = firstNonEmpty(query.Get("plan"), query.Get("plan_type"))
@@ -940,8 +944,9 @@ func (a *App) listImportJobTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	adminItems, pendingIDs := a.adminTokenItems(r.Context(), tokens, queryBool(r, "include_quota", false))
-	counts, _ := a.store.TokenCounts(ctx)
+	asOf := store.TokenListStatusAsOf(opts)
+	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), tokens, queryBool(r, "include_quota", false), asOf)
+	counts, _ := a.store.TokenCountsScopedAt(ctx, store.AllResources(), asOf)
 	planCounts, _ := a.store.TokenPlanCounts(ctx, opts)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": adminItems, "pagination": pagination(opts.Limit, opts.Offset, len(adminItems), total),

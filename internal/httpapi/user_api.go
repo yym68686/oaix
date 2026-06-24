@@ -371,8 +371,9 @@ func (a *App) listMyTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	adminItems, pendingIDs := a.adminTokenItems(r.Context(), items, queryBool(r, "include_quota", false))
-	counts, _ := a.store.TokenCountsScoped(ctx, scope)
+	asOf := store.TokenListStatusAsOf(opts)
+	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), items, queryBool(r, "include_quota", false), asOf)
+	counts, _ := a.store.TokenCountsScopedAt(ctx, scope, asOf)
 	planCounts, _ := a.store.TokenPlanCountsScoped(ctx, scope, opts)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts":                    counts,
@@ -872,8 +873,9 @@ func (a *App) listMyImportJobTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	adminItems, pendingIDs := a.adminTokenItems(r.Context(), tokens, queryBool(r, "include_quota", false))
-	counts, _ := a.store.TokenCountsScoped(ctx, scope)
+	asOf := store.TokenListStatusAsOf(opts)
+	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), tokens, queryBool(r, "include_quota", false), asOf)
+	counts, _ := a.store.TokenCountsScopedAt(ctx, scope, asOf)
 	planCounts, _ := a.store.TokenPlanCountsScoped(ctx, scope, opts)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": adminItems, "pagination": pagination(opts.Limit, opts.Offset, len(adminItems), total),

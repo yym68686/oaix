@@ -107,6 +107,7 @@ type TokenListOptions struct {
 	ErrorCode      string
 	CooldownReason string
 	QuotaState     string
+	StatusAsOf     *time.Time
 }
 
 type RefreshTokenIdentity struct {
@@ -218,6 +219,13 @@ func tokenListWhere(opts TokenListOptions, includePlan bool) (string, []any) {
 	return tokenListWhereScoped(opts, includePlan, AllResources())
 }
 
+func TokenListStatusAsOf(opts TokenListOptions) time.Time {
+	if opts.StatusAsOf != nil && !opts.StatusAsOf.IsZero() {
+		return opts.StatusAsOf.UTC()
+	}
+	return time.Now().UTC()
+}
+
 func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope ResourceScope) (string, []any) {
 	var filters []string
 	var args []any
@@ -237,9 +245,11 @@ func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope Resourc
 	}
 	switch strings.ToLower(strings.TrimSpace(opts.Status)) {
 	case "available", "active":
-		filters = append(filters, "is_active = true and disabled_at is null and (cooldown_until is null or cooldown_until <= now())")
+		asOf := arg(TokenListStatusAsOf(opts))
+		filters = append(filters, fmt.Sprintf("is_active = true and disabled_at is null and (cooldown_until is null or cooldown_until <= %s)", asOf))
 	case "cooling", "cooldown":
-		filters = append(filters, "is_active = true and disabled_at is null and cooldown_until > now()")
+		asOf := arg(TokenListStatusAsOf(opts))
+		filters = append(filters, fmt.Sprintf("is_active = true and disabled_at is null and cooldown_until > %s", asOf))
 	case "disabled", "inactive":
 		filters = append(filters, "(is_active = false or disabled_at is not null)")
 	}
@@ -336,8 +346,15 @@ func (s *Store) TokenCounts(ctx context.Context) (TokenCounts, error) {
 }
 
 func (s *Store) TokenCountsScoped(ctx context.Context, scope ResourceScope) (TokenCounts, error) {
+	return s.TokenCountsScopedAt(ctx, scope, time.Now().UTC())
+}
+
+func (s *Store) TokenCountsScopedAt(ctx context.Context, scope ResourceScope, asOf time.Time) (TokenCounts, error) {
+	if asOf.IsZero() {
+		asOf = time.Now().UTC()
+	}
 	var counts TokenCounts
-	args := []any{}
+	args := []any{asOf.UTC()}
 	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	err := s.pool.QueryRow(ctx, `
 		select
@@ -347,9 +364,9 @@ func (s *Store) TokenCountsScoped(ctx context.Context, scope ResourceScope) (Tok
 				  and disabled_at is null
 				  and access_token is not null
 				  and access_token <> ''
-				  and (cooldown_until is null or cooldown_until <= now())
+				  and (cooldown_until is null or cooldown_until <= $1)
 			)::int as available,
-			count(*) filter (where is_active = true and disabled_at is null and cooldown_until > now())::int as cooling,
+			count(*) filter (where is_active = true and disabled_at is null and cooldown_until > $1)::int as cooling,
 			count(*) filter (where is_active = false or disabled_at is not null)::int as disabled
 		from codex_tokens
 		where merged_into_token_id is null

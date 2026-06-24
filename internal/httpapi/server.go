@@ -341,12 +341,13 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	adminItems, pendingIDs := a.adminTokenItems(r.Context(), items, queryBool(r, "include_quota", false))
+	asOf := store.TokenListStatusAsOf(tokenOpts)
+	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), items, queryBool(r, "include_quota", false), asOf)
 	countsScope := store.AllResources()
 	if tokenOpts.OwnerUserID > 0 {
 		countsScope = store.OwnerResources(tokenOpts.OwnerUserID)
 	}
-	counts, _ := a.store.TokenCountsScoped(ctx, countsScope)
+	counts, _ := a.store.TokenCountsScopedAt(ctx, countsScope, asOf)
 	planCtx, planCancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer planCancel()
 	planCounts, _ := a.store.TokenPlanCounts(planCtx, tokenOpts)

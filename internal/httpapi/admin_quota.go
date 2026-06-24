@@ -146,6 +146,13 @@ func newAdminQuotaService(cfg config.Config, tokenStore *store.Store) *adminQuot
 }
 
 func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, includeQuota bool) ([]adminTokenItem, []int64) {
+	return a.adminTokenItemsAt(parent, tokens, includeQuota, time.Now().UTC())
+}
+
+func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, includeQuota bool, now time.Time) ([]adminTokenItem, []int64) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	quotaByID := map[int64]*codexQuotaSnapshot{}
 	var pendingIDs []int64
 	if includeQuota && a.quota != nil && len(tokens) > 0 {
@@ -171,7 +178,6 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 
 	activeByID := a.activeStreamsByTokenID(tokens)
 	cap := a.tokens.ActiveStreamCap()
-	now := time.Now().UTC()
 	items := make([]adminTokenItem, 0, len(tokens))
 	disabledFromQuota := false
 	for _, token := range tokens {
