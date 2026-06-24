@@ -165,6 +165,10 @@ func tokenListOptionsFromRequest(r *http.Request, opts store.TokenListOptions) s
 	opts.Plan = firstNonEmpty(query.Get("plan"), query.Get("plan_type"))
 	opts.Sort = query.Get("sort")
 	opts.Cursor = query.Get("cursor")
+	opts.OwnerUserID = queryInt64(r, "owner_user_id", 0)
+	if opts.OwnerUserID == 0 {
+		opts.OwnerUserID = queryInt64(r, "user_id", 0)
+	}
 	opts.ImportJobID = queryInt64(r, "import_job_id", 0)
 	if opts.ImportJobID == 0 {
 		opts.ImportJobID = queryInt64(r, "import_batch_id", 0)

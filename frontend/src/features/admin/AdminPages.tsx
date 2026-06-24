@@ -1,4 +1,4 @@
-import { DatabaseIcon, FileClockIcon, ListFilterIcon, SearchIcon, UserRoundIcon, UsersRoundIcon } from "lucide-react";
+import { FileClockIcon, ListFilterIcon, SearchIcon, UserRoundIcon, UsersRoundIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { navigateTo, type RouteState } from "@/app/router";
 import { Badge } from "@/registry/default/ui/badge";
@@ -7,11 +7,12 @@ import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } f
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
-import { api, type APIKeyItem, type CreatedAPIKey, type ImportBatch, type OwnerUsageSummary, type PlatformUser, type PoolSummaryResponse, type RequestItem, type TokenCounts, type TokenItem, type TokenPlanCount } from "@/lib/api";
+import { KeyListPage } from "@/features/keys/KeysPage";
+import { api, type APIKeyItem, type CreatedAPIKey, type ImportBatch, type OwnerUsageSummary, type PlatformUser, type RequestItem, type TokenCounts, type TokenItem } from "@/lib/api";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert, LoadingState, MiniMetric, SelectField } from "@/shared/components";
-import { errorMessage, planOptionsWithCounts, statusOptionsWithCounts } from "@/shared/domain";
-import { ApiKeyTable, ImportJobsTable, PoolSummaryCards, RequestLogsTable, TokenTable, UserSelector } from "@/shared/resourceTables";
+import { errorMessage } from "@/shared/domain";
+import { ApiKeyTable, ImportJobsTable, RequestLogsTable, TokenTable, UserSelector } from "@/shared/resourceTables";
 import type { ToastMessage } from "@/shared/types";
 
 export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title: string, variant?: ToastMessage["variant"]) => void; refreshNonce: number }) {
@@ -357,24 +358,32 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
   );
 }
 
-export function AdminPoolsPage({ refreshNonce }: { refreshNonce: number }) {
-  const [summary, setSummary] = useState<PoolSummaryResponse>({});
-  const [byUser, setByUser] = useState<Array<{ user?: PlatformUser; counts?: TokenCounts; plan_counts?: TokenPlanCount[]; usage?: OwnerUsageSummary }>>([]);
-  const [loading, setLoading] = useState(true);
+export function AdminPoolsPage({
+  activeStreamCap,
+  pushToast,
+  refreshNonce,
+  route,
+}: {
+  activeStreamCap: number;
+  pushToast: (title: string, variant?: ToastMessage["variant"]) => void;
+  refreshNonce: number;
+  route: RouteState;
+}) {
+  const [users, setUsers] = useState<PlatformUser[]>([]);
+  const [loadingUsers, setLoadingUsers] = useState(true);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
-    setLoading(true);
+    setLoadingUsers(true);
     setError("");
     try {
-      const params = new URLSearchParams({ limit: "100", hours: "24" });
-      const [pool, users] = await Promise.all([api.adminPoolSummary(), api.adminPoolSummaryByUser(params)]);
-      setSummary(pool);
-      setByUser(users.items || []);
+      const params = new URLSearchParams({ limit: "500" });
+      const payload = await api.adminUsers(params);
+      setUsers(payload.items || []);
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
-      setLoading(false);
+      setLoadingUsers(false);
     }
   }, []);
 
@@ -382,57 +391,47 @@ export function AdminPoolsPage({ refreshNonce }: { refreshNonce: number }) {
     void load();
   }, [load, refreshNonce]);
 
+  const ownerOptions = useMemo(
+    () => [
+      { label: loadingUsers ? "全部账号 · 载入中" : "全部账号", value: "all" },
+      ...users.map((user) => ({
+        label: `${user.email || `User #${user.id}`} · ID ${user.id}`,
+        value: String(user.id),
+      })),
+    ],
+    [loadingUsers, users],
+  );
+  const ownerLabelByID = useMemo(() => {
+    const labels: Record<number, string> = {};
+    for (const user of users) {
+      labels[user.id] = user.email || `User #${user.id}`;
+    }
+    return labels;
+  }, [users]);
+
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <DatabaseIcon className="size-5" />
-          号池总览
-        </CardTitle>
-        <CardDescription>全局账号池状态和按用户聚合。</CardDescription>
-      </CardHeader>
-      <CardPanel className="grid gap-4">
-        {error && <ErrorAlert title="号池载入失败" message={error} />}
-        <PoolSummaryCards summary={summary} />
-        <div className="flex flex-wrap gap-2">
-          {planOptionsWithCounts(summary.plan_counts || []).slice(1).map((item) => (
-            <Badge key={item.value} variant="secondary">
-              {item.label}
-            </Badge>
-          ))}
-        </div>
-        {loading && !byUser.length ? (
-          <LoadingState label="正在载入号池数据" />
-        ) : byUser.length ? (
-          <div className="overflow-hidden rounded-lg border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>用户</TableHead>
-                  <TableHead>状态</TableHead>
-                  <TableHead>计划</TableHead>
-                  <TableHead>请求</TableHead>
-                  <TableHead>24h 缓存 / 累计成本</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {byUser.map((item) => (
-                  <TableRow key={item.user?.id}>
-                    <TableCell>{item.user?.email || `User #${item.user?.id}`}</TableCell>
-                    <TableCell>{statusOptionsWithCounts(item.counts || {}).map((option) => option.label).join(" · ")}</TableCell>
-                    <TableCell>{planOptionsWithCounts(item.plan_counts || []).slice(1, 5).map((option) => option.label).join(" · ")}</TableCell>
-                    <TableCell>请求 {formatNumber(item.usage?.request_count)} · 成功 {formatPercent(item.usage?.success_rate)}</TableCell>
-                    <TableCell>缓存 {formatPercent(item.usage?.cache_hit_ratio)} · {formatCurrency(readObservedCostUSD(item.usage))}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-        ) : (
-          <EmptyState title="暂无用户号池" description="用户导入 Key 后会在这里显示。" />
-        )}
-      </CardPanel>
-    </Card>
+    <div className="grid gap-4">
+      {error && <ErrorAlert title="账号筛选载入失败" message={error} />}
+      <KeyListPage
+        activeStreamCap={activeStreamCap}
+        config={{
+          apiScope: "admin",
+          basePath: "/admin/pools",
+          description: "查看所有账号的 Key 状态，可按账号、状态、计划、搜索和排序筛选。",
+          detailBasePath: "/admin/pools",
+          emptyDescription: "调整账号、搜索、状态、计划或排序后再试。",
+          importHref: "/imports/new",
+          ownerFilterOptions: ownerOptions,
+          ownerLabelByID,
+          searchId: "admin-token-search",
+          showOwnerColumn: true,
+          title: "号池 Key 状态",
+        }}
+        pushToast={pushToast}
+        refreshNonce={refreshNonce}
+        route={route}
+      />
+    </div>
   );
 }
 

@@ -188,6 +188,20 @@ func TestTokenListWhereScopedAddsOwnerFilter(t *testing.T) {
 	}
 }
 
+func TestTokenListWhereSupportsOwnerOption(t *testing.T) {
+	ownerID := int64(77)
+	where, args := tokenListWhere(TokenListOptions{OwnerUserID: ownerID, Query: "acct"}, true)
+	if len(args) != 2 || args[0] != ownerID || args[1] != "%acct%" {
+		t.Fatalf("args = %#v", args)
+	}
+	if !strings.Contains(where, "owner_user_id = $1") {
+		t.Fatalf("owner option filter missing: %s", where)
+	}
+	if !strings.Contains(where, "(email ilike $2 or account_id ilike $2 or remark ilike $2)") {
+		t.Fatalf("query filter missing: %s", where)
+	}
+}
+
 func TestScanTokenAllowsMissingSecretColumns(t *testing.T) {
 	now := time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC)
 	token, err := scanToken(fakeTokenRow{values: []any{

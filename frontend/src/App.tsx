@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { AppShell } from "@/app/AppShell";
 import { useRouteState } from "@/app/router";
 import { ImportsPage } from "@/features/imports/ImportsPage";
-import { KeysPage } from "@/features/keys/KeysPage";
+import { KeyDetailPage, KeysPage } from "@/features/keys/KeysPage";
 import { RequestsPage } from "@/features/requests/RequestsPage";
 import { RuntimePage } from "@/features/runtime/RuntimePage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
@@ -123,7 +123,19 @@ export function App(): React.ReactElement {
   } else if (route.key === "admin_user_detail") {
     page = <AdminUserDetailPage pushToast={pushToast} refreshNonce={refreshNonce} route={route} />;
   } else if (route.key === "admin_pools") {
-    page = <AdminPoolsPage refreshNonce={refreshNonce} />;
+    page = <AdminPoolsPage activeStreamCap={streamCap} pushToast={pushToast} refreshNonce={refreshNonce} route={route} />;
+  } else if (route.key === "admin_pool_detail") {
+    page = (
+      <KeyDetailPage
+        activeStreamCap={streamCap}
+        apiScope="admin"
+        backHref={`/admin/pools${route.search || ""}`}
+        backLabel="返回号池"
+        id={Number(route.params.id)}
+        pushToast={pushToast}
+        refreshNonce={refreshNonce}
+      />
+    );
   } else if (route.key === "admin_requests") {
     page = <AdminRequestsPage refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_audit") {

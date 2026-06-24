@@ -66,6 +66,7 @@ export type TokenQuotaResetResult = {
 
 export type TokenItem = {
   id: number;
+  owner_user_id?: number | null;
   email?: string | null;
   account_id?: string | null;
   plan_type?: string | null;
@@ -500,6 +501,18 @@ function scopedPath(userPath: string, adminPath: string): string {
   return isSelfUserMode() ? userPath : adminPath;
 }
 
+export type TokenAPIScope = "auto" | "self" | "admin";
+
+function tokenScopedPath(userPath: string, adminPath: string, scope: TokenAPIScope = "auto"): string {
+  if (scope === "self") {
+    return userPath;
+  }
+  if (scope === "admin") {
+    return adminPath;
+  }
+  return currentAuth?.user?.id ? userPath : scopedPath(userPath, adminPath);
+}
+
 function oauthBase(): string {
   return isSelfUserMode() ? "/api/oauth/openai" : "/admin/oauth/openai";
 }
@@ -521,50 +534,50 @@ export const api = {
   tokenSelection: () => requestJSON<Record<string, unknown>>("/admin/token-selection"),
   updateTokenSelection: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/token-selection", payload),
-  listTokens: (params: URLSearchParams) =>
-    requestJSON<TokenListResponse>(`${scopedPath("/api/tokens", "/admin/tokens")}?${params.toString()}`),
-  getToken: (id: number, includeQuota = false) => {
+  listTokens: (params: URLSearchParams, scope: TokenAPIScope = "auto") =>
+    requestJSON<TokenListResponse>(`${tokenScopedPath("/api/tokens", "/admin/tokens", scope)}?${params.toString()}`),
+  getToken: (id: number, includeQuota = false, scope: TokenAPIScope = "auto") => {
     const params = new URLSearchParams();
     if (includeQuota) {
       params.set("include_quota", "true");
     }
     const query = params.toString();
-    return requestJSON<TokenItem>(`${scopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`)}${query ? `?${query}` : ""}`);
+    return requestJSON<TokenItem>(`${tokenScopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`, scope)}${query ? `?${query}` : ""}`);
   },
-  tokenRefreshToken: (id: number) =>
-    requestJSON<{ refresh_token?: string }>(scopedPath(`/api/tokens/${id}/refresh-token`, `/admin/token-refresh-tokens/${id}`)),
-  tokenQuotaResetCredits: (id: number) =>
-    requestJSON<TokenQuotaResetCreditsResponse>(scopedPath(`/api/tokens/${id}/quota-reset-credits`, `/admin/token-quota-reset-credits/${id}`)),
-  resetTokenQuota: (id: number) =>
-    postJSON<TokenQuotaResetResult>(scopedPath(`/api/tokens/${id}/quota-reset`, `/admin/token-quota-reset/${id}`), {}),
+  tokenRefreshToken: (id: number, scope: TokenAPIScope = "auto") =>
+    requestJSON<{ refresh_token?: string }>(tokenScopedPath(`/api/tokens/${id}/refresh-token`, `/admin/token-refresh-tokens/${id}`, scope)),
+  tokenQuotaResetCredits: (id: number, scope: TokenAPIScope = "auto") =>
+    requestJSON<TokenQuotaResetCreditsResponse>(tokenScopedPath(`/api/tokens/${id}/quota-reset-credits`, `/admin/token-quota-reset-credits/${id}`, scope)),
+  resetTokenQuota: (id: number, scope: TokenAPIScope = "auto") =>
+    postJSON<TokenQuotaResetResult>(tokenScopedPath(`/api/tokens/${id}/quota-reset`, `/admin/token-quota-reset/${id}`, scope), {}),
   tokenCosts: (ids: number[]) =>
     requestJSON<{ items?: TokenObservedCostItem[] }>(`/admin/tokens/costs?ids=${ids.join(",")}`),
-  updateActivation: (id: number, payload: Record<string, unknown>) => {
-    if (isSelfUserMode()) {
+  updateActivation: (id: number, payload: Record<string, unknown>, scope: TokenAPIScope = "auto") => {
+    if (tokenScopedPath("/api", "/admin", scope) === "/api") {
       return patchJSON<Record<string, unknown>>(`/api/tokens/${id}`, { is_active: Boolean(payload.active) });
     }
     return postJSON<Record<string, unknown>>(`/admin/tokens/${id}/activation`, payload);
   },
-  updateRemark: (id: number, remark: string) => {
-    if (isSelfUserMode()) {
+  updateRemark: (id: number, remark: string, scope: TokenAPIScope = "auto") => {
+    if (tokenScopedPath("/api", "/admin", scope) === "/api") {
       return patchJSON<Record<string, unknown>>(`/api/tokens/${id}`, { remark });
     }
     return postJSON<Record<string, unknown>>(`/admin/tokens/${id}/remark`, { remark });
   },
-  probeToken: (id: number, payload: Record<string, unknown> = {}) =>
-    postJSON<TokenProbeResponse>(scopedPath(`/api/tokens/${id}/probe`, `/admin/tokens/${id}/probe`), payload),
-  deleteToken: (id: number) =>
-    deleteJSON<Record<string, unknown>>(scopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`)),
-  batchTokens: async (payload: Record<string, unknown>) => {
-    if (!isSelfUserMode()) {
+  probeToken: (id: number, payload: Record<string, unknown> = {}, scope: TokenAPIScope = "auto") =>
+    postJSON<TokenProbeResponse>(tokenScopedPath(`/api/tokens/${id}/probe`, `/admin/tokens/${id}/probe`, scope), payload),
+  deleteToken: (id: number, scope: TokenAPIScope = "auto") =>
+    deleteJSON<Record<string, unknown>>(tokenScopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`, scope)),
+  batchTokens: async (payload: Record<string, unknown>, scope: TokenAPIScope = "auto") => {
+    if (tokenScopedPath("/api", "/admin", scope) === "/admin") {
       return postJSON<Record<string, unknown>>("/admin/tokens/batch", payload);
     }
     const ids = Array.isArray(payload.token_ids) ? payload.token_ids.map(Number).filter(Boolean) : [];
     const action = String(payload.action || "");
     if (action === "delete") {
-      await Promise.all(ids.map((id) => api.deleteToken(id)));
+      await Promise.all(ids.map((id) => api.deleteToken(id, "self")));
     } else if (action === "enable" || action === "disable") {
-      await Promise.all(ids.map((id) => api.updateActivation(id, { active: action === "enable" })));
+      await Promise.all(ids.map((id) => api.updateActivation(id, { active: action === "enable" }, "self")));
     }
     return { ok: true, count: ids.length };
   },

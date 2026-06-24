@@ -27,6 +27,9 @@ export function parseRoute(pathname: string, search = ""): RouteState {
   if (segments[0] === "admin" && segments[1] === "users") {
     return { key: "admin_users", params: {}, path, search };
   }
+  if (segments[0] === "admin" && segments[1] === "pools" && segments[2]) {
+    return { key: "admin_pool_detail", params: { id: segments[2] }, path, search };
+  }
   if (segments[0] === "admin" && segments[1] === "pools") {
     return { key: "admin_pools", params: {}, path, search };
   }

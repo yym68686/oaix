@@ -338,7 +338,11 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	adminItems, pendingIDs := a.adminTokenItems(r.Context(), items, queryBool(r, "include_quota", false))
-	counts, _ := a.store.TokenCounts(ctx)
+	countsScope := store.AllResources()
+	if tokenOpts.OwnerUserID > 0 {
+		countsScope = store.OwnerResources(tokenOpts.OwnerUserID)
+	}
+	counts, _ := a.store.TokenCountsScoped(ctx, countsScope)
 	planCtx, planCancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer planCancel()
 	planCounts, _ := a.store.TokenPlanCounts(planCtx, tokenOpts)

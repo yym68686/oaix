@@ -31,13 +31,15 @@ func TestFrontendAdminPagesContract(t *testing.T) {
 	adminPages := readFrontendFile(t, "src", "features", "admin", "AdminPages.tsx")
 	for _, required := range []string{
 		"api.adminUsers",
-		"api.adminPoolSummary",
 		"api.adminPoolSummaryByUser",
 		"UserDetailPage",
-		"PoolSummaryCards",
+		"KeyListPage",
+		`apiScope: "admin"`,
+		"ownerFilterOptions",
+		"ownerLabelByID",
 	} {
 		if !strings.Contains(adminPages, required) {
-			t.Fatalf("AdminPages must expose user status and pool overview data path %q", required)
+			t.Fatalf("AdminPages must expose user status and admin pool key list data path %q", required)
 		}
 	}
 }

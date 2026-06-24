@@ -34,6 +34,7 @@ import { cn } from "@/registry/default/lib/utils";
 import {
   api,
   getAuthContext,
+  type TokenAPIScope,
   type TokenCounts,
   type TokenItem,
   type TokenPlanCount,
@@ -70,6 +71,25 @@ import { TokenFilters } from "@/shared/resourceTables";
 import type { DeleteTarget, RemarkTarget, ToastMessage, TokenStatus } from "@/shared/types";
 import { navigateTo, type RouteState, useRouteSearch } from "@/app/router";
 
+type OwnerFilterOption = {
+  label: string;
+  value: string;
+};
+
+type KeyListPageConfig = {
+  apiScope?: TokenAPIScope;
+  basePath?: string;
+  description?: string;
+  detailBasePath?: string;
+  emptyDescription?: string;
+  importHref?: string | null;
+  ownerFilterOptions?: OwnerFilterOption[];
+  ownerLabelByID?: Record<number, string>;
+  searchId?: string;
+  showOwnerColumn?: boolean;
+  title?: string;
+};
+
 export function KeysPage({
   activeStreamCap,
   onCountsChange,
@@ -97,15 +117,17 @@ export function KeysPage({
   );
 }
 
-function KeyListPage({
+export function KeyListPage({
   activeStreamCap,
+  config = {},
   onCountsChange,
   pushToast,
   refreshNonce,
   route,
 }: {
   activeStreamCap: number;
-  onCountsChange: (counts: TokenCounts) => void;
+  config?: KeyListPageConfig;
+  onCountsChange?: (counts: TokenCounts) => void;
   pushToast: (title: string, variant?: ToastMessage["variant"]) => void;
   refreshNonce: number;
   route: RouteState;
@@ -115,6 +137,7 @@ function KeyListPage({
   const plan = searchParams.get("plan") || "all";
   const sort = searchParams.get("sort") || "-created_at";
   const search = searchParams.get("q") || "";
+  const ownerUserID = config.ownerFilterOptions ? searchParams.get("owner_user_id") || "all" : "all";
   const page = Math.max(1, Number(searchParams.get("page") || 1));
   const [tokens, setTokens] = useState<TokenItem[]>([]);
   const [tokenTotal, setTokenTotal] = useState(0);
@@ -131,12 +154,19 @@ function KeyListPage({
   const totalPages = Math.max(1, Math.ceil(tokenTotal / PAGE_SIZE));
   const statusOptions = useMemo(() => statusOptionsWithCounts(counts), [counts]);
   const planOptions = useMemo(() => planOptionsWithCounts(planCounts), [planCounts]);
-  const queryKey = useMemo(() => JSON.stringify({ page, plan, search, sort, status }), [page, plan, search, sort, status]);
+  const queryKey = useMemo(() => JSON.stringify({ ownerUserID, page, plan, search, sort, status }), [ownerUserID, page, plan, search, sort, status]);
   const [loadedQueryKey, setLoadedQueryKey] = useState("");
   const tableLoading = loading && (!tokens.length || loadedQueryKey !== queryKey);
   const pageIds = tokens.map((item) => item.id);
   const allSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.has(id));
   const canMutate = String(getAuthContext()?.role || getAuthContext()?.user?.role || "").toLowerCase() !== "readonly_admin";
+  const apiScope = config.apiScope || "auto";
+  const basePath = config.basePath || "/keys";
+  const importHref = config.importHref === undefined ? "/imports/new" : config.importHref;
+  const searchId = config.searchId || "token-search";
+  const title = config.title || "Key 状态";
+  const description = config.description || `显示 ${formatNumber(tokens.length)} / ${formatNumber(tokenTotal)} 个 key`;
+  const detailBasePath = config.detailBasePath || "/keys";
 
   const beginQueryLoading = useCallback(() => {
     requestSeq.current += 1;
@@ -160,13 +190,13 @@ function KeyListPage({
         }
       }
       const query = params.toString();
-      const nextPath = `/keys${query ? `?${query}` : ""}`;
+      const nextPath = `${basePath}${query ? `?${query}` : ""}`;
       if (nextPath !== `${route.path}${route.search}`) {
         beginQueryLoading();
       }
       navigateTo(nextPath, { replace });
     },
-    [beginQueryLoading, route.path, route.search],
+    [basePath, beginQueryLoading, route.path, route.search],
   );
 
   const loadTokens = useCallback(async () => {
@@ -189,11 +219,14 @@ function KeyListPage({
       if (plan !== "all") {
         params.set("plan", plan);
       }
+      if (ownerUserID !== "all") {
+        params.set("owner_user_id", ownerUserID);
+      }
       const mappedSort = sortParam(sort);
       if (mappedSort) {
         params.set("sort", mappedSort);
       }
-      const payload = await api.listTokens(params);
+      const payload = await api.listTokens(params, apiScope);
       if (requestID !== requestSeq.current) {
         return;
       }
@@ -205,7 +238,7 @@ function KeyListPage({
       setPlanCounts(payload.plan_counts || []);
       setSelectedIds(new Set());
       setLoadedQueryKey(queryKey);
-      onCountsChange(nextCounts);
+      onCountsChange?.(nextCounts);
     } catch (caught) {
       if (requestID !== requestSeq.current) {
         return;
@@ -217,7 +250,7 @@ function KeyListPage({
         setLoading(false);
       }
     }
-  }, [onCountsChange, page, plan, queryKey, search, sort, status]);
+  }, [apiScope, onCountsChange, ownerUserID, page, plan, queryKey, search, sort, status]);
 
   useEffect(() => {
     if (loadedQueryKey && loadedQueryKey !== queryKey) {
@@ -231,7 +264,7 @@ function KeyListPage({
   }, [loadTokens, refreshNonce, search]);
 
   async function updateActivation(id: number, active: boolean) {
-    await api.updateActivation(id, { active, clear_cooldown: true });
+    await api.updateActivation(id, { active, clear_cooldown: true }, apiScope);
     pushToast(active ? "Key 已启用" : "Key 已禁用");
     await loadTokens();
   }
@@ -239,7 +272,7 @@ function KeyListPage({
   async function runTokenProbe(id: number) {
     setProbeBusyIds((current) => new Set(current).add(id));
     try {
-      const result = await api.probeToken(id);
+      const result = await api.probeToken(id, {}, apiScope);
       pushToast(result.message || "测试完成", probeToastVariant(result.outcome));
       await loadTokens();
     } catch (caught) {
@@ -261,7 +294,7 @@ function KeyListPage({
       action: active ? "enable" : "disable",
       clear_cooldown: active,
       token_ids: [...selectedIds],
-    });
+    }, apiScope);
     pushToast(active ? "已批量启用" : "已批量禁用");
     await loadTokens();
   }
@@ -272,9 +305,9 @@ function KeyListPage({
     }
     try {
       if (deleteTarget.ids.length === 1) {
-        await api.deleteToken(deleteTarget.ids[0]);
+        await api.deleteToken(deleteTarget.ids[0], apiScope);
       } else {
-        await api.batchTokens({ action: "delete", token_ids: deleteTarget.ids });
+        await api.batchTokens({ action: "delete", token_ids: deleteTarget.ids }, apiScope);
       }
       pushToast("Key 已删除");
       setDeleteTarget(null);
@@ -288,7 +321,7 @@ function KeyListPage({
     if (!remarkTarget) {
       return;
     }
-    await api.updateRemark(remarkTarget.id, remarkTarget.remark);
+    await api.updateRemark(remarkTarget.id, remarkTarget.remark, apiScope);
     pushToast("备注已保存");
     setRemarkTarget(null);
     await loadTokens();
@@ -300,26 +333,26 @@ function KeyListPage({
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <KeyRoundIcon className="size-5" />
-            Key 状态
+            {title}
           </CardTitle>
-          <CardDescription>
-            显示 {formatNumber(tokens.length)} / {formatNumber(tokenTotal)} 个 key
-          </CardDescription>
-          <CardAction>
-            <Button onClick={() => navigateTo("/imports/new")} size="sm" variant="outline">
-              导入 Key
-            </Button>
-          </CardAction>
+          <CardDescription>{description}</CardDescription>
+          {importHref && (
+            <CardAction>
+              <Button onClick={() => navigateTo(importHref)} size="sm" variant="outline">
+                导入 Key
+              </Button>
+            </CardAction>
+          )}
         </CardHeader>
         <CardPanel className="grid gap-4">
-          <div className="grid gap-3 xl:grid-cols-[minmax(260px,1fr)_190px_190px_190px]">
+          <div className={cn("grid gap-3", config.ownerFilterOptions ? "xl:grid-cols-[minmax(220px,1fr)_210px_190px_190px_190px]" : "xl:grid-cols-[minmax(260px,1fr)_190px_190px_190px]")}>
             <div className="grid min-w-0 gap-2">
-              <Label htmlFor="token-search">搜索 Key</Label>
+              <Label htmlFor={searchId}>搜索 Key</Label>
               <div className="relative min-w-0">
                 <SearchIcon className="-translate-y-1/2 pointer-events-none absolute left-3 top-1/2 size-4 text-muted-foreground" />
                 <Input
                   className="min-w-0 pl-9"
-                  id="token-search"
+                  id={searchId}
                   nativeInput
                   onChange={(event) => updateQuery({ page: 1, q: event.currentTarget.value })}
                   placeholder="邮箱、Token ID、来源或错误"
@@ -328,6 +361,14 @@ function KeyListPage({
                 />
               </div>
             </div>
+            {config.ownerFilterOptions && (
+              <SelectField
+                label="账号"
+                onChange={(value) => updateQuery({ owner_user_id: value, page: 1 })}
+                options={config.ownerFilterOptions}
+                value={ownerUserID}
+              />
+            )}
             <div className="xl:col-span-2">
               <TokenFilters
                 onPlanChange={(value) => updateQuery({ page: 1, plan: value })}
@@ -385,6 +426,9 @@ function KeyListPage({
 
           <TokenTable
             activeStreamCap={activeStreamCap}
+            detailBasePath={detailBasePath}
+            detailSearch={route.search}
+            emptyDescription={config.emptyDescription}
             error={error}
             loading={tableLoading}
             onDelete={setDeleteTarget}
@@ -392,8 +436,10 @@ function KeyListPage({
             onRemark={setRemarkTarget}
             onSelectedChange={setSelectedIds}
             onToggleActivation={(id, active) => void updateActivation(id, active)}
+            ownerLabelByID={config.ownerLabelByID}
             probeBusyIds={probeBusyIds}
             selectedIds={selectedIds}
+            showOwnerColumn={Boolean(config.showOwnerColumn)}
             tokens={tokens}
           />
           <Pagination page={page} totalPages={totalPages} onPageChange={(next) => updateQuery({ page: clamp(next, 1, totalPages) }, false)} total={tokenTotal} />
@@ -412,6 +458,9 @@ function KeyListPage({
 
 function TokenTable({
   activeStreamCap,
+  detailBasePath,
+  detailSearch,
+  emptyDescription,
   error,
   loading,
   onDelete,
@@ -419,11 +468,16 @@ function TokenTable({
   onRemark,
   onSelectedChange,
   onToggleActivation,
+  ownerLabelByID,
   probeBusyIds,
   selectedIds,
+  showOwnerColumn,
   tokens,
 }: {
   activeStreamCap: number;
+  detailBasePath: string;
+  detailSearch: string;
+  emptyDescription?: string;
   error: string;
   loading: boolean;
   onDelete: (target: DeleteTarget) => void;
@@ -431,8 +485,10 @@ function TokenTable({
   onRemark: (target: RemarkTarget) => void;
   onSelectedChange: (selected: Set<number>) => void;
   onToggleActivation: (id: number, active: boolean) => void;
+  ownerLabelByID?: Record<number, string>;
   probeBusyIds: Set<number>;
   selectedIds: Set<number>;
+  showOwnerColumn: boolean;
   tokens: TokenItem[];
 }) {
   if (error) {
@@ -449,7 +505,7 @@ function TokenTable({
     );
   }
   if (!tokens.length) {
-    return <EmptyState title="没有匹配的 key" description="调整搜索、状态、计划或排序后再试。" />;
+    return <EmptyState title="没有匹配的 key" description={emptyDescription || "调整搜索、状态、计划或排序后再试。"} />;
   }
   return (
     <div className="min-w-0 overflow-hidden rounded-lg border">
@@ -457,6 +513,7 @@ function TokenTable({
         <colgroup>
           <col className="w-9" />
           <col className="w-[26%]" />
+          {showOwnerColumn && <col className="w-[12rem]" />}
           <col className="w-[5.75rem]" />
           <col className="w-[8rem]" />
           <col className="w-[9.5rem]" />
@@ -468,6 +525,7 @@ function TokenTable({
           <TableRow>
             <TableHead className="w-9" />
             <TableHead>Key</TableHead>
+            {showOwnerColumn && <TableHead>账号</TableHead>}
             <TableHead>状态</TableHead>
             <TableHead className="px-1.5">额度</TableHead>
             <TableHead className="px-1.5">并发 / 金额</TableHead>
@@ -480,6 +538,8 @@ function TokenTable({
           {tokens.map((item) => (
             <TokenRow
               activeStreamCap={activeStreamCap}
+              detailBasePath={detailBasePath}
+              detailSearch={detailSearch}
               item={item}
               key={item.id}
               onDelete={onDelete}
@@ -487,8 +547,10 @@ function TokenTable({
               onRemark={onRemark}
               onSelectedChange={onSelectedChange}
               onToggleActivation={onToggleActivation}
+              ownerLabel={ownerLabelByID?.[Number(item.owner_user_id || 0)]}
               probeBusy={probeBusyIds.has(item.id)}
               selectedIds={selectedIds}
+              showOwnerColumn={showOwnerColumn}
             />
           ))}
         </TableBody>
@@ -499,24 +561,32 @@ function TokenTable({
 
 function TokenRow({
   activeStreamCap,
+  detailBasePath,
+  detailSearch,
   item,
   onDelete,
   onProbe,
   onRemark,
   onSelectedChange,
   onToggleActivation,
+  ownerLabel,
   probeBusy,
   selectedIds,
+  showOwnerColumn,
 }: {
   activeStreamCap: number;
+  detailBasePath: string;
+  detailSearch: string;
   item: TokenItem;
   onDelete: (target: DeleteTarget) => void;
   onProbe: (id: number) => void;
   onRemark: (target: RemarkTarget) => void;
   onSelectedChange: (selected: Set<number>) => void;
   onToggleActivation: (id: number, active: boolean) => void;
+  ownerLabel?: string;
   probeBusy: boolean;
   selectedIds: Set<number>;
+  showOwnerColumn: boolean;
 }) {
   const status = tokenStatusOf(item);
   const title = tokenTitle(item);
@@ -541,7 +611,7 @@ function TokenRow({
       </TableCell>
       <TableCell className="min-w-[18rem] max-w-[28rem]">
         <div className="grid max-h-11 min-w-0 gap-1 overflow-hidden">
-          <button className="min-w-0 text-left font-medium hover:underline" onClick={() => navigateTo(`/keys/${item.id}`)} type="button">
+          <button className="min-w-0 text-left font-medium hover:underline" onClick={() => navigateTo(`${detailBasePath}/${item.id}${detailSearch || ""}`)} type="button">
             <span className="block truncate" title={title}>
               {title}
             </span>
@@ -558,6 +628,18 @@ function TokenRow({
           </div>
         </div>
       </TableCell>
+      {showOwnerColumn && (
+        <TableCell className="min-w-[10rem] max-w-[14rem]">
+          <div className="grid min-w-0 gap-1">
+            <span className="truncate text-sm" title={ownerLabel || undefined}>
+              {ownerLabel || (item.owner_user_id ? `User #${item.owner_user_id}` : "-")}
+            </span>
+            {item.owner_user_id ? (
+              <span className="text-muted-foreground text-xs">ID {item.owner_user_id}</span>
+            ) : null}
+          </div>
+        </TableCell>
+      )}
       <TableCell>
         <TokenStatusPlan plan={planType} status={status} />
       </TableCell>
@@ -638,13 +720,19 @@ function quotaResetCreditCount(quota?: TokenItem["quota"] | null): number | null
   return Math.max(0, Math.floor(value));
 }
 
-function KeyDetailPage({
+export function KeyDetailPage({
   activeStreamCap,
+  apiScope = "auto",
+  backHref = "/keys?status=available",
+  backLabel = "返回 Key",
   id,
   pushToast,
   refreshNonce,
 }: {
   activeStreamCap: number;
+  apiScope?: TokenAPIScope;
+  backHref?: string;
+  backLabel?: string;
   id: number;
   pushToast: (title: string, variant?: ToastMessage["variant"]) => void;
   refreshNonce: number;
@@ -669,7 +757,7 @@ function KeyDetailPage({
     setLoading(true);
     setError("");
     try {
-      const nextToken = await api.getToken(id, true);
+      const nextToken = await api.getToken(id, true, apiScope);
       setToken(nextToken);
       setQuotaCreditCount(quotaResetCreditCount(nextToken.quota));
     } catch (caught) {
@@ -677,7 +765,7 @@ function KeyDetailPage({
     } finally {
       setLoading(false);
     }
-  }, [id]);
+  }, [apiScope, id]);
 
   useEffect(() => {
     void loadToken();
@@ -694,7 +782,7 @@ function KeyDetailPage({
     }
     setProbeBusy(true);
     try {
-      const result = await api.probeToken(token.id);
+      const result = await api.probeToken(token.id, {}, apiScope);
       setProbeResult(result);
       pushToast(result.message || "测试完成", probeToastVariant(result.outcome));
       await loadToken();
@@ -711,7 +799,7 @@ function KeyDetailPage({
     }
     setCopyRefreshBusy(true);
     try {
-      const payload = await api.tokenRefreshToken(token.id);
+      const payload = await api.tokenRefreshToken(token.id, apiScope);
       const refreshToken = payload.refresh_token?.trim();
       if (!refreshToken) {
         throw new Error("refresh_token 为空");
@@ -743,7 +831,7 @@ function KeyDetailPage({
     }
     setQuotaCreditBusy(true);
     try {
-      const payload = await api.tokenQuotaResetCredits(token.id);
+      const payload = await api.tokenQuotaResetCredits(token.id, apiScope);
       const count = applyQuotaCreditPayload(payload, token.id);
       if (payload.quota?.error) {
         pushToast(payload.quota.error, "warning");
@@ -771,10 +859,10 @@ function KeyDetailPage({
     }
     setQuotaResetBusy(true);
     try {
-      const result = await api.resetTokenQuota(token.id);
+      const result = await api.resetTokenQuota(token.id, apiScope);
       let refreshedCount = 0;
       try {
-        const payload = await api.tokenQuotaResetCredits(token.id);
+        const payload = await api.tokenQuotaResetCredits(token.id, apiScope);
         refreshedCount = applyQuotaCreditPayload(payload, token.id);
       } catch (caught) {
         setQuotaCreditCount(null);
@@ -793,7 +881,7 @@ function KeyDetailPage({
     if (!remarkTarget) {
       return;
     }
-    await api.updateRemark(remarkTarget.id, remarkTarget.remark);
+    await api.updateRemark(remarkTarget.id, remarkTarget.remark, apiScope);
     pushToast("备注已保存");
     setRemarkTarget(null);
     await loadToken();
@@ -802,9 +890,9 @@ function KeyDetailPage({
   if (error) {
     return (
       <div className="grid gap-4">
-        <Button className="w-fit" onClick={() => navigateTo("/keys?status=available")} variant="outline">
+        <Button className="w-fit" onClick={() => navigateTo(backHref)} variant="outline">
           <ChevronLeftIcon />
-          返回 Key
+          {backLabel}
         </Button>
         <ErrorAlert title="Key 详情载入失败" message={error} />
       </div>
@@ -822,9 +910,9 @@ function KeyDetailPage({
   const plan = tokenPlanType(token);
   return (
     <div className="grid gap-4">
-      <Button className="w-fit" onClick={() => navigateTo("/keys?status=available")} variant="outline">
+      <Button className="w-fit" onClick={() => navigateTo(backHref)} variant="outline">
         <ChevronLeftIcon />
-        返回 Key
+        {backLabel}
       </Button>
       <Card>
         <CardHeader>

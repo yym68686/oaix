@@ -91,6 +91,7 @@ type TokenListOptions struct {
 	Limit          int
 	Offset         int
 	Cursor         string
+	OwnerUserID    int64
 	Query          string
 	Status         string
 	Plan           string
@@ -226,6 +227,10 @@ func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope Resourc
 	}
 	filters = append(filters, "merged_into_token_id is null")
 	filters = append(filters, scope.ownerFilter("owner_user_id", &args))
+	if opts.OwnerUserID > 0 {
+		placeholder := arg(opts.OwnerUserID)
+		filters = append(filters, fmt.Sprintf("owner_user_id = %s", placeholder))
+	}
 	if q := strings.TrimSpace(opts.Query); q != "" {
 		placeholder := arg("%" + q + "%")
 		filters = append(filters, fmt.Sprintf("(email ilike %s or account_id ilike %s or remark ilike %s)", placeholder, placeholder, placeholder))

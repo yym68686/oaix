@@ -190,6 +190,7 @@ export function AppShell({
                         routeKey === item.key ||
                         (routeKey === "key_detail" && item.key === "keys") ||
                         (routeKey === "import_new" && item.key === "imports") ||
+                        (routeKey === "admin_pool_detail" && item.key === "admin_pools") ||
                         (routeKey === "admin_user_detail" && item.key === "admin_users");
                       return (
                         <Button
