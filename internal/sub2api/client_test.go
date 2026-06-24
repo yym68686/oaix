@@ -89,6 +89,62 @@ func TestClientCreateAccountsUnwrapsBatchResult(t *testing.T) {
 	}
 }
 
+func TestClientRestoreAccountAvailability(t *testing.T) {
+	seen := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		if got := r.Header.Get("X-API-Key"); got != "admin-fixture" {
+			t.Fatalf("X-API-Key = %q", got)
+		}
+		switch r.URL.Path {
+		case "/api/v1/admin/accounts/42/clear-error":
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s", r.Method)
+			}
+			writeSub2APISuccess(t, w, map[string]any{"id": 42, "status": "active"})
+		case "/api/v1/admin/accounts/42/schedulable":
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s", r.Method)
+			}
+			var payload map[string]bool
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode schedulable payload: %v", err)
+			}
+			if !payload["schedulable"] {
+				t.Fatalf("payload = %#v", payload)
+			}
+			writeSub2APISuccess(t, w, map[string]any{"id": 42, "schedulable": true})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	if err := client.RestoreAccountAvailability(t.Context(), server.URL, "admin-fixture", 42); err != nil {
+		t.Fatalf("RestoreAccountAvailability returned error: %v", err)
+	}
+	want := []string{
+		"POST /api/v1/admin/accounts/42/clear-error",
+		"POST /api/v1/admin/accounts/42/schedulable",
+	}
+	if strings.Join(seen, ",") != strings.Join(want, ",") {
+		t.Fatalf("seen = %#v, want %#v", seen, want)
+	}
+}
+
+func TestClientRestoreAccountAvailabilityIgnoresMissingAPI(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	if err := client.RestoreAccountAvailability(t.Context(), server.URL, "admin-fixture", 42); err != nil {
+		t.Fatalf("RestoreAccountAvailability returned error: %v", err)
+	}
+}
+
 func TestClientListProxiesUsesActiveProxyEndpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/admin/proxies/all" {

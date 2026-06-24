@@ -20,6 +20,20 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+type HTTPError struct {
+	Method     string
+	URL        string
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s %s failed: HTTP %d: %s", e.Method, e.URL, e.StatusCode, e.Body)
+}
+
 type Group struct {
 	ID       int64  `json:"id"`
 	Name     string `json:"name"`
@@ -175,6 +189,33 @@ func (c *Client) CreateAccounts(ctx context.Context, baseURL string, adminKey st
 	return result, err
 }
 
+func (c *Client) RestoreAccountAvailability(ctx context.Context, baseURL string, adminKey string, accountID int64) error {
+	if accountID <= 0 {
+		return nil
+	}
+	if err := c.doJSON(ctx, http.MethodPost, baseURL, adminKey, fmt.Sprintf("/admin/accounts/%d/clear-error", accountID), nil, nil); err != nil {
+		if isUnsupportedRestoreAPI(err) {
+			return nil
+		}
+		return err
+	}
+	if err := c.doJSON(ctx, http.MethodPost, baseURL, adminKey, fmt.Sprintf("/admin/accounts/%d/schedulable", accountID), map[string]any{"schedulable": true}, nil); err != nil {
+		if isUnsupportedRestoreAPI(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func isUnsupportedRestoreAPI(err error) bool {
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	return httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusMethodNotAllowed
+}
+
 func (c *Client) doJSON(ctx context.Context, method string, baseURL string, adminKey string, path string, body any, dest any) error {
 	client := c.HTTPClient
 	if client == nil {
@@ -211,7 +252,7 @@ func (c *Client) doJSON(ctx context.Context, method string, baseURL string, admi
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s failed: HTTP %d: %s", method, endpoint, resp.StatusCode, truncateBody(raw))
+		return &HTTPError{Method: method, URL: endpoint, StatusCode: resp.StatusCode, Body: truncateBody(raw)}
 	}
 	payload, err := unwrapResponse(raw)
 	if err != nil {

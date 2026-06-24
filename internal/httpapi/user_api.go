@@ -570,6 +570,9 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.store.WriteAuditLog(ctx, "user_token_update", "self", "token", strconv.FormatInt(id, 10), map[string]any{"user_id": *scope.OwnerUserID, "remark": payload.Remark != nil, "is_active": payload.IsActive, "share_enabled": shareEnabled})
 	_ = a.tokens.Refresh(ctx)
+	if payload.IsActive != nil && *payload.IsActive {
+		a.syncSub2APIAvailabilityAsync(token, "user_token_active")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"token": token})
 }
 

@@ -803,6 +803,7 @@ func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	var updated, deleted, failed int
 	var results []any
+	var availabilityTokens []store.Token
 	for _, id := range payload.TokenIDs {
 		if id <= 0 {
 			failed++
@@ -814,10 +815,12 @@ func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
 			if payload.Active != nil {
 				active = *payload.Active
 			}
-			if _, err := a.store.SetTokenActive(ctx, id, active, payload.ClearCooldown); err != nil {
+			token, err := a.store.SetTokenActive(ctx, id, active, payload.ClearCooldown)
+			if err != nil {
 				failed++
 			} else {
 				updated++
+				availabilityTokens = append(availabilityTokens, *token)
 			}
 		case "delete":
 			if err := a.store.DeleteToken(ctx, id); err != nil {
@@ -826,10 +829,12 @@ func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
 				deleted++
 			}
 		case "clear_cooldown":
-			if _, err := a.store.ClearTokenCooldown(ctx, id); err != nil {
+			token, err := a.store.ClearTokenCooldown(ctx, id)
+			if err != nil {
 				failed++
 			} else {
 				updated++
+				availabilityTokens = append(availabilityTokens, *token)
 			}
 		case "set_plan":
 			plan := payload.PlanType
@@ -883,6 +888,9 @@ func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.tokens.Refresh(ctx)
 	_ = a.store.WriteAuditLog(ctx, "token_batch_"+action, "api", "token", "", payload)
+	for index := range availabilityTokens {
+		a.syncSub2APIAvailabilityAsync(&availabilityTokens[index], "admin_batch_"+action)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"updated": updated,
 		"deleted": deleted,
@@ -918,6 +926,7 @@ func (a *App) updateTokenActivation(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.tokens.Refresh(ctx)
 	_ = a.store.WriteAuditLog(ctx, "token_activation", "api", "token", strconv.FormatInt(id, 10), payload)
+	a.syncSub2APIAvailabilityAsync(token, "admin_activation")
 	writeJSON(w, http.StatusOK, token)
 }
 

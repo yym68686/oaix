@@ -85,3 +85,25 @@ func TestCreateAccountRequestDefaultsConcurrency(t *testing.T) {
 		t.Fatalf("ProxyID = %#v, want nil", request.ProxyID)
 	}
 }
+
+func TestTokenAvailableForSub2API(t *testing.T) {
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Minute)
+	past := now.Add(-time.Minute)
+
+	if !tokenAvailableForSub2API(store.Token{ID: 1, IsActive: true}, now) {
+		t.Fatal("active token without cooldown should be available")
+	}
+	if !tokenAvailableForSub2API(store.Token{ID: 1, IsActive: true, CooldownUntil: &past}, now) {
+		t.Fatal("expired cooldown should be available")
+	}
+	if tokenAvailableForSub2API(store.Token{ID: 1, IsActive: true, CooldownUntil: &future}, now) {
+		t.Fatal("future cooldown should not be available")
+	}
+	if tokenAvailableForSub2API(store.Token{ID: 1, IsActive: false}, now) {
+		t.Fatal("inactive token should not be available")
+	}
+	if tokenAvailableForSub2API(store.Token{ID: 0, IsActive: true}, now) {
+		t.Fatal("token without id should not be available")
+	}
+}

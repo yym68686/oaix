@@ -3,6 +3,7 @@ package sub2api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -80,6 +81,42 @@ func (s *Syncer) SyncTarget(ctx context.Context, targetID int64, trigger string)
 		return store.Sub2APISyncRun{}, err
 	}
 	return s.RunTarget(ctx, target, trigger, SyncModeSync)
+}
+
+func (s *Syncer) RestoreTokenAvailability(ctx context.Context, token store.Token) (int, error) {
+	if s == nil || s.Store == nil || s.Client == nil || !tokenAvailableForSub2API(token, time.Now().UTC()) {
+		return 0, nil
+	}
+	mappings, err := s.Store.ListSub2APIAvailabilityMappingsForToken(ctx, token.ID)
+	if err != nil {
+		return 0, err
+	}
+	restored := 0
+	errs := make([]error, 0)
+	for _, mapping := range mappings {
+		if mapping.RemoteAccountID <= 0 {
+			continue
+		}
+		if err := s.Client.RestoreAccountAvailability(ctx, mapping.BaseURL, mapping.AdminKey, mapping.RemoteAccountID); err != nil {
+			errs = append(errs, fmt.Errorf("target %d remote account %d: %w", mapping.TargetID, mapping.RemoteAccountID, err))
+			if s.Logger != nil {
+				s.Logger.Warn("sub2api account availability restore failed", "target_id", mapping.TargetID, "remote_account_id", mapping.RemoteAccountID, "oaix_token_id", token.ID, "error", err)
+			}
+			continue
+		}
+		restored++
+	}
+	return restored, errors.Join(errs...)
+}
+
+func tokenAvailableForSub2API(token store.Token, now time.Time) bool {
+	if !token.IsActive || token.DisabledAt != nil {
+		return false
+	}
+	if token.CooldownUntil != nil && token.CooldownUntil.After(now) {
+		return false
+	}
+	return token.ID > 0
 }
 
 func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, trigger string, mode SyncMode) (store.Sub2APISyncRun, error) {

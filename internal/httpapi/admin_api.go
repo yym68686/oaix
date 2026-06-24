@@ -374,6 +374,9 @@ func (a *App) patchToken(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.tokens.Refresh(ctx)
 	_ = a.store.WriteAuditLog(ctx, "token_metadata_update", "api", "token", strconv.FormatInt(id, 10), payload)
+	if payload.IsActive != nil && *payload.IsActive {
+		a.syncSub2APIAvailabilityAsync(token, "admin_metadata_active")
+	}
 	writeJSON(w, http.StatusOK, token)
 }
 
@@ -435,6 +438,7 @@ func (a *App) clearTokenCooldown(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.tokens.Refresh(ctx)
 	_ = a.store.WriteAuditLog(ctx, "token_cooldown_clear", "api", "token", strconv.FormatInt(id, 10), nil)
+	a.syncSub2APIAvailabilityAsync(token, "admin_cooldown_clear")
 	writeJSON(w, http.StatusOK, token)
 }
 
@@ -585,6 +589,7 @@ func (a *App) unmergeToken(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.tokens.Refresh(ctx)
 	_ = a.store.WriteAuditLog(ctx, "token_unmerge", "api", "token", strconv.FormatInt(id, 10), nil)
+	a.syncSub2APIAvailabilityAsync(token, "admin_unmerge")
 	writeJSON(w, http.StatusOK, token)
 }
 

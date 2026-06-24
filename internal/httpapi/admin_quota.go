@@ -832,6 +832,7 @@ func (a *App) writeTokenQuotaReset(w http.ResponseWriter, r *http.Request, token
 			}
 		}
 		refreshCancel()
+		a.syncSub2APIAvailabilityAsync(&token, "quota_reset_auto_available")
 	}
 	details["windows_reset"] = result.WindowsReset
 	details["code"] = result.Code

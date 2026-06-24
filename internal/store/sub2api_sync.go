@@ -120,6 +120,14 @@ type Sub2APITokenCandidate struct {
 	UpdatedAt    time.Time       `json:"updated_at"`
 }
 
+type Sub2APIAvailabilityMapping struct {
+	TargetID        int64
+	TargetName      string
+	BaseURL         string
+	AdminKey        string
+	RemoteAccountID int64
+}
+
 type Sub2APITokenCandidateOptions struct {
 	Limit           int
 	CreatedAfter    *time.Time
@@ -439,6 +447,38 @@ func (s *Store) ListSub2APITokenCandidates(ctx context.Context, target Sub2APISy
 			return nil, err
 		}
 		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) ListSub2APIAvailabilityMappingsForToken(ctx context.Context, tokenID int64) ([]Sub2APIAvailabilityMapping, error) {
+	if tokenID <= 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		select t.id, t.name, t.base_url, t.admin_key, coalesce(m.remote_account_id, 0)
+		from sub2api_sync_mappings m
+		join sub2api_sync_targets t on t.id = m.target_id
+		where m.token_id = $1
+		  and m.status = 'synced'
+		  and m.remote_account_id is not null
+		  and t.enabled = true
+		  and btrim(coalesce(t.admin_key, '')) <> ''
+		order by t.id asc
+	`, tokenID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Sub2APIAvailabilityMapping{}
+	for rows.Next() {
+		var item Sub2APIAvailabilityMapping
+		if err := rows.Scan(&item.TargetID, &item.TargetName, &item.BaseURL, &item.AdminKey, &item.RemoteAccountID); err != nil {
+			return nil, err
+		}
+		if item.RemoteAccountID > 0 {
+			items = append(items, item)
+		}
 	}
 	return items, rows.Err()
 }
