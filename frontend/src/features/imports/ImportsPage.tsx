@@ -336,9 +336,6 @@ function ImportForm({
                 <Button onClick={() => void startOAuthImport()} variant="outline">
                   重新生成
                 </Button>
-                <Button disabled={!oauthCallbackInput.trim() || importBusy} loading={importBusy} onClick={() => void completeOAuthImport()}>
-                  完成导入
-                </Button>
               </div>
             </div>
           ) : (
@@ -361,7 +358,7 @@ function ImportForm({
           </Button>
         </div>
       </div>
-      <Button disabled={importBusy} loading={importBusy} onClick={() => void importTokens()}>
+      <Button disabled={importBusy || (importSource === "oauth" && Boolean(oauthSession) && !oauthCallbackInput.trim())} loading={importBusy} onClick={() => void importTokens()}>
         {importSource === "oauth" && <ExternalLinkIcon />}
         {importSource === "oauth" ? (oauthSession ? "完成 OAuth 导入" : "生成并打开授权链接") : "开始导入"}
       </Button>
