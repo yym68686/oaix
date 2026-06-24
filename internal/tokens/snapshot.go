@@ -37,6 +37,8 @@ type RuntimeToken struct {
 	RecentTTFTMs atomic.Int64
 }
 
+type ReadyTransitionHandler func(ctx context.Context, tokens []store.Token)
+
 type Manager struct {
 	source          Source
 	logger          *slog.Logger
@@ -52,6 +54,8 @@ type Manager struct {
 	stopOnce        sync.Once
 	stopCh          chan struct{}
 	refreshMu       sync.Mutex
+	readyMu         sync.RWMutex
+	readyHandler    ReadyTransitionHandler
 }
 
 type TokenPoolManager = Manager
@@ -168,19 +172,32 @@ func (m *Manager) Stop() {
 	})
 }
 
+func (m *Manager) SetReadyTransitionHandler(handler ReadyTransitionHandler) {
+	if m == nil {
+		return
+	}
+	m.readyMu.Lock()
+	m.readyHandler = handler
+	m.readyMu.Unlock()
+}
+
 func (m *Manager) Refresh(ctx context.Context) error {
 	m.refreshMu.Lock()
-	defer m.refreshMu.Unlock()
 	rows, err := m.listAvailableTokens(ctx, store.AllResources())
 	if err != nil {
+		m.refreshMu.Unlock()
 		return err
 	}
 	version := m.version.Add(1)
-	next := buildSnapshot(rows, m.Snapshot(), version)
+	current := m.Snapshot()
+	next := buildSnapshot(rows, current, version)
+	readyTransitions := newlyReadyTokens(current, next)
 	m.snapshot.Store(next)
+	m.refreshMu.Unlock()
 	if m.logger != nil {
 		m.logger.Info("token snapshot refreshed", "version", version, "ready_tokens", len(next.Ready))
 	}
+	m.notifyReadyTransitions(ctx, readyTransitions)
 	return nil
 }
 
@@ -548,6 +565,32 @@ func buildSnapshot(rows []store.Token, current *Snapshot, version int64) *Snapsh
 		ByPlan:   nextByPlan,
 		Cooling:  nextCooling,
 		Ready:    ready,
+	}
+}
+
+func newlyReadyTokens(current *Snapshot, next *Snapshot) []store.Token {
+	if current == nil || next == nil || current.Version == 0 {
+		return nil
+	}
+	ready := make([]store.Token, 0)
+	for id, runtimeToken := range next.ByID {
+		if _, ok := current.ByID[id]; ok || runtimeToken == nil {
+			continue
+		}
+		ready = append(ready, runtimeToken.Token)
+	}
+	return ready
+}
+
+func (m *Manager) notifyReadyTransitions(ctx context.Context, ready []store.Token) {
+	if m == nil || len(ready) == 0 {
+		return
+	}
+	m.readyMu.RLock()
+	handler := m.readyHandler
+	m.readyMu.RUnlock()
+	if handler != nil {
+		handler(ctx, ready)
 	}
 }
 

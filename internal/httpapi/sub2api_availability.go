@@ -27,3 +27,12 @@ func (a *App) syncSub2APIAvailabilityAsync(token *store.Token, reason string) {
 		}
 	}()
 }
+
+func (a *App) syncSub2APIReadyTransitions(ctx context.Context, ready []store.Token) {
+	if a == nil || len(ready) == 0 {
+		return
+	}
+	for i := range ready {
+		a.syncSub2APIAvailabilityAsync(&ready[i], "token_ready_snapshot")
+	}
+}

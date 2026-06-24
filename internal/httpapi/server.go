@@ -58,7 +58,7 @@ type adminImportItem struct {
 }
 
 func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenManager *tokens.Manager, logWriter *logs.Writer, pipeline *proxy.Pipeline) *App {
-	return &App{
+	app := &App{
 		cfg:       cfg,
 		logger:    logger,
 		store:     store,
@@ -72,6 +72,10 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		started:   time.Now().UTC(),
 		authKeys:  cfg.Auth.ServiceAPIKeys,
 	}
+	if tokenManager != nil {
+		tokenManager.SetReadyTransitionHandler(app.syncSub2APIReadyTransitions)
+	}
+	return app
 }
 
 func (a *App) Handler() http.Handler {

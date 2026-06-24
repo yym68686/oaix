@@ -111,6 +111,50 @@ func TestSnapshotIndexes(t *testing.T) {
 	}
 }
 
+func TestManagerReadyTransitionHandler(t *testing.T) {
+	rows := makeTokens(2)
+	source := &fakeSource{tokens: rows[:1]}
+	manager := NewManager(source, nil, time.Second, time.Second, 1)
+
+	var transitions []int64
+	manager.SetReadyTransitionHandler(func(_ context.Context, ready []store.Token) {
+		for _, token := range ready {
+			transitions = append(transitions, token.ID)
+		}
+	})
+
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh returned error: %v", err)
+	}
+	if len(transitions) != 0 {
+		t.Fatalf("initial refresh transitions = %v, want none", transitions)
+	}
+
+	source.tokens = nil
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("cooldown Refresh returned error: %v", err)
+	}
+	if len(transitions) != 0 {
+		t.Fatalf("cooldown refresh transitions = %v, want none", transitions)
+	}
+
+	source.tokens = rows[:1]
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("ready Refresh returned error: %v", err)
+	}
+	if fmt.Sprint(transitions) != "[1]" {
+		t.Fatalf("ready transitions = %v, want [1]", transitions)
+	}
+
+	source.tokens = rows
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("second ready Refresh returned error: %v", err)
+	}
+	if fmt.Sprint(transitions) != "[1 2]" {
+		t.Fatalf("ready transitions = %v, want [1 2]", transitions)
+	}
+}
+
 func TestManagerActiveStreamCapCanUpdateAtRuntime(t *testing.T) {
 	manager := NewManager(&fakeSource{tokens: makeTokens(1)}, slog.Default(), time.Second, time.Second, 4)
 	if manager.ActiveStreamCap() != 4 {
