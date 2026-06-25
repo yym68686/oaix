@@ -234,6 +234,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			timing["cache_affinity_lane_count"] = affinityResult.LaneCount
 		}
 		timing["token_select_ms"] = int(time.Since(selectStarted).Milliseconds())
+		p.recordClaimTiming(timing, claim, err)
 		if err != nil {
 			finalStatus = http.StatusServiceUnavailable
 			lastErr = err
@@ -278,6 +279,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		timing["upstream_attempt_ms"] = int(time.Since(attemptStarted).Milliseconds())
 		timing["upstream_attempt_count"] = attempt
 		claim.Release()
+		p.recordClaimReleaseTiming(timing, claim)
 		finalStatus = status
 		if committed {
 			success := err == nil && status >= 200 && status < 400
@@ -366,6 +368,46 @@ func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptC
 		LaneTTL:               p.cfg.PromptCache.LaneTTL,
 		ResponseTTL:           p.cfg.PromptCache.ResponseTTL,
 	})
+}
+
+func (p *Pipeline) recordClaimTiming(timing map[string]any, claim *tokens.Claim, err error) {
+	if timing == nil {
+		return
+	}
+	if err != nil {
+		timing["token_claim_error"] = err.Error()
+	}
+	if claim == nil {
+		return
+	}
+	telemetry := claim.Telemetry
+	timing["token_claim_id"] = telemetry.ClaimID
+	timing["token_claim_reason"] = telemetry.Reason
+	timing["token_claim_snapshot_scope"] = telemetry.SnapshotScope
+	timing["token_claim_snapshot_version"] = telemetry.SnapshotVersion
+	timing["token_claim_snapshot_age_ms"] = telemetry.SnapshotAgeMs
+	timing["token_claim_ready_tokens"] = telemetry.SnapshotReadyTokens
+	timing["token_claim_active_cap"] = telemetry.ActiveCap
+	timing["token_claim_active_before"] = telemetry.ActiveBefore
+	timing["token_claim_active_after"] = telemetry.ActiveAfter
+	timing["token_claim_candidate_count"] = telemetry.CandidateCount
+	timing["token_claim_selected_at"] = telemetry.SelectedAt
+}
+
+func (p *Pipeline) recordClaimReleaseTiming(timing map[string]any, claim *tokens.Claim) {
+	if timing == nil || claim == nil {
+		return
+	}
+	telemetry := claim.Telemetry
+	if telemetry.ReleasedAt != nil {
+		timing["token_claim_released_at"] = telemetry.ReleasedAt
+	}
+	if telemetry.HeldMs != nil {
+		timing["token_claim_held_ms"] = *telemetry.HeldMs
+	}
+	if telemetry.ActiveAfterRelease != nil {
+		timing["token_claim_active_after_release"] = *telemetry.ActiveAfterRelease
+	}
 }
 
 func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Attempt) (AttemptResult, error) {

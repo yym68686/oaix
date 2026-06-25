@@ -241,6 +241,40 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP oaix_token_selector_misses_total Token selector misses.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_selector_misses_total counter\n")
 	_, _ = fmt.Fprintf(w, "oaix_token_selector_misses_total %d\n", a.tokens.SelectorMisses())
+	claimCounters := tokenStats.Claims
+	_, _ = fmt.Fprintf(w, "# HELP oaix_token_claims_total Token claims created by the scheduler.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_claims_total counter\n")
+	_, _ = fmt.Fprintf(w, "oaix_token_claims_total %d\n", claimCounters.ClaimsTotal)
+	_, _ = fmt.Fprintf(w, "# HELP oaix_token_claim_releases_total Token claims released by the scheduler.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_claim_releases_total counter\n")
+	_, _ = fmt.Fprintf(w, "oaix_token_claim_releases_total %d\n", claimCounters.ReleasesTotal)
+	_, _ = fmt.Fprintf(w, "# HELP oaix_token_claim_denied_over_cap_total Token claim attempts rejected because active streams reached the configured cap.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_claim_denied_over_cap_total counter\n")
+	_, _ = fmt.Fprintf(w, "oaix_token_claim_denied_over_cap_total %d\n", claimCounters.DeniedOverCapTotal)
+	_, _ = fmt.Fprintf(w, "# HELP oaix_token_claim_denied_no_token_total Token claim attempts that ended with no available token.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_claim_denied_no_token_total counter\n")
+	_, _ = fmt.Fprintf(w, "oaix_token_claim_denied_no_token_total %d\n", claimCounters.DeniedNoTokenTotal)
+	_, _ = fmt.Fprintf(w, "# HELP oaix_token_snapshot_active_streams Active streams by scheduler snapshot scope.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_snapshot_active_streams gauge\n")
+	for _, snapshot := range a.tokens.SnapshotDiagnostics(-1) {
+		ownerID := ""
+		if snapshot.OwnerUserID != nil {
+			ownerID = strconv.FormatInt(*snapshot.OwnerUserID, 10)
+		}
+		_, _ = fmt.Fprintf(w, "oaix_token_snapshot_active_streams{scope=\"%s\",owner_user_id=\"%s\"} %d\n", prometheusLabel(snapshot.Scope), prometheusLabel(ownerID), snapshot.ActiveStreams)
+	}
+	_, _ = fmt.Fprintf(w, "# HELP oaix_token_active_streams_by_token Active streams for currently active tokens, grouped by scheduler snapshot scope.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_active_streams_by_token gauge\n")
+	for _, token := range a.tokens.ActiveTokenDiagnostics(200) {
+		if token.ActiveStreams <= 0 {
+			continue
+		}
+		plan := ""
+		if token.PlanType != nil {
+			plan = *token.PlanType
+		}
+		_, _ = fmt.Fprintf(w, "oaix_token_active_streams_by_token{token_id=\"%d\",owner_user_id=\"%d\",snapshot_scope=\"%s\",plan=\"%s\"} %d\n", token.TokenID, token.OwnerUserID, prometheusLabel(token.SnapshotScope), prometheusLabel(plan), token.ActiveStreams)
+	}
 	_, _ = fmt.Fprintf(w, "# HELP oaix_token_state_commit_failures_total Token runtime state commit failures after retry.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_state_commit_failures_total counter\n")
 	_, _ = fmt.Fprintf(w, "oaix_token_state_commit_failures_total %d\n", a.proxy.StateCommitFailures())
@@ -276,6 +310,10 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP oaix_db_pool_acquire_count_total Database pool acquire count.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_db_pool_acquire_count_total counter\n")
 	_, _ = fmt.Fprintf(w, "oaix_db_pool_acquire_count_total %d\n", dbStats.AcquireCount)
+}
+
+func prometheusLabel(value string) string {
+	return strings.NewReplacer("\\", "\\\\", "\n", "\\n", "\"", "\\\"").Replace(value)
 }
 
 func (a *App) tokenSelection(w http.ResponseWriter, r *http.Request) {
@@ -1012,8 +1050,21 @@ func (a *App) analytics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) runtime(w http.ResponseWriter, r *http.Request) {
+	scheduler := map[string]any{
+		"claims":            a.tokens.ClaimCounters(),
+		"snapshots":         a.tokens.SnapshotDiagnostics(20),
+		"top_active_tokens": a.tokens.ActiveTokenDiagnostics(50),
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if settings, err := a.store.GetTokenSelectionSettings(ctx, a.cfg.TokenPool.ActiveStreamCap); err == nil {
+		scheduler["token_selection_settings"] = settings
+	} else {
+		scheduler["token_selection_settings_error"] = err.Error()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token_pool":  a.tokens.Stats(),
+		"scheduler":   scheduler,
 		"request_log": a.logs.Stats(),
 		"upstream":    a.proxy.TransportStats(),
 		"state_commit": map[string]any{

@@ -1241,11 +1241,24 @@ func (a *App) tokenPoolSnapshot(w http.ResponseWriter, r *http.Request) {
 	for _, token := range snapshot.Ready {
 		items = append(items, map[string]any{
 			"id":             token.Token.ID,
+			"owner_user_id":  token.Token.OwnerUserID,
+			"account_id":     token.Token.AccountID,
+			"plan_type":      token.Token.PlanType,
 			"active_streams": token.Active.Load(),
+			"is_active":      token.Token.IsActive,
+			"share_enabled":  token.Token.ShareEnabled,
+			"share_status":   token.Token.ShareStatus,
 			"last_used_at":   token.Token.LastUsedAt,
+			"cooldown_until": token.Token.CooldownUntil,
+			"last_error":     token.Token.LastError,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"stats": a.tokens.Stats(), "items": items})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"stats":             a.tokens.Stats(),
+		"diagnostics":       a.tokens.SnapshotDiagnostics(20),
+		"top_active_tokens": a.tokens.ActiveTokenDiagnostics(50),
+		"items":             items,
+	})
 }
 
 func (a *App) resetIdleTransport(w http.ResponseWriter, r *http.Request) {

@@ -76,6 +76,40 @@ func TestManagerClaimRelease(t *testing.T) {
 	}
 }
 
+func TestManagerClaimTelemetryRecordsLifecycle(t *testing.T) {
+	manager := NewManager(&fakeSource{tokens: makeTokens(1)}, slog.Default(), time.Second, time.Second, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+	claim, err := manager.Claim(context.Background(), Intent{})
+	if err != nil {
+		t.Fatalf("Claim returned error: %v", err)
+	}
+	if claim.Telemetry.ClaimID == 0 {
+		t.Fatal("claim telemetry claim_id = 0")
+	}
+	if claim.Telemetry.SnapshotScope != "global" {
+		t.Fatalf("claim telemetry scope = %q, want global", claim.Telemetry.SnapshotScope)
+	}
+	if claim.Telemetry.ActiveBefore != 0 || claim.Telemetry.ActiveAfter != 1 {
+		t.Fatalf("claim telemetry active before/after = %d/%d, want 0/1", claim.Telemetry.ActiveBefore, claim.Telemetry.ActiveAfter)
+	}
+	claim.Release()
+	if claim.Telemetry.ReleasedAt == nil {
+		t.Fatal("claim telemetry released_at missing")
+	}
+	if claim.Telemetry.HeldMs == nil {
+		t.Fatal("claim telemetry held_ms missing")
+	}
+	if claim.Telemetry.ActiveAfterRelease == nil || *claim.Telemetry.ActiveAfterRelease != 0 {
+		t.Fatalf("claim telemetry active_after_release = %#v, want 0", claim.Telemetry.ActiveAfterRelease)
+	}
+	stats := manager.Stats()
+	if stats.Claims.ClaimsTotal != 1 || stats.Claims.ReleasesTotal != 1 {
+		t.Fatalf("claim counters = %#v, want one claim and one release", stats.Claims)
+	}
+}
+
 func TestSnapshotByIDLookup(t *testing.T) {
 	manager := NewManager(&fakeSource{tokens: makeTokens(10_000)}, slog.Default(), time.Second, time.Second, 1)
 	if err := manager.Refresh(context.Background()); err != nil {

@@ -47,6 +47,11 @@ type Manager struct {
 	activeCap       atomic.Int64
 	selector        Selector
 	selectorMisses  atomic.Int64
+	claimSequence   atomic.Uint64
+	claimsTotal     atomic.Int64
+	releasesTotal   atomic.Int64
+	overCapDenials  atomic.Int64
+	noTokenDenials  atomic.Int64
 	version         atomic.Int64
 	snapshot        atomic.Value
 	ownerSnapshots  sync.Map
@@ -72,13 +77,71 @@ type ownerSnapshotState struct {
 }
 
 type Stats struct {
-	Version       int64     `json:"version"`
-	LoadedAt      time.Time `json:"loaded_at"`
-	AgeMs         int64     `json:"age_ms"`
-	ReadyTokens   int       `json:"ready_tokens"`
-	ActiveStreams int64     `json:"active_streams"`
-	ActiveCap     int64     `json:"active_stream_cap"`
-	Stale         bool      `json:"stale"`
+	Version       int64         `json:"version"`
+	LoadedAt      time.Time     `json:"loaded_at"`
+	AgeMs         int64         `json:"age_ms"`
+	ReadyTokens   int           `json:"ready_tokens"`
+	ActiveStreams int64         `json:"active_streams"`
+	ActiveCap     int64         `json:"active_stream_cap"`
+	Stale         bool          `json:"stale"`
+	Claims        ClaimCounters `json:"claim_counters"`
+}
+
+type ClaimCounters struct {
+	ClaimsTotal         int64 `json:"claims_total"`
+	ReleasesTotal       int64 `json:"releases_total"`
+	SelectorMissesTotal int64 `json:"selector_misses_total"`
+	DeniedOverCapTotal  int64 `json:"denied_over_cap_total"`
+	DeniedNoTokenTotal  int64 `json:"denied_no_token_total"`
+}
+
+type ClaimTelemetry struct {
+	ClaimID             uint64     `json:"claim_id"`
+	TokenID             int64      `json:"token_id"`
+	OwnerUserID         int64      `json:"owner_user_id"`
+	Reason              string     `json:"reason"`
+	SnapshotScope       string     `json:"snapshot_scope"`
+	SnapshotVersion     int64      `json:"snapshot_version"`
+	SnapshotAgeMs       int64      `json:"snapshot_age_ms"`
+	SnapshotReadyTokens int        `json:"snapshot_ready_tokens"`
+	ActiveCap           int64      `json:"active_cap"`
+	ActiveBefore        int64      `json:"active_before"`
+	ActiveAfter         int64      `json:"active_after"`
+	CandidateCount      int        `json:"candidate_count"`
+	SelectedAt          time.Time  `json:"selected_at"`
+	ReleasedAt          *time.Time `json:"released_at,omitempty"`
+	HeldMs              *int64     `json:"held_ms,omitempty"`
+	ActiveAfterRelease  *int64     `json:"active_after_release,omitempty"`
+}
+
+type SnapshotDiagnostics struct {
+	Scope         string          `json:"scope"`
+	OwnerUserID   *int64          `json:"owner_user_id,omitempty"`
+	Version       int64           `json:"version"`
+	LoadedAt      time.Time       `json:"loaded_at"`
+	AgeMs         int64           `json:"age_ms"`
+	ReadyTokens   int             `json:"ready_tokens"`
+	ActiveStreams int64           `json:"active_streams"`
+	ActiveCap     int64           `json:"active_stream_cap"`
+	Stale         bool            `json:"stale"`
+	TopActive     []TokenActivity `json:"top_active_tokens,omitempty"`
+}
+
+type TokenActivity struct {
+	SnapshotScope   string     `json:"snapshot_scope"`
+	SnapshotVersion int64      `json:"snapshot_version"`
+	TokenID         int64      `json:"token_id"`
+	OwnerUserID     int64      `json:"owner_user_id"`
+	AccountID       *string    `json:"account_id,omitempty"`
+	PlanType        *string    `json:"plan_type,omitempty"`
+	ActiveStreams   int64      `json:"active_streams"`
+	ActiveCap       int64      `json:"active_stream_cap"`
+	IsActive        bool       `json:"is_active"`
+	ShareEnabled    bool       `json:"share_enabled"`
+	ShareStatus     string     `json:"share_status,omitempty"`
+	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
+	CooldownUntil   *time.Time `json:"cooldown_until,omitempty"`
+	LastError       *string    `json:"last_error,omitempty"`
 }
 
 type Intent struct {
@@ -96,7 +159,8 @@ type Claim struct {
 	Token      *RuntimeToken
 	Reason     string
 	released   atomic.Bool
-	releaseFn  func(*RuntimeToken)
+	releaseFn  func(*RuntimeToken) int64
+	Telemetry  ClaimTelemetry
 	selectedAt time.Time
 }
 
@@ -300,6 +364,20 @@ func (m *Manager) Stats() Stats {
 		ActiveStreams: m.ActiveStreams(),
 		ActiveCap:     m.ActiveStreamCap(),
 		Stale:         snapshot.LoadedAt.IsZero() || now.Sub(snapshot.LoadedAt) > m.maxAge,
+		Claims:        m.ClaimCounters(),
+	}
+}
+
+func (m *Manager) ClaimCounters() ClaimCounters {
+	if m == nil {
+		return ClaimCounters{}
+	}
+	return ClaimCounters{
+		ClaimsTotal:         m.claimsTotal.Load(),
+		ReleasesTotal:       m.releasesTotal.Load(),
+		SelectorMissesTotal: m.selectorMisses.Load(),
+		DeniedOverCapTotal:  m.overCapDenials.Load(),
+		DeniedNoTokenTotal:  m.noTokenDenials.Load(),
 	}
 }
 
@@ -335,6 +413,162 @@ func (m *Manager) ActiveStreamsForToken(tokenID int64, ownerUserID int64) int64 
 	return active
 }
 
+func (m *Manager) SnapshotDiagnostics(limit int) []SnapshotDiagnostics {
+	if m == nil {
+		return nil
+	}
+	activeCap := m.ActiveStreamCap()
+	now := time.Now().UTC()
+	summaries := []SnapshotDiagnostics{
+		snapshotDiagnostics("global", nil, m.Snapshot(), now, m.maxAge, activeCap, limit),
+	}
+	m.ownerSnapshots.Range(func(_, value any) bool {
+		state, ok := value.(*ownerSnapshotState)
+		if !ok || state == nil {
+			return true
+		}
+		ownerID := state.ownerID
+		summaries = append(summaries, snapshotDiagnostics("owner", &ownerID, state.snapshotValue(), now, m.maxAge, activeCap, limit))
+		return true
+	})
+	sort.SliceStable(summaries[1:], func(i, j int) bool {
+		left := summaries[i+1]
+		right := summaries[j+1]
+		if left.ActiveStreams != right.ActiveStreams {
+			return left.ActiveStreams > right.ActiveStreams
+		}
+		leftOwner, rightOwner := int64(0), int64(0)
+		if left.OwnerUserID != nil {
+			leftOwner = *left.OwnerUserID
+		}
+		if right.OwnerUserID != nil {
+			rightOwner = *right.OwnerUserID
+		}
+		return leftOwner < rightOwner
+	})
+	return summaries
+}
+
+func (m *Manager) ActiveTokenDiagnostics(limit int) []TokenActivity {
+	if m == nil {
+		return nil
+	}
+	activeCap := m.ActiveStreamCap()
+	items := tokenActivities("global", m.Snapshot(), activeCap, limit)
+	m.ownerSnapshots.Range(func(_, value any) bool {
+		state, ok := value.(*ownerSnapshotState)
+		if !ok || state == nil {
+			return true
+		}
+		items = append(items, tokenActivities("owner", state.snapshotValue(), activeCap, limit)...)
+		return true
+	})
+	sortTokenActivities(items)
+	if limit > 0 && len(items) > limit {
+		return items[:limit]
+	}
+	return items
+}
+
+func snapshotDiagnostics(scope string, ownerUserID *int64, snapshot *Snapshot, now time.Time, maxAge time.Duration, activeCap int64, limit int) SnapshotDiagnostics {
+	age := snapshotAge(snapshot, now)
+	diagnostics := SnapshotDiagnostics{
+		Scope:         scope,
+		OwnerUserID:   ownerUserID,
+		Version:       snapshotVersion(snapshot),
+		LoadedAt:      snapshotLoadedAt(snapshot),
+		AgeMs:         age.Milliseconds(),
+		ReadyTokens:   snapshotReadyTokens(snapshot),
+		ActiveStreams: snapshotActiveStreams(snapshot),
+		ActiveCap:     activeCap,
+		Stale:         snapshot == nil || snapshot.LoadedAt.IsZero() || now.Sub(snapshot.LoadedAt) > maxAge,
+	}
+	if limit >= 0 {
+		diagnostics.TopActive = tokenActivities(scope, snapshot, activeCap, limit)
+	}
+	return diagnostics
+}
+
+func tokenActivities(scope string, snapshot *Snapshot, activeCap int64, limit int) []TokenActivity {
+	if snapshot == nil {
+		return nil
+	}
+	items := make([]TokenActivity, 0, len(snapshot.Ready))
+	for _, runtimeToken := range snapshot.Ready {
+		if runtimeToken == nil {
+			continue
+		}
+		token := runtimeToken.Token
+		active := runtimeToken.Active.Load()
+		if active <= 0 && limit > 0 {
+			continue
+		}
+		items = append(items, TokenActivity{
+			SnapshotScope:   scope,
+			SnapshotVersion: snapshot.Version,
+			TokenID:         token.ID,
+			OwnerUserID:     token.OwnerUserID,
+			AccountID:       token.AccountID,
+			PlanType:        token.PlanType,
+			ActiveStreams:   active,
+			ActiveCap:       activeCap,
+			IsActive:        token.IsActive,
+			ShareEnabled:    token.ShareEnabled,
+			ShareStatus:     token.ShareStatus,
+			LastUsedAt:      token.LastUsedAt,
+			CooldownUntil:   token.CooldownUntil,
+			LastError:       token.LastError,
+		})
+	}
+	sortTokenActivities(items)
+	if limit > 0 && len(items) > limit {
+		return items[:limit]
+	}
+	return items
+}
+
+func sortTokenActivities(items []TokenActivity) {
+	sort.SliceStable(items, func(i, j int) bool {
+		left := items[i]
+		right := items[j]
+		if left.ActiveStreams != right.ActiveStreams {
+			return left.ActiveStreams > right.ActiveStreams
+		}
+		if left.SnapshotScope != right.SnapshotScope {
+			return left.SnapshotScope < right.SnapshotScope
+		}
+		return left.TokenID < right.TokenID
+	})
+}
+
+func snapshotAge(snapshot *Snapshot, now time.Time) time.Duration {
+	if snapshot == nil || snapshot.LoadedAt.IsZero() {
+		return 0
+	}
+	return now.Sub(snapshot.LoadedAt)
+}
+
+func snapshotVersion(snapshot *Snapshot) int64 {
+	if snapshot == nil {
+		return 0
+	}
+	return snapshot.Version
+}
+
+func snapshotLoadedAt(snapshot *Snapshot) time.Time {
+	if snapshot == nil {
+		return time.Time{}
+	}
+	return snapshot.LoadedAt
+}
+
+func snapshotReadyTokens(snapshot *Snapshot) int {
+	if snapshot == nil {
+		return 0
+	}
+	return len(snapshot.Ready)
+}
+
 func snapshotActiveStreams(snapshot *Snapshot) int64 {
 	if snapshot == nil {
 		return 0
@@ -362,6 +596,9 @@ func snapshotTokenActive(snapshot *Snapshot, tokenID int64) int64 {
 func (m *Manager) Claim(ctx context.Context, intent Intent) (*Claim, error) {
 	claimSnapshot, cursorState, err := m.snapshotForClaim(ctx, intent)
 	if err != nil {
+		if errors.Is(err, ErrNoToken) {
+			m.recordNoTokenDenial()
+		}
 		return nil, err
 	}
 	total := uint64(len(claimSnapshot.Ready))
@@ -377,22 +614,21 @@ func (m *Manager) Claim(ctx context.Context, intent Intent) (*Claim, error) {
 		if candidate == nil {
 			break
 		}
+		activeBefore := candidate.Active.Load()
 		next := candidate.Active.Add(1)
 		if next > activeCap {
 			candidate.Active.Add(-1)
+			m.recordOverCapDenial()
 			continue
 		}
-		claim := &Claim{
-			Token:      candidate,
-			Reason:     reason,
-			selectedAt: time.Now().UTC(),
-			releaseFn: func(token *RuntimeToken) {
-				token.Active.Add(-1)
-			},
-		}
-		return claim, nil
+		now := time.Now().UTC()
+		return m.newClaim(claimSnapshot, intent, candidate, reason, activeBefore, next, activeCap, int(total), now), nil
 	}
 	m.selectorMisses.Add(1)
+	if snapshotHasCapBlockedToken(claimSnapshot, intent, activeCap) {
+		m.recordOverCapDenial()
+	}
+	m.recordNoTokenDenial()
 	return nil, ErrNoToken
 }
 
@@ -408,8 +644,86 @@ func (c *Claim) Release() {
 		return
 	}
 	if c.released.CompareAndSwap(false, true) {
-		c.releaseFn(c.Token)
+		held := int64(0)
+		if !c.selectedAt.IsZero() {
+			held = time.Since(c.selectedAt).Milliseconds()
+		}
+		releasedAt := time.Now().UTC()
+		activeAfter := c.releaseFn(c.Token)
+		c.Telemetry.ReleasedAt = &releasedAt
+		c.Telemetry.HeldMs = &held
+		c.Telemetry.ActiveAfterRelease = &activeAfter
 	}
+}
+
+func (m *Manager) newClaim(snapshot *Snapshot, intent Intent, token *RuntimeToken, reason string, activeBefore, activeAfter, activeCap int64, candidateCount int, selectedAt time.Time) *Claim {
+	if m != nil {
+		m.claimsTotal.Add(1)
+	}
+	claimID := uint64(0)
+	if m != nil {
+		claimID = m.claimSequence.Add(1)
+	}
+	telemetry := ClaimTelemetry{
+		ClaimID:             claimID,
+		TokenID:             token.Token.ID,
+		OwnerUserID:         token.Token.OwnerUserID,
+		Reason:              reason,
+		SnapshotScope:       snapshotScopeForIntent(intent),
+		SnapshotVersion:     snapshotVersion(snapshot),
+		SnapshotAgeMs:       snapshotAge(snapshot, selectedAt).Milliseconds(),
+		SnapshotReadyTokens: snapshotReadyTokens(snapshot),
+		ActiveCap:           activeCap,
+		ActiveBefore:        activeBefore,
+		ActiveAfter:         activeAfter,
+		CandidateCount:      candidateCount,
+		SelectedAt:          selectedAt,
+	}
+	return &Claim{
+		Token:    token,
+		Reason:   reason,
+		released: atomic.Bool{},
+		releaseFn: func(runtimeToken *RuntimeToken) int64 {
+			if m != nil {
+				m.releasesTotal.Add(1)
+			}
+			return runtimeToken.Active.Add(-1)
+		},
+		Telemetry:  telemetry,
+		selectedAt: selectedAt,
+	}
+}
+
+func (m *Manager) recordOverCapDenial() {
+	if m == nil {
+		return
+	}
+	m.overCapDenials.Add(1)
+}
+
+func (m *Manager) recordNoTokenDenial() {
+	if m == nil {
+		return
+	}
+	m.noTokenDenials.Add(1)
+}
+
+func snapshotHasCapBlockedToken(snapshot *Snapshot, intent Intent, activeCap int64) bool {
+	if snapshot == nil {
+		return false
+	}
+	for _, token := range snapshot.Ready {
+		if token == nil {
+			continue
+		}
+		if _, excluded := intent.ExcludeTokenIDs[token.Token.ID]; excluded {
+			continue
+		}
+		if tokenMatchesIntent(token, intent) && token.Active.Load() >= activeCap {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Claim) AccessToken() string {
@@ -458,6 +772,16 @@ func (m *Manager) refreshSnapshotForIntent(ctx context.Context, intent Intent) e
 		return m.RefreshOwner(ctx, intent.OwnerUserID)
 	}
 	return m.Refresh(ctx)
+}
+
+func snapshotScopeForIntent(intent Intent) string {
+	if isMarketplaceSelection(intent.SelectionMode) {
+		return "global"
+	}
+	if intent.OwnerUserID > 0 {
+		return "owner"
+	}
+	return "global"
 }
 
 func isMarketplaceSelection(mode string) bool {

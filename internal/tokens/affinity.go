@@ -42,6 +42,9 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 	}
 	snapshot, _, err := m.snapshotForClaim(ctx, intent)
 	if err != nil {
+		if err == ErrNoToken {
+			m.recordNoTokenDenial()
+		}
 		return nil, PromptAffinityResult{Result: "snapshot_unavailable"}, err
 	}
 
@@ -57,6 +60,7 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 				return claim, result, nil
 			}
 			if opts.PreviousStrict {
+				m.recordNoTokenDenial()
 				return nil, PromptAffinityResult{Result: "previous_owner_busy"}, ErrNoToken
 			}
 		}
@@ -120,10 +124,12 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 				}
 			}
 			if !opts.GlobalFallbackEnabled {
+				m.recordNoTokenDenial()
 				return nil, PromptAffinityResult{Result: "lane_create_failed"}, ErrNoToken
 			}
 		}
 		if !opts.GlobalFallbackEnabled {
+			m.recordNoTokenDenial()
 			return nil, PromptAffinityResult{Result: "global_fallback_disabled"}, ErrNoToken
 		}
 	}
@@ -203,19 +209,19 @@ func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent 
 			return nil
 		default:
 		}
-		if candidate.Active.Load() < activeCap {
+		activeBefore := candidate.Active.Load()
+		if activeBefore >= activeCap {
+			if wait <= 0 || time.Now().After(deadline) {
+				m.recordOverCapDenial()
+				return nil
+			}
+		} else {
 			next := candidate.Active.Add(1)
 			if next <= activeCap {
-				return &Claim{
-					Token:      candidate,
-					Reason:     reason,
-					selectedAt: time.Now().UTC(),
-					releaseFn: func(token *RuntimeToken) {
-						token.Active.Add(-1)
-					},
-				}
+				return m.newClaim(snapshot, intent, candidate, reason, activeBefore, next, activeCap, len(snapshot.Ready), time.Now().UTC())
 			}
 			candidate.Active.Add(-1)
+			m.recordOverCapDenial()
 		}
 		if wait <= 0 || time.Now().After(deadline) {
 			return nil
