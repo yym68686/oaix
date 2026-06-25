@@ -27,6 +27,8 @@ import (
 	"github.com/yym68686/oaix/internal/transport"
 )
 
+const maxRejectedEncryptedContentRetries = 64
+
 type Pipeline struct {
 	cfg            config.Config
 	logger         *slog.Logger
@@ -258,19 +260,34 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			StreamState: streamState,
 		}
 		result, err := p.doAttempt(w, r, attemptSpec)
-		if !result.Committed && !result.StreamState.DownstreamStarted && shouldRetryWithoutMalformedCompaction(intent, result.Status, err, result.ErrorBody) {
-			sanitizedBody, removed, changed := sanitizeMalformedCompactionEncryptedContentBody(bodyBytes)
-			if changed {
-				retryStarted := time.Now()
-				retrySpec := attemptSpec
-				retrySpec.Body = sanitizedBody
-				retrySpec.RetryCause = classify(result.Status, err)
-				bodyBytes = sanitizedBody
-				timing["malformed_compaction_retry"] = true
-				timing["malformed_compaction_removed_count"] = removed
-				result, err = p.doAttempt(w, r, retrySpec)
-				timing["malformed_compaction_retry_ms"] = int(time.Since(retryStarted).Milliseconds())
+		encryptedContentRetryStarted := time.Now()
+		encryptedContentRetryCount := 0
+		for encryptedContentRetryCount < maxRejectedEncryptedContentRetries && !result.Committed && !result.StreamState.DownstreamStarted {
+			marker, ok := rejectedEncryptedContentMarker(intent, result.Status, err, result.ErrorBody)
+			if !ok {
+				break
 			}
+			sanitizedBody, removed, changed := sanitizeRejectedEncryptedContentBody(bodyBytes, marker)
+			if !changed {
+				break
+			}
+			retryStarted := time.Now()
+			retrySpec := attemptSpec
+			retrySpec.Body = sanitizedBody
+			retrySpec.RetryCause = classify(result.Status, err)
+			bodyBytes = sanitizedBody
+			encryptedContentRetryCount++
+			timing["rejected_encrypted_content_retry"] = true
+			timing["rejected_encrypted_content_retry_count"] = encryptedContentRetryCount
+			timing["rejected_encrypted_content_removed_count"] = encryptedContentRetryCount
+			timing["rejected_encrypted_content_last_removed_index"] = removed.Index
+			timing["rejected_encrypted_content_last_removed_type"] = removed.Type
+			result, err = p.doAttempt(w, r, retrySpec)
+			timing["rejected_encrypted_content_retry_last_ms"] = int(time.Since(retryStarted).Milliseconds())
+			timing["rejected_encrypted_content_retry_total_ms"] = int(time.Since(encryptedContentRetryStarted).Milliseconds())
+		}
+		if encryptedContentRetryCount >= maxRejectedEncryptedContentRetries {
+			timing["rejected_encrypted_content_retry_limit_reached"] = true
 		}
 		if result.StreamState.DownstreamStarted {
 			streamState.DownstreamStarted = true

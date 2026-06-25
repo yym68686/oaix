@@ -63,7 +63,7 @@ func TestSanitizeReasoningContentBodyNoChangeKeepsBytes(t *testing.T) {
 	}
 }
 
-func TestSanitizeMalformedCompactionEncryptedContentBody(t *testing.T) {
+func TestSanitizeRejectedEncryptedContentBodyRemovesExactCompaction(t *testing.T) {
 	body := []byte(`{
 		"model": "gpt-5.5",
 		"input": [
@@ -73,9 +73,9 @@ func TestSanitizeMalformedCompactionEncryptedContentBody(t *testing.T) {
 			{"role": "user", "content": "say test"}
 		]
 	}`)
-	sanitized, removed, changed := sanitizeMalformedCompactionEncryptedContentBody(body)
-	if !changed || removed != 1 {
-		t.Fatalf("changed=%v removed=%d, want one malformed compaction removed", changed, removed)
+	sanitized, removed, changed := sanitizeRejectedEncryptedContentBody(body, "plain handoff text is not encrypted")
+	if !changed || removed.Type != "compaction" || removed.Index != 1 {
+		t.Fatalf("changed=%v removed=%+v, want compaction at index 1 removed", changed, removed)
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(sanitized, &payload); err != nil {
@@ -99,20 +99,68 @@ func TestSanitizeMalformedCompactionEncryptedContentBody(t *testing.T) {
 	}
 }
 
-func TestShouldRetryWithoutMalformedCompactionRequiresSpecific400(t *testing.T) {
+func TestSanitizeRejectedEncryptedContentBodyRemovesRedactedReasoning(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": [
+			{"type": "reasoning", "encrypted_content": "gAAAAABfirst-token-1234"},
+			{"role": "user", "content": "say test"},
+			{"type": "reasoning", "encrypted_content": "gAAAAABsecond-token-BHs="}
+		]
+	}`)
+	sanitized, removed, changed := sanitizeRejectedEncryptedContentBody(body, "gAAA...BHs=")
+	if !changed || removed.Type != "reasoning" || removed.Index != 2 {
+		t.Fatalf("changed=%v removed=%+v, want reasoning at index 2 removed", changed, removed)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(sanitized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	input := payload["input"].([]any)
+	if len(input) != 2 {
+		t.Fatalf("input length = %d, want 2: %v", len(input), input)
+	}
+	for _, item := range input {
+		object, ok := item.(map[string]any)
+		if ok && object["encrypted_content"] == "gAAAAABsecond-token-BHs=" {
+			t.Fatalf("rejected reasoning was not removed: %v", input)
+		}
+	}
+}
+
+func TestSanitizeRejectedEncryptedContentBodyRejectsAmbiguousMarker(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": [
+			{"type": "reasoning", "encrypted_content": "gAAAAABfirst-BHs="},
+			{"type": "reasoning", "encrypted_content": "gAAAAABsecond-BHs="},
+			{"role": "user", "content": "say test"}
+		]
+	}`)
+	sanitized, removed, changed := sanitizeRejectedEncryptedContentBody(body, "gAAA...BHs=")
+	if changed {
+		t.Fatalf("ambiguous marker should not change body, removed=%+v", removed)
+	}
+	if string(sanitized) != string(body) {
+		t.Fatalf("body changed for ambiguous marker: %s", sanitized)
+	}
+}
+
+func TestRejectedEncryptedContentMarkerRequiresSpecific400(t *testing.T) {
 	intent := RequestIntent{Endpoint: "/v1/responses"}
 	raw := []byte(`event: error
 data: {"error":{"message":"The encrypted content plain handoff text could not be verified. Reason: Encrypted content could not be decrypted or parsed.","status":400}}
 
 `)
-	if !shouldRetryWithoutMalformedCompaction(intent, 400, nil, raw) {
+	marker, ok := rejectedEncryptedContentMarker(intent, 400, nil, raw)
+	if !ok || marker != "plain handoff text" {
 		t.Fatal("expected exact encrypted content parse failure to trigger retry")
 	}
-	if shouldRetryWithoutMalformedCompaction(intent, 400, nil, []byte(`{"error":{"message":"unsupported content type"}}`)) {
-		t.Fatal("unsupported content type must not trigger compaction retry")
+	if marker, ok := rejectedEncryptedContentMarker(intent, 400, nil, []byte(`{"error":{"message":"unsupported content type"}}`)); ok || marker != "" {
+		t.Fatal("unsupported content type must not trigger encrypted content retry")
 	}
-	if shouldRetryWithoutMalformedCompaction(RequestIntent{Endpoint: "/v1/chat/completions"}, 400, nil, raw) {
-		t.Fatal("chat completions must not trigger compaction retry")
+	if marker, ok := rejectedEncryptedContentMarker(RequestIntent{Endpoint: "/v1/chat/completions"}, 400, nil, raw); ok || marker != "" {
+		t.Fatal("chat completions must not trigger encrypted content retry")
 	}
 }
 

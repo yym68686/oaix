@@ -371,6 +371,125 @@ func TestProxyRetriesAfterMalformedCompactionEncryptedContent400(t *testing.T) {
 	}
 }
 
+func TestProxyRetriesRejectedReasoningEncryptedContentUntilSuccess(t *testing.T) {
+	var upstreamBodies [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upstreamBodies = append(upstreamBodies, body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch len(upstreamBodies) {
+		case 1:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, strings.Join([]string{
+				`event: error`,
+				`data: {"error":{"code":"oaix_gateway_error","message":"The encrypted content gAAA...6g== could not be verified. Reason: Encrypted content could not be decrypted or parsed.","status":400,"type":"gateway_error"}}`,
+				``,
+			}, "\n"))
+		case 2:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, strings.Join([]string{
+				`event: error`,
+				`data: {"error":{"code":"oaix_gateway_error","message":"The encrypted content gAAA...BHs= could not be verified. Reason: Encrypted content could not be decrypted or parsed.","status":400,"type":"gateway_error"}}`,
+				``,
+			}, "\n"))
+		default:
+			_, _ = io.WriteString(w, strings.Join([]string{
+				`event: response.completed`,
+				`data: {"type":"response.completed","response":{"id":"resp_retry","object":"response","model":"gpt-5.5","status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+				``,
+			}, "\n"))
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                1,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{tokens: []store.Token{{
+		ID:          1,
+		AccessToken: "upstream-token",
+		IsActive:    true,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}}}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model": "gpt-5.5",
+		"stream": true,
+		"input": [
+			{"type": "reasoning", "encrypted_content": "gAAAAABfirst-token-6g==", "summary": []},
+			{"role": "user", "content": "say test"},
+			{"type": "reasoning", "encrypted_content": "gAAAAABsecond-token-BHs=", "summary": []},
+			{"type": "reasoning", "encrypted_content": "gAAAAABvalid-reasoning-token", "summary": []}
+		]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses"})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(upstreamBodies) != 3 {
+		t.Fatalf("upstream calls = %d, want 3", len(upstreamBodies))
+	}
+	var retriedPayload map[string]any
+	if err := json.Unmarshal(upstreamBodies[2], &retriedPayload); err != nil {
+		t.Fatalf("retried body was not JSON: %v body=%q", err, upstreamBodies[2])
+	}
+	input := retriedPayload["input"].([]any)
+	if len(input) != 2 {
+		t.Fatalf("retried input length = %d, want 2: %v", len(input), input)
+	}
+	hasUser := false
+	hasUnrejectedReasoning := false
+	for _, item := range input {
+		object, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if object["encrypted_content"] == "gAAAAABfirst-token-6g==" || object["encrypted_content"] == "gAAAAABsecond-token-BHs=" {
+			t.Fatalf("rejected reasoning was forwarded on retry: %v", input)
+		}
+		if object["role"] == "user" && object["content"] == "say test" {
+			hasUser = true
+		}
+		if object["type"] == "reasoning" && object["encrypted_content"] == "gAAAAABvalid-reasoning-token" {
+			hasUnrejectedReasoning = true
+		}
+	}
+	if !hasUser || !hasUnrejectedReasoning {
+		t.Fatalf("retry removed unrelated input items: %v", input)
+	}
+	if !strings.Contains(recorder.Body.String(), "response.completed") {
+		t.Fatalf("expected successful stream body, got %q", recorder.Body.String())
+	}
+}
+
 func TestProxyUsageLimitUsesOfficialCooldown(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
