@@ -258,6 +258,20 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			StreamState: streamState,
 		}
 		result, err := p.doAttempt(w, r, attemptSpec)
+		if !result.Committed && !result.StreamState.DownstreamStarted && shouldRetryWithoutMalformedCompaction(intent, result.Status, err, result.ErrorBody) {
+			sanitizedBody, removed, changed := sanitizeMalformedCompactionEncryptedContentBody(bodyBytes)
+			if changed {
+				retryStarted := time.Now()
+				retrySpec := attemptSpec
+				retrySpec.Body = sanitizedBody
+				retrySpec.RetryCause = classify(result.Status, err)
+				bodyBytes = sanitizedBody
+				timing["malformed_compaction_retry"] = true
+				timing["malformed_compaction_removed_count"] = removed
+				result, err = p.doAttempt(w, r, retrySpec)
+				timing["malformed_compaction_retry_ms"] = int(time.Since(retryStarted).Milliseconds())
+			}
+		}
 		if result.StreamState.DownstreamStarted {
 			streamState.DownstreamStarted = true
 		}
