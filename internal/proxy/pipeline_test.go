@@ -246,7 +246,15 @@ func TestProxyDecodesZstdRequestBeforeForwarding(t *testing.T) {
 	if err := json.Unmarshal(upstreamBody, &payload); err != nil {
 		t.Fatalf("upstream body was not decoded JSON: %v body=%q", err, upstreamBody)
 	}
-	if payload["model"] != "gpt-5.5" || payload["input"] != "hello" {
+	input, ok := payload["input"].([]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("unexpected upstream payload: %v", payload)
+	}
+	message, ok := input[0].(map[string]any)
+	if !ok || message["role"] != "user" || message["content"] != "hello" {
+		t.Fatalf("unexpected upstream payload: %v", payload)
+	}
+	if payload["model"] != "gpt-5.5" {
 		t.Fatalf("unexpected upstream payload: %v", payload)
 	}
 }
@@ -598,6 +606,54 @@ func TestPrepareResponsesPayloadAppliesCodexDefaults(t *testing.T) {
 	input := payload["input"].([]any)
 	if _, ok := input[0].(map[string]any)["id"]; ok {
 		t.Fatalf("store=false reasoning input id should be stripped: %v", input[0])
+	}
+}
+
+func TestPrepareResponsesPayloadNormalizesStringInput(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5.5",
+		"input": "Calculate and respond with ONLY the number, nothing else.\n\nQ: 3 + 5 = ?\nA:",
+		"instructions": "You are a channel health-check endpoint. Answer the arithmetic challenge exactly and briefly.",
+		"stream": false
+	}`)
+	intent := RequestIntent{Endpoint: "/v1/responses"}
+	upstream, err := prepareResponsesPayload(body, &intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(upstream, &payload); err != nil {
+		t.Fatal(err)
+	}
+	input, ok := payload["input"].([]any)
+	if !ok {
+		t.Fatalf("input should be normalized to a list: %T", payload["input"])
+	}
+	if len(input) != 1 {
+		t.Fatalf("input length = %d, want 1", len(input))
+	}
+	message, ok := input[0].(map[string]any)
+	if !ok {
+		t.Fatalf("input item should be an object: %T", input[0])
+	}
+	if message["role"] != "user" {
+		t.Fatalf("input role = %v", message["role"])
+	}
+	content, _ := message["content"].(string)
+	if !strings.Contains(content, "Q: 3 + 5") {
+		t.Fatalf("input content not preserved: %q", content)
+	}
+	if payload["instructions"] == "" {
+		t.Fatalf("instructions should be preserved: %v", payload)
+	}
+	if payload["stream"] != true {
+		t.Fatalf("non-compact responses should force upstream streaming, got %v", payload["stream"])
+	}
+	if payload["store"] != false {
+		t.Fatalf("store must be false, got %v", payload["store"])
+	}
+	if intent.UpstreamAccept != "text/event-stream" {
+		t.Fatalf("upstream accept = %q", intent.UpstreamAccept)
 	}
 }
 

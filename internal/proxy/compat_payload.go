@@ -81,6 +81,7 @@ func prepareResponsesPayload(body []byte, intent *RequestIntent) ([]byte, error)
 	if err != nil {
 		return body, err
 	}
+	normalizeResponsesStringInput(payload)
 	model := text(payload["model"])
 	preservePreviousResponseID := false
 	if model == defaultImagesToolModel {
@@ -107,6 +108,19 @@ func prepareResponsesPayload(body []byte, intent *RequestIntent) ([]byte, error)
 		intent.UpstreamAccept = "application/json"
 	}
 	return openai.EncodeJSON(payload)
+}
+
+func normalizeResponsesStringInput(payload map[string]any) {
+	input, ok := payload["input"].(string)
+	if !ok {
+		return
+	}
+	payload["input"] = []any{
+		map[string]any{
+			"role":    "user",
+			"content": input,
+		},
+	}
 }
 
 func translateResponsesImageCompatPayload(payload map[string]any, compact bool) (map[string]any, error) {
