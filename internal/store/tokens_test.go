@@ -147,7 +147,7 @@ func TestTokenListWhereCanSkipPlanFilterForPlanCounts(t *testing.T) {
 	if !strings.Contains(where, "is_active = true") {
 		t.Fatalf("status filter missing: %s", where)
 	}
-	if !strings.Contains(where, "cooldown_until <= $2") {
+	if !strings.Contains(where, "cooldown_until <= $2") || !strings.Contains(where, "retryable upstream failure:%") {
 		t.Fatalf("status filter should use fixed timestamp parameter: %s", where)
 	}
 	if strings.Contains(where, "plan_type") {
@@ -173,6 +173,7 @@ func TestTokenListWhereCoolingExcludesDisabledTokens(t *testing.T) {
 		"is_active = true",
 		"disabled_at is null",
 		"cooldown_until > $1",
+		"not (coalesce(last_error, '') like 'retryable upstream failure:%'",
 	} {
 		if !strings.Contains(where, fragment) {
 			t.Fatalf("cooling filter missing %q: %s", fragment, where)
@@ -193,8 +194,52 @@ func TestTokenListWhereScopedAddsOwnerFilter(t *testing.T) {
 	if !strings.Contains(where, "is_active = true") {
 		t.Fatalf("status filter missing: %s", where)
 	}
-	if !strings.Contains(where, "cooldown_until <= $2") {
+	if !strings.Contains(where, "cooldown_until <= $2") || !strings.Contains(where, "retryable upstream failure:%") {
 		t.Fatalf("status filter should use scoped fixed timestamp parameter: %s", where)
+	}
+}
+
+func TestTokenHasTransientRetryBackoff(t *testing.T) {
+	now := time.Date(2026, 6, 25, 1, 25, 0, 0, time.UTC)
+	shortUntil := now.Add(5 * time.Second)
+	longUntil := now.Add(2 * time.Minute)
+	expiredUntil := now.Add(-time.Second)
+	retryError := "retryable upstream failure: Our servers are currently overloaded. Please try again later."
+	manualError := "admin cooldown"
+
+	tests := []struct {
+		name  string
+		token Token
+		want  bool
+	}{
+		{
+			name:  "short retry backoff",
+			token: Token{CooldownUntil: &shortUntil, LastError: &retryError},
+			want:  true,
+		},
+		{
+			name:  "long retry cooldown stays cooling",
+			token: Token{CooldownUntil: &longUntil, LastError: &retryError},
+			want:  false,
+		},
+		{
+			name:  "manual cooldown stays cooling",
+			token: Token{CooldownUntil: &shortUntil, LastError: &manualError},
+			want:  false,
+		},
+		{
+			name:  "expired retry backoff",
+			token: Token{CooldownUntil: &expiredUntil, LastError: &retryError},
+			want:  false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := TokenHasTransientRetryBackoff(test.token, now); got != test.want {
+				t.Fatalf("TokenHasTransientRetryBackoff = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 

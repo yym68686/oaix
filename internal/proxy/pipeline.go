@@ -327,7 +327,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				message = "upstream usage limit cooldown"
 			}
 			p.commitTokenError(claim.TokenID(), message, false, cooldownUntil)
-		} else if action == OutcomeUpstream5xx || action == OutcomeTransportError {
+		} else if retry && (action == OutcomeUpstream5xx || action == OutcomeTransportError) {
 			cooldown := time.Now().UTC().Add(5 * time.Second)
 			p.commitTokenError(claim.TokenID(), fmt.Sprintf("retryable upstream failure: %v", err), false, &cooldown)
 		}

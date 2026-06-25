@@ -316,6 +316,64 @@ func TestProxyUsageLimitUsesOfficialCooldown(t *testing.T) {
 	}
 }
 
+func TestProxyNonRetryableUpstream4xxDoesNotCooldownToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"encrypted content could not be verified"}}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                1,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{{
+			ID:          1,
+			AccessToken: "upstream-token",
+			IsActive:    true,
+			CreatedAt:   time.Now().UTC(),
+			UpdatedAt:   time.Now().UTC(),
+		}},
+		tokenErrorCh: make(chan *time.Time, 1),
+	}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5"})
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case until := <-fakes.tokenErrorCh:
+		t.Fatalf("unexpected token cooldown commit: %v", until)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 func TestPromptCacheContextInjectsKeyAndStableSession(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","instructions":"You are terse.","input":[{"role":"user","content":"Explain build"}]}`)
 	headers := http.Header{}

@@ -19,6 +19,9 @@ const (
 	planTeam    = "team"
 	planPro     = "pro"
 	planUnknown = "unknown"
+
+	transientRetryCooldownPrefix        = "retryable upstream failure:"
+	transientRetryCooldownDisplayWindow = time.Minute
 )
 
 var primaryPlanOrder = []string{planFree, planPlus, planTeam, planPro}
@@ -226,6 +229,36 @@ func TokenListStatusAsOf(opts TokenListOptions) time.Time {
 	return time.Now().UTC()
 }
 
+func TokenHasTransientRetryBackoff(token Token, asOf time.Time) bool {
+	if token.CooldownUntil == nil {
+		return false
+	}
+	if asOf.IsZero() {
+		asOf = time.Now().UTC()
+	} else {
+		asOf = asOf.UTC()
+	}
+	if !token.CooldownUntil.After(asOf) || token.CooldownUntil.Sub(asOf) > transientRetryCooldownDisplayWindow {
+		return false
+	}
+	if token.LastError == nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(*token.LastError), transientRetryCooldownPrefix)
+}
+
+func tokenTransientRetryBackoffWhere(asOf string) string {
+	return fmt.Sprintf("(coalesce(last_error, '') like '%s%%' and cooldown_until <= %s + interval '1 minute')", transientRetryCooldownPrefix, asOf)
+}
+
+func tokenDisplayAvailableWhere(asOf string) string {
+	return fmt.Sprintf("(cooldown_until is null or cooldown_until <= %s or %s)", asOf, tokenTransientRetryBackoffWhere(asOf))
+}
+
+func tokenDisplayCoolingWhere(asOf string) string {
+	return fmt.Sprintf("(cooldown_until > %s and not %s)", asOf, tokenTransientRetryBackoffWhere(asOf))
+}
+
 func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope ResourceScope) (string, []any) {
 	var filters []string
 	var args []any
@@ -246,10 +279,10 @@ func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope Resourc
 	switch strings.ToLower(strings.TrimSpace(opts.Status)) {
 	case "available", "active":
 		asOf := arg(TokenListStatusAsOf(opts))
-		filters = append(filters, fmt.Sprintf("is_active = true and disabled_at is null and (cooldown_until is null or cooldown_until <= %s)", asOf))
+		filters = append(filters, fmt.Sprintf("is_active = true and disabled_at is null and %s", tokenDisplayAvailableWhere(asOf)))
 	case "cooling", "cooldown":
 		asOf := arg(TokenListStatusAsOf(opts))
-		filters = append(filters, fmt.Sprintf("is_active = true and disabled_at is null and cooldown_until > %s", asOf))
+		filters = append(filters, fmt.Sprintf("is_active = true and disabled_at is null and %s", tokenDisplayCoolingWhere(asOf)))
 	case "disabled", "inactive":
 		filters = append(filters, "(is_active = false or disabled_at is not null)")
 	}
@@ -364,9 +397,9 @@ func (s *Store) TokenCountsScopedAt(ctx context.Context, scope ResourceScope, as
 				  and disabled_at is null
 				  and access_token is not null
 				  and access_token <> ''
-				  and (cooldown_until is null or cooldown_until <= $1)
+				  and `+tokenDisplayAvailableWhere("$1")+`
 			)::int as available,
-			count(*) filter (where is_active = true and disabled_at is null and cooldown_until > $1)::int as cooling,
+			count(*) filter (where is_active = true and disabled_at is null and `+tokenDisplayCoolingWhere("$1")+`)::int as cooling,
 			count(*) filter (where is_active = false or disabled_at is not null)::int as disabled
 		from codex_tokens
 		where merged_into_token_id is null

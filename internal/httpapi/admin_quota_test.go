@@ -243,7 +243,9 @@ func TestAdminTokenStatusUsesServerTime(t *testing.T) {
 	now := time.Date(2026, 6, 17, 17, 30, 0, 0, time.UTC)
 	pastCooldown := now.Add(-time.Second)
 	futureCooldown := now.Add(time.Second)
+	longCooldown := now.Add(2 * time.Minute)
 	disabledAt := now.Add(-time.Minute)
+	retryError := "retryable upstream failure: Our servers are currently overloaded. Please try again later."
 
 	tests := []struct {
 		name  string
@@ -263,6 +265,24 @@ func TestAdminTokenStatusUsesServerTime(t *testing.T) {
 			token: store.Token{
 				IsActive:      true,
 				CooldownUntil: &futureCooldown,
+			},
+			want: "cooling",
+		},
+		{
+			name: "active when only transient retry backoff is in the future",
+			token: store.Token{
+				IsActive:      true,
+				CooldownUntil: &futureCooldown,
+				LastError:     &retryError,
+			},
+			want: "active",
+		},
+		{
+			name: "cooling when retry cooldown is not transient",
+			token: store.Token{
+				IsActive:      true,
+				CooldownUntil: &longCooldown,
+				LastError:     &retryError,
 			},
 			want: "cooling",
 		},

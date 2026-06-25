@@ -213,7 +213,7 @@ func adminTokenStatus(token store.Token, now time.Time) string {
 	if !token.IsActive || token.DisabledAt != nil {
 		return "disabled"
 	}
-	if token.CooldownUntil != nil && token.CooldownUntil.After(now) {
+	if token.CooldownUntil != nil && token.CooldownUntil.After(now) && !store.TokenHasTransientRetryBackoff(token, now) {
 		return "cooling"
 	}
 	return "active"
