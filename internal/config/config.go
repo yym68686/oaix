@@ -160,7 +160,7 @@ func Load() (Config, error) {
 		TokenPool: TokenPoolConfig{
 			SnapshotMaxAge:       envDurationSeconds("TOKEN_POOL_SNAPSHOT_MAX_AGE_SECONDS", 10*time.Second),
 			RefreshInterval:      envDurationSeconds("TOKEN_POOL_REFRESH_INTERVAL_SECONDS", 2*time.Second),
-			ActiveStreamCap:      int64(envInt("TOKEN_ACTIVE_STREAM_CAP", envInt("TOKEN_SELECTION_ACTIVE_STREAM_CAP", 4))),
+			ActiveStreamCap:      int64(envInt("TOKEN_ACTIVE_STREAM_CAP", envInt("TOKEN_SELECTION_ACTIVE_STREAM_CAP", 10))),
 			DefaultCooldown:      envDurationSeconds("DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS", 300*time.Second),
 			CompactErrorCooldown: envDurationSeconds("COMPACT_SERVER_ERROR_COOLDOWN_SECONDS", 60*time.Second),
 			AccessTokenFile:      envString("OAIX_ACCESS_TOKEN_FILE", envString("ACCESS_TOKEN_FILE", "")),
