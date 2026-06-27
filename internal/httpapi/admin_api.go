@@ -1422,7 +1422,7 @@ func (a *App) settingsSchema(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token_selection": map[string]any{
 			"type":       "object",
-			"properties": map[string]any{"active_stream_cap": map[string]any{"type": "integer", "minimum": 1}},
+			"properties": map[string]any{"active_stream_cap": map[string]any{"type": "integer", "minimum": 1, "maximum": store.MaxTokenActiveStreamCap}},
 		},
 		"generic": map[string]any{"type": "object"},
 	})

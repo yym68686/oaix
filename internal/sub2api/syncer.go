@@ -296,6 +296,8 @@ func (s *Syncer) createAccountRequest(target store.Sub2APISyncTarget, candidate 
 	accountConcurrency := target.AccountConcurrency
 	if accountConcurrency <= 0 {
 		accountConcurrency = store.Sub2APIDefaultAccountConcurrency
+	} else if accountConcurrency > store.Sub2APIMaxAccountConcurrency {
+		accountConcurrency = store.Sub2APIMaxAccountConcurrency
 	}
 	accountPriority := target.AccountPriority
 	if accountPriority < 0 {

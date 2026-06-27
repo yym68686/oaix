@@ -24,6 +24,7 @@ const (
 	Sub2APITokenStatusDisabled  = "disabled"
 
 	Sub2APIDefaultAccountConcurrency = 10
+	Sub2APIMaxAccountConcurrency     = 50
 	Sub2APIDefaultAccountPriority    = 50
 )
 
@@ -196,7 +197,7 @@ func (s *Store) CreateSub2APISyncTarget(ctx context.Context, input Sub2APISyncTa
 		boolValue(input.Enabled, true), input.OwnerUserID,
 		normalizePlanFilters(input.PlanFilters), normalizeTokenStatusFilters(input.TokenStatusFilters), normalizeInt64IDs(input.TargetGroupIDs), normalizeStringList(input.TargetGroupNames),
 		normalizeCheckInterval(input.CheckIntervalSeconds), normalizeNonNegative(input.MinAvailable, 10), normalizePositive(input.TopUpBatchSize, 10),
-		normalizePositive(input.AccountConcurrency, Sub2APIDefaultAccountConcurrency),
+		normalizeSub2APIAccountConcurrency(input.AccountConcurrency),
 		normalizeSub2APIAccountPriority(input.AccountPriority), normalizeSub2APIProxyID(input.ProxyID),
 		boolValue(input.AutoSyncNew, false),
 	)
@@ -242,7 +243,7 @@ func (s *Store) UpdateSub2APISyncTarget(ctx context.Context, id int64, input Sub
 		hasAdminKey, adminKey, boolValue(input.Enabled, true), input.OwnerUserID,
 		normalizePlanFilters(input.PlanFilters), normalizeTokenStatusFilters(input.TokenStatusFilters), normalizeInt64IDs(input.TargetGroupIDs), normalizeStringList(input.TargetGroupNames),
 		normalizeCheckInterval(input.CheckIntervalSeconds), normalizeNonNegative(input.MinAvailable, 10), normalizePositive(input.TopUpBatchSize, 10),
-		normalizePositive(input.AccountConcurrency, Sub2APIDefaultAccountConcurrency),
+		normalizeSub2APIAccountConcurrency(input.AccountConcurrency),
 		normalizeSub2APIAccountPriority(input.AccountPriority), normalizeSub2APIProxyID(input.ProxyID),
 		boolValue(input.AutoSyncNew, false),
 	)
@@ -547,6 +548,16 @@ func validateSub2APISyncTargetInput(input Sub2APISyncTargetInput, requireAdminKe
 	return nil
 }
 
+func normalizeSub2APIAccountConcurrency(value int) int {
+	if value <= 0 {
+		return Sub2APIDefaultAccountConcurrency
+	}
+	if value > Sub2APIMaxAccountConcurrency {
+		return Sub2APIMaxAccountConcurrency
+	}
+	return value
+}
+
 func scanSub2APISyncTarget(row rowScanner) (Sub2APISyncTarget, error) {
 	var item Sub2APISyncTarget
 	var ownerEmail sql.NullString
@@ -569,7 +580,7 @@ func scanSub2APISyncTarget(row rowScanner) (Sub2APISyncTarget, error) {
 	item.CheckIntervalSeconds = normalizeCheckInterval(item.CheckIntervalSeconds)
 	item.MinAvailable = normalizeNonNegative(item.MinAvailable, 10)
 	item.TopUpBatchSize = normalizePositive(item.TopUpBatchSize, 10)
-	item.AccountConcurrency = normalizePositive(item.AccountConcurrency, Sub2APIDefaultAccountConcurrency)
+	item.AccountConcurrency = normalizeSub2APIAccountConcurrency(item.AccountConcurrency)
 	item.AccountPriority = normalizeNonNegative(item.AccountPriority, Sub2APIDefaultAccountPriority)
 	item.ProxyID = normalizeSub2APIProxyID(item.ProxyID)
 	return item, err

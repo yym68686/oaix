@@ -36,7 +36,7 @@ export function SettingsPage({
     const payload = await api.tokenSelection();
     const cap = Number(payload.active_stream_cap || 10);
     setSelectionSummary(String(payload.strategy || "snapshot_round_robin"));
-    onStreamCapChange(Number.isFinite(cap) ? clamp(cap, 1, 10) : 10);
+    onStreamCapChange(Number.isFinite(cap) ? clamp(cap, 1, 50) : 10);
   }, [onStreamCapChange]);
 
   const loadSettings = useCallback(async () => {
@@ -111,10 +111,10 @@ export function SettingsPage({
               <Label htmlFor="stream-cap">每 Key 并发</Label>
               <Input
                 id="stream-cap"
-                max={10}
+                max={50}
                 min={1}
                 nativeInput
-                onChange={(event) => onStreamCapChange(clamp(Number(event.currentTarget.value || 1), 1, 10))}
+                onChange={(event) => onStreamCapChange(clamp(Number(event.currentTarget.value || 1), 1, 50))}
                 type="number"
                 value={streamCap}
               />

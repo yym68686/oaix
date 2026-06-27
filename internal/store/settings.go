@@ -18,7 +18,7 @@ const (
 	DefaultTokenSelectionStrategy   = "least_recently_used"
 	TokenSelectionStrategyFillFirst = "fill_first"
 	MinTokenActiveStreamCap         = int64(1)
-	MaxTokenActiveStreamCap         = int64(10)
+	MaxTokenActiveStreamCap         = int64(50)
 	defaultTokenActiveStreamCap     = int64(10)
 )
 

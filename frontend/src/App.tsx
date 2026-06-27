@@ -79,7 +79,7 @@ export function App(): React.ReactElement {
         try {
           const selection = await api.tokenSelection();
           const cap = Number(selection.active_stream_cap || 10);
-          setStreamCap(Number.isFinite(cap) ? Math.max(1, Math.min(10, cap)) : 10);
+          setStreamCap(Number.isFinite(cap) ? Math.max(1, Math.min(50, cap)) : 10);
         } catch {}
       }
       setRefreshNonce((value) => value + 1);

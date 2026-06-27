@@ -50,10 +50,10 @@ func TestParseTokenActiveStreamCapRange(t *testing.T) {
 	if _, err := ParseTokenActiveStreamCap(0); err == nil {
 		t.Fatal("ParseTokenActiveStreamCap(0) returned nil error")
 	}
-	if _, err := ParseTokenActiveStreamCap(11); err == nil {
-		t.Fatal("ParseTokenActiveStreamCap(11) returned nil error")
+	if _, err := ParseTokenActiveStreamCap(51); err == nil {
+		t.Fatal("ParseTokenActiveStreamCap(51) returned nil error")
 	}
-	if got, err := ParseTokenActiveStreamCap(10); err != nil || got != 10 {
-		t.Fatalf("ParseTokenActiveStreamCap(10) = %d, %v; want 10, nil", got, err)
+	if got, err := ParseTokenActiveStreamCap(50); err != nil || got != 50 {
+		t.Fatalf("ParseTokenActiveStreamCap(50) = %d, %v; want 50, nil", got, err)
 	}
 }

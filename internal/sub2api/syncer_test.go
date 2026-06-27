@@ -86,6 +86,25 @@ func TestCreateAccountRequestDefaultsConcurrency(t *testing.T) {
 	}
 }
 
+func TestCreateAccountRequestCapsConcurrency(t *testing.T) {
+	syncer := NewSyncer(nil, nil, nil, "client-fixture")
+	request := syncer.createAccountRequest(store.Sub2APISyncTarget{
+		ID:                 7,
+		TargetGroupIDs:     []int64{10},
+		AccountConcurrency: store.Sub2APIMaxAccountConcurrency + 1,
+	}, store.Sub2APITokenCandidate{
+		ID:           42,
+		OwnerUserID:  9,
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+		CreatedAt:    time.Now(),
+	})
+
+	if request.Concurrency != store.Sub2APIMaxAccountConcurrency {
+		t.Fatalf("Concurrency = %d, want %d", request.Concurrency, store.Sub2APIMaxAccountConcurrency)
+	}
+}
+
 func TestTokenAvailableForSub2API(t *testing.T) {
 	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
 	future := now.Add(time.Minute)

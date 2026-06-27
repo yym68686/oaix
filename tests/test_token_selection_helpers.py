@@ -43,14 +43,14 @@ def test_normalize_token_selection_strategy_falls_back_to_default() -> None:
 def test_parse_token_active_stream_cap_accepts_ui_range() -> None:
     assert parse_token_active_stream_cap(MIN_TOKEN_ACTIVE_STREAM_CAP) == 1
     assert parse_token_active_stream_cap("7") == 7
-    assert parse_token_active_stream_cap(MAX_TOKEN_ACTIVE_STREAM_CAP) == 10
+    assert parse_token_active_stream_cap(MAX_TOKEN_ACTIVE_STREAM_CAP) == 50
 
 
 def test_parse_token_active_stream_cap_rejects_out_of_range_values() -> None:
     with pytest.raises(ValueError):
         parse_token_active_stream_cap(0)
     with pytest.raises(ValueError):
-        parse_token_active_stream_cap(11)
+        parse_token_active_stream_cap(51)
 
 
 def test_normalize_token_active_stream_cap_falls_back_to_default() -> None:

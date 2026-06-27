@@ -10,7 +10,7 @@ import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { api, type PlatformUser, type Sub2APIGroup, type Sub2APIProxy, type Sub2APIRun, type Sub2APITarget, type TokenPlanCount } from "@/lib/api";
-import { formatDate, formatNumber } from "@/lib/format";
+import { clamp, formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert, LoadingState, MiniMetric, SelectField } from "@/shared/components";
 import { errorMessage, normalizePlanValue, planLabel } from "@/shared/domain";
 import type { ToastMessage } from "@/shared/types";
@@ -495,7 +495,14 @@ export function AdminSub2APIPage({
             <Input min={1} nativeInput onChange={(event) => updateDraft({ top_up_batch_size: Number(event.currentTarget.value) })} type="number" value={draft.top_up_batch_size} />
           </Field>
           <Field label="账号并发">
-            <Input min={1} nativeInput onChange={(event) => updateDraft({ account_concurrency: Number(event.currentTarget.value) })} type="number" value={draft.account_concurrency} />
+            <Input
+              max={50}
+              min={1}
+              nativeInput
+              onChange={(event) => updateDraft({ account_concurrency: clamp(Number(event.currentTarget.value || 1), 1, 50) })}
+              type="number"
+              value={draft.account_concurrency}
+            />
           </Field>
           <Field label="账号优先级">
             <Input min={0} nativeInput onChange={(event) => updateDraft({ account_priority: Number(event.currentTarget.value) })} type="number" value={draft.account_priority} />
