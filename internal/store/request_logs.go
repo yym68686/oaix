@@ -512,6 +512,14 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 }
 
 func (s *Store) TokenObservedCosts(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
+	return s.tokenObservedCosts(ctx, tokens, true)
+}
+
+func (s *Store) TokenObservedCostsSnapshot(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
+	return s.tokenObservedCosts(ctx, tokens, false)
+}
+
+func (s *Store) tokenObservedCosts(ctx context.Context, tokens []Token, includePendingLogs bool) (map[int64]*float64, error) {
 	result := make(map[int64]*float64, len(tokens))
 	requestedIDs := make([]int64, 0, len(tokens))
 	requested := map[int64]struct{}{}
@@ -547,8 +555,10 @@ func (s *Store) TokenObservedCosts(ctx context.Context, tokens []Token) (map[int
 		if err := s.addRequestCostsByTokenAggregate(ctx, canonicalByLogTokenID, result); err != nil {
 			return nil, err
 		}
-		if err := s.addRequestCostsByTokenLogs(ctx, canonicalByLogTokenID, result, true); err != nil {
-			return result, &observedCostsPartialError{step: "pending_token_logs", err: err}
+		if includePendingLogs {
+			if err := s.addRequestCostsByTokenLogs(ctx, canonicalByLogTokenID, result, true); err != nil {
+				return result, &observedCostsPartialError{step: "pending_token_logs", err: err}
+			}
 		}
 	} else if err := s.addRequestCostsByTokenLogs(ctx, canonicalByLogTokenID, result, false); err != nil {
 		return nil, err
