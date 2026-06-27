@@ -516,7 +516,11 @@ func (s *Store) TokenObservedCosts(ctx context.Context, tokens []Token) (map[int
 }
 
 func (s *Store) TokenObservedCostsSnapshot(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
-	return s.tokenObservedCosts(ctx, tokens, false)
+	costs, err := s.tokenObservedCosts(ctx, tokens, false)
+	if costs != nil && (err == nil || IsObservedCostsPartialError(err)) {
+		fillMissingObservedCosts(tokens, costs)
+	}
+	return costs, err
 }
 
 func (s *Store) tokenObservedCosts(ctx context.Context, tokens []Token, includePendingLogs bool) (map[int64]*float64, error) {
@@ -568,6 +572,24 @@ func (s *Store) tokenObservedCosts(ctx context.Context, tokens []Token, includeP
 		return result, &observedCostsPartialError{step: "unique_account_fallback", err: err}
 	}
 	return result, nil
+}
+
+func fillMissingObservedCosts(tokens []Token, result map[int64]*float64) {
+	seen := map[int64]struct{}{}
+	for _, token := range tokens {
+		if token.ID <= 0 {
+			continue
+		}
+		if _, ok := seen[token.ID]; ok {
+			continue
+		}
+		seen[token.ID] = struct{}{}
+		if result[token.ID] != nil {
+			continue
+		}
+		value := 0.0
+		result[token.ID] = &value
+	}
 }
 
 func (s *Store) addRequestCostsByUniqueAccountFallback(ctx context.Context, tokenByID map[int64]Token, result map[int64]*float64) error {

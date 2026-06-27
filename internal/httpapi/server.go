@@ -457,7 +457,7 @@ func (a *App) listTokenCosts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	costs, err := a.store.TokenObservedCosts(ctx, tokens)
+	costs, err := a.store.TokenObservedCostsSnapshot(ctx, tokens)
 	if err != nil && !store.IsObservedCostsPartialError(err) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
