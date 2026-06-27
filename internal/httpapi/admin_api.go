@@ -945,9 +945,12 @@ func (a *App) listImportJobTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	asOf := store.TokenListStatusAsOf(opts)
+	counts, planCounts, err := a.loadTokenListMetadata(r.Context(), store.AllResources(), opts, asOf)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), tokens, queryBool(r, "include_quota", false), asOf)
-	counts, _ := a.store.TokenCountsScopedAt(ctx, store.AllResources(), asOf)
-	planCounts, _ := a.store.TokenPlanCounts(ctx, opts)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": adminItems, "pagination": pagination(opts.Limit, opts.Offset, len(adminItems), total),
 		"counts": counts, "plan_counts": planCounts, "quota_refresh_pending_ids": pendingIDs,

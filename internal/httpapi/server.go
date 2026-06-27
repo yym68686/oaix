@@ -380,15 +380,16 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	asOf := store.TokenListStatusAsOf(tokenOpts)
-	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), items, queryBool(r, "include_quota", false), asOf)
 	countsScope := store.AllResources()
 	if tokenOpts.OwnerUserID > 0 {
 		countsScope = store.OwnerResources(tokenOpts.OwnerUserID)
 	}
-	counts, _ := a.store.TokenCountsScopedAt(ctx, countsScope, asOf)
-	planCtx, planCancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer planCancel()
-	planCounts, _ := a.store.TokenPlanCounts(planCtx, tokenOpts)
+	counts, planCounts, err := a.loadTokenListMetadata(r.Context(), countsScope, tokenOpts, asOf)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), items, queryBool(r, "include_quota", false), asOf)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts":          counts,
 		"filtered_counts": counts,
@@ -404,6 +405,39 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 		"items":                     adminItems,
 		"quota_refresh_pending_ids": pendingIDs,
 	})
+}
+
+func (a *App) loadTokenListMetadata(parent context.Context, scope store.ResourceScope, opts store.TokenListOptions, asOf time.Time) (store.TokenCounts, []store.TokenPlanCount, error) {
+	if asOf.IsZero() {
+		asOf = time.Now().UTC()
+	}
+	countCtx, countCancel := context.WithTimeout(parent, 5*time.Second)
+	counts, err := a.store.TokenCountsScopedAt(countCtx, scope, asOf)
+	countCancel()
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Warn("token list counts load failed", append(tokenListScopeAttrs(scope), "error", err)...)
+		}
+		return store.TokenCounts{}, nil, err
+	}
+	planCtx, planCancel := context.WithTimeout(parent, 5*time.Second)
+	planCounts, err := a.store.TokenPlanCountsScoped(planCtx, scope, opts)
+	planCancel()
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Warn("token list plan counts load failed", append(tokenListScopeAttrs(scope), "error", err)...)
+		}
+		return store.TokenCounts{}, nil, err
+	}
+	return counts, planCounts, nil
+}
+
+func tokenListScopeAttrs(scope store.ResourceScope) []any {
+	attrs := []any{"scope_all", scope.AllowAll}
+	if scope.OwnerUserID != nil {
+		attrs = append(attrs, "owner_user_id", *scope.OwnerUserID)
+	}
+	return attrs
 }
 
 func (a *App) listTokenCosts(w http.ResponseWriter, r *http.Request) {
