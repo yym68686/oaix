@@ -458,9 +458,12 @@ func (a *App) listTokenCosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	costs, err := a.store.TokenObservedCosts(ctx, tokens)
-	if err != nil {
+	if err != nil && !store.IsObservedCostsPartialError(err) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
+	}
+	if err != nil && a.logger != nil {
+		a.logger.Warn("admin token observed costs load failed", "error", err)
 	}
 	items := make([]store.TokenObservedCost, 0, len(tokens))
 	for _, token := range tokens {

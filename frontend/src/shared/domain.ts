@@ -125,6 +125,9 @@ export function formatUSD(value: number): string {
 }
 
 export function formatUSDOptional(value: unknown): string {
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
   const amount = Number(value);
   if (!Number.isFinite(amount)) {
     return "-";

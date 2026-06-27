@@ -169,7 +169,9 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		var err error
 		observedCostByID, err = a.store.TokenObservedCosts(ctx, tokens)
 		if err != nil {
-			observedCostByID = map[int64]*float64{}
+			if observedCostByID == nil {
+				observedCostByID = map[int64]*float64{}
+			}
 			if a.logger != nil {
 				a.logger.Warn("admin token observed costs load failed", "error", err)
 			}

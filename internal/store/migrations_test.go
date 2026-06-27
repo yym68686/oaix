@@ -65,6 +65,21 @@ func TestSharedTokenIndexRunsAfterShareColumnsExist(t *testing.T) {
 	}
 }
 
+func TestOnlineMigrationIndexesPendingObservedCostLookups(t *testing.T) {
+	joinedOnline := strings.ToLower(strings.Join(onlineMigrationStatements, "\n"))
+	required := []string{
+		"ix_gateway_request_logs_pending_token_cost",
+		"analytics_recorded_at is null",
+		"token_id is not null",
+		"estimated_cost_usd is not null",
+	}
+	for _, fragment := range required {
+		if !strings.Contains(joinedOnline, fragment) {
+			t.Fatalf("missing pending observed cost index fragment %q", fragment)
+		}
+	}
+}
+
 func TestMigrationDropsLegacyHourlyStatsConstraints(t *testing.T) {
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
 	required := []string{

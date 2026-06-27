@@ -83,6 +83,24 @@ type ModelStat struct {
 
 const requestTokenCostReconcileSettingKey = "request_token_costs_go_recorded_reconciled_at"
 
+type observedCostsPartialError struct {
+	step string
+	err  error
+}
+
+func (e *observedCostsPartialError) Error() string {
+	return fmt.Sprintf("partial observed costs load failed at %s: %v", e.step, e.err)
+}
+
+func (e *observedCostsPartialError) Unwrap() error {
+	return e.err
+}
+
+func IsObservedCostsPartialError(err error) bool {
+	var partial *observedCostsPartialError
+	return errors.As(err, &partial)
+}
+
 func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error {
 	if len(logs) == 0 {
 		return nil
@@ -529,14 +547,14 @@ func (s *Store) TokenObservedCosts(ctx context.Context, tokens []Token) (map[int
 			return nil, err
 		}
 		if err := s.addRequestCostsByTokenLogs(ctx, canonicalByLogTokenID, result, true); err != nil {
-			return nil, err
+			return result, &observedCostsPartialError{step: "pending_token_logs", err: err}
 		}
 	} else if err := s.addRequestCostsByTokenLogs(ctx, canonicalByLogTokenID, result, false); err != nil {
 		return nil, err
 	}
 
 	if err := s.addRequestCostsByUniqueAccountFallback(ctx, tokenByID, result); err != nil {
-		return nil, err
+		return result, &observedCostsPartialError{step: "unique_account_fallback", err: err}
 	}
 	return result, nil
 }

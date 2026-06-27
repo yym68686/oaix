@@ -271,6 +271,14 @@ export function TokenConcurrency({ fallbackCap, item }: { fallbackCap: number; i
 }
 
 export function TokenObservedCost({ value }: { value?: number | null }) {
+  if (value === null || value === undefined) {
+    return (
+      <div className="inline-flex min-w-[5.6rem] items-center gap-1 rounded-md border bg-muted/32 px-2 py-0.5" title="已使用金额更新中">
+        <span className="text-muted-foreground">已用</span>
+        <span className="text-muted-foreground">更新中</span>
+      </div>
+    );
+  }
   const amount = Number(value);
   if (!Number.isFinite(amount)) {
     return null;
