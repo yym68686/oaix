@@ -83,6 +83,40 @@ type ModelStat struct {
 
 const requestTokenCostReconcileSettingKey = "request_token_costs_go_recorded_reconciled_at"
 
+const aggregateRequestTokenCostsSQL = `
+	with pending as (
+		select
+			token_id,
+			coalesce(token_owner_user_id, owner_user_id) as owner_user_id,
+			coalesce(estimated_cost_usd, 0) as estimated_cost_usd
+		from gateway_request_logs
+		where analytics_recorded_at is null
+		  and finished_at is not null
+		  and token_id is not null
+		  and estimated_cost_usd is not null
+		order by id
+		limit 5000
+		for update skip locked
+	),
+	agg as (
+		select
+			token_id,
+			max(owner_user_id) as owner_user_id,
+			count(*)::bigint as request_count,
+			sum(estimated_cost_usd)::float8 as estimated_cost_usd
+		from pending
+		group by token_id
+	)
+	insert into gateway_request_token_costs(token_id, owner_user_id, request_count, estimated_cost_usd, updated_at)
+	select token_id, owner_user_id, request_count, estimated_cost_usd, now()
+	from agg
+	on conflict (token_id) do update set
+		owner_user_id = coalesce(excluded.owner_user_id, gateway_request_token_costs.owner_user_id),
+		request_count = gateway_request_token_costs.request_count + excluded.request_count,
+		estimated_cost_usd = gateway_request_token_costs.estimated_cost_usd + excluded.estimated_cost_usd,
+		updated_at = now()
+`
+
 type observedCostsPartialError struct {
 	step string
 	err  error
@@ -450,40 +484,7 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 	if err != nil {
 		return 0, err
 	}
-	_, err = tx.Exec(ctx, `
-		with pending as (
-			select
-				token_id,
-				owner_user_id,
-				coalesce(estimated_cost_usd, 0) as estimated_cost_usd
-			from gateway_request_logs
-			where analytics_recorded_at is null
-			  and finished_at is not null
-			  and token_id is not null
-			  and owner_user_id is not null
-			  and estimated_cost_usd is not null
-			order by id
-			limit 5000
-			for update skip locked
-		),
-		agg as (
-			select
-				token_id,
-				owner_user_id,
-				count(*)::bigint as request_count,
-				sum(estimated_cost_usd)::float8 as estimated_cost_usd
-			from pending
-			group by token_id, owner_user_id
-		)
-		insert into gateway_request_token_costs(token_id, owner_user_id, request_count, estimated_cost_usd, updated_at)
-		select token_id, owner_user_id, request_count, estimated_cost_usd, now()
-		from agg
-		on conflict (token_id) do update set
-			owner_user_id = coalesce(excluded.owner_user_id, gateway_request_token_costs.owner_user_id),
-			request_count = gateway_request_token_costs.request_count + excluded.request_count,
-			estimated_cost_usd = gateway_request_token_costs.estimated_cost_usd + excluded.estimated_cost_usd,
-			updated_at = now()
-	`)
+	_, err = tx.Exec(ctx, aggregateRequestTokenCostsSQL)
 	if err != nil {
 		return 0, err
 	}
