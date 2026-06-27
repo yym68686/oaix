@@ -103,7 +103,16 @@ export function KeysPage({
   route: RouteState;
 }) {
   if (route.key === "key_detail") {
-    return <KeyDetailPage activeStreamCap={activeStreamCap} apiScope="self" id={Number(route.params.id)} pushToast={pushToast} refreshNonce={refreshNonce} />;
+    return (
+      <KeyDetailPage
+        activeStreamCap={activeStreamCap}
+        apiScope="self"
+        backHref={`/keys${route.search || ""}`}
+        id={Number(route.params.id)}
+        pushToast={pushToast}
+        refreshNonce={refreshNonce}
+      />
+    );
   }
   return (
     <KeyListPage
