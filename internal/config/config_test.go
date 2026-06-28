@@ -13,6 +13,7 @@ func TestLoadUsesTypedDefaultsAndEnvOverrides(t *testing.T) {
 	t.Setenv("PORT", "18080")
 	t.Setenv("REQUEST_LOG_WRITE_BATCH_SIZE", "123")
 	t.Setenv("TOKEN_POOL_SNAPSHOT_MAX_AGE_SECONDS", "7")
+	t.Setenv("UPSTREAM_MAX_REQUEST_BODY_BYTES", "")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
@@ -38,8 +39,29 @@ func TestLoadUsesTypedDefaultsAndEnvOverrides(t *testing.T) {
 	if cfg.Upstream.OAuthClientID == "" || cfg.Upstream.OAuthScope != "openid profile email" {
 		t.Fatalf("OAuth config = %#v", cfg.Upstream)
 	}
+	if cfg.Upstream.MaxRequestBodyBytes != 0 {
+		t.Fatalf("MaxRequestBodyBytes = %d, want unlimited default", cfg.Upstream.MaxRequestBodyBytes)
+	}
 	if !cfg.Worker.Embedded {
 		t.Fatal("embedded worker should default to enabled")
+	}
+}
+
+func TestLoadReadsRequestBodyLimitOverride(t *testing.T) {
+	t.Setenv("UPSTREAM_MAX_REQUEST_BODY_BYTES", "134217728")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Upstream.MaxRequestBodyBytes != 134217728 {
+		t.Fatalf("MaxRequestBodyBytes = %d", cfg.Upstream.MaxRequestBodyBytes)
+	}
+}
+
+func TestLoadRejectsNegativeRequestBodyLimit(t *testing.T) {
+	t.Setenv("UPSTREAM_MAX_REQUEST_BODY_BYTES", "-1")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected negative request body limit error")
 	}
 }
 
@@ -54,6 +76,7 @@ func TestLoadRejectsInvalidPort(t *testing.T) {
 func TestSanitizedSummaryDoesNotExposeSecrets(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgresql://user:secret@localhost:5432/db")
 	t.Setenv("SERVICE_API_KEYS", "secret-key")
+	t.Setenv("UPSTREAM_MAX_REQUEST_BODY_BYTES", "")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)

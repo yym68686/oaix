@@ -64,6 +64,9 @@ func readBodyWithLimit(reader io.Reader, maxBytes int64) ([]byte, error) {
 	if maxBytes < 0 {
 		return nil, errRequestBodyTooLarge
 	}
+	if maxBytes == 0 {
+		return io.ReadAll(reader)
+	}
 	limit := maxBytes + 1
 	if limit < 0 {
 		limit = maxBytes

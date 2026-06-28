@@ -62,6 +62,7 @@ type UpstreamConfig struct {
 	TLSHandshakeTimeout       time.Duration
 	DisableCompression        bool
 	ForceAttemptHTTP2         bool
+	MaxRequestBodyBytes       int64
 	NonStreamMaxResponseBytes int64
 }
 
@@ -155,6 +156,7 @@ func Load() (Config, error) {
 			TLSHandshakeTimeout:       envDurationSeconds("UPSTREAM_HTTP_TLS_HANDSHAKE_TIMEOUT_SECONDS", 10*time.Second),
 			DisableCompression:        envBool("UPSTREAM_HTTP_DISABLE_COMPRESSION", false),
 			ForceAttemptHTTP2:         envBool("UPSTREAM_HTTP_FORCE_HTTP2", false),
+			MaxRequestBodyBytes:       int64(envInt("UPSTREAM_MAX_REQUEST_BODY_BYTES", 0)),
 			NonStreamMaxResponseBytes: int64(envInt("UPSTREAM_NON_STREAM_MAX_RESPONSE_BYTES", 64*1024*1024)),
 		},
 		TokenPool: TokenPoolConfig{
@@ -238,6 +240,9 @@ func (c Config) Validate() error {
 	}
 	if c.Upstream.ShardCount <= 0 {
 		errs = append(errs, fmt.Errorf("UPSTREAM_HTTP_SHARD_COUNT must be positive"))
+	}
+	if c.Upstream.MaxRequestBodyBytes < 0 {
+		errs = append(errs, fmt.Errorf("UPSTREAM_MAX_REQUEST_BODY_BYTES must be zero or positive"))
 	}
 	return errors.Join(errs...)
 }

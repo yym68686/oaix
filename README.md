@@ -53,6 +53,7 @@
 - `IMAGE_REQUEST_MAX_ACCOUNT_RETRIES`: 图片接口单次请求最多切换多少个 key，默认 `8`
 - `IMAGE_INPUT_MAX_PER_REQUEST`: 单次图片请求最多允许多少张输入图片，默认 `249`；达到上游 `input-images per min` 桶大小前直接拒绝超大请求
 - `IMAGE_UPLOAD_MAX_BYTES`: multipart 图片上传单文件最大字节数，默认 `26214400`（25 MiB）
+- `UPSTREAM_MAX_REQUEST_BODY_BYTES`: 入站代理请求体最大字节数，默认 `0`（不限制；由上游 edge / 调用入口控制）
 - `UPSTREAM_NON_STREAM_MAX_RESPONSE_BYTES`: 非流式上游响应聚合最大字节数，默认 `67108864`（64 MiB）
 - `STREAM_CAPTURE_MAX_BYTES`: 流式响应中用于错误/统计解析的最大捕获字节数，默认 `8388608`（8 MiB）；超过后继续透传但停止内存捕获
 - `IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS`: `gpt-image-2` 撞到上游 `input-images` 短速率限制且未返回明确重试时间时的 scoped 冷却秒数，默认 `5`
@@ -203,6 +204,7 @@ export REQUEST_LOG_CLEANUP_INTERVAL_SECONDS='3600'
 export ADMIN_REQUESTS_CACHE_TTL_SECONDS='5'
 export ADMIN_TOKEN_COUNTS_CACHE_TTL_SECONDS='2'
 export IMAGE_UPLOAD_MAX_BYTES='26214400'
+export UPSTREAM_MAX_REQUEST_BODY_BYTES='0'
 export UPSTREAM_NON_STREAM_MAX_RESPONSE_BYTES='67108864'
 export STREAM_CAPTURE_MAX_BYTES='8388608'
 export COMPACT_SERVER_ERROR_COOLDOWN_SECONDS='60'

@@ -139,7 +139,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	started := time.Now().UTC()
 	requestID := requestID(r)
 	w.Header().Set("X-Request-ID", requestID)
-	bodyBytes, bodyStatus, bodyMessage, err := readProxyRequestBody(r, p.cfg.Upstream.NonStreamMaxResponseBytes)
+	bodyBytes, bodyStatus, bodyMessage, err := readProxyRequestBody(r, p.cfg.Upstream.MaxRequestBodyBytes)
 	if err != nil {
 		writeJSONError(w, bodyStatus, bodyMessage)
 		return

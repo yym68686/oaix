@@ -147,6 +147,43 @@ func TestReadProxyRequestBodyRejectsOversizedDecodedZstd(t *testing.T) {
 	}
 }
 
+func TestReadProxyRequestBodyAllowsUnlimitedBodyWhenLimitZero(t *testing.T) {
+	body := []byte("0123456789")
+	compressed := zstdEncodeForTest(t, body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(compressed))
+	req.Header.Set("Content-Encoding", "zstd")
+
+	got, status, message, err := readProxyRequestBody(req, 0)
+	if err != nil {
+		t.Fatalf("readProxyRequestBody returned status=%d message=%q err=%v", status, message, err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("decoded body = %q, want %q", got, body)
+	}
+}
+
+func TestProxyUsesRequestBodyLimitForIngress(t *testing.T) {
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			MaxRequestBodyBytes:       5,
+			NonStreamMaxResponseBytes: 1 << 20,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pipeline := New(cfg, logger, nil, nil, nil, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("0123456789"))
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses"})
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "request body too large") {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
 func TestCopyProxyHeadersStripsBodyEncodingHeaders(t *testing.T) {
 	src := http.Header{}
 	src.Set("Content-Encoding", "zstd")
