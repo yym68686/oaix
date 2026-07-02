@@ -2,12 +2,38 @@ import { DownloadIcon } from "lucide-react";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
 import { Input } from "@/registry/default/ui/input";
+import { cn } from "@/registry/default/lib/utils";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import type { APIKeyItem, ImportBatch, PoolSummaryResponse, RequestItem, TokenItem } from "@/lib/api";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, LoadingState, MiniMetric, SelectField } from "@/shared/components";
 
 export type ResourceScope = { kind: "all" } | { kind: "user"; userId: number };
+
+function normalizedModel(value: string | null | undefined) {
+  const text = String(value || "").trim();
+  return text || "";
+}
+
+export function RequestModelCell({ className, item }: { className?: string; item: Pick<RequestItem, "model" | "model_name"> }) {
+  const requestedModel = normalizedModel(item.model);
+  const responseModel = normalizedModel(item.model_name);
+  const primaryModel = responseModel || requestedModel;
+  const shouldShowRequested = Boolean(requestedModel && responseModel && requestedModel !== responseModel);
+
+  if (!primaryModel) {
+    return <span>-</span>;
+  }
+
+  return (
+    <div className={cn("grid min-w-0 max-w-64 gap-0.5", className)} title={shouldShowRequested ? `${primaryModel}\n请求: ${requestedModel}` : primaryModel}>
+      <span className="min-w-0 break-words font-medium leading-tight [overflow-wrap:anywhere]">{primaryModel}</span>
+      {shouldShowRequested && (
+        <span className="min-w-0 break-words text-muted-foreground text-xs leading-tight [overflow-wrap:anywhere]">请求: {requestedModel}</span>
+      )}
+    </div>
+  );
+}
 
 export function PoolSummaryCards({ summary }: { summary: PoolSummaryResponse }) {
   return (
@@ -208,7 +234,9 @@ export function RequestLogsTable({
               <TableCell>{formatDate(item.started_at)}</TableCell>
               <TableCell>{String(item.owner_user_id || "-")}</TableCell>
               <TableCell>{String(item.api_key_id || "-")}</TableCell>
-              <TableCell>{item.model_name || item.model || "-"}</TableCell>
+              <TableCell>
+                <RequestModelCell item={item} />
+              </TableCell>
               <TableCell>
                 <Badge variant={item.success === false ? "error" : "success"}>{item.status_code || "-"}</Badge>
               </TableCell>

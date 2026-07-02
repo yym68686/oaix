@@ -7,6 +7,7 @@ import { api, type RequestItem, type RequestSummary } from "@/lib/api";
 import { formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert, LoadingRows, MiniMetric } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
+import { RequestModelCell } from "@/shared/resourceTables";
 
 export function RequestsPage({ refreshNonce }: { refreshNonce: number }) {
   const [requests, setRequests] = useState<RequestItem[]>([]);
@@ -95,7 +96,9 @@ export function RequestsPage({ refreshNonce }: { refreshNonce: number }) {
                 {requests.map((item, index) => (
                   <TableRow key={item.id || item.started_at || index}>
                     <TableCell>{formatDate(item.started_at)}</TableCell>
-                    <TableCell>{item.model_name || item.model || "-"}</TableCell>
+                    <TableCell>
+                      <RequestModelCell item={item} />
+                    </TableCell>
                     <TableCell>{item.endpoint || "-"}</TableCell>
                     <TableCell>
                       <Badge variant={item.success === false ? "error" : "success"}>{item.status_code || "-"}</Badge>

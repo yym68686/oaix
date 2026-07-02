@@ -8,11 +8,11 @@ import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { KeyListPage } from "@/features/keys/KeysPage";
-import { api, type APIKeyItem, type CreatedAPIKey, type ImportBatch, type OwnerUsageSummary, type PlatformUser, type RequestItem, type TokenCounts, type TokenItem } from "@/lib/api";
+import { api, type APIKeyItem, type CreatedAPIKey, type ImportBatch, type OwnerUsageSummary, type PlatformUser, type PoolSummaryResponse, type RequestItem, type TokenCounts, type TokenItem } from "@/lib/api";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert, LoadingState, MiniMetric, SelectField } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
-import { ApiKeyTable, ImportJobsTable, RequestLogsTable, TokenTable, UserSelector } from "@/shared/resourceTables";
+import { ApiKeyTable, ImportJobsTable, RequestLogsTable, RequestModelCell, TokenTable, UserSelector } from "@/shared/resourceTables";
 import type { ToastMessage } from "@/shared/types";
 
 export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title: string, variant?: ToastMessage["variant"]) => void; refreshNonce: number }) {
@@ -712,7 +712,9 @@ function RequestMiniTable({ items }: { items: RequestItem[] }) {
             <TableRow key={item.id || item.started_at || index}>
               <TableCell>{formatDate(item.started_at)}</TableCell>
               <TableCell>{String((item as any).owner_user_id || "-")}</TableCell>
-              <TableCell>{item.model_name || item.model || "-"}</TableCell>
+              <TableCell>
+                <RequestModelCell item={item} />
+              </TableCell>
               <TableCell>
                 <Badge variant={item.success === false ? "error" : "success"}>{item.status_code || "-"}</Badge>
               </TableCell>
