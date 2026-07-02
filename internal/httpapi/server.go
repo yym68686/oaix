@@ -1293,9 +1293,6 @@ func parseImportPayload(body any) ([]map[string]any, string, error) {
 }
 
 func sub2APIImportPayloads(record map[string]any) ([]map[string]any, bool) {
-	if strings.TrimSpace(stringFromAny(record["type"])) != "sub2api-data" {
-		return nil, false
-	}
 	accounts, ok := record["accounts"].([]any)
 	if !ok {
 		return nil, false
@@ -1308,6 +1305,7 @@ func sub2APIImportPayloads(record map[string]any) ([]map[string]any, bool) {
 		}
 		payload, ok := sub2APIAccountImportPayload(account)
 		if ok {
+			preserveImportPayloadControlFields(payload, record)
 			payloads = append(payloads, payload)
 		}
 	}

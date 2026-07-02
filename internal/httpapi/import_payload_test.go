@@ -139,6 +139,48 @@ func TestParseImportTextPayloadsExpandsSub2APIDataExport(t *testing.T) {
 	}
 }
 
+func TestParseImportPayloadExpandsAccountsExportWithoutType(t *testing.T) {
+	payloads, queuePosition, err := parseImportPayload(map[string]any{
+		"import_queue_position": "front",
+		"_share_enabled":        true,
+		"_share_status":         "active",
+		"source_file":           "accounts.json",
+		"accounts": []any{
+			map[string]any{
+				"name":     "account@example.com",
+				"platform": "openai",
+				"type":     "oauth",
+				"credentials": map[string]any{
+					"access_token":       "eyJhbGciOi.account.signature",
+					"refresh_token":      "rt-account",
+					"chatgpt_account_id": "acct-account",
+					"email":              "account@example.com",
+					"plan_type":          "plus",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queuePosition != "front" || len(payloads) != 1 {
+		t.Fatalf("queue=%q payloads=%#v", queuePosition, payloads)
+	}
+	payload := payloads[0]
+	if payload["refresh_token"] != "rt-account" {
+		t.Fatalf("account refresh token not expanded: %#v", payload)
+	}
+	if _, ok := payload["accounts"]; ok {
+		t.Fatalf("top-level accounts leaked into normalized payload: %#v", payload)
+	}
+	if payload["email"] != "account@example.com" || payload["plan_type"] != "plus" {
+		t.Fatalf("account metadata not preserved: %#v", payload)
+	}
+	if payload["_share_enabled"] != true || payload["_share_status"] != "active" || payload["source_file"] != "accounts.json" {
+		t.Fatalf("import control fields not preserved: %#v", payload)
+	}
+}
+
 func TestParseImportPayloadExpandsNestedCredentialTokenItems(t *testing.T) {
 	payloads, queuePosition, err := parseImportPayload(map[string]any{
 		"import_queue_position": "back",
