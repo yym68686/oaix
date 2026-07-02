@@ -75,3 +75,41 @@ func TestWorkerValidateBatchRefreshTokens(t *testing.T) {
 		t.Fatalf("refresh metadata was not preserved: %+v", updates[0].ValidatedPayload)
 	}
 }
+
+func TestWorkerValidateBatchNestedCredentialsRefreshTokens(t *testing.T) {
+	worker := &Worker{
+		MaxConcurrency: 2,
+		Validator: TokenPayloadValidator{
+			Refresh: OAuthRefreshValidator{Client: fakeRefreshClient{}},
+		},
+	}
+	updates := worker.ValidateBatch(context.Background(), []store.ImportItem{
+		{
+			ID: 1,
+			Payload: map[string]any{
+				"name":     "nested@example.com",
+				"platform": "openai",
+				"type":     "oauth",
+				"credentials": map[string]any{
+					"access_token":       "stale-access-token",
+					"refresh_token":      "rt-nested",
+					"chatgpt_account_id": "acct-input",
+					"email":              "nested@example.com",
+				},
+			},
+		},
+	})
+	if len(updates) != 1 {
+		t.Fatalf("updates len = %d", len(updates))
+	}
+	if updates[0].Status != string(ItemValidated) {
+		t.Fatalf("unexpected status: %+v", updates[0])
+	}
+	if updates[0].Action != "oauth_refresh" {
+		t.Fatalf("nested credentials should prefer refresh token, got %+v", updates[0])
+	}
+	if updates[0].ValidatedPayload["access_token"] != "at-rt-nested" ||
+		updates[0].ValidatedPayload["refresh_token"] != "rt-next" {
+		t.Fatalf("nested credentials were not refreshed: %+v", updates[0].ValidatedPayload)
+	}
+}

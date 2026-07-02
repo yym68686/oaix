@@ -139,8 +139,9 @@ func (AccessTokenValidator) Validate(ctx context.Context, item store.ImportItem)
 		return ValidatedItem{}, ctx.Err()
 	default:
 	}
+	payload := flattenNestedCredentialsPayload(item.Payload)
 	for _, key := range []string{"access_token", "accessToken", "token"} {
-		if value, ok := item.Payload[key].(string); ok && strings.TrimSpace(value) != "" {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
 			return ValidatedItem{AccessToken: strings.TrimSpace(value), Action: "upsert_access_token"}, nil
 		}
 	}
@@ -153,14 +154,16 @@ type TokenPayloadValidator struct {
 }
 
 func (v TokenPayloadValidator) Validate(ctx context.Context, item store.ImportItem) (ValidatedItem, error) {
-	if hasPayloadString(item.Payload, "access_token", "accessToken", "token") {
+	payload := flattenNestedCredentialsPayload(item.Payload)
+	item.Payload = payload
+	if hasPayloadString(payload, "access_token", "accessToken", "token") {
 		access := v.Access
 		if access == nil {
 			access = AccessTokenValidator{}
 		}
 		return access.Validate(ctx, item)
 	}
-	if hasPayloadString(item.Payload, "refresh_token", "refreshToken") {
+	if hasPayloadString(payload, "refresh_token", "refreshToken") {
 		refresh := v.Refresh
 		if refresh == nil {
 			return ValidatedItem{}, fmt.Errorf("oauth client is not configured")
@@ -168,6 +171,46 @@ func (v TokenPayloadValidator) Validate(ctx context.Context, item store.ImportIt
 		return refresh.Validate(ctx, item)
 	}
 	return AccessTokenValidator{}.Validate(ctx, item)
+}
+
+func flattenNestedCredentialsPayload(payload map[string]any) map[string]any {
+	if len(payload) == 0 {
+		return payload
+	}
+	credentials, ok := payload["credentials"].(map[string]any)
+	if !ok || len(credentials) == 0 {
+		return payload
+	}
+	flattened := make(map[string]any, len(payload)+len(credentials))
+	for key, value := range payload {
+		if key != "credentials" {
+			flattened[key] = value
+		}
+	}
+	copyStringPayloadField(flattened, credentials, "refresh_token", "refresh_token")
+	copyStringPayloadField(flattened, credentials, "refreshToken", "refresh_token")
+	if _, hasRefresh := flattened["refresh_token"]; !hasRefresh {
+		copyStringPayloadField(flattened, credentials, "access_token", "access_token")
+		copyStringPayloadField(flattened, credentials, "accessToken", "access_token")
+	}
+	copyStringPayloadField(flattened, credentials, "account_id", "account_id")
+	copyStringPayloadField(flattened, credentials, "chatgpt_account_id", "chatgpt_account_id")
+	copyStringPayloadField(flattened, credentials, "chatgpt_user_id", "chatgpt_user_id")
+	copyStringPayloadField(flattened, credentials, "organization_id", "organization_id")
+	copyStringPayloadField(flattened, credentials, "email", "email")
+	copyStringPayloadField(flattened, credentials, "id_token", "id_token")
+	copyStringPayloadField(flattened, credentials, "plan_type", "plan_type")
+	copyStringPayloadField(flattened, credentials, "type", "type")
+	return flattened
+}
+
+func copyStringPayloadField(dst map[string]any, src map[string]any, srcKey string, dstKey string) {
+	if _, exists := dst[dstKey]; exists {
+		return
+	}
+	if value, ok := src[srcKey].(string); ok && strings.TrimSpace(value) != "" {
+		dst[dstKey] = strings.TrimSpace(value)
+	}
 }
 
 type OAuthRefreshValidator struct {

@@ -139,6 +139,42 @@ func TestParseImportTextPayloadsExpandsSub2APIDataExport(t *testing.T) {
 	}
 }
 
+func TestParseImportPayloadExpandsNestedCredentialTokenItems(t *testing.T) {
+	payloads, queuePosition, err := parseImportPayload(map[string]any{
+		"import_queue_position": "back",
+		"tokens": []any{
+			map[string]any{
+				"name":     "nested@example.com",
+				"platform": "openai",
+				"type":     "oauth",
+				"credentials": map[string]any{
+					"access_token":       "eyJhbGciOi.nested.signature",
+					"refresh_token":      "rt-nested",
+					"chatgpt_account_id": "acct-nested",
+					"email":              "nested@example.com",
+					"plan_type":          "plus",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queuePosition != "back" || len(payloads) != 1 {
+		t.Fatalf("queue=%q payloads=%#v", queuePosition, payloads)
+	}
+	payload := payloads[0]
+	if payload["refresh_token"] != "rt-nested" {
+		t.Fatalf("nested refresh token not expanded: %#v", payload)
+	}
+	if _, ok := payload["credentials"]; ok {
+		t.Fatalf("nested credentials leaked into normalized payload: %#v", payload)
+	}
+	if payload["chatgpt_account_id"] != "acct-nested" || payload["email"] != "nested@example.com" || payload["plan_type"] != "plus" {
+		t.Fatalf("nested metadata not preserved: %#v", payload)
+	}
+}
+
 func TestPrepareImportPayloadsRefreshesRefreshTokens(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {

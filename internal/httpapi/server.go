@@ -1328,6 +1328,7 @@ func sub2APIAccountImportPayload(account map[string]any) (map[string]any, bool) 
 	copyStringField(payload, credentials, "organization_id", "organization_id")
 	copyStringField(payload, credentials, "email", "email")
 	copyStringField(payload, credentials, "id_token", "id_token")
+	copyStringField(payload, credentials, "plan_type", "plan_type")
 	copyStringField(payload, credentials, "type", "type")
 	copyStringField(payload, account, "platform", "platform")
 	copyStringField(payload, account, "type", "account_type")
@@ -1362,6 +1363,10 @@ func importPayloadFromString(value string) map[string]any {
 }
 
 func normalizeImportPayloadMap(payload map[string]any) map[string]any {
+	if normalized, ok := sub2APIAccountImportPayload(payload); ok {
+		preserveImportPayloadControlFields(normalized, payload)
+		return normalized
+	}
 	out := make(map[string]any, len(payload)+1)
 	for key, value := range payload {
 		out[key] = value
@@ -1389,6 +1394,20 @@ func normalizeImportPayloadMap(payload map[string]any) map[string]any {
 		}
 	}
 	return out
+}
+
+func preserveImportPayloadControlFields(dst map[string]any, src map[string]any) {
+	if dst == nil || src == nil {
+		return
+	}
+	for _, key := range []string{
+		"_share_enabled", "_share_status", "share_enabled", "shareEnabled", "share_status", "shareStatus",
+		"source_file", "_import_index", "_previous_refresh_token",
+	} {
+		if value, ok := src[key]; ok {
+			dst[key] = value
+		}
+	}
 }
 
 func looksLikeAccessTokenText(value string) bool {
