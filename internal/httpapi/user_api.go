@@ -255,8 +255,13 @@ func (a *App) myPoolSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	sharingCounts, err := a.store.TokenSharingCountsScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	plans, _ := a.store.TokenPlanCountsScoped(ctx, scope, store.TokenListOptions{})
-	writeJSON(w, http.StatusOK, map[string]any{"counts": counts, "plan_counts": plans})
+	writeJSON(w, http.StatusOK, map[string]any{"counts": counts, "sharing_counts": sharingCounts, "plan_counts": plans})
 }
 
 func (a *App) listMySettings(w http.ResponseWriter, r *http.Request) {
@@ -625,13 +630,19 @@ func (a *App) patchMyTokensSharing(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	sharingCounts, err := a.store.TokenSharingCountsScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	plans, _ := a.store.TokenPlanCountsScoped(ctx, scope, store.TokenListOptions{})
 	_ = a.store.WriteAuditLog(ctx, "user_tokens_sharing_update", "self", "token", "bulk", map[string]any{"user_id": scope.OwnerUserID, "updated": updated, "all": payload.All, "share_enabled": *shareEnabled})
 	_ = a.tokens.Refresh(ctx)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"updated":     updated,
-		"counts":      counts,
-		"plan_counts": plans,
+		"updated":        updated,
+		"counts":         counts,
+		"sharing_counts": sharingCounts,
+		"plan_counts":    plans,
 	})
 }
 

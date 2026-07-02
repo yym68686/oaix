@@ -113,6 +113,11 @@ type TokenListOptions struct {
 	StatusAsOf     *time.Time
 }
 
+type TokenSharingCounts struct {
+	Shared  int `json:"shared"`
+	Private int `json:"private"`
+}
+
 type RefreshTokenIdentity struct {
 	TokenID int64  `json:"token_id"`
 	Hash    string `json:"hash"`
@@ -404,6 +409,26 @@ func (s *Store) TokenCountsScopedAt(ctx context.Context, scope ResourceScope, as
 		from codex_tokens
 		where merged_into_token_id is null
 		  and `+ownerWhere, args...).Scan(&counts.Total, &counts.Available, &counts.Cooling, &counts.Disabled)
+	return counts, err
+}
+
+func (s *Store) TokenSharingCountsScoped(ctx context.Context, scope ResourceScope) (TokenSharingCounts, error) {
+	var counts TokenSharingCounts
+	args := []any{}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	err := s.pool.QueryRow(ctx, `
+		select
+			count(*) filter (
+				where share_enabled = true
+				  and lower(coalesce(share_status, '')) = 'active'
+			)::int as shared,
+			count(*) filter (
+				where share_enabled = false
+				   or lower(coalesce(share_status, '')) <> 'active'
+			)::int as private
+		from codex_tokens
+		where merged_into_token_id is null
+		  and `+ownerWhere, args...).Scan(&counts.Shared, &counts.Private)
 	return counts, err
 }
 
