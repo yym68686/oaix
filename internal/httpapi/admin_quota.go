@@ -651,7 +651,7 @@ func (s *adminQuotaService) refreshQuotaToken(ctx context.Context, token store.T
 	if s.oauthClient == nil {
 		return token, fmt.Errorf("oauth refresh client is not configured")
 	}
-	result, err := s.oauthClient.Refresh(ctx, refreshToken)
+	result, err := s.refreshOAuthToken(ctx, token, refreshToken)
 	if err != nil {
 		return token, err
 	}
@@ -691,6 +691,23 @@ func (s *adminQuotaService) refreshQuotaToken(ctx context.Context, token store.T
 		token.PlanType = &value
 	}
 	return token, nil
+}
+
+func (s *adminQuotaService) refreshOAuthToken(ctx context.Context, token store.Token, refreshToken string) (oauth.RefreshResult, error) {
+	clientID := ""
+	if s.store != nil {
+		value, err := s.store.TokenOAuthClientID(ctx, token.ID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return oauth.RefreshResult{}, err
+		}
+		clientID = strings.TrimSpace(value)
+	}
+	if clientID != "" {
+		if refresher, ok := s.oauthClient.(oauth.ClientIDRefresher); ok {
+			return refresher.RefreshWithClientID(ctx, refreshToken, clientID)
+		}
+	}
+	return s.oauthClient.Refresh(ctx, refreshToken)
 }
 
 func (a *App) getTokenQuotaResetCredits(w http.ResponseWriter, r *http.Request) {

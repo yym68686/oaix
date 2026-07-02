@@ -23,13 +23,14 @@ func (fn ValidatorFunc) Validate(ctx context.Context, item store.ImportItem) (Va
 }
 
 type ValidatedItem struct {
-	AccessToken  string
-	RefreshToken string
-	IDToken      string
-	AccountID    string
-	Email        string
-	PlanType     string
-	Action       string
+	AccessToken   string
+	RefreshToken  string
+	IDToken       string
+	AccountID     string
+	Email         string
+	PlanType      string
+	OAuthClientID string
+	Action        string
 }
 
 type Worker struct {
@@ -91,6 +92,9 @@ func (w *Worker) ValidateBatch(ctx context.Context, items []store.ImportItem) []
 					"account_id":    validated.AccountID,
 					"email":         validated.Email,
 					"plan_type":     validated.PlanType,
+				}
+				if validated.OAuthClientID != "" {
+					validatedPayload["client_id"] = validated.OAuthClientID
 				}
 				copyImportControlFields(item.Payload, validatedPayload)
 				updates[index] = store.ImportItemUpdate{
@@ -199,6 +203,9 @@ func flattenNestedCredentialsPayload(payload map[string]any) map[string]any {
 	copyStringPayloadField(flattened, credentials, "organization_id", "organization_id")
 	copyStringPayloadField(flattened, credentials, "email", "email")
 	copyStringPayloadField(flattened, credentials, "id_token", "id_token")
+	copyStringPayloadField(flattened, credentials, "client_id", "client_id")
+	copyStringPayloadField(flattened, credentials, "clientId", "client_id")
+	copyStringPayloadField(flattened, credentials, "oauth_client_id", "oauth_client_id")
 	copyStringPayloadField(flattened, credentials, "plan_type", "plan_type")
 	copyStringPayloadField(flattened, credentials, "type", "type")
 	return flattened
@@ -231,17 +238,19 @@ func (v OAuthRefreshValidator) Validate(ctx context.Context, item store.ImportIt
 	if refreshToken == "" {
 		return ValidatedItem{}, fmt.Errorf("import item %d does not contain a refresh token", item.ID)
 	}
-	result, err := v.Client.Refresh(ctx, refreshToken)
+	clientID := oauthClientIDFromPayload(item.Payload)
+	result, err := refreshOAuthItem(ctx, v.Client, clientID, refreshToken)
 	if err != nil {
 		return ValidatedItem{}, err
 	}
 	return ValidatedItem{
-		AccessToken:  result.AccessToken,
-		RefreshToken: firstNonEmpty(result.RefreshToken, refreshToken),
-		AccountID:    result.AccountID,
-		Email:        result.Email,
-		PlanType:     result.PlanType,
-		Action:       "oauth_refresh",
+		AccessToken:   result.AccessToken,
+		RefreshToken:  firstNonEmpty(result.RefreshToken, refreshToken),
+		AccountID:     result.AccountID,
+		Email:         result.Email,
+		PlanType:      result.PlanType,
+		OAuthClientID: clientID,
+		Action:        "oauth_refresh",
 	}, nil
 }
 
@@ -258,11 +267,31 @@ func copyImportControlFields(src map[string]any, dst map[string]any) {
 	if len(src) == 0 || dst == nil {
 		return
 	}
-	for _, key := range []string{"_share_enabled", "_share_status", "share_enabled", "shareEnabled", "share_status", "shareStatus"} {
+	for _, key := range []string{"_share_enabled", "_share_status", "share_enabled", "shareEnabled", "share_status", "shareStatus", "client_id", "clientId", "oauth_client_id"} {
 		if value, ok := src[key]; ok {
 			dst[key] = value
 		}
 	}
+}
+
+func refreshOAuthItem(ctx context.Context, client oauth.Client, clientID string, refreshToken string) (oauth.RefreshResult, error) {
+	if clientID != "" {
+		if refresher, ok := client.(oauth.ClientIDRefresher); ok {
+			return refresher.RefreshWithClientID(ctx, refreshToken, clientID)
+		}
+	}
+	return client.Refresh(ctx, refreshToken)
+}
+
+func oauthClientIDFromPayload(payload map[string]any) string {
+	return firstNonEmpty(payloadString(payload, "client_id"), payloadString(payload, "clientId"), payloadString(payload, "oauth_client_id"))
+}
+
+func payloadString(payload map[string]any, key string) string {
+	if value, ok := payload[key].(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
 }
 
 func firstNonEmpty(values ...string) string {

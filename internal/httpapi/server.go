@@ -553,7 +553,7 @@ func (a *App) prepareImportPayloads(ctx context.Context, payloads []map[string]a
 			}
 		}
 		if refreshToken != "" && accessToken == "" {
-			refreshed, err := client.Refresh(ctx, refreshToken)
+			refreshed, err := refreshOAuthPayload(ctx, client, normalized, refreshToken)
 			if err != nil {
 				result.Failed++
 				result.Items = append(result.Items, store.ImportResultItem{
@@ -588,6 +588,14 @@ func (a *App) prepareImportPayloads(ctx context.Context, payloads []map[string]a
 		out = append(out, normalized)
 	}
 	return out, result
+}
+
+func refreshOAuthPayload(ctx context.Context, client *oauth.HTTPClient, payload map[string]any, refreshToken string) (oauth.RefreshResult, error) {
+	clientID := stringFromImportPayload(payload, "client_id", "clientId", "oauth_client_id")
+	if clientID != "" {
+		return client.RefreshWithClientID(ctx, refreshToken, clientID)
+	}
+	return client.Refresh(ctx, refreshToken)
 }
 
 func mergeImportResults(left store.ImportResult, right store.ImportResult) store.ImportResult {
@@ -1328,6 +1336,7 @@ func sub2APIAccountImportPayload(account map[string]any) (map[string]any, bool) 
 	copyStringField(payload, credentials, "organization_id", "organization_id")
 	copyStringField(payload, credentials, "email", "email")
 	copyStringField(payload, credentials, "id_token", "id_token")
+	copyStringField(payload, credentials, "client_id", "client_id")
 	copyStringField(payload, credentials, "plan_type", "plan_type")
 	copyStringField(payload, credentials, "type", "type")
 	copyStringField(payload, account, "platform", "platform")

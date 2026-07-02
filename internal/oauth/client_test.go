@@ -86,6 +86,32 @@ func TestHTTPClientRefreshRetries(t *testing.T) {
 	}
 }
 
+func TestHTTPClientRefreshWithClientIDOverridesDefault(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm: %v", err)
+		}
+		if r.Form.Get("client_id") != "payload-client" {
+			t.Fatalf("client_id was not overridden: %v", r.Form)
+		}
+		if r.Form.Get("refresh_token") != "rt" {
+			t.Fatalf("unexpected refresh token: %v", r.Form)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at","refresh_token":"rt2","expires_in":3600}`))
+	}))
+	defer server.Close()
+	client := NewHTTPClient(server.URL)
+	client.ClientID = "default-client"
+	result, err := client.RefreshWithClientID(context.Background(), "rt", "payload-client")
+	if err != nil {
+		t.Fatalf("RefreshWithClientID returned error: %v", err)
+	}
+	if result.AccessToken != "at" || result.RefreshToken != "rt2" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
 func TestHTTPClientExchangeAuthorizationCode(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {

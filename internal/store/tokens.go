@@ -987,6 +987,28 @@ func (s *Store) GetTokenScoped(ctx context.Context, scope ResourceScope, tokenID
 	return &token, nil
 }
 
+func (s *Store) TokenOAuthClientID(ctx context.Context, tokenID int64) (string, error) {
+	return s.TokenOAuthClientIDScoped(ctx, AllResources(), tokenID)
+}
+
+func (s *Store) TokenOAuthClientIDScoped(ctx context.Context, scope ResourceScope, tokenID int64) (string, error) {
+	args := []any{tokenID}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	var value sql.NullString
+	err := s.pool.QueryRow(ctx, `
+		select coalesce(raw_payload->>'client_id', raw_payload->>'clientId', raw_payload->>'oauth_client_id', '')
+		from codex_tokens
+		where id = $1 and merged_into_token_id is null
+		  and `+ownerWhere, args...).Scan(&value)
+	if err != nil {
+		return "", err
+	}
+	if value.Valid {
+		return strings.TrimSpace(value.String), nil
+	}
+	return "", nil
+}
+
 func (s *Store) UpdateTokenRemark(ctx context.Context, tokenID int64, remark string) (*Token, error) {
 	return s.UpdateTokenRemarkScoped(ctx, AllResources(), tokenID, remark)
 }

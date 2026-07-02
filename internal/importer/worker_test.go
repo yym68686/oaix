@@ -20,6 +20,19 @@ func (fakeRefreshClient) Refresh(ctx context.Context, refreshToken string) (oaut
 	}, nil
 }
 
+type fakeRefreshClientWithClientID struct {
+	clientID string
+}
+
+func (c *fakeRefreshClientWithClientID) Refresh(ctx context.Context, refreshToken string) (oauth.RefreshResult, error) {
+	return oauth.RefreshResult{AccessToken: "default-" + refreshToken, RefreshToken: "rt-default"}, nil
+}
+
+func (c *fakeRefreshClientWithClientID) RefreshWithClientID(ctx context.Context, refreshToken string, clientID string) (oauth.RefreshResult, error) {
+	c.clientID = clientID
+	return oauth.RefreshResult{AccessToken: "client-" + refreshToken, RefreshToken: "rt-client"}, nil
+}
+
 func TestJobAndItemTransitions(t *testing.T) {
 	if !CanTransitionJob(JobQueued, JobRunning) || CanTransitionJob(JobCompleted, JobRunning) {
 		t.Fatal("unexpected job transition result")
@@ -77,10 +90,11 @@ func TestWorkerValidateBatchRefreshTokens(t *testing.T) {
 }
 
 func TestWorkerValidateBatchNestedCredentialsRefreshTokens(t *testing.T) {
+	refreshClient := &fakeRefreshClientWithClientID{}
 	worker := &Worker{
 		MaxConcurrency: 2,
 		Validator: TokenPayloadValidator{
-			Refresh: OAuthRefreshValidator{Client: fakeRefreshClient{}},
+			Refresh: OAuthRefreshValidator{Client: refreshClient},
 		},
 	}
 	updates := worker.ValidateBatch(context.Background(), []store.ImportItem{
@@ -94,6 +108,7 @@ func TestWorkerValidateBatchNestedCredentialsRefreshTokens(t *testing.T) {
 					"access_token":       "stale-access-token",
 					"refresh_token":      "rt-nested",
 					"chatgpt_account_id": "acct-input",
+					"client_id":          "payload-client",
 					"email":              "nested@example.com",
 				},
 			},
@@ -108,8 +123,12 @@ func TestWorkerValidateBatchNestedCredentialsRefreshTokens(t *testing.T) {
 	if updates[0].Action != "oauth_refresh" {
 		t.Fatalf("nested credentials should prefer refresh token, got %+v", updates[0])
 	}
-	if updates[0].ValidatedPayload["access_token"] != "at-rt-nested" ||
-		updates[0].ValidatedPayload["refresh_token"] != "rt-next" {
+	if refreshClient.clientID != "payload-client" {
+		t.Fatalf("nested client_id was not used: %q", refreshClient.clientID)
+	}
+	if updates[0].ValidatedPayload["access_token"] != "client-rt-nested" ||
+		updates[0].ValidatedPayload["refresh_token"] != "rt-client" ||
+		updates[0].ValidatedPayload["client_id"] != "payload-client" {
 		t.Fatalf("nested credentials were not refreshed: %+v", updates[0].ValidatedPayload)
 	}
 }

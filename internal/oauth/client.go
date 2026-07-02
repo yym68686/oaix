@@ -43,6 +43,10 @@ type Client interface {
 	Refresh(ctx context.Context, refreshToken string) (RefreshResult, error)
 }
 
+type ClientIDRefresher interface {
+	RefreshWithClientID(ctx context.Context, refreshToken string, clientID string) (RefreshResult, error)
+}
+
 type HTTPClient struct {
 	TokenURL   string
 	ClientID   string
@@ -79,6 +83,14 @@ func NewHTTPClient(tokenURL string) *HTTPClient {
 }
 
 func (c *HTTPClient) Refresh(ctx context.Context, refreshToken string) (RefreshResult, error) {
+	return c.refresh(ctx, refreshToken, c.ClientID)
+}
+
+func (c *HTTPClient) RefreshWithClientID(ctx context.Context, refreshToken string, clientID string) (RefreshResult, error) {
+	return c.refresh(ctx, refreshToken, strings.TrimSpace(clientID))
+}
+
+func (c *HTTPClient) refresh(ctx context.Context, refreshToken string, clientID string) (RefreshResult, error) {
 	if c == nil || c.TokenURL == "" {
 		return RefreshResult{}, errors.New("oauth token url is not configured")
 	}
@@ -92,7 +104,7 @@ func (c *HTTPClient) Refresh(ctx context.Context, refreshToken string) (RefreshR
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		atomic.AddInt64(&c.metrics.RefreshAttempts, 1)
-		result, status, err := c.refreshOnce(ctx, refreshToken)
+		result, status, err := c.refreshOnce(ctx, refreshToken, clientID)
 		if err == nil {
 			atomic.AddInt64(&c.metrics.RefreshSuccess, 1)
 			return result, nil
@@ -168,10 +180,10 @@ func (c *HTTPClient) ExchangeAuthorizationCode(ctx context.Context, request Auth
 	return ParseRefreshResponse(body)
 }
 
-func (c *HTTPClient) refreshOnce(ctx context.Context, refreshToken string) (RefreshResult, int, error) {
+func (c *HTTPClient) refreshOnce(ctx context.Context, refreshToken string, clientID string) (RefreshResult, int, error) {
 	form := url.Values{}
-	if c.ClientID != "" {
-		form.Set("client_id", c.ClientID)
+	if clientID != "" {
+		form.Set("client_id", clientID)
 	}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)

@@ -152,6 +152,7 @@ func TestParseImportPayloadExpandsNestedCredentialTokenItems(t *testing.T) {
 					"refresh_token":      "rt-nested",
 					"chatgpt_account_id": "acct-nested",
 					"email":              "nested@example.com",
+					"client_id":          "payload-client",
 					"plan_type":          "plus",
 				},
 			},
@@ -170,7 +171,7 @@ func TestParseImportPayloadExpandsNestedCredentialTokenItems(t *testing.T) {
 	if _, ok := payload["credentials"]; ok {
 		t.Fatalf("nested credentials leaked into normalized payload: %#v", payload)
 	}
-	if payload["chatgpt_account_id"] != "acct-nested" || payload["email"] != "nested@example.com" || payload["plan_type"] != "plus" {
+	if payload["chatgpt_account_id"] != "acct-nested" || payload["email"] != "nested@example.com" || payload["client_id"] != "payload-client" || payload["plan_type"] != "plus" {
 		t.Fatalf("nested metadata not preserved: %#v", payload)
 	}
 }
@@ -219,6 +220,40 @@ func TestPrepareImportPayloadsRefreshesRefreshTokens(t *testing.T) {
 	}
 	if payloads[0]["account_id"] != "acct-refresh" || payloads[0]["email"] != "acct@example.com" {
 		t.Fatalf("identity metadata = %#v", payloads[0])
+	}
+}
+
+func TestPrepareImportPayloadsUsesPayloadOAuthClientID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("client_id") != "payload-client" || r.Form.Get("refresh_token") != "rt-original" {
+			t.Fatalf("unexpected form: %v", r.Form)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "eyJhbGciOi.fixture.signature",
+			"refresh_token": "rt-next",
+		})
+	}))
+	defer server.Close()
+
+	app := NewApp(config.Config{
+		Upstream: config.UpstreamConfig{
+			OAuthTokenURL: server.URL,
+			OAuthClientID: "default-client",
+			OAuthScope:    "openid profile email",
+		},
+	}, nil, nil, nil, nil, nil)
+	payloads, result := app.prepareImportPayloads(context.Background(), []map[string]any{
+		{"refresh_token": "rt-original", "client_id": "payload-client"},
+	})
+	if result.Failed != 0 || len(payloads) != 1 {
+		t.Fatalf("preflight result=%+v payloads=%#v", result, payloads)
+	}
+	if payloads[0]["client_id"] != "payload-client" || payloads[0]["refresh_token"] != "rt-next" {
+		t.Fatalf("payload metadata not preserved: %#v", payloads[0])
 	}
 }
 
