@@ -223,6 +223,11 @@ func (h *multiUserHarness) createToken(t *testing.T, ownerID int64, label string
 
 func (h *multiUserHarness) request(t *testing.T, method string, path string, apiKey string, body string) *http.Response {
 	t.Helper()
+	return h.requestWithHeaders(t, method, path, apiKey, body, nil)
+}
+
+func (h *multiUserHarness) requestWithHeaders(t *testing.T, method string, path string, apiKey string, body string, headers map[string]string) *http.Response {
+	t.Helper()
 	req, err := http.NewRequest(method, h.server.URL+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -232,6 +237,9 @@ func (h *multiUserHarness) request(t *testing.T, method string, path string, api
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -302,6 +310,105 @@ func TestMultiUserAPIIsolationWithDatabase(t *testing.T) {
 	overridePayload := expectStatus(t, h.request(t, http.MethodGet, "/api/requests?include_total=true&user_id="+strconv.FormatInt(userB.ID, 10), keyA.PlaintextKey, ""), http.StatusOK)
 	if items, _ := overridePayload["items"].([]any); len(items) != 0 {
 		t.Fatalf("user A bypassed owner scope via user_id query: %v", items)
+	}
+}
+
+func TestUserImportJobSharingOptionsWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	user, key := h.createUser(t, "import-share")
+	body := `{"share_enabled":true,"share_status":"active","tokens":[{"access_token":"access-import-share-` + strconv.FormatInt(time.Now().UnixNano(), 10) + `","refresh_token":"refresh-import-share-` + strconv.FormatInt(time.Now().UnixNano(), 10) + `","email":"share@example.test"}]}`
+	payload := expectStatus(t, h.request(t, http.MethodPost, "/api/import/jobs", key.PlaintextKey, body), http.StatusAccepted)
+	job := payload["job"].(map[string]any)
+	jobID := int64(job["id"].(float64))
+
+	items, err := h.db.ClaimImportItems(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].JobID != jobID {
+		t.Fatalf("claimed items = %#v, jobID=%d", items, jobID)
+	}
+	if items[0].Payload["_share_enabled"] != true || items[0].Payload["_share_status"] != "active" {
+		t.Fatalf("share options were not stamped into import item payload: %#v", items[0].Payload)
+	}
+	result, err := h.db.PublishImportPayloads(context.Background(), jobID, []map[string]any{items[0].Payload}, "test_import_share")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Tokens) != 1 {
+		t.Fatalf("published tokens = %d", len(result.Tokens))
+	}
+	token, err := h.db.GetToken(context.Background(), result.Tokens[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.OwnerUserID != user.ID || !token.ShareEnabled || token.ShareStatus != "active" {
+		t.Fatalf("imported token sharing = owner %d enabled %v status %q", token.OwnerUserID, token.ShareEnabled, token.ShareStatus)
+	}
+
+	privateBody := `{"share_enabled":false,"tokens":[{"access_token":"access-import-private-` + strconv.FormatInt(time.Now().UnixNano(), 10) + `","refresh_token":"refresh-import-private-` + strconv.FormatInt(time.Now().UnixNano(), 10) + `"}]}`
+	privatePayload := expectStatus(t, h.request(t, http.MethodPost, "/api/import/jobs", key.PlaintextKey, privateBody), http.StatusAccepted)
+	privateJob := privatePayload["job"].(map[string]any)
+	privateJobID := int64(privateJob["id"].(float64))
+	privateItems, err := h.db.ClaimImportItems(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(privateItems) != 1 || privateItems[0].JobID != privateJobID {
+		t.Fatalf("claimed private items = %#v, jobID=%d", privateItems, privateJobID)
+	}
+	privateResult, err := h.db.PublishImportPayloads(context.Background(), privateJobID, []map[string]any{privateItems[0].Payload}, "test_import_private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateToken, err := h.db.GetToken(context.Background(), privateResult.Tokens[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if privateToken.ShareEnabled || privateToken.ShareStatus != "private" {
+		t.Fatalf("private import token sharing = enabled %v status %q", privateToken.ShareEnabled, privateToken.ShareStatus)
+	}
+}
+
+func TestBulkTokenSharingScopeWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	userA, keyA := h.createUser(t, "bulk-share-a")
+	userB, _ := h.createUser(t, "bulk-share-b")
+	tokenA := h.createToken(t, userA.ID, "bulk-share-a")
+	tokenB := h.createToken(t, userB.ID, "bulk-share-b")
+
+	expectStatus(t, h.request(t, http.MethodPatch, "/api/tokens/sharing", keyA.PlaintextKey, fmt.Sprintf(`{"token_ids":[%d,%d],"share_enabled":true}`, tokenA.ID, tokenB.ID)), http.StatusOK)
+	reloadedA, err := h.db.GetToken(context.Background(), tokenA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloadedB, err := h.db.GetToken(context.Background(), tokenB.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloadedA.ShareEnabled || reloadedA.ShareStatus != "active" {
+		t.Fatalf("owner token was not shared: %#v", reloadedA)
+	}
+	if reloadedB.ShareEnabled {
+		t.Fatalf("other owner token was modified by user-scoped bulk sharing: %#v", reloadedB)
+	}
+
+	expectStatus(t, h.requestWithHeaders(t, http.MethodPatch, "/api/tokens/sharing", "service-test-key", `{"all":true,"share_enabled":true}`, map[string]string{
+		"X-OAIX-Act-As-User": strconv.FormatInt(userB.ID, 10),
+	}), http.StatusOK)
+	reloadedB, err = h.db.GetToken(context.Background(), tokenB.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloadedB.ShareEnabled || reloadedB.ShareStatus != "active" {
+		t.Fatalf("service act-as did not update target owner token: %#v", reloadedB)
+	}
+	reloadedA, err = h.db.GetToken(context.Background(), tokenA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloadedA.ShareEnabled {
+		t.Fatalf("service act-as changed non-target owner token: %#v", reloadedA)
 	}
 }
 

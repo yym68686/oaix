@@ -641,6 +641,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 		if _, ok := payload["source"]; !ok && accessToken != "" {
 			payload["source"] = "access_token_import"
 		}
+		shareEnabled, shareStatus, shareExplicit := importSharingFromPayload(payload)
 
 		existingID, err := findExistingTokenForImport(ctx, tx, ownerUserID, refreshToken, previousRefreshToken, accountID, email)
 		if err != nil {
@@ -662,13 +663,18 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 					    last_error = $11,
 					    refresh_token = coalesce(nullif($12, ''), refresh_token),
 					    last_refresh = coalesce($13, last_refresh),
+					    share_enabled = case when $14 then $15 else share_enabled end,
+					    share_status = case when $14 then $16 else share_status end,
+					    share_disabled_reason = case when $14 and $15 then null when $14 and not $15 then null else share_disabled_reason end,
+					    share_enabled_at = case when $14 and $15 then coalesce(share_enabled_at, now()) else share_enabled_at end,
+					    share_disabled_at = case when $14 and $15 then null when $14 and not $15 then now() else share_disabled_at end,
 					    updated_at = now()
 					where id = $1
 					returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 					          is_active, cooldown_until, disabled_at,
 					          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 					          last_used_at, last_error, created_at, updated_at
-				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(payload), isActive, lastError, refreshToken, lastRefresh)
+				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(payload), isActive, lastError, refreshToken, lastRefresh, shareExplicit, shareEnabled, shareStatus)
 			token, scanErr := scanTokenWithSharing(row)
 			if scanErr != nil {
 				return result, scanErr
@@ -692,14 +698,16 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 		row := tx.QueryRow(ctx, `
 				insert into codex_tokens (
 					owner_user_id, email, account_id, id_token, access_token, refresh_token, raw_payload, plan_type, source_file,
-					type, is_active, disabled_at, last_error, last_refresh, created_at, updated_at
+					type, is_active, disabled_at, last_error, last_refresh, share_enabled, share_status,
+					share_enabled_at, share_disabled_at, created_at, updated_at
 				)
-				values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, case when $11 then null else now() end, $12, $13, now(), now())
+				values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, case when $11 then null else now() end,
+				        $12, $13, $14, $15, case when $14 then now() else null end, case when $16 and not $14 then now() else null end, now(), now())
 				returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 				          is_active, cooldown_until, disabled_at,
 				          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 				          last_used_at, last_error, created_at, updated_at
-			`, ownerUserID, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh)
+			`, ownerUserID, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh, shareEnabled, shareStatus, shareExplicit)
 		token, scanErr := scanTokenWithSharing(row)
 		if scanErr != nil {
 			return result, scanErr
@@ -1001,6 +1009,34 @@ func (s *Store) SetTokenSharingScoped(ctx context.Context, scope ResourceScope, 
 		return nil, err
 	}
 	return &token, nil
+}
+
+func (s *Store) SetTokensSharingScoped(ctx context.Context, scope ResourceScope, tokenIDs []int64, all bool, enabled bool, status string, reason string) (int64, error) {
+	ids := postgresIntIDs(tokenIDs)
+	if !all && len(ids) == 0 {
+		return 0, nil
+	}
+	args := []any{enabled, normalizeShareStatus(enabled, status), truncate(reason, 1000)}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	idWhere := ""
+	if !all {
+		args = append(args, ids)
+		idWhere = fmt.Sprintf(" and id = any($%d::integer[])", len(args))
+	}
+	tag, err := s.pool.Exec(ctx, `
+		update codex_tokens
+		set share_enabled = $1,
+		    share_status = $2,
+		    share_disabled_reason = case when $1 then null else nullif($3, '') end,
+		    share_enabled_at = case when $1 then coalesce(share_enabled_at, now()) else share_enabled_at end,
+		    share_disabled_at = case when $1 then null else now() end,
+		    updated_at = now()
+		where merged_into_token_id is null
+		  and `+ownerWhere+idWhere, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (s *Store) UpdateTokenPlanTypes(ctx context.Context, planByTokenID map[int64]string) error {
@@ -1470,6 +1506,47 @@ func payloadBool(value any, fallback bool) bool {
 		return typed != 0
 	}
 	return fallback
+}
+
+func importSharingFromPayload(payload map[string]any) (bool, string, bool) {
+	enabled, ok := payloadBoolExplicit(payload["_share_enabled"])
+	if !ok {
+		enabled, ok = payloadBoolExplicit(payload["share_enabled"])
+	}
+	if !ok {
+		enabled, ok = payloadBoolExplicit(payload["shareEnabled"])
+	}
+	status := stringFromPayload(payload, "_share_status", "share_status", "shareStatus")
+	if !ok {
+		return false, normalizeShareStatus(false, ""), false
+	}
+	return enabled, normalizeShareStatus(enabled, status), true
+}
+
+func payloadBoolExplicit(value any) (bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "1", "true", "yes", "on", "active", "enabled":
+			return true, true
+		case "0", "false", "no", "off", "inactive", "disabled", "private":
+			return false, true
+		}
+	case float64:
+		return typed != 0, true
+	case int:
+		return typed != 0, true
+	case int64:
+		return typed != 0, true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err == nil {
+			return parsed != 0, true
+		}
+	}
+	return false, false
 }
 
 func looksLikeAccessToken(value string) bool {

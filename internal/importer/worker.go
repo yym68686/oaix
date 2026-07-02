@@ -84,19 +84,21 @@ func (w *Worker) ValidateBatch(ctx context.Context, items []store.ImportItem) []
 					continue
 				}
 				atomic.AddInt64(&w.metrics.Validated, 1)
+				validatedPayload := map[string]any{
+					"access_token":  validated.AccessToken,
+					"refresh_token": validated.RefreshToken,
+					"id_token":      validated.IDToken,
+					"account_id":    validated.AccountID,
+					"email":         validated.Email,
+					"plan_type":     validated.PlanType,
+				}
+				copyImportControlFields(item.Payload, validatedPayload)
 				updates[index] = store.ImportItemUpdate{
-					ID:     item.ID,
-					Status: string(ItemValidated),
-					ValidatedPayload: map[string]any{
-						"access_token":  validated.AccessToken,
-						"refresh_token": validated.RefreshToken,
-						"id_token":      validated.IDToken,
-						"account_id":    validated.AccountID,
-						"email":         validated.Email,
-						"plan_type":     validated.PlanType,
-					},
-					Action:       validated.Action,
-					ValidationMS: &elapsed,
+					ID:               item.ID,
+					Status:           string(ItemValidated),
+					ValidatedPayload: validatedPayload,
+					Action:           validated.Action,
+					ValidationMS:     &elapsed,
 				}
 			}
 		}()
@@ -207,6 +209,17 @@ func hasPayloadString(payload map[string]any, keys ...string) bool {
 		}
 	}
 	return false
+}
+
+func copyImportControlFields(src map[string]any, dst map[string]any) {
+	if len(src) == 0 || dst == nil {
+		return
+	}
+	for _, key := range []string{"_share_enabled", "_share_status", "share_enabled", "shareEnabled", "share_status", "shareStatus"} {
+		if value, ok := src[key]; ok {
+			dst[key] = value
+		}
+	}
 }
 
 func firstNonEmpty(values ...string) string {

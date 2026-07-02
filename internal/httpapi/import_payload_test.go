@@ -43,6 +43,37 @@ func TestParseImportPayloadPreservesRefreshTokenInputs(t *testing.T) {
 	}
 }
 
+func TestParseImportPayloadExtendedStampsSharingOptions(t *testing.T) {
+	payloads, queuePosition, err := parseImportPayloadExtended(map[string]any{
+		"import_queue_position": "back",
+		"share_enabled":         true,
+		"share_status":          "active",
+		"tokens": []any{
+			map[string]any{"refresh_token": "rt-shared"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queuePosition != "back" || len(payloads) != 1 {
+		t.Fatalf("queue=%q payloads=%#v", queuePosition, payloads)
+	}
+	if payloads[0]["_share_enabled"] != true || payloads[0]["_share_status"] != "active" {
+		t.Fatalf("sharing options = %#v", payloads[0])
+	}
+
+	textPayloads, _, err := parseImportPayloadExtended(map[string]any{
+		"share_enabled": false,
+		"text":          `{"tokens":[{"refresh_token":"rt-private"}]}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(textPayloads) != 1 || textPayloads[0]["_share_enabled"] != false || textPayloads[0]["_share_status"] != "private" {
+		t.Fatalf("text sharing options = %#v", textPayloads)
+	}
+}
+
 func TestParseImportTextPayloadsExpandsSub2APIDataExport(t *testing.T) {
 	payloads, err := parseImportTextPayloads(`{
 		"type": "sub2api-data",

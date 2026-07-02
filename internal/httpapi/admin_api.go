@@ -1537,16 +1537,65 @@ func (a *App) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
 
 func parseImportPayloadExtended(body any) ([]map[string]any, string, error) {
 	if record, ok := body.(map[string]any); ok {
+		shareEnabled, shareStatus, hasShare := importJobSharingFromRecord(record)
 		if text, ok := record["text"].(string); ok && strings.TrimSpace(text) != "" {
 			payloads, err := parseImportTextPayloads(text)
 			queue := "front"
 			if qp, ok := record["import_queue_position"].(string); ok && strings.TrimSpace(qp) != "" {
 				queue = normalizeImportQueuePosition(qp)
 			}
-			return payloads, queue, err
+			return stampImportPayloadSharing(payloads, shareEnabled, shareStatus, hasShare), queue, err
 		}
+		payloads, queue, err := parseImportPayload(body)
+		return stampImportPayloadSharing(payloads, shareEnabled, shareStatus, hasShare), queue, err
 	}
 	return parseImportPayload(body)
+}
+
+func importJobSharingFromRecord(record map[string]any) (bool, string, bool) {
+	enabled, ok := boolFromAny(record["share_enabled"])
+	if !ok {
+		enabled, ok = boolFromAny(record["shareEnabled"])
+	}
+	status := ""
+	for _, key := range []string{"share_status", "shareStatus"} {
+		if value, ok := record[key].(string); ok && strings.TrimSpace(value) != "" {
+			status = strings.TrimSpace(value)
+			break
+		}
+	}
+	if !ok {
+		return false, "", false
+	}
+	return enabled, normalizeImportShareStatus(enabled, status), true
+}
+
+func stampImportPayloadSharing(payloads []map[string]any, enabled bool, status string, ok bool) []map[string]any {
+	if !ok {
+		return payloads
+	}
+	for index := range payloads {
+		if payloads[index] == nil {
+			payloads[index] = map[string]any{}
+		}
+		payloads[index]["_share_enabled"] = enabled
+		payloads[index]["_share_status"] = normalizeImportShareStatus(enabled, status)
+	}
+	return payloads
+}
+
+func normalizeImportShareStatus(enabled bool, status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if enabled {
+		return "active"
+	}
+	if status == "" || status == "active" || status == "enabled" || status == "approved" {
+		return "private"
+	}
+	if len(status) > 32 {
+		return status[:32]
+	}
+	return status
 }
 
 func parseImportTextPayloads(raw string) ([]map[string]any, error) {

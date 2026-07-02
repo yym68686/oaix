@@ -31,6 +31,7 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tokens", a.requireAuth(a.listMyTokens))
 	mux.HandleFunc("GET /api/tokens/quota", a.requireAuth(a.listMyTokenQuota))
 	mux.HandleFunc("POST /api/tokens/quota-refresh", a.requireAuth(a.createMyQuotaRefreshJob))
+	mux.HandleFunc("PATCH /api/tokens/sharing", a.requireAuth(a.patchMyTokensSharing))
 	mux.HandleFunc("GET /api/tokens/{token_id}", a.requireAuth(a.getMyToken))
 	mux.HandleFunc("GET /api/tokens/{token_id}/refresh-token", a.requireAuth(a.getMyTokenRefreshToken))
 	mux.HandleFunc("GET /api/tokens/{token_id}/quota-reset-credits", a.requireAuth(a.getMyTokenQuotaResetCredits))
@@ -578,6 +579,60 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 		a.syncSub2APIAvailabilityAsync(token, "user_token_active")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"token": token})
+}
+
+func (a *App) patchMyTokensSharing(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
+	if !ok {
+		return
+	}
+	var payload struct {
+		All                 bool    `json:"all"`
+		TokenIDs            []int64 `json:"token_ids"`
+		ShareEnabled        *bool   `json:"share_enabled"`
+		ShareEnabledCamel   *bool   `json:"shareEnabled"`
+		ShareStatus         *string `json:"share_status"`
+		ShareStatusCamel    *string `json:"shareStatus"`
+		ShareDisabledReason *string `json:"share_disabled_reason"`
+	}
+	_ = decodeJSON(r, &payload)
+	shareEnabled := payload.ShareEnabled
+	if shareEnabled == nil {
+		shareEnabled = payload.ShareEnabledCamel
+	}
+	if shareEnabled == nil {
+		writeError(w, http.StatusBadRequest, errors.New("share_enabled is required"))
+		return
+	}
+	if !payload.All && len(payload.TokenIDs) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("token_ids are required when all is false"))
+		return
+	}
+	status := stringPtr(payload.ShareStatus)
+	if status == "" {
+		status = stringPtr(payload.ShareStatusCamel)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	updated, err := a.store.SetTokensSharingScoped(ctx, scope, payload.TokenIDs, payload.All, *shareEnabled, status, stringPtr(payload.ShareDisabledReason))
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	counts, err := a.store.TokenCountsScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	plans, _ := a.store.TokenPlanCountsScoped(ctx, scope, store.TokenListOptions{})
+	_ = a.store.WriteAuditLog(ctx, "user_tokens_sharing_update", "self", "token", "bulk", map[string]any{"user_id": scope.OwnerUserID, "updated": updated, "all": payload.All, "share_enabled": *shareEnabled})
+	_ = a.tokens.Refresh(ctx)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated":     updated,
+		"counts":      counts,
+		"plan_counts": plans,
+	})
 }
 
 func (a *App) deleteMyToken(w http.ResponseWriter, r *http.Request) {
