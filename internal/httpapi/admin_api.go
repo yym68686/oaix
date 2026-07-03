@@ -87,6 +87,7 @@ func (a *App) registerAdminAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/tokens/quota-refresh", a.requireAuth(a.createQuotaRefreshJob))
 	mux.HandleFunc("GET /admin/tokens/quota-refresh/{job_id}", a.requireAuth(a.getQuotaRefreshJob))
 	mux.HandleFunc("GET /admin/token-quota-history/{token_id}", a.requireAuth(a.listTokenQuotaHistory))
+	mux.HandleFunc("GET /admin/token-state-events/{token_id}", a.requireAuth(a.listTokenStateEvents))
 	mux.HandleFunc("POST /admin/tokens/{token_id}/cooldown", a.requireAuth(a.setTokenCooldown))
 	mux.HandleFunc("DELETE /admin/token-cooldown/{token_id}", a.requireAuth(a.clearTokenCooldown))
 	mux.HandleFunc("DELETE /admin/token-last-error/{token_id}", a.requireAuth(a.clearTokenLastError))
@@ -123,6 +124,7 @@ func (a *App) registerAdminAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/oauth/openai/sessions/{session_id}/exchange", a.requireAuth(a.exchangeOpenAIOAuthSession))
 
 	mux.HandleFunc("GET /admin/requests/{request_id}", a.requireAuth(a.getRequestLog))
+	mux.HandleFunc("GET /admin/requests/{request_id}/attempts", a.requireAuth(a.listRequestAttempts))
 	mux.HandleFunc("GET /admin/requests/export", a.requireAuth(a.exportRequests))
 	mux.HandleFunc("GET /admin/analytics/models", a.requireAuth(a.analytics))
 	mux.HandleFunc("GET /admin/analytics/cache", a.requireAuth(a.cacheAnalytics))
@@ -206,7 +208,8 @@ func adminOpenAPISpec() map[string]any {
 		"POST /admin/tokens/{token_id}/refresh", "GET /admin/token-refresh-history/{token_id}",
 		"POST /admin/tokens/{token_id}/merge", "POST /admin/tokens/{token_id}/unmerge",
 		"POST /admin/tokens/quota-refresh", "GET /admin/tokens/quota-refresh/{job_id}",
-		"GET /admin/token-quota-history/{token_id}", "GET /admin/costs/by-token", "GET /admin/costs/by-account",
+		"GET /admin/token-quota-history/{token_id}", "GET /admin/token-state-events/{token_id}",
+		"GET /admin/costs/by-token", "GET /admin/costs/by-account",
 		"POST /admin/import/parse", "POST /admin/import/upload", "POST /admin/import/jobs",
 		"GET /admin/import/jobs", "GET /admin/import/jobs/{job_id}", "GET /admin/import/jobs/{job_id}/items",
 		"GET /admin/import/jobs/{job_id}/tokens", "GET /admin/import/jobs/{job_id}/failed-items",
@@ -214,7 +217,7 @@ func adminOpenAPISpec() map[string]any {
 		"POST /admin/import/items/{item_id}/skip", "GET /admin/import/jobs/{job_id}/events",
 		"POST /admin/oauth/openai/sessions", "GET /admin/oauth/openai/sessions/{session_id}",
 		"DELETE /admin/oauth/openai/sessions/{session_id}", "POST /admin/oauth/openai/sessions/{session_id}/exchange",
-		"GET /admin/requests", "GET /admin/requests/{request_id}", "GET /admin/requests/export",
+		"GET /admin/requests", "GET /admin/requests/{request_id}", "GET /admin/requests/{request_id}/attempts", "GET /admin/requests/export",
 		"GET /admin/analytics/models", "GET /admin/analytics/cache", "GET /admin/analytics/errors",
 		"GET /admin/analytics/latency", "GET /admin/inflight", "GET /admin/runtime", "GET /admin/workers",
 		"GET /admin/request-log-outbox", "POST /admin/request-log-outbox/drain",
@@ -1104,6 +1107,40 @@ func (a *App) getRequestLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
+}
+
+func (a *App) listRequestAttempts(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("request_id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("request_id is required"))
+		return
+	}
+	limit := queryInt(r, "limit", 100)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	items, err := a.store.ListGatewayRequestAttempts(ctx, id, limit)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items)})
+}
+
+func (a *App) listTokenStateEvents(w http.ResponseWriter, r *http.Request) {
+	tokenID, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("token_id")), 10, 64)
+	if err != nil || tokenID <= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("invalid token_id"))
+		return
+	}
+	limit := queryInt(r, "limit", 100)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	items, err := a.store.ListTokenStateEvents(ctx, tokenID, limit)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items)})
 }
 
 func (a *App) exportRequests(w http.ResponseWriter, r *http.Request) {

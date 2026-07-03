@@ -1350,6 +1350,7 @@ type fakeProxyStore struct {
 	tokens           []store.Token
 	tokenErrorCh     chan *time.Time
 	tokenErrorEvents chan tokenErrorEvent
+	attempts         []store.GatewayRequestAttempt
 }
 
 type tokenErrorEvent struct {
@@ -1399,6 +1400,10 @@ func (s *fakeProxyStore) MarkTokenSuccess(_ context.Context, tokenID int64) erro
 }
 
 func (s *fakeProxyStore) MarkTokenError(_ context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time) error {
+	return s.MarkTokenErrorWithContext(context.Background(), tokenID, message, deactivate, cooldownUntil, store.TokenStateEventContext{})
+}
+
+func (s *fakeProxyStore) MarkTokenErrorWithContext(_ context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time, _ store.TokenStateEventContext) error {
 	s.mu.Lock()
 	for i := range s.tokens {
 		if s.tokens[i].ID == tokenID {
@@ -1427,6 +1432,14 @@ func (s *fakeProxyStore) MarkTokenError(_ context.Context, tokenID int64, messag
 		}
 	}
 	return nil
+}
+
+func (s *fakeProxyStore) InsertGatewayRequestAttempt(_ context.Context, item store.GatewayRequestAttempt) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := int64(len(s.attempts) + 1)
+	s.attempts = append(s.attempts, item)
+	return id, nil
 }
 
 func (s *fakeProxyStore) UpsertRequestLogs(context.Context, []store.RequestLog) error {

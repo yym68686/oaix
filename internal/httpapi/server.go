@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -41,20 +42,30 @@ type App struct {
 }
 
 type adminImportItem struct {
-	ID                 int64      `json:"id"`
-	JobID              int64      `json:"job_id"`
-	ItemIndex          int        `json:"item_index"`
-	Status             string     `json:"status"`
-	TokenID            *int64     `json:"token_id,omitempty"`
-	Action             *string    `json:"action,omitempty"`
-	ErrorMessage       *string    `json:"error_message,omitempty"`
-	ValidationMS       *int       `json:"validation_ms,omitempty"`
-	PublishMS          *int       `json:"publish_ms,omitempty"`
-	ValidationStarted  *time.Time `json:"validation_started_at,omitempty"`
-	ValidationFinished *time.Time `json:"validation_finished_at,omitempty"`
-	PublishedAt        *time.Time `json:"published_at,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID                         int64      `json:"id"`
+	JobID                      int64      `json:"job_id"`
+	ItemIndex                  int        `json:"item_index"`
+	Status                     string     `json:"status"`
+	TokenID                    *int64     `json:"token_id,omitempty"`
+	Action                     *string    `json:"action,omitempty"`
+	ErrorMessage               *string    `json:"error_message,omitempty"`
+	ValidationMS               *int       `json:"validation_ms,omitempty"`
+	PublishMS                  *int       `json:"publish_ms,omitempty"`
+	ValidationStarted          *time.Time `json:"validation_started_at,omitempty"`
+	ValidationFinished         *time.Time `json:"validation_finished_at,omitempty"`
+	PublishedAt                *time.Time `json:"published_at,omitempty"`
+	MatchedExistingTokenID     *int64     `json:"matched_existing_token_id,omitempty"`
+	PublishAttempted           bool       `json:"publish_attempted"`
+	PublishSkippedReason       *string    `json:"publish_skipped_reason,omitempty"`
+	Reactivated                bool       `json:"reactivated"`
+	PreviousIsActive           *bool      `json:"previous_is_active,omitempty"`
+	NextIsActive               *bool      `json:"next_is_active,omitempty"`
+	PreviousDisabledAt         *time.Time `json:"previous_disabled_at,omitempty"`
+	NextDisabledAt             *time.Time `json:"next_disabled_at,omitempty"`
+	RefreshErrorCode           *string    `json:"refresh_error_code,omitempty"`
+	RefreshErrorMessageExcerpt *string    `json:"refresh_error_message_excerpt,omitempty"`
+	CreatedAt                  time.Time  `json:"created_at"`
+	UpdatedAt                  time.Time  `json:"updated_at"`
 }
 
 func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenManager *tokens.Manager, logWriter *logs.Writer, pipeline *proxy.Pipeline) *App {
@@ -300,6 +311,7 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP oaix_upstream_active_requests Active upstream requests.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_upstream_active_requests gauge\n")
 	_, _ = fmt.Fprintf(w, "oaix_upstream_active_requests %d\n", upstreamStats.Active)
+	a.writeRouteObservabilityMetrics(w, r.Context())
 	dbStats := a.store.PoolStats()
 	_, _ = fmt.Fprintf(w, "# HELP oaix_db_pool_acquired_conns Acquired database connections.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_db_pool_acquired_conns gauge\n")
@@ -310,6 +322,69 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP oaix_db_pool_acquire_count_total Database pool acquire count.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_db_pool_acquire_count_total counter\n")
 	_, _ = fmt.Fprintf(w, "oaix_db_pool_acquire_count_total %d\n", dbStats.AcquireCount)
+}
+
+func (a *App) writeRouteObservabilityMetrics(w io.Writer, parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	since := time.Now().UTC().Add(-time.Hour)
+	if rows, err := a.store.GatewayAttemptMetrics(ctx, since); err == nil {
+		_, _ = fmt.Fprintf(w, "# HELP oaix_gateway_attempt_total Gateway token attempts in the last hour.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE oaix_gateway_attempt_total counter\n")
+		writeMetricRows(w, "oaix_gateway_attempt_total", rows)
+	} else {
+		_, _ = fmt.Fprintf(w, "# oaix_gateway_attempt_total unavailable: %s\n", prometheusLabel(err.Error()))
+	}
+	if rows, err := a.store.TokenStateMetrics(ctx, since, "disabled"); err == nil {
+		_, _ = fmt.Fprintf(w, "# HELP oaix_token_disabled_total Token disable events in the last hour.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE oaix_token_disabled_total counter\n")
+		writeMetricRows(w, "oaix_token_disabled_total", rows)
+	} else {
+		_, _ = fmt.Fprintf(w, "# oaix_token_disabled_total unavailable: %s\n", prometheusLabel(err.Error()))
+	}
+	if rows, err := a.store.TokenStateMetrics(ctx, since, "cooldown"); err == nil {
+		_, _ = fmt.Fprintf(w, "# HELP oaix_token_cooldown_total Token cooldown events in the last hour.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE oaix_token_cooldown_total counter\n")
+		writeMetricRows(w, "oaix_token_cooldown_total", rows)
+	} else {
+		_, _ = fmt.Fprintf(w, "# oaix_token_cooldown_total unavailable: %s\n", prometheusLabel(err.Error()))
+	}
+	if rows, err := a.store.NoAvailableTokenMetrics(ctx, since); err == nil {
+		_, _ = fmt.Fprintf(w, "# HELP oaix_no_available_token_total No-token gateway attempts in the last hour.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE oaix_no_available_token_total counter\n")
+		writeMetricRows(w, "oaix_no_available_token_total", rows)
+	} else {
+		_, _ = fmt.Fprintf(w, "# oaix_no_available_token_total unavailable: %s\n", prometheusLabel(err.Error()))
+	}
+	if rows, err := a.store.ImportItemMetrics(ctx, since); err == nil {
+		_, _ = fmt.Fprintf(w, "# HELP oaix_import_item_total Import items updated in the last hour.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE oaix_import_item_total counter\n")
+		writeMetricRows(w, "oaix_import_item_total", rows)
+	} else {
+		_, _ = fmt.Fprintf(w, "# oaix_import_item_total unavailable: %s\n", prometheusLabel(err.Error()))
+	}
+	if count, err := a.store.ImportReactivatedTotal(ctx, since); err == nil {
+		_, _ = fmt.Fprintf(w, "# HELP oaix_import_reactivated_total Import items that reactivated existing tokens in the last hour.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE oaix_import_reactivated_total counter\n")
+		_, _ = fmt.Fprintf(w, "oaix_import_reactivated_total %d\n", count)
+	} else {
+		_, _ = fmt.Fprintf(w, "# oaix_import_reactivated_total unavailable: %s\n", prometheusLabel(err.Error()))
+	}
+}
+
+func writeMetricRows(w io.Writer, name string, rows []store.MetricRow) {
+	for _, row := range rows {
+		labels := make([]string, 0, len(row.Labels))
+		for key, value := range row.Labels {
+			labels = append(labels, fmt.Sprintf("%s=\"%s\"", key, prometheusLabel(value)))
+		}
+		sort.Strings(labels)
+		if len(labels) == 0 {
+			_, _ = fmt.Fprintf(w, "%s %d\n", name, row.Value)
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "%s{%s} %d\n", name, strings.Join(labels, ","), row.Value)
+	}
 }
 
 func prometheusLabel(value string) string {
@@ -849,20 +924,30 @@ func sanitizeImportItems(items []store.ImportItem) []adminImportItem {
 	out := make([]adminImportItem, 0, len(items))
 	for _, item := range items {
 		out = append(out, adminImportItem{
-			ID:                 item.ID,
-			JobID:              item.JobID,
-			ItemIndex:          item.ItemIndex,
-			Status:             item.Status,
-			TokenID:            item.TokenID,
-			Action:             item.Action,
-			ErrorMessage:       item.ErrorMessage,
-			ValidationMS:       item.ValidationMS,
-			PublishMS:          item.PublishMS,
-			ValidationStarted:  item.ValidationStarted,
-			ValidationFinished: item.ValidationFinished,
-			PublishedAt:        item.PublishedAt,
-			CreatedAt:          item.CreatedAt,
-			UpdatedAt:          item.UpdatedAt,
+			ID:                         item.ID,
+			JobID:                      item.JobID,
+			ItemIndex:                  item.ItemIndex,
+			Status:                     item.Status,
+			TokenID:                    item.TokenID,
+			Action:                     item.Action,
+			ErrorMessage:               item.ErrorMessage,
+			ValidationMS:               item.ValidationMS,
+			PublishMS:                  item.PublishMS,
+			ValidationStarted:          item.ValidationStarted,
+			ValidationFinished:         item.ValidationFinished,
+			PublishedAt:                item.PublishedAt,
+			MatchedExistingTokenID:     item.MatchedExistingTokenID,
+			PublishAttempted:           item.PublishAttempted,
+			PublishSkippedReason:       item.PublishSkippedReason,
+			Reactivated:                item.Reactivated,
+			PreviousIsActive:           item.PreviousIsActive,
+			NextIsActive:               item.NextIsActive,
+			PreviousDisabledAt:         item.PreviousDisabledAt,
+			NextDisabledAt:             item.NextDisabledAt,
+			RefreshErrorCode:           item.RefreshErrorCode,
+			RefreshErrorMessageExcerpt: item.RefreshErrorMessageExcerpt,
+			CreatedAt:                  item.CreatedAt,
+			UpdatedAt:                  item.UpdatedAt,
 		})
 	}
 	return out

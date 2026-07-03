@@ -43,6 +43,8 @@ type Pipeline struct {
 type tokenStateStore interface {
 	MarkTokenSuccess(ctx context.Context, tokenID int64) error
 	MarkTokenError(ctx context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time) error
+	MarkTokenErrorWithContext(ctx context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time, eventCtx store.TokenStateEventContext) error
+	InsertGatewayRequestAttempt(ctx context.Context, item store.GatewayRequestAttempt) (int64, error)
 }
 
 type RequestIntent struct {
@@ -98,14 +100,16 @@ type StreamAttemptState struct {
 type Outcome string
 
 const (
-	OutcomeSuccess             Outcome = "success"
-	OutcomeClientCanceled      Outcome = "client_canceled"
-	OutcomeUpstream429Cooldown Outcome = "upstream_429_cooldown"
-	OutcomeUpstream401Invalid  Outcome = "upstream_401_invalid"
-	OutcomeUpstream403Invalid  Outcome = "upstream_403_invalid"
-	OutcomeUpstream5xx         Outcome = "upstream_5xx"
-	OutcomeTransportError      Outcome = "transport_error"
-	OutcomeNoToken             Outcome = "no_token"
+	OutcomeSuccess                Outcome = "success"
+	OutcomeClientCanceled         Outcome = "client_canceled"
+	OutcomeUpstream429Cooldown    Outcome = "upstream_429_cooldown"
+	OutcomeUpstream401Invalid     Outcome = "upstream_401_invalid"
+	OutcomeUpstream402Deactivated Outcome = "upstream_402_deactivated_workspace"
+	OutcomeUpstream403Invalid     Outcome = "upstream_403_invalid"
+	OutcomeUpstream4xx            Outcome = "upstream_4xx"
+	OutcomeUpstream5xx            Outcome = "upstream_5xx"
+	OutcomeTransportError         Outcome = "transport_error"
+	OutcomeNoToken                Outcome = "no_token"
 )
 
 func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, client *transport.Client, writer *logs.Writer, stateStore tokenStateStore, affinityStore affinity.Store) *Pipeline {
@@ -240,6 +244,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		if err != nil {
 			finalStatus = http.StatusServiceUnavailable
 			lastErr = err
+			p.recordNoTokenGatewayAttempt(requestID, intent, attempt, selectStarted.UTC(), err)
 			break
 		}
 		selectedTokenID = ptrInt64(claim.TokenID())
@@ -314,6 +319,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		finalStatus = status
 		if committed {
 			success := err == nil && status >= 200 && status < 400
+			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, classify(status, err), retry, false, nil)
 			var msg *string
 			if err != nil {
 				text := err.Error()
@@ -327,6 +333,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			return
 		}
 		if err == nil && status >= 200 && status < 400 {
+			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, OutcomeSuccess, retry, false, nil)
 			p.commitSuccess(claim.TokenID())
 			p.recordPromptCacheSuccess(promptCacheContext, claim.TokenID(), lastResponseID)
 			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, selectedTokenOwnerID, accountID, nil, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
@@ -335,6 +342,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		lastErr = err
 		action := classify(status, err)
 		if action == OutcomeClientCanceled {
+			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, retry, false, nil)
 			message := "client canceled"
 			if err != nil {
 				message = err.Error()
@@ -345,7 +353,8 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		if isDeactivatedWorkspaceFailure(status, result.ErrorBody, err) {
 			message := "terminal upstream status 402: deactivated_workspace"
 			lastErr = errors.New(message)
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil)
+			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream402Deactivated, retry, true, nil)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream402Deactivated, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < p.cfg.Upstream.MaxRetries {
@@ -353,13 +362,20 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			}
 			break
 		}
+		var (
+			deactivate     bool
+			cooldownUntil  *time.Time
+			commitMessage  string
+			commitRequired bool
+		)
 		if action == OutcomeUpstream401Invalid || action == OutcomeUpstream403Invalid {
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, fmt.Sprintf("terminal upstream status %d", status), true, nil)
-			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+			deactivate = true
+			commitRequired = true
+			commitMessage = fmt.Sprintf("terminal upstream status %d", status)
 		} else if action == OutcomeUpstream429Cooldown {
 			now := time.Now().UTC()
-			cooldownUntil := cooldown.UsageLimitUntil(status, result.ErrorBody, now, p.cfg.TokenPool.DefaultCooldown)
-			message := "upstream 429 cooldown"
+			cooldownUntil = cooldown.UsageLimitUntil(status, result.ErrorBody, now, p.cfg.TokenPool.DefaultCooldown)
+			commitMessage = "upstream 429 cooldown"
 			if cooldownUntil == nil {
 				fallback := p.cfg.TokenPool.DefaultCooldown
 				if fallback <= 0 {
@@ -368,12 +384,21 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				until := now.Add(fallback)
 				cooldownUntil = &until
 			} else {
-				message = "upstream usage limit cooldown"
+				commitMessage = "upstream usage limit cooldown"
 			}
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, false, cooldownUntil)
+			commitRequired = true
 		} else if retry && (action == OutcomeUpstream5xx || action == OutcomeTransportError) {
 			cooldown := time.Now().UTC().Add(5 * time.Second)
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, fmt.Sprintf("retryable upstream failure: %v", err), false, &cooldown)
+			cooldownUntil = &cooldown
+			commitMessage = fmt.Sprintf("retryable upstream failure: %v", err)
+			commitRequired = true
+		}
+		attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, retry, deactivate, cooldownUntil)
+		if commitRequired {
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, commitMessage, deactivate, cooldownUntil, p.tokenStateEventContext(requestID, intent, status, action, attemptID))
+			if deactivate {
+				p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+			}
 		}
 		excluded[claim.TokenID()] = struct{}{}
 		if !retry || attempt == p.cfg.Upstream.MaxRetries {
@@ -574,6 +599,9 @@ func classify(status int, err error) Outcome {
 	if status >= 500 {
 		return OutcomeUpstream5xx
 	}
+	if status >= 400 {
+		return OutcomeUpstream4xx
+	}
 	if err != nil {
 		return OutcomeTransportError
 	}
@@ -605,12 +633,119 @@ func (p *Pipeline) commitSuccess(tokenID int64) {
 	}()
 }
 
-func (p *Pipeline) commitTokenError(tokenID int64, tokenOwnerUserID *int64, message string, deactivate bool, cooldownUntil *time.Time) {
+func (p *Pipeline) recordNoTokenGatewayAttempt(requestID string, intent RequestIntent, attemptIndex int, started time.Time, err error) *int64 {
+	finished := time.Now().UTC()
+	duration := int(finished.Sub(started).Milliseconds())
+	item := store.GatewayRequestAttempt{
+		RequestID:           requestID,
+		AttemptIndex:        attemptIndex,
+		OwnerUserID:         intent.OwnerUserID,
+		SelectionMode:       nullable(strings.TrimSpace(intent.SelectionMode)),
+		CallerOwnerUserID:   ptrPositiveInt64(intent.CallerOwnerUserID),
+		ExcludeOwnerUserID:  ptrPositiveInt64(intent.ExcludeOwnerUserID),
+		Endpoint:            intent.Endpoint,
+		Model:               nullable(intent.Model),
+		StartedAt:           started,
+		FinishedAt:          &finished,
+		DurationMs:          &duration,
+		StatusCode:          ptrInt(http.StatusServiceUnavailable),
+		Success:             boolPtr(false),
+		Retry:               boolPtr(false),
+		Outcome:             string(OutcomeNoToken),
+		ErrorCode:           nullable(string(OutcomeNoToken)),
+		ErrorMessageExcerpt: errorExcerpt(err),
+	}
+	return p.insertGatewayAttempt(item)
+}
+
+func (p *Pipeline) recordGatewayAttempt(ctx context.Context, attempt Attempt, result AttemptResult, err error, outcome Outcome, retry bool, deactivated bool, cooldownUntil *time.Time) *int64 {
+	finished := time.Now().UTC()
+	started := attempt.StartedAt
+	if started.IsZero() {
+		started = finished
+	}
+	duration := int(finished.Sub(started).Milliseconds())
+	success := err == nil && result.Status >= 200 && result.Status < 400
+	item := store.GatewayRequestAttempt{
+		RequestID:           attempt.RequestID,
+		AttemptIndex:        attempt.Index,
+		OwnerUserID:         attempt.Intent.OwnerUserID,
+		SelectionMode:       nullable(strings.TrimSpace(attempt.Intent.SelectionMode)),
+		CallerOwnerUserID:   ptrPositiveInt64(attempt.Intent.CallerOwnerUserID),
+		ExcludeOwnerUserID:  ptrPositiveInt64(attempt.Intent.ExcludeOwnerUserID),
+		Endpoint:            attempt.Intent.Endpoint,
+		Model:               nullable(attempt.Intent.Model),
+		StartedAt:           started,
+		FinishedAt:          &finished,
+		DurationMs:          &duration,
+		StatusCode:          ptrInt(result.Status),
+		Success:             &success,
+		Retry:               &retry,
+		Outcome:             string(outcome),
+		Deactivated:         deactivated,
+		CooldownUntil:       cooldownUntil,
+		ErrorCode:           attemptErrorCode(result.Status, result.ErrorBody, err, outcome),
+		ErrorMessageExcerpt: errorExcerpt(err),
+		ErrorBodyHash:       errorBodyHash(result.ErrorBody),
+	}
+	if attempt.Claim != nil {
+		tokenID := attempt.Claim.TokenID()
+		item.TokenID = &tokenID
+		telemetry := attempt.Claim.Telemetry
+		if telemetry.OwnerUserID > 0 {
+			item.TokenOwnerUserID = &telemetry.OwnerUserID
+		}
+		item.ClaimID = int64PtrFromUint64(telemetry.ClaimID)
+		item.CandidateCount = ptrInt(telemetry.CandidateCount)
+		item.ReadyTokens = ptrInt(telemetry.SnapshotReadyTokens)
+		if telemetry.SnapshotVersion > 0 {
+			item.SnapshotVersion = &telemetry.SnapshotVersion
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return p.insertGatewayAttempt(item)
+}
+
+func (p *Pipeline) insertGatewayAttempt(item store.GatewayRequestAttempt) *int64 {
+	if p == nil || p.store == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	id, err := p.store.InsertGatewayRequestAttempt(ctx, item)
+	if err != nil {
+		if p.logger != nil {
+			p.logger.Warn("gateway attempt log write failed", "request_id", item.RequestID, "attempt", item.AttemptIndex, "error", err)
+		}
+		return nil
+	}
+	return &id
+}
+
+func (p *Pipeline) tokenStateEventContext(requestID string, intent RequestIntent, status int, outcome Outcome, attemptID *int64) store.TokenStateEventContext {
+	return store.TokenStateEventContext{
+		RequestID:               requestID,
+		GatewayRequestAttemptID: attemptID,
+		Endpoint:                intent.Endpoint,
+		Model:                   intent.Model,
+		StatusCode:              ptrInt(status),
+		SelectionMode:           strings.TrimSpace(intent.SelectionMode),
+		CallerOwnerUserID:       ptrPositiveInt64(intent.CallerOwnerUserID),
+		Metadata: map[string]any{
+			"outcome":               string(outcome),
+			"exclude_owner_user_id": intent.ExcludeOwnerUserID,
+		},
+	}
+}
+
+func (p *Pipeline) commitTokenError(tokenID int64, tokenOwnerUserID *int64, message string, deactivate bool, cooldownUntil *time.Time, eventCtx store.TokenStateEventContext) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := p.withCommitRetry(ctx, func(ctx context.Context) error {
-			return p.store.MarkTokenError(ctx, tokenID, message, deactivate, cooldownUntil)
+			return p.store.MarkTokenErrorWithContext(ctx, tokenID, message, deactivate, cooldownUntil, eventCtx)
 		}); err != nil {
 			p.commitFailures.Add(1)
 			if p.logger != nil {
@@ -629,6 +764,81 @@ func (p *Pipeline) commitTokenError(tokenID int64, tokenOwnerUserID *int64, mess
 			}
 		}
 	}()
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func int64PtrFromUint64(value uint64) *int64 {
+	if value == 0 || value > uint64(^uint64(0)>>1) {
+		return nil
+	}
+	out := int64(value)
+	return &out
+}
+
+func errorExcerpt(err error) *string {
+	if err == nil {
+		return nil
+	}
+	text := strings.TrimSpace(err.Error())
+	if text == "" {
+		return nil
+	}
+	if len(text) > 512 {
+		text = text[:512]
+	}
+	return &text
+}
+
+func errorBodyHash(raw []byte) *string {
+	if len(raw) == 0 {
+		return nil
+	}
+	sum := sha256.Sum256(raw)
+	value := hex.EncodeToString(sum[:])
+	return &value
+}
+
+func attemptErrorCode(status int, raw []byte, err error, outcome Outcome) *string {
+	if status >= 200 && status < 400 && err == nil {
+		return nil
+	}
+	if code := errorCodeFromBody(raw); code != "" {
+		return &code
+	}
+	if outcome != "" && outcome != OutcomeSuccess {
+		value := string(outcome)
+		return &value
+	}
+	return nil
+}
+
+func errorCodeFromBody(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	if code := errorCodeFromMap(payload); code != "" {
+		return code
+	}
+	if nested, ok := payload["error"].(map[string]any); ok {
+		return errorCodeFromMap(nested)
+	}
+	return ""
+}
+
+func errorCodeFromMap(payload map[string]any) string {
+	for _, key := range []string{"code", "type", "error_code"} {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (p *Pipeline) withCommitRetry(ctx context.Context, fn func(context.Context) error) error {

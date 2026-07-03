@@ -49,36 +49,56 @@ type DeletedImportJob struct {
 }
 
 type ImportItem struct {
-	ID                 int64          `json:"id"`
-	OwnerUserID        int64          `json:"owner_user_id"`
-	JobID              int64          `json:"job_id"`
-	ItemIndex          int            `json:"item_index"`
-	Status             string         `json:"status"`
-	RefreshTokenHash   *string        `json:"refresh_token_hash,omitempty"`
-	Payload            map[string]any `json:"payload,omitempty"`
-	ValidatedPayload   map[string]any `json:"validated_payload,omitempty"`
-	TokenID            *int64         `json:"token_id,omitempty"`
-	Action             *string        `json:"action,omitempty"`
-	ErrorMessage       *string        `json:"error_message,omitempty"`
-	ValidationMS       *int           `json:"validation_ms,omitempty"`
-	PublishMS          *int           `json:"publish_ms,omitempty"`
-	ValidationStarted  *time.Time     `json:"validation_started_at,omitempty"`
-	ValidationFinished *time.Time     `json:"validation_finished_at,omitempty"`
-	PublishedAt        *time.Time     `json:"published_at,omitempty"`
-	CreatedAt          time.Time      `json:"created_at"`
-	UpdatedAt          time.Time      `json:"updated_at"`
+	ID                         int64          `json:"id"`
+	OwnerUserID                int64          `json:"owner_user_id"`
+	JobID                      int64          `json:"job_id"`
+	ItemIndex                  int            `json:"item_index"`
+	Status                     string         `json:"status"`
+	RefreshTokenHash           *string        `json:"refresh_token_hash,omitempty"`
+	Payload                    map[string]any `json:"payload,omitempty"`
+	ValidatedPayload           map[string]any `json:"validated_payload,omitempty"`
+	TokenID                    *int64         `json:"token_id,omitempty"`
+	Action                     *string        `json:"action,omitempty"`
+	ErrorMessage               *string        `json:"error_message,omitempty"`
+	ValidationMS               *int           `json:"validation_ms,omitempty"`
+	PublishMS                  *int           `json:"publish_ms,omitempty"`
+	ValidationStarted          *time.Time     `json:"validation_started_at,omitempty"`
+	ValidationFinished         *time.Time     `json:"validation_finished_at,omitempty"`
+	PublishedAt                *time.Time     `json:"published_at,omitempty"`
+	MatchedExistingTokenID     *int64         `json:"matched_existing_token_id,omitempty"`
+	PublishAttempted           bool           `json:"publish_attempted"`
+	PublishSkippedReason       *string        `json:"publish_skipped_reason,omitempty"`
+	Reactivated                bool           `json:"reactivated"`
+	PreviousIsActive           *bool          `json:"previous_is_active,omitempty"`
+	NextIsActive               *bool          `json:"next_is_active,omitempty"`
+	PreviousDisabledAt         *time.Time     `json:"previous_disabled_at,omitempty"`
+	NextDisabledAt             *time.Time     `json:"next_disabled_at,omitempty"`
+	RefreshErrorCode           *string        `json:"refresh_error_code,omitempty"`
+	RefreshErrorMessageExcerpt *string        `json:"refresh_error_message_excerpt,omitempty"`
+	CreatedAt                  time.Time      `json:"created_at"`
+	UpdatedAt                  time.Time      `json:"updated_at"`
 }
 
 type ImportItemUpdate struct {
-	ID               int64
-	Status           string
-	ValidatedPayload map[string]any
-	TokenID          *int64
-	Action           string
-	ErrorMessage     string
-	ValidationMS     *int
-	PublishMS        *int
-	Published        bool
+	ID                         int64
+	Status                     string
+	ValidatedPayload           map[string]any
+	TokenID                    *int64
+	Action                     string
+	ErrorMessage               string
+	ValidationMS               *int
+	PublishMS                  *int
+	Published                  bool
+	MatchedExistingTokenID     *int64
+	PublishAttempted           bool
+	PublishSkippedReason       string
+	Reactivated                bool
+	PreviousIsActive           *bool
+	NextIsActive               *bool
+	PreviousDisabledAt         *time.Time
+	NextDisabledAt             *time.Time
+	RefreshErrorCode           string
+	RefreshErrorMessageExcerpt string
 }
 
 type ImportWorkerMetrics struct {
@@ -462,7 +482,9 @@ func (s *Store) ListImportJobItemsScoped(ctx context.Context, scope ResourceScop
 		select id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
 		       validated_payload, token_id, action, error_message, validation_ms,
 		       publish_ms, validation_started_at, validation_finished_at,
-		       published_at, created_at, updated_at
+		       published_at, matched_existing_token_id, publish_attempted, publish_skipped_reason,
+		       reactivated, previous_is_active, next_is_active, previous_disabled_at, next_disabled_at,
+		       refresh_error_code, refresh_error_message_excerpt, created_at, updated_at
 		from token_import_items
 		where job_id = $1
 		  and `+ownerWhere+`
@@ -497,10 +519,12 @@ func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, owner
 		payloadData := jsonBytes(payload)
 		hash := refreshHashFromPayload(payload)
 		base := len(args) + 1
-		args = append(args, item.Index, status, payloadData, payloadData, hash, item.TokenID, item.Action, item.ErrorMessage)
+		args = append(args, item.Index, status, payloadData, payloadData, hash, item.TokenID, item.Action, item.ErrorMessage,
+			item.MatchedExistingTokenID, status == "published", item.Reactivated, item.PreviousIsActive, item.NextIsActive,
+			item.PreviousDisabledAt, item.NextDisabledAt, item.RefreshErrorCode, item.RefreshErrorMessage)
 		values = append(values, fmt.Sprintf(
-			"($1, $2, $%d, $%d, $%d, $%d, $%d, $%d, nullif($%d, ''), nullif($%d, ''), now(), now())",
-			base, base+1, base+2, base+3, base+4, base+5, base+6, base+7,
+			"($1, $2, $%d, $%d, $%d, $%d, $%d, $%d, nullif($%d, ''), nullif($%d, ''), now(), $%d, $%d, $%d, $%d, $%d, $%d, $%d, nullif($%d, ''), nullif($%d, ''), now())",
+			base, base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11, base+12, base+13, base+14, base+15, base+16,
 		))
 	}
 	if len(values) == 0 {
@@ -509,7 +533,9 @@ func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, owner
 	_, err := tx.Exec(ctx, `
 		insert into token_import_items(
 			job_id, owner_user_id, item_index, status, payload, validated_payload,
-			refresh_token_hash, token_id, action, error_message, published_at, updated_at
+			refresh_token_hash, token_id, action, error_message, published_at,
+			matched_existing_token_id, publish_attempted, reactivated, previous_is_active, next_is_active,
+			previous_disabled_at, next_disabled_at, refresh_error_code, refresh_error_message_excerpt, updated_at
 		)
 		values `+strings.Join(values, ",")+`
 		on conflict (job_id, item_index) do update
@@ -521,6 +547,15 @@ func (s *Store) insertCompletedImportItems(ctx context.Context, tx pgx.Tx, owner
 		    action = excluded.action,
 		    error_message = excluded.error_message,
 		    published_at = excluded.published_at,
+		    matched_existing_token_id = excluded.matched_existing_token_id,
+		    publish_attempted = excluded.publish_attempted,
+		    reactivated = excluded.reactivated,
+		    previous_is_active = excluded.previous_is_active,
+		    next_is_active = excluded.next_is_active,
+		    previous_disabled_at = excluded.previous_disabled_at,
+		    next_disabled_at = excluded.next_disabled_at,
+		    refresh_error_code = excluded.refresh_error_code,
+		    refresh_error_message_excerpt = excluded.refresh_error_message_excerpt,
 		    updated_at = now()
 	`, args...)
 	return err
@@ -831,9 +866,22 @@ func (s *Store) UpdateImportItems(ctx context.Context, updates []ImportItemUpdat
 			    publish_ms = coalesce($8, publish_ms),
 			    validation_finished_at = coalesce(validation_finished_at, now()),
 			    published_at = case when $9 then now() else published_at end,
+			    matched_existing_token_id = coalesce($10, matched_existing_token_id),
+			    publish_attempted = publish_attempted or $11,
+			    publish_skipped_reason = coalesce(nullif($12, ''), publish_skipped_reason),
+			    reactivated = reactivated or $13,
+			    previous_is_active = coalesce($14, previous_is_active),
+			    next_is_active = coalesce($15, next_is_active),
+			    previous_disabled_at = coalesce($16, previous_disabled_at),
+			    next_disabled_at = coalesce($17, next_disabled_at),
+			    refresh_error_code = coalesce(nullif($18, ''), refresh_error_code),
+			    refresh_error_message_excerpt = coalesce(nullif($19, ''), refresh_error_message_excerpt),
 			    updated_at = now()
 			where id = $1
-		`, update.ID, status, payload, update.TokenID, update.Action, update.ErrorMessage, update.ValidationMS, update.PublishMS, update.Published)
+		`, update.ID, status, payload, update.TokenID, update.Action, update.ErrorMessage, update.ValidationMS, update.PublishMS,
+			update.Published, update.MatchedExistingTokenID, update.PublishAttempted, update.PublishSkippedReason, update.Reactivated,
+			update.PreviousIsActive, update.NextIsActive, update.PreviousDisabledAt, update.NextDisabledAt,
+			update.RefreshErrorCode, update.RefreshErrorMessageExcerpt)
 	}
 	br := s.pool.SendBatch(ctx, batch)
 	defer br.Close()
@@ -998,6 +1046,16 @@ func scanImportItems(rows pgx.Rows) ([]ImportItem, error) {
 			&item.ValidationStarted,
 			&item.ValidationFinished,
 			&item.PublishedAt,
+			&item.MatchedExistingTokenID,
+			&item.PublishAttempted,
+			&item.PublishSkippedReason,
+			&item.Reactivated,
+			&item.PreviousIsActive,
+			&item.NextIsActive,
+			&item.PreviousDisabledAt,
+			&item.NextDisabledAt,
+			&item.RefreshErrorCode,
+			&item.RefreshErrorMessageExcerpt,
 			&item.CreatedAt,
 			&item.UpdatedAt,
 		); err != nil {

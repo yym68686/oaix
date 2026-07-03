@@ -193,12 +193,24 @@ func publishValidatedAccessTokens(ctx context.Context, db *store.Store, items []
 			if index < len(result.Items) {
 				itemResult := result.Items[index]
 				update.TokenID = itemResult.TokenID
+				update.MatchedExistingTokenID = itemResult.MatchedExistingTokenID
+				update.Reactivated = itemResult.Reactivated
+				update.PreviousIsActive = itemResult.PreviousIsActive
+				update.NextIsActive = itemResult.NextIsActive
+				update.PreviousDisabledAt = itemResult.PreviousDisabledAt
+				update.NextDisabledAt = itemResult.NextDisabledAt
+				update.RefreshErrorCode = itemResult.RefreshErrorCode
+				update.RefreshErrorMessageExcerpt = itemResult.RefreshErrorMessage
+				update.PublishAttempted = true
 				if itemResult.Action != "" {
 					update.Action = itemResult.Action
 				}
 				if itemResult.Status == "failed" {
 					update.Status = string(importer.ItemFailed)
 					update.ErrorMessage = itemResult.ErrorMessage
+					if update.PublishSkippedReason == "" {
+						update.PublishSkippedReason = "publish_failed"
+					}
 				} else {
 					update.Status = string(importer.ItemPublished)
 					update.Published = true
@@ -206,6 +218,7 @@ func publishValidatedAccessTokens(ctx context.Context, db *store.Store, items []
 			} else {
 				update.Status = string(importer.ItemPublished)
 				update.Published = true
+				update.PublishAttempted = true
 			}
 			publishedUpdates = append(publishedUpdates, update)
 		}

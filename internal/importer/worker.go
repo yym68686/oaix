@@ -76,11 +76,16 @@ func (w *Worker) ValidateBatch(ctx context.Context, items []store.ImportItem) []
 				elapsed := int(time.Since(started).Milliseconds())
 				if err != nil {
 					atomic.AddInt64(&w.metrics.Failed, 1)
+					code, excerpt := classifyRefreshImportError(err)
 					updates[index] = store.ImportItemUpdate{
-						ID:           item.ID,
-						Status:       string(ItemFailed),
-						ErrorMessage: err.Error(),
-						ValidationMS: &elapsed,
+						ID:                         item.ID,
+						Status:                     string(ItemFailed),
+						ErrorMessage:               err.Error(),
+						ValidationMS:               &elapsed,
+						PublishAttempted:           false,
+						PublishSkippedReason:       "validation_failed",
+						RefreshErrorCode:           code,
+						RefreshErrorMessageExcerpt: excerpt,
 					}
 					continue
 				}
@@ -301,4 +306,33 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func classifyRefreshImportError(err error) (string, string) {
+	if err == nil {
+		return "", ""
+	}
+	message := strings.TrimSpace(err.Error())
+	lower := strings.ToLower(message)
+	code := "validation_failed"
+	switch {
+	case strings.Contains(lower, "refresh_token_reused"):
+		code = "refresh_token_reused"
+	case strings.Contains(lower, "invalid_grant"):
+		code = "invalid_grant"
+	case strings.Contains(lower, "missing access_token"):
+		code = "oauth_response_missing_access_token"
+	case strings.Contains(lower, "oauth refresh failed"):
+		code = "oauth_refresh_failed"
+	case strings.Contains(lower, "does not contain a refresh token"):
+		code = "missing_refresh_token"
+	case strings.Contains(lower, "does not contain an access token"):
+		code = "missing_access_token"
+	case strings.Contains(lower, "oauth client is not configured"):
+		code = "oauth_client_not_configured"
+	}
+	if len(message) > 512 {
+		message = message[:512]
+	}
+	return code, message
 }

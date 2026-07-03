@@ -405,10 +405,12 @@ func (s *Store) ListImportJobItemsFilteredScoped(ctx context.Context, scope Reso
 	}
 	args = append(args, opts.Limit, opts.Offset)
 	rows, err := s.pool.Query(ctx, `
-		select id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
-		       validated_payload, token_id, action, error_message, validation_ms,
-		       publish_ms, validation_started_at, validation_finished_at,
-		       published_at, created_at, updated_at
+			select id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
+			       validated_payload, token_id, action, error_message, validation_ms,
+			       publish_ms, validation_started_at, validation_finished_at,
+			       published_at, matched_existing_token_id, publish_attempted, publish_skipped_reason,
+			       reactivated, previous_is_active, next_is_active, previous_disabled_at, next_disabled_at,
+			       refresh_error_code, refresh_error_message_excerpt, created_at, updated_at
 		from token_import_items
 		where `+where+`
 		order by item_index asc, id asc
@@ -435,6 +437,16 @@ func (s *Store) RetryImportJob(ctx context.Context, jobID int64) (ImportJob, err
 		    validated_payload = null,
 		    token_id = null,
 		    action = null,
+		    matched_existing_token_id = null,
+		    publish_attempted = false,
+		    publish_skipped_reason = null,
+		    reactivated = false,
+		    previous_is_active = null,
+		    next_is_active = null,
+		    previous_disabled_at = null,
+		    next_disabled_at = null,
+		    refresh_error_code = null,
+		    refresh_error_message_excerpt = null,
 		    validation_started_at = null,
 		    validation_finished_at = null,
 		    validation_ms = null,
@@ -490,15 +502,27 @@ func (s *Store) RetryImportItem(ctx context.Context, itemID int64) (ImportItem, 
 	row := s.pool.QueryRow(ctx, `
 		update token_import_items
 		set status = 'queued',
-		    error_message = null,
-		    validation_started_at = null,
-		    validation_finished_at = null,
-		    updated_at = now()
-		where id = $1
-		returning id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
-		          validated_payload, token_id, action, error_message, validation_ms,
-		          publish_ms, validation_started_at, validation_finished_at,
-		          published_at, created_at, updated_at
+			    error_message = null,
+			    validation_started_at = null,
+			    validation_finished_at = null,
+			    matched_existing_token_id = null,
+			    publish_attempted = false,
+			    publish_skipped_reason = null,
+			    reactivated = false,
+			    previous_is_active = null,
+			    next_is_active = null,
+			    previous_disabled_at = null,
+			    next_disabled_at = null,
+			    refresh_error_code = null,
+			    refresh_error_message_excerpt = null,
+			    updated_at = now()
+			where id = $1
+			returning id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
+			          validated_payload, token_id, action, error_message, validation_ms,
+			          publish_ms, validation_started_at, validation_finished_at,
+			          published_at, matched_existing_token_id, publish_attempted, publish_skipped_reason,
+			          reactivated, previous_is_active, next_is_active, previous_disabled_at, next_disabled_at,
+			          refresh_error_code, refresh_error_message_excerpt, created_at, updated_at
 	`, itemID)
 	return scanImportItem(row)
 }
@@ -517,10 +541,12 @@ func (s *Store) SkipImportItem(ctx context.Context, itemID int64, reason string)
 		    error_message = nullif($2, ''),
 		    updated_at = now()
 		where id = $1
-		returning id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
-		          validated_payload, token_id, action, error_message, validation_ms,
-		          publish_ms, validation_started_at, validation_finished_at,
-		          published_at, created_at, updated_at
+			returning id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
+			          validated_payload, token_id, action, error_message, validation_ms,
+			          publish_ms, validation_started_at, validation_finished_at,
+			          published_at, matched_existing_token_id, publish_attempted, publish_skipped_reason,
+			          reactivated, previous_is_active, next_is_active, previous_disabled_at, next_disabled_at,
+			          refresh_error_code, refresh_error_message_excerpt, created_at, updated_at
 	`, itemID, truncate(reason, 1000))
 	return scanImportItem(row)
 }
@@ -1002,6 +1028,16 @@ func scanImportItem(row rowScanner) (ImportItem, error) {
 		&item.ValidationStarted,
 		&item.ValidationFinished,
 		&item.PublishedAt,
+		&item.MatchedExistingTokenID,
+		&item.PublishAttempted,
+		&item.PublishSkippedReason,
+		&item.Reactivated,
+		&item.PreviousIsActive,
+		&item.NextIsActive,
+		&item.PreviousDisabledAt,
+		&item.NextDisabledAt,
+		&item.RefreshErrorCode,
+		&item.RefreshErrorMessageExcerpt,
 		&item.CreatedAt,
 		&item.UpdatedAt,
 	)

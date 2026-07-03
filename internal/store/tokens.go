@@ -83,11 +83,19 @@ type ImportResult struct {
 }
 
 type ImportResultItem struct {
-	Index        int    `json:"index"`
-	TokenID      *int64 `json:"token_id,omitempty"`
-	Action       string `json:"action,omitempty"`
-	Status       string `json:"status"`
-	ErrorMessage string `json:"error_message,omitempty"`
+	Index                  int        `json:"index"`
+	TokenID                *int64     `json:"token_id,omitempty"`
+	Action                 string     `json:"action,omitempty"`
+	Status                 string     `json:"status"`
+	ErrorMessage           string     `json:"error_message,omitempty"`
+	MatchedExistingTokenID *int64     `json:"matched_existing_token_id,omitempty"`
+	Reactivated            bool       `json:"reactivated,omitempty"`
+	PreviousIsActive       *bool      `json:"previous_is_active,omitempty"`
+	NextIsActive           *bool      `json:"next_is_active,omitempty"`
+	PreviousDisabledAt     *time.Time `json:"previous_disabled_at,omitempty"`
+	NextDisabledAt         *time.Time `json:"next_disabled_at,omitempty"`
+	RefreshErrorCode       string     `json:"refresh_error_code,omitempty"`
+	RefreshErrorMessage    string     `json:"refresh_error_message_excerpt,omitempty"`
 }
 
 type TokenListOptions struct {
@@ -673,6 +681,16 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 			return result, err
 		}
 		if existingID > 0 {
+			var previousActive bool
+			var previousDisabledAt *time.Time
+			if err := tx.QueryRow(ctx, `
+				select is_active, disabled_at
+				from codex_tokens
+				where id = $1
+				for update
+			`, existingID).Scan(&previousActive, &previousDisabledAt); err != nil {
+				return result, err
+			}
 			row := tx.QueryRow(ctx, `
 				update codex_tokens
 				set access_token = coalesce(nullif($2, ''), access_token),
@@ -711,12 +729,32 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 			result.Updated++
 			result.Tokens = append(result.Tokens, token)
 			tokenID := token.ID
+			nextActive := token.IsActive
 			result.Items = append(result.Items, ImportResultItem{
-				Index:   resultIndex,
-				TokenID: &tokenID,
-				Action:  action,
-				Status:  "published",
+				Index:                  resultIndex,
+				TokenID:                &tokenID,
+				Action:                 action,
+				Status:                 "published",
+				MatchedExistingTokenID: &tokenID,
+				Reactivated:            !previousActive && token.IsActive,
+				PreviousIsActive:       &previousActive,
+				NextIsActive:           &nextActive,
+				PreviousDisabledAt:     previousDisabledAt,
+				NextDisabledAt:         token.DisabledAt,
 			})
+			if !previousActive && token.IsActive {
+				_, _ = tx.Exec(ctx, `
+					insert into token_state_events(
+						token_id, owner_user_id, event_type, reason, previous_is_active, next_is_active, metadata
+					)
+					values ($1, $2, 'reactivated_by_import', $3, $4, $5, $6)
+				`, token.ID, ownerUserID, truncate("token reactivated by import", 4000), previousActive, nextActive, jsonBytes(map[string]any{
+					"source":                    source,
+					"matched_existing_token_id": token.ID,
+					"previous_disabled_at":      previousDisabledAt,
+					"next_disabled_at":          token.DisabledAt,
+				}))
+			}
 			continue
 		}
 
@@ -743,11 +781,13 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 		result.Created++
 		result.Tokens = append(result.Tokens, token)
 		tokenID := token.ID
+		nextActive := token.IsActive
 		result.Items = append(result.Items, ImportResultItem{
-			Index:   resultIndex,
-			TokenID: &tokenID,
-			Action:  "created",
-			Status:  "published",
+			Index:        resultIndex,
+			TokenID:      &tokenID,
+			Action:       "created",
+			Status:       "published",
+			NextIsActive: &nextActive,
 		})
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -892,16 +932,38 @@ func (s *Store) MarkTokenSuccess(ctx context.Context, tokenID int64) error {
 }
 
 func (s *Store) MarkTokenError(ctx context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time) error {
+	return s.MarkTokenErrorWithContext(ctx, tokenID, message, deactivate, cooldownUntil, TokenStateEventContext{})
+}
+
+func (s *Store) MarkTokenErrorWithContext(ctx context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time, eventCtx TokenStateEventContext) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	var ownerUserID sql.NullInt64
+	var previousActive bool
+	if err := tx.QueryRow(ctx, `
+		select owner_user_id, is_active
+		from codex_tokens
+		where id = $1
+		for update
+	`, tokenID).Scan(&ownerUserID, &previousActive); err != nil {
+		return err
+	}
 	disabledAtExpr := "disabled_at"
 	isActiveExpr := "is_active"
+	nextActive := previousActive
 	if deactivate {
 		disabledAtExpr = "now()"
 		isActiveExpr = "false"
+		nextActive = false
+	}
+	if eventCtx.PreviousIsActive == nil {
+		eventCtx.PreviousIsActive = &previousActive
+	}
+	if eventCtx.NextIsActive == nil {
+		eventCtx.NextIsActive = &nextActive
 	}
 	_, err = tx.Exec(ctx, fmt.Sprintf(`
 		update codex_tokens
@@ -928,10 +990,22 @@ func (s *Store) MarkTokenError(ctx context.Context, tokenID int64, message strin
 	if err != nil {
 		return err
 	}
+	var ownerParam any
+	if ownerUserID.Valid {
+		ownerParam = ownerUserID.Int64
+	}
 	_, err = tx.Exec(ctx, `
-		insert into token_state_events(token_id, event_type, reason, cooldown_until)
-		values ($1, $2, $3, $4)
-	`, tokenID, map[bool]string{true: "disabled", false: "error"}[deactivate], truncate(message, 4000), cooldownUntil)
+		insert into token_state_events(
+			token_id, owner_user_id, event_type, reason, cooldown_until, request_id,
+			gateway_request_log_id, gateway_request_attempt_id, endpoint, model, status_code,
+			selection_mode, caller_owner_user_id, previous_is_active, next_is_active, metadata
+		)
+		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+	`, tokenID, ownerParam, map[bool]string{true: "disabled", false: "error"}[deactivate], truncate(message, 4000), cooldownUntil,
+		nullableString(eventCtx.RequestID), eventCtx.GatewayRequestLogID, eventCtx.GatewayRequestAttemptID,
+		nullableString(eventCtx.Endpoint), nullableString(eventCtx.Model), eventCtx.StatusCode,
+		nullableString(eventCtx.SelectionMode), eventCtx.CallerOwnerUserID,
+		eventCtx.PreviousIsActive, eventCtx.NextIsActive, jsonBytes(eventCtx.Metadata))
 	if err != nil {
 		return err
 	}
