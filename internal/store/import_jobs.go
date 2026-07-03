@@ -479,12 +479,7 @@ func (s *Store) ListImportJobItemsScoped(ctx context.Context, scope ResourceScop
 	args := []any{jobID}
 	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
-		select id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
-		       validated_payload, token_id, action, error_message, validation_ms,
-		       publish_ms, validation_started_at, validation_finished_at,
-		       published_at, matched_existing_token_id, publish_attempted, publish_skipped_reason,
-		       reactivated, previous_is_active, next_is_active, previous_disabled_at, next_disabled_at,
-		       refresh_error_code, refresh_error_message_excerpt, created_at, updated_at
+		select `+importItemSelectColumns("")+`
 		from token_import_items
 		where job_id = $1
 		  and `+ownerWhere+`
@@ -796,10 +791,7 @@ func (s *Store) ClaimImportItems(ctx context.Context, limit int) ([]ImportItem, 
 		    updated_at = now()
 		from claimed
 		where i.id = claimed.id
-		returning i.id, coalesce(i.owner_user_id, 0), i.job_id, i.item_index, i.status, i.refresh_token_hash, i.payload,
-		          i.validated_payload, i.token_id, i.action, i.error_message, i.validation_ms,
-		          i.publish_ms, i.validation_started_at, i.validation_finished_at,
-		          i.published_at, i.created_at, i.updated_at
+		returning `+importItemSelectColumns("i")+`
 	`, limit)
 	if err != nil {
 		return nil, err
@@ -1070,6 +1062,47 @@ func scanImportItems(rows pgx.Rows) ([]ImportItem, error) {
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func importItemSelectColumns(alias string) string {
+	return strings.Join(importItemSelectColumnList(alias), ", ")
+}
+
+func importItemSelectColumnList(alias string) []string {
+	prefix := ""
+	if strings.TrimSpace(alias) != "" {
+		prefix = strings.TrimSpace(alias) + "."
+	}
+	return []string{
+		prefix + "id",
+		"coalesce(" + prefix + "owner_user_id, 0)",
+		prefix + "job_id",
+		prefix + "item_index",
+		prefix + "status",
+		prefix + "refresh_token_hash",
+		prefix + "payload",
+		prefix + "validated_payload",
+		prefix + "token_id",
+		prefix + "action",
+		prefix + "error_message",
+		prefix + "validation_ms",
+		prefix + "publish_ms",
+		prefix + "validation_started_at",
+		prefix + "validation_finished_at",
+		prefix + "published_at",
+		prefix + "matched_existing_token_id",
+		prefix + "publish_attempted",
+		prefix + "publish_skipped_reason",
+		prefix + "reactivated",
+		prefix + "previous_is_active",
+		prefix + "next_is_active",
+		prefix + "previous_disabled_at",
+		prefix + "next_disabled_at",
+		prefix + "refresh_error_code",
+		prefix + "refresh_error_message_excerpt",
+		prefix + "created_at",
+		prefix + "updated_at",
+	}
 }
 
 func refreshHashFromPayload(payload map[string]any) *string {

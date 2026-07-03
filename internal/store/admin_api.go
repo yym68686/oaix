@@ -405,12 +405,7 @@ func (s *Store) ListImportJobItemsFilteredScoped(ctx context.Context, scope Reso
 	}
 	args = append(args, opts.Limit, opts.Offset)
 	rows, err := s.pool.Query(ctx, `
-			select id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
-			       validated_payload, token_id, action, error_message, validation_ms,
-			       publish_ms, validation_started_at, validation_finished_at,
-			       published_at, matched_existing_token_id, publish_attempted, publish_skipped_reason,
-			       reactivated, previous_is_active, next_is_active, previous_disabled_at, next_disabled_at,
-			       refresh_error_code, refresh_error_message_excerpt, created_at, updated_at
+			select `+importItemSelectColumns("")+`
 		from token_import_items
 		where `+where+`
 		order by item_index asc, id asc
@@ -517,12 +512,7 @@ func (s *Store) RetryImportItem(ctx context.Context, itemID int64) (ImportItem, 
 			    refresh_error_message_excerpt = null,
 			    updated_at = now()
 			where id = $1
-			returning id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
-			          validated_payload, token_id, action, error_message, validation_ms,
-			          publish_ms, validation_started_at, validation_finished_at,
-			          published_at, matched_existing_token_id, publish_attempted, publish_skipped_reason,
-			          reactivated, previous_is_active, next_is_active, previous_disabled_at, next_disabled_at,
-			          refresh_error_code, refresh_error_message_excerpt, created_at, updated_at
+			returning `+importItemSelectColumns("")+`
 	`, itemID)
 	return scanImportItem(row)
 }
@@ -541,12 +531,7 @@ func (s *Store) SkipImportItem(ctx context.Context, itemID int64, reason string)
 		    error_message = nullif($2, ''),
 		    updated_at = now()
 		where id = $1
-			returning id, coalesce(owner_user_id, 0), job_id, item_index, status, refresh_token_hash, payload,
-			          validated_payload, token_id, action, error_message, validation_ms,
-			          publish_ms, validation_started_at, validation_finished_at,
-			          published_at, matched_existing_token_id, publish_attempted, publish_skipped_reason,
-			          reactivated, previous_is_active, next_is_active, previous_disabled_at, next_disabled_at,
-			          refresh_error_code, refresh_error_message_excerpt, created_at, updated_at
+			returning `+importItemSelectColumns("")+`
 	`, itemID, truncate(reason, 1000))
 	return scanImportItem(row)
 }
