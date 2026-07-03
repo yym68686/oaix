@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,6 +45,21 @@ func TestClassifyUpstreamFailures(t *testing.T) {
 				t.Fatalf("classify(%d, %v) = %s, want %s", tt.status, tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIsDeactivatedWorkspaceFailure(t *testing.T) {
+	if !isDeactivatedWorkspaceFailure(http.StatusPaymentRequired, []byte(`{"error":{"code":"deactivated_workspace"}}`), nil) {
+		t.Fatal("expected deactivated workspace body to be terminal")
+	}
+	if !isDeactivatedWorkspaceFailure(http.StatusPaymentRequired, nil, errors.New("map[code:deactivated_workspace]")) {
+		t.Fatal("expected deactivated workspace error text to be terminal")
+	}
+	if isDeactivatedWorkspaceFailure(http.StatusPaymentRequired, []byte(`{"error":{"code":"usage_limit_reached"}}`), nil) {
+		t.Fatal("ordinary 402 should not be terminal")
+	}
+	if isDeactivatedWorkspaceFailure(http.StatusTooManyRequests, []byte(`{"error":{"code":"deactivated_workspace"}}`), nil) {
+		t.Fatal("non-402 deactivated marker should not match")
 	}
 }
 
@@ -589,6 +605,176 @@ func TestProxyUsageLimitUsesOfficialCooldown(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for token error commit")
+	}
+}
+
+func TestProxyDeactivatesAndRetriesAfterDeactivatedWorkspace402(t *testing.T) {
+	var mu sync.Mutex
+	var authHeaders []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		attempt := len(authHeaders)
+		mu.Unlock()
+		if attempt == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = io.WriteString(w, strings.Join([]string{
+				`event: error`,
+				`data: {"error":{"code":"oaix_gateway_error","message":"map[code:deactivated_workspace]","status":402,"type":"gateway_error"}}`,
+				``,
+			}, "\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: response.completed`,
+			`data: {"type":"response.completed","response":{"id":"resp_retry","object":"response","model":"gpt-5.5","status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+			``,
+		}, "\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                2,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	now := time.Now().UTC()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, OwnerUserID: 10, AccessToken: "good-token", IsActive: true, CreatedAt: now, UpdatedAt: now},
+			{ID: 2, OwnerUserID: 20, AccessToken: "bad-token", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorEvents: make(chan tokenErrorEvent, 1),
+	}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	affinityStore := affinity.NewMemoryStore()
+	affinityStore.Put("prompt", affinity.Lane{PrimaryTokenID: 2}, time.Hour)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinityStore)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", Stream: true})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	mu.Lock()
+	gotAuthHeaders := append([]string(nil), authHeaders...)
+	mu.Unlock()
+	if len(gotAuthHeaders) != 2 {
+		t.Fatalf("upstream calls = %d, want 2", len(gotAuthHeaders))
+	}
+	if gotAuthHeaders[0] != "Bearer bad-token" || gotAuthHeaders[1] != "Bearer good-token" {
+		t.Fatalf("auth headers = %v", gotAuthHeaders)
+	}
+	select {
+	case event := <-fakes.tokenErrorEvents:
+		if event.TokenID != 2 {
+			t.Fatalf("token_id = %d, want 2", event.TokenID)
+		}
+		if !event.Deactivate {
+			t.Fatal("expected token to be deactivated")
+		}
+		if event.CooldownUntil != nil {
+			t.Fatalf("cooldown = %v, want nil", event.CooldownUntil)
+		}
+		if !strings.Contains(event.Message, "deactivated_workspace") {
+			t.Fatalf("message = %q", event.Message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for token deactivate commit")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if manager.Snapshot().ByID[2] == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bad token remained in refreshed snapshot")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok := affinityStore.Get("prompt"); ok {
+		t.Fatal("prompt affinity still contains deactivated token")
+	}
+}
+
+func TestProxyPaymentRequiredWithoutDeactivatedWorkspaceDoesNotDeactivateToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = io.WriteString(w, `{"error":{"code":"billing_required","message":"payment required"}}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                1,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	now := time.Now().UTC()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{{
+			ID:          1,
+			AccessToken: "upstream-token",
+			IsActive:    true,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}},
+		tokenErrorEvents: make(chan tokenErrorEvent, 1),
+	}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5"})
+
+	if recorder.Code != http.StatusPaymentRequired {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case event := <-fakes.tokenErrorEvents:
+		t.Fatalf("unexpected token error commit: %+v", event)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -1160,25 +1346,85 @@ type countingResponseRecorder struct {
 }
 
 type fakeProxyStore struct {
-	tokens       []store.Token
-	tokenErrorCh chan *time.Time
+	mu               sync.Mutex
+	tokens           []store.Token
+	tokenErrorCh     chan *time.Time
+	tokenErrorEvents chan tokenErrorEvent
+}
+
+type tokenErrorEvent struct {
+	TokenID       int64
+	Message       string
+	Deactivate    bool
+	CooldownUntil *time.Time
 }
 
 func (s *fakeProxyStore) ListAvailableTokens(context.Context) ([]store.Token, error) {
-	return append([]store.Token(nil), s.tokens...), nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	out := make([]store.Token, 0, len(s.tokens))
+	for _, token := range s.tokens {
+		if !token.IsActive || token.DisabledAt != nil {
+			continue
+		}
+		if token.CooldownUntil != nil && token.CooldownUntil.After(now) {
+			continue
+		}
+		out = append(out, token)
+	}
+	return out, nil
 }
 
 func (s *fakeProxyStore) TouchTokens(context.Context, []int64, time.Time) error {
 	return nil
 }
 
-func (s *fakeProxyStore) MarkTokenSuccess(context.Context, int64) error {
+func (s *fakeProxyStore) MarkTokenSuccess(_ context.Context, tokenID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.tokens {
+		if s.tokens[i].ID == tokenID {
+			now := time.Now().UTC()
+			s.tokens[i].IsActive = true
+			s.tokens[i].DisabledAt = nil
+			s.tokens[i].CooldownUntil = nil
+			s.tokens[i].LastError = nil
+			s.tokens[i].LastUsedAt = &now
+			s.tokens[i].UpdatedAt = now
+			break
+		}
+	}
 	return nil
 }
 
-func (s *fakeProxyStore) MarkTokenError(_ context.Context, _ int64, _ string, _ bool, cooldownUntil *time.Time) error {
+func (s *fakeProxyStore) MarkTokenError(_ context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time) error {
+	s.mu.Lock()
+	for i := range s.tokens {
+		if s.tokens[i].ID == tokenID {
+			msg := message
+			now := time.Now().UTC()
+			s.tokens[i].LastError = &msg
+			s.tokens[i].CooldownUntil = cooldownUntil
+			if deactivate {
+				s.tokens[i].IsActive = false
+				s.tokens[i].DisabledAt = &now
+			}
+			s.tokens[i].UpdatedAt = now
+			break
+		}
+	}
+	s.mu.Unlock()
 	if s.tokenErrorCh != nil {
 		s.tokenErrorCh <- cooldownUntil
+	}
+	if s.tokenErrorEvents != nil {
+		s.tokenErrorEvents <- tokenErrorEvent{
+			TokenID:       tokenID,
+			Message:       message,
+			Deactivate:    deactivate,
+			CooldownUntil: cooldownUntil,
+		}
 	}
 	return nil
 }

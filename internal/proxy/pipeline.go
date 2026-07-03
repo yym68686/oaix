@@ -342,8 +342,19 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 			return
 		}
+		if isDeactivatedWorkspaceFailure(status, result.ErrorBody, err) {
+			message := "terminal upstream status 402: deactivated_workspace"
+			lastErr = errors.New(message)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil)
+			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+			excluded[claim.TokenID()] = struct{}{}
+			if attempt < p.cfg.Upstream.MaxRetries {
+				continue
+			}
+			break
+		}
 		if action == OutcomeUpstream401Invalid || action == OutcomeUpstream403Invalid {
-			p.commitTokenError(claim.TokenID(), fmt.Sprintf("terminal upstream status %d", status), true, nil)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, fmt.Sprintf("terminal upstream status %d", status), true, nil)
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 		} else if action == OutcomeUpstream429Cooldown {
 			now := time.Now().UTC()
@@ -359,10 +370,10 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			} else {
 				message = "upstream usage limit cooldown"
 			}
-			p.commitTokenError(claim.TokenID(), message, false, cooldownUntil)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, false, cooldownUntil)
 		} else if retry && (action == OutcomeUpstream5xx || action == OutcomeTransportError) {
 			cooldown := time.Now().UTC().Add(5 * time.Second)
-			p.commitTokenError(claim.TokenID(), fmt.Sprintf("retryable upstream failure: %v", err), false, &cooldown)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, fmt.Sprintf("retryable upstream failure: %v", err), false, &cooldown)
 		}
 		excluded[claim.TokenID()] = struct{}{}
 		if !retry || attempt == p.cfg.Upstream.MaxRetries {
@@ -569,6 +580,16 @@ func classify(status int, err error) Outcome {
 	return OutcomeSuccess
 }
 
+func isDeactivatedWorkspaceFailure(status int, raw []byte, err error) bool {
+	if status != http.StatusPaymentRequired {
+		return false
+	}
+	if bytes.Contains(bytes.ToLower(raw), []byte("deactivated_workspace")) {
+		return true
+	}
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "deactivated_workspace")
+}
+
 func (p *Pipeline) commitSuccess(tokenID int64) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -584,7 +605,7 @@ func (p *Pipeline) commitSuccess(tokenID int64) {
 	}()
 }
 
-func (p *Pipeline) commitTokenError(tokenID int64, message string, deactivate bool, cooldownUntil *time.Time) {
+func (p *Pipeline) commitTokenError(tokenID int64, tokenOwnerUserID *int64, message string, deactivate bool, cooldownUntil *time.Time) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -594,6 +615,17 @@ func (p *Pipeline) commitTokenError(tokenID int64, message string, deactivate bo
 			p.commitFailures.Add(1)
 			if p.logger != nil {
 				p.logger.Error("mark token error failed", "token_id", tokenID, "error", err)
+			}
+			return
+		}
+		if deactivate && p.tokens != nil {
+			if err := p.tokens.Refresh(ctx); err != nil && p.logger != nil {
+				p.logger.Warn("token snapshot refresh after deactivate failed", "token_id", tokenID, "error", err)
+			}
+			if tokenOwnerUserID != nil {
+				if err := p.tokens.RefreshOwner(ctx, *tokenOwnerUserID); err != nil && p.logger != nil {
+					p.logger.Warn("owner token snapshot refresh after deactivate failed", "token_id", tokenID, "owner_user_id", *tokenOwnerUserID, "error", err)
+				}
 			}
 		}
 	}()
