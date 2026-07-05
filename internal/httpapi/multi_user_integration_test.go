@@ -273,6 +273,58 @@ func expectStatus(t *testing.T, resp *http.Response, want int) map[string]any {
 	return payload
 }
 
+func TestServiceAPIKeyActsAsPlatformUserForSelfRoutes(t *testing.T) {
+	h := newMultiUserHarness(t)
+	ctx := context.Background()
+	platformUser, err := h.db.BootstrapUser(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherUser, _ := h.createUser(t, "service-self-other")
+	platformJob, err := h.db.CreateCompletedImportJobForOwner(ctx, platformUser.ID, []map[string]any{{
+		"refresh_token": "rt-platform-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+	}}, "front", store.ImportResult{Created: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherJob, err := h.db.CreateCompletedImportJobForOwner(ctx, otherUser.ID, []map[string]any{{
+		"refresh_token": "rt-other-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+	}}, "front", store.ImportResult{Created: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mePayload := expectStatus(t, h.request(t, http.MethodGet, "/api/me", "service-test-key", ""), http.StatusOK)
+	user, _ := mePayload["user"].(map[string]any)
+	if user == nil || user["email"] != store.BootstrapUserEmail {
+		t.Fatalf("service /api/me user = %#v, want %s", user, store.BootstrapUserEmail)
+	}
+	if mePayload["principal_type"] != "service" {
+		t.Fatalf("principal_type = %v, want service", mePayload["principal_type"])
+	}
+
+	payload := expectStatus(t, h.request(t, http.MethodGet, "/api/import/jobs?limit=10", "service-test-key", ""), http.StatusOK)
+	items, _ := payload["items"].([]any)
+	seenPlatform := false
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		id := int64(item["id"].(float64))
+		ownerID := int64(item["owner_user_id"].(float64))
+		if id == otherJob.ID {
+			t.Fatalf("service self import jobs leaked other owner job %d: %#v", otherJob.ID, item)
+		}
+		if id == platformJob.ID {
+			seenPlatform = true
+			if ownerID != platformUser.ID {
+				t.Fatalf("platform job owner = %d, want %d", ownerID, platformUser.ID)
+			}
+		}
+	}
+	if !seenPlatform {
+		t.Fatalf("service self import jobs did not include platform job %d: %#v", platformJob.ID, items)
+	}
+}
+
 func TestMultiUserAPIIsolationWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userA, keyA := h.createUser(t, "isolation-a")

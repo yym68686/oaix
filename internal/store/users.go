@@ -76,14 +76,19 @@ type ValidatedAPIKey struct {
 }
 
 func (s *Store) BootstrapUserID(ctx context.Context) (int64, error) {
-	var id int64
+	user, err := s.BootstrapUser(ctx)
+	return user.ID, err
+}
+
+func (s *Store) BootstrapUser(ctx context.Context) (PlatformUser, error) {
+	var item PlatformUser
 	err := s.pool.QueryRow(ctx, `
 		insert into platform_users(email, display_name, role, status)
 		values ($1, 'Platform Bootstrap', 'admin', 'active')
 		on conflict (email) do update set updated_at = now()
-		returning id
-	`, BootstrapUserEmail).Scan(&id)
-	return id, err
+		returning id, email, display_name, role, status, plan, notes, created_at, updated_at, last_seen_at, disabled_at
+	`, BootstrapUserEmail).Scan(&item.ID, &item.Email, &item.DisplayName, &item.Role, &item.Status, &item.Plan, &item.Notes, &item.CreatedAt, &item.UpdatedAt, &item.LastSeenAt, &item.DisabledAt)
+	return item, err
 }
 
 func (s *Store) CreatePlatformUserWithPassword(ctx context.Context, email string, password string, displayName string, role string) (PlatformUser, error) {

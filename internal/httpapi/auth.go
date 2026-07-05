@@ -109,12 +109,7 @@ func (a *App) authenticateRequest(r *http.Request) (*AuthContext, bool) {
 	}
 	for _, key := range a.authKeys {
 		if subtle.ConstantTimeCompare([]byte(provided), []byte(key)) == 1 {
-			return &AuthContext{
-				PrincipalType: "service",
-				Role:          "service",
-				IsService:     true,
-				IsAdmin:       true,
-			}, true
+			return a.serviceAuthContext(r.Context()), true
 		}
 	}
 	if a.store == nil {
@@ -154,6 +149,31 @@ func (a *App) authenticateRequest(r *http.Request) (*AuthContext, bool) {
 		}, true
 	}
 	return nil, false
+}
+
+func (a *App) serviceAuthContext(ctx context.Context) *AuthContext {
+	auth := &AuthContext{
+		PrincipalType: "service",
+		Role:          "service",
+		IsService:     true,
+		IsAdmin:       true,
+	}
+	if a == nil || a.store == nil {
+		return auth
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 900*time.Millisecond)
+	defer cancel()
+	user, err := a.store.BootstrapUser(lookupCtx)
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Warn("service api key bootstrap user lookup failed", "error", err)
+		}
+		return auth
+	}
+	userID := user.ID
+	auth.UserID = &userID
+	auth.User = &user
+	return auth
 }
 
 func (a *App) touchAPIKeyAsync(id int64) {
