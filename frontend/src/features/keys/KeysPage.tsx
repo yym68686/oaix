@@ -51,6 +51,7 @@ import {
   sortParam,
   statusOptionsWithCounts,
   tokenPlanType,
+  tokenResetAtLabel,
   tokenStatusLabel,
   tokenStatusOf,
   tokenTitle,
@@ -534,15 +535,16 @@ function TokenTable({
   }
   return (
     <div className="min-w-0 overflow-hidden rounded-lg border">
-      <Table className="min-w-[86rem] table-fixed">
+      <Table className="min-w-[92rem] table-fixed">
         <colgroup>
           <col className="w-9" />
-          <col className="w-[26%]" />
+          <col className="w-[24%]" />
           <col className="w-[5.75rem]" />
           <col className="w-[8rem]" />
           <col className="w-[9.5rem]" />
-          <col className="w-[9.75rem]" />
-          <col className="w-[17rem]" />
+          <col className="w-[9.5rem]" />
+          <col className="w-[9.5rem]" />
+          <col className="w-[15rem]" />
           <col className="w-[13rem]" />
         </colgroup>
         <TableHeader>
@@ -552,7 +554,8 @@ function TokenTable({
             <TableHead>状态</TableHead>
             <TableHead className="px-1.5">额度</TableHead>
             <TableHead className="px-1.5">并发 / 金额</TableHead>
-            <TableHead className="px-1.5">最近</TableHead>
+            <TableHead className="px-1.5">最近使用</TableHead>
+            <TableHead className="px-1.5">重置时间</TableHead>
             <TableHead>备注</TableHead>
             <TableHead className="text-right">操作</TableHead>
           </TableRow>
@@ -659,11 +662,11 @@ function TokenRow({
           <TokenObservedCost value={item.observed_cost_usd} />
         </div>
       </TableCell>
-      <TableCell className="px-1.5">
-        <div className="grid max-h-10 min-w-0 gap-1 overflow-hidden text-xs">
-          <span className="oaix-tabular text-muted-foreground">最近 {formatDate(item.last_used_at)}</span>
-          <span className="oaix-tabular text-muted-foreground">冷却 {formatDate(item.cooldown_until)}</span>
-        </div>
+      <TableCell className="px-1.5 whitespace-nowrap text-muted-foreground text-xs oaix-tabular" title={formatDate(item.last_used_at)}>
+        {formatDate(item.last_used_at)}
+      </TableCell>
+      <TableCell className="px-1.5 whitespace-nowrap text-muted-foreground text-xs oaix-tabular" title={tokenResetAtLabel(item)}>
+        {tokenResetAtLabel(item)}
       </TableCell>
       <TableCell className="min-w-[14rem] max-w-[24rem] align-top">
         <span className="block min-w-0 whitespace-pre-wrap break-words text-muted-foreground text-xs leading-relaxed [overflow-wrap:anywhere]" title={secondaryText}>
@@ -1005,7 +1008,7 @@ export function KeyDetailPage({
           <div className="grid gap-2 rounded-lg border bg-muted/24 p-3 text-sm">
             <div className="grid gap-2 md:grid-cols-2">
               <DetailItem label="最近使用" value={formatDate(token.last_used_at)} />
-              <DetailItem label="冷却至" value={formatDate(token.cooldown_until)} />
+              <DetailItem label="重置时间" value={tokenResetAtLabel(token)} />
               <DetailItem label="创建" value={formatDate(token.created_at)} />
               <DetailItem label="更新" value={formatDate(token.updated_at)} />
             </div>

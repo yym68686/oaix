@@ -11,7 +11,7 @@ import { KeyListPage } from "@/features/keys/KeysPage";
 import { api, type APIKeyItem, type CreatedAPIKey, type ImportBatch, type OwnerUsageSummary, type PlatformUser, type PoolSummaryResponse, type RequestItem, type TokenCounts, type TokenItem } from "@/lib/api";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert, LoadingState, MiniMetric, SelectField } from "@/shared/components";
-import { errorMessage } from "@/shared/domain";
+import { errorMessage, tokenResetAtLabel } from "@/shared/domain";
 import { ApiKeyTable, ImportJobsTable, RequestLogsTable, RequestModelCell, TokenTable, UserSelector } from "@/shared/resourceTables";
 import type { ToastMessage } from "@/shared/types";
 
@@ -566,6 +566,7 @@ function AdminTokenMiniTable({ items }: { items: TokenItem[] }) {
             <TableHead>状态</TableHead>
             <TableHead>计划</TableHead>
             <TableHead>最近使用</TableHead>
+            <TableHead>重置时间</TableHead>
             <TableHead>备注</TableHead>
           </TableRow>
         </TableHeader>
@@ -580,7 +581,8 @@ function AdminTokenMiniTable({ items }: { items: TokenItem[] }) {
                 <Badge variant={item.is_active ? "success" : "warning"}>{item.is_active ? "有效" : "禁用"}</Badge>
               </TableCell>
               <TableCell>{item.plan_type || "unknown"}</TableCell>
-              <TableCell>{formatDate(item.last_used_at)}</TableCell>
+              <TableCell className="whitespace-nowrap text-xs oaix-tabular">{formatDate(item.last_used_at)}</TableCell>
+              <TableCell className="whitespace-nowrap text-xs oaix-tabular">{tokenResetAtLabel(item)}</TableCell>
               <TableCell className="max-w-80 whitespace-pre-wrap break-words text-muted-foreground text-xs">{item.remark || item.source_file || "-"}</TableCell>
             </TableRow>
           ))}

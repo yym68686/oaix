@@ -46,6 +46,7 @@ type adminTokenItem struct {
 	ActiveStreams   int64               `json:"active_streams"`
 	ActiveStreamCap int64               `json:"active_stream_cap"`
 	ObservedCostUSD *float64            `json:"observed_cost_usd"`
+	ResetAt         *time.Time          `json:"reset_at,omitempty"`
 	Quota           *codexQuotaSnapshot `json:"quota,omitempty"`
 }
 
@@ -183,10 +184,11 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 	items := make([]adminTokenItem, 0, len(tokens))
 	disabledFromQuota := false
 	for _, token := range tokens {
-		if quota := quotaByID[token.ID]; quota != nil && quota.PlanType != nil {
+		quota := quotaByID[token.ID]
+		if quota != nil && quota.PlanType != nil {
 			token.PlanType = quota.PlanType
 		}
-		if quotaSnapshotDisablesToken(quotaByID[token.ID]) {
+		if quotaSnapshotDisablesToken(quota) {
 			if token.IsActive {
 				disabledFromQuota = true
 			}
@@ -198,7 +200,8 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 			ActiveStreams:   activeByID[token.ID],
 			ActiveStreamCap: cap,
 			ObservedCostUSD: observedCostByID[token.ID],
-			Quota:           quotaByID[token.ID],
+			ResetAt:         quotaNextResetAt(quota, now),
+			Quota:           quota,
 		})
 	}
 	if disabledFromQuota && a.tokens != nil {
@@ -209,6 +212,30 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		}
 	}
 	return items, pendingIDs
+}
+
+func quotaNextResetAt(snapshot *codexQuotaSnapshot, now time.Time) *time.Time {
+	if snapshot == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var best *time.Time
+	for _, window := range snapshot.Windows {
+		if window.ResetAt == nil {
+			continue
+		}
+		candidate := window.ResetAt.UTC()
+		if !candidate.After(now) {
+			continue
+		}
+		if best == nil || candidate.Before(*best) {
+			value := candidate
+			best = &value
+		}
+	}
+	return best
 }
 
 func adminTokenStatus(token store.Token, now time.Time) string {

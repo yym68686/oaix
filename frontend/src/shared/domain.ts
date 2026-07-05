@@ -461,7 +461,32 @@ export function importBatchTotal(job: ImportBatch): number {
 }
 
 export function tokenFreshnessTitle(item: TokenItem): string {
-  return `最近 ${formatDate(item.last_used_at)}，冷却 ${formatDate(item.cooldown_until)}`;
+  return `最近 ${formatDate(item.last_used_at)}，重置 ${tokenResetAtLabel(item)}`;
+}
+
+export function tokenResetAt(item: TokenItem): string | null {
+  if (item.reset_at) {
+    return item.reset_at;
+  }
+  const now = Date.now();
+  let best: { raw: string; time: number } | null = null;
+  for (const window of item.quota?.windows || []) {
+    if (!window.reset_at) {
+      continue;
+    }
+    const time = new Date(window.reset_at).getTime();
+    if (!Number.isFinite(time) || time <= now) {
+      continue;
+    }
+    if (!best || time < best.time) {
+      best = { raw: window.reset_at, time };
+    }
+  }
+  return best?.raw ?? null;
+}
+
+export function tokenResetAtLabel(item: TokenItem): string {
+  return formatDate(tokenResetAt(item));
 }
 
 function formatNumber(value: unknown): string {

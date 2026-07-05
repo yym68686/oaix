@@ -311,3 +311,24 @@ func TestAdminTokenStatusUsesServerTime(t *testing.T) {
 		})
 	}
 }
+
+func TestQuotaNextResetAtUsesNearestFutureWindow(t *testing.T) {
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Minute)
+	weekly := now.Add(7 * 24 * time.Hour)
+	fiveHour := now.Add(5 * time.Hour)
+	snapshot := &codexQuotaSnapshot{Windows: []codexQuotaWindow{
+		{ID: "past", ResetAt: &past},
+		{ID: "7d", ResetAt: &weekly},
+		{ID: "5h", ResetAt: &fiveHour},
+		{ID: "missing"},
+	}}
+
+	got := quotaNextResetAt(snapshot, now)
+	if got == nil {
+		t.Fatal("reset_at = nil, want nearest future window")
+	}
+	if !got.Equal(fiveHour) {
+		t.Fatalf("reset_at = %s, want %s", got.Format(time.RFC3339), fiveHour.Format(time.RFC3339))
+	}
+}

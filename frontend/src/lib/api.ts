@@ -74,6 +74,7 @@ export type TokenItem = {
   source_file?: string | null;
   is_active: boolean;
   cooldown_until?: string | null;
+  reset_at?: string | null;
   disabled_at?: string | null;
   last_used_at?: string | null;
   last_error?: string | null;
