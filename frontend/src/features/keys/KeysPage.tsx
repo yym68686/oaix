@@ -534,8 +534,8 @@ function TokenTable({
     return <EmptyState title="没有匹配的 key" description={emptyDescription || "调整搜索、状态、计划或排序后再试。"} />;
   }
   return (
-    <div className="min-w-0 overflow-hidden rounded-lg border">
-      <Table className="min-w-[86rem] table-fixed">
+    <div className="min-w-0 overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table className="table-fixed" style={{ width: "max(100%, 86rem)" }}>
         <colgroup>
           <col className="w-9" />
           <col className="w-[26%]" />

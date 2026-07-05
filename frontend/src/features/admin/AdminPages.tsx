@@ -116,8 +116,8 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
         {loading && !users.length ? (
           <LoadingState label="正在载入用户" />
         ) : (
-          <div className="overflow-hidden rounded-lg border">
-            <Table>
+          <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+            <Table style={{ width: "max(100%, 86rem)" }}>
               <TableHeader>
                 <TableRow>
                   <TableHead>用户</TableHead>
@@ -523,8 +523,8 @@ export function AdminAuditPage({ refreshNonce }: { refreshNonce: number }) {
         {loading && !items.length ? (
           <LoadingState label="正在载入审计日志" />
         ) : items.length ? (
-          <div className="overflow-hidden rounded-lg border">
-            <Table>
+          <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+            <Table style={{ width: "max(100%, 52rem)" }}>
               <TableHeader>
                 <TableRow>
                   <TableHead>时间</TableHead>
@@ -558,8 +558,8 @@ function AdminTokenMiniTable({ items }: { items: TokenItem[] }) {
     return <EmptyState title="暂无 Key" description="该用户还没有导入账号。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 64rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>Key</TableHead>
@@ -600,8 +600,8 @@ function ImportJobsMiniTable({ items }: { items: ImportBatch[] }) {
     return <EmptyState title="暂无导入批次" description="该用户还没有导入任务。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 64rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>批次</TableHead>
@@ -635,8 +635,8 @@ function AuditMiniTable({ items, loading = false }: { items: Array<Record<string
     return <EmptyState title="暂无审计记录" description="该用户相关操作会在这里显示。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 52rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>时间</TableHead>
@@ -665,8 +665,8 @@ function SimpleAPIKeyTable({ items, onRevoke }: { items: APIKeyItem[]; onRevoke:
     return <EmptyState title="暂无 API Key" description="新建后会在这里显示。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 56rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>名称</TableHead>
@@ -701,8 +701,8 @@ function RequestMiniTable({ items }: { items: RequestItem[] }) {
     return <EmptyState title="暂无请求" description="有流量后会在这里显示。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 64rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>时间</TableHead>

@@ -659,8 +659,8 @@ function TargetTable({
     return <EmptyState title="暂无 Sub2API 目标" description="新增目标后会在这里显示。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 74rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>目标</TableHead>
@@ -738,8 +738,8 @@ function RunTable({ items, loading }: { items: Sub2APIRun[]; loading: boolean })
     return <EmptyState compact title="暂无同步记录" description="检查或同步后会生成运行记录。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 64rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>时间</TableHead>

@@ -627,8 +627,8 @@ function ImportBatchList({
     return <EmptyState title="暂无导入批次" description="导入任务提交后会在这里出现。" />;
   }
   return (
-    <div className="min-w-0 overflow-hidden rounded-lg border">
-      <Table>
+    <div className="min-w-0 overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 76rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>批次</TableHead>
@@ -814,7 +814,7 @@ function ImportBatchDetailDialog({
             <div className="rounded-lg border border-dashed bg-muted/24 p-4 text-muted-foreground text-sm">这个批次暂时没有可关联的 key 明细。</div>
           ) : filteredTokens.length > 0 ? (
             <div className="max-h-[min(52vh,28rem)] min-w-0 overflow-auto rounded-lg border oaix-scrollbar">
-              <Table className="table-fixed">
+              <Table className="table-fixed" style={{ width: "max(100%, 74rem)" }}>
                 <colgroup>
                   <col className="w-[28%]" />
                   <col className="w-[7rem]" />

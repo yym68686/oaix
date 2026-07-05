@@ -80,8 +80,8 @@ export function RequestsPage({ refreshNonce }: { refreshNonce: number }) {
         ) : loading && !requests.length ? (
           <LoadingRows />
         ) : requests.length ? (
-          <div className="min-w-0 overflow-hidden rounded-lg border">
-            <Table>
+          <div className="min-w-0 overflow-x-auto rounded-lg border oaix-scrollbar">
+            <Table style={{ width: "max(100%, 64rem)" }}>
               <TableHeader>
                 <TableRow>
                   <TableHead>时间</TableHead>

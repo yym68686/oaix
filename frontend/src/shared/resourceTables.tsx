@@ -120,8 +120,8 @@ export function ApiKeyTable({
     return <EmptyState title="暂无 API Key" description="新建后会在这里显示。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 56rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>名称</TableHead>
@@ -170,8 +170,8 @@ export function ImportJobsTable({
     return <EmptyState title="暂无导入批次" description="没有匹配的导入任务。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 64rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>批次</TableHead>
@@ -216,8 +216,8 @@ export function RequestLogsTable({
     return <EmptyState title="暂无请求" description="有流量后会在这里显示。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 68rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>时间</TableHead>
@@ -266,8 +266,8 @@ export function TokenTable({
     return <EmptyState title="暂无 Key" description="没有匹配的 Key。" />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border">
-      <Table>
+    <div className="overflow-x-auto rounded-lg border oaix-scrollbar">
+      <Table style={{ width: "max(100%, 64rem)" }}>
         <TableHeader>
           <TableRow>
             <TableHead>Key</TableHead>
