@@ -565,8 +565,7 @@ function AdminTokenMiniTable({ items }: { items: TokenItem[] }) {
             <TableHead>Key</TableHead>
             <TableHead>状态</TableHead>
             <TableHead>计划</TableHead>
-            <TableHead>最近使用</TableHead>
-            <TableHead>重置时间</TableHead>
+            <TableHead>最近</TableHead>
             <TableHead>备注</TableHead>
           </TableRow>
         </TableHeader>
@@ -581,8 +580,12 @@ function AdminTokenMiniTable({ items }: { items: TokenItem[] }) {
                 <Badge variant={item.is_active ? "success" : "warning"}>{item.is_active ? "有效" : "禁用"}</Badge>
               </TableCell>
               <TableCell>{item.plan_type || "unknown"}</TableCell>
-              <TableCell className="whitespace-nowrap text-xs oaix-tabular">{formatDate(item.last_used_at)}</TableCell>
-              <TableCell className="whitespace-nowrap text-xs oaix-tabular">{tokenResetAtLabel(item)}</TableCell>
+              <TableCell>
+                <div className="grid max-h-10 gap-1 overflow-hidden text-muted-foreground text-xs">
+                  <span className="oaix-tabular" title={formatDate(item.last_used_at)}>最近 {formatDate(item.last_used_at)}</span>
+                  <span className="oaix-tabular" title={tokenResetAtLabel(item)}>重置 {tokenResetAtLabel(item)}</span>
+                </div>
+              </TableCell>
               <TableCell className="max-w-80 whitespace-pre-wrap break-words text-muted-foreground text-xs">{item.remark || item.source_file || "-"}</TableCell>
             </TableRow>
           ))}

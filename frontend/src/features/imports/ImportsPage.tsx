@@ -816,12 +816,11 @@ function ImportBatchDetailDialog({
             <div className="max-h-[min(52vh,28rem)] min-w-0 overflow-auto rounded-lg border oaix-scrollbar">
               <Table className="table-fixed">
                 <colgroup>
-                  <col className="w-[25%]" />
+                  <col className="w-[28%]" />
                   <col className="w-[7rem]" />
                   <col className="w-[10rem]" />
                   <col className="w-[10rem]" />
-                  <col className="w-[9rem]" />
-                  <col className="w-[9rem]" />
+                  <col className="w-[9.5rem]" />
                   <col />
                 </colgroup>
                 <TableHeader>
@@ -830,8 +829,7 @@ function ImportBatchDetailDialog({
                     <TableHead>状态</TableHead>
                     <TableHead>额度</TableHead>
                     <TableHead>并发 / 金额</TableHead>
-                    <TableHead>最近使用</TableHead>
-                    <TableHead>重置时间</TableHead>
+                    <TableHead>最近</TableHead>
                     <TableHead>备注</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -981,11 +979,15 @@ function ImportBatchTokenRow({ token }: { token: TokenItem }) {
           <TokenObservedCost value={token.observed_cost_usd} />
         </div>
       </TableCell>
-      <TableCell className="whitespace-nowrap py-2 align-middle text-muted-foreground text-xs oaix-tabular" title={formatDate(token.last_used_at)}>
-        {formatDate(token.last_used_at)}
-      </TableCell>
-      <TableCell className="whitespace-nowrap py-2 align-middle text-muted-foreground text-xs oaix-tabular" title={tokenResetAtLabel(token)}>
-        {tokenResetAtLabel(token)}
+      <TableCell className="py-2 align-middle">
+        <div className="grid max-h-10 gap-1 overflow-hidden text-muted-foreground text-xs">
+          <span className="oaix-tabular" title={formatDate(token.last_used_at)}>
+            最近 {formatDate(token.last_used_at)}
+          </span>
+          <span className="oaix-tabular" title={tokenResetAtLabel(token)}>
+            重置 {tokenResetAtLabel(token)}
+          </span>
+        </div>
       </TableCell>
       <TableCell className="py-2 align-top">
         <span className="block min-w-0 whitespace-pre-wrap break-words text-muted-foreground text-xs leading-relaxed [overflow-wrap:anywhere]" title={note}>
