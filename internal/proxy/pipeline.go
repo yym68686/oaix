@@ -55,6 +55,7 @@ type RequestIntent struct {
 	SelectionMode       string
 	CallerOwnerUserID   int64
 	ExcludeOwnerUserID  int64
+	TargetTokenID       int64
 	Stream              bool
 	Compact             bool
 	Method              string
@@ -175,6 +176,9 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	if intent.ExcludeOwnerUserID > 0 {
 		timing["exclude_owner_user_id"] = intent.ExcludeOwnerUserID
 	}
+	if intent.TargetTokenID > 0 {
+		timing["target_token_id"] = intent.TargetTokenID
+	}
 	p.logs.Submit(r.Context(), store.RequestLog{
 		RequestID:                     requestID,
 		OwnerUserID:                   ptrInt64(intent.OwnerUserID),
@@ -223,6 +227,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			OwnerUserID:        intent.OwnerUserID,
 			SelectionMode:      intent.SelectionMode,
 			ExcludeOwnerUserID: intent.ExcludeOwnerUserID,
+			TargetTokenID:      intent.TargetTokenID,
 			ExcludeTokenIDs:    excluded,
 		}
 		if promptCacheContext != nil {
@@ -736,6 +741,7 @@ func (p *Pipeline) tokenStateEventContext(requestID string, intent RequestIntent
 		Metadata: map[string]any{
 			"outcome":               string(outcome),
 			"exclude_owner_user_id": intent.ExcludeOwnerUserID,
+			"target_token_id":       intent.TargetTokenID,
 		},
 	}
 }

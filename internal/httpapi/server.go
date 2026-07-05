@@ -1291,7 +1291,19 @@ func (a *App) proxyRequest(w http.ResponseWriter, r *http.Request, intent proxy.
 	}
 	intent.OwnerUserID = ownerID
 	intent.APIKeyID = auth.APIKeyID
+	if value := strings.TrimSpace(r.Header.Get("X-OAIX-Target-Token-ID")); value != "" {
+		parsed, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || parsed <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "invalid X-OAIX-Target-Token-ID"})
+			return
+		}
+		intent.TargetTokenID = parsed
+	}
 	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-OAIX-Selection-Mode")), "marketplace") {
+		if intent.TargetTokenID > 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "X-OAIX-Target-Token-ID cannot be used with marketplace selection"})
+			return
+		}
 		if !auth.IsService && !auth.IsAdmin {
 			writeJSON(w, http.StatusForbidden, map[string]any{"detail": "marketplace selection requires service or admin auth"})
 			return
@@ -1330,7 +1342,7 @@ func (a *App) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,Content-Encoding,X-API-Key,X-Request-ID,Idempotency-Key,X-OAIX-Act-As-User,X-OAIX-Selection-Mode,X-OAIX-Exclude-Owner")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,Content-Encoding,X-API-Key,X-Request-ID,Idempotency-Key,X-OAIX-Act-As-User,X-OAIX-Selection-Mode,X-OAIX-Exclude-Owner,X-OAIX-Target-Token-ID")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

@@ -33,6 +33,10 @@ type PromptAffinityResult struct {
 }
 
 func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store, intent Intent, opts PromptAffinityOptions) (*Claim, PromptAffinityResult, error) {
+	if intent.TargetTokenID > 0 {
+		claim, err := m.Claim(ctx, intent)
+		return claim, PromptAffinityResult{Result: claimReason(claim)}, err
+	}
 	if store == nil || (opts.AffinityKey == "" && opts.PreviousResponseID == "") {
 		claim, err := m.Claim(ctx, intent)
 		return claim, PromptAffinityResult{Result: claimReason(claim)}, err
@@ -190,7 +194,7 @@ func (m *Manager) snapshotForClaim(ctx context.Context, intent Intent) (*Snapsho
 	return snapshot, cursorState, nil
 }
 
-func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent Intent, tokenID int64, wait time.Duration, reason string) *Claim {
+func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent Intent, tokenID int64, wait time.Duration, reason string, candidateCount ...int) *Claim {
 	if tokenID <= 0 || snapshot == nil {
 		return nil
 	}
@@ -218,7 +222,11 @@ func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent 
 		} else {
 			next := candidate.Active.Add(1)
 			if next <= activeCap {
-				return m.newClaim(snapshot, intent, candidate, reason, activeBefore, next, activeCap, len(snapshot.Ready), time.Now().UTC())
+				count := len(snapshot.Ready)
+				if len(candidateCount) > 0 && candidateCount[0] > 0 {
+					count = candidateCount[0]
+				}
+				return m.newClaim(snapshot, intent, candidate, reason, activeBefore, next, activeCap, count, time.Now().UTC())
 			}
 			candidate.Active.Add(-1)
 			m.recordOverCapDenial()
@@ -242,6 +250,9 @@ func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent 
 
 func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 	if candidate == nil {
+		return false
+	}
+	if intent.TargetTokenID > 0 && candidate.Token.ID != intent.TargetTokenID {
 		return false
 	}
 	if strings.EqualFold(strings.TrimSpace(intent.SelectionMode), "marketplace") {

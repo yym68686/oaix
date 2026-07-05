@@ -150,6 +150,7 @@ type Intent struct {
 	OwnerUserID        int64
 	SelectionMode      string
 	ExcludeOwnerUserID int64
+	TargetTokenID      int64
 	PromptCacheKeyHash string
 	ExcludeTokenIDs    map[int64]struct{}
 	RequireNonFree     bool
@@ -600,6 +601,16 @@ func (m *Manager) Claim(ctx context.Context, intent Intent) (*Claim, error) {
 			m.recordNoTokenDenial()
 		}
 		return nil, err
+	}
+	if intent.TargetTokenID > 0 {
+		if claim := m.claimSpecific(ctx, claimSnapshot, intent, intent.TargetTokenID, 0, "target_token", 1); claim != nil {
+			return claim, nil
+		}
+		if snapshotHasCapBlockedToken(claimSnapshot, intent, m.ActiveStreamCap()) {
+			m.recordOverCapDenial()
+		}
+		m.recordNoTokenDenial()
+		return nil, ErrNoToken
 	}
 	total := uint64(len(claimSnapshot.Ready))
 	selector := m.selector

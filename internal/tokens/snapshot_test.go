@@ -245,6 +245,55 @@ func TestManagerClaimLoadsOwnerSnapshotLazily(t *testing.T) {
 	}
 }
 
+func TestManagerClaimTargetTokenUsesOwnerScopedSnapshot(t *testing.T) {
+	rows := makeTokens(4)
+	rows[0].OwnerUserID = 10
+	rows[1].OwnerUserID = 10
+	rows[2].OwnerUserID = 20
+	rows[3].OwnerUserID = 20
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, slog.Default(), time.Second, time.Second, 2)
+
+	claim, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10, TargetTokenID: 2})
+	if err != nil {
+		t.Fatalf("Claim returned error: %v", err)
+	}
+	defer claim.Release()
+	if claim.Token.Token.ID != 2 {
+		t.Fatalf("claimed token = %d, want target token 2", claim.Token.Token.ID)
+	}
+	if claim.Token.Token.OwnerUserID != 10 {
+		t.Fatalf("claimed owner = %d, want 10", claim.Token.Token.OwnerUserID)
+	}
+	if claim.Telemetry.Reason != "target_token" {
+		t.Fatalf("claim reason = %q, want target_token", claim.Telemetry.Reason)
+	}
+	if claim.Telemetry.CandidateCount != 1 {
+		t.Fatalf("candidate count = %d, want 1", claim.Telemetry.CandidateCount)
+	}
+	if source.scopedCalls == 0 || source.scopedOwner != 10 {
+		t.Fatalf("scoped source calls=%d owner=%d, want owner scoped call for 10", source.scopedCalls, source.scopedOwner)
+	}
+}
+
+func TestManagerClaimTargetTokenDoesNotFallbackToOwnerPool(t *testing.T) {
+	rows := makeTokens(3)
+	rows[0].OwnerUserID = 10
+	rows[1].OwnerUserID = 10
+	rows[2].OwnerUserID = 20
+	manager := NewManager(&fakeSource{tokens: rows}, slog.Default(), time.Second, time.Second, 2)
+
+	claim, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10, TargetTokenID: 3})
+	if err != ErrNoToken {
+		t.Fatalf("Claim error = %v claim=%v, want ErrNoToken", err, claim)
+	}
+
+	claim, err = manager.Claim(context.Background(), Intent{OwnerUserID: 10, TargetTokenID: 99})
+	if err != ErrNoToken {
+		t.Fatalf("Claim missing target error = %v claim=%v, want ErrNoToken", err, claim)
+	}
+}
+
 func TestManagerMarketplaceClaimUsesGlobalSnapshot(t *testing.T) {
 	rows := makeTokens(3)
 	rows[0].OwnerUserID = 1

@@ -719,6 +719,84 @@ func TestProxyDeactivatesAndRetriesAfterDeactivatedWorkspace402(t *testing.T) {
 	}
 }
 
+func TestProxyTargetTokenDoesNotFallbackAcrossOwnerPool(t *testing.T) {
+	var mu sync.Mutex
+	var authHeaders []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"code":"invalid_api_key","message":"invalid"}}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                2,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	now := time.Now().UTC()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, OwnerUserID: 10, AccessToken: "target-token", IsActive: true, CreatedAt: now, UpdatedAt: now},
+			{ID: 2, OwnerUserID: 10, AccessToken: "other-owner-token", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorEvents: make(chan tokenErrorEvent, 2),
+	}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", OwnerUserID: 10, TargetTokenID: 1})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	mu.Lock()
+	gotAuthHeaders := append([]string(nil), authHeaders...)
+	mu.Unlock()
+	if len(gotAuthHeaders) != 1 {
+		t.Fatalf("upstream calls = %d, want only target token attempt", len(gotAuthHeaders))
+	}
+	if gotAuthHeaders[0] != "Bearer target-token" {
+		t.Fatalf("auth headers = %v, want target token only", gotAuthHeaders)
+	}
+	select {
+	case event := <-fakes.tokenErrorEvents:
+		if event.TokenID != 1 || !event.Deactivate {
+			t.Fatalf("token error event = %+v, want token 1 deactivated", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for target token deactivate commit")
+	}
+	select {
+	case event := <-fakes.tokenErrorEvents:
+		t.Fatalf("unexpected second token error event: %+v", event)
+	default:
+	}
+}
+
 func TestProxyPaymentRequiredWithoutDeactivatedWorkspaceDoesNotDeactivateToken(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
