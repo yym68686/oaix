@@ -150,6 +150,9 @@ func apiKeyManagementScope(ctx context.Context, st *store.Store, w http.Response
 		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
 		return store.ResourceScope{}, false
 	}
+	if (auth.IsService || auth.IsAdmin) && auth.ActAsUserID != nil && *auth.ActAsUserID > 0 {
+		return store.OwnerResources(*auth.ActAsUserID), true
+	}
 	if auth.UserID != nil {
 		return store.OwnerResources(*auth.UserID), true
 	}
@@ -704,11 +707,11 @@ func userScope(w http.ResponseWriter, auth *AuthContext) (store.ResourceScope, b
 		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
 		return store.ResourceScope{}, false
 	}
-	if auth.UserID != nil {
-		return store.OwnerResources(*auth.UserID), true
-	}
 	if (auth.IsService || auth.IsAdmin) && auth.ActAsUserID != nil && *auth.ActAsUserID > 0 {
 		return store.OwnerResources(*auth.ActAsUserID), true
+	}
+	if auth.UserID != nil {
+		return store.OwnerResources(*auth.UserID), true
 	}
 	writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
 	return store.ResourceScope{}, false
@@ -719,11 +722,11 @@ func (a *App) tokenSelfScope(ctx context.Context, w http.ResponseWriter, auth *A
 		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "User API key required"})
 		return store.ResourceScope{}, false
 	}
-	if auth.UserID != nil {
-		return store.OwnerResources(*auth.UserID), true
-	}
 	if (auth.IsService || auth.IsAdmin) && auth.ActAsUserID != nil && *auth.ActAsUserID > 0 {
 		return store.OwnerResources(*auth.ActAsUserID), true
+	}
+	if auth.UserID != nil {
+		return store.OwnerResources(*auth.UserID), true
 	}
 	if auth.IsService || auth.IsAdmin {
 		if a == nil || a.store == nil {

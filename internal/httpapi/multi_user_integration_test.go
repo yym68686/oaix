@@ -325,6 +325,99 @@ func TestServiceAPIKeyActsAsPlatformUserForSelfRoutes(t *testing.T) {
 	}
 }
 
+func TestServiceAPIKeyActAsOverridesPlatformUserForSelfRoutes(t *testing.T) {
+	h := newMultiUserHarness(t)
+	ctx := context.Background()
+	platformUser, err := h.db.BootstrapUser(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	platformTokenA := h.createToken(t, platformUser.ID, "service-actas-platform-a")
+	platformTokenB := h.createToken(t, platformUser.ID, "service-actas-platform-b")
+	targetUser, _ := h.createUser(t, "service-actas-target")
+	targetToken := h.createToken(t, targetUser.ID, "service-actas-target")
+	platformJob, err := h.db.CreateCompletedImportJobForOwner(ctx, platformUser.ID, []map[string]any{{
+		"refresh_token": "rt-service-actas-platform-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+	}}, "front", store.ImportResult{Created: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetJob, err := h.db.CreateCompletedImportJobForOwner(ctx, targetUser.ID, []map[string]any{{
+		"refresh_token": "rt-service-actas-target-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+	}}, "front", store.ImportResult{Created: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := map[string]string{"X-OAIX-Act-As-User": strconv.FormatInt(targetUser.ID, 10)}
+
+	mePayload := expectStatus(t, h.requestWithHeaders(t, http.MethodGet, "/api/me", "service-test-key", "", headers), http.StatusOK)
+	if got := int64(mePayload["act_as_user_id"].(float64)); got != targetUser.ID {
+		t.Fatalf("act_as_user_id = %d, want %d", got, targetUser.ID)
+	}
+	user, _ := mePayload["user"].(map[string]any)
+	if user == nil || int64(user["id"].(float64)) != platformUser.ID {
+		t.Fatalf("service principal user = %#v, want platform user %d", user, platformUser.ID)
+	}
+
+	poolPayload := expectStatus(t, h.requestWithHeaders(t, http.MethodGet, "/api/me/pool-summary", "service-test-key", "", headers), http.StatusOK)
+	counts, _ := poolPayload["counts"].(map[string]any)
+	if counts == nil || int64(counts["total"].(float64)) != 1 {
+		t.Fatalf("act-as pool counts = %#v, want target user's single token", counts)
+	}
+
+	tokensPayload := expectStatus(t, h.requestWithHeaders(t, http.MethodGet, "/api/tokens?limit=20", "service-test-key", "", headers), http.StatusOK)
+	items, _ := tokensPayload["items"].([]any)
+	seenTarget := false
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		id := int64(item["id"].(float64))
+		ownerID := int64(item["owner_user_id"].(float64))
+		if ownerID != targetUser.ID {
+			t.Fatalf("act-as token list leaked owner %d item=%#v", ownerID, item)
+		}
+		if id == targetToken.ID {
+			seenTarget = true
+		}
+		if id == platformTokenA.ID || id == platformTokenB.ID {
+			t.Fatalf("act-as token list included platform token %d", id)
+		}
+	}
+	if !seenTarget {
+		t.Fatalf("act-as token list did not include target token %d: %#v", targetToken.ID, items)
+	}
+
+	jobsPayload := expectStatus(t, h.requestWithHeaders(t, http.MethodGet, "/api/import/jobs?limit=20", "service-test-key", "", headers), http.StatusOK)
+	jobs, _ := jobsPayload["items"].([]any)
+	seenTargetJob := false
+	for _, raw := range jobs {
+		item, _ := raw.(map[string]any)
+		id := int64(item["id"].(float64))
+		ownerID := int64(item["owner_user_id"].(float64))
+		if ownerID != targetUser.ID {
+			t.Fatalf("act-as import jobs leaked owner %d item=%#v", ownerID, item)
+		}
+		if id == targetJob.ID {
+			seenTargetJob = true
+		}
+		if id == platformJob.ID {
+			t.Fatalf("act-as import jobs included platform job %d", id)
+		}
+	}
+	if !seenTargetJob {
+		t.Fatalf("act-as import jobs did not include target job %d: %#v", targetJob.ID, jobs)
+	}
+
+	platformPayload := expectStatus(t, h.request(t, http.MethodGet, "/api/tokens?limit=20", "service-test-key", ""), http.StatusOK)
+	platformItems, _ := platformPayload["items"].([]any)
+	for _, raw := range platformItems {
+		item, _ := raw.(map[string]any)
+		ownerID := int64(item["owner_user_id"].(float64))
+		if ownerID != platformUser.ID {
+			t.Fatalf("service token list without act-as leaked owner %d item=%#v", ownerID, item)
+		}
+	}
+}
+
 func TestMultiUserAPIIsolationWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userA, keyA := h.createUser(t, "isolation-a")
