@@ -14,6 +14,7 @@ export type RouteKey =
   | "admin_user_detail"
   | "admin_pools"
   | "admin_pool_detail"
+  | "admin_imports"
   | "admin_requests"
   | "admin_audit"
   | "admin_sub2api";

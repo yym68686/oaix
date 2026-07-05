@@ -156,13 +156,16 @@ export function ApiKeyTable({
 export function ImportJobsTable({
   items,
   loading = false,
+  ownerLabel,
   scope,
 }: {
   items: ImportBatch[];
   loading?: boolean;
+  ownerLabel?: (ownerUserID: number) => string;
   scope?: ResourceScope;
 }) {
   void scope;
+  const showOwner = Boolean(ownerLabel);
   if (loading && !items.length) {
     return <LoadingState label="正在载入导入批次" />;
   }
@@ -175,6 +178,7 @@ export function ImportJobsTable({
         <TableHeader>
           <TableRow>
             <TableHead>批次</TableHead>
+            {showOwner && <TableHead>账号</TableHead>}
             <TableHead>状态</TableHead>
             <TableHead>进度</TableHead>
             <TableHead>结果</TableHead>
@@ -185,6 +189,7 @@ export function ImportJobsTable({
           {items.map((item) => (
             <TableRow key={item.id}>
               <TableCell>#{item.id}</TableCell>
+              {showOwner && <TableCell className="max-w-72 truncate">{ownerLabel?.(Number(item.owner_user_id || 0)) || "-"}</TableCell>}
               <TableCell>
                 <Badge variant={item.status === "completed" ? "success" : "secondary"}>{item.status}</Badge>
               </TableCell>

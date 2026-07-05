@@ -19,6 +19,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Textarea } from "@/registry/default/ui/textarea";
 import {
   api,
+  isAuthContextPending,
   type ImportBatch,
   type ImportBatchDetail,
   type TokenCounts,
@@ -424,6 +425,9 @@ function ImportBatchesPage({
   const handledOAuthResultRef = useRef("");
 
   const loadBatches = useCallback(async () => {
+    if (isAuthContextPending()) {
+      return;
+    }
     setLoading(true);
     setError("");
     try {

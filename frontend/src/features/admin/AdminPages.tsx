@@ -1,4 +1,4 @@
-import { FileClockIcon, ListFilterIcon, SearchIcon, UserRoundIcon, UsersRoundIcon } from "lucide-react";
+import { FileClockIcon, ListFilterIcon, SearchIcon, UploadIcon, UserRoundIcon, UsersRoundIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { navigateTo, type RouteState } from "@/app/router";
 import { Badge } from "@/registry/default/ui/badge";
@@ -423,6 +423,91 @@ export function AdminPoolsPage({
         route={route}
       />
     </div>
+  );
+}
+
+export function AdminImportsPage({ refreshNonce }: { refreshNonce: number }) {
+  const [items, setItems] = useState<ImportBatch[]>([]);
+  const [users, setUsers] = useState<PlatformUser[]>([]);
+  const [userID, setUserID] = useState("all");
+  const [loading, setLoading] = useState(true);
+  const [loadingUsers, setLoadingUsers] = useState(true);
+  const [error, setError] = useState("");
+
+  const loadUsers = useCallback(async () => {
+    setLoadingUsers(true);
+    try {
+      const payload = await api.adminUsers(new URLSearchParams({ limit: "500" }));
+      setUsers(payload.items || []);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setLoadingUsers(false);
+    }
+  }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const selected = userID === "all" ? 0 : Number(userID);
+      if (userID !== "all" && (!Number.isInteger(selected) || selected <= 0)) {
+        throw new Error("User ID 无效");
+      }
+      const payload = selected > 0
+        ? await api.adminUserImportJobs(selected, new URLSearchParams({ limit: "120" }))
+        : await api.importJobs(120, "admin");
+      setItems(payload.items || []);
+    } catch (caught) {
+      setError(errorMessage(caught));
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [userID]);
+
+  useEffect(() => {
+    void loadUsers();
+  }, [loadUsers, refreshNonce]);
+
+  useEffect(() => {
+    void load();
+  }, [load, refreshNonce]);
+
+  const ownerOptions = useMemo(
+    () => [
+      { label: loadingUsers ? "全部账号 · 载入中" : "全部账号", value: "all" },
+      ...users.map((user) => ({
+        label: `${user.email || `User #${user.id}`} · ID ${user.id}`,
+        value: String(user.id),
+      })),
+    ],
+    [loadingUsers, users],
+  );
+  const ownerByID = useMemo(() => new Map(users.map((user) => [user.id, user])), [users]);
+  const ownerLabel = useCallback(
+    (ownerUserID: number) => {
+      const user = ownerByID.get(ownerUserID);
+      return user ? `${user.email || `User #${ownerUserID}`} · ID ${ownerUserID}` : `User #${ownerUserID || "-"}`;
+    },
+    [ownerByID],
+  );
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <UploadIcon className="size-5" />
+          全局导入
+        </CardTitle>
+        <CardDescription>查看所有账号的导入批次，可按账号筛选。</CardDescription>
+      </CardHeader>
+      <CardPanel className="grid gap-3">
+        {error && <ErrorAlert title="全局导入载入失败" message={error} />}
+        <SelectField label="账号" onChange={setUserID} options={ownerOptions} value={userID} />
+        <ImportJobsTable items={items} loading={loading && !items.length} ownerLabel={ownerLabel} scope={{ kind: "all" }} />
+      </CardPanel>
+    </Card>
   );
 }
 

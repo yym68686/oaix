@@ -123,6 +123,7 @@ export type TokenListResponse = {
 
 export type ImportBatch = {
   id: number;
+  owner_user_id?: number | null;
   status: string;
   import_queue_position?: string | null;
   submitted_at?: string | null;
@@ -404,6 +405,10 @@ export function isSelfUserMode(): boolean {
   return Boolean(currentAuth?.user?.id) && !isAdminPrincipal(currentAuth);
 }
 
+export function hasUserPrincipal(value: MeResponse | null = currentAuth): boolean {
+  return Boolean(value?.user?.id);
+}
+
 export function getServiceKey(): string {
   try {
     const current = window.localStorage.getItem(KEY_STORAGE) || "";
@@ -435,6 +440,10 @@ export function setServiceKey(value: string): void {
 
 export function hasServiceKey(): boolean {
   return getServiceKey().trim() !== "";
+}
+
+export function isAuthContextPending(): boolean {
+  return hasServiceKey() && currentAuth == null;
 }
 
 async function requestJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -499,7 +508,7 @@ function patchJSON<T>(path: string, body: unknown): Promise<T> {
 }
 
 function scopedPath(userPath: string, adminPath: string): string {
-  return isSelfUserMode() ? userPath : adminPath;
+  return hasUserPrincipal() ? userPath : adminPath;
 }
 
 export type TokenAPIScope = "auto" | "self" | "admin";
@@ -515,8 +524,10 @@ function tokenScopedPath(userPath: string, adminPath: string, scope: TokenAPISco
 }
 
 function oauthBase(): string {
-  return isSelfUserMode() ? "/api/oauth/openai" : "/admin/oauth/openai";
+  return hasUserPrincipal() ? "/api/oauth/openai" : "/admin/oauth/openai";
 }
+
+export type ImportAPIScope = "self" | "admin";
 
 export const api = {
   health: () => requestJSON<HealthResponse>("/healthz"),
@@ -596,10 +607,12 @@ export const api = {
     const sessionID = String(payload.session_id || "");
     return postJSON<OpenAIOAuthExchangeResponse>(`${oauthBase()}/sessions/${encodeURIComponent(sessionID)}/exchange`, payload);
   },
-  importJobs: (limit = 50) =>
-    requestJSON<{ items?: ImportBatch[] }>(isSelfUserMode() ? `/api/import/jobs?limit=${limit}` : `/admin/tokens/import-batches?limit=${limit}`),
-  importJob: async (id: number) => {
-    if (!isSelfUserMode()) {
+  importJobs: (limit = 50, scope: ImportAPIScope = "self") =>
+    requestJSON<{ items?: ImportBatch[] }>(
+      scope === "admin" || !hasUserPrincipal() ? `/admin/tokens/import-batches?limit=${limit}` : `/api/import/jobs?limit=${limit}`,
+    ),
+  importJob: async (id: number, scope: ImportAPIScope = "self") => {
+    if (scope === "admin" || !hasUserPrincipal()) {
       return requestJSON<ImportBatchDetail>(`/admin/tokens/import-jobs/${id}?include_quota=true`);
     }
     const [jobPayload, itemPayload, tokenPayload] = await Promise.all([
@@ -613,12 +626,15 @@ export const api = {
       tokens: tokenPayload.items || [],
     } satisfies ImportBatchDetail;
   },
-  cancelImportJob: (id: number) =>
-    postJSON<Record<string, unknown>>(scopedPath(`/api/import/jobs/${id}/cancel`, `/admin/tokens/import-jobs/${id}/cancel`), {}),
-  deleteImportJob: (id: number) =>
-    deleteJSON<Record<string, unknown>>(scopedPath(`/api/import/jobs/${id}`, `/admin/tokens/import-jobs/${id}`)),
+  cancelImportJob: (id: number, scope: ImportAPIScope = "self") =>
+    postJSON<Record<string, unknown>>(
+      scope === "admin" || !hasUserPrincipal() ? `/admin/tokens/import-jobs/${id}/cancel` : `/api/import/jobs/${id}/cancel`,
+      {},
+    ),
+  deleteImportJob: (id: number, scope: ImportAPIScope = "self") =>
+    deleteJSON<Record<string, unknown>>(scope === "admin" || !hasUserPrincipal() ? `/admin/tokens/import-jobs/${id}` : `/api/import/jobs/${id}`),
   requests: async (limit = 80) => {
-    if (!isSelfUserMode()) {
+    if (!hasUserPrincipal()) {
       return requestJSON<{ items?: RequestItem[]; summary?: RequestSummary }>(`/admin/requests?limit=${limit}`);
     }
     const [requestPayload, usagePayload] = await Promise.all([
@@ -639,7 +655,7 @@ export const api = {
     };
   },
   analytics: (hours = 24) => {
-    if (isSelfUserMode()) {
+    if (hasUserPrincipal()) {
       return Promise.resolve({ hours, models: [] });
     }
     return requestJSON<Record<string, unknown>>(`/admin/analytics?hours=${hours}`);

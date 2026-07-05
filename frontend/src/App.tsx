@@ -6,7 +6,7 @@ import { KeyDetailPage, KeysPage } from "@/features/keys/KeysPage";
 import { RequestsPage } from "@/features/requests/RequestsPage";
 import { RuntimePage } from "@/features/runtime/RuntimePage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
-import { AdminAuditPage, AdminPoolsPage, AdminRequestsPage, AdminUserDetailPage, AdminUsersPage } from "@/features/admin/AdminPages";
+import { AdminAuditPage, AdminImportsPage, AdminPoolsPage, AdminRequestsPage, AdminUserDetailPage, AdminUsersPage } from "@/features/admin/AdminPages";
 import { AdminSub2APIPage } from "@/features/admin/Sub2APIPage";
 import { api, hasServiceKey, isAdminPrincipal, isSelfUserMode, setAuthContext, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
 import { applyTheme, errorMessage, readThemePreference } from "@/shared/domain";
@@ -133,6 +133,8 @@ export function App(): React.ReactElement {
     );
   } else if (route.key === "admin_requests") {
     page = <AdminRequestsPage refreshNonce={refreshNonce} />;
+  } else if (route.key === "admin_imports") {
+    page = <AdminImportsPage refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_audit") {
     page = <AdminAuditPage refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_sub2api") {

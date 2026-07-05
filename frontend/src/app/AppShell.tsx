@@ -48,6 +48,7 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { adminOnly: true, key: "admin_users", href: "/admin/users", icon: <UsersRoundIcon />, label: "用户状态" },
       { adminOnly: true, key: "admin_pools", href: "/admin/pools", icon: <DatabaseIcon />, label: "号池总览" },
+      { adminOnly: true, key: "admin_imports", href: "/admin/imports", icon: <UploadIcon />, label: "全局导入" },
       { adminOnly: true, key: "admin_requests", href: "/admin/requests", icon: <ListFilterIcon />, label: "全局请求" },
       { adminOnly: true, key: "admin_audit", href: "/admin/audit", icon: <ShieldCheckIcon />, label: "审计" },
       { adminOnly: true, key: "admin_sub2api", href: "/admin/sub2api", icon: <SendIcon />, label: "Sub2API" },

@@ -20,6 +20,8 @@ func TestFrontendAdminNavigationContract(t *testing.T) {
 		`label: "用户状态"`,
 		`{ adminOnly: true, key: "admin_pools", href: "/admin/pools"`,
 		`label: "号池总览"`,
+		`{ adminOnly: true, key: "admin_imports", href: "/admin/imports"`,
+		`label: "全局导入"`,
 	} {
 		if !strings.Contains(appShell, required) {
 			t.Fatalf("AppShell admin navigation contract missing %q", required)
@@ -36,6 +38,9 @@ func TestFrontendAdminPagesContract(t *testing.T) {
 		"KeyListPage",
 		`apiScope: "admin"`,
 		"ownerFilterOptions",
+		"AdminImportsPage",
+		"api.importJobs(120, \"admin\")",
+		"api.adminUserImportJobs",
 		`detailBasePath: "/admin/pools"`,
 	} {
 		if !strings.Contains(adminPages, required) {
@@ -52,6 +57,22 @@ func TestFrontendKeysPageUsesSelfScope(t *testing.T) {
 	} {
 		if !strings.Contains(keysPage, required) {
 			t.Fatalf("KeysPage must force normal key routes through self token APIs: missing %q", required)
+		}
+	}
+}
+
+func TestFrontendUserAreaUsesUserPrincipalScope(t *testing.T) {
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+	for _, required := range []string{
+		"export function hasUserPrincipal",
+		`scopedPath(userPath: string, adminPath: string): string`,
+		`return hasUserPrincipal() ? userPath : adminPath`,
+		"export function isAuthContextPending",
+		`importJobs: (limit = 50, scope: ImportAPIScope = "self")`,
+		`scope === "admin" || !hasUserPrincipal() ?`,
+	} {
+		if !strings.Contains(apiFile, required) {
+			t.Fatalf("user area APIs must use user principal scope before admin fallback: missing %q", required)
 		}
 	}
 }

@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/registry/default/ui/badge";
 import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
-import { api, type RequestItem, type RequestSummary } from "@/lib/api";
+import { api, isAuthContextPending, type RequestItem, type RequestSummary } from "@/lib/api";
 import { formatDate, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert, LoadingRows, MiniMetric } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
@@ -17,6 +17,9 @@ export function RequestsPage({ refreshNonce }: { refreshNonce: number }) {
   const [error, setError] = useState("");
 
   const loadRequests = useCallback(async () => {
+    if (isAuthContextPending()) {
+      return;
+    }
     setLoading(true);
     setError("");
     try {
