@@ -20,6 +20,9 @@ const (
 	planPro     = "pro"
 	planUnknown = "unknown"
 
+	DefaultMarketplacePriceBPS = 250
+	MaxMarketplacePriceBPS     = 250
+
 	transientRetryCooldownPrefix        = "retryable upstream failure:"
 	transientRetryCooldownDisplayWindow = time.Minute
 )
@@ -27,27 +30,30 @@ const (
 var primaryPlanOrder = []string{planFree, planPlus, planTeam, planPro}
 
 type Token struct {
-	ID              int64      `json:"id"`
-	OwnerUserID     int64      `json:"owner_user_id"`
-	Email           *string    `json:"email,omitempty"`
-	AccountID       *string    `json:"account_id,omitempty"`
-	AccessToken     string     `json:"-"`
-	RefreshToken    string     `json:"-"`
-	PlanType        *string    `json:"plan_type,omitempty"`
-	Remark          *string    `json:"remark,omitempty"`
-	SourceFile      *string    `json:"source_file,omitempty"`
-	IsActive        bool       `json:"is_active"`
-	CooldownUntil   *time.Time `json:"cooldown_until,omitempty"`
-	DisabledAt      *time.Time `json:"disabled_at,omitempty"`
-	ShareEnabled    bool       `json:"share_enabled"`
-	ShareStatus     string     `json:"share_status,omitempty"`
-	ShareReason     *string    `json:"share_disabled_reason,omitempty"`
-	ShareEnabledAt  *time.Time `json:"share_enabled_at,omitempty"`
-	ShareDisabledAt *time.Time `json:"share_disabled_at,omitempty"`
-	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
-	LastError       *string    `json:"last_error,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ID                        int64      `json:"id"`
+	OwnerUserID               int64      `json:"owner_user_id"`
+	Email                     *string    `json:"email,omitempty"`
+	AccountID                 *string    `json:"account_id,omitempty"`
+	AccessToken               string     `json:"-"`
+	RefreshToken              string     `json:"-"`
+	PlanType                  *string    `json:"plan_type,omitempty"`
+	Remark                    *string    `json:"remark,omitempty"`
+	SourceFile                *string    `json:"source_file,omitempty"`
+	IsActive                  bool       `json:"is_active"`
+	CooldownUntil             *time.Time `json:"cooldown_until,omitempty"`
+	DisabledAt                *time.Time `json:"disabled_at,omitempty"`
+	ShareEnabled              bool       `json:"share_enabled"`
+	ShareStatus               string     `json:"share_status,omitempty"`
+	ShareReason               *string    `json:"share_disabled_reason,omitempty"`
+	ShareEnabledAt            *time.Time `json:"share_enabled_at,omitempty"`
+	ShareDisabledAt           *time.Time `json:"share_disabled_at,omitempty"`
+	MarketplacePriceBPS       *int       `json:"marketplace_price_bps,omitempty"`
+	MarketplacePriceUpdatedAt *time.Time `json:"marketplace_price_updated_at,omitempty"`
+	MarketplacePriceSource    string     `json:"marketplace_price_source,omitempty"`
+	LastUsedAt                *time.Time `json:"last_used_at,omitempty"`
+	LastError                 *string    `json:"last_error,omitempty"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
 }
 
 type TokenObservedCost struct {
@@ -126,6 +132,15 @@ type TokenSharingCounts struct {
 	Private int `json:"private"`
 }
 
+type TokenMarketplacePricingSummary struct {
+	DefaultPriceBPS int  `json:"default_price_bps"`
+	MinPriceBPS     *int `json:"min_price_bps,omitempty"`
+	MaxPriceBPS     *int `json:"max_price_bps,omitempty"`
+	AvgPriceBPS     *int `json:"avg_price_bps,omitempty"`
+	PricedCount     int  `json:"priced_count"`
+	Total           int  `json:"total"`
+}
+
 type RefreshTokenIdentity struct {
 	TokenID int64  `json:"token_id"`
 	Hash    string `json:"hash"`
@@ -155,6 +170,7 @@ func (s *Store) ListAvailableTokensScoped(ctx context.Context, scope ResourceSco
 		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 		       last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where is_active = true
@@ -213,6 +229,7 @@ func (s *Store) ListTokensScoped(ctx context.Context, scope ResourceScope, opts 
 		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 		       last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where %s
@@ -375,6 +392,7 @@ func (s *Store) ListTokensByIDsScoped(ctx context.Context, scope ResourceScope, 
 		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 		       last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where id = any($1::integer[])
@@ -438,6 +456,41 @@ func (s *Store) TokenSharingCountsScoped(ctx context.Context, scope ResourceScop
 		where merged_into_token_id is null
 		  and `+ownerWhere, args...).Scan(&counts.Shared, &counts.Private)
 	return counts, err
+}
+
+func (s *Store) TokenMarketplacePricingSummaryScoped(ctx context.Context, scope ResourceScope) (TokenMarketplacePricingSummary, error) {
+	summary := TokenMarketplacePricingSummary{DefaultPriceBPS: DefaultMarketplacePriceBPS}
+	args := []any{DefaultMarketplacePriceBPS}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	var minPrice sql.NullInt64
+	var maxPrice sql.NullInt64
+	var avgPrice sql.NullFloat64
+	err := s.pool.QueryRow(ctx, `
+		select
+			count(*)::int as total,
+			count(marketplace_price_bps)::int as priced_count,
+			min(coalesce(marketplace_price_bps, $1))::bigint as min_price_bps,
+			max(coalesce(marketplace_price_bps, $1))::bigint as max_price_bps,
+			avg(coalesce(marketplace_price_bps, $1))::float8 as avg_price_bps
+		from codex_tokens
+		where merged_into_token_id is null
+		  and `+ownerWhere, args...).Scan(&summary.Total, &summary.PricedCount, &minPrice, &maxPrice, &avgPrice)
+	if err != nil {
+		return summary, err
+	}
+	if minPrice.Valid {
+		value := int(minPrice.Int64)
+		summary.MinPriceBPS = &value
+	}
+	if maxPrice.Valid {
+		value := int(maxPrice.Int64)
+		summary.MaxPriceBPS = &value
+	}
+	if avgPrice.Valid {
+		value := int(avgPrice.Float64 + 0.5)
+		summary.AvgPriceBPS = &value
+	}
+	return summary, nil
 }
 
 func (s *Store) TokenPlanCounts(ctx context.Context, opts TokenListOptions) ([]TokenPlanCount, error) {
@@ -716,6 +769,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 					returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 					          is_active, cooldown_until, disabled_at,
 					          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+					          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 					          last_used_at, last_error, created_at, updated_at
 				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(payload), isActive, lastError, refreshToken, lastRefresh, shareExplicit, shareEnabled, shareStatus)
 			token, scanErr := scanTokenWithSharing(row)
@@ -769,6 +823,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 				returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 				          is_active, cooldown_until, disabled_at,
 				          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+				          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 				          last_used_at, last_error, created_at, updated_at
 			`, ownerUserID, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh, shareEnabled, shareStatus, shareExplicit)
 		token, scanErr := scanTokenWithSharing(row)
@@ -1030,6 +1085,7 @@ func (s *Store) SetTokenActiveScoped(ctx context.Context, scope ResourceScope, t
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 		          last_used_at, last_error, created_at, updated_at
 	`, args...)
 	token, err := scanTokenWithSharing(row)
@@ -1050,6 +1106,7 @@ func (s *Store) GetTokenScoped(ctx context.Context, scope ResourceScope, tokenID
 		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 		       last_used_at, last_error, created_at, updated_at
 		from codex_tokens
 		where id = $1 and merged_into_token_id is null
@@ -1098,6 +1155,7 @@ func (s *Store) UpdateTokenRemarkScoped(ctx context.Context, scope ResourceScope
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 		          last_used_at, last_error, created_at, updated_at
 	`, args...)
 	token, err := scanTokenWithSharing(row)
@@ -1123,6 +1181,7 @@ func (s *Store) SetTokenSharingScoped(ctx context.Context, scope ResourceScope, 
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 		          last_used_at, last_error, created_at, updated_at
 	`, args...)
 	token, err := scanTokenWithSharing(row)
@@ -1151,6 +1210,40 @@ func (s *Store) SetTokensSharingScoped(ctx context.Context, scope ResourceScope,
 		    share_disabled_reason = case when $1 then null else nullif($3, '') end,
 		    share_enabled_at = case when $1 then coalesce(share_enabled_at, now()) else share_enabled_at end,
 		    share_disabled_at = case when $1 then null else now() end,
+		    updated_at = now()
+		where merged_into_token_id is null
+		  and `+ownerWhere+idWhere, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (s *Store) SetTokensMarketplacePriceScoped(ctx context.Context, scope ResourceScope, tokenIDs []int64, all bool, priceBPS int, source string) (int64, error) {
+	if priceBPS < 0 || priceBPS > MaxMarketplacePriceBPS {
+		return 0, fmt.Errorf("marketplace price bps must be between 0 and %d", MaxMarketplacePriceBPS)
+	}
+	ids := postgresIntIDs(tokenIDs)
+	if !all && len(ids) == 0 {
+		return 0, nil
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "owner_default"
+	}
+	source = truncate(source, 64)
+	args := []any{priceBPS, source}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	idWhere := ""
+	if !all {
+		args = append(args, ids)
+		idWhere = fmt.Sprintf(" and id = any($%d::integer[])", len(args))
+	}
+	tag, err := s.pool.Exec(ctx, `
+		update codex_tokens
+		set marketplace_price_bps = $1,
+		    marketplace_price_source = $2,
+		    marketplace_price_updated_at = now(),
 		    updated_at = now()
 		where merged_into_token_id is null
 		  and `+ownerWhere+idWhere, args...)
@@ -1319,6 +1412,8 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 		var accessToken sql.NullString
 		var refreshToken sql.NullString
 		var shareStatus sql.NullString
+		var marketplacePriceBPS sql.NullInt64
+		var marketplacePriceSource sql.NullString
 		err := rows.Scan(
 			&token.ID,
 			&token.OwnerUserID,
@@ -1337,6 +1432,9 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 			&token.ShareReason,
 			&token.ShareEnabledAt,
 			&token.ShareDisabledAt,
+			&marketplacePriceBPS,
+			&token.MarketplacePriceUpdatedAt,
+			&marketplacePriceSource,
 			&token.LastUsedAt,
 			&token.LastError,
 			&token.CreatedAt,
@@ -1353,6 +1451,13 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 		}
 		if shareStatus.Valid {
 			token.ShareStatus = shareStatus.String
+		}
+		if marketplacePriceBPS.Valid {
+			value := int(marketplacePriceBPS.Int64)
+			token.MarketplacePriceBPS = &value
+		}
+		if marketplacePriceSource.Valid {
+			token.MarketplacePriceSource = marketplacePriceSource.String
 		}
 		tokens = append(tokens, token)
 	}
@@ -1399,6 +1504,8 @@ func scanTokenWithSharing(row rowScanner) (Token, error) {
 	var accessToken sql.NullString
 	var refreshToken sql.NullString
 	var shareStatus sql.NullString
+	var marketplacePriceBPS sql.NullInt64
+	var marketplacePriceSource sql.NullString
 	err := row.Scan(
 		&token.ID,
 		&token.OwnerUserID,
@@ -1417,6 +1524,9 @@ func scanTokenWithSharing(row rowScanner) (Token, error) {
 		&token.ShareReason,
 		&token.ShareEnabledAt,
 		&token.ShareDisabledAt,
+		&marketplacePriceBPS,
+		&token.MarketplacePriceUpdatedAt,
+		&marketplacePriceSource,
 		&token.LastUsedAt,
 		&token.LastError,
 		&token.CreatedAt,
@@ -1430,6 +1540,13 @@ func scanTokenWithSharing(row rowScanner) (Token, error) {
 	}
 	if shareStatus.Valid {
 		token.ShareStatus = shareStatus.String
+	}
+	if marketplacePriceBPS.Valid {
+		value := int(marketplacePriceBPS.Int64)
+		token.MarketplacePriceBPS = &value
+	}
+	if marketplacePriceSource.Valid {
+		token.MarketplacePriceSource = marketplacePriceSource.String
 	}
 	return token, err
 }

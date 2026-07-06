@@ -557,6 +557,48 @@ func TestBulkTokenSharingScopeWithDatabase(t *testing.T) {
 	}
 }
 
+func TestBulkTokenMarketplacePriceScopeWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	userA, keyA := h.createUser(t, "bulk-price-a")
+	userB, _ := h.createUser(t, "bulk-price-b")
+	tokenA := h.createToken(t, userA.ID, "bulk-price-a")
+	tokenB := h.createToken(t, userB.ID, "bulk-price-b")
+
+	expectStatus(t, h.request(t, http.MethodPatch, "/api/tokens/marketplace-price", keyA.PlaintextKey, fmt.Sprintf(`{"token_ids":[%d,%d],"price_bps":120}`, tokenA.ID, tokenB.ID)), http.StatusOK)
+	reloadedA, err := h.db.GetToken(context.Background(), tokenA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloadedB, err := h.db.GetToken(context.Background(), tokenB.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloadedA.MarketplacePriceBPS == nil || *reloadedA.MarketplacePriceBPS != 120 {
+		t.Fatalf("owner token price was not updated: %#v", reloadedA.MarketplacePriceBPS)
+	}
+	if reloadedB.MarketplacePriceBPS != nil {
+		t.Fatalf("other owner token was modified by user-scoped pricing: %#v", reloadedB.MarketplacePriceBPS)
+	}
+
+	expectStatus(t, h.requestWithHeaders(t, http.MethodPatch, "/api/tokens/marketplace-price", "service-test-key", `{"all":true,"price_bps":90}`, map[string]string{
+		"X-OAIX-Act-As-User": strconv.FormatInt(userB.ID, 10),
+	}), http.StatusOK)
+	reloadedB, err = h.db.GetToken(context.Background(), tokenB.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloadedB.MarketplacePriceBPS == nil || *reloadedB.MarketplacePriceBPS != 90 {
+		t.Fatalf("service act-as did not update target owner token price: %#v", reloadedB.MarketplacePriceBPS)
+	}
+	reloadedA, err = h.db.GetToken(context.Background(), tokenA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloadedA.MarketplacePriceBPS == nil || *reloadedA.MarketplacePriceBPS != 120 {
+		t.Fatalf("service act-as changed non-target owner token price: %#v", reloadedA.MarketplacePriceBPS)
+	}
+}
+
 func TestMultiUserAdminAndReadonlyPermissionsWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userB, _ := h.createUser(t, "admin-read-target")

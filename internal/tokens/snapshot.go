@@ -617,6 +617,9 @@ func (m *Manager) Claim(ctx context.Context, intent Intent) (*Claim, error) {
 	if selector == nil {
 		selector = RoundRobinSelector{}
 	}
+	if isMarketplacePriceSelection(intent.SelectionMode) {
+		selector = MarketplacePriceSelector{Fallback: selector}
+	}
 	activeCap := m.ActiveStreamCap()
 	cursor := cursorState.Load()
 	for offset := uint64(0); offset < total; offset++ {
@@ -796,7 +799,16 @@ func snapshotScopeForIntent(intent Intent) string {
 }
 
 func isMarketplaceSelection(mode string) bool {
-	return strings.EqualFold(strings.TrimSpace(mode), "marketplace")
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "marketplace", "marketplace-priced":
+		return true
+	default:
+		return false
+	}
+}
+
+func isMarketplacePriceSelection(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), "marketplace-priced")
 }
 
 func (m *Manager) ownerState(ownerUserID int64) *ownerSnapshotState {

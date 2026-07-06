@@ -32,6 +32,7 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tokens/quota", a.requireAuth(a.listMyTokenQuota))
 	mux.HandleFunc("POST /api/tokens/quota-refresh", a.requireAuth(a.createMyQuotaRefreshJob))
 	mux.HandleFunc("PATCH /api/tokens/sharing", a.requireAuth(a.patchMyTokensSharing))
+	mux.HandleFunc("PATCH /api/tokens/marketplace-price", a.requireAuth(a.patchMyTokensMarketplacePrice))
 	mux.HandleFunc("GET /api/tokens/{token_id}", a.requireAuth(a.getMyToken))
 	mux.HandleFunc("GET /api/tokens/{token_id}/refresh-token", a.requireAuth(a.getMyTokenRefreshToken))
 	mux.HandleFunc("GET /api/tokens/{token_id}/quota-reset-credits", a.requireAuth(a.getMyTokenQuotaResetCredits))
@@ -264,7 +265,12 @@ func (a *App) myPoolSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	plans, _ := a.store.TokenPlanCountsScoped(ctx, scope, store.TokenListOptions{})
-	writeJSON(w, http.StatusOK, map[string]any{"counts": counts, "sharing_counts": sharingCounts, "plan_counts": plans})
+	pricing, err := a.store.TokenMarketplacePricingSummaryScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"counts": counts, "sharing_counts": sharingCounts, "plan_counts": plans, "marketplace_pricing": pricing})
 }
 
 func (a *App) listMySettings(w http.ResponseWriter, r *http.Request) {
@@ -639,13 +645,64 @@ func (a *App) patchMyTokensSharing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	plans, _ := a.store.TokenPlanCountsScoped(ctx, scope, store.TokenListOptions{})
+	pricing, err := a.store.TokenMarketplacePricingSummaryScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	_ = a.store.WriteAuditLog(ctx, "user_tokens_sharing_update", "self", "token", "bulk", map[string]any{"user_id": scope.OwnerUserID, "updated": updated, "all": payload.All, "share_enabled": *shareEnabled})
 	_ = a.tokens.Refresh(ctx)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"updated":        updated,
-		"counts":         counts,
-		"sharing_counts": sharingCounts,
-		"plan_counts":    plans,
+		"updated":             updated,
+		"counts":              counts,
+		"sharing_counts":      sharingCounts,
+		"plan_counts":         plans,
+		"marketplace_pricing": pricing,
+	})
+}
+
+func (a *App) patchMyTokensMarketplacePrice(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
+	if !ok {
+		return
+	}
+	var payload struct {
+		All           bool    `json:"all"`
+		TokenIDs      []int64 `json:"token_ids"`
+		PriceBPS      *int    `json:"price_bps"`
+		PriceBPSCamel *int    `json:"priceBps"`
+	}
+	_ = decodeJSON(r, &payload)
+	priceBPS := payload.PriceBPS
+	if priceBPS == nil {
+		priceBPS = payload.PriceBPSCamel
+	}
+	if priceBPS == nil {
+		writeError(w, http.StatusBadRequest, errors.New("price_bps is required"))
+		return
+	}
+	if !payload.All && len(payload.TokenIDs) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("token_ids are required when all is false"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	updated, err := a.store.SetTokensMarketplacePriceScoped(ctx, scope, payload.TokenIDs, payload.All, *priceBPS, "owner_default")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	pricing, err := a.store.TokenMarketplacePricingSummaryScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	_ = a.store.WriteAuditLog(ctx, "user_tokens_marketplace_price_update", "self", "token", "bulk", map[string]any{"user_id": scope.OwnerUserID, "updated": updated, "all": payload.All, "price_bps": *priceBPS})
+	_ = a.tokens.Refresh(ctx)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated":             updated,
+		"marketplace_pricing": pricing,
 	})
 }
 

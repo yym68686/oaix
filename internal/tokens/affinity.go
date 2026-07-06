@@ -11,6 +11,7 @@ import (
 	"golang.org/x/crypto/blake2b"
 
 	"github.com/yym68686/oaix/internal/affinity"
+	"github.com/yym68686/oaix/internal/store"
 )
 
 type PromptAffinityOptions struct {
@@ -255,7 +256,7 @@ func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 	if intent.TargetTokenID > 0 && candidate.Token.ID != intent.TargetTokenID {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(intent.SelectionMode), "marketplace") {
+	if isMarketplaceSelection(intent.SelectionMode) {
 		if intent.ExcludeOwnerUserID > 0 && candidate.Token.OwnerUserID == intent.ExcludeOwnerUserID {
 			return false
 		}
@@ -308,6 +309,30 @@ func sortedLaneCandidates(affinityKey string, snapshot *Snapshot, intent Intent,
 	return candidates
 }
 
+func sortNewLaneTokenCandidates(affinityKey string, snapshot *Snapshot, intent Intent, tokenIDs []int64) {
+	if !isMarketplacePriceSelection(intent.SelectionMode) {
+		sortTokenCandidates(affinityKey, snapshot, tokenIDs)
+		return
+	}
+	sort.SliceStable(tokenIDs, func(i, j int) bool {
+		left := snapshot.ByID[tokenIDs[i]]
+		right := snapshot.ByID[tokenIDs[j]]
+		if left == nil || right == nil {
+			return right != nil
+		}
+		if marketplacePriceBucket(left) != marketplacePriceBucket(right) {
+			return marketplacePriceBucket(left) < marketplacePriceBucket(right)
+		}
+		if left.Active.Load() != right.Active.Load() {
+			return left.Active.Load() < right.Active.Load()
+		}
+		if left.RecentTTFTMs.Load() != right.RecentTTFTMs.Load() {
+			return left.RecentTTFTMs.Load() < right.RecentTTFTMs.Load()
+		}
+		return rendezvousScore(affinityKey, tokenIDs[i]) > rendezvousScore(affinityKey, tokenIDs[j])
+	})
+}
+
 func sortedNewLaneCandidates(affinityKey string, snapshot *Snapshot, intent Intent) []int64 {
 	candidates := make([]int64, 0, len(snapshot.Ready))
 	for _, token := range snapshot.Ready {
@@ -323,7 +348,7 @@ func sortedNewLaneCandidates(affinityKey string, snapshot *Snapshot, intent Inte
 		}
 		candidates = append(candidates, tokenID)
 	}
-	sortTokenCandidates(affinityKey, snapshot, candidates)
+	sortNewLaneTokenCandidates(affinityKey, snapshot, intent, candidates)
 	return candidates
 }
 
@@ -358,6 +383,25 @@ func rendezvousScore(affinityKey string, tokenID int64) uint64 {
 	}
 	return uint64(sum[0])<<56 | uint64(sum[1])<<48 | uint64(sum[2])<<40 | uint64(sum[3])<<32 |
 		uint64(sum[4])<<24 | uint64(sum[5])<<16 | uint64(sum[6])<<8 | uint64(sum[7])
+}
+
+func tokenMarketplacePriceBPS(token *RuntimeToken) int {
+	if token == nil || token.Token.MarketplacePriceBPS == nil {
+		return store.DefaultMarketplacePriceBPS
+	}
+	value := *token.Token.MarketplacePriceBPS
+	if value < 0 {
+		return 0
+	}
+	if value > store.MaxMarketplacePriceBPS {
+		return store.MaxMarketplacePriceBPS
+	}
+	return value
+}
+
+func marketplacePriceBucket(token *RuntimeToken) int {
+	const bucketSizeBPS = 10
+	return tokenMarketplacePriceBPS(token) / bucketSizeBPS
 }
 
 func bindLane(store affinity.Store, affinityKey string, tokenID int64, maxLanes int, ttl time.Duration, preferPrimary bool) (*int, int) {

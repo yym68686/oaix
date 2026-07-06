@@ -121,6 +121,69 @@ func (LatencyAwareSelector) Select(ctx context.Context, snapshot *Snapshot, inte
 	return selected, "snapshot_latency_aware"
 }
 
+type MarketplacePriceSelector struct {
+	Fallback Selector
+}
+
+func (s MarketplacePriceSelector) Select(ctx context.Context, snapshot *Snapshot, intent Intent, activeCap int64, cursor *uint64) (*RuntimeToken, string) {
+	if !isMarketplacePriceSelection(intent.SelectionMode) {
+		return marketplaceFallbackSelector(s.Fallback).Select(ctx, snapshot, intent, activeCap, cursor)
+	}
+	if snapshot == nil || len(snapshot.Ready) == 0 {
+		return nil, ""
+	}
+	bestBucket := -1
+	ready := make([]*RuntimeToken, 0, len(snapshot.Ready))
+	for _, candidate := range snapshot.Ready {
+		select {
+		case <-ctx.Done():
+			return nil, ""
+		default:
+		}
+		if candidate == nil {
+			continue
+		}
+		if _, excluded := intent.ExcludeTokenIDs[candidate.Token.ID]; excluded {
+			continue
+		}
+		if !tokenMatchesIntent(candidate, intent) || candidate.Active.Load() >= activeCap {
+			continue
+		}
+		bucket := marketplacePriceBucket(candidate)
+		if bestBucket == -1 || bucket < bestBucket {
+			bestBucket = bucket
+			ready = ready[:0]
+		}
+		if bucket == bestBucket {
+			ready = append(ready, candidate)
+		}
+	}
+	if len(ready) == 0 {
+		return nil, ""
+	}
+	filtered := &Snapshot{
+		Ready:    ready,
+		ByID:     snapshot.ByID,
+		LoadedAt: snapshot.LoadedAt,
+		Version:  snapshot.Version,
+	}
+	token, reason := marketplaceFallbackSelector(s.Fallback).Select(ctx, filtered, intent, activeCap, cursor)
+	if token == nil {
+		return nil, ""
+	}
+	if reason == "" {
+		reason = "snapshot_selected"
+	}
+	return token, "marketplace_price_" + reason
+}
+
+func marketplaceFallbackSelector(selector Selector) Selector {
+	if selector == nil {
+		return RoundRobinSelector{}
+	}
+	return selector
+}
+
 type PromptAffinitySelector struct {
 	PreferredTokenID int64
 	Fallback         Selector

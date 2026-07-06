@@ -1299,7 +1299,8 @@ func (a *App) proxyRequest(w http.ResponseWriter, r *http.Request, intent proxy.
 		}
 		intent.TargetTokenID = parsed
 	}
-	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-OAIX-Selection-Mode")), "marketplace") {
+	selectionMode := strings.ToLower(strings.TrimSpace(r.Header.Get("X-OAIX-Selection-Mode")))
+	if selectionMode == "marketplace" || selectionMode == "marketplace-priced" {
 		if intent.TargetTokenID > 0 {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "X-OAIX-Target-Token-ID cannot be used with marketplace selection"})
 			return
@@ -1317,7 +1318,7 @@ func (a *App) proxyRequest(w http.ResponseWriter, r *http.Request, intent proxy.
 			}
 			excludeOwnerID = parsed
 		}
-		intent.SelectionMode = "marketplace"
+		intent.SelectionMode = selectionMode
 		intent.CallerOwnerUserID = ownerID
 		intent.ExcludeOwnerUserID = excludeOwnerID
 	}

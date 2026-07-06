@@ -96,3 +96,47 @@ func TestClaimPromptAffinityPreviousOwnerStrictWhenBusy(t *testing.T) {
 		t.Fatalf("expected strict previous owner busy, claim=%v result=%+v err=%v", claim, result, err)
 	}
 }
+
+func TestMarketplacePriceCreatesNewLaneWithoutStealingPrimary(t *testing.T) {
+	highPrice := 250
+	lowPrice := 100
+	rows := makeTokens(2)
+	rows[0].OwnerUserID = 10
+	rows[0].ShareEnabled = true
+	rows[0].ShareStatus = "active"
+	rows[0].MarketplacePriceBPS = &highPrice
+	rows[1].OwnerUserID = 20
+	rows[1].ShareEnabled = true
+	rows[1].ShareStatus = "active"
+	rows[1].MarketplacePriceBPS = &lowPrice
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := affinity.NewMemoryStore()
+	opts := PromptAffinityOptions{
+		AffinityKey:           "cache-family-price",
+		MaxLanesPerKey:        3,
+		GlobalFallbackEnabled: true,
+		LaneTTL:               time.Hour,
+	}
+
+	first, result, err := manager.ClaimPromptAffinity(context.Background(), store, Intent{SelectionMode: "marketplace-priced"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != "lane_created" || first.TokenID() != 2 {
+		t.Fatalf("new lane selected token=%d result=%+v, want low-price token 2", first.TokenID(), result)
+	}
+	first.Release()
+
+	store.Put(opts.AffinityKey, affinity.Lane{PrimaryTokenID: 1}, time.Hour)
+	second, result, err := manager.ClaimPromptAffinity(context.Background(), store, Intent{SelectionMode: "marketplace-priced"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if result.Result != "primary_hit" || second.TokenID() != 1 {
+		t.Fatalf("existing primary selected token=%d result=%+v, want high-price primary token 1", second.TokenID(), result)
+	}
+}

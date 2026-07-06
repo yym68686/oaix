@@ -255,6 +255,10 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		selectedTokenID = ptrInt64(claim.TokenID())
 		if claim.Token != nil {
 			selectedTokenOwnerID = ptrInt64(claim.Token.Token.OwnerUserID)
+			if isMarketplaceIntent(intent) {
+				timing["marketplace_price_bps"] = claimMarketplacePriceBPS(claim)
+				timing["marketplace_price_source"] = claimMarketplacePriceSource(claim)
+			}
 		}
 		accountID = claim.AccountID()
 		attemptStarted := time.Now()
@@ -525,6 +529,11 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	w.Header().Set("X-OAIX-Token-ID", fmt.Sprint(attempt.Claim.TokenID()))
 	if attempt.Claim != nil && attempt.Claim.Token != nil {
 		w.Header().Set("X-OAIX-Token-Owner-User-ID", fmt.Sprint(attempt.Claim.Token.Token.OwnerUserID))
+		if isMarketplaceIntent(attempt.Intent) {
+			w.Header().Set("X-OAIX-Selection-Mode", "marketplace")
+			w.Header().Set("X-OAIX-Marketplace-Price-BPS", fmt.Sprint(claimMarketplacePriceBPS(attempt.Claim)))
+			w.Header().Set("X-OAIX-Marketplace-Price-Source", claimMarketplacePriceSource(attempt.Claim))
+		}
 	}
 	if attempt.Intent.ImageResponseFormat != "" {
 		if attempt.Intent.Stream {
@@ -558,6 +567,40 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		return result, copyErr
 	}
 	return result, nil
+}
+
+func isMarketplaceIntent(intent RequestIntent) bool {
+	switch strings.ToLower(strings.TrimSpace(intent.SelectionMode)) {
+	case "marketplace", "marketplace-priced":
+		return true
+	default:
+		return false
+	}
+}
+
+func claimMarketplacePriceBPS(claim *tokens.Claim) int {
+	if claim == nil || claim.Token == nil || claim.Token.Token.MarketplacePriceBPS == nil {
+		return store.DefaultMarketplacePriceBPS
+	}
+	value := *claim.Token.Token.MarketplacePriceBPS
+	if value < 0 {
+		return 0
+	}
+	if value > store.MaxMarketplacePriceBPS {
+		return store.MaxMarketplacePriceBPS
+	}
+	return value
+}
+
+func claimMarketplacePriceSource(claim *tokens.Claim) string {
+	if claim == nil || claim.Token == nil {
+		return "owner_default"
+	}
+	source := strings.TrimSpace(claim.Token.Token.MarketplacePriceSource)
+	if source == "" {
+		return "owner_default"
+	}
+	return source
 }
 
 func (p *Pipeline) upstreamURL(intent RequestIntent) (string, error) {
