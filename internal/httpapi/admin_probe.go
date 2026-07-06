@@ -100,13 +100,6 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 	if baseURL == "" {
 		return tokenProbeResult(token.ID, "inconclusive", 500, "测试未得出结论：CODEX_BASE_URL 为空，当前状态未改变。", "CODEX_BASE_URL is empty", model)
 	}
-	if strings.TrimSpace(token.RefreshToken) != "" {
-		refreshed, result := a.refreshProbeAccessToken(parent, token, model)
-		if result != nil {
-			return result
-		}
-		token = refreshed
-	}
 	accessToken := strings.TrimSpace(token.AccessToken)
 	if accessToken == "" {
 		return tokenProbeResult(token.ID, "inconclusive", 400, "测试未得出结论：该 key 缺少 access token，当前状态未改变。", "missing access token", model)
@@ -168,12 +161,12 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 			}
 			if isPermanentProbeDisableError(resp.StatusCode, streamDetail) {
 				a.markProbeError(token.ID, streamDetail, true, nil, true)
-				return tokenProbeResult(token.ID, "disabled", http.StatusForbidden, "测试失败：使用最新 access token 请求上游后仍返回鉴权/停用错误，当前已标记为禁用。", streamDetail, model)
+				return tokenProbeResult(token.ID, "disabled", http.StatusForbidden, "测试失败：使用当前 access token 请求上游后仍返回鉴权/停用错误，当前已标记为禁用。", streamDetail, model)
 			}
 			return tokenProbeResult(token.ID, "inconclusive", resp.StatusCode, "测试未得出结论：上游流式事件失败，当前状态未改变。", streamDetail, model)
 		}
 		a.markProbeSuccess(token.ID)
-		result := tokenProbeResult(token.ID, "reactivated", resp.StatusCode, "测试成功：使用最新 access token 请求上游成功，当前已标记为可用。", "", model)
+		result := tokenProbeResult(token.ID, "reactivated", resp.StatusCode, "测试成功：使用当前 access token 请求上游成功，当前已标记为可用。", "", model)
 		if responseModel == "" {
 			responseModel = extractProbeResponseModel(respBody)
 		}
@@ -197,7 +190,7 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || isPermanentProbeDisableError(resp.StatusCode, detail) {
 		a.markProbeError(token.ID, detail, true, nil, true)
-		return tokenProbeResult(token.ID, "disabled", resp.StatusCode, "测试失败：使用最新 access token 请求上游后仍返回鉴权/停用错误，当前已标记为禁用。", detail, model)
+		return tokenProbeResult(token.ID, "disabled", resp.StatusCode, "测试失败：使用当前 access token 请求上游后仍返回鉴权/停用错误，当前已标记为禁用。", detail, model)
 	}
 
 	return tokenProbeResult(token.ID, "inconclusive", resp.StatusCode, "测试未得出结论：上游返回非成功状态，当前状态未改变。", detail, model)

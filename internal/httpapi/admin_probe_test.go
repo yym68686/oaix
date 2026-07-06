@@ -12,33 +12,15 @@ import (
 	"github.com/yym68686/oaix/internal/store"
 )
 
-func TestProbeTokenRefreshesLatestAccessTokenAndUsesStreamingPayload(t *testing.T) {
-	var oauthRefreshSeen bool
+func TestProbeTokenUsesCurrentAccessTokenAndStreamingPayload(t *testing.T) {
 	oauthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("oauth method = %s", r.Method)
-		}
-		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
-		}
-		if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "rt-fixture" {
-			t.Fatalf("unexpected oauth form: %v", r.Form)
-		}
-		oauthRefreshSeen = true
-		writeJSON(w, http.StatusOK, map[string]any{
-			"access_token":  "fresh-access-token",
-			"refresh_token": "rt-next",
-			"expires_in":    3600,
-			"account_id":    "acct_refreshed",
-			"email":         "probe@example.com",
-			"plan_type":     "pro",
-		})
+		t.Fatal("oauth refresh should not be called by token probe")
 	}))
 	defer oauthServer.Close()
 
 	var upstreamSeen bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer fresh-access-token" {
+		if got := r.Header.Get("Authorization"); got != "Bearer current-access-token" {
 			t.Fatalf("authorization = %q", got)
 		}
 		if got := r.Header.Get("Accept"); got != "text/event-stream" {
@@ -47,7 +29,7 @@ func TestProbeTokenRefreshesLatestAccessTokenAndUsesStreamingPayload(t *testing.
 		if got := r.Header.Get("Session_id"); !strings.HasPrefix(got, "oaix-admin-probe-7") {
 			t.Fatalf("session id = %q", got)
 		}
-		if got := r.Header.Get("Chatgpt-Account-Id"); got != "acct_refreshed" {
+		if got := r.Header.Get("Chatgpt-Account-Id"); got != "acct_current" {
 			t.Fatalf("account id = %q", got)
 		}
 		var payload map[string]any
@@ -72,15 +54,14 @@ func TestProbeTokenRefreshesLatestAccessTokenAndUsesStreamingPayload(t *testing.
 		},
 		TokenPool: config.TokenPoolConfig{DefaultCooldown: 5 * time.Minute},
 	}}
+	accountID := "acct_current"
 	result := app.probeTokenWithAccess(t.Context(), store.Token{
 		ID:           7,
-		AccessToken:  "stale-access-token",
+		AccessToken:  "current-access-token",
 		RefreshToken: "rt-fixture",
+		AccountID:    &accountID,
 	}, "gpt-5.5")
 
-	if !oauthRefreshSeen {
-		t.Fatal("oauth refresh was not called")
-	}
 	if !upstreamSeen {
 		t.Fatal("upstream probe was not called")
 	}
@@ -92,18 +73,20 @@ func TestProbeTokenRefreshesLatestAccessTokenAndUsesStreamingPayload(t *testing.
 	}
 }
 
-func TestProbeTokenDisablesPermanentlyInvalidRefreshToken(t *testing.T) {
+func TestProbeTokenIgnoresInvalidRefreshTokenWhenCurrentAccessTokenWorks(t *testing.T) {
 	oauthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]any{
-				"code":    "app_session_terminated",
-				"message": "Your session has ended. Please log in again.",
-			},
-		})
+		t.Fatal("oauth refresh should not be called by token probe")
 	}))
 	defer oauthServer.Close()
+	var upstreamSeen bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("upstream should not be called when refresh token is permanently invalid")
+		if got := r.Header.Get("Authorization"); got != "Bearer still-valid-access-token" {
+			t.Fatalf("authorization = %q", got)
+		}
+		upstreamSeen = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"model":"gpt-5.5"}}` + "\n\n"))
 	}))
 	defer upstream.Close()
 
@@ -113,15 +96,15 @@ func TestProbeTokenDisablesPermanentlyInvalidRefreshToken(t *testing.T) {
 	}}}
 	result := app.probeTokenWithAccess(t.Context(), store.Token{
 		ID:           9,
-		AccessToken:  "stale-access-token",
+		AccessToken:  "still-valid-access-token",
 		RefreshToken: "rt-invalid",
 	}, "")
 
-	if result["outcome"] != "disabled" || result["status_code"] != http.StatusBadRequest {
-		t.Fatalf("unexpected result: %#v", result)
+	if !upstreamSeen {
+		t.Fatal("upstream probe was not called")
 	}
-	if !strings.Contains(result["message"].(string), "refresh token 已失效") {
-		t.Fatalf("message = %q", result["message"])
+	if result["outcome"] != "reactivated" || result["status_code"] != http.StatusOK {
+		t.Fatalf("unexpected result: %#v", result)
 	}
 }
 
