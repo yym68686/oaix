@@ -666,7 +666,21 @@ func TestMultiUserAdminAndReadonlyPermissionsWithDatabase(t *testing.T) {
 	}
 
 	expectStatus(t, h.request(t, http.MethodGet, "/api/admin/users?limit=5", "service-test-key", ""), http.StatusOK)
-	expectStatus(t, h.request(t, http.MethodGet, "/api/admin/pool-summary", "service-test-key", ""), http.StatusOK)
+	poolPayload := expectStatus(t, h.request(t, http.MethodGet, "/api/admin/pool-summary", "service-test-key", ""), http.StatusOK)
+	if _, ok := poolPayload["sharing_counts"].(map[string]any); !ok {
+		t.Fatalf("admin pool summary missing sharing_counts: %v", poolPayload)
+	}
+	poolByUserPayload := expectStatus(t, h.request(t, http.MethodGet, "/api/admin/pool-summary/by-user?limit=5", "service-test-key", ""), http.StatusOK)
+	poolByUserItems, _ := poolByUserPayload["items"].([]any)
+	for _, raw := range poolByUserItems {
+		item, _ := raw.(map[string]any)
+		if item == nil {
+			continue
+		}
+		if _, ok := item["sharing_counts"].(map[string]any); !ok {
+			t.Fatalf("admin pool summary by user item missing sharing_counts: %v", item)
+		}
+	}
 	expectStatus(t, h.request(t, http.MethodPatch, "/api/admin/users/"+strconv.FormatInt(userB.ID, 10), readonlyKey.PlaintextKey, `{"status":"disabled"}`), http.StatusForbidden)
 
 	now := time.Now().UTC()
