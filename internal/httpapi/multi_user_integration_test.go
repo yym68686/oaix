@@ -557,6 +557,58 @@ func TestBulkTokenSharingScopeWithDatabase(t *testing.T) {
 	}
 }
 
+func TestDeleteDisabledTokensScopeWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	userA, keyA := h.createUser(t, "disabled-delete-a")
+	userB, _ := h.createUser(t, "disabled-delete-b")
+	activeA := h.createToken(t, userA.ID, "disabled-delete-active-a")
+	disabledA1 := h.createToken(t, userA.ID, "disabled-delete-a-1")
+	disabledA2 := h.createToken(t, userA.ID, "disabled-delete-a-2")
+	disabledB := h.createToken(t, userB.ID, "disabled-delete-b")
+
+	ctx := context.Background()
+	for _, token := range []store.Token{disabledA1, disabledA2} {
+		if _, err := h.db.SetTokenActiveScoped(ctx, store.OwnerResources(userA.ID), token.ID, false, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.db.SetTokenActiveScoped(ctx, store.OwnerResources(userB.ID), disabledB.ID, false, true); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := h.request(t, http.MethodDelete, "/api/tokens/disabled", keyA.PlaintextKey, "")
+	expectStatus(t, resp, http.StatusOK)
+	var payload struct {
+		Deleted    int     `json:"deleted"`
+		DeletedIDs []int64 `json:"deleted_ids"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if payload.Deleted != 2 || len(payload.DeletedIDs) != 2 {
+		t.Fatalf("deleted payload = %#v", payload)
+	}
+	if _, err := h.db.GetToken(ctx, activeA.ID); err != nil {
+		t.Fatalf("active owner token was deleted: %v", err)
+	}
+	for _, token := range []store.Token{disabledA1, disabledA2} {
+		if _, err := h.db.GetToken(ctx, token.ID); err == nil {
+			t.Fatalf("disabled owner token %d was not deleted", token.ID)
+		}
+	}
+	if _, err := h.db.GetToken(ctx, disabledB.ID); err != nil {
+		t.Fatalf("other owner disabled token was deleted: %v", err)
+	}
+
+	expectStatus(t, h.requestWithHeaders(t, http.MethodDelete, "/api/tokens/disabled", "service-test-key", "", map[string]string{
+		"X-OAIX-Act-As-User": strconv.FormatInt(userB.ID, 10),
+	}), http.StatusOK)
+	if _, err := h.db.GetToken(ctx, disabledB.ID); err == nil {
+		t.Fatalf("service act-as did not delete target owner disabled token %d", disabledB.ID)
+	}
+}
+
 func TestBulkTokenMarketplacePriceScopeWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userA, keyA := h.createUser(t, "bulk-price-a")

@@ -38,6 +38,7 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tokens/{token_id}/quota-reset-credits", a.requireAuth(a.getMyTokenQuotaResetCredits))
 	mux.HandleFunc("POST /api/tokens/{token_id}/quota-reset", a.requireAuth(a.resetMyTokenQuotaCredit))
 	mux.HandleFunc("PATCH /api/tokens/{token_id}", a.requireAuth(a.patchMyToken))
+	mux.HandleFunc("DELETE /api/tokens/disabled", a.requireAuth(a.deleteMyDisabledTokens))
 	mux.HandleFunc("DELETE /api/tokens/{token_id}", a.requireAuth(a.deleteMyToken))
 	mux.HandleFunc("POST /api/tokens/{token_id}/probe", a.requireAuth(a.probeMyToken))
 	mux.HandleFunc("POST /api/import/parse", a.requireAuth(a.parseImport))
@@ -728,6 +729,47 @@ func (a *App) deleteMyToken(w http.ResponseWriter, r *http.Request) {
 	_ = a.store.WriteAuditLog(ctx, "user_token_delete", "self", "token", strconv.FormatInt(id, 10), map[string]any{"user_id": *scope.OwnerUserID})
 	_ = a.tokens.Refresh(ctx)
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
+}
+
+func (a *App) deleteMyDisabledTokens(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	deletedIDs, err := a.store.DeleteDisabledTokensScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	counts, err := a.store.TokenCountsScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	sharingCounts, err := a.store.TokenSharingCountsScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	plans, _ := a.store.TokenPlanCountsScoped(ctx, scope, store.TokenListOptions{})
+	pricing, err := a.store.TokenMarketplacePricingSummaryScoped(ctx, scope)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	_ = a.store.WriteAuditLog(ctx, "user_disabled_tokens_delete", "self", "token", "bulk", map[string]any{"user_id": scope.OwnerUserID, "deleted": len(deletedIDs), "token_ids": deletedIDs})
+	_ = a.tokens.Refresh(ctx)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deleted":             len(deletedIDs),
+		"deleted_ids":         deletedIDs,
+		"counts":              counts,
+		"sharing_counts":      sharingCounts,
+		"plan_counts":         plans,
+		"marketplace_pricing": pricing,
+	})
 }
 
 func (a *App) probeMyToken(w http.ResponseWriter, r *http.Request) {

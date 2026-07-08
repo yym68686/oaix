@@ -1300,6 +1300,45 @@ func (s *Store) DeleteTokenScoped(ctx context.Context, scope ResourceScope, toke
 	return nil
 }
 
+func (s *Store) DeleteDisabledTokensScoped(ctx context.Context, scope ResourceScope) ([]int64, error) {
+	args := []any{}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	rows, err := s.pool.Query(ctx, `
+		with roots as (
+			select id
+			from codex_tokens
+			where merged_into_token_id is null
+			  and (is_active = false or disabled_at is not null)
+			  and `+ownerWhere+`
+		),
+		deleted as (
+			delete from codex_tokens
+			where (id in (select id from roots) or merged_into_token_id in (select id from roots))
+			  and `+ownerWhere+`
+			returning id
+		)
+		select id
+		from deleted
+		order by id
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 func (s *Store) RecordRefreshTokenIdentity(ctx context.Context, tokenID int64, refreshToken string) (RefreshTokenIdentity, error) {
 	identity := RefreshTokenIdentity{TokenID: tokenID, Hash: hashString(refreshToken)}
 	tag, err := s.pool.Exec(ctx, `
