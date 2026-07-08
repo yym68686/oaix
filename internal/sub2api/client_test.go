@@ -2,6 +2,7 @@ package sub2api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -86,6 +87,38 @@ func TestClientCreateAccountsUnwrapsBatchResult(t *testing.T) {
 	}
 	if result.Success != 1 || len(result.Results) != 1 || result.Results[0].ID != 99 {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestClientGetAccount(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/admin/accounts/42" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		writeSub2APISuccess(t, w, Account{ID: 42, Name: "mapped", Status: "active", Schedulable: boolPtr(true)})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	account, err := client.GetAccount(t.Context(), server.URL, "admin-fixture", 42)
+	if err != nil {
+		t.Fatalf("GetAccount returned error: %v", err)
+	}
+	if account.ID != 42 || account.Status != "active" || account.Schedulable == nil || !*account.Schedulable {
+		t.Fatalf("account = %#v", account)
+	}
+}
+
+func TestClientGetAccountNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	_, err := client.GetAccount(t.Context(), server.URL, "admin-fixture", 42)
+	if !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("err = %v, want ErrAccountNotFound", err)
 	}
 }
 

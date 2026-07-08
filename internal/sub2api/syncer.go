@@ -26,6 +26,14 @@ const (
 	SyncModeSync  SyncMode = "sync"
 )
 
+type mappedAccountReconcileResult struct {
+	CheckedTokenIDs        []int64 `json:"checked_token_ids,omitempty"`
+	StaleTokenIDs          []int64 `json:"stale_token_ids,omitempty"`
+	StaleRemoteAccountIDs  []int64 `json:"stale_remote_account_ids,omitempty"`
+	RestoredTokenIDs       []int64 `json:"restored_token_ids,omitempty"`
+	RestoredRemoteAccounts []int64 `json:"restored_remote_account_ids,omitempty"`
+}
+
 func NewSyncer(st *store.Store, client *Client, logger *slog.Logger, oauthClientID string) *Syncer {
 	if client == nil {
 		client = NewClient(nil)
@@ -158,6 +166,29 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 		result.Details = map[string]any{"mode": "check", "group_ids": target.TargetGroupIDs}
 		return s.finish(ctx, run, result)
 	}
+	reconcile := mappedAccountReconcileResult{}
+	if result.NeededCount > 0 {
+		reconciled, reconcileErr := s.reconcileMappedAccounts(ctx, target, run.ID)
+		if reconcileErr != nil {
+			result.Status = store.Sub2APISyncStatusFailed
+			result.ErrorMessage = reconcileErr.Error()
+			return s.finish(ctx, run, result)
+		}
+		reconcile = reconciled
+		if len(reconcile.RestoredRemoteAccounts) > 0 {
+			remoteCount, err = s.Client.CountActiveOAuthAccounts(ctx, target.BaseURL, target.AdminKey, target.TargetGroupIDs)
+			if err != nil {
+				result.Status = store.Sub2APISyncStatusFailed
+				result.ErrorMessage = err.Error()
+				return s.finish(ctx, run, result)
+			}
+			result.RemoteCount = remoteCount
+			result.NeededCount = 0
+			if target.MinAvailable > remoteCount {
+				result.NeededCount = target.MinAvailable - remoteCount
+			}
+		}
+	}
 
 	limit := target.TopUpBatchSize
 	if limit <= 0 {
@@ -183,7 +214,7 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 	result.SelectedCount = len(candidates)
 	if len(candidates) == 0 {
 		result.Status = store.Sub2APISyncStatusSkipped
-		result.Details = map[string]any{"reason": "no_unsynced_oaix_candidates", "group_ids": target.TargetGroupIDs}
+		result.Details = syncDetails(map[string]any{"reason": "no_unsynced_oaix_candidates", "group_ids": target.TargetGroupIDs}, reconcile)
 		return s.finish(ctx, run, result)
 	}
 
@@ -196,7 +227,7 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 		result.Status = store.Sub2APISyncStatusFailed
 		result.FailedCount = len(candidates)
 		result.ErrorMessage = err.Error()
-		result.Details = map[string]any{"selected_token_ids": tokenCandidateIDs(candidates)}
+		result.Details = syncDetails(map[string]any{"selected_token_ids": tokenCandidateIDs(candidates)}, reconcile)
 		return s.finish(ctx, run, result)
 	}
 	for index, candidate := range candidates {
@@ -227,7 +258,76 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 		"selected_token_ids":  tokenCandidateIDs(candidates),
 		"sub2api_batch_total": map[string]any{"success": batch.Success, "failed": batch.Failed},
 	}
+	result.Details = syncDetails(result.Details.(map[string]any), reconcile)
 	return s.finish(ctx, run, result)
+}
+
+func (s *Syncer) reconcileMappedAccounts(ctx context.Context, target store.Sub2APISyncTarget, runID int64) (mappedAccountReconcileResult, error) {
+	result := mappedAccountReconcileResult{}
+	if s == nil || s.Store == nil || s.Client == nil {
+		return result, nil
+	}
+	mappings, err := s.Store.ListSub2APISyncedTokenMappings(ctx, target, 500)
+	if err != nil {
+		return result, err
+	}
+	now := time.Now().UTC()
+	for _, mapping := range mappings {
+		if mapping.RemoteAccountID <= 0 || mapping.TokenID <= 0 {
+			continue
+		}
+		result.CheckedTokenIDs = append(result.CheckedTokenIDs, mapping.TokenID)
+		account, err := s.Client.GetAccount(ctx, target.BaseURL, target.AdminKey, mapping.RemoteAccountID)
+		if errors.Is(err, ErrAccountNotFound) {
+			message := fmt.Sprintf("remote sub2api account %d not found; mapping marked stale for recreation", mapping.RemoteAccountID)
+			if markErr := s.Store.MarkSub2APISyncMappingStale(ctx, target.ID, mapping.TokenID, runID, message); markErr != nil {
+				return result, markErr
+			}
+			result.StaleTokenIDs = append(result.StaleTokenIDs, mapping.TokenID)
+			result.StaleRemoteAccountIDs = append(result.StaleRemoteAccountIDs, mapping.RemoteAccountID)
+			continue
+		}
+		if err != nil {
+			return result, err
+		}
+		if !tokenAvailableForSub2API(mapping.Token(), now) || remoteAccountAvailable(account) {
+			continue
+		}
+		if err := s.Client.RestoreAccountAvailability(ctx, target.BaseURL, target.AdminKey, mapping.RemoteAccountID); err != nil {
+			return result, err
+		}
+		result.RestoredTokenIDs = append(result.RestoredTokenIDs, mapping.TokenID)
+		result.RestoredRemoteAccounts = append(result.RestoredRemoteAccounts, mapping.RemoteAccountID)
+	}
+	return result, nil
+}
+
+func remoteAccountAvailable(account Account) bool {
+	if strings.ToLower(strings.TrimSpace(account.Status)) != "active" {
+		return false
+	}
+	if account.Schedulable != nil && !*account.Schedulable {
+		return false
+	}
+	return account.ID > 0
+}
+
+func syncDetails(base map[string]any, reconcile mappedAccountReconcileResult) map[string]any {
+	if base == nil {
+		base = map[string]any{}
+	}
+	if len(reconcile.CheckedTokenIDs) > 0 {
+		base["mapped_check_count"] = len(reconcile.CheckedTokenIDs)
+	}
+	if len(reconcile.StaleTokenIDs) > 0 {
+		base["stale_mapping_token_ids"] = reconcile.StaleTokenIDs
+		base["stale_mapping_remote_account_ids"] = reconcile.StaleRemoteAccountIDs
+	}
+	if len(reconcile.RestoredTokenIDs) > 0 {
+		base["restored_token_ids"] = reconcile.RestoredTokenIDs
+		base["restored_remote_account_ids"] = reconcile.RestoredRemoteAccounts
+	}
+	return base
 }
 
 func (s *Syncer) finish(ctx context.Context, run store.Sub2APISyncRun, result store.Sub2APISyncRunResult) (store.Sub2APISyncRun, error) {

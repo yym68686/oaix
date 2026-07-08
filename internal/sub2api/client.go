@@ -16,6 +16,8 @@ import (
 
 const apiPrefix = "/api/v1"
 
+var ErrAccountNotFound = errors.New("sub2api account not found")
+
 type Client struct {
 	HTTPClient *http.Client
 }
@@ -149,6 +151,24 @@ func (c *Client) ListAccountsPage(ctx context.Context, baseURL string, adminKey 
 	return payload, err
 }
 
+func (c *Client) GetAccount(ctx context.Context, baseURL string, adminKey string, accountID int64) (Account, error) {
+	var account Account
+	if accountID <= 0 {
+		return account, ErrAccountNotFound
+	}
+	err := c.doJSON(ctx, http.MethodGet, baseURL, adminKey, fmt.Sprintf("/admin/accounts/%d", accountID), nil, &account)
+	if err != nil {
+		if isNotFoundHTTPError(err) {
+			return account, ErrAccountNotFound
+		}
+		return account, err
+	}
+	if account.ID <= 0 {
+		return account, ErrAccountNotFound
+	}
+	return account, nil
+}
+
 func (c *Client) CountActiveOAuthAccounts(ctx context.Context, baseURL string, adminKey string, groupIDs []int64) (int, error) {
 	seen := map[int64]struct{}{}
 	for _, groupID := range groupIDs {
@@ -209,11 +229,19 @@ func (c *Client) RestoreAccountAvailability(ctx context.Context, baseURL string,
 }
 
 func isUnsupportedRestoreAPI(err error) bool {
+	if errors.Is(err, ErrAccountNotFound) {
+		return false
+	}
 	var httpErr *HTTPError
 	if !errors.As(err, &httpErr) {
 		return false
 	}
 	return httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusMethodNotAllowed
+}
+
+func isNotFoundHTTPError(err error) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
 }
 
 func (c *Client) doJSON(ctx context.Context, method string, baseURL string, adminKey string, path string, body any, dest any) error {

@@ -129,6 +129,26 @@ type Sub2APIAvailabilityMapping struct {
 	RemoteAccountID int64
 }
 
+type Sub2APISyncedTokenMapping struct {
+	TargetID        int64
+	TokenID         int64
+	RemoteAccountID int64
+	OwnerUserID     int64
+	IsActive        bool
+	CooldownUntil   *time.Time
+	DisabledAt      *time.Time
+}
+
+func (m Sub2APISyncedTokenMapping) Token() Token {
+	return Token{
+		ID:            m.TokenID,
+		OwnerUserID:   m.OwnerUserID,
+		IsActive:      m.IsActive,
+		CooldownUntil: m.CooldownUntil,
+		DisabledAt:    m.DisabledAt,
+	}
+}
+
 type Sub2APITokenCandidateOptions struct {
 	Limit           int
 	CreatedAfter    *time.Time
@@ -452,6 +472,56 @@ func (s *Store) ListSub2APITokenCandidates(ctx context.Context, target Sub2APISy
 	return items, rows.Err()
 }
 
+func (s *Store) ListSub2APISyncedTokenMappings(ctx context.Context, target Sub2APISyncTarget, limit int) ([]Sub2APISyncedTokenMapping, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+	args := []any{target.ID, target.OwnerUserID}
+	filters := []string{
+		"m.target_id = $1",
+		"m.status = 'synced'",
+		"coalesce(m.remote_account_id, 0) > 0",
+		"t.merged_into_token_id is null",
+		"t.owner_user_id = $2",
+		"coalesce(t.access_token, '') <> ''",
+		"coalesce(t.refresh_token, '') <> ''",
+	}
+	statuses := normalizeTokenStatusFilters(target.TokenStatusFilters)
+	filters = append(filters, tokenStatusFilterSQL(statuses))
+	plans := normalizePlanFilters(target.PlanFilters)
+	if len(plans) > 0 {
+		args = append(args, plans)
+		placeholder := fmt.Sprintf("$%d::text[]", len(args))
+		filters = append(filters, fmt.Sprintf(`(
+			case when t.plan_type is null or btrim(t.plan_type) = '' then 'unknown' else lower(btrim(t.plan_type)) end
+		) = any(%s)`, placeholder))
+	}
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, `
+		select m.target_id, m.token_id, coalesce(m.remote_account_id, 0),
+		       coalesce(t.owner_user_id, 0), t.is_active, t.cooldown_until, t.disabled_at
+		from sub2api_sync_mappings m
+		join codex_tokens t on t.id = m.token_id
+		where `+strings.Join(filters, " and ")+`
+		order by m.updated_at asc, m.token_id asc
+		limit $`+strconvI(len(args)), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Sub2APISyncedTokenMapping{}
+	for rows.Next() {
+		var item Sub2APISyncedTokenMapping
+		if err := rows.Scan(&item.TargetID, &item.TokenID, &item.RemoteAccountID, &item.OwnerUserID, &item.IsActive, &item.CooldownUntil, &item.DisabledAt); err != nil {
+			return nil, err
+		}
+		if item.RemoteAccountID > 0 {
+			items = append(items, item)
+		}
+	}
+	return items, rows.Err()
+}
+
 func (s *Store) ListSub2APIAvailabilityMappingsForToken(ctx context.Context, tokenID int64) ([]Sub2APIAvailabilityMapping, error) {
 	if tokenID <= 0 {
 		return nil, nil
@@ -499,6 +569,23 @@ func (s *Store) RecordSub2APISyncMapping(ctx context.Context, targetID int64, to
 		    error_message = excluded.error_message,
 		    updated_at = now()
 	`, targetID, tokenID, remoteAccountID, runID, status, truncate(message, 2000))
+	return err
+}
+
+func (s *Store) MarkSub2APISyncMappingStale(ctx context.Context, targetID int64, tokenID int64, runID int64, message string) error {
+	if strings.TrimSpace(message) == "" {
+		message = "remote sub2api account no longer exists"
+	}
+	_, err := s.pool.Exec(ctx, `
+		update sub2api_sync_mappings
+		set status = 'failed',
+		    error_message = nullif($4, ''),
+		    last_run_id = coalesce(nullif($3, 0), last_run_id),
+		    updated_at = now()
+		where target_id = $1
+		  and token_id = $2
+		  and status = 'synced'
+	`, targetID, tokenID, runID, truncate(message, 2000))
 	return err
 }
 
