@@ -157,12 +157,18 @@ type Intent struct {
 }
 
 type Claim struct {
-	Token      *RuntimeToken
-	Reason     string
-	released   atomic.Bool
-	releaseFn  func(*RuntimeToken) int64
-	Telemetry  ClaimTelemetry
-	selectedAt time.Time
+	Token                       *RuntimeToken
+	Reason                      string
+	MarketplacePriceBPS         int
+	MarketplacePriceSource      string
+	MarketplacePriceLocked      bool
+	MarketplacePriceLockedAt    *time.Time
+	MarketplacePriceLockStatus  string
+	MarketplacePriceContractKey string
+	released                    atomic.Bool
+	releaseFn                   func(*RuntimeToken) int64
+	Telemetry                   ClaimTelemetry
+	selectedAt                  time.Time
 }
 
 func NewManager(source Source, logger *slog.Logger, maxAge, refreshInterval time.Duration, activeCap int64) *Manager {

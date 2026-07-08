@@ -77,7 +77,7 @@ func TestClaimPromptAffinityPreviousOwnerStrictWhenBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := affinity.NewMemoryStore()
-	store.BindResponseOwner("resp-owner", 1, time.Hour)
+	store.BindResponseOwner("resp-owner", affinity.ResponseOwnerBinding{TokenID: 1}, time.Hour)
 	owner, err := manager.Claim(context.Background(), Intent{ExcludeTokenIDs: map[int64]struct{}{2: {}}})
 	if err != nil {
 		t.Fatal(err)
@@ -94,6 +94,103 @@ func TestClaimPromptAffinityPreviousOwnerStrictWhenBusy(t *testing.T) {
 	})
 	if !errors.Is(err, ErrNoToken) || claim != nil || result.Result != "previous_owner_busy" {
 		t.Fatalf("expected strict previous owner busy, claim=%v result=%+v err=%v", claim, result, err)
+	}
+}
+
+func TestMarketplacePriceAffinityLocksInitialExecutionPrice(t *testing.T) {
+	lowPrice := 50
+	highPrice := 250
+	rows := makeTokens(1)
+	rows[0].OwnerUserID = 10
+	rows[0].ShareEnabled = true
+	rows[0].ShareStatus = "active"
+	rows[0].MarketplacePriceBPS = &lowPrice
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := affinity.NewMemoryStore()
+	opts := PromptAffinityOptions{
+		AffinityKey:           "cache-family-price-lock",
+		MaxLanesPerKey:        3,
+		GlobalFallbackEnabled: true,
+		LaneTTL:               time.Hour,
+	}
+
+	first, result, err := manager.ClaimPromptAffinity(context.Background(), store, Intent{SelectionMode: "marketplace-priced"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != "lane_created" || !first.MarketplacePriceLocked || first.MarketplacePriceBPS != lowPrice {
+		t.Fatalf("first claim did not lock low execution price: claim=%+v result=%+v", first, result)
+	}
+	first.Release()
+
+	source.tokens[0].MarketplacePriceBPS = &highPrice
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, result, err := manager.ClaimPromptAffinity(context.Background(), store, Intent{SelectionMode: "marketplace-priced"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if result.Result != "primary_hit" || second.TokenID() != 1 {
+		t.Fatalf("expected primary lane hit after reprice: token=%d result=%+v", second.TokenID(), result)
+	}
+	if second.Token.Token.MarketplacePriceBPS == nil || *second.Token.Token.MarketplacePriceBPS != highPrice {
+		t.Fatalf("test setup did not refresh token current price: %#v", second.Token.Token.MarketplacePriceBPS)
+	}
+	if !second.MarketplacePriceLocked || second.MarketplacePriceBPS != lowPrice {
+		t.Fatalf("sticky lane price changed after owner reprice: locked=%v price=%d want=%d", second.MarketplacePriceLocked, second.MarketplacePriceBPS, lowPrice)
+	}
+}
+
+func TestMarketplacePricePreviousResponseCarriesExecutionPrice(t *testing.T) {
+	lowPrice := 70
+	highPrice := 250
+	rows := makeTokens(1)
+	rows[0].OwnerUserID = 10
+	rows[0].ShareEnabled = true
+	rows[0].ShareStatus = "active"
+	rows[0].MarketplacePriceBPS = &lowPrice
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := affinity.NewMemoryStore()
+	opts := PromptAffinityOptions{
+		AffinityKey:           "cache-family-response-price-lock",
+		MaxLanesPerKey:        3,
+		GlobalFallbackEnabled: true,
+		LaneTTL:               time.Hour,
+		ResponseTTL:           time.Hour,
+	}
+	first, _, err := manager.ClaimPromptAffinity(context.Background(), store, Intent{SelectionMode: "marketplace-priced"}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.BindPromptResponseOwner(store, "resp-price-lock", first, time.Hour)
+	first.Release()
+
+	source.tokens[0].MarketplacePriceBPS = &highPrice
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, result, err := manager.ClaimPromptAffinity(context.Background(), store, Intent{SelectionMode: "marketplace-priced"}, PromptAffinityOptions{
+		PreviousResponseID:    "resp-price-lock",
+		MaxLanesPerKey:        3,
+		GlobalFallbackEnabled: true,
+		ResponseTTL:           time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if result.Result != "previous_owner_hit" || !second.MarketplacePriceLocked || second.MarketplacePriceBPS != lowPrice {
+		t.Fatalf("previous response did not retain execution price: claim=%+v result=%+v", second, result)
 	}
 }
 

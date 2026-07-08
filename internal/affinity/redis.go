@@ -128,34 +128,42 @@ func (s *RedisStore) RemoveToken(tokenID int64) {
 	_ = s.client.Del(ctx, indexKey, redisOwnerTokenIndexKey(tokenID)).Err()
 }
 
-func (s *RedisStore) BindResponseOwner(responseID string, tokenID int64, ttl time.Duration) {
+func (s *RedisStore) BindResponseOwner(responseID string, binding ResponseOwnerBinding, ttl time.Duration) {
 	atomic.AddInt64(&s.stats.ResponseBinds, 1)
+	if binding.TokenID <= 0 {
+		return
+	}
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
 	ctx, cancel := s.context()
 	defer cancel()
 	key := responseKey(responseID)
+	payload, _ := json.Marshal(binding)
 	pipe := s.client.Pipeline()
-	pipe.Set(ctx, key, strconv.FormatInt(tokenID, 10), ttl)
-	pipe.SAdd(ctx, redisOwnerTokenIndexKey(tokenID), key)
-	pipe.Expire(ctx, redisOwnerTokenIndexKey(tokenID), ttl)
+	pipe.Set(ctx, key, payload, ttl)
+	pipe.SAdd(ctx, redisOwnerTokenIndexKey(binding.TokenID), key)
+	pipe.Expire(ctx, redisOwnerTokenIndexKey(binding.TokenID), ttl)
 	_, _ = pipe.Exec(ctx)
 }
 
-func (s *RedisStore) GetResponseOwner(responseID string) (int64, bool) {
+func (s *RedisStore) GetResponseOwner(responseID string) (ResponseOwnerBinding, bool) {
 	atomic.AddInt64(&s.stats.ResponseLookups, 1)
 	ctx, cancel := s.context()
 	defer cancel()
 	text, err := s.client.Get(ctx, responseKey(responseID)).Result()
 	if err != nil {
-		return 0, false
+		return ResponseOwnerBinding{}, false
+	}
+	var binding ResponseOwnerBinding
+	if err := json.Unmarshal([]byte(text), &binding); err == nil && binding.TokenID > 0 {
+		return binding, true
 	}
 	tokenID, err := strconv.ParseInt(text, 10, 64)
 	if err != nil || tokenID <= 0 {
-		return 0, false
+		return ResponseOwnerBinding{}, false
 	}
-	return tokenID, true
+	return ResponseOwnerBinding{TokenID: tokenID}, true
 }
 
 func (s *RedisStore) Stats() Metrics {

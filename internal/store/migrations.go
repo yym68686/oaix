@@ -299,6 +299,7 @@ var migrationStatements = []string{
 		prompt_key_hash varchar(128) primary key,
 		primary_token_id integer,
 		secondary_token_ids jsonb,
+		marketplace_price_locks jsonb,
 		policy_version integer not null default 1,
 		expires_at timestamptz not null,
 		updated_at timestamptz not null default now()
@@ -308,6 +309,10 @@ var migrationStatements = []string{
 	`create table if not exists response_owner_bindings (
 		response_id_hash varchar(128) primary key,
 		token_id integer not null,
+		marketplace_price_bps integer,
+		marketplace_price_source varchar(64),
+		marketplace_price_locked_at timestamptz,
+		marketplace_price_contract_key varchar(128),
 		expires_at timestamptz not null,
 		updated_at timestamptz not null default now()
 	)`,
@@ -512,7 +517,12 @@ var migrationStatements = []string{
 	`alter table gateway_request_hourly_stats alter column duration_count type bigint using duration_count::bigint`,
 	`alter table gateway_request_token_costs alter column request_count type bigint using request_count::bigint`,
 	`alter table prompt_affinity_lanes add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table prompt_affinity_lanes add column if not exists marketplace_price_locks jsonb`,
 	`alter table response_owner_bindings add column if not exists owner_user_id bigint references platform_users(id)`,
+	`alter table response_owner_bindings add column if not exists marketplace_price_bps integer`,
+	`alter table response_owner_bindings add column if not exists marketplace_price_source varchar(64)`,
+	`alter table response_owner_bindings add column if not exists marketplace_price_locked_at timestamptz`,
+	`alter table response_owner_bindings add column if not exists marketplace_price_contract_key varchar(128)`,
 	`alter table admin_audit_logs add column if not exists actor_user_id bigint references platform_users(id)`,
 	`alter table admin_audit_logs add column if not exists actor_api_key_id bigint references api_keys(id)`,
 	`alter table admin_audit_logs add column if not exists actor_role varchar(32)`,

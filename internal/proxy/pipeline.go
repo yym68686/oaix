@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -258,6 +259,18 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			if isMarketplaceIntent(intent) {
 				timing["marketplace_price_bps"] = claimMarketplacePriceBPS(claim)
 				timing["marketplace_price_source"] = claimMarketplacePriceSource(claim)
+				if claim.MarketplacePriceLocked {
+					timing["marketplace_price_locked"] = true
+					if claim.MarketplacePriceLockedAt != nil {
+						timing["marketplace_price_locked_at"] = claim.MarketplacePriceLockedAt.UTC().Format(time.RFC3339Nano)
+					}
+					if claim.MarketplacePriceContractKey != "" {
+						timing["marketplace_price_contract_key"] = claim.MarketplacePriceContractKey
+					}
+					if claim.MarketplacePriceLockStatus != "" {
+						timing["marketplace_price_lock_status"] = claim.MarketplacePriceLockStatus
+					}
+				}
 			}
 		}
 		accountID = claim.AccountID()
@@ -337,14 +350,14 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, selectedTokenOwnerID, accountID, msg, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 			if success {
 				p.commitSuccess(claim.TokenID())
-				p.recordPromptCacheSuccess(promptCacheContext, claim.TokenID(), lastResponseID)
+				p.recordPromptCacheSuccess(promptCacheContext, claim, lastResponseID)
 			}
 			return
 		}
 		if err == nil && status >= 200 && status < 400 {
 			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, OutcomeSuccess, retry, false, nil)
 			p.commitSuccess(claim.TokenID())
-			p.recordPromptCacheSuccess(promptCacheContext, claim.TokenID(), lastResponseID)
+			p.recordPromptCacheSuccess(promptCacheContext, claim, lastResponseID)
 			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, selectedTokenOwnerID, accountID, nil, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
 			return
 		}
@@ -533,6 +546,13 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 			w.Header().Set("X-OAIX-Selection-Mode", "marketplace")
 			w.Header().Set("X-OAIX-Marketplace-Price-BPS", fmt.Sprint(claimMarketplacePriceBPS(attempt.Claim)))
 			w.Header().Set("X-OAIX-Marketplace-Price-Source", claimMarketplacePriceSource(attempt.Claim))
+			w.Header().Set("X-OAIX-Marketplace-Price-Locked", strconv.FormatBool(attempt.Claim.MarketplacePriceLocked))
+			if attempt.Claim.MarketplacePriceLockedAt != nil {
+				w.Header().Set("X-OAIX-Marketplace-Price-Locked-At", attempt.Claim.MarketplacePriceLockedAt.UTC().Format(time.RFC3339Nano))
+			}
+			if attempt.Claim.MarketplacePriceContractKey != "" {
+				w.Header().Set("X-OAIX-Marketplace-Contract-Key", attempt.Claim.MarketplacePriceContractKey)
+			}
 		}
 	}
 	if attempt.Intent.ImageResponseFormat != "" {
@@ -579,6 +599,16 @@ func isMarketplaceIntent(intent RequestIntent) bool {
 }
 
 func claimMarketplacePriceBPS(claim *tokens.Claim) int {
+	if claim != nil && claim.MarketplacePriceLocked {
+		value := claim.MarketplacePriceBPS
+		if value < 0 {
+			return 0
+		}
+		if value > store.MaxMarketplacePriceBPS {
+			return store.MaxMarketplacePriceBPS
+		}
+		return value
+	}
 	if claim == nil || claim.Token == nil || claim.Token.Token.MarketplacePriceBPS == nil {
 		return store.DefaultMarketplacePriceBPS
 	}
@@ -593,6 +623,9 @@ func claimMarketplacePriceBPS(claim *tokens.Claim) int {
 }
 
 func claimMarketplacePriceSource(claim *tokens.Claim) string {
+	if claim != nil && claim.MarketplacePriceLocked && strings.TrimSpace(claim.MarketplacePriceSource) != "" {
+		return strings.TrimSpace(claim.MarketplacePriceSource)
+	}
 	if claim == nil || claim.Token == nil {
 		return "owner_default"
 	}
@@ -964,12 +997,12 @@ func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent Reques
 	}, true)
 }
 
-func (p *Pipeline) recordPromptCacheSuccess(promptCacheContext *PromptCacheContext, tokenID int64, responseID string) {
+func (p *Pipeline) recordPromptCacheSuccess(promptCacheContext *PromptCacheContext, claim *tokens.Claim, responseID string) {
 	if promptCacheContext == nil {
 		return
 	}
 	if responseID != "" {
-		p.tokens.BindPromptResponseOwner(p.affinity, responseID, tokenID, p.cfg.PromptCache.ResponseTTL)
+		p.tokens.BindPromptResponseOwner(p.affinity, responseID, claim, p.cfg.PromptCache.ResponseTTL)
 	}
 }
 

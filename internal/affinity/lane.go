@@ -7,19 +7,33 @@ import (
 )
 
 type Lane struct {
-	PrimaryTokenID    int64     `json:"primary_token_id"`
-	SecondaryTokenIDs []int64   `json:"secondary_token_ids"`
-	UpdatedAt         time.Time `json:"updated_at"`
-	ExpiresAt         time.Time `json:"expires_at"`
-	PolicyVersion     int       `json:"policy_version"`
+	PrimaryTokenID        int64                          `json:"primary_token_id"`
+	SecondaryTokenIDs     []int64                        `json:"secondary_token_ids"`
+	MarketplacePriceLocks map[int64]MarketplacePriceLock `json:"marketplace_price_locks,omitempty"`
+	UpdatedAt             time.Time                      `json:"updated_at"`
+	ExpiresAt             time.Time                      `json:"expires_at"`
+	PolicyVersion         int                            `json:"policy_version"`
+}
+
+type MarketplacePriceLock struct {
+	PriceBPS    int       `json:"price_bps"`
+	Source      string    `json:"source"`
+	LockedAt    time.Time `json:"locked_at"`
+	ContractKey string    `json:"contract_key,omitempty"`
+}
+
+type ResponseOwnerBinding struct {
+	TokenID              int64
+	MarketplacePriceLock *MarketplacePriceLock
+	ExpiresAt            time.Time
 }
 
 type Store interface {
 	Get(promptKey string) (Lane, bool)
 	Put(promptKey string, lane Lane, ttl time.Duration)
 	RemoveToken(tokenID int64)
-	BindResponseOwner(responseID string, tokenID int64, ttl time.Duration)
-	GetResponseOwner(responseID string) (int64, bool)
+	BindResponseOwner(responseID string, binding ResponseOwnerBinding, ttl time.Duration)
+	GetResponseOwner(responseID string) (ResponseOwnerBinding, bool)
 }
 
 type MemoryStore struct {
@@ -31,8 +45,9 @@ type MemoryStore struct {
 }
 
 type responseOwner struct {
-	TokenID   int64
-	ExpiresAt time.Time
+	TokenID              int64
+	MarketplacePriceLock *MarketplacePriceLock
+	ExpiresAt            time.Time
 }
 
 type Metrics struct {
@@ -80,6 +95,7 @@ func (s *MemoryStore) Put(promptKey string, lane Lane, ttl time.Duration) {
 	if lane.PolicyVersion == 0 {
 		lane.PolicyVersion = 1
 	}
+	lane.NormalizeMarketplacePriceLocks()
 	s.mu.Lock()
 	s.lanes[promptKey] = lane
 	s.mu.Unlock()
@@ -94,6 +110,10 @@ func (s *MemoryStore) RemoveToken(tokenID int64) {
 			if len(lane.SecondaryTokenIDs) > 0 {
 				lane.PrimaryTokenID = lane.SecondaryTokenIDs[0]
 				lane.SecondaryTokenIDs = lane.SecondaryTokenIDs[1:]
+				if lane.MarketplacePriceLocks != nil {
+					delete(lane.MarketplacePriceLocks, tokenID)
+				}
+				lane.NormalizeMarketplacePriceLocks()
 				s.lanes[key] = lane
 			} else {
 				delete(s.lanes, key)
@@ -107,6 +127,10 @@ func (s *MemoryStore) RemoveToken(tokenID int64) {
 			}
 		}
 		lane.SecondaryTokenIDs = filtered
+		if lane.MarketplacePriceLocks != nil {
+			delete(lane.MarketplacePriceLocks, tokenID)
+		}
+		lane.NormalizeMarketplacePriceLocks()
 		s.lanes[key] = lane
 	}
 	for key, owner := range s.response {
@@ -116,10 +140,16 @@ func (s *MemoryStore) RemoveToken(tokenID int64) {
 	}
 }
 
-func (s *MemoryStore) BindResponseOwner(responseID string, tokenID int64, ttl time.Duration) {
+func (s *MemoryStore) BindResponseOwner(responseID string, binding ResponseOwnerBinding, ttl time.Duration) {
 	atomic.AddInt64(&s.stats.ResponseBinds, 1)
+	if binding.TokenID <= 0 {
+		return
+	}
 	now := s.now().UTC()
-	owner := responseOwner{TokenID: tokenID}
+	owner := responseOwner{
+		TokenID:              binding.TokenID,
+		MarketplacePriceLock: cloneMarketplacePriceLock(binding.MarketplacePriceLock),
+	}
 	if ttl > 0 {
 		owner.ExpiresAt = now.Add(ttl)
 	}
@@ -128,21 +158,25 @@ func (s *MemoryStore) BindResponseOwner(responseID string, tokenID int64, ttl ti
 	s.mu.Unlock()
 }
 
-func (s *MemoryStore) GetResponseOwner(responseID string) (int64, bool) {
+func (s *MemoryStore) GetResponseOwner(responseID string) (ResponseOwnerBinding, bool) {
 	atomic.AddInt64(&s.stats.ResponseLookups, 1)
 	s.mu.RLock()
 	owner, ok := s.response[responseID]
 	s.mu.RUnlock()
 	if !ok {
-		return 0, false
+		return ResponseOwnerBinding{}, false
 	}
 	if !owner.ExpiresAt.IsZero() && s.now().After(owner.ExpiresAt) {
 		s.mu.Lock()
 		delete(s.response, responseID)
 		s.mu.Unlock()
-		return 0, false
+		return ResponseOwnerBinding{}, false
 	}
-	return owner.TokenID, true
+	return ResponseOwnerBinding{
+		TokenID:              owner.TokenID,
+		MarketplacePriceLock: cloneMarketplacePriceLock(owner.MarketplacePriceLock),
+		ExpiresAt:            owner.ExpiresAt,
+	}, true
 }
 
 func (s *MemoryStore) Stats() Metrics {
@@ -154,4 +188,59 @@ func (s *MemoryStore) Stats() Metrics {
 		ResponseBinds:   atomic.LoadInt64(&s.stats.ResponseBinds),
 		ResponseLookups: atomic.LoadInt64(&s.stats.ResponseLookups),
 	}
+}
+
+func (lane *Lane) NormalizeMarketplacePriceLocks() {
+	if lane == nil || len(lane.MarketplacePriceLocks) == 0 {
+		return
+	}
+	keep := map[int64]struct{}{}
+	if lane.PrimaryTokenID > 0 {
+		keep[lane.PrimaryTokenID] = struct{}{}
+	}
+	for _, tokenID := range lane.SecondaryTokenIDs {
+		if tokenID > 0 {
+			keep[tokenID] = struct{}{}
+		}
+	}
+	for tokenID := range lane.MarketplacePriceLocks {
+		if _, ok := keep[tokenID]; !ok {
+			delete(lane.MarketplacePriceLocks, tokenID)
+		}
+	}
+	if len(lane.MarketplacePriceLocks) == 0 {
+		lane.MarketplacePriceLocks = nil
+	}
+}
+
+func (lane Lane) MarketplacePriceLock(tokenID int64) (*MarketplacePriceLock, bool) {
+	if tokenID <= 0 || len(lane.MarketplacePriceLocks) == 0 {
+		return nil, false
+	}
+	lock, ok := lane.MarketplacePriceLocks[tokenID]
+	if !ok {
+		return nil, false
+	}
+	return cloneMarketplacePriceLock(&lock), true
+}
+
+func (lane *Lane) SetMarketplacePriceLock(tokenID int64, lock MarketplacePriceLock) {
+	if lane == nil || tokenID <= 0 {
+		return
+	}
+	if lock.LockedAt.IsZero() {
+		lock.LockedAt = time.Now().UTC()
+	}
+	if lane.MarketplacePriceLocks == nil {
+		lane.MarketplacePriceLocks = map[int64]MarketplacePriceLock{}
+	}
+	lane.MarketplacePriceLocks[tokenID] = lock
+}
+
+func cloneMarketplacePriceLock(lock *MarketplacePriceLock) *MarketplacePriceLock {
+	if lock == nil {
+		return nil
+	}
+	cloned := *lock
+	return &cloned
 }

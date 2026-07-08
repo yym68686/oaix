@@ -14,8 +14,15 @@ import (
 
 func TestMemoryStoreRemoveTokenAndMetrics(t *testing.T) {
 	s := NewMemoryStore()
-	s.Put("prompt-a", Lane{PrimaryTokenID: 1, SecondaryTokenIDs: []int64{2, 3}}, time.Hour)
-	s.BindResponseOwner("response-a", 1, time.Hour)
+	s.Put("prompt-a", Lane{
+		PrimaryTokenID:    1,
+		SecondaryTokenIDs: []int64{2, 3},
+		MarketplacePriceLocks: map[int64]MarketplacePriceLock{
+			1: {PriceBPS: 50, Source: "owner_default", LockedAt: time.Now().UTC()},
+			2: {PriceBPS: 80, Source: "owner_default", LockedAt: time.Now().UTC()},
+		},
+	}, time.Hour)
+	s.BindResponseOwner("response-a", ResponseOwnerBinding{TokenID: 1}, time.Hour)
 	s.RemoveToken(1)
 	lane, ok := s.Get("prompt-a")
 	if !ok {
@@ -23,6 +30,12 @@ func TestMemoryStoreRemoveTokenAndMetrics(t *testing.T) {
 	}
 	if lane.PrimaryTokenID != 2 || len(lane.SecondaryTokenIDs) != 1 || lane.SecondaryTokenIDs[0] != 3 {
 		t.Fatalf("unexpected lane after remove: %+v", lane)
+	}
+	if _, ok := lane.MarketplacePriceLock(1); ok {
+		t.Fatal("removed primary price lock should be removed")
+	}
+	if lock, ok := lane.MarketplacePriceLock(2); !ok || lock.PriceBPS != 80 {
+		t.Fatalf("promoted secondary price lock was not retained: lock=%+v ok=%v", lock, ok)
 	}
 	if _, ok := s.GetResponseOwner("response-a"); ok {
 		t.Fatal("response owner should be removed with token")

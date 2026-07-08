@@ -2,6 +2,7 @@ package tokens
 
 import (
 	"context"
+	"encoding/hex"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,14 +55,20 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 	}
 
 	if opts.PreviousResponseID != "" {
-		if ownerID, ok := store.GetResponseOwner(opts.PreviousResponseID); ok {
-			if claim := m.claimSpecific(ctx, snapshot, intent, ownerID, opts.PreviousOwnerWait, "previous_owner_hit"); claim != nil {
+		if binding, ok := store.GetResponseOwner(opts.PreviousResponseID); ok {
+			if claim := m.claimSpecific(ctx, snapshot, intent, binding.TokenID, opts.PreviousOwnerWait, "previous_owner_hit"); claim != nil {
 				result := PromptAffinityResult{Result: "previous_owner_hit"}
+				lock, status := responseOwnerPriceLock(store, opts.PreviousResponseID, binding, claim, intent, opts.ResponseTTL)
 				if opts.AffinityKey != "" {
-					index, count := bindLane(store, opts.AffinityKey, ownerID, opts.MaxLanesPerKey, opts.LaneTTL, true)
+					index, count, laneLock, laneStatus := bindLane(store, opts.AffinityKey, claim, opts.MaxLanesPerKey, opts.LaneTTL, true, lock)
 					result.LaneIndex = index
 					result.LaneCount = count
+					if laneLock != nil {
+						lock = laneLock
+						status = laneStatus
+					}
 				}
+				applyClaimMarketplacePriceLock(claim, lock, status)
 				return claim, result, nil
 			}
 			if opts.PreviousStrict {
@@ -76,13 +83,15 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 		if ok {
 			if lane.PrimaryTokenID > 0 {
 				if claim := m.claimSpecific(ctx, snapshot, intent, lane.PrimaryTokenID, opts.PrimaryWait, "primary_hit"); claim != nil {
-					index, count := bindLane(store, opts.AffinityKey, lane.PrimaryTokenID, opts.MaxLanesPerKey, opts.LaneTTL, true)
+					index, count, lock, status := bindLane(store, opts.AffinityKey, claim, opts.MaxLanesPerKey, opts.LaneTTL, true, nil)
+					applyClaimMarketplacePriceLock(claim, lock, status)
 					return claim, PromptAffinityResult{Result: "primary_hit", LaneIndex: index, LaneCount: count}, nil
 				}
 			}
 			for _, tokenID := range sortedLaneCandidates(opts.AffinityKey, snapshot, intent, lane.SecondaryTokenIDs) {
 				if claim := m.claimSpecific(ctx, snapshot, intent, tokenID, 0, "lane_hit"); claim != nil {
-					index, count := bindLane(store, opts.AffinityKey, tokenID, opts.MaxLanesPerKey, opts.LaneTTL, false)
+					index, count, lock, status := bindLane(store, opts.AffinityKey, claim, opts.MaxLanesPerKey, opts.LaneTTL, false, nil)
+					applyClaimMarketplacePriceLock(claim, lock, status)
 					return claim, PromptAffinityResult{Result: "lane_hit", LaneIndex: index, LaneCount: count}, nil
 				}
 			}
@@ -98,7 +107,8 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 				nextIntent.ExcludeTokenIDs = mergeExcluded(intent.ExcludeTokenIDs, excluded)
 				for _, tokenID := range sortedNewLaneCandidates(opts.AffinityKey, snapshot, nextIntent) {
 					if claim := m.claimSpecific(ctx, snapshot, nextIntent, tokenID, 0, "lane_created"); claim != nil {
-						index, count := bindLane(store, opts.AffinityKey, tokenID, opts.MaxLanesPerKey, opts.LaneTTL, false)
+						index, count, lock, status := bindLane(store, opts.AffinityKey, claim, opts.MaxLanesPerKey, opts.LaneTTL, false, nil)
+						applyClaimMarketplacePriceLock(claim, lock, status)
 						return claim, PromptAffinityResult{Result: "lane_created", LaneIndex: index, LaneCount: count}, nil
 					}
 				}
@@ -116,7 +126,8 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 				}
 				for _, tokenID := range sortedLaneCandidates(opts.AffinityKey, snapshot, intent, append([]int64{lane.PrimaryTokenID}, lane.SecondaryTokenIDs...)) {
 					if claim := m.claimSpecific(ctx, snapshot, intent, tokenID, 0, "lane_hit_after_wait"); claim != nil {
-						index, count := bindLane(store, opts.AffinityKey, tokenID, opts.MaxLanesPerKey, opts.LaneTTL, false)
+						index, count, lock, status := bindLane(store, opts.AffinityKey, claim, opts.MaxLanesPerKey, opts.LaneTTL, false, nil)
+						applyClaimMarketplacePriceLock(claim, lock, status)
 						return claim, PromptAffinityResult{Result: "lane_hit_after_wait", LaneIndex: index, LaneCount: count}, nil
 					}
 				}
@@ -124,7 +135,8 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 		} else {
 			for _, tokenID := range sortedNewLaneCandidates(opts.AffinityKey, snapshot, intent) {
 				if claim := m.claimSpecific(ctx, snapshot, intent, tokenID, 0, "lane_created"); claim != nil {
-					index, count := bindLane(store, opts.AffinityKey, tokenID, opts.MaxLanesPerKey, opts.LaneTTL, true)
+					index, count, lock, status := bindLane(store, opts.AffinityKey, claim, opts.MaxLanesPerKey, opts.LaneTTL, true, nil)
+					applyClaimMarketplacePriceLock(claim, lock, status)
 					return claim, PromptAffinityResult{Result: "lane_created", LaneIndex: index, LaneCount: count}, nil
 				}
 			}
@@ -142,18 +154,23 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 	claim, err := m.Claim(ctx, intent)
 	result := PromptAffinityResult{Result: "global_fallback"}
 	if err == nil && claim != nil && opts.AffinityKey != "" {
-		index, count := bindLane(store, opts.AffinityKey, claim.TokenID(), opts.MaxLanesPerKey, opts.LaneTTL, false)
+		index, count, lock, status := bindLane(store, opts.AffinityKey, claim, opts.MaxLanesPerKey, opts.LaneTTL, false, nil)
+		applyClaimMarketplacePriceLock(claim, lock, status)
 		result.LaneIndex = index
 		result.LaneCount = count
 	}
 	return claim, result, err
 }
 
-func (m *Manager) BindPromptResponseOwner(store affinity.Store, responseID string, tokenID int64, ttl time.Duration) {
-	if store == nil || responseID == "" || tokenID <= 0 {
+func (m *Manager) BindPromptResponseOwner(store affinity.Store, responseID string, claim *Claim, ttl time.Duration) {
+	if store == nil || responseID == "" || claim == nil || claim.TokenID() <= 0 {
 		return
 	}
-	store.BindResponseOwner(responseID, tokenID, ttl)
+	binding := affinity.ResponseOwnerBinding{TokenID: claim.TokenID()}
+	if lock := priceLockFromClaim(claim); lock != nil {
+		binding.MarketplacePriceLock = lock
+	}
+	store.BindResponseOwner(responseID, binding, ttl)
 }
 
 func (m *Manager) RemovePromptAffinityToken(store affinity.Store, tokenID int64) {
@@ -399,45 +416,174 @@ func tokenMarketplacePriceBPS(token *RuntimeToken) int {
 	return value
 }
 
+func tokenMarketplacePriceBPSFromClaim(claim *Claim) int {
+	if claim == nil {
+		return store.DefaultMarketplacePriceBPS
+	}
+	return tokenMarketplacePriceBPS(claim.Token)
+}
+
+func tokenMarketplacePriceSource(claim *Claim) string {
+	if claim == nil || claim.Token == nil {
+		return "owner_default"
+	}
+	source := strings.TrimSpace(claim.Token.Token.MarketplacePriceSource)
+	if source == "" {
+		return "owner_default"
+	}
+	return source
+}
+
 func marketplacePriceBucket(token *RuntimeToken) int {
 	const bucketSizeBPS = 10
 	return tokenMarketplacePriceBPS(token) / bucketSizeBPS
 }
 
-func bindLane(store affinity.Store, affinityKey string, tokenID int64, maxLanes int, ttl time.Duration, preferPrimary bool) (*int, int) {
-	if store == nil || affinityKey == "" || tokenID <= 0 {
-		return nil, 0
+func bindLane(store affinity.Store, affinityKey string, claim *Claim, maxLanes int, ttl time.Duration, preferPrimary bool, preferredLock *affinity.MarketplacePriceLock) (*int, int, *affinity.MarketplacePriceLock, string) {
+	if store == nil || affinityKey == "" || claim == nil || claim.TokenID() <= 0 {
+		return nil, 0, nil, ""
 	}
+	tokenID := claim.TokenID()
 	lane, ok := store.Get(affinityKey)
 	if !ok {
 		lane = affinity.Lane{PrimaryTokenID: tokenID}
+		lock := marketplacePriceLockForLane(affinityKey, claim, preferredLock)
+		lane.SetMarketplacePriceLock(tokenID, lock)
 		store.Put(affinityKey, lane, ttl)
 		index := 0
-		return &index, 1
+		return &index, 1, &lock, "created"
 	}
+	lock, status := ensureLaneMarketplacePriceLock(&lane, affinityKey, claim, preferredLock)
 	if lane.PrimaryTokenID == 0 || (preferPrimary && lane.PrimaryTokenID == tokenID) {
 		lane.PrimaryTokenID = tokenID
 	}
 	if lane.PrimaryTokenID == tokenID {
 		store.Put(affinityKey, lane, ttl)
 		index := 0
-		return &index, laneSize(lane)
+		return &index, laneSize(lane), lock, status
 	}
 	for index, id := range lane.SecondaryTokenIDs {
 		if id == tokenID {
 			store.Put(affinityKey, lane, ttl)
 			resolved := index + 1
-			return &resolved, laneSize(lane)
+			return &resolved, laneSize(lane), lock, status
 		}
 	}
 	if laneSize(lane) < maxLanes {
 		lane.SecondaryTokenIDs = append(lane.SecondaryTokenIDs, tokenID)
 		store.Put(affinityKey, lane, ttl)
 		index := len(lane.SecondaryTokenIDs)
-		return &index, laneSize(lane)
+		return &index, laneSize(lane), lock, status
 	}
 	store.Put(affinityKey, lane, ttl)
-	return nil, laneSize(lane)
+	return nil, laneSize(lane), lock, status
+}
+
+func ensureLaneMarketplacePriceLock(lane *affinity.Lane, affinityKey string, claim *Claim, preferredLock *affinity.MarketplacePriceLock) (*affinity.MarketplacePriceLock, string) {
+	if lane == nil || claim == nil || claim.TokenID() <= 0 {
+		return nil, ""
+	}
+	tokenID := claim.TokenID()
+	if lock, ok := lane.MarketplacePriceLock(tokenID); ok {
+		return lock, "hit"
+	}
+	lock := marketplacePriceLockForLane(affinityKey, claim, preferredLock)
+	lane.SetMarketplacePriceLock(tokenID, lock)
+	return &lock, "backfilled"
+}
+
+func responseOwnerPriceLock(store affinity.Store, responseID string, binding affinity.ResponseOwnerBinding, claim *Claim, intent Intent, ttl time.Duration) (*affinity.MarketplacePriceLock, string) {
+	if claim == nil || !isMarketplaceSelection(intent.SelectionMode) {
+		return nil, ""
+	}
+	if binding.MarketplacePriceLock != nil {
+		return binding.MarketplacePriceLock, "response_hit"
+	}
+	lock := marketplacePriceLockForResponse(responseID, claim)
+	if store != nil && responseID != "" {
+		binding.TokenID = claim.TokenID()
+		binding.MarketplacePriceLock = &lock
+		store.BindResponseOwner(responseID, binding, ttl)
+	}
+	return &lock, "response_backfilled"
+}
+
+func marketplacePriceLockForLane(affinityKey string, claim *Claim, preferredLock *affinity.MarketplacePriceLock) affinity.MarketplacePriceLock {
+	if preferredLock != nil {
+		lock := *preferredLock
+		if lock.LockedAt.IsZero() {
+			lock.LockedAt = time.Now().UTC()
+		}
+		if lock.Source == "" {
+			lock.Source = tokenMarketplacePriceSource(claim)
+		}
+		if lock.ContractKey == "" {
+			lock.ContractKey = marketplaceContractKey("lane", affinityKey, claim.TokenID())
+		}
+		return lock
+	}
+	lock := marketplacePriceLockFromClaim(claim)
+	lock.ContractKey = marketplaceContractKey("lane", affinityKey, claim.TokenID())
+	return lock
+}
+
+func marketplacePriceLockForResponse(responseID string, claim *Claim) affinity.MarketplacePriceLock {
+	lock := marketplacePriceLockFromClaim(claim)
+	lock.ContractKey = marketplaceContractKey("response", responseID, claim.TokenID())
+	return lock
+}
+
+func marketplacePriceLockFromClaim(claim *Claim) affinity.MarketplacePriceLock {
+	return affinity.MarketplacePriceLock{
+		PriceBPS: tokenMarketplacePriceBPSFromClaim(claim),
+		Source:   tokenMarketplacePriceSource(claim),
+		LockedAt: time.Now().UTC(),
+	}
+}
+
+func applyClaimMarketplacePriceLock(claim *Claim, lock *affinity.MarketplacePriceLock, status string) {
+	if claim == nil || lock == nil {
+		return
+	}
+	claim.MarketplacePriceBPS = lock.PriceBPS
+	claim.MarketplacePriceSource = lock.Source
+	claim.MarketplacePriceLocked = true
+	if !lock.LockedAt.IsZero() {
+		lockedAt := lock.LockedAt
+		claim.MarketplacePriceLockedAt = &lockedAt
+	}
+	claim.MarketplacePriceLockStatus = status
+	claim.MarketplacePriceContractKey = lock.ContractKey
+}
+
+func priceLockFromClaim(claim *Claim) *affinity.MarketplacePriceLock {
+	if claim == nil || !claim.MarketplacePriceLocked {
+		return nil
+	}
+	lock := affinity.MarketplacePriceLock{
+		PriceBPS:    claim.MarketplacePriceBPS,
+		Source:      claim.MarketplacePriceSource,
+		ContractKey: claim.MarketplacePriceContractKey,
+	}
+	if claim.MarketplacePriceLockedAt != nil {
+		lock.LockedAt = *claim.MarketplacePriceLockedAt
+	} else {
+		lock.LockedAt = time.Now().UTC()
+	}
+	return &lock
+}
+
+func marketplaceContractKey(kind, key string, tokenID int64) string {
+	hash, err := blake2b.New(16, nil)
+	if err != nil {
+		return ""
+	}
+	_, _ = hash.Write([]byte(kind))
+	_, _ = hash.Write([]byte(":"))
+	_, _ = hash.Write([]byte(key))
+	_, _ = hash.Write([]byte(":"))
+	_, _ = hash.Write([]byte(strconv.FormatInt(tokenID, 10)))
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func laneSize(lane affinity.Lane) int {
