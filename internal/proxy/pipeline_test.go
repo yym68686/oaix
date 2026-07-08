@@ -19,6 +19,7 @@ import (
 	"github.com/yym68686/oaix/internal/affinity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/logs"
+	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/tokens"
 	"github.com/yym68686/oaix/internal/transport"
@@ -716,6 +717,246 @@ func TestProxyDeactivatesAndRetriesAfterDeactivatedWorkspace402(t *testing.T) {
 	}
 	if _, ok := affinityStore.Get("prompt"); ok {
 		t.Fatal("prompt affinity still contains deactivated token")
+	}
+}
+
+func TestProxyRefreshesOAuthAccessTokenBeforeDeactivating401(t *testing.T) {
+	var mu sync.Mutex
+	var authHeaders []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		auth := r.Header.Get("Authorization")
+		mu.Unlock()
+		if auth == "Bearer old-token" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"code":"no_matching_rule","message":"Unauthorized"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: response.completed`,
+			`data: {"type":"response.completed","response":{"id":"resp_retry","object":"response","model":"gpt-5.5","status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+			``,
+		}, "\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                2,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	now := time.Now().UTC()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{{
+			ID:           1,
+			OwnerUserID:  10,
+			AccessToken:  "old-token",
+			RefreshToken: "refresh-token",
+			IsActive:     true,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}},
+		tokenErrorEvents: make(chan tokenErrorEvent, 1),
+	}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+	pipeline.SetOAuthClient(fakeOAuthClient{result: oauth.RefreshResult{AccessToken: "new-token", RefreshToken: "refresh-token-2", ExpiresIn: 3600}})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", Stream: true})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	mu.Lock()
+	gotAuthHeaders := append([]string(nil), authHeaders...)
+	mu.Unlock()
+	if len(gotAuthHeaders) != 2 {
+		t.Fatalf("upstream calls = %d, want 2", len(gotAuthHeaders))
+	}
+	if gotAuthHeaders[0] != "Bearer old-token" || gotAuthHeaders[1] != "Bearer new-token" {
+		t.Fatalf("auth headers = %v", gotAuthHeaders)
+	}
+	fakes.mu.Lock()
+	token := fakes.tokens[0]
+	fakes.mu.Unlock()
+	if token.AccessToken != "new-token" || token.RefreshToken != "refresh-token-2" {
+		t.Fatalf("token secret was not updated: access=%q refresh=%q", token.AccessToken, token.RefreshToken)
+	}
+	if !token.IsActive || token.DisabledAt != nil {
+		t.Fatalf("token was disabled after refresh: %+v", token)
+	}
+	select {
+	case event := <-fakes.tokenErrorEvents:
+		t.Fatalf("unexpected token error event after refresh: %+v", event)
+	default:
+	}
+}
+
+func TestProxyDoesNotDeactivateOAuthTokenWhen401PersistsAfterRefresh(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"code":"no_matching_rule","message":"Unauthorized"}}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                2,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	now := time.Now().UTC()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{{
+			ID:           1,
+			OwnerUserID:  10,
+			AccessToken:  "old-token",
+			RefreshToken: "refresh-token",
+			IsActive:     true,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}},
+		tokenErrorEvents: make(chan tokenErrorEvent, 1),
+	}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+	pipeline.SetOAuthClient(fakeOAuthClient{result: oauth.RefreshResult{AccessToken: "new-token", RefreshToken: "refresh-token-2", ExpiresIn: 3600}})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5"})
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case event := <-fakes.tokenErrorEvents:
+		if event.TokenID != 1 {
+			t.Fatalf("token_id = %d, want 1", event.TokenID)
+		}
+		if event.Deactivate {
+			t.Fatalf("token should not be deactivated after refresh-backed 401: %+v", event)
+		}
+		if event.CooldownUntil == nil {
+			t.Fatalf("expected short cooldown for inconclusive auth failure: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for non-terminal token error commit")
+	}
+	fakes.mu.Lock()
+	token := fakes.tokens[0]
+	fakes.mu.Unlock()
+	if !token.IsActive || token.DisabledAt != nil {
+		t.Fatalf("token was disabled after inconclusive auth failure: %+v", token)
+	}
+}
+
+func TestProxyDeactivatesOAuthTokenWhenRefreshTokenIsPermanentlyInvalid(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"code":"no_matching_rule","message":"Unauthorized"}}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                1,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	now := time.Now().UTC()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{{
+			ID:           1,
+			OwnerUserID:  10,
+			AccessToken:  "old-token",
+			RefreshToken: "refresh-token",
+			IsActive:     true,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}},
+		tokenErrorEvents: make(chan tokenErrorEvent, 1),
+	}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+	pipeline.SetOAuthClient(fakeOAuthClient{err: errors.New(`oauth refresh failed with status 400: {"error":"invalid_grant"}`)})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5"})
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case event := <-fakes.tokenErrorEvents:
+		if event.TokenID != 1 || !event.Deactivate {
+			t.Fatalf("token error event = %+v, want token 1 deactivated", event)
+		}
+		if !strings.Contains(event.Message, "refresh token invalid") {
+			t.Fatalf("message = %q", event.Message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for token deactivate commit")
 	}
 }
 
@@ -1431,6 +1672,15 @@ type fakeProxyStore struct {
 	attempts         []store.GatewayRequestAttempt
 }
 
+type fakeOAuthClient struct {
+	result oauth.RefreshResult
+	err    error
+}
+
+func (c fakeOAuthClient) Refresh(context.Context, string) (oauth.RefreshResult, error) {
+	return c.result, c.err
+}
+
 type tokenErrorEvent struct {
 	TokenID       int64
 	Message       string
@@ -1510,6 +1760,42 @@ func (s *fakeProxyStore) MarkTokenErrorWithContext(_ context.Context, tokenID in
 		}
 	}
 	return nil
+}
+
+func (s *fakeProxyStore) UpdateTokenSecret(_ context.Context, update store.TokenSecretUpdate) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.tokens {
+		if s.tokens[i].ID != update.TokenID {
+			continue
+		}
+		if update.AccessToken != "" {
+			s.tokens[i].AccessToken = update.AccessToken
+		}
+		if update.RefreshToken != "" {
+			s.tokens[i].RefreshToken = update.RefreshToken
+		}
+		if update.AccountID != "" {
+			accountID := update.AccountID
+			s.tokens[i].AccountID = &accountID
+		}
+		if update.Email != "" {
+			email := update.Email
+			s.tokens[i].Email = &email
+		}
+		if update.PlanType != "" {
+			planType := update.PlanType
+			s.tokens[i].PlanType = &planType
+		}
+		if !update.PreserveActivation {
+			s.tokens[i].IsActive = true
+			s.tokens[i].DisabledAt = nil
+			s.tokens[i].LastError = nil
+		}
+		s.tokens[i].UpdatedAt = time.Now().UTC()
+		return nil
+	}
+	return fmt.Errorf("token %d not found", update.TokenID)
 }
 
 func (s *fakeProxyStore) InsertGatewayRequestAttempt(_ context.Context, item store.GatewayRequestAttempt) (int64, error) {

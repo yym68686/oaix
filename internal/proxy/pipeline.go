@@ -21,6 +21,7 @@ import (
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/cooldown"
 	"github.com/yym68686/oaix/internal/logs"
+	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/protocol/openai"
 	"github.com/yym68686/oaix/internal/protocol/sse"
 	"github.com/yym68686/oaix/internal/store"
@@ -28,7 +29,11 @@ import (
 	"github.com/yym68686/oaix/internal/transport"
 )
 
-const maxRejectedEncryptedContentRetries = 64
+const (
+	maxRejectedEncryptedContentRetries = 64
+	authFailureRefreshTimeout          = 15 * time.Second
+	authFailureCooldown                = 5 * time.Second
+)
 
 type Pipeline struct {
 	cfg            config.Config
@@ -38,6 +43,7 @@ type Pipeline struct {
 	logs           *logs.Writer
 	store          tokenStateStore
 	affinity       affinity.Store
+	oauthClient    oauth.Client
 	commitFailures atomic.Int64
 }
 
@@ -46,6 +52,14 @@ type tokenStateStore interface {
 	MarkTokenError(ctx context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time) error
 	MarkTokenErrorWithContext(ctx context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time, eventCtx store.TokenStateEventContext) error
 	InsertGatewayRequestAttempt(ctx context.Context, item store.GatewayRequestAttempt) (int64, error)
+}
+
+type tokenSecretUpdater interface {
+	UpdateTokenSecret(ctx context.Context, update store.TokenSecretUpdate) error
+}
+
+type tokenOAuthClientIDStore interface {
+	TokenOAuthClientID(ctx context.Context, tokenID int64) (string, error)
 }
 
 type RequestIntent struct {
@@ -124,6 +138,13 @@ func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, c
 		store:     stateStore,
 		affinity:  affinityStore,
 	}
+}
+
+func (p *Pipeline) SetOAuthClient(client oauth.Client) {
+	if p == nil {
+		return
+	}
+	p.oauthClient = client
 }
 
 func (p *Pipeline) TransportStats() transport.Stats {
@@ -220,6 +241,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var lastResponseID string
 	var lastFirstTokenAt *time.Time
 	var streamState StreamAttemptState
+	var refreshedAuthTokens = make(map[int64]struct{})
 	for attempt := 1; attempt <= p.cfg.Upstream.MaxRetries; attempt++ {
 		selectStarted := time.Now()
 		tokenIntent := tokens.Intent{
@@ -389,11 +411,31 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			cooldownUntil  *time.Time
 			commitMessage  string
 			commitRequired bool
+			retrySameToken bool
 		)
 		if action == OutcomeUpstream401Invalid || action == OutcomeUpstream403Invalid {
-			deactivate = true
-			commitRequired = true
-			commitMessage = fmt.Sprintf("terminal upstream status %d", status)
+			_, alreadyRefreshed := refreshedAuthTokens[claim.TokenID()]
+			refreshResult := p.refreshAccessTokenAfterAuthFailure(r.Context(), claim, alreadyRefreshed)
+			switch {
+			case refreshResult.Refreshed:
+				refreshedAuthTokens[claim.TokenID()] = struct{}{}
+				retrySameToken = true
+				timing["oauth_refresh_on_auth_failure"] = true
+			case refreshResult.Inconclusive:
+				cooldownUntil = authFailureCooldownUntil()
+				commitRequired = true
+				commitMessage = refreshResult.Message
+				if commitMessage == "" {
+					commitMessage = fmt.Sprintf("non-terminal upstream status %d after oauth refresh check", status)
+				}
+			default:
+				deactivate = true
+				commitRequired = true
+				commitMessage = refreshResult.Message
+				if commitMessage == "" {
+					commitMessage = fmt.Sprintf("terminal upstream status %d", status)
+				}
+			}
 		} else if action == OutcomeUpstream429Cooldown {
 			now := time.Now().UTC()
 			cooldownUntil = cooldown.UsageLimitUntil(status, result.ErrorBody, now, p.cfg.TokenPool.DefaultCooldown)
@@ -421,6 +463,12 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			if deactivate {
 				p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			}
+		}
+		if retrySameToken {
+			if attempt < p.cfg.Upstream.MaxRetries {
+				continue
+			}
+			break
 		}
 		excluded[claim.TokenID()] = struct{}{}
 		if !retry || attempt == p.cfg.Upstream.MaxRetries {
@@ -457,6 +505,121 @@ func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptC
 		LaneTTL:               p.cfg.PromptCache.LaneTTL,
 		ResponseTTL:           p.cfg.PromptCache.ResponseTTL,
 	})
+}
+
+type authFailureRefreshResult struct {
+	Refreshed    bool
+	Inconclusive bool
+	Message      string
+}
+
+func (p *Pipeline) refreshAccessTokenAfterAuthFailure(parent context.Context, claim *tokens.Claim, alreadyRefreshed bool) authFailureRefreshResult {
+	if alreadyRefreshed {
+		return authFailureRefreshResult{
+			Inconclusive: true,
+			Message:      "non-terminal upstream auth failure after oauth access refresh",
+		}
+	}
+	if p == nil || p.oauthClient == nil || claim == nil || claim.Token == nil {
+		return authFailureRefreshResult{}
+	}
+	token := claim.Token.Token
+	refreshToken := strings.TrimSpace(token.RefreshToken)
+	if refreshToken == "" {
+		return authFailureRefreshResult{}
+	}
+	updater, ok := p.store.(tokenSecretUpdater)
+	if !ok || updater == nil {
+		return authFailureRefreshResult{}
+	}
+
+	ctx, cancel := context.WithTimeout(parent, authFailureRefreshTimeout)
+	defer cancel()
+	result, err := p.refreshOAuthToken(ctx, token.ID, refreshToken)
+	if err != nil {
+		detail := err.Error()
+		status := oauth.RefreshErrorStatus(detail)
+		if oauth.IsPermanentlyInvalidRefreshTokenError(status, detail) {
+			return authFailureRefreshResult{
+				Message: "terminal upstream auth failure: refresh token invalid",
+			}
+		}
+		return authFailureRefreshResult{
+			Inconclusive: true,
+			Message:      "non-terminal upstream auth failure: oauth refresh inconclusive: " + truncateDetail(detail, 240),
+		}
+	}
+
+	expiresAt := (*time.Time)(nil)
+	if result.ExpiresIn > 0 {
+		expires := time.Now().UTC().Add(time.Duration(result.ExpiresIn) * time.Second)
+		expiresAt = &expires
+	}
+	if err := updater.UpdateTokenSecret(ctx, store.TokenSecretUpdate{
+		TokenID:            token.ID,
+		AccessToken:        result.AccessToken,
+		RefreshToken:       result.RefreshToken,
+		IDToken:            result.IDToken,
+		ExpiresAt:          expiresAt,
+		AccountID:          result.AccountID,
+		Email:              result.Email,
+		PlanType:           result.PlanType,
+		PreserveActivation: true,
+	}); err != nil {
+		return authFailureRefreshResult{
+			Inconclusive: true,
+			Message:      "non-terminal upstream auth failure: oauth refresh persist failed: " + truncateDetail(err.Error(), 240),
+		}
+	}
+	p.refreshTokenSnapshotsAfterSecretUpdate(ctx, token.OwnerUserID)
+	if p.logger != nil {
+		p.logger.Info("oauth access token refreshed after upstream auth failure", "token_id", token.ID, "owner_user_id", token.OwnerUserID)
+	}
+	return authFailureRefreshResult{Refreshed: true}
+}
+
+func (p *Pipeline) refreshOAuthToken(ctx context.Context, tokenID int64, refreshToken string) (oauth.RefreshResult, error) {
+	clientID := ""
+	if source, ok := p.store.(tokenOAuthClientIDStore); ok && source != nil {
+		if value, err := source.TokenOAuthClientID(ctx, tokenID); err == nil {
+			clientID = strings.TrimSpace(value)
+		} else if p.logger != nil {
+			p.logger.Warn("token oauth client id lookup failed; using default client id", "token_id", tokenID, "error", err)
+		}
+	}
+	if clientID != "" {
+		if refresher, ok := p.oauthClient.(oauth.ClientIDRefresher); ok {
+			return refresher.RefreshWithClientID(ctx, refreshToken, clientID)
+		}
+	}
+	return p.oauthClient.Refresh(ctx, refreshToken)
+}
+
+func (p *Pipeline) refreshTokenSnapshotsAfterSecretUpdate(ctx context.Context, ownerUserID int64) {
+	if p == nil || p.tokens == nil {
+		return
+	}
+	if err := p.tokens.Refresh(ctx); err != nil && p.logger != nil {
+		p.logger.Warn("token snapshot refresh after oauth access refresh failed", "owner_user_id", ownerUserID, "error", err)
+	}
+	if ownerUserID > 0 {
+		if err := p.tokens.RefreshOwner(ctx, ownerUserID); err != nil && p.logger != nil {
+			p.logger.Warn("owner token snapshot refresh after oauth access refresh failed", "owner_user_id", ownerUserID, "error", err)
+		}
+	}
+}
+
+func authFailureCooldownUntil() *time.Time {
+	until := time.Now().UTC().Add(authFailureCooldown)
+	return &until
+}
+
+func truncateDetail(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "..."
 }
 
 func (p *Pipeline) recordClaimTiming(timing map[string]any, claim *tokens.Claim, err error) {

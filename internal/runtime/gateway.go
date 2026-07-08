@@ -11,6 +11,7 @@ import (
 	"github.com/yym68686/oaix/internal/httpapi"
 	"github.com/yym68686/oaix/internal/importer"
 	"github.com/yym68686/oaix/internal/logs"
+	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/observability"
 	"github.com/yym68686/oaix/internal/proxy"
 	"github.com/yym68686/oaix/internal/store"
@@ -67,6 +68,10 @@ func RunGateway(ctx context.Context) error {
 	defer upstream.CloseIdleConnections()
 	affinityStore := affinity.NewPostgresStore(db.Pool())
 	pipeline := proxy.New(cfg, logger, tokenManager, upstream, logWriter, db, affinityStore)
+	oauthClient := oauth.NewHTTPClient(cfg.Upstream.OAuthTokenURL)
+	oauthClient.ClientID = cfg.Upstream.OAuthClientID
+	oauthClient.Scope = cfg.Upstream.OAuthScope
+	pipeline.SetOAuthClient(oauthClient)
 	app := httpapi.NewApp(cfg, logger, db, tokenManager, logWriter, pipeline)
 	server := &http.Server{
 		Addr:         cfg.Address(),

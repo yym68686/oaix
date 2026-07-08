@@ -395,45 +395,11 @@ func isPermanentProbeDisableError(status int, detail string) bool {
 }
 
 func oauthRefreshErrorStatus(detail string) int {
-	var status int
-	if _, err := fmt.Sscanf(detail, "oauth refresh failed with status %d:", &status); err == nil {
-		return status
-	}
-	return 0
+	return oauth.RefreshErrorStatus(detail)
 }
 
 func isPermanentlyInvalidRefreshTokenError(status int, detail string) bool {
-	if status != 0 && status != http.StatusBadRequest && status != http.StatusUnauthorized && status != http.StatusForbidden {
-		return false
-	}
-	lowered := strings.ToLower(detail)
-	for _, marker := range []string{
-		"invalid_grant",
-		"invalid_refresh_token",
-		"refresh_token_expired",
-		"refresh_token_not_found",
-		"refresh_token_reused",
-		"refresh_token_revoked",
-		"app_session_terminated",
-		"session_terminated",
-		"token_expired",
-		"token_revoked",
-		"already been used to generate a new access token",
-		"invalid refresh token",
-		"please try signing in again",
-		"please log in again",
-		"refresh token expired",
-		"refresh token is invalid",
-		"refresh token not found",
-		"refresh token revoked",
-		"session has ended",
-		"your session has ended",
-	} {
-		if strings.Contains(lowered, marker) {
-			return true
-		}
-	}
-	return false
+	return oauth.IsPermanentlyInvalidRefreshTokenError(status, detail)
 }
 
 func extractProbeStreamResult(ctx context.Context, body []byte) (string, string, string) {
