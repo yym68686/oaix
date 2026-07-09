@@ -143,9 +143,8 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Openai-Beta", "responses=experimental")
-	req.Header.Set("Originator", "codex_cli_rs")
-	req.Header.Set("Version", "0.125.0")
-	req.Header.Set("User-Agent", "codex_cli_rs/0.125.0")
+	req.Header.Set("Originator", codexOriginator)
+	req.Header.Set("User-Agent", codexUserAgent)
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Session_id", fmt.Sprintf("oaix-admin-probe-%d", token.ID))
 	if token.AccountID != nil && strings.TrimSpace(*token.AccountID) != "" {

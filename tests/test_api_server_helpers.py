@@ -814,8 +814,8 @@ def test_build_upstream_headers_uses_current_codex_user_agent_default() -> None:
 
     assert headers["Authorization"] == "Bearer access-token"
     assert headers["Accept"] == "application/json"
-    assert headers["Version"] == "0.125.0"
-    assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
+    assert "Version" not in headers
+    assert headers["User-Agent"] == "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal"
     assert "Conversation_id" not in headers
     assert "Connection" not in headers
 
@@ -832,8 +832,8 @@ def test_build_upstream_headers_overrides_stale_client_codex_identity() -> None:
 
     headers = _build_upstream_headers(request, access_token="access-token", account_id=None, stream=True)
 
-    assert headers["Version"] == "0.125.0"
-    assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
+    assert "Version" not in headers
+    assert headers["User-Agent"] == "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 
 
 def test_prompt_cache_context_injects_key_and_stable_session_id() -> None:

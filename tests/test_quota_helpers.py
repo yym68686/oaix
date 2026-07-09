@@ -47,7 +47,7 @@ def test_extract_codex_plan_info_reads_openai_auth_claims() -> None:
 
 
 def test_wham_user_agent_uses_current_codex_version() -> None:
-    assert WHAM_USER_AGENT.startswith("codex_cli_rs/0.125.0 ")
+    assert WHAM_USER_AGENT.startswith("codex_cli_rs/0.144.0 ")
 
 
 def test_parse_codex_quota_payload_reads_5h_and_7d_windows() -> None:

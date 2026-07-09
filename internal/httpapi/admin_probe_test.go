@@ -27,6 +27,12 @@ func TestProbeTokenUsesCurrentAccessTokenAndStreamingPayload(t *testing.T) {
 		if got := r.Header.Get("Accept"); got != "text/event-stream" {
 			t.Fatalf("accept = %q", got)
 		}
+		if got := r.Header.Get("Version"); got != "" {
+			t.Fatalf("version header should be absent, got %q", got)
+		}
+		if got := r.Header.Get("User-Agent"); got != codexUserAgent {
+			t.Fatalf("user agent = %q", got)
+		}
 		if got := r.Header.Get("Session_id"); !strings.HasPrefix(got, "oaix-admin-probe-7") {
 			t.Fatalf("session id = %q", got)
 		}

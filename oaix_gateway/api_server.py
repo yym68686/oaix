@@ -37,7 +37,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from types import SimpleNamespace
 from starlette.datastructures import UploadFile
 from .chat_image_store import create_chat_image_checkpoint, resolve_chat_image_output_items
-from .codex_constants import CODEX_CLI_VERSION, CODEX_USER_AGENT
+from .codex_constants import CODEX_USER_AGENT
 from .database import (
     close_database,
     get_request_log_session,
@@ -4709,7 +4709,6 @@ def _build_upstream_headers(
         "Authorization": f"Bearer {access_token}",
         "Openai-Beta": (http_request.headers.get("Openai-Beta") or "responses=experimental").strip(),
         "Originator": (http_request.headers.get("Originator") or "codex_cli_rs").strip(),
-        "Version": CODEX_CLI_VERSION,
         "Session_id": resolved_session_id,
         "User-Agent": CODEX_USER_AGENT,
         "Accept": "text/event-stream" if stream else "application/json",

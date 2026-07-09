@@ -27,7 +27,7 @@ import (
 const (
 	defaultWHAMUsageURL      = "https://chatgpt.com/backend-api/wham/usage"
 	defaultWHAMResetURL      = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
-	defaultWHAMUserAgent     = "codex_cli_rs/0.125.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	defaultWHAMUserAgent     = codexUserAgent
 	defaultWHAMOriginator    = "Codex Desktop"
 	defaultWHAMLanguage      = "zh-CN"
 	quotaWindow5HSeconds     = 5 * 60 * 60

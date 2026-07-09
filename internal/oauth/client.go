@@ -71,6 +71,8 @@ const (
 	ErrorClassTerminal  ErrorClass = "terminal"
 )
 
+const codexUserAgent = "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+
 func NewHTTPClient(tokenURL string) *HTTPClient {
 	return &HTTPClient{
 		TokenURL: tokenURL,
@@ -167,7 +169,7 @@ func (c *HTTPClient) ExchangeAuthorizationCode(ctx context.Context, request Auth
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "codex-cli/0.91.0")
+	req.Header.Set("User-Agent", codexUserAgent)
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return RefreshResult{}, err
@@ -196,7 +198,7 @@ func (c *HTTPClient) refreshOnce(ctx context.Context, refreshToken string, clien
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "codex-cli/0.91.0")
+	req.Header.Set("User-Agent", codexUserAgent)
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return RefreshResult{}, 0, err
