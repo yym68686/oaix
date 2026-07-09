@@ -1461,6 +1461,11 @@ func (a *App) settingsSchema(w http.ResponseWriter, r *http.Request) {
 			"type":       "object",
 			"properties": map[string]any{"active_stream_cap": map[string]any{"type": "integer", "minimum": 1, "maximum": store.MaxTokenActiveStreamCap}},
 		},
+		"admin_token_probe_model": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"model": map[string]any{"type": "string", "enum": supportedTokenProbeModels}},
+			"default":    map[string]any{"model": defaultAdminProbeModel},
+		},
 		"generic": map[string]any{"type": "object"},
 	})
 }

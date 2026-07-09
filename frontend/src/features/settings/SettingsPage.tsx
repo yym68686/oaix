@@ -9,9 +9,94 @@ import { Textarea } from "@/registry/default/ui/textarea";
 import { cn } from "@/registry/default/lib/utils";
 import { api, getServiceKey, setServiceKey, type SettingItem } from "@/lib/api";
 import { clamp } from "@/lib/format";
-import { EmptyState, ErrorAlert, LoadingState } from "@/shared/components";
+import {
+  ADMIN_TOKEN_PROBE_MODEL_SETTING_KEY,
+  DEFAULT_TEST_MODEL,
+  TEST_MODEL_SELECT_OPTIONS,
+  USER_TOKEN_PROBE_MODEL_SETTING_KEY,
+  testModelFromSettings,
+  testModelSettingPayload,
+  type TestModel,
+} from "@/lib/test-models";
+import { EmptyState, ErrorAlert, LoadingState, SelectField } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
 import type { ToastMessage } from "@/shared/types";
+
+export function UserSettingsPage({
+  pushToast,
+  refreshNonce,
+}: {
+  pushToast: (title: string, variant?: ToastMessage["variant"]) => void;
+  refreshNonce: number;
+}) {
+  const [probeModel, setProbeModel] = useState<TestModel>(DEFAULT_TEST_MODEL);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const loadSettings = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const payload = await api.mySettings();
+      setProbeModel(testModelFromSettings(payload.items || [], USER_TOKEN_PROBE_MODEL_SETTING_KEY));
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSettings();
+  }, [loadSettings, refreshNonce]);
+
+  async function saveProbeModel() {
+    setSaving(true);
+    try {
+      await api.updateMySetting(USER_TOKEN_PROBE_MODEL_SETTING_KEY, testModelSettingPayload(probeModel));
+      pushToast("默认测试模型已保存");
+      await loadSettings();
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-[minmax(320px,.65fr)_minmax(0,1fr)]">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Settings2Icon className="size-5" />
+            测试设置
+          </CardTitle>
+          <CardDescription>设置用户页面 Key 测试按钮默认使用的模型。</CardDescription>
+        </CardHeader>
+        <CardPanel className="grid gap-4">
+          {error && <ErrorAlert title="设置载入失败" message={error} />}
+          {loading && !error ? (
+            <LoadingState compact label="正在载入设置" />
+          ) : (
+            <>
+              <SelectField
+                label="默认测试模型"
+                onChange={(value) => setProbeModel(value as TestModel)}
+                options={TEST_MODEL_SELECT_OPTIONS}
+                value={probeModel}
+              />
+              <Button className="w-fit" disabled={saving} loading={saving} onClick={() => void saveProbeModel()}>
+                <SaveIcon />
+                保存测试设置
+              </Button>
+            </>
+          )}
+        </CardPanel>
+      </Card>
+    </div>
+  );
+}
 
 export function SettingsPage({
   onStreamCapChange,
@@ -28,9 +113,11 @@ export function SettingsPage({
   const [selectionSummary, setSelectionSummary] = useState("等待载入");
   const [settingKey, setSettingKey] = useState("");
   const [settingValue, setSettingValue] = useState("{\n  \"enabled\": true\n}");
+  const [adminProbeModel, setAdminProbeModel] = useState<TestModel>(DEFAULT_TEST_MODEL);
   const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [adminProbeModelSaving, setAdminProbeModelSaving] = useState(false);
 
   const loadTokenSelection = useCallback(async () => {
     const payload = await api.tokenSelection();
@@ -44,7 +131,9 @@ export function SettingsPage({
     setError("");
     try {
       const [settingsPayload] = await Promise.all([api.settings(), loadTokenSelection()]);
-      setItems(settingsPayload.items || []);
+      const nextItems = settingsPayload.items || [];
+      setItems(nextItems);
+      setAdminProbeModel(testModelFromSettings(nextItems, ADMIN_TOKEN_PROBE_MODEL_SETTING_KEY));
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -77,6 +166,19 @@ export function SettingsPage({
     await api.updateSetting(settingKey.trim(), value);
     pushToast("设置已保存");
     await loadSettings();
+  }
+
+  async function saveAdminProbeModel() {
+    setAdminProbeModelSaving(true);
+    try {
+      await api.updateSetting(ADMIN_TOKEN_PROBE_MODEL_SETTING_KEY, testModelSettingPayload(adminProbeModel));
+      pushToast("管理员测试模型已保存");
+      await loadSettings();
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setAdminProbeModelSaving(false);
+    }
   }
 
   function saveServiceKey() {
@@ -122,6 +224,28 @@ export function SettingsPage({
             <Button onClick={() => void saveStreamCap()}>
               <SaveIcon />
               保存调度设置
+            </Button>
+          </CardPanel>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Settings2Icon className="size-5" />
+              测试设置
+            </CardTitle>
+            <CardDescription>管理员号池总览和 Key 详情测试按钮默认使用的模型。</CardDescription>
+          </CardHeader>
+          <CardPanel className="grid gap-4">
+            <SelectField
+              label="默认测试模型"
+              onChange={(value) => setAdminProbeModel(value as TestModel)}
+              options={TEST_MODEL_SELECT_OPTIONS}
+              value={adminProbeModel}
+            />
+            <Button className="w-fit" disabled={adminProbeModelSaving} loading={adminProbeModelSaving} onClick={() => void saveAdminProbeModel()}>
+              <SaveIcon />
+              保存测试设置
             </Button>
           </CardPanel>
         </Card>

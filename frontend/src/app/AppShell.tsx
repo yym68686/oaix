@@ -41,6 +41,7 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
       { key: "keys", href: "/keys?status=available", icon: <KeyRoundIcon />, label: "Key" },
       { key: "imports", href: "/imports", icon: <UploadIcon />, label: "导入" },
       { key: "requests", href: "/requests", icon: <ListFilterIcon />, label: "请求" },
+      { key: "user_settings", href: "/account/settings", icon: <Settings2Icon />, label: "设置" },
     ],
   },
   {

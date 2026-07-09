@@ -59,6 +59,16 @@ func (s *Store) ListSettings(ctx context.Context) ([]Setting, error) {
 	return items, rows.Err()
 }
 
+func (s *Store) GetSetting(ctx context.Context, key string) (Setting, error) {
+	item := Setting{Scope: "global"}
+	err := s.pool.QueryRow(ctx, `
+		select key, coalesce(value::jsonb, '{}'::jsonb), updated_at
+		from gateway_settings
+		where key = $1
+	`, key).Scan(&item.Key, &item.Value, &item.UpdatedAt)
+	return item, err
+}
+
 func (s *Store) UpsertSetting(ctx context.Context, key string, value json.RawMessage) (Setting, error) {
 	row := s.pool.QueryRow(ctx, `
 		insert into gateway_settings(key, value, updated_at)

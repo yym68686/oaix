@@ -42,6 +42,9 @@ export function parseRoute(pathname: string, search = ""): RouteState {
   if (segments[0] === "keys" && segments[1]) {
     return { key: "key_detail", params: { id: segments[1] }, path, search };
   }
+  if (segments[0] === "account" && segments[1] === "settings") {
+    return { key: "user_settings", params: {}, path, search };
+  }
   if (segments[0] === "imports" && segments[1] === "new") {
     return { key: "import_new", params: {}, path, search };
   }

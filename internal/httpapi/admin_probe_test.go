@@ -83,6 +83,13 @@ func TestProbeTokenIgnoresInvalidRefreshTokenWhenCurrentAccessTokenWorks(t *test
 		if got := r.Header.Get("Authorization"); got != "Bearer still-valid-access-token" {
 			t.Fatalf("authorization = %q", got)
 		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["model"] != "gpt-5.4-mini" {
+			t.Fatalf("default probe model = %#v", payload["model"])
+		}
 		upstreamSeen = true
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("event: response.completed\n"))

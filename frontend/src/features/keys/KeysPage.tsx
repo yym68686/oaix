@@ -43,6 +43,13 @@ import {
 import { ImportNewDialog } from "@/features/imports/ImportsPage";
 import { clamp, formatDate, formatNumber } from "@/lib/format";
 import {
+  ADMIN_TOKEN_PROBE_MODEL_SETTING_KEY,
+  DEFAULT_TEST_MODEL,
+  USER_TOKEN_PROBE_MODEL_SETTING_KEY,
+  testModelFromSettings,
+  type TestModel,
+} from "@/lib/test-models";
+import {
   PAGE_SIZE,
   SORT_OPTIONS,
   errorMessage,
@@ -89,6 +96,39 @@ type KeyListPageConfig = {
   searchId?: string;
   title?: string;
 };
+
+function useTokenProbeModel(apiScope: TokenAPIScope): TestModel {
+  const [model, setModel] = useState<TestModel>(DEFAULT_TEST_MODEL);
+
+  useEffect(() => {
+    let active = true;
+    async function load() {
+      try {
+        if (apiScope === "admin" || (apiScope === "auto" && !getAuthContext()?.user?.id)) {
+          const payload = await api.settings();
+          if (active) {
+            setModel(testModelFromSettings(payload.items || [], ADMIN_TOKEN_PROBE_MODEL_SETTING_KEY));
+          }
+          return;
+        }
+        const payload = await api.mySettings();
+        if (active) {
+          setModel(testModelFromSettings(payload.items || [], USER_TOKEN_PROBE_MODEL_SETTING_KEY));
+        }
+      } catch {
+        if (active) {
+          setModel(DEFAULT_TEST_MODEL);
+        }
+      }
+    }
+    void load();
+    return () => {
+      active = false;
+    };
+  }, [apiScope]);
+
+  return model;
+}
 
 export function KeysPage({
   activeStreamCap,
@@ -172,6 +212,7 @@ export function KeyListPage({
   const allSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.has(id));
   const canMutate = String(getAuthContext()?.role || getAuthContext()?.user?.role || "").toLowerCase() !== "readonly_admin";
   const apiScope = config.apiScope || "auto";
+  const probeModel = useTokenProbeModel(apiScope);
   const basePath = config.basePath || "/keys";
   const importMode = config.importHref === undefined ? "dialog" : config.importHref ? "route" : "hidden";
   const searchId = config.searchId || "token-search";
@@ -283,7 +324,7 @@ export function KeyListPage({
   async function runTokenProbe(id: number) {
     setProbeBusyIds((current) => new Set(current).add(id));
     try {
-      const result = await api.probeToken(id, {}, apiScope);
+      const result = await api.probeToken(id, { model: probeModel }, apiScope);
       pushToast(result.message || "测试完成", probeToastVariant(result.outcome));
       await loadTokens();
     } catch (caught) {
@@ -757,6 +798,7 @@ export function KeyDetailPage({
   const [quotaCreditCount, setQuotaCreditCount] = useState<number | null>(null);
   const [probeResult, setProbeResult] = useState<TokenProbeResponse | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
+  const probeModel = useTokenProbeModel(apiScope);
 
   const loadToken = useCallback(async () => {
     if (!Number.isFinite(id) || id <= 0) {
@@ -792,7 +834,7 @@ export function KeyDetailPage({
     }
     setProbeBusy(true);
     try {
-      const result = await api.probeToken(token.id, {}, apiScope);
+      const result = await api.probeToken(token.id, { model: probeModel }, apiScope);
       setProbeResult(result);
       pushToast(result.message || "测试完成", probeToastVariant(result.outcome));
       await loadToken();

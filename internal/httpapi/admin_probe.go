@@ -22,9 +22,20 @@ import (
 
 const (
 	adminTokenProbeInput       = "say test"
-	defaultAdminProbeModel     = "gpt-5.5"
+	defaultAdminProbeModel     = "gpt-5.4-mini"
 	defaultAdminProbeBodyLimit = 2 * 1024 * 1024
+	adminProbeModelSettingKey  = "admin_token_probe_model"
+	userProbeModelSettingKey   = "token_probe_model"
 )
+
+var supportedTokenProbeModels = []string{
+	"gpt-5.4-mini",
+	"gpt-5.4",
+	"gpt-5.5",
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+}
 
 func (a *App) listTokenQuota(w http.ResponseWriter, r *http.Request) {
 	ids, err := parseAdminTokenIDs(r.URL.Query().Get("ids"), 100)
@@ -87,14 +98,18 @@ func (a *App) probeToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	result := a.probeTokenWithAccess(r.Context(), *token, payload.Model)
+	model := a.resolveTokenProbeModel(r.Context(), nil, payload.Model)
+	result := a.probeTokenWithAccess(r.Context(), *token, model)
 	writeJSON(w, http.StatusOK, result)
 }
 
 func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, requestedModel string) map[string]any {
 	model := strings.TrimSpace(requestedModel)
 	if model == "" {
-		model = firstEnv("ADMIN_TOKEN_PROBE_MODEL", defaultAdminProbeModel)
+		model = normalizeConfiguredTokenProbeModel(firstEnv("ADMIN_TOKEN_PROBE_MODEL", ""))
+	}
+	if model == "" {
+		model = defaultAdminProbeModel
 	}
 	baseURL := strings.TrimSpace(a.cfg.Upstream.ResponsesURL)
 	if baseURL == "" {
@@ -256,6 +271,64 @@ func (a *App) refreshProbeAccessToken(parent context.Context, token store.Token,
 		token.PlanType = &value
 	}
 	return token, nil
+}
+
+func (a *App) resolveTokenProbeModel(parent context.Context, ownerUserID *int64, requestedModel string) string {
+	if model := strings.TrimSpace(requestedModel); model != "" {
+		return model
+	}
+	if a != nil && a.store != nil {
+		ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+		defer cancel()
+		if ownerUserID != nil && *ownerUserID > 0 {
+			item, err := a.store.GetUserSetting(ctx, *ownerUserID, userProbeModelSettingKey)
+			if err == nil {
+				if model := tokenProbeModelFromSetting(item.Value); model != "" {
+					return model
+				}
+			}
+		} else {
+			item, err := a.store.GetSetting(ctx, adminProbeModelSettingKey)
+			if err == nil {
+				if model := tokenProbeModelFromSetting(item.Value); model != "" {
+					return model
+				}
+			}
+		}
+	}
+	if model := normalizeConfiguredTokenProbeModel(firstEnv("ADMIN_TOKEN_PROBE_MODEL", "")); model != "" {
+		return model
+	}
+	return defaultAdminProbeModel
+}
+
+func tokenProbeModelFromSetting(raw json.RawMessage) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		if model := normalizeConfiguredTokenProbeModel(payload.Model); model != "" {
+			return model
+		}
+	}
+	var scalar string
+	if err := json.Unmarshal(raw, &scalar); err == nil {
+		return normalizeConfiguredTokenProbeModel(scalar)
+	}
+	return ""
+}
+
+func normalizeConfiguredTokenProbeModel(value string) string {
+	model := strings.TrimSpace(value)
+	if model == "" {
+		return ""
+	}
+	for _, supported := range supportedTokenProbeModels {
+		if model == supported {
+			return model
+		}
+	}
+	return ""
 }
 
 func (a *App) markProbeSuccess(tokenID int64) {

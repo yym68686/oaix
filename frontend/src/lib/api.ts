@@ -542,6 +542,9 @@ export const api = {
   revokeMyAPIKey: (id: number) => deleteJSON<Record<string, unknown>>(`/api/me/api-keys/${id}`),
   myUsage: (hours = 24) => requestJSON<{ usage?: UsageSummary }>(`/api/me/usage?hours=${hours}`),
   myPoolSummary: () => requestJSON<PoolSummaryResponse>("/api/me/pool-summary"),
+  mySettings: () => requestJSON<{ items?: SettingItem[] }>("/api/me/settings"),
+  updateMySetting: (key: string, value: unknown) =>
+    postJSON<SettingItem>(`/api/me/settings/${encodeURIComponent(key)}`, value),
   runtime: () => requestJSON<Record<string, unknown>>("/admin/runtime"),
   tokenSelection: () => requestJSON<Record<string, unknown>>("/admin/token-selection"),
   updateTokenSelection: (payload: Record<string, unknown>) =>

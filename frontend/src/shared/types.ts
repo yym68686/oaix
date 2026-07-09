@@ -8,6 +8,7 @@ export type RouteKey =
   | "imports"
   | "import_new"
   | "requests"
+  | "user_settings"
   | "settings"
   | "runtime"
   | "admin_users"

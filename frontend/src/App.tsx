@@ -5,7 +5,7 @@ import { ImportsPage } from "@/features/imports/ImportsPage";
 import { KeyDetailPage, KeysPage } from "@/features/keys/KeysPage";
 import { RequestsPage } from "@/features/requests/RequestsPage";
 import { RuntimePage } from "@/features/runtime/RuntimePage";
-import { SettingsPage } from "@/features/settings/SettingsPage";
+import { SettingsPage, UserSettingsPage } from "@/features/settings/SettingsPage";
 import { AdminAuditPage, AdminImportsPage, AdminPoolsPage, AdminRequestsPage, AdminUserDetailPage, AdminUsersPage } from "@/features/admin/AdminPages";
 import { AdminSub2APIPage } from "@/features/admin/Sub2APIPage";
 import { api, hasServiceKey, isAdminPrincipal, isSelfUserMode, setAuthContext, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
@@ -145,6 +145,8 @@ export function App(): React.ReactElement {
     page = <RequestsPage refreshNonce={refreshNonce} />;
   } else if (route.key === "settings") {
     page = <SettingsPage onStreamCapChange={setStreamCap} pushToast={pushToast} refreshNonce={refreshNonce} streamCap={streamCap} />;
+  } else if (route.key === "user_settings") {
+    page = <UserSettingsPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "runtime") {
     page = <RuntimePage counts={counts} health={health} refreshNonce={refreshNonce} />;
   } else {

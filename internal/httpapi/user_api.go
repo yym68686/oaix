@@ -797,7 +797,8 @@ func (a *App) probeMyToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	result := a.probeTokenWithAccess(r.Context(), *token, payload.Model)
+	model := a.resolveTokenProbeModel(r.Context(), scope.OwnerUserID, payload.Model)
+	result := a.probeTokenWithAccess(r.Context(), *token, model)
 	writeJSON(w, http.StatusOK, result)
 }
 
