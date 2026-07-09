@@ -74,20 +74,21 @@ type CostAggregate struct {
 }
 
 type CacheAnalytics struct {
-	Hours                           int              `json:"hours"`
-	TotalRequests                   int64            `json:"total_requests"`
-	RequestsWithUsage               int64            `json:"requests_with_usage"`
-	InputTokens                     int64            `json:"input_tokens"`
-	CacheWriteInputTokens           int64            `json:"cache_write_input_tokens"`
-	CachedInputTokens               int64            `json:"cached_input_tokens"`
-	CacheWriteReportedRequests      int64            `json:"cache_write_reported_requests"`
-	CacheWritePositiveRequests      int64            `json:"cache_write_positive_requests"`
-	GPT56CacheWriteMissingRequests  int64            `json:"gpt56_cache_write_missing_requests"`
-	GPT56ZeroWriteThenReadSequences int64            `json:"gpt56_zero_write_then_read_sequences"`
-	CacheHitRatio                   float64          `json:"cache_hit_ratio"`
-	PromptCacheSources              map[string]int64 `json:"prompt_cache_sources"`
-	CacheWriteTokenSources          map[string]int64 `json:"cache_write_token_sources"`
-	AffinityResults                 map[string]int64 `json:"affinity_results"`
+	Hours                             int              `json:"hours"`
+	TotalRequests                     int64            `json:"total_requests"`
+	RequestsWithUsage                 int64            `json:"requests_with_usage"`
+	InputTokens                       int64            `json:"input_tokens"`
+	CacheWriteInputTokens             int64            `json:"cache_write_input_tokens"`
+	CachedInputTokens                 int64            `json:"cached_input_tokens"`
+	CacheWriteReportedRequests        int64            `json:"cache_write_reported_requests"`
+	CacheWritePositiveRequests        int64            `json:"cache_write_positive_requests"`
+	GPT56CacheWriteMissingRequests    int64            `json:"gpt56_cache_write_missing_requests"`
+	GPT56CacheWriteUnobservedRequests int64            `json:"gpt56_cache_write_unobserved_requests"`
+	GPT56ZeroWriteThenReadSequences   int64            `json:"gpt56_zero_write_then_read_sequences"`
+	CacheHitRatio                     float64          `json:"cache_hit_ratio"`
+	PromptCacheSources                map[string]int64 `json:"prompt_cache_sources"`
+	CacheWriteTokenSources            map[string]int64 `json:"cache_write_token_sources"`
+	AffinityResults                   map[string]int64 `json:"affinity_results"`
 }
 
 const gpt56ModelSQL = `(
@@ -652,6 +653,13 @@ func (s *Store) CacheAnalyticsScoped(ctx context.Context, scope ResourceScope, h
 				where input_tokens is not null
 				  and cache_write_tokens_source is null
 				  and `+gpt56ModelSQL+`
+				  and prompt_cache_trace->'usage'->'raw'->>'cache_write_reported' = 'false'
+			)::bigint,
+			count(*) filter (
+				where input_tokens is not null
+				  and cache_write_tokens_source is null
+				  and `+gpt56ModelSQL+`
+				  and prompt_cache_trace->'usage'->'raw'->>'cache_write_reported' is null
 			)::bigint
 		from gateway_request_logs
 		where `+where, args...)
@@ -675,6 +683,7 @@ func (s *Store) CacheAnalyticsScoped(ctx context.Context, scope ResourceScope, h
 			&out.CacheWriteReportedRequests,
 			&out.CacheWritePositiveRequests,
 			&out.GPT56CacheWriteMissingRequests,
+			&out.GPT56CacheWriteUnobservedRequests,
 		); err != nil {
 			return CacheAnalytics{}, err
 		}

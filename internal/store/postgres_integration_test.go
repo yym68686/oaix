@@ -59,6 +59,8 @@ func TestPostgresGPT56CacheWriteObservability(t *testing.T) {
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	firstRequestID := "gpt56-cache-observability-" + suffix + "-1"
 	secondRequestID := "gpt56-cache-observability-" + suffix + "-2"
+	missingRequestID := "gpt56-cache-observability-" + suffix + "-missing"
+	unobservedRequestID := "gpt56-cache-observability-" + suffix + "-unobserved"
 	cacheKey := "gpt56-cache-key-" + suffix
 	model := "gpt-5.6-sol"
 	source := "response.usage.input_tokens_details.cache_write_tokens"
@@ -75,8 +77,20 @@ func TestPostgresGPT56CacheWriteObservability(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		_, _ = db.pool.Exec(cleanupCtx, "delete from gateway_request_logs where request_id in ($1, $2)", firstRequestID, secondRequestID)
+		_, _ = db.pool.Exec(
+			cleanupCtx,
+			"delete from gateway_request_logs where request_id in ($1, $2, $3, $4)",
+			firstRequestID,
+			secondRequestID,
+			missingRequestID,
+			unobservedRequestID,
+		)
 	})
+
+	before, err := db.CacheAnalytics(ctx, 1)
+	if err != nil {
+		t.Fatalf("CacheAnalytics before fixture returned error: %v", err)
+	}
 
 	logs := []RequestLog{
 		{
@@ -112,6 +126,42 @@ func TestPostgresGPT56CacheWriteObservability(t *testing.T) {
 			OutputTokens:           &outputTokens,
 			TotalTokens:            &totalTokens,
 			PromptCacheKeyHash:     &cacheKey,
+		},
+		{
+			RequestID:         missingRequestID,
+			Endpoint:          "/v1/responses",
+			Model:             &model,
+			ModelName:         &model,
+			StatusCode:        &statusCode,
+			Success:           &success,
+			AttemptCount:      1,
+			StartedAt:         now.Add(-30 * time.Second),
+			InputTokens:       &inputTokens,
+			CachedInputTokens: &firstCachedTokens,
+			OutputTokens:      &outputTokens,
+			TotalTokens:       &totalTokens,
+			PromptCacheTrace: map[string]any{
+				"usage": map[string]any{
+					"raw": map[string]any{
+						"cache_write_reported": false,
+					},
+					"anomalies": []string{"gpt56_cache_write_tokens_missing"},
+				},
+			},
+		},
+		{
+			RequestID:         unobservedRequestID,
+			Endpoint:          "/v1/responses",
+			Model:             &model,
+			ModelName:         &model,
+			StatusCode:        &statusCode,
+			Success:           &success,
+			AttemptCount:      1,
+			StartedAt:         now.Add(-15 * time.Second),
+			InputTokens:       &inputTokens,
+			CachedInputTokens: &firstCachedTokens,
+			OutputTokens:      &outputTokens,
+			TotalTokens:       &totalTokens,
 		},
 	}
 	if err := db.UpsertRequestLogs(ctx, logs); err != nil {
@@ -152,6 +202,20 @@ func TestPostgresGPT56CacheWriteObservability(t *testing.T) {
 	}
 	if analytics.CacheWriteTokenSources[source] < 2 {
 		t.Fatalf("cache write source count = %d, want at least 2", analytics.CacheWriteTokenSources[source])
+	}
+	if analytics.GPT56CacheWriteMissingRequests != before.GPT56CacheWriteMissingRequests+1 {
+		t.Fatalf(
+			"confirmed missing requests = %d, want %d",
+			analytics.GPT56CacheWriteMissingRequests,
+			before.GPT56CacheWriteMissingRequests+1,
+		)
+	}
+	if analytics.GPT56CacheWriteUnobservedRequests != before.GPT56CacheWriteUnobservedRequests+1 {
+		t.Fatalf(
+			"unobserved requests = %d, want %d",
+			analytics.GPT56CacheWriteUnobservedRequests,
+			before.GPT56CacheWriteUnobservedRequests+1,
+		)
 	}
 }
 
