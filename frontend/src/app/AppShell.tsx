@@ -92,7 +92,7 @@ export function AppShell({
   const [credentialDialogOpen, setCredentialDialogOpen] = useState(false);
   const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
   const [serviceKeyError, setServiceKeyError] = useState("");
-  const [authMode, setAuthMode] = useState<"api_key" | "login" | "register">("api_key");
+  const [authMode, setAuthMode] = useState<"api_key" | "login" | "register">("login");
   const [emailDraft, setEmailDraft] = useState("");
   const [passwordDraft, setPasswordDraft] = useState("");
   const [displayNameDraft, setDisplayNameDraft] = useState("");
@@ -107,6 +107,7 @@ export function AppShell({
     if (credentialRequired) {
       setServiceKeyDraft(getServiceKey());
       setServiceKeyError("");
+      setAuthMode("login");
       setCredentialDialogOpen(true);
     }
   }, [credentialRequired]);
@@ -239,6 +240,7 @@ export function AppShell({
                     onClick={() => {
                       setServiceKeyDraft(getServiceKey());
                       setServiceKeyError("");
+                      setAuthMode("api_key");
                       setCredentialDialogOpen(true);
                     }}
                     size="sm"
@@ -262,8 +264,8 @@ export function AppShell({
           {authBlocked && (
             <Alert className="mb-4" variant="warning">
               <ShieldCheckIcon />
-              <AlertTitle>需要 API Key</AlertTitle>
-              <AlertDescription>请先填写 API Key，或使用邮箱密码登录/注册后继续。</AlertDescription>
+              <AlertTitle>需要登录</AlertTitle>
+              <AlertDescription>普通用户请登录或注册；管理员可在弹窗里切换到管理员入口。</AlertDescription>
             </Alert>
           )}
 
@@ -278,26 +280,35 @@ export function AppShell({
       <Dialog open={credentialOpen} onOpenChange={changeCredentialDialogOpen}>
         <DialogPopup className="sm:max-w-md" showCloseButton={!credentialRequired}>
           <DialogHeader>
-            <DialogTitle>连接 oaix</DialogTitle>
+            <DialogTitle>登录 oaix</DialogTitle>
             <DialogDescription>
-              使用已有 API Key，或用邮箱密码登录/注册。注册只需要邮箱和密码。
+              普通用户使用邮箱密码登录或注册；管理员可使用 API Key 进入。
             </DialogDescription>
           </DialogHeader>
           <DialogPanel className="grid gap-2">
             <div className="flex rounded-lg bg-muted p-1">
               {[
-                ["api_key", "API Key"],
                 ["login", "登录"],
                 ["register", "注册"],
+                ["api_key", "管理员入口"],
               ].map(([value, label]) => (
-                <Button className="flex-1" key={value} onClick={() => setAuthMode(value as typeof authMode)} size="sm" variant={authMode === value ? "secondary" : "ghost"}>
+                <Button
+                  className="flex-1"
+                  key={value}
+                  onClick={() => {
+                    setServiceKeyError("");
+                    setAuthMode(value as typeof authMode);
+                  }}
+                  size="sm"
+                  variant={authMode === value ? "secondary" : "ghost"}
+                >
                   {label}
                 </Button>
               ))}
             </div>
             {authMode === "api_key" ? (
               <>
-                <Label htmlFor="global-service-key">API Key</Label>
+                <Label htmlFor="global-service-key">管理员 API Key</Label>
                 <Input
                   autoFocus
                   id="global-service-key"
@@ -313,7 +324,7 @@ export function AppShell({
                       saveCredential();
                     }
                   }}
-                  placeholder="oaix_user_... / oaix_service_..."
+                  placeholder="oaix_service_..."
                   type="password"
                   value={serviceKeyDraft}
                 />
@@ -322,7 +333,7 @@ export function AppShell({
               <div className="grid gap-3">
                 <div className="grid gap-2">
                   <Label htmlFor="auth-email">邮箱</Label>
-                  <Input id="auth-email" nativeInput onChange={(event) => setEmailDraft(event.currentTarget.value)} type="email" value={emailDraft} />
+                  <Input autoFocus id="auth-email" nativeInput onChange={(event) => setEmailDraft(event.currentTarget.value)} type="email" value={emailDraft} />
                 </div>
                 {authMode === "register" && (
                   <div className="grid gap-2">
@@ -332,7 +343,18 @@ export function AppShell({
                 )}
                 <div className="grid gap-2">
                   <Label htmlFor="auth-password">密码</Label>
-                  <Input id="auth-password" nativeInput onChange={(event) => setPasswordDraft(event.currentTarget.value)} type="password" value={passwordDraft} />
+                  <Input
+                    id="auth-password"
+                    nativeInput
+                    onChange={(event) => setPasswordDraft(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        void submitPasswordAuth(authMode);
+                      }
+                    }}
+                    type="password"
+                    value={passwordDraft}
+                  />
                 </div>
               </div>
             )}
@@ -345,10 +367,10 @@ export function AppShell({
               </Button>
             )}
             {authMode === "api_key" ? (
-            <Button onClick={saveCredential}>
-              <SaveIcon />
-              保存并同步
-            </Button>
+              <Button onClick={saveCredential}>
+                <SaveIcon />
+                使用 API Key 进入
+              </Button>
             ) : (
               <Button loading={authBusy} onClick={() => void submitPasswordAuth(authMode)}>
                 <SaveIcon />
