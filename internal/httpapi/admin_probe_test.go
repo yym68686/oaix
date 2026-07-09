@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -131,5 +132,31 @@ func TestExtractProbeStreamResultPreservesFailureRawPayload(t *testing.T) {
 	}
 	if !strings.Contains(raw, `"resets_in_seconds":120`) {
 		t.Fatalf("raw failure payload lost reset metadata: %q", raw)
+	}
+}
+
+func TestProbeTokenReturnsRawBodyForInconclusiveNonSuccess(t *testing.T) {
+	upstreamBody := `{"error":{"code":"temporary_gateway_error","message":"upstream unavailable","type":"gateway_error"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:          11,
+		AccessToken: "still-valid-access-token",
+	}, "gpt-5.4-mini")
+
+	if result["outcome"] != "inconclusive" || result["status_code"] != http.StatusBadGateway {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if result["raw_response"] != upstreamBody {
+		t.Fatalf("raw_response = %#v", result["raw_response"])
+	}
+	if detail := fmt.Sprint(result["detail"]); !strings.Contains(detail, "upstream unavailable") {
+		t.Fatalf("detail = %#v", result["detail"])
 	}
 }

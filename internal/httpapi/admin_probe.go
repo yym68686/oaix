@@ -208,7 +208,11 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		return tokenProbeResult(token.ID, "disabled", resp.StatusCode, "测试失败：使用当前 access token 请求上游后仍返回鉴权/停用错误，当前已标记为禁用。", detail, model)
 	}
 
-	return tokenProbeResult(token.ID, "inconclusive", resp.StatusCode, "测试未得出结论：上游返回非成功状态，当前状态未改变。", detail, model)
+	result := tokenProbeResult(token.ID, "inconclusive", resp.StatusCode, "测试未得出结论：上游返回非成功状态，当前状态未改变。", detail, model)
+	if len(respBody) > 0 {
+		result["raw_response"] = string(respBody)
+	}
+	return result
 }
 
 func (a *App) refreshProbeAccessToken(parent context.Context, token store.Token, model string) (store.Token, map[string]any) {

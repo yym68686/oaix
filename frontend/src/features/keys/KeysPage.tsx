@@ -97,6 +97,16 @@ type KeyListPageConfig = {
   title?: string;
 };
 
+function probeResultMessage(result: TokenProbeResponse): string {
+  const message = result.message || "测试完成";
+  const rawResponse = String(result.raw_response || "").trim();
+  if (!rawResponse) {
+    return message;
+  }
+  const preview = rawResponse.length > 220 ? `${rawResponse.slice(0, 220)}...` : rawResponse;
+  return `${message} 上游响应：${preview}`;
+}
+
 function useTokenProbeModel(apiScope: TokenAPIScope): TestModel {
   const [model, setModel] = useState<TestModel>(DEFAULT_TEST_MODEL);
 
@@ -325,7 +335,7 @@ export function KeyListPage({
     setProbeBusyIds((current) => new Set(current).add(id));
     try {
       const result = await api.probeToken(id, { model: probeModel }, apiScope);
-      pushToast(result.message || "测试完成", probeToastVariant(result.outcome));
+      pushToast(probeResultMessage(result), probeToastVariant(result.outcome));
       await loadTokens();
     } catch (caught) {
       pushToast(errorMessage(caught), "error");
@@ -836,7 +846,7 @@ export function KeyDetailPage({
     try {
       const result = await api.probeToken(token.id, { model: probeModel }, apiScope);
       setProbeResult(result);
-      pushToast(result.message || "测试完成", probeToastVariant(result.outcome));
+      pushToast(probeResultMessage(result), probeToastVariant(result.outcome));
       await loadToken();
     } catch (caught) {
       pushToast(errorMessage(caught), "error");

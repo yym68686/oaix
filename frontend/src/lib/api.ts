@@ -98,6 +98,7 @@ export type TokenProbeResponse = {
   status_code?: number | null;
   message?: string | null;
   detail?: string | null;
+  raw_response?: string | null;
   cooldown_seconds?: number | null;
   probe_model?: string | null;
   probe_input?: string | null;

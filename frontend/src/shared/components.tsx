@@ -285,15 +285,23 @@ export function TokenObservedCost({ value }: { value?: number | null }) {
 
 export function TokenProbeResult({ result }: { result: TokenProbeResponse }) {
   const text = result.message || result.detail || "测试完成";
+  const rawResponse = result.raw_response || "";
   return (
-    <div className="flex min-w-0 items-center gap-2">
-      <Badge size="sm" variant={probeBadgeVariant(result.outcome)}>
-        {probeOutcomeLabel(result.outcome)}
-        {result.status_code ? ` ${result.status_code}` : ""}
-      </Badge>
-      <span className="min-w-0 truncate text-muted-foreground" title={result.detail || text}>
-        {text}
-      </span>
+    <div className="grid min-w-0 gap-2">
+      <div className="flex min-w-0 items-center gap-2">
+        <Badge size="sm" variant={probeBadgeVariant(result.outcome)}>
+          {probeOutcomeLabel(result.outcome)}
+          {result.status_code ? ` ${result.status_code}` : ""}
+        </Badge>
+        <span className="min-w-0 truncate text-muted-foreground" title={result.detail || text}>
+          {text}
+        </span>
+      </div>
+      {rawResponse && (
+        <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border bg-background p-3 font-mono text-foreground text-xs oaix-scrollbar">
+          {rawResponse}
+        </pre>
+      )}
     </div>
   );
 }
