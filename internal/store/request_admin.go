@@ -32,33 +32,35 @@ type RequestLogListOptions struct {
 }
 
 type RequestUsageSummary struct {
-	Hours             int     `json:"hours"`
-	Total             int64   `json:"total"`
-	Success           int64   `json:"success"`
-	Failure           int64   `json:"failure"`
-	InputTokens       int64   `json:"input_tokens"`
-	CachedInputTokens int64   `json:"cached_input_tokens"`
-	TotalTokens       int64   `json:"total_tokens"`
-	EstimatedCostUSD  float64 `json:"estimated_cost_usd"`
-	CacheHitRatio     float64 `json:"cache_hit_ratio"`
-	AverageTTFTMS     float64 `json:"average_ttft_ms"`
-	AverageDurationMS float64 `json:"average_duration_ms"`
+	Hours                 int     `json:"hours"`
+	Total                 int64   `json:"total"`
+	Success               int64   `json:"success"`
+	Failure               int64   `json:"failure"`
+	InputTokens           int64   `json:"input_tokens"`
+	CacheWriteInputTokens int64   `json:"cache_write_input_tokens"`
+	CachedInputTokens     int64   `json:"cached_input_tokens"`
+	TotalTokens           int64   `json:"total_tokens"`
+	EstimatedCostUSD      float64 `json:"estimated_cost_usd"`
+	CacheHitRatio         float64 `json:"cache_hit_ratio"`
+	AverageTTFTMS         float64 `json:"average_ttft_ms"`
+	AverageDurationMS     float64 `json:"average_duration_ms"`
 }
 
 type OwnerUsageSummary struct {
-	OwnerUserID       int64   `json:"owner_user_id"`
-	Hours             int     `json:"hours"`
-	RequestCount      int64   `json:"request_count"`
-	SuccessCount      int64   `json:"success_count"`
-	FailureCount      int64   `json:"failure_count"`
-	StreamingCount    int64   `json:"streaming_count"`
-	InputTokens       int64   `json:"input_tokens"`
-	CachedInputTokens int64   `json:"cached_input_tokens"`
-	TotalTokens       int64   `json:"total_tokens"`
-	EstimatedCostUSD  float64 `json:"estimated_cost_usd"`
-	ObservedCostUSD   float64 `json:"observed_cost_usd"`
-	SuccessRate       float64 `json:"success_rate"`
-	CacheHitRatio     float64 `json:"cache_hit_ratio"`
+	OwnerUserID           int64   `json:"owner_user_id"`
+	Hours                 int     `json:"hours"`
+	RequestCount          int64   `json:"request_count"`
+	SuccessCount          int64   `json:"success_count"`
+	FailureCount          int64   `json:"failure_count"`
+	StreamingCount        int64   `json:"streaming_count"`
+	InputTokens           int64   `json:"input_tokens"`
+	CacheWriteInputTokens int64   `json:"cache_write_input_tokens"`
+	CachedInputTokens     int64   `json:"cached_input_tokens"`
+	TotalTokens           int64   `json:"total_tokens"`
+	EstimatedCostUSD      float64 `json:"estimated_cost_usd"`
+	ObservedCostUSD       float64 `json:"observed_cost_usd"`
+	SuccessRate           float64 `json:"success_rate"`
+	CacheHitRatio         float64 `json:"cache_hit_ratio"`
 }
 
 type CostAggregate struct {
@@ -72,15 +74,37 @@ type CostAggregate struct {
 }
 
 type CacheAnalytics struct {
-	Hours              int              `json:"hours"`
-	TotalRequests      int64            `json:"total_requests"`
-	RequestsWithUsage  int64            `json:"requests_with_usage"`
-	InputTokens        int64            `json:"input_tokens"`
-	CachedInputTokens  int64            `json:"cached_input_tokens"`
-	CacheHitRatio      float64          `json:"cache_hit_ratio"`
-	PromptCacheSources map[string]int64 `json:"prompt_cache_sources"`
-	AffinityResults    map[string]int64 `json:"affinity_results"`
+	Hours                           int              `json:"hours"`
+	TotalRequests                   int64            `json:"total_requests"`
+	RequestsWithUsage               int64            `json:"requests_with_usage"`
+	InputTokens                     int64            `json:"input_tokens"`
+	CacheWriteInputTokens           int64            `json:"cache_write_input_tokens"`
+	CachedInputTokens               int64            `json:"cached_input_tokens"`
+	CacheWriteReportedRequests      int64            `json:"cache_write_reported_requests"`
+	CacheWritePositiveRequests      int64            `json:"cache_write_positive_requests"`
+	GPT56CacheWriteMissingRequests  int64            `json:"gpt56_cache_write_missing_requests"`
+	GPT56ZeroWriteThenReadSequences int64            `json:"gpt56_zero_write_then_read_sequences"`
+	CacheHitRatio                   float64          `json:"cache_hit_ratio"`
+	PromptCacheSources              map[string]int64 `json:"prompt_cache_sources"`
+	CacheWriteTokenSources          map[string]int64 `json:"cache_write_token_sources"`
+	AffinityResults                 map[string]int64 `json:"affinity_results"`
 }
+
+const gpt56ModelSQL = `(
+	model_name in ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna')
+	or (model_name >= 'gpt-5.6-sol-' and model_name < 'gpt-5.6-sol.')
+	or (model_name >= 'gpt-5.6-terra-' and model_name < 'gpt-5.6-terra.')
+	or (model_name >= 'gpt-5.6-luna-' and model_name < 'gpt-5.6-luna.')
+	or (
+		model_name is null
+		and (
+			model in ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna')
+			or (model >= 'gpt-5.6-sol-' and model < 'gpt-5.6-sol.')
+			or (model >= 'gpt-5.6-terra-' and model < 'gpt-5.6-terra.')
+			or (model >= 'gpt-5.6-luna-' and model < 'gpt-5.6-luna.')
+		)
+	)
+)`
 
 type ErrorAnalyticsItem struct {
 	ErrorKey  string `json:"error_key"`
@@ -130,7 +154,8 @@ func (s *Store) ListRequestLogsFilteredScoped(ctx context.Context, scope Resourc
 		select request_id, endpoint, model, model_name, is_stream, status_code, success,
 		       owner_user_id, api_key_id, token_owner_user_id, selection_mode, caller_owner_user_id,
 		       attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
-		       first_token_at, ttft_ms, duration_ms, input_tokens, cached_input_tokens, output_tokens,
+		       first_token_at, ttft_ms, duration_ms, input_tokens, cache_write_input_tokens,
+		       cache_write_tokens_source, cached_input_tokens, output_tokens,
 		       total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
 		       prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
 		       prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
@@ -243,7 +268,8 @@ func scanRequestLogs(rows pgxRows) ([]RequestLog, error) {
 			&item.CallerOwnerUserID, &item.AttemptCount,
 			&item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
 			&item.StartedAt, &item.FinishedAt, &item.FirstTokenAt, &item.TTFTMs, &item.DurationMs,
-			&item.InputTokens, &item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,
+			&item.InputTokens, &item.CacheWriteInputTokens, &item.CacheWriteTokensSource,
+			&item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,
 			&item.RequestPayloadHash, &item.UpstreamPayloadHash, &item.PromptTemplateHash, &item.PromptDynamicHash,
 			&item.PromptCacheSource, &item.PromptCacheKeyHash, &item.PromptCacheRetentionRequested,
 			&item.PromptCacheRetentionSent, &item.SessionIDHash, &item.SessionIDSource, &item.PreviousResponseIDHash,
@@ -274,6 +300,7 @@ func (s *Store) RequestUsageSummaryScoped(ctx context.Context, scope ResourceSco
 			count(*) filter (where success = true)::bigint,
 			count(*) filter (where success = false)::bigint,
 			coalesce(sum(input_tokens), 0)::bigint,
+			coalesce(sum(cache_write_input_tokens), 0)::bigint,
 			coalesce(sum(cached_input_tokens), 0)::bigint,
 			coalesce(sum(total_tokens), 0)::bigint,
 			coalesce(sum(estimated_cost_usd), 0)::float8,
@@ -281,7 +308,7 @@ func (s *Store) RequestUsageSummaryScoped(ctx context.Context, scope ResourceSco
 			coalesce(avg(duration_ms) filter (where duration_ms is not null), 0)::float8
 		from gateway_request_logs
 		where `+where, args...).Scan(
-		&out.Total, &out.Success, &out.Failure, &out.InputTokens, &out.CachedInputTokens,
+		&out.Total, &out.Success, &out.Failure, &out.InputTokens, &out.CacheWriteInputTokens, &out.CachedInputTokens,
 		&out.TotalTokens, &out.EstimatedCostUSD, &out.AverageTTFTMS, &out.AverageDurationMS,
 	)
 	if err != nil {
@@ -309,6 +336,7 @@ func (s *Store) RequestUsageByOwner(ctx context.Context, ownerIDs []int64, hours
 			coalesce(sum(failure_count), 0)::bigint,
 			coalesce(sum(streaming_count), 0)::bigint,
 			coalesce(sum(input_tokens), 0)::bigint,
+			coalesce(sum(cache_write_input_tokens), 0)::bigint,
 			coalesce(sum(cached_input_tokens), 0)::bigint,
 			coalesce(sum(total_tokens), 0)::bigint,
 			coalesce(sum(estimated_cost_usd), 0)::float8
@@ -325,7 +353,7 @@ func (s *Store) RequestUsageByOwner(ctx context.Context, ownerIDs []int64, hours
 		item := OwnerUsageSummary{Hours: hours}
 		if err := rows.Scan(
 			&item.OwnerUserID, &item.RequestCount, &item.SuccessCount, &item.FailureCount,
-			&item.StreamingCount, &item.InputTokens, &item.CachedInputTokens, &item.TotalTokens,
+			&item.StreamingCount, &item.InputTokens, &item.CacheWriteInputTokens, &item.CachedInputTokens, &item.TotalTokens,
 			&item.EstimatedCostUSD,
 		); err != nil {
 			return nil, err
@@ -482,6 +510,7 @@ func (s *Store) requestUsageByRequestLogUserColumn(ctx context.Context, column s
 			count(*) filter (where success = false)::bigint,
 			count(*) filter (where is_stream = true)::bigint,
 			coalesce(sum(input_tokens), 0)::bigint,
+			coalesce(sum(cache_write_input_tokens), 0)::bigint,
 			coalesce(sum(cached_input_tokens), 0)::bigint,
 			coalesce(sum(total_tokens), 0)::bigint,
 			coalesce(sum(estimated_cost_usd), 0)::float8
@@ -499,7 +528,7 @@ func (s *Store) requestUsageByRequestLogUserColumn(ctx context.Context, column s
 		item := OwnerUsageSummary{Hours: hours}
 		if err := rows.Scan(
 			&item.OwnerUserID, &item.RequestCount, &item.SuccessCount, &item.FailureCount,
-			&item.StreamingCount, &item.InputTokens, &item.CachedInputTokens, &item.TotalTokens,
+			&item.StreamingCount, &item.InputTokens, &item.CacheWriteInputTokens, &item.CachedInputTokens, &item.TotalTokens,
 			&item.EstimatedCostUSD,
 		); err != nil {
 			return nil, err
@@ -615,16 +644,38 @@ func (s *Store) CacheAnalyticsScoped(ctx context.Context, scope ResourceScope, h
 			count(*)::bigint,
 			count(*) filter (where input_tokens is not null)::bigint,
 			coalesce(sum(input_tokens), 0)::bigint,
-			coalesce(sum(cached_input_tokens), 0)::bigint
+			coalesce(sum(cache_write_input_tokens), 0)::bigint,
+			coalesce(sum(cached_input_tokens), 0)::bigint,
+			count(*) filter (where cache_write_tokens_source is not null)::bigint,
+			count(*) filter (where coalesce(cache_write_input_tokens, 0) > 0)::bigint,
+			count(*) filter (
+				where input_tokens is not null
+				  and cache_write_tokens_source is null
+				  and `+gpt56ModelSQL+`
+			)::bigint
 		from gateway_request_logs
 		where `+where, args...)
 	if err != nil {
 		return CacheAnalytics{}, err
 	}
 	defer rows.Close()
-	out := CacheAnalytics{Hours: hours, PromptCacheSources: map[string]int64{}, AffinityResults: map[string]int64{}}
+	out := CacheAnalytics{
+		Hours:                  hours,
+		PromptCacheSources:     map[string]int64{},
+		CacheWriteTokenSources: map[string]int64{},
+		AffinityResults:        map[string]int64{},
+	}
 	if rows.Next() {
-		if err := rows.Scan(&out.TotalRequests, &out.RequestsWithUsage, &out.InputTokens, &out.CachedInputTokens); err != nil {
+		if err := rows.Scan(
+			&out.TotalRequests,
+			&out.RequestsWithUsage,
+			&out.InputTokens,
+			&out.CacheWriteInputTokens,
+			&out.CachedInputTokens,
+			&out.CacheWriteReportedRequests,
+			&out.CacheWritePositiveRequests,
+			&out.GPT56CacheWriteMissingRequests,
+		); err != nil {
 			return CacheAnalytics{}, err
 		}
 	}
@@ -635,7 +686,42 @@ func (s *Store) CacheAnalyticsScoped(ctx context.Context, scope ResourceScope, h
 	if err := s.fillStringCountMapScoped(ctx, scope, `prompt_cache_source`, hours, out.PromptCacheSources); err != nil {
 		return CacheAnalytics{}, err
 	}
+	if err := s.fillStringCountMapScoped(ctx, scope, `cache_write_tokens_source`, hours, out.CacheWriteTokenSources); err != nil {
+		return CacheAnalytics{}, err
+	}
 	if err := s.fillStringCountMapScoped(ctx, scope, `cache_affinity_result`, hours, out.AffinityResults); err != nil {
+		return CacheAnalytics{}, err
+	}
+	sequenceWhere, sequenceArgs := requestLogWhereScoped(RequestLogListOptions{From: &from, Success: ptrBool(true)}, scope)
+	err = s.pool.QueryRow(ctx, `
+		with ordered as (
+			select
+				started_at,
+				coalesce(cached_input_tokens, 0) as cached_input_tokens,
+				lag(started_at) over cache_sequence as previous_started_at,
+				lag(coalesce(cached_input_tokens, 0)) over cache_sequence as previous_cached_input_tokens,
+				lag(coalesce(cache_write_input_tokens, 0)) over cache_sequence as previous_cache_write_input_tokens,
+				lag(cache_write_tokens_source) over cache_sequence as previous_cache_write_tokens_source
+			from gateway_request_logs
+			where `+sequenceWhere+`
+			  and prompt_cache_key_hash is not null
+			  and `+gpt56ModelSQL+`
+			window cache_sequence as (
+				partition by owner_user_id, prompt_cache_key_hash, lower(coalesce(model_name, model, ''))
+				order by started_at, request_id
+			)
+		)
+		select count(*) filter (
+			where cached_input_tokens > 0
+			  and previous_cached_input_tokens = 0
+			  and previous_cache_write_input_tokens = 0
+			  and previous_cache_write_tokens_source is not null
+			  and previous_started_at is not null
+			  and started_at <= previous_started_at + interval '30 minutes'
+		)::bigint
+		from ordered
+	`, sequenceArgs...).Scan(&out.GPT56ZeroWriteThenReadSequences)
+	if err != nil {
 		return CacheAnalytics{}, err
 	}
 	return out, nil
@@ -646,7 +732,7 @@ func (s *Store) fillStringCountMap(ctx context.Context, column string, hours int
 }
 
 func (s *Store) fillStringCountMapScoped(ctx context.Context, scope ResourceScope, column string, hours int, out map[string]int64) error {
-	if column != "prompt_cache_source" && column != "cache_affinity_result" {
+	if column != "prompt_cache_source" && column != "cache_affinity_result" && column != "cache_write_tokens_source" {
 		return fmt.Errorf("invalid analytics column")
 	}
 	if hours <= 0 {

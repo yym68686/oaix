@@ -89,8 +89,10 @@ curl -X PATCH "$OAIX_URL/api/admin/users/$USER_ID" \
 
 1. `GET /admin/analytics/cache?hours=1` 看全局缓存率。
 2. `GET /api/admin/pool-summary/by-user?hours=1` 看用户维度缓存率。
-3. 检查 `/v1/responses` 请求体是否被保留 `prompt_cache_key` / `previous_response_id`。
-4. 检查 owner-scoped prompt affinity：不同用户不会共享同一个 affinity key。
+3. 对 GPT-5.6 检查 `cache_write_reported_requests`、`gpt56_cache_write_missing_requests`、`cache_write_token_sources` 和 `gpt56_zero_write_then_read_sequences`。
+4. 查看对应请求的 `cache_write_input_tokens`、`cache_write_tokens_source` 和 `prompt_cache_trace.usage.raw`。source 非空且值为 `0` 是上游明确报告零写入；source 为空才是字段缺失，OAIX 不会推断计费。
+5. 检查 `/v1/responses` 请求体是否被保留 `prompt_cache_key` / `previous_response_id`。
+6. 检查 owner-scoped prompt affinity：不同用户不会共享同一个 affinity key。
 
 ## 上线后核对
 

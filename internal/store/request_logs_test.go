@@ -44,6 +44,25 @@ func TestFillMissingObservedCostsDefaultsZero(t *testing.T) {
 	}
 }
 
+func TestGPT56CacheAnalyticsModelFilterIsExplicit(t *testing.T) {
+	filter := compactSQL(gpt56ModelSQL)
+	for _, model := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		if !strings.Contains(filter, model) {
+			t.Fatalf("GPT-5.6 analytics filter missing %q: %s", model, filter)
+		}
+	}
+	for _, fragment := range []string{"model_name in", "model_name >=", "model_name <", "model_name is null", "model in"} {
+		if !strings.Contains(filter, fragment) {
+			t.Fatalf("GPT-5.6 analytics filter missing index-friendly fragment %q: %s", fragment, filter)
+		}
+	}
+	for _, forbidden := range []string{"= 'gpt-5.6'", "like ", "lower(", "coalesce("} {
+		if strings.Contains(filter, forbidden) {
+			t.Fatalf("GPT-5.6 analytics filter uses overbroad match %q: %s", forbidden, filter)
+		}
+	}
+}
+
 func compactSQL(sql string) string {
 	return strings.ToLower(strings.Join(strings.Fields(sql), " "))
 }

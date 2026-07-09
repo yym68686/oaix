@@ -10,12 +10,38 @@ import (
 )
 
 type UsageMetrics struct {
-	InputTokens       int
-	CachedInputTokens int
-	OutputTokens      int
-	TotalTokens       int
-	CacheHitRatio     *float64
-	EstimatedCostUSD  *float64
+	InputTokens                   int
+	CacheWriteInputTokens         int
+	CachedInputTokens             int
+	OutputTokens                  int
+	TotalTokens                   int
+	NonCachedInputTokens          int
+	InputTokensSource             string
+	CacheWriteTokensSource        string
+	CachedInputTokensSource       string
+	OutputTokensSource            string
+	TotalTokensSource             string
+	PricingModel                  string
+	BillingMode                   string
+	InputPricePerMillionUSD       float64
+	CacheWritePricePerMillionUSD  *float64
+	CachedInputPricePerMillionUSD *float64
+	OutputPricePerMillionUSD      float64
+	CacheHitRatio                 *float64
+	EstimatedCostUSD              *float64
+	Anomalies                     []string
+}
+
+const (
+	usageBillingModeOpenAICachedInput = "openai_cached_input"
+	usageBillingModeOpenAIPromptCache = "openai_prompt_cache"
+)
+
+type usageField struct {
+	Value   int
+	Present bool
+	Valid   bool
+	Source  string
 }
 
 type usageObserver struct {
@@ -94,73 +120,132 @@ func extractResponseMetrics(body []byte, modelName string) (*UsageMetrics, strin
 }
 
 func extractUsageMetrics(payload any, modelName string) *UsageMetrics {
-	usageObj := usageObject(payload)
+	usageObj, usagePrefix := usageObject(payload)
 	if usageObj == nil {
 		return nil
 	}
-	inputTokens, inputOK := normalizeInt(usageObj["input_tokens"])
-	if !inputOK {
-		inputTokens, inputOK = normalizeInt(usageObj["prompt_tokens"])
+	input := resolveUsageField(usageObj, usagePrefix, []string{"input_tokens"}, []string{"prompt_tokens"})
+	output := resolveUsageField(usageObj, usagePrefix, []string{"output_tokens"}, []string{"completion_tokens"})
+	total := resolveUsageField(usageObj, usagePrefix, []string{"total_tokens"})
+	cacheWrite := resolveUsageField(
+		usageObj,
+		usagePrefix,
+		[]string{"input_tokens_details", "cache_write_tokens"},
+		[]string{"prompt_tokens_details", "cache_write_tokens"},
+		[]string{"cache_write_tokens"},
+		[]string{"cache_creation_input_tokens"},
+	)
+	cached := resolveUsageField(
+		usageObj,
+		usagePrefix,
+		[]string{"input_cached_tokens"},
+		[]string{"input_tokens_details", "cached_tokens"},
+		[]string{"prompt_tokens_details", "cached_tokens"},
+		[]string{"cache_read_input_tokens"},
+	)
+	if !total.Valid && (input.Valid || output.Valid) {
+		total = usageField{
+			Value:   input.Value + output.Value,
+			Present: true,
+			Valid:   true,
+			Source:  "computed.input_plus_output",
+		}
 	}
-	outputTokens, outputOK := normalizeInt(usageObj["output_tokens"])
-	if !outputOK {
-		outputTokens, outputOK = normalizeInt(usageObj["completion_tokens"])
-	}
-	totalTokens, totalOK := normalizeInt(usageObj["total_tokens"])
-	if !totalOK && (inputOK || outputOK) {
-		totalTokens = inputTokens + outputTokens
-		totalOK = true
-	}
-	cachedTokens, _ := normalizeInt(firstPresent(
-		usageObj["input_cached_tokens"],
-		nestedGet(usageObj, "input_tokens_details", "cached_tokens"),
-		nestedGet(usageObj, "prompt_tokens_details", "cached_tokens"),
-	))
-	if !inputOK && !outputOK && !totalOK {
+	if !input.Valid && !output.Valid && !total.Valid {
 		return nil
 	}
 	metrics := &UsageMetrics{
-		InputTokens:       inputTokens,
-		CachedInputTokens: cachedTokens,
-		OutputTokens:      outputTokens,
-		TotalTokens:       totalTokens,
+		InputTokens:             input.Value,
+		CacheWriteInputTokens:   cacheWrite.Value,
+		CachedInputTokens:       cached.Value,
+		OutputTokens:            output.Value,
+		TotalTokens:             total.Value,
+		InputTokensSource:       input.Source,
+		CacheWriteTokensSource:  cacheWrite.Source,
+		CachedInputTokensSource: cached.Source,
+		OutputTokensSource:      output.Source,
+		TotalTokensSource:       total.Source,
 	}
-	if inputTokens > 0 {
-		ratio := math.Max(0, math.Min(1, float64(cachedTokens)/float64(inputTokens)))
+	if input.Value > 0 {
+		ratio := math.Max(0, math.Min(1, float64(cached.Value)/float64(input.Value)))
 		metrics.CacheHitRatio = &ratio
 	}
-	if cost := estimateUsageCost(modelName, inputTokens, outputTokens, cachedTokens); cost != nil {
-		metrics.EstimatedCostUSD = cost
+	if !cacheWrite.Valid && cacheWrite.Present {
+		metrics.Anomalies = append(metrics.Anomalies, "invalid_cache_write_tokens")
+	}
+	if !cached.Valid && cached.Present {
+		metrics.Anomalies = append(metrics.Anomalies, "invalid_cached_tokens")
+	}
+	if pricing, ok := pricingForModel(modelName); ok {
+		applyUsagePricing(metrics, pricing)
+		if pricing.billingMode == usageBillingModeOpenAIPromptCache && !cacheWrite.Present {
+			metrics.Anomalies = append(metrics.Anomalies, "gpt56_cache_write_tokens_missing")
+		}
+	}
+	cacheComponentTokens := metrics.CachedInputTokens
+	if metrics.BillingMode == usageBillingModeOpenAIPromptCache {
+		cacheComponentTokens += metrics.CacheWriteInputTokens
+	}
+	if cacheComponentTokens > metrics.InputTokens {
+		metrics.Anomalies = append(metrics.Anomalies, "cache_components_exceed_input_tokens")
 	}
 	return metrics
 }
 
-func nestedGet(mapping any, keys ...string) any {
-	current := mapping
+func resolveUsageField(mapping map[string]any, prefix string, paths ...[]string) usageField {
+	var firstInvalid *usageField
+	for _, path := range paths {
+		raw, present := lookupPath(mapping, path...)
+		if !present {
+			continue
+		}
+		source := strings.Trim(strings.TrimSpace(prefix)+"."+strings.Join(path, "."), ".")
+		value, valid := normalizeInt(raw)
+		field := usageField{Value: value, Present: true, Valid: valid, Source: source}
+		if valid {
+			return field
+		}
+		if firstInvalid == nil {
+			copy := field
+			firstInvalid = &copy
+		}
+	}
+	if firstInvalid != nil {
+		return *firstInvalid
+	}
+	return usageField{}
+}
+
+func lookupPath(mapping map[string]any, keys ...string) (any, bool) {
+	var current any = mapping
 	for _, key := range keys {
 		next, ok := current.(map[string]any)
 		if !ok {
-			return nil
+			return nil, false
 		}
-		current = next[key]
+		value, present := next[key]
+		if !present {
+			return nil, false
+		}
+		current = value
 	}
-	return current
+	return current, true
 }
 
-func usageObject(payload any) map[string]any {
+func usageObject(payload any) (map[string]any, string) {
 	mapping, ok := payload.(map[string]any)
 	if !ok {
-		return nil
+		return nil, ""
 	}
 	if usage, ok := mapping["usage"].(map[string]any); ok {
-		return usage
+		return usage, "usage"
 	}
 	if response, ok := mapping["response"].(map[string]any); ok {
 		if usage, ok := response["usage"].(map[string]any); ok {
-			return usage
+			return usage, "response.usage"
 		}
 	}
-	return nil
+	return nil, ""
 }
 
 func extractResponseID(payload any) string {
@@ -222,53 +307,115 @@ func normalizeInt(value any) (int, bool) {
 	}
 }
 
-func firstPresent(values ...any) any {
-	for _, value := range values {
-		if value != nil && value != "" {
-			return value
-		}
-	}
-	return nil
-}
-
-func estimateUsageCost(modelName string, inputTokens, outputTokens, cachedInputTokens int) *float64 {
+func estimateUsageCost(modelName string, inputTokens, outputTokens, cacheWriteInputTokens, cachedInputTokens int) *float64 {
 	pricing, ok := pricingForModel(modelName)
 	if !ok {
 		return nil
 	}
-	nonCached := inputTokens - cachedInputTokens
+	metrics := &UsageMetrics{
+		InputTokens:           inputTokens,
+		CacheWriteInputTokens: cacheWriteInputTokens,
+		CachedInputTokens:     cachedInputTokens,
+		OutputTokens:          outputTokens,
+	}
+	applyUsagePricing(metrics, pricing)
+	return metrics.EstimatedCostUSD
+}
+
+func applyUsagePricing(metrics *UsageMetrics, pricing modelPricing) {
+	if metrics == nil {
+		return
+	}
+	nonCached := metrics.InputTokens - metrics.CachedInputTokens
+	if pricing.cacheWrite != nil {
+		nonCached -= metrics.CacheWriteInputTokens
+	}
 	if nonCached < 0 {
 		nonCached = 0
 	}
 	cost := (float64(nonCached)/1_000_000.0)*pricing.input +
-		(float64(outputTokens)/1_000_000.0)*pricing.output
-	if pricing.cached != nil && cachedInputTokens > 0 {
-		cost += (float64(cachedInputTokens) / 1_000_000.0) * *pricing.cached
+		(float64(metrics.OutputTokens)/1_000_000.0)*pricing.output
+	if pricing.cacheWrite != nil && metrics.CacheWriteInputTokens > 0 {
+		cost += (float64(metrics.CacheWriteInputTokens) / 1_000_000.0) * *pricing.cacheWrite
+	}
+	if pricing.cached != nil && metrics.CachedInputTokens > 0 {
+		cost += (float64(metrics.CachedInputTokens) / 1_000_000.0) * *pricing.cached
 	}
 	rounded := math.Round(cost*100_000_000) / 100_000_000
-	return &rounded
+	metrics.NonCachedInputTokens = nonCached
+	metrics.PricingModel = pricing.name
+	metrics.BillingMode = pricing.billingMode
+	metrics.InputPricePerMillionUSD = pricing.input
+	metrics.CacheWritePricePerMillionUSD = pricing.cacheWrite
+	metrics.CachedInputPricePerMillionUSD = pricing.cached
+	metrics.OutputPricePerMillionUSD = pricing.output
+	metrics.EstimatedCostUSD = &rounded
 }
 
 type modelPricing struct {
-	input  float64
-	output float64
-	cached *float64
+	name        string
+	billingMode string
+	input       float64
+	output      float64
+	cached      *float64
+	cacheWrite  *float64
 }
 
 func pricingForModel(modelName string) (modelPricing, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(modelName))
-	cached := func(value float64) *float64 { return &value }
+	price := func(value float64) *float64 { return &value }
 	table := map[string]modelPricing{
-		"gpt-5.5":      {input: 5.0, cached: cached(0.5), output: 30.0},
-		"gpt-5":        {input: 1.25, cached: cached(0.125), output: 10.0},
-		"gpt-5-mini":   {input: 0.25, cached: cached(0.025), output: 2.0},
-		"gpt-5-nano":   {input: 0.05, cached: cached(0.005), output: 0.4},
-		"gpt-5.4":      {input: 2.5, cached: cached(0.25), output: 15.0},
-		"gpt-5.4-mini": {input: 0.75, cached: cached(0.075), output: 4.5},
-		"gpt-5.4-nano": {input: 0.2, cached: cached(0.02), output: 1.25},
+		"gpt-5.6-sol": {
+			name: "gpt-5.6-sol", billingMode: usageBillingModeOpenAIPromptCache,
+			input: 10.0, cacheWrite: price(12.5), cached: price(1.0), output: 60.0,
+		},
+		"gpt-5.6-terra": {
+			name: "gpt-5.6-terra", billingMode: usageBillingModeOpenAIPromptCache,
+			input: 5.0, cacheWrite: price(6.25), cached: price(0.5), output: 5.0,
+		},
+		"gpt-5.6-luna": {
+			name: "gpt-5.6-luna", billingMode: usageBillingModeOpenAIPromptCache,
+			input: 2.0, cacheWrite: price(2.5), cached: price(0.2), output: 12.0,
+		},
+		"gpt-5.5": {
+			name: "gpt-5.5", billingMode: usageBillingModeOpenAICachedInput,
+			input: 5.0, cached: price(0.5), output: 30.0,
+		},
+		"gpt-5": {
+			name: "gpt-5", billingMode: usageBillingModeOpenAICachedInput,
+			input: 1.25, cached: price(0.125), output: 10.0,
+		},
+		"gpt-5-mini": {
+			name: "gpt-5-mini", billingMode: usageBillingModeOpenAICachedInput,
+			input: 0.25, cached: price(0.025), output: 2.0,
+		},
+		"gpt-5-nano": {
+			name: "gpt-5-nano", billingMode: usageBillingModeOpenAICachedInput,
+			input: 0.05, cached: price(0.005), output: 0.4,
+		},
+		"gpt-5.4": {
+			name: "gpt-5.4", billingMode: usageBillingModeOpenAICachedInput,
+			input: 2.5, cached: price(0.25), output: 15.0,
+		},
+		"gpt-5.4-mini": {
+			name: "gpt-5.4-mini", billingMode: usageBillingModeOpenAICachedInput,
+			input: 0.75, cached: price(0.075), output: 4.5,
+		},
+		"gpt-5.4-nano": {
+			name: "gpt-5.4-nano", billingMode: usageBillingModeOpenAICachedInput,
+			input: 0.2, cached: price(0.02), output: 1.25,
+		},
 	}
 	if pricing, ok := table[normalized]; ok {
 		return pricing, true
+	}
+	for _, family := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		if strings.HasPrefix(normalized, family+"-") {
+			return table[family], true
+		}
+	}
+	if strings.HasPrefix(normalized, "gpt-5.6") {
+		return modelPricing{}, false
 	}
 	for _, family := range []string{"gpt-5.5", "gpt-5.4", "gpt-5"} {
 		if strings.HasPrefix(normalized, family) {
@@ -288,4 +435,49 @@ func pricingForModel(modelName string) (modelPricing, bool) {
 		return table["gpt-5-nano"], true
 	}
 	return modelPricing{}, false
+}
+
+func (u *UsageMetrics) Trace() map[string]any {
+	if u == nil {
+		return nil
+	}
+	raw := map[string]any{
+		"input_tokens":              u.InputTokens,
+		"cache_write_tokens":        u.CacheWriteInputTokens,
+		"cached_tokens":             u.CachedInputTokens,
+		"output_tokens":             u.OutputTokens,
+		"total_tokens":              u.TotalTokens,
+		"input_tokens_source":       u.InputTokensSource,
+		"cache_write_tokens_source": u.CacheWriteTokensSource,
+		"cached_tokens_source":      u.CachedInputTokensSource,
+		"output_tokens_source":      u.OutputTokensSource,
+		"total_tokens_source":       u.TotalTokensSource,
+		"cache_write_reported":      u.CacheWriteTokensSource != "",
+	}
+	trace := map[string]any{"raw": raw}
+	if u.PricingModel != "" {
+		billing := map[string]any{
+			"pricing_model":            u.PricingModel,
+			"mode":                     u.BillingMode,
+			"non_cached_input_tokens":  u.NonCachedInputTokens,
+			"cache_write_input_tokens": u.CacheWriteInputTokens,
+			"cached_input_tokens":      u.CachedInputTokens,
+			"input_per_million_usd":    u.InputPricePerMillionUSD,
+			"output_per_million_usd":   u.OutputPricePerMillionUSD,
+		}
+		if u.CacheWritePricePerMillionUSD != nil {
+			billing["cache_write_per_million_usd"] = *u.CacheWritePricePerMillionUSD
+		}
+		if u.CachedInputPricePerMillionUSD != nil {
+			billing["cached_input_per_million_usd"] = *u.CachedInputPricePerMillionUSD
+		}
+		if u.EstimatedCostUSD != nil {
+			billing["estimated_cost_usd"] = *u.EstimatedCostUSD
+		}
+		trace["billing"] = billing
+	}
+	if len(u.Anomalies) > 0 {
+		trace["anomalies"] = append([]string(nil), u.Anomalies...)
+	}
+	return trace
 }

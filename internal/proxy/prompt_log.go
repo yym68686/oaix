@@ -23,7 +23,10 @@ func promptTrace(ctx *PromptCacheContext) map[string]any {
 func updatePromptTrace(ctx *PromptCacheContext, affinityResult tokens.PromptAffinityResult, usage *UsageMetrics, upstreamResponseID string, status int) map[string]any {
 	trace := promptTrace(ctx)
 	if trace == nil {
-		return nil
+		if usage == nil {
+			return nil
+		}
+		trace = map[string]any{}
 	}
 	route := ensureTraceMap(trace, "route")
 	if affinityResult.Result != "" {
@@ -38,11 +41,20 @@ func updatePromptTrace(ctx *PromptCacheContext, affinityResult tokens.PromptAffi
 	usageMap := ensureTraceMap(trace, "usage")
 	if usage != nil {
 		usageMap["input_tokens"] = usage.InputTokens
+		usageMap["cache_write_input_tokens"] = usage.CacheWriteInputTokens
 		usageMap["cached_input_tokens"] = usage.CachedInputTokens
 		usageMap["output_tokens"] = usage.OutputTokens
 		usageMap["total_tokens"] = usage.TotalTokens
+		usageMap["non_cached_input_tokens"] = usage.NonCachedInputTokens
+		usageMap["cache_write_tokens_source"] = usage.CacheWriteTokensSource
+		usageMap["cached_input_tokens_source"] = usage.CachedInputTokensSource
+		usageMap["pricing_model"] = usage.PricingModel
+		usageMap["billing_mode"] = usage.BillingMode
 		if usage.CacheHitRatio != nil {
 			usageMap["cache_hit_ratio"] = *usage.CacheHitRatio
+		}
+		for key, value := range usage.Trace() {
+			usageMap[key] = value
 		}
 	}
 	response := ensureTraceMap(trace, "response")
@@ -82,6 +94,13 @@ func usageInt(usage *UsageMetrics, getter func(*UsageMetrics) int) *int {
 	}
 	value := getter(usage)
 	return &value
+}
+
+func usageString(usage *UsageMetrics, getter func(*UsageMetrics) string) *string {
+	if usage == nil || getter == nil {
+		return nil
+	}
+	return nullable(getter(usage))
 }
 
 func usageFloat(usage *UsageMetrics, getter func(*UsageMetrics) *float64) *float64 {

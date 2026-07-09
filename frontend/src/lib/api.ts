@@ -208,7 +208,14 @@ export type RequestItem = {
   success?: boolean | null;
   ttft_ms?: number | null;
   attempt_count?: number | null;
+  input_tokens?: number | null;
+  cache_write_input_tokens?: number | null;
+  cache_write_tokens_source?: string | null;
+  cached_input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
   estimated_cost_usd?: number | null;
+  prompt_cache_trace?: Record<string, unknown> | null;
   error_message?: string | null;
 };
 
@@ -275,6 +282,7 @@ export type UsageSummary = {
   success?: number;
   failure?: number;
   input_tokens?: number;
+  cache_write_input_tokens?: number;
   cached_input_tokens?: number;
   total_tokens?: number;
   estimated_cost_usd?: number;
@@ -291,6 +299,7 @@ export type OwnerUsageSummary = {
   failure_count?: number;
   streaming_count?: number;
   input_tokens?: number;
+  cache_write_input_tokens?: number;
   cached_input_tokens?: number;
   total_tokens?: number;
   estimated_cost_usd?: number;

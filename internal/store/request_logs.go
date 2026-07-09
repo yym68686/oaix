@@ -37,6 +37,8 @@ type RequestLog struct {
 	DurationMs                    *int           `json:"duration_ms,omitempty"`
 	TimingSpans                   map[string]any `json:"timing_spans,omitempty"`
 	InputTokens                   *int           `json:"input_tokens,omitempty"`
+	CacheWriteInputTokens         *int           `json:"cache_write_input_tokens,omitempty"`
+	CacheWriteTokensSource        *string        `json:"cache_write_tokens_source,omitempty"`
 	CachedInputTokens             *int           `json:"cached_input_tokens,omitempty"`
 	OutputTokens                  *int           `json:"output_tokens,omitempty"`
 	TotalTokens                   *int           `json:"total_tokens,omitempty"`
@@ -154,15 +156,16 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 			insert into gateway_request_logs (
 				request_id, owner_user_id, api_key_id, token_owner_user_id, endpoint, model, model_name, is_stream, status_code, success,
 				attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
-				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, cached_input_tokens,
-				output_tokens, total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
+				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, cache_write_input_tokens,
+				cache_write_tokens_source, cached_input_tokens, output_tokens, total_tokens, estimated_cost_usd,
+				request_payload_hash, upstream_payload_hash,
 				prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
 				prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
 				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
 				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message,
 				selection_mode, caller_owner_user_id
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)
 			on conflict (request_id) do update set
 				owner_user_id = coalesce(excluded.owner_user_id, gateway_request_logs.owner_user_id),
 				api_key_id = coalesce(excluded.api_key_id, gateway_request_logs.api_key_id),
@@ -187,6 +190,8 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				duration_ms = coalesce(excluded.duration_ms, gateway_request_logs.duration_ms),
 				timing_spans = coalesce(excluded.timing_spans, gateway_request_logs.timing_spans),
 				input_tokens = coalesce(excluded.input_tokens, gateway_request_logs.input_tokens),
+				cache_write_input_tokens = coalesce(excluded.cache_write_input_tokens, gateway_request_logs.cache_write_input_tokens),
+				cache_write_tokens_source = coalesce(excluded.cache_write_tokens_source, gateway_request_logs.cache_write_tokens_source),
 				cached_input_tokens = coalesce(excluded.cached_input_tokens, gateway_request_logs.cached_input_tokens),
 				output_tokens = coalesce(excluded.output_tokens, gateway_request_logs.output_tokens),
 				total_tokens = coalesce(excluded.total_tokens, gateway_request_logs.total_tokens),
@@ -212,8 +217,9 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 			item.RequestID, item.OwnerUserID, item.APIKeyID, item.TokenOwnerUserID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
 			item.FinishedAt, item.FirstTokenAt, item.TTFTMs, item.DurationMs, timing, item.InputTokens,
-			item.CachedInputTokens, item.OutputTokens, item.TotalTokens, item.EstimatedCostUSD, item.RequestPayloadHash,
-			item.UpstreamPayloadHash, item.PromptTemplateHash, item.PromptDynamicHash, item.PromptCacheSource,
+			item.CacheWriteInputTokens, item.CacheWriteTokensSource, item.CachedInputTokens, item.OutputTokens,
+			item.TotalTokens, item.EstimatedCostUSD, item.RequestPayloadHash, item.UpstreamPayloadHash,
+			item.PromptTemplateHash, item.PromptDynamicHash, item.PromptCacheSource,
 			item.PromptCacheKeyHash, item.PromptCacheRetentionRequested, item.PromptCacheRetentionSent,
 			item.SessionIDHash, item.SessionIDSource, item.PreviousResponseIDHash, item.UpstreamResponseID,
 			item.CacheHitRatio, item.CacheAffinityResult, item.CacheAffinityLaneIndex, promptTrace, item.ErrorMessage,
@@ -317,15 +323,16 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 			insert into gateway_request_logs (
 				request_id, owner_user_id, api_key_id, token_owner_user_id, endpoint, model, model_name, is_stream, status_code, success,
 				attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
-				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, cached_input_tokens,
-				output_tokens, total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
+				first_token_at, ttft_ms, duration_ms, timing_spans, input_tokens, cache_write_input_tokens,
+				cache_write_tokens_source, cached_input_tokens, output_tokens, total_tokens, estimated_cost_usd,
+				request_payload_hash, upstream_payload_hash,
 				prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
 				prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
 				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
 				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message,
 				selection_mode, caller_owner_user_id
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)
 			on conflict (request_id) do update set
 				owner_user_id = coalesce(excluded.owner_user_id, gateway_request_logs.owner_user_id),
 				api_key_id = coalesce(excluded.api_key_id, gateway_request_logs.api_key_id),
@@ -342,6 +349,8 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				duration_ms = coalesce(excluded.duration_ms, gateway_request_logs.duration_ms),
 				timing_spans = coalesce(excluded.timing_spans, gateway_request_logs.timing_spans),
 				input_tokens = coalesce(excluded.input_tokens, gateway_request_logs.input_tokens),
+				cache_write_input_tokens = coalesce(excluded.cache_write_input_tokens, gateway_request_logs.cache_write_input_tokens),
+				cache_write_tokens_source = coalesce(excluded.cache_write_tokens_source, gateway_request_logs.cache_write_tokens_source),
 				cached_input_tokens = coalesce(excluded.cached_input_tokens, gateway_request_logs.cached_input_tokens),
 				output_tokens = coalesce(excluded.output_tokens, gateway_request_logs.output_tokens),
 				total_tokens = coalesce(excluded.total_tokens, gateway_request_logs.total_tokens),
@@ -367,7 +376,8 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 			item.RequestID, item.OwnerUserID, item.APIKeyID, item.TokenOwnerUserID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
 			item.FinishedAt, item.FirstTokenAt, item.TTFTMs, item.DurationMs, jsonBytes(item.TimingSpans),
-			item.InputTokens, item.CachedInputTokens, item.OutputTokens, item.TotalTokens, item.EstimatedCostUSD,
+			item.InputTokens, item.CacheWriteInputTokens, item.CacheWriteTokensSource, item.CachedInputTokens,
+			item.OutputTokens, item.TotalTokens, item.EstimatedCostUSD,
 			item.RequestPayloadHash, item.UpstreamPayloadHash, item.PromptTemplateHash, item.PromptDynamicHash,
 			item.PromptCacheSource, item.PromptCacheKeyHash, item.PromptCacheRetentionRequested,
 			item.PromptCacheRetentionSent, item.SessionIDHash, item.SessionIDSource, item.PreviousResponseIDHash,
@@ -421,6 +431,7 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 				success,
 				is_stream,
 				coalesce(input_tokens, 0) as input_tokens,
+				coalesce(cache_write_input_tokens, 0) as cache_write_input_tokens,
 				coalesce(cached_input_tokens, 0) as cached_input_tokens,
 				coalesce(output_tokens, 0) as output_tokens,
 				coalesce(total_tokens, 0) as total_tokens,
@@ -444,6 +455,7 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 				count(*) filter (where success = false)::bigint as failure_count,
 				count(*) filter (where is_stream = true)::bigint as streaming_count,
 				coalesce(sum(input_tokens), 0)::bigint as input_tokens,
+				coalesce(sum(cache_write_input_tokens), 0)::bigint as cache_write_input_tokens,
 				coalesce(sum(cached_input_tokens), 0)::bigint as cached_input_tokens,
 				coalesce(sum(output_tokens), 0)::bigint as output_tokens,
 				coalesce(sum(total_tokens), 0)::bigint as total_tokens,
@@ -458,11 +470,11 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 		)
 		insert into gateway_request_hourly_stats (
 			owner_user_id, bucket_start, model_name, request_count, success_count, failure_count, streaming_count,
-			input_tokens, cached_input_tokens, output_tokens, total_tokens, estimated_cost_usd,
+			input_tokens, cache_write_input_tokens, cached_input_tokens, output_tokens, total_tokens, estimated_cost_usd,
 			ttft_ms_sum, ttft_count, duration_ms_sum, duration_count, updated_at
 		)
 		select owner_user_id, bucket_start, model_name, request_count, success_count, failure_count, streaming_count,
-		       input_tokens, cached_input_tokens, output_tokens, total_tokens, estimated_cost_usd,
+		       input_tokens, cache_write_input_tokens, cached_input_tokens, output_tokens, total_tokens, estimated_cost_usd,
 		       ttft_ms_sum, ttft_count, duration_ms_sum, duration_count, now()
 		from agg
 		on conflict (owner_user_id, bucket_start, model_name) do update set
@@ -471,6 +483,7 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 			failure_count = gateway_request_hourly_stats.failure_count + excluded.failure_count,
 			streaming_count = gateway_request_hourly_stats.streaming_count + excluded.streaming_count,
 			input_tokens = gateway_request_hourly_stats.input_tokens + excluded.input_tokens,
+			cache_write_input_tokens = gateway_request_hourly_stats.cache_write_input_tokens + excluded.cache_write_input_tokens,
 			cached_input_tokens = gateway_request_hourly_stats.cached_input_tokens + excluded.cached_input_tokens,
 			output_tokens = gateway_request_hourly_stats.output_tokens + excluded.output_tokens,
 			total_tokens = gateway_request_hourly_stats.total_tokens + excluded.total_tokens,
@@ -905,7 +918,8 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 		select request_id, endpoint, model, model_name, is_stream, status_code, success,
 		       owner_user_id, api_key_id, token_owner_user_id, selection_mode, caller_owner_user_id,
 		       attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
-		       first_token_at, ttft_ms, duration_ms, input_tokens, cached_input_tokens, output_tokens,
+		       first_token_at, ttft_ms, duration_ms, input_tokens, cache_write_input_tokens,
+		       cache_write_tokens_source, cached_input_tokens, output_tokens,
 		       total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
 		       prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
 		       prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
@@ -928,7 +942,8 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 			&item.Success, &item.OwnerUserID, &item.APIKeyID, &item.TokenOwnerUserID, &item.SelectionMode,
 			&item.CallerOwnerUserID, &item.AttemptCount, &item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
 			&item.StartedAt, &item.FinishedAt, &item.FirstTokenAt, &item.TTFTMs, &item.DurationMs,
-			&item.InputTokens, &item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,
+			&item.InputTokens, &item.CacheWriteInputTokens, &item.CacheWriteTokensSource,
+			&item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,
 			&item.RequestPayloadHash, &item.UpstreamPayloadHash, &item.PromptTemplateHash, &item.PromptDynamicHash,
 			&item.PromptCacheSource, &item.PromptCacheKeyHash, &item.PromptCacheRetentionRequested,
 			&item.PromptCacheRetentionSent, &item.SessionIDHash, &item.SessionIDSource, &item.PreviousResponseIDHash,

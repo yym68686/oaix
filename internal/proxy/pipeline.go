@@ -1136,6 +1136,8 @@ func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent Reques
 		DurationMs:                    &duration,
 		TimingSpans:                   timing,
 		InputTokens:                   usageInt(usage, func(u *UsageMetrics) int { return u.InputTokens }),
+		CacheWriteInputTokens:         usageInt(usage, func(u *UsageMetrics) int { return u.CacheWriteInputTokens }),
+		CacheWriteTokensSource:        usageString(usage, func(u *UsageMetrics) string { return u.CacheWriteTokensSource }),
 		CachedInputTokens:             usageInt(usage, func(u *UsageMetrics) int { return u.CachedInputTokens }),
 		OutputTokens:                  usageInt(usage, func(u *UsageMetrics) int { return u.OutputTokens }),
 		TotalTokens:                   usageInt(usage, func(u *UsageMetrics) int { return u.TotalTokens }),

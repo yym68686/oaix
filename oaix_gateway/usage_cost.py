@@ -10,6 +10,7 @@ class ModelPricing:
     input_per_million_usd: float
     output_per_million_usd: float
     cached_input_per_million_usd: float | None = None
+    cache_write_input_per_million_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,7 @@ class UsageMetrics:
     input_tokens: int
     output_tokens: int
     total_tokens: int
+    cache_write_input_tokens: int = 0
     cached_input_tokens: int = 0
     estimated_cost_usd: float | None = None
     pricing_model: str | None = None
@@ -29,6 +31,24 @@ class UsageMetrics:
 
 
 DEFAULT_MODEL_PRICING: dict[str, ModelPricing] = {
+    "gpt-5.6-sol": ModelPricing(
+        input_per_million_usd=10.0,
+        cache_write_input_per_million_usd=12.5,
+        cached_input_per_million_usd=1.0,
+        output_per_million_usd=60.0,
+    ),
+    "gpt-5.6-terra": ModelPricing(
+        input_per_million_usd=5.0,
+        cache_write_input_per_million_usd=6.25,
+        cached_input_per_million_usd=0.5,
+        output_per_million_usd=5.0,
+    ),
+    "gpt-5.6-luna": ModelPricing(
+        input_per_million_usd=2.0,
+        cache_write_input_per_million_usd=2.5,
+        cached_input_per_million_usd=0.2,
+        output_per_million_usd=12.0,
+    ),
     "gpt-5.5": ModelPricing(input_per_million_usd=5.0, cached_input_per_million_usd=0.5, output_per_million_usd=30.0),
     "gpt-5": ModelPricing(input_per_million_usd=1.25, cached_input_per_million_usd=0.125, output_per_million_usd=10.0),
     "gpt-5-mini": ModelPricing(input_per_million_usd=0.25, cached_input_per_million_usd=0.025, output_per_million_usd=2.0),
@@ -59,6 +79,14 @@ def _mapping_get(mapping: Any, *keys: str) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def _first_normalized_int(*values: Any) -> int:
+    for value in values:
+        normalized = _normalize_int(value)
+        if normalized is not None:
+            return normalized
+    return 0
 
 
 def _normalize_model_name(value: Any) -> str | None:
@@ -98,10 +126,17 @@ def _env_model_pricing() -> dict[str, ModelPricing]:
         except (TypeError, ValueError):
             cached_price = None
 
+        cache_write_raw = value.get("cache_write_input_per_million_usd")
+        try:
+            cache_write_price = float(cache_write_raw) if cache_write_raw is not None else None
+        except (TypeError, ValueError):
+            cache_write_price = None
+
         pricing[model_name] = ModelPricing(
             input_per_million_usd=max(0.0, input_price),
             output_per_million_usd=max(0.0, output_price),
             cached_input_per_million_usd=max(0.0, cached_price) if cached_price is not None else None,
+            cache_write_input_per_million_usd=max(0.0, cache_write_price) if cache_write_price is not None else None,
         )
     return pricing
 
@@ -116,6 +151,14 @@ def resolve_model_pricing(model_name: str | None) -> tuple[str | None, ModelPric
         return normalized, env_pricing[normalized]
     if normalized in DEFAULT_MODEL_PRICING:
         return normalized, DEFAULT_MODEL_PRICING[normalized]
+
+    for family_name in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        if normalized.startswith(f"{family_name}-"):
+            pricing = env_pricing.get(family_name) or DEFAULT_MODEL_PRICING.get(family_name)
+            if pricing is not None:
+                return family_name, pricing
+    if normalized.startswith("gpt-5.6"):
+        return None, None
 
     alias = DEFAULT_MODEL_ALIASES.get(normalized)
     if alias:
@@ -144,6 +187,7 @@ def estimate_usage_cost(
     model_name: str | None,
     input_tokens: int,
     output_tokens: int,
+    cache_write_input_tokens: int = 0,
     cached_input_tokens: int = 0,
 ) -> tuple[float | None, str | None]:
     pricing_model, pricing = resolve_model_pricing(model_name)
@@ -151,10 +195,16 @@ def estimate_usage_cost(
         return None, None
 
     non_cached_input_tokens = max(0, input_tokens - cached_input_tokens)
+    if pricing.cache_write_input_per_million_usd is not None:
+        non_cached_input_tokens = max(0, non_cached_input_tokens - cache_write_input_tokens)
     estimated_cost_usd = (
         (non_cached_input_tokens / 1_000_000.0) * pricing.input_per_million_usd
         + (output_tokens / 1_000_000.0) * pricing.output_per_million_usd
     )
+    if pricing.cache_write_input_per_million_usd is not None and cache_write_input_tokens > 0:
+        estimated_cost_usd += (
+            cache_write_input_tokens / 1_000_000.0
+        ) * pricing.cache_write_input_per_million_usd
     if pricing.cached_input_per_million_usd is not None and cached_input_tokens > 0:
         estimated_cost_usd += (cached_input_tokens / 1_000_000.0) * pricing.cached_input_per_million_usd
 
@@ -184,11 +234,18 @@ def extract_usage_metrics(payload: Any, *, model_name: str | None = None) -> Usa
     if total_tokens is None and (input_tokens is not None or output_tokens is not None):
         total_tokens = max(0, (input_tokens or 0) + (output_tokens or 0))
 
-    cached_input_tokens = _normalize_int(
-        usage_obj.get("input_cached_tokens")
-        or _mapping_get(usage_obj, "input_tokens_details", "cached_tokens")
-        or _mapping_get(usage_obj, "prompt_tokens_details", "cached_tokens")
-    ) or 0
+    cached_input_tokens = _first_normalized_int(
+        usage_obj.get("input_cached_tokens"),
+        _mapping_get(usage_obj, "input_tokens_details", "cached_tokens"),
+        _mapping_get(usage_obj, "prompt_tokens_details", "cached_tokens"),
+        usage_obj.get("cache_read_input_tokens"),
+    )
+    cache_write_input_tokens = _first_normalized_int(
+        _mapping_get(usage_obj, "input_tokens_details", "cache_write_tokens"),
+        _mapping_get(usage_obj, "prompt_tokens_details", "cache_write_tokens"),
+        usage_obj.get("cache_write_tokens"),
+        usage_obj.get("cache_creation_input_tokens"),
+    )
 
     if input_tokens is None and output_tokens is None and total_tokens is None:
         return None
@@ -200,12 +257,14 @@ def extract_usage_metrics(payload: Any, *, model_name: str | None = None) -> Usa
         model_name=model_name,
         input_tokens=effective_input_tokens,
         output_tokens=effective_output_tokens,
+        cache_write_input_tokens=cache_write_input_tokens,
         cached_input_tokens=cached_input_tokens,
     )
     return UsageMetrics(
         input_tokens=effective_input_tokens,
         output_tokens=effective_output_tokens,
         total_tokens=effective_total_tokens,
+        cache_write_input_tokens=cache_write_input_tokens,
         cached_input_tokens=cached_input_tokens,
         estimated_cost_usd=estimated_cost_usd,
         pricing_model=pricing_model,

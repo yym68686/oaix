@@ -1158,12 +1158,18 @@ func (a *App) exportRequests(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	writer := csv.NewWriter(w)
-	_ = writer.Write([]string{"request_id", "endpoint", "model_name", "stream", "status_code", "success", "token_id", "account_id", "started_at", "duration_ms", "estimated_cost_usd", "error_message"})
+	_ = writer.Write([]string{
+		"request_id", "endpoint", "model_name", "stream", "status_code", "success", "token_id", "account_id",
+		"started_at", "duration_ms", "input_tokens", "cache_write_input_tokens", "cache_write_tokens_source",
+		"cached_input_tokens", "output_tokens", "total_tokens", "estimated_cost_usd", "error_message",
+	})
 	for _, item := range items {
 		_ = writer.Write([]string{
 			item.RequestID, item.Endpoint, stringPtr(item.ModelName), strconv.FormatBool(item.IsStream),
 			intPtr(item.StatusCode), boolPtr(item.Success), int64Ptr(item.TokenID), stringPtr(item.AccountID),
-			item.StartedAt.Format(time.RFC3339), intPtr(item.DurationMs), floatPtr(item.EstimatedCostUSD), stringPtr(item.ErrorMessage),
+			item.StartedAt.Format(time.RFC3339), intPtr(item.DurationMs), intPtr(item.InputTokens),
+			intPtr(item.CacheWriteInputTokens), stringPtr(item.CacheWriteTokensSource), intPtr(item.CachedInputTokens),
+			intPtr(item.OutputTokens), intPtr(item.TotalTokens), floatPtr(item.EstimatedCostUSD), stringPtr(item.ErrorMessage),
 		})
 	}
 	writer.Flush()

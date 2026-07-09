@@ -81,6 +81,20 @@ func TestOnlineMigrationIndexesPendingObservedCostLookups(t *testing.T) {
 	}
 }
 
+func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
+	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	required := []string{
+		"cache_write_input_tokens integer",
+		"cache_write_tokens_source varchar(128)",
+		"cache_write_input_tokens bigint not null default 0",
+	}
+	for _, fragment := range required {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing cache write migration fragment %q", fragment)
+		}
+	}
+}
+
 func TestMigrationDropsLegacyHourlyStatsConstraints(t *testing.T) {
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
 	required := []string{
