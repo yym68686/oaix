@@ -482,6 +482,17 @@ var migrationStatements = []string{
 	`alter table codex_tokens add column if not exists marketplace_price_bps integer`,
 	`alter table codex_tokens add column if not exists marketplace_price_updated_at timestamptz`,
 	`alter table codex_tokens add column if not exists marketplace_price_source varchar(64) not null default 'owner_default'`,
+	`update codex_tokens
+	 set marketplace_price_bps = case
+	         when marketplace_price_bps <= 0 then 0
+	         else least(250, ((marketplace_price_bps + 9) / 10) * 10)
+	     end,
+	     marketplace_price_updated_at = coalesce(marketplace_price_updated_at, now()),
+	     updated_at = now()
+	 where marketplace_price_bps is not null
+	   and marketplace_price_bps >= 0
+	   and marketplace_price_bps <= 250
+	   and marketplace_price_bps % 10 <> 0`,
 	`update codex_tokens set marketplace_price_source = 'owner_default' where marketplace_price_source is null or btrim(marketplace_price_source) = ''`,
 	`alter table codex_tokens alter column marketplace_price_source set default 'owner_default'`,
 	`alter table codex_tokens alter column marketplace_price_source set not null`,

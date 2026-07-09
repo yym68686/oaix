@@ -336,6 +336,22 @@ func TestServiceAPIKeyActAsOverridesPlatformUserForSelfRoutes(t *testing.T) {
 	platformTokenB := h.createToken(t, platformUser.ID, "service-actas-platform-b")
 	targetUser, _ := h.createUser(t, "service-actas-target")
 	targetToken := h.createToken(t, targetUser.ID, "service-actas-target")
+	if _, err := h.db.Pool().Exec(ctx, `
+		update codex_tokens
+		set share_enabled = true,
+		    share_status = 'active',
+		    disabled_at = null,
+		    marketplace_price_bps = case id
+		        when $1 then 80
+		        when $2 then 20
+		        when $3 then 40
+		    end,
+		    cooldown_until = case when id = $2 then now() + interval '1 hour' else null end,
+		    updated_at = now()
+		where id = any($4::int[])
+	`, platformTokenA.ID, platformTokenB.ID, targetToken.ID, []int32{int32(platformTokenA.ID), int32(platformTokenB.ID), int32(targetToken.ID)}); err != nil {
+		t.Fatal(err)
+	}
 	platformJob, err := h.db.CreateCompletedImportJobForOwner(ctx, platformUser.ID, []map[string]any{{
 		"refresh_token": "rt-service-actas-platform-" + strconv.FormatInt(time.Now().UnixNano(), 10),
 	}}, "front", store.ImportResult{Created: 1})
@@ -363,6 +379,23 @@ func TestServiceAPIKeyActAsOverridesPlatformUserForSelfRoutes(t *testing.T) {
 	counts, _ := poolPayload["counts"].(map[string]any)
 	if counts == nil || int64(counts["total"].(float64)) != 1 {
 		t.Fatalf("act-as pool counts = %#v, want target user's single token", counts)
+	}
+	availablePricing, _ := poolPayload["marketplace_available_pricing"].(map[string]any)
+	if availablePricing == nil {
+		t.Fatalf("pool summary missing marketplace_available_pricing: %#v", poolPayload)
+	}
+	competitor, _ := availablePricing["competitor"].(map[string]any)
+	if competitor == nil {
+		t.Fatalf("pool summary missing competitor pricing: %#v", availablePricing)
+	}
+	if got := int(competitor["price_step_bps"].(float64)); got != store.MarketplacePriceStepBPS {
+		t.Fatalf("price_step_bps = %d, want %d", got, store.MarketplacePriceStepBPS)
+	}
+	if got := int(competitor["lowest_price_bps"].(float64)); got != 80 {
+		t.Fatalf("competitor lowest price = %d, want available platform token price 80", got)
+	}
+	if got := int(competitor["available_token_count"].(float64)); got != 1 {
+		t.Fatalf("competitor available token count = %d, want 1", got)
 	}
 
 	tokensPayload := expectStatus(t, h.requestWithHeaders(t, http.MethodGet, "/api/tokens?limit=20", "service-test-key", "", headers), http.StatusOK)
@@ -615,6 +648,8 @@ func TestBulkTokenMarketplacePriceScopeWithDatabase(t *testing.T) {
 	userB, _ := h.createUser(t, "bulk-price-b")
 	tokenA := h.createToken(t, userA.ID, "bulk-price-a")
 	tokenB := h.createToken(t, userB.ID, "bulk-price-b")
+
+	expectStatus(t, h.request(t, http.MethodPatch, "/api/tokens/marketplace-price", keyA.PlaintextKey, fmt.Sprintf(`{"token_ids":[%d],"price_bps":115}`, tokenA.ID)), http.StatusBadRequest)
 
 	expectStatus(t, h.request(t, http.MethodPatch, "/api/tokens/marketplace-price", keyA.PlaintextKey, fmt.Sprintf(`{"token_ids":[%d,%d],"price_bps":120}`, tokenA.ID, tokenB.ID)), http.StatusOK)
 	reloadedA, err := h.db.GetToken(context.Background(), tokenA.ID)

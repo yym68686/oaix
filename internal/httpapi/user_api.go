@@ -271,7 +271,22 @@ func (a *App) myPoolSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"counts": counts, "sharing_counts": sharingCounts, "plan_counts": plans, "marketplace_pricing": pricing})
+	var excludeOwnerID int64
+	if scope.OwnerUserID != nil {
+		excludeOwnerID = *scope.OwnerUserID
+	}
+	availablePricing, err := a.store.TokenMarketplaceAvailablePricingSummary(ctx, excludeOwnerID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"counts":                        counts,
+		"sharing_counts":                sharingCounts,
+		"plan_counts":                   plans,
+		"marketplace_pricing":           pricing,
+		"marketplace_available_pricing": availablePricing,
+	})
 }
 
 func (a *App) listMySettings(w http.ResponseWriter, r *http.Request) {
@@ -699,11 +714,21 @@ func (a *App) patchMyTokensMarketplacePrice(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	var excludeOwnerID int64
+	if scope.OwnerUserID != nil {
+		excludeOwnerID = *scope.OwnerUserID
+	}
+	availablePricing, err := a.store.TokenMarketplaceAvailablePricingSummary(ctx, excludeOwnerID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	_ = a.store.WriteAuditLog(ctx, "user_tokens_marketplace_price_update", "self", "token", "bulk", map[string]any{"user_id": scope.OwnerUserID, "updated": updated, "all": payload.All, "price_bps": *priceBPS})
 	_ = a.tokens.Refresh(ctx)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"updated":             updated,
-		"marketplace_pricing": pricing,
+		"updated":                       updated,
+		"marketplace_pricing":           pricing,
+		"marketplace_available_pricing": availablePricing,
 	})
 }
 

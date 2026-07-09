@@ -22,6 +22,7 @@ const (
 
 	DefaultMarketplacePriceBPS = 250
 	MaxMarketplacePriceBPS     = 250
+	MarketplacePriceStepBPS    = 10
 
 	transientRetryCooldownPrefix        = "retryable upstream failure:"
 	transientRetryCooldownDisplayWindow = time.Minute
@@ -139,6 +140,20 @@ type TokenMarketplacePricingSummary struct {
 	AvgPriceBPS     *int `json:"avg_price_bps,omitempty"`
 	PricedCount     int  `json:"priced_count"`
 	Total           int  `json:"total"`
+}
+
+type TokenMarketplaceAvailablePriceSummary struct {
+	DefaultPriceBPS     int    `json:"default_price_bps"`
+	PriceStepBPS        int    `json:"price_step_bps"`
+	LowestPriceBPS      *int   `json:"lowest_price_bps,omitempty"`
+	AvailableTokenCount int    `json:"available_token_count"`
+	LowestTokenCount    int    `json:"lowest_token_count"`
+	ExcludedOwnerUserID *int64 `json:"excluded_owner_user_id,omitempty"`
+}
+
+type TokenMarketplaceAvailablePricingSummary struct {
+	All        TokenMarketplaceAvailablePriceSummary `json:"all"`
+	Competitor TokenMarketplaceAvailablePriceSummary `json:"competitor"`
 }
 
 type RefreshTokenIdentity struct {
@@ -489,6 +504,69 @@ func (s *Store) TokenMarketplacePricingSummaryScoped(ctx context.Context, scope 
 	if avgPrice.Valid {
 		value := int(avgPrice.Float64 + 0.5)
 		summary.AvgPriceBPS = &value
+	}
+	return summary, nil
+}
+
+func (s *Store) TokenMarketplaceAvailablePricingSummary(ctx context.Context, excludeOwnerUserID int64) (TokenMarketplaceAvailablePricingSummary, error) {
+	all, err := s.tokenMarketplaceAvailablePriceFloor(ctx, nil)
+	if err != nil {
+		return TokenMarketplaceAvailablePricingSummary{}, err
+	}
+	var exclude *int64
+	if excludeOwnerUserID > 0 {
+		exclude = &excludeOwnerUserID
+	}
+	competitor, err := s.tokenMarketplaceAvailablePriceFloor(ctx, exclude)
+	if err != nil {
+		return TokenMarketplaceAvailablePricingSummary{}, err
+	}
+	return TokenMarketplaceAvailablePricingSummary{All: all, Competitor: competitor}, nil
+}
+
+func (s *Store) tokenMarketplaceAvailablePriceFloor(ctx context.Context, excludeOwnerUserID *int64) (TokenMarketplaceAvailablePriceSummary, error) {
+	summary := TokenMarketplaceAvailablePriceSummary{
+		DefaultPriceBPS: DefaultMarketplacePriceBPS,
+		PriceStepBPS:    MarketplacePriceStepBPS,
+	}
+	args := []any{DefaultMarketplacePriceBPS}
+	ownerWhere := "true"
+	if excludeOwnerUserID != nil && *excludeOwnerUserID > 0 {
+		args = append(args, *excludeOwnerUserID)
+		ownerWhere = fmt.Sprintf("owner_user_id is distinct from $%d", len(args))
+		summary.ExcludedOwnerUserID = excludeOwnerUserID
+	}
+	var lowest sql.NullInt64
+	err := s.pool.QueryRow(ctx, `
+		with available as (
+			select coalesce(marketplace_price_bps, $1)::int as price_bps
+			from codex_tokens
+			where merged_into_token_id is null
+			  and share_enabled = true
+			  and share_status = 'active'
+			  and is_active = true
+			  and disabled_at is null
+			  and access_token is not null
+			  and access_token <> ''
+			  and (cooldown_until is null or cooldown_until <= now())
+			  and `+ownerWhere+`
+		),
+		lowest as (
+			select min(price_bps)::bigint as price_bps
+			from available
+		)
+		select
+			count(*)::int,
+			(select price_bps from lowest),
+			count(*) filter (where price_bps = (select price_bps from lowest))::int
+		from available
+	`, args...).Scan(&summary.AvailableTokenCount, &lowest, &summary.LowestTokenCount)
+	if err != nil {
+		return summary, err
+	}
+	if lowest.Valid {
+		value := int(lowest.Int64)
+		summary.LowestPriceBPS = &value
 	}
 	return summary, nil
 }
@@ -1222,6 +1300,9 @@ func (s *Store) SetTokensSharingScoped(ctx context.Context, scope ResourceScope,
 func (s *Store) SetTokensMarketplacePriceScoped(ctx context.Context, scope ResourceScope, tokenIDs []int64, all bool, priceBPS int, source string) (int64, error) {
 	if priceBPS < 0 || priceBPS > MaxMarketplacePriceBPS {
 		return 0, fmt.Errorf("marketplace price bps must be between 0 and %d", MaxMarketplacePriceBPS)
+	}
+	if priceBPS%MarketplacePriceStepBPS != 0 {
+		return 0, fmt.Errorf("marketplace price bps must use %d bps increments", MarketplacePriceStepBPS)
 	}
 	ids := postgresIntIDs(tokenIDs)
 	if !all && len(ids) == 0 {
