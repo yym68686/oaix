@@ -182,6 +182,7 @@ func codexModelInfoForID(id string, priority int) codexModelInfo {
 		InputModalities:             inputModalities,
 		SupportsSearchTool:          false,
 		UseResponsesLite:            false,
+		MultiAgentVersion:           codexMultiAgentVersion(id),
 	}
 }
 
@@ -220,6 +221,20 @@ func codexReasoningLevels(id string) []codexReasoningPreset {
 func codexModelMatchesFamily(id, family string) bool {
 	lower := strings.ToLower(strings.TrimSpace(id))
 	return lower == family || strings.HasPrefix(lower, family+"-")
+}
+
+func codexMultiAgentVersion(id string) *string {
+	version := ""
+	switch {
+	case codexModelMatchesFamily(id, "gpt-5.6-sol"),
+		codexModelMatchesFamily(id, "gpt-5.6-terra"):
+		version = "v2"
+	case codexModelMatchesFamily(id, "gpt-5.6-luna"):
+		version = "v1"
+	default:
+		return nil
+	}
+	return &version
 }
 
 func isCodexCatalogModelID(id string) bool {

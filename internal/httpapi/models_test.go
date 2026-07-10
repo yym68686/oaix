@@ -125,6 +125,20 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		if *model.DefaultReasoningLevel != wantDefault {
 			t.Fatalf("%s default reasoning level = %q, want %q", model.Slug, *model.DefaultReasoningLevel, wantDefault)
 		}
+		wantMultiAgentVersion := ""
+		switch model.Slug {
+		case "gpt-5.6-sol", "gpt-5.6-terra":
+			wantMultiAgentVersion = "v2"
+		case "gpt-5.6-luna":
+			wantMultiAgentVersion = "v1"
+		}
+		if wantMultiAgentVersion == "" {
+			if model.MultiAgentVersion != nil {
+				t.Fatalf("%s multi-agent version = %q, want nil", model.Slug, *model.MultiAgentVersion)
+			}
+		} else if model.MultiAgentVersion == nil || *model.MultiAgentVersion != wantMultiAgentVersion {
+			t.Fatalf("%s multi-agent version = %#v, want %q", model.Slug, model.MultiAgentVersion, wantMultiAgentVersion)
+		}
 	}
 	sol := payload.Models[3]
 	if got := reasoningDescription(sol.SupportedReasoningLevels, "max"); got != "Maximum reasoning depth for the hardest problems" {
