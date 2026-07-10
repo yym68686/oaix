@@ -126,6 +126,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/settings", a.requireAuth(a.listSettings))
 	mux.HandleFunc("POST /admin/settings/{key}", a.requireAuth(a.updateSetting))
 	a.registerAdminAPIRoutes(mux)
+	mux.HandleFunc("GET /v1/models", a.requireAuth(a.models))
 	mux.HandleFunc("POST /v1/responses", a.requireAuth(a.responses))
 	mux.HandleFunc("GET /v1/responses/{response_id}", a.requireAuth(a.getResponse))
 	mux.HandleFunc("DELETE /v1/responses/{response_id}", a.requireAuth(a.deleteResponse))
