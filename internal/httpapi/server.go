@@ -27,18 +27,19 @@ import (
 )
 
 type App struct {
-	cfg       config.Config
-	logger    *slog.Logger
-	store     *store.Store
-	tokens    *tokens.Manager
-	logs      *logs.Writer
-	proxy     *proxy.Pipeline
-	quota     *adminQuotaService
-	quotaJobs *quotaRefreshRegistry
-	oauth     *openAIOAuthSessionStore
-	webDir    string
-	started   time.Time
-	authKeys  []string
+	cfg          config.Config
+	logger       *slog.Logger
+	store        *store.Store
+	tokens       *tokens.Manager
+	logs         *logs.Writer
+	proxy        *proxy.Pipeline
+	quota        *adminQuotaService
+	quotaJobs    *quotaRefreshRegistry
+	oauth        *openAIOAuthSessionStore
+	modelCatalog *officialModelsCatalog
+	webDir       string
+	started      time.Time
+	authKeys     []string
 }
 
 type adminImportItem struct {
@@ -70,18 +71,19 @@ type adminImportItem struct {
 
 func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenManager *tokens.Manager, logWriter *logs.Writer, pipeline *proxy.Pipeline) *App {
 	app := &App{
-		cfg:       cfg,
-		logger:    logger,
-		store:     store,
-		tokens:    tokenManager,
-		logs:      logWriter,
-		proxy:     pipeline,
-		quota:     newAdminQuotaService(cfg, store),
-		quotaJobs: newQuotaRefreshRegistry(),
-		oauth:     newOpenAIOAuthSessionStore(),
-		webDir:    filepath.Join("oaix_gateway", "web"),
-		started:   time.Now().UTC(),
-		authKeys:  cfg.Auth.ServiceAPIKeys,
+		cfg:          cfg,
+		logger:       logger,
+		store:        store,
+		tokens:       tokenManager,
+		logs:         logWriter,
+		proxy:        pipeline,
+		quota:        newAdminQuotaService(cfg, store),
+		quotaJobs:    newQuotaRefreshRegistry(),
+		oauth:        newOpenAIOAuthSessionStore(),
+		modelCatalog: newOfficialModelsCatalog(),
+		webDir:       filepath.Join("oaix_gateway", "web"),
+		started:      time.Now().UTC(),
+		authKeys:     cfg.Auth.ServiceAPIKeys,
 	}
 	if tokenManager != nil {
 		tokenManager.SetReadyTransitionHandler(app.syncSub2APIReadyTransitions)

@@ -111,33 +111,92 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		"gpt-5.6-terra": {"low", "medium", "high", "xhigh", "max", "ultra"},
 		"gpt-5.6-luna":  {"low", "medium", "high", "xhigh", "max"},
 	}
+	type modelCapabilities struct {
+		displayName       string
+		defaultReasoning  string
+		defaultVerbosity  string
+		contextWindow     int64
+		maxContextWindow  int64
+		priority          int
+		compHash          string
+		speedTiers        int
+		serviceTiers      int
+		includeSkills     bool
+		useResponsesLite  bool
+		toolMode          string
+		multiAgentVersion string
+	}
+	wantCapabilities := map[string]modelCapabilities{
+		"gpt-5.4-mini": {
+			displayName: "GPT-5.4-Mini", defaultReasoning: "medium", defaultVerbosity: "medium",
+			contextWindow: 272000, maxContextWindow: 272000, priority: 23, compHash: "2911",
+		},
+		"gpt-5.4": {
+			displayName: "GPT-5.4", defaultReasoning: "medium", defaultVerbosity: "low",
+			contextWindow: 272000, maxContextWindow: 1000000, priority: 16, compHash: "2911",
+			speedTiers: 1, serviceTiers: 1,
+		},
+		"gpt-5.5": {
+			displayName: "GPT-5.5", defaultReasoning: "medium", defaultVerbosity: "low",
+			contextWindow: 272000, maxContextWindow: 272000, priority: 7, compHash: "2911",
+			speedTiers: 1, serviceTiers: 1, includeSkills: true,
+		},
+		"gpt-5.6-sol": {
+			displayName: "GPT-5.6-Sol", defaultReasoning: "low", defaultVerbosity: "low",
+			contextWindow: 372000, maxContextWindow: 372000, priority: 1, compHash: "3000",
+			speedTiers: 1, serviceTiers: 1, useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
+		},
+		"gpt-5.6-terra": {
+			displayName: "GPT-5.6-Terra", defaultReasoning: "medium", defaultVerbosity: "low",
+			contextWindow: 372000, maxContextWindow: 372000, priority: 2, compHash: "3000",
+			speedTiers: 1, serviceTiers: 1, useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
+		},
+		"gpt-5.6-luna": {
+			displayName: "GPT-5.6-Luna", defaultReasoning: "medium", defaultVerbosity: "low",
+			contextWindow: 372000, maxContextWindow: 372000, priority: 3, compHash: "3000",
+			speedTiers: 1, serviceTiers: 1, useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v1",
+		},
+	}
 	for _, model := range payload.Models {
+		want := wantCapabilities[model.Slug]
 		if got := reasoningEfforts(model.SupportedReasoningLevels); !equalStrings(got, wantReasoning[model.Slug]) {
 			t.Fatalf("%s reasoning levels = %#v, want %#v", model.Slug, got, wantReasoning[model.Slug])
 		}
 		if model.DefaultReasoningLevel == nil {
 			t.Fatalf("%s default reasoning level is nil", model.Slug)
 		}
-		wantDefault := "medium"
-		if model.Slug == "gpt-5.6-sol" {
-			wantDefault = "low"
+		if *model.DefaultReasoningLevel != want.defaultReasoning {
+			t.Fatalf("%s default reasoning level = %q, want %q", model.Slug, *model.DefaultReasoningLevel, want.defaultReasoning)
 		}
-		if *model.DefaultReasoningLevel != wantDefault {
-			t.Fatalf("%s default reasoning level = %q, want %q", model.Slug, *model.DefaultReasoningLevel, wantDefault)
+		if model.DefaultVerbosity == nil || *model.DefaultVerbosity != want.defaultVerbosity {
+			t.Fatalf("%s default verbosity = %#v, want %q", model.Slug, model.DefaultVerbosity, want.defaultVerbosity)
 		}
-		wantMultiAgentVersion := ""
-		switch model.Slug {
-		case "gpt-5.6-sol", "gpt-5.6-terra":
-			wantMultiAgentVersion = "v2"
-		case "gpt-5.6-luna":
-			wantMultiAgentVersion = "v1"
+		if model.DisplayName != want.displayName ||
+			model.ContextWindow != want.contextWindow ||
+			model.MaxContextWindow != want.maxContextWindow ||
+			model.Priority != want.priority {
+			t.Fatalf("%s model profile = %#v, want %#v", model.Slug, model, want)
 		}
-		if wantMultiAgentVersion == "" {
-			if model.MultiAgentVersion != nil {
-				t.Fatalf("%s multi-agent version = %q, want nil", model.Slug, *model.MultiAgentVersion)
-			}
-		} else if model.MultiAgentVersion == nil || *model.MultiAgentVersion != wantMultiAgentVersion {
-			t.Fatalf("%s multi-agent version = %#v, want %q", model.Slug, model.MultiAgentVersion, wantMultiAgentVersion)
+		if model.CompHash == nil || *model.CompHash != want.compHash {
+			t.Fatalf("%s comp hash = %#v, want %q", model.Slug, model.CompHash, want.compHash)
+		}
+		if model.DefaultReasoningSummary != "none" ||
+			!model.SupportVerbosity ||
+			model.WebSearchToolType != "text_and_image" ||
+			!model.SupportsSearchTool {
+			t.Fatalf("%s shared capabilities incomplete: %#v", model.Slug, model)
+		}
+		if len(model.AdditionalSpeedTiers) != want.speedTiers ||
+			len(model.ServiceTiers) != want.serviceTiers ||
+			model.IncludeSkillsInstructions != want.includeSkills ||
+			model.UseResponsesLite != want.useResponsesLite {
+			t.Fatalf("%s tier/runtime capabilities = %#v, want %#v", model.Slug, model, want)
+		}
+		if got := optionalString(model.ToolMode); got != want.toolMode {
+			t.Fatalf("%s tool mode = %q, want %q", model.Slug, got, want.toolMode)
+		}
+		if got := optionalString(model.MultiAgentVersion); got != want.multiAgentVersion {
+			t.Fatalf("%s multi-agent version = %q, want %q", model.Slug, got, want.multiAgentVersion)
 		}
 	}
 	sol := payload.Models[3]
@@ -213,4 +272,11 @@ func equalStrings(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+func optionalString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }

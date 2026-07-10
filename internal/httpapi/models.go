@@ -7,8 +7,8 @@ import (
 )
 
 const (
-	codexDefaultContextWindow int64 = 272000
-	codexBaseInstructions           = "You are Codex, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled.\n\n" +
+	codexFallbackContextWindow int64 = 272000
+	codexBaseInstructions            = "You are Codex, a coding agent. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled.\n\n" +
 		"Read the codebase before making changes, prefer existing project patterns, and keep edits focused on the requested behavior. Use fast search tools such as rg when available. Preserve unrelated user changes and never run destructive git commands unless the user explicitly asks for them.\n\n" +
 		"When editing files, use patch-oriented changes, keep comments sparse and useful, and avoid broad refactors unless they are required for the fix. Validate your work with the narrowest relevant tests first, then broader tests when risk warrants it. If a command fails, inspect the failure and continue from the concrete cause.\n\n" +
 		"Communicate concise progress while working and finish with the important outcome, changed files, verification performed, and any remaining risk."
@@ -53,6 +53,7 @@ type codexModelInfo struct {
 	Upgrade                     any                    `json:"upgrade"`
 	BaseInstructions            string                 `json:"base_instructions"`
 	ModelMessages               any                    `json:"model_messages,omitempty"`
+	IncludeSkillsInstructions   bool                   `json:"include_skills_usage_instructions"`
 	SupportsReasoningSummaries  bool                   `json:"supports_reasoning_summaries"`
 	DefaultReasoningSummary     string                 `json:"default_reasoning_summary"`
 	SupportVerbosity            bool                   `json:"support_verbosity"`
@@ -92,9 +93,34 @@ type codexTruncationPolicy struct {
 	Limit int64  `json:"limit"`
 }
 
+type codexModelProfile struct {
+	DisplayName               string
+	Description               string
+	DefaultReasoningLevel     string
+	Priority                  int
+	AdditionalSpeedTiers      []string
+	ServiceTiers              []codexServiceTier
+	IncludeSkillsInstructions bool
+	DefaultReasoningSummary   string
+	SupportVerbosity          bool
+	DefaultVerbosity          string
+	WebSearchToolType         string
+	ContextWindow             int64
+	MaxContextWindow          int64
+	CompHash                  string
+	SupportsSearchTool        bool
+	UseResponsesLite          bool
+	ToolMode                  string
+	MultiAgentVersion         string
+}
+
 func (a *App) models(w http.ResponseWriter, r *http.Request) {
 	modelIDs := advertisedModelIDs()
-	if strings.TrimSpace(r.URL.Query().Get("client_version")) != "" {
+	if clientVersion := strings.TrimSpace(r.URL.Query().Get("client_version")); clientVersion != "" {
+		if a.writeOfficialModelsCatalog(w, r, clientVersion) {
+			return
+		}
+		w.Header().Set("X-OAIX-Models-Source", "static-fallback")
 		writeJSON(w, http.StatusOK, codexModelsCatalog(modelIDs))
 		return
 	}
@@ -131,11 +157,12 @@ func codexModelsCatalog(modelIDs []string) codexModelsResponse {
 }
 
 func codexModelInfoForID(id string, priority int) codexModelInfo {
+	profile := codexModelProfileForID(id, priority)
 	reasoningLevels := []codexReasoningPreset{}
 	defaultReasoningLevel := (*string)(nil)
 	supportsReasoningSummaries := false
 	if codexModelSupportsReasoning(id) {
-		defaultReasoningLevel = codexDefaultReasoningLevel(id)
+		defaultReasoningLevel = stringPointer(profile.DefaultReasoningLevel)
 		reasoningLevels = codexReasoningLevels(id)
 		supportsReasoningSummaries = true
 	}
@@ -149,48 +176,130 @@ func codexModelInfoForID(id string, priority int) codexModelInfo {
 
 	return codexModelInfo{
 		Slug:                       id,
-		DisplayName:                id,
-		Description:                "Available through OAIX.",
+		DisplayName:                profile.DisplayName,
+		Description:                profile.Description,
 		DefaultReasoningLevel:      defaultReasoningLevel,
 		SupportedReasoningLevels:   reasoningLevels,
 		ShellType:                  "shell_command",
 		Visibility:                 "list",
 		SupportedInAPI:             true,
-		Priority:                   priority,
-		AdditionalSpeedTiers:       []string{"fast"},
-		ServiceTiers:               []codexServiceTier{{ID: "priority", Name: "Fast", Description: "1.5x speed, increased usage"}},
+		Priority:                   profile.Priority,
+		AdditionalSpeedTiers:       profile.AdditionalSpeedTiers,
+		ServiceTiers:               profile.ServiceTiers,
 		AvailabilityNux:            nil,
 		Upgrade:                    nil,
 		BaseInstructions:           codexBaseInstructions,
+		IncludeSkillsInstructions:  profile.IncludeSkillsInstructions,
 		SupportsReasoningSummaries: supportsReasoningSummaries,
-		DefaultReasoningSummary:    "auto",
-		SupportVerbosity:           false,
-		DefaultVerbosity:           nil,
+		DefaultReasoningSummary:    profile.DefaultReasoningSummary,
+		SupportVerbosity:           profile.SupportVerbosity,
+		DefaultVerbosity:           stringPointer(profile.DefaultVerbosity),
 		ApplyPatchToolType:         &codexApplyPatchTool,
-		WebSearchToolType:          "text",
+		WebSearchToolType:          profile.WebSearchToolType,
 		TruncationPolicy: codexTruncationPolicy{
 			Mode:  "tokens",
 			Limit: 10000,
 		},
 		SupportsParallelToolCalls:   true,
 		SupportsImageDetailOriginal: supportsImageDetailOriginal,
-		ContextWindow:               codexDefaultContextWindow,
-		MaxContextWindow:            codexDefaultContextWindow,
+		ContextWindow:               profile.ContextWindow,
+		MaxContextWindow:            profile.MaxContextWindow,
 		AutoCompactTokenLimit:       nil,
+		CompHash:                    stringPointer(profile.CompHash),
 		EffectiveContextWindowPct:   95,
 		ExperimentalSupportedTools:  []string{},
 		InputModalities:             inputModalities,
-		SupportsSearchTool:          false,
-		UseResponsesLite:            false,
-		MultiAgentVersion:           codexMultiAgentVersion(id),
+		SupportsSearchTool:          profile.SupportsSearchTool,
+		UseResponsesLite:            profile.UseResponsesLite,
+		ToolMode:                    stringPointer(profile.ToolMode),
+		MultiAgentVersion:           stringPointer(profile.MultiAgentVersion),
 	}
 }
 
-func codexDefaultReasoningLevel(id string) *string {
-	if codexModelMatchesFamily(id, "gpt-5.6-sol") {
-		return &codexReasoningLow
+func codexModelProfileForID(id string, priority int) codexModelProfile {
+	fastTiers := []string{"fast"}
+	priorityService := []codexServiceTier{{
+		ID:          "priority",
+		Name:        "Fast",
+		Description: "1.5x speed, increased usage",
+	}}
+	profile := codexModelProfile{
+		DisplayName:             id,
+		Description:             "Available through OAIX.",
+		DefaultReasoningLevel:   codexReasoningMedium,
+		Priority:                priority,
+		AdditionalSpeedTiers:    fastTiers,
+		ServiceTiers:            priorityService,
+		DefaultReasoningSummary: "auto",
+		WebSearchToolType:       "text",
+		ContextWindow:           codexFallbackContextWindow,
+		MaxContextWindow:        codexFallbackContextWindow,
 	}
-	return &codexReasoningMedium
+	switch {
+	case codexModelMatchesFamily(id, "gpt-5.6-sol"):
+		profile.DisplayName = "GPT-5.6-Sol"
+		profile.Description = "Latest frontier agentic coding model."
+		profile.DefaultReasoningLevel = codexReasoningLow
+		profile.Priority = 1
+		profile.DefaultVerbosity = "low"
+		profile.ContextWindow = 372000
+		profile.MaxContextWindow = 372000
+		profile.CompHash = "3000"
+		profile.UseResponsesLite = true
+		profile.ToolMode = "code_mode_only"
+		profile.MultiAgentVersion = "v2"
+	case codexModelMatchesFamily(id, "gpt-5.6-terra"):
+		profile.DisplayName = "GPT-5.6-Terra"
+		profile.Description = "Balanced agentic coding model for everyday work."
+		profile.Priority = 2
+		profile.DefaultVerbosity = "low"
+		profile.ContextWindow = 372000
+		profile.MaxContextWindow = 372000
+		profile.CompHash = "3000"
+		profile.UseResponsesLite = true
+		profile.ToolMode = "code_mode_only"
+		profile.MultiAgentVersion = "v2"
+	case codexModelMatchesFamily(id, "gpt-5.6-luna"):
+		profile.DisplayName = "GPT-5.6-Luna"
+		profile.Description = "Fast and affordable agentic coding model."
+		profile.Priority = 3
+		profile.DefaultVerbosity = "low"
+		profile.ContextWindow = 372000
+		profile.MaxContextWindow = 372000
+		profile.CompHash = "3000"
+		profile.UseResponsesLite = true
+		profile.ToolMode = "code_mode_only"
+		profile.MultiAgentVersion = "v1"
+	case codexModelMatchesFamily(id, "gpt-5.5"):
+		profile.DisplayName = "GPT-5.5"
+		profile.Description = "Frontier model for complex coding, research, and real-world work."
+		profile.Priority = 7
+		profile.DefaultVerbosity = "low"
+		profile.CompHash = "2911"
+		profile.IncludeSkillsInstructions = true
+	case codexModelMatchesFamily(id, "gpt-5.4-mini"):
+		profile.DisplayName = "GPT-5.4-Mini"
+		profile.Description = "Small, fast, and cost-efficient model for simpler coding tasks."
+		profile.Priority = 23
+		profile.AdditionalSpeedTiers = []string{}
+		profile.ServiceTiers = []codexServiceTier{}
+		profile.DefaultVerbosity = "medium"
+		profile.CompHash = "2911"
+	case codexModelMatchesFamily(id, "gpt-5.4"):
+		profile.DisplayName = "GPT-5.4"
+		profile.Description = "Strong model for everyday coding."
+		profile.Priority = 16
+		profile.DefaultVerbosity = "low"
+		profile.MaxContextWindow = 1000000
+		profile.CompHash = "2911"
+	}
+	if profile.CompHash != "" {
+		profile.DefaultReasoningSummary = "none"
+		profile.SupportVerbosity = true
+		profile.WebSearchToolType = "text_and_image"
+		profile.SupportsSearchTool = true
+	}
+	return profile
 }
 
 func codexReasoningLevels(id string) []codexReasoningPreset {
@@ -223,18 +332,11 @@ func codexModelMatchesFamily(id, family string) bool {
 	return lower == family || strings.HasPrefix(lower, family+"-")
 }
 
-func codexMultiAgentVersion(id string) *string {
-	version := ""
-	switch {
-	case codexModelMatchesFamily(id, "gpt-5.6-sol"),
-		codexModelMatchesFamily(id, "gpt-5.6-terra"):
-		version = "v2"
-	case codexModelMatchesFamily(id, "gpt-5.6-luna"):
-		version = "v1"
-	default:
+func stringPointer(value string) *string {
+	if value == "" {
 		return nil
 	}
-	return &version
+	return &value
 }
 
 func isCodexCatalogModelID(id string) bool {
