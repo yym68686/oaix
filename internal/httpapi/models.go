@@ -15,6 +15,7 @@ const (
 )
 
 var (
+	codexReasoningLow    = "low"
 	codexReasoningMedium = "medium"
 	codexApplyPatchTool  = "freeform"
 )
@@ -134,8 +135,8 @@ func codexModelInfoForID(id string, priority int) codexModelInfo {
 	defaultReasoningLevel := (*string)(nil)
 	supportsReasoningSummaries := false
 	if codexModelSupportsReasoning(id) {
-		defaultReasoningLevel = &codexReasoningMedium
-		reasoningLevels = codexReasoningLevels()
+		defaultReasoningLevel = codexDefaultReasoningLevel(id)
+		reasoningLevels = codexReasoningLevels(id)
 		supportsReasoningSummaries = true
 	}
 
@@ -184,13 +185,41 @@ func codexModelInfoForID(id string, priority int) codexModelInfo {
 	}
 }
 
-func codexReasoningLevels() []codexReasoningPreset {
-	return []codexReasoningPreset{
+func codexDefaultReasoningLevel(id string) *string {
+	if codexModelMatchesFamily(id, "gpt-5.6-sol") {
+		return &codexReasoningLow
+	}
+	return &codexReasoningMedium
+}
+
+func codexReasoningLevels(id string) []codexReasoningPreset {
+	levels := []codexReasoningPreset{
 		{Effort: "low", Description: "Fast responses with lighter reasoning"},
 		{Effort: "medium", Description: "Balances speed and reasoning depth for everyday tasks"},
 		{Effort: "high", Description: "Greater reasoning depth for complex problems"},
 		{Effort: "xhigh", Description: "Extra high reasoning depth for complex problems"},
 	}
+	if codexModelMatchesFamily(id, "gpt-5.6-sol") ||
+		codexModelMatchesFamily(id, "gpt-5.6-terra") ||
+		codexModelMatchesFamily(id, "gpt-5.6-luna") {
+		levels = append(levels, codexReasoningPreset{
+			Effort:      "max",
+			Description: "Maximum reasoning depth for the hardest problems",
+		})
+	}
+	if codexModelMatchesFamily(id, "gpt-5.6-sol") ||
+		codexModelMatchesFamily(id, "gpt-5.6-terra") {
+		levels = append(levels, codexReasoningPreset{
+			Effort:      "ultra",
+			Description: "Maximum reasoning with automatic task delegation",
+		})
+	}
+	return levels
+}
+
+func codexModelMatchesFamily(id, family string) bool {
+	lower := strings.ToLower(strings.TrimSpace(id))
+	return lower == family || strings.HasPrefix(lower, family+"-")
 }
 
 func isCodexCatalogModelID(id string) bool {

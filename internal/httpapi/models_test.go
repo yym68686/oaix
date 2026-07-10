@@ -103,8 +103,35 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 			t.Fatalf("model[%d] capabilities incomplete: %#v", index, item)
 		}
 	}
-	if !hasReasoningEffort(payload.Models[0].SupportedReasoningLevels, "xhigh") {
-		t.Fatalf("reasoning levels = %#v", payload.Models[0].SupportedReasoningLevels)
+	wantReasoning := map[string][]string{
+		"gpt-5.4-mini":  {"low", "medium", "high", "xhigh"},
+		"gpt-5.4":       {"low", "medium", "high", "xhigh"},
+		"gpt-5.5":       {"low", "medium", "high", "xhigh"},
+		"gpt-5.6-sol":   {"low", "medium", "high", "xhigh", "max", "ultra"},
+		"gpt-5.6-terra": {"low", "medium", "high", "xhigh", "max", "ultra"},
+		"gpt-5.6-luna":  {"low", "medium", "high", "xhigh", "max"},
+	}
+	for _, model := range payload.Models {
+		if got := reasoningEfforts(model.SupportedReasoningLevels); !equalStrings(got, wantReasoning[model.Slug]) {
+			t.Fatalf("%s reasoning levels = %#v, want %#v", model.Slug, got, wantReasoning[model.Slug])
+		}
+		if model.DefaultReasoningLevel == nil {
+			t.Fatalf("%s default reasoning level is nil", model.Slug)
+		}
+		wantDefault := "medium"
+		if model.Slug == "gpt-5.6-sol" {
+			wantDefault = "low"
+		}
+		if *model.DefaultReasoningLevel != wantDefault {
+			t.Fatalf("%s default reasoning level = %q, want %q", model.Slug, *model.DefaultReasoningLevel, wantDefault)
+		}
+	}
+	sol := payload.Models[3]
+	if got := reasoningDescription(sol.SupportedReasoningLevels, "max"); got != "Maximum reasoning depth for the hardest problems" {
+		t.Fatalf("max description = %q", got)
+	}
+	if got := reasoningDescription(sol.SupportedReasoningLevels, "ultra"); got != "Maximum reasoning with automatic task delegation" {
+		t.Fatalf("ultra description = %q", got)
 	}
 }
 
@@ -145,11 +172,31 @@ func modelsTestHandler() http.Handler {
 	return app.Handler()
 }
 
-func hasReasoningEffort(levels []codexReasoningPreset, effort string) bool {
+func reasoningEfforts(levels []codexReasoningPreset) []string {
+	efforts := make([]string, 0, len(levels))
+	for _, level := range levels {
+		efforts = append(efforts, level.Effort)
+	}
+	return efforts
+}
+
+func reasoningDescription(levels []codexReasoningPreset, effort string) string {
 	for _, level := range levels {
 		if level.Effort == effort {
-			return true
+			return level.Description
 		}
 	}
-	return false
+	return ""
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
 }
