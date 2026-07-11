@@ -3,11 +3,13 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/yym68686/oaix/internal/store"
 )
@@ -361,18 +363,66 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 	for _, user := range users {
 		ownerIDs = append(ownerIDs, user.ID)
 	}
-	usageByOwner, _ := a.store.RequestUsageByTokenOwner(ctx, ownerIDs, queryInt(r, "hours", 24))
-	observedCostsByOwner, _ := a.store.TokenObservedCostsByOwner(ctx, ownerIDs)
+	poolByOwner, usageByOwner, observedCostsByOwner, err := loadPlatformPoolSummaryData(ctx, a.store, ownerIDs, queryInt(r, "hours", 24))
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	items := make([]map[string]any, 0, len(users))
 	for _, user := range users {
-		counts, _ := a.store.TokenCountsScoped(ctx, store.OwnerResources(user.ID))
-		sharingCounts, _ := a.store.TokenSharingCountsScoped(ctx, store.OwnerResources(user.ID))
-		plans, _ := a.store.TokenPlanCountsScoped(ctx, store.OwnerResources(user.ID), store.TokenListOptions{})
+		pool := poolByOwner[user.ID]
 		usage := usageByOwner[user.ID]
 		usage.ObservedCostUSD = observedCostsByOwner[user.ID]
-		items = append(items, map[string]any{"user": user, "counts": counts, "sharing_counts": sharingCounts, "plan_counts": plans, "usage": usage})
+		items = append(items, map[string]any{"user": user, "counts": pool.Counts, "sharing_counts": pool.SharingCounts, "plan_counts": pool.PlanCounts, "usage": usage})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "pagination": pagination(opts.Limit, opts.Offset, len(items), total)})
+}
+
+type platformPoolSummaryStore interface {
+	TokenPoolSummariesByOwner(context.Context, []int64, time.Time) (map[int64]store.OwnerTokenPoolSummary, error)
+	RequestUsageByTokenOwner(context.Context, []int64, int) (map[int64]store.OwnerUsageSummary, error)
+	TokenObservedCostsByOwner(context.Context, []int64) (map[int64]float64, error)
+}
+
+func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStore, ownerIDs []int64, hours int) (
+	map[int64]store.OwnerTokenPoolSummary,
+	map[int64]store.OwnerUsageSummary,
+	map[int64]float64,
+	error,
+) {
+	group, groupCtx := errgroup.WithContext(ctx)
+	var poolByOwner map[int64]store.OwnerTokenPoolSummary
+	var usageByOwner map[int64]store.OwnerUsageSummary
+	var observedCostsByOwner map[int64]float64
+
+	group.Go(func() error {
+		var err error
+		poolByOwner, err = db.TokenPoolSummariesByOwner(groupCtx, ownerIDs, time.Now().UTC())
+		if err != nil {
+			return fmt.Errorf("load token pool summaries: %w", err)
+		}
+		return nil
+	})
+	group.Go(func() error {
+		var err error
+		usageByOwner, err = db.RequestUsageByTokenOwner(groupCtx, ownerIDs, hours)
+		if err != nil {
+			return fmt.Errorf("load token owner usage: %w", err)
+		}
+		return nil
+	})
+	group.Go(func() error {
+		var err error
+		observedCostsByOwner, err = db.TokenObservedCostsByOwner(groupCtx, ownerIDs)
+		if err != nil {
+			return fmt.Errorf("load token owner costs: %w", err)
+		}
+		return nil
+	})
+	if err := group.Wait(); err != nil {
+		return nil, nil, nil, err
+	}
+	return poolByOwner, usageByOwner, observedCostsByOwner, nil
 }
 
 func (a *App) writeTokenList(w http.ResponseWriter, r *http.Request, scope store.ResourceScope) {

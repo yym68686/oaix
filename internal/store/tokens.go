@@ -133,6 +133,12 @@ type TokenSharingCounts struct {
 	Private int `json:"private"`
 }
 
+type OwnerTokenPoolSummary struct {
+	Counts        TokenCounts
+	SharingCounts TokenSharingCounts
+	PlanCounts    []TokenPlanCount
+}
+
 type TokenMarketplacePricingSummary struct {
 	DefaultPriceBPS int  `json:"default_price_bps"`
 	MinPriceBPS     *int `json:"min_price_bps,omitempty"`
@@ -471,6 +477,87 @@ func (s *Store) TokenSharingCountsScoped(ctx context.Context, scope ResourceScop
 		where merged_into_token_id is null
 		  and `+ownerWhere, args...).Scan(&counts.Shared, &counts.Private)
 	return counts, err
+}
+
+func (s *Store) TokenPoolSummariesByOwner(ctx context.Context, ownerIDs []int64, asOf time.Time) (map[int64]OwnerTokenPoolSummary, error) {
+	ids := uniquePositiveInt64s(ownerIDs)
+	out := make(map[int64]OwnerTokenPoolSummary, len(ids))
+	planCountsByOwner := make(map[int64]map[string]int, len(ids))
+	for _, ownerID := range ids {
+		out[ownerID] = OwnerTokenPoolSummary{}
+		planCountsByOwner[ownerID] = map[string]int{}
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	if asOf.IsZero() {
+		asOf = time.Now().UTC()
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		select
+			owner_user_id,
+			case
+				when plan_type is null or btrim(plan_type) = '' then 'unknown'
+				else lower(btrim(plan_type))
+			end as plan,
+			count(*)::int as total,
+			count(*) filter (
+				where is_active = true
+				  and disabled_at is null
+				  and access_token is not null
+				  and access_token <> ''
+				  and `+tokenDisplayAvailableWhere("$1")+`
+			)::int as available,
+			count(*) filter (where is_active = true and disabled_at is null and `+tokenDisplayCoolingWhere("$1")+`)::int as cooling,
+			count(*) filter (where is_active = false or disabled_at is not null)::int as disabled,
+			count(*) filter (where share_enabled = true and lower(coalesce(share_status, '')) = 'active')::int as shared,
+			count(*) filter (where share_enabled = false or lower(coalesce(share_status, '')) <> 'active')::int as private
+		from codex_tokens
+		where merged_into_token_id is null
+		  and owner_user_id = any($2::bigint[])
+		group by owner_user_id, 2
+	`, asOf.UTC(), ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ownerID int64
+		var plan string
+		var counts TokenCounts
+		var sharingCounts TokenSharingCounts
+		if err := rows.Scan(
+			&ownerID, &plan,
+			&counts.Total, &counts.Available, &counts.Cooling, &counts.Disabled,
+			&sharingCounts.Shared, &sharingCounts.Private,
+		); err != nil {
+			return nil, err
+		}
+		summary := out[ownerID]
+		summary.Counts.Total += counts.Total
+		summary.Counts.Available += counts.Available
+		summary.Counts.Cooling += counts.Cooling
+		summary.Counts.Disabled += counts.Disabled
+		summary.SharingCounts.Shared += sharingCounts.Shared
+		summary.SharingCounts.Private += sharingCounts.Private
+		out[ownerID] = summary
+
+		plan = normalizePlanFilter(plan)
+		if plan == "" {
+			plan = planUnknown
+		}
+		planCountsByOwner[ownerID][plan] += counts.Total
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, ownerID := range ids {
+		summary := out[ownerID]
+		summary.PlanCounts = buildPlanCounts(planCountsByOwner[ownerID])
+		out[ownerID] = summary
+	}
+	return out, nil
 }
 
 func (s *Store) TokenMarketplacePricingSummaryScoped(ctx context.Context, scope ResourceScope) (TokenMarketplacePricingSummary, error) {
