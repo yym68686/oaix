@@ -341,6 +341,7 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 	if _, ok := requirePlatformAdmin(w, r); !ok {
 		return
 	}
+	includeUsage := queryBool(r, "include_usage", true)
 	opts := store.PlatformUserListOptions{
 		Limit:             queryInt(r, "limit", 100),
 		Offset:            queryInt(r, "offset", 0),
@@ -352,7 +353,11 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 		InactiveForHours:  queryInt(r, "inactive_for_hours", 0),
 		Sort:              r.URL.Query().Get("sort"),
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	timeout := 10 * time.Second
+	if includeUsage {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	users, total, err := a.store.ListPlatformUsers(ctx, opts)
 	if err != nil {
@@ -363,7 +368,7 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 	for _, user := range users {
 		ownerIDs = append(ownerIDs, user.ID)
 	}
-	poolByOwner, usageByOwner, observedCostsByOwner, err := loadPlatformPoolSummaryData(ctx, a.store, ownerIDs, queryInt(r, "hours", 24))
+	poolByOwner, usageByOwner, observedCostsByOwner, err := loadPlatformPoolSummaryData(ctx, a.store, ownerIDs, queryInt(r, "hours", 24), includeUsage)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -375,7 +380,11 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 		usage.ObservedCostUSD = observedCostsByOwner[user.ID]
 		items = append(items, map[string]any{"user": user, "counts": pool.Counts, "sharing_counts": pool.SharingCounts, "plan_counts": pool.PlanCounts, "usage": usage})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "pagination": pagination(opts.Limit, opts.Offset, len(items), total)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":          items,
+		"pagination":     pagination(opts.Limit, opts.Offset, len(items), total),
+		"usage_included": includeUsage,
+	})
 }
 
 type platformPoolSummaryStore interface {
@@ -384,12 +393,26 @@ type platformPoolSummaryStore interface {
 	TokenObservedCostsByOwner(context.Context, []int64) (map[int64]float64, error)
 }
 
-func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStore, ownerIDs []int64, hours int) (
+func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStore, ownerIDs []int64, hours int, includeUsage bool) (
 	map[int64]store.OwnerTokenPoolSummary,
 	map[int64]store.OwnerUsageSummary,
 	map[int64]float64,
 	error,
 ) {
+	if !includeUsage {
+		poolByOwner, err := db.TokenPoolSummariesByOwner(ctx, ownerIDs, time.Now().UTC())
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("load token pool summaries: %w", err)
+		}
+		usageByOwner := make(map[int64]store.OwnerUsageSummary, len(ownerIDs))
+		observedCostsByOwner := make(map[int64]float64, len(ownerIDs))
+		for _, ownerID := range ownerIDs {
+			usageByOwner[ownerID] = store.OwnerUsageSummary{OwnerUserID: ownerID, Hours: hours}
+			observedCostsByOwner[ownerID] = 0
+		}
+		return poolByOwner, usageByOwner, observedCostsByOwner, nil
+	}
+
 	group, groupCtx := errgroup.WithContext(ctx)
 	var poolByOwner map[int64]store.OwnerTokenPoolSummary
 	var usageByOwner map[int64]store.OwnerUsageSummary

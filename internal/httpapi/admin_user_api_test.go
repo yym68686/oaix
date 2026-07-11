@@ -42,7 +42,7 @@ func TestLoadPlatformPoolSummaryDataRejectsPartialResults(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pool, usage, costs, err := loadPlatformPoolSummaryData(context.Background(), tt.db, []int64{1}, 24)
+			pool, usage, costs, err := loadPlatformPoolSummaryData(context.Background(), tt.db, []int64{1}, 24, true)
 			if !errors.Is(err, sentinel) {
 				t.Fatalf("error = %v, want sentinel", err)
 			}
@@ -63,11 +63,31 @@ func TestLoadPlatformPoolSummaryDataReturnsCompleteResults(t *testing.T) {
 		},
 		observedCostsByOwner: map[int64]float64{1: 1.25},
 	}
-	pool, usage, costs, err := loadPlatformPoolSummaryData(context.Background(), db, []int64{1}, 24)
+	pool, usage, costs, err := loadPlatformPoolSummaryData(context.Background(), db, []int64{1}, 24, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if pool[1].Counts.Total != 7 || usage[1].RequestCount != 9 || costs[1] != 1.25 {
 		t.Fatalf("unexpected results: pool=%v usage=%v costs=%v", pool, usage, costs)
+	}
+}
+
+func TestLoadPlatformPoolSummaryDataCanSkipUsage(t *testing.T) {
+	db := fakePlatformPoolSummaryStore{
+		poolByOwner: map[int64]store.OwnerTokenPoolSummary{
+			1: {Counts: store.TokenCounts{Total: 7, Available: 2, Cooling: 3, Disabled: 2}},
+		},
+		usageErr: errors.New("usage must not be queried"),
+		costErr:  errors.New("costs must not be queried"),
+	}
+	pool, usage, costs, err := loadPlatformPoolSummaryData(context.Background(), db, []int64{1}, 24, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pool[1].Counts.Total != 7 {
+		t.Fatalf("pool = %v", pool)
+	}
+	if usage[1].OwnerUserID != 1 || usage[1].Hours != 24 || costs[1] != 0 {
+		t.Fatalf("unexpected skipped usage placeholders: usage=%v costs=%v", usage, costs)
 	}
 }
