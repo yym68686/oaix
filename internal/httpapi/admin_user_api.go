@@ -306,15 +306,14 @@ func (a *App) platformUserUsage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	counts, _ := a.store.TokenCountsScoped(ctx, store.OwnerResources(userID))
-	usageByOwner, _ := a.store.RequestUsageByTokenOwner(ctx, []int64{userID}, queryInt(r, "hours", 24))
-	observedCostsByOwner, _ := a.store.TokenObservedCostsByOwner(ctx, []int64{userID})
-	sub2APICostsByOwner, _ := a.store.Sub2APIUsageCostsByOwner(ctx, []int64{userID})
-	usage := usageByOwner[userID]
-	applyOwnerObservedCosts(&usage, observedCostsByOwner[userID], sub2APICostsByOwner[userID])
-	writeJSON(w, http.StatusOK, map[string]any{"pool": counts, "usage": usage})
+	poolByOwner, usageByOwner, _, err := loadPlatformPoolSummaryData(ctx, a.store, []int64{userID}, queryInt(r, "hours", 24), true)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"pool": poolByOwner[userID].Counts, "usage": usageByOwner[userID]})
 }
 
 func (a *App) platformPoolSummary(w http.ResponseWriter, r *http.Request) {
