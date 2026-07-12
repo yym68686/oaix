@@ -118,19 +118,7 @@ func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Log
 		return err
 	})
 	runStep(ctx, logger, "GPT-5.6 request cost repricing", maxDuration(2*time.Minute, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
-		result, err := db.RepriceGPT56RequestCosts(stepCtx)
-		if err == nil && (result.ScannedLogs > 0 || result.RebuiltTokenCosts > 0 || result.RebuiltHourlyCosts > 0) && logger != nil {
-			logger.Info(
-				"GPT-5.6 request costs repriced",
-				"phase", result.Phase,
-				"scanned_logs", result.ScannedLogs,
-				"updated_logs", result.UpdatedLogs,
-				"rebuilt_token_costs", result.RebuiltTokenCosts,
-				"rebuilt_hourly_costs", result.RebuiltHourlyCosts,
-				"completed", result.Completed,
-			)
-		}
-		return err
+		return runGPT56RequestCostRepricing(stepCtx, logger, db)
 	})
 	runStep(ctx, logger, "sub2api sync", maxDuration(30*time.Second, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
 		if sub2apiSyncer == nil {
@@ -152,6 +140,44 @@ func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Log
 	if includeCleanup {
 		runRequestLogCleanup(ctx, cfg, logger, db)
 	}
+}
+
+func runGPT56RequestCostRepricing(ctx context.Context, logger *slog.Logger, db *store.Store) error {
+	const cycleWriteBudget = 45 * time.Second
+	deadline := time.Now().Add(cycleWriteBudget)
+	var total store.GPT56CostRepriceResult
+	batchCount := 0
+	for {
+		result, err := db.RepriceGPT56RequestCosts(ctx)
+		if err != nil {
+			return err
+		}
+		batchCount++
+		total.ScannedLogs += result.ScannedLogs
+		total.UpdatedLogs += result.UpdatedLogs
+		total.RebuiltTokenCosts += result.RebuiltTokenCosts
+		total.RebuiltHourlyCosts += result.RebuiltHourlyCosts
+		total.Phase = result.Phase
+		total.Completed = result.Completed
+
+		progressed := result.ScannedLogs > 0 || result.RebuiltTokenCosts > 0 || result.RebuiltHourlyCosts > 0
+		if result.Completed || !progressed || time.Now().After(deadline) {
+			break
+		}
+	}
+	if logger != nil && (total.ScannedLogs > 0 || total.RebuiltTokenCosts > 0 || total.RebuiltHourlyCosts > 0) {
+		logger.Info(
+			"GPT-5.6 request costs repriced",
+			"phase", total.Phase,
+			"batches", batchCount,
+			"scanned_logs", total.ScannedLogs,
+			"updated_logs", total.UpdatedLogs,
+			"rebuilt_token_costs", total.RebuiltTokenCosts,
+			"rebuilt_hourly_costs", total.RebuiltHourlyCosts,
+			"completed", total.Completed,
+		)
+	}
+	return nil
 }
 
 func runRequestLogCleanup(ctx context.Context, cfg config.Config, logger *slog.Logger, db *store.Store) {

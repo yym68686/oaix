@@ -11,7 +11,7 @@ import (
 const (
 	gpt56CostRepriceSettingKey        = "request_costs_gpt56_official_pricing_v2"
 	gpt56CostRepriceFinalizationDelay = 15 * time.Minute
-	gpt56CostRepriceBatchSize         = 20_000
+	gpt56CostRepriceBatchSize         = 1_000
 )
 
 var gpt56IncorrectPricingStartedAt = time.Date(2026, time.July, 9, 0, 0, 0, 0, time.UTC)
