@@ -87,6 +87,12 @@ type CreateAccountRequest struct {
 	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk,omitempty"`
 }
 
+type ApplyOAuthCredentialsRequest struct {
+	Type        string         `json:"type"`
+	Credentials map[string]any `json:"credentials"`
+	Extra       map[string]any `json:"extra,omitempty"`
+}
+
 type BatchCreateResult struct {
 	Success int                  `json:"success"`
 	Failed  int                  `json:"failed"`
@@ -207,6 +213,18 @@ func (c *Client) CreateAccounts(ctx context.Context, baseURL string, adminKey st
 	body := map[string]any{"accounts": accounts}
 	err := c.doJSON(ctx, http.MethodPost, baseURL, adminKey, "/admin/accounts/batch", body, &result)
 	return result, err
+}
+
+func (c *Client) ApplyOAuthCredentials(ctx context.Context, baseURL string, adminKey string, accountID int64, credentials map[string]any, extra map[string]any) error {
+	if accountID <= 0 {
+		return nil
+	}
+	body := ApplyOAuthCredentialsRequest{
+		Type:        "oauth",
+		Credentials: credentials,
+		Extra:       extra,
+	}
+	return c.doJSON(ctx, http.MethodPost, baseURL, adminKey, fmt.Sprintf("/admin/accounts/%d/apply-oauth-credentials", accountID), body, nil)
 }
 
 func (c *Client) RestoreAccountAvailability(ctx context.Context, baseURL string, adminKey string, accountID int64) error {

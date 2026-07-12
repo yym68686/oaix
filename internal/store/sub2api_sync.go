@@ -472,6 +472,21 @@ func (s *Store) ListSub2APITokenCandidates(ctx context.Context, target Sub2APISy
 	return items, rows.Err()
 }
 
+func (s *Store) GetSub2APITokenCandidate(ctx context.Context, tokenID int64) (Sub2APITokenCandidate, error) {
+	rawPayloadExpr := sub2APIRawPayloadSelectSQL()
+	row := s.pool.QueryRow(ctx, `
+		select t.id, coalesce(t.owner_user_id, 0), t.email, t.account_id, t.id_token,
+		       t.access_token, t.refresh_token, t.plan_type, `+rawPayloadExpr+`,
+		       t.created_at, t.updated_at
+		from codex_tokens t
+		where t.id = $1
+		  and t.merged_into_token_id is null
+		  and coalesce(t.access_token, '') <> ''
+		  and coalesce(t.refresh_token, '') <> ''
+	`, tokenID)
+	return scanSub2APITokenCandidate(row)
+}
+
 func (s *Store) ListSub2APISyncedTokenMappings(ctx context.Context, target Sub2APISyncTarget, limit int) ([]Sub2APISyncedTokenMapping, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 500

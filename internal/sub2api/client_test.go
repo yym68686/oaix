@@ -122,6 +122,35 @@ func TestClientGetAccountNotFound(t *testing.T) {
 	}
 }
 
+func TestClientApplyOAuthCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts/42/apply-oauth-credentials" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var payload ApplyOAuthCredentialsRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if payload.Type != "oauth" || payload.Credentials["access_token"] != "new-access" || payload.Credentials["refresh_token"] != "new-refresh" {
+			t.Fatalf("payload = %#v", payload)
+		}
+		if payload.Extra["oaix_token_id"] != float64(9434) {
+			t.Fatalf("extra = %#v", payload.Extra)
+		}
+		writeSub2APISuccess(t, w, map[string]any{"id": 42, "status": "active"})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	err := client.ApplyOAuthCredentials(t.Context(), server.URL, "admin-fixture", 42,
+		map[string]any{"access_token": "new-access", "refresh_token": "new-refresh"},
+		map[string]any{"oaix_token_id": int64(9434)},
+	)
+	if err != nil {
+		t.Fatalf("ApplyOAuthCredentials returned error: %v", err)
+	}
+}
+
 func TestClientRestoreAccountAvailability(t *testing.T) {
 	seen := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

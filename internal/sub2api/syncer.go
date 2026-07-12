@@ -99,13 +99,20 @@ func (s *Syncer) RestoreTokenAvailability(ctx context.Context, token store.Token
 	if err != nil {
 		return 0, err
 	}
+	if len(mappings) == 0 {
+		return 0, nil
+	}
+	candidate, err := s.Store.GetSub2APITokenCandidate(ctx, token.ID)
+	if err != nil {
+		return 0, err
+	}
 	restored := 0
 	errs := make([]error, 0)
 	for _, mapping := range mappings {
 		if mapping.RemoteAccountID <= 0 {
 			continue
 		}
-		if err := s.Client.RestoreAccountAvailability(ctx, mapping.BaseURL, mapping.AdminKey, mapping.RemoteAccountID); err != nil {
+		if err := s.syncMappedAccount(ctx, mapping.BaseURL, mapping.AdminKey, mapping.TargetID, mapping.RemoteAccountID, candidate); err != nil {
 			errs = append(errs, fmt.Errorf("target %d remote account %d: %w", mapping.TargetID, mapping.RemoteAccountID, err))
 			if s.Logger != nil {
 				s.Logger.Warn("sub2api account availability restore failed", "target_id", mapping.TargetID, "remote_account_id", mapping.RemoteAccountID, "oaix_token_id", token.ID, "error", err)
@@ -167,7 +174,7 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 		return s.finish(ctx, run, result)
 	}
 	reconcile := mappedAccountReconcileResult{}
-	if result.NeededCount > 0 {
+	if shouldReconcileMappedAccounts(trigger, result.NeededCount) {
 		reconciled, reconcileErr := s.reconcileMappedAccounts(ctx, target, run.ID)
 		if reconcileErr != nil {
 			result.Status = store.Sub2APISyncStatusFailed
@@ -293,13 +300,31 @@ func (s *Syncer) reconcileMappedAccounts(ctx context.Context, target store.Sub2A
 		if !tokenAvailableForSub2API(mapping.Token(), now) || remoteAccountAvailable(account) {
 			continue
 		}
-		if err := s.Client.RestoreAccountAvailability(ctx, target.BaseURL, target.AdminKey, mapping.RemoteAccountID); err != nil {
+		candidate, err := s.Store.GetSub2APITokenCandidate(ctx, mapping.TokenID)
+		if err != nil {
+			return result, err
+		}
+		if err := s.syncMappedAccount(ctx, target.BaseURL, target.AdminKey, target.ID, mapping.RemoteAccountID, candidate); err != nil {
 			return result, err
 		}
 		result.RestoredTokenIDs = append(result.RestoredTokenIDs, mapping.TokenID)
 		result.RestoredRemoteAccounts = append(result.RestoredRemoteAccounts, mapping.RemoteAccountID)
 	}
 	return result, nil
+}
+
+func shouldReconcileMappedAccounts(trigger string, neededCount int) bool {
+	return neededCount > 0 || strings.EqualFold(strings.TrimSpace(trigger), "manual")
+}
+
+func (s *Syncer) syncMappedAccount(ctx context.Context, baseURL string, adminKey string, targetID int64, remoteAccountID int64, candidate store.Sub2APITokenCandidate) error {
+	if err := s.Client.ApplyOAuthCredentials(ctx, baseURL, adminKey, remoteAccountID, s.oauthCredentials(candidate), sub2APISyncMetadata(targetID, candidate)); err != nil {
+		return fmt.Errorf("update oauth credentials: %w", err)
+	}
+	if err := s.Client.RestoreAccountAvailability(ctx, baseURL, adminKey, remoteAccountID); err != nil {
+		return fmt.Errorf("restore availability: %w", err)
+	}
+	return nil
 }
 
 func remoteAccountAvailable(account Account) bool {
@@ -339,48 +364,8 @@ func (s *Syncer) finish(ctx context.Context, run store.Sub2APISyncRun, result st
 }
 
 func (s *Syncer) createAccountRequest(target store.Sub2APISyncTarget, candidate store.Sub2APITokenCandidate) CreateAccountRequest {
-	credentials := map[string]any{
-		"access_token":  candidate.AccessToken,
-		"refresh_token": candidate.RefreshToken,
-		"client_id":     s.OAuthClientID,
-	}
-	if candidate.IDToken != "" {
-		credentials["id_token"] = candidate.IDToken
-	}
-	if candidate.Email != "" {
-		credentials["email"] = candidate.Email
-	}
-	if candidate.AccountID != "" {
-		credentials["chatgpt_account_id"] = candidate.AccountID
-	}
-	if candidate.PlanType != "" {
-		credentials["plan_type"] = candidate.PlanType
-	}
-	for _, key := range []string{"chatgpt_user_id", "organization_id", "org_id"} {
-		if value := stringFromRawPayload(candidate.RawPayload, key); value != "" {
-			if key == "org_id" {
-				credentials["organization_id"] = value
-			} else {
-				credentials[key] = value
-			}
-		}
-	}
-
-	extra := map[string]any{
-		"oaix_token_id":      candidate.ID,
-		"oaix_owner_user_id": candidate.OwnerUserID,
-		"oaix_source":        "oaix_sub2api_sync",
-		"oaix_synced_at":     time.Now().UTC().Format(time.RFC3339),
-	}
-	if candidate.AccountID != "" {
-		extra["oaix_account_id"] = candidate.AccountID
-	}
-	if candidate.PlanType != "" {
-		extra["oaix_plan_type"] = candidate.PlanType
-	}
-	if target.ID > 0 {
-		extra["oaix_sub2api_target_id"] = target.ID
-	}
+	credentials := s.oauthCredentials(candidate)
+	extra := sub2APISyncMetadata(target.ID, candidate)
 
 	name := candidate.Email
 	if name == "" {
@@ -422,6 +407,55 @@ func (s *Syncer) createAccountRequest(target store.Sub2APISyncTarget, candidate 
 		AutoPauseOnExpired:      &autoPause,
 		ConfirmMixedChannelRisk: &confirmMixedChannelRisk,
 	}
+}
+
+func (s *Syncer) oauthCredentials(candidate store.Sub2APITokenCandidate) map[string]any {
+	credentials := map[string]any{
+		"access_token":  candidate.AccessToken,
+		"refresh_token": candidate.RefreshToken,
+		"client_id":     s.OAuthClientID,
+	}
+	if candidate.IDToken != "" {
+		credentials["id_token"] = candidate.IDToken
+	}
+	if candidate.Email != "" {
+		credentials["email"] = candidate.Email
+	}
+	if candidate.AccountID != "" {
+		credentials["chatgpt_account_id"] = candidate.AccountID
+	}
+	if candidate.PlanType != "" {
+		credentials["plan_type"] = candidate.PlanType
+	}
+	for _, key := range []string{"chatgpt_user_id", "organization_id", "org_id"} {
+		if value := stringFromRawPayload(candidate.RawPayload, key); value != "" {
+			if key == "org_id" {
+				credentials["organization_id"] = value
+			} else {
+				credentials[key] = value
+			}
+		}
+	}
+	return credentials
+}
+
+func sub2APISyncMetadata(targetID int64, candidate store.Sub2APITokenCandidate) map[string]any {
+	extra := map[string]any{
+		"oaix_token_id":      candidate.ID,
+		"oaix_owner_user_id": candidate.OwnerUserID,
+		"oaix_source":        "oaix_sub2api_sync",
+		"oaix_synced_at":     time.Now().UTC().Format(time.RFC3339),
+	}
+	if candidate.AccountID != "" {
+		extra["oaix_account_id"] = candidate.AccountID
+	}
+	if candidate.PlanType != "" {
+		extra["oaix_plan_type"] = candidate.PlanType
+	}
+	if targetID > 0 {
+		extra["oaix_sub2api_target_id"] = targetID
+	}
+	return extra
 }
 
 func tokenCandidateIDs(items []store.Sub2APITokenCandidate) []int64 {

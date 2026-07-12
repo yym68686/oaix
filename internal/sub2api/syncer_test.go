@@ -2,6 +2,9 @@ package sub2api
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,5 +127,82 @@ func TestTokenAvailableForSub2API(t *testing.T) {
 	}
 	if tokenAvailableForSub2API(store.Token{ID: 0, IsActive: true}, now) {
 		t.Fatal("token without id should not be available")
+	}
+}
+
+func TestOAuthCredentialsCopiesReimportedTokenValues(t *testing.T) {
+	syncer := NewSyncer(nil, nil, nil, "client-fixture")
+	credentials := syncer.oauthCredentials(store.Sub2APITokenCandidate{
+		ID:           9434,
+		Email:        "s1071734018+hocen@gmail.com",
+		AccountID:    "account-fixture",
+		IDToken:      "new-id-token",
+		AccessToken:  "new-access-token",
+		RefreshToken: "new-refresh-token",
+		PlanType:     "pro",
+		RawPayload:   json.RawMessage(`{"organization_id":"org-fixture"}`),
+	})
+
+	if credentials["access_token"] != "new-access-token" || credentials["refresh_token"] != "new-refresh-token" {
+		t.Fatalf("credentials = %#v", credentials)
+	}
+	if credentials["id_token"] != "new-id-token" || credentials["client_id"] != "client-fixture" {
+		t.Fatalf("credentials = %#v", credentials)
+	}
+	if credentials["chatgpt_account_id"] != "account-fixture" || credentials["organization_id"] != "org-fixture" {
+		t.Fatalf("credentials = %#v", credentials)
+	}
+}
+
+func TestShouldReconcileMappedAccounts(t *testing.T) {
+	if !shouldReconcileMappedAccounts("schedule", 1) {
+		t.Fatal("scheduled top-up should reconcile mapped accounts")
+	}
+	if !shouldReconcileMappedAccounts("manual", 0) {
+		t.Fatal("manual sync should reconcile mapped accounts above the threshold")
+	}
+	if shouldReconcileMappedAccounts("schedule", 0) {
+		t.Fatal("routine scheduled sync above the threshold should not scan mapped accounts")
+	}
+}
+
+func TestSyncMappedAccountUpdatesCredentialsBeforeRestoringAvailability(t *testing.T) {
+	seen := make([]string, 0, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		switch r.URL.Path {
+		case "/api/v1/admin/accounts/42/apply-oauth-credentials":
+			var payload ApplyOAuthCredentialsRequest
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode credentials payload: %v", err)
+			}
+			if payload.Credentials["access_token"] != "new-access" || payload.Credentials["refresh_token"] != "new-refresh" {
+				t.Fatalf("credentials = %#v", payload.Credentials)
+			}
+		case "/api/v1/admin/accounts/42/clear-error", "/api/v1/admin/accounts/42/schedulable":
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		writeSub2APISuccess(t, w, map[string]any{"id": 42})
+	}))
+	defer server.Close()
+
+	syncer := NewSyncer(nil, NewClient(server.Client()), nil, "client-fixture")
+	err := syncer.syncMappedAccount(t.Context(), server.URL, "admin-fixture", 2, 42, store.Sub2APITokenCandidate{
+		ID:           9434,
+		OwnerUserID:  1,
+		AccessToken:  "new-access",
+		RefreshToken: "new-refresh",
+	})
+	if err != nil {
+		t.Fatalf("syncMappedAccount returned error: %v", err)
+	}
+	want := []string{
+		"POST /api/v1/admin/accounts/42/apply-oauth-credentials",
+		"POST /api/v1/admin/accounts/42/clear-error",
+		"POST /api/v1/admin/accounts/42/schedulable",
+	}
+	if strings.Join(seen, ",") != strings.Join(want, ",") {
+		t.Fatalf("seen = %#v, want %#v", seen, want)
 	}
 }
