@@ -367,15 +367,15 @@ func pricingForModel(modelName string) (modelPricing, bool) {
 	table := map[string]modelPricing{
 		"gpt-5.6-sol": {
 			name: "gpt-5.6-sol", billingMode: usageBillingModeOpenAIPromptCache,
-			input: 10.0, cacheWrite: price(12.5), cached: price(1.0), output: 60.0,
+			input: 5.0, cacheWrite: price(6.25), cached: price(0.5), output: 30.0,
 		},
 		"gpt-5.6-terra": {
 			name: "gpt-5.6-terra", billingMode: usageBillingModeOpenAIPromptCache,
-			input: 5.0, cacheWrite: price(6.25), cached: price(0.5), output: 5.0,
+			input: 2.5, cacheWrite: price(3.125), cached: price(0.25), output: 15.0,
 		},
 		"gpt-5.6-luna": {
 			name: "gpt-5.6-luna", billingMode: usageBillingModeOpenAIPromptCache,
-			input: 2.0, cacheWrite: price(2.5), cached: price(0.2), output: 12.0,
+			input: 1.0, cacheWrite: price(1.25), cached: price(0.1), output: 6.0,
 		},
 		"gpt-5.5": {
 			name: "gpt-5.5", billingMode: usageBillingModeOpenAICachedInput,

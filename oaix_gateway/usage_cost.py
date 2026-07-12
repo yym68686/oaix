@@ -32,22 +32,22 @@ class UsageMetrics:
 
 DEFAULT_MODEL_PRICING: dict[str, ModelPricing] = {
     "gpt-5.6-sol": ModelPricing(
-        input_per_million_usd=10.0,
-        cache_write_input_per_million_usd=12.5,
-        cached_input_per_million_usd=1.0,
-        output_per_million_usd=60.0,
-    ),
-    "gpt-5.6-terra": ModelPricing(
         input_per_million_usd=5.0,
         cache_write_input_per_million_usd=6.25,
         cached_input_per_million_usd=0.5,
-        output_per_million_usd=5.0,
+        output_per_million_usd=30.0,
+    ),
+    "gpt-5.6-terra": ModelPricing(
+        input_per_million_usd=2.5,
+        cache_write_input_per_million_usd=3.125,
+        cached_input_per_million_usd=0.25,
+        output_per_million_usd=15.0,
     ),
     "gpt-5.6-luna": ModelPricing(
-        input_per_million_usd=2.0,
-        cache_write_input_per_million_usd=2.5,
-        cached_input_per_million_usd=0.2,
-        output_per_million_usd=12.0,
+        input_per_million_usd=1.0,
+        cache_write_input_per_million_usd=1.25,
+        cached_input_per_million_usd=0.1,
+        output_per_million_usd=6.0,
     ),
     "gpt-5.5": ModelPricing(input_per_million_usd=5.0, cached_input_per_million_usd=0.5, output_per_million_usd=30.0),
     "gpt-5": ModelPricing(input_per_million_usd=1.25, cached_input_per_million_usd=0.125, output_per_million_usd=10.0),

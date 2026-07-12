@@ -36,7 +36,7 @@ func TestExtractUsageMetricsGPT56PromptCacheBilling(t *testing.T) {
 	if usage.CachedInputTokensSource != "response.usage.input_tokens_details.cached_tokens" {
 		t.Fatalf("cached source = %q", usage.CachedInputTokensSource)
 	}
-	assertCost(t, usage.EstimatedCostUSD, 0.000276)
+	assertCost(t, usage.EstimatedCostUSD, 0.000138)
 }
 
 func TestGPT56PricingFamilies(t *testing.T) {
@@ -48,9 +48,9 @@ func TestGPT56PricingFamilies(t *testing.T) {
 		cached     float64
 		output     float64
 	}{
-		{model: "gpt-5.6-sol", pricing: "gpt-5.6-sol", input: 10, cacheWrite: 12.5, cached: 1, output: 60},
-		{model: "gpt-5.6-terra-2026-07-01", pricing: "gpt-5.6-terra", input: 5, cacheWrite: 6.25, cached: 0.5, output: 5},
-		{model: "gpt-5.6-luna", pricing: "gpt-5.6-luna", input: 2, cacheWrite: 2.5, cached: 0.2, output: 12},
+		{model: "gpt-5.6-sol", pricing: "gpt-5.6-sol", input: 5, cacheWrite: 6.25, cached: 0.5, output: 30},
+		{model: "gpt-5.6-terra-2026-07-01", pricing: "gpt-5.6-terra", input: 2.5, cacheWrite: 3.125, cached: 0.25, output: 15},
+		{model: "gpt-5.6-luna", pricing: "gpt-5.6-luna", input: 1, cacheWrite: 1.25, cached: 0.1, output: 6},
 	}
 	for _, test := range tests {
 		t.Run(test.model, func(t *testing.T) {

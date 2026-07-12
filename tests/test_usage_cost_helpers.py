@@ -94,14 +94,14 @@ def test_extract_usage_metrics_supports_gpt_5_6_cache_write_billing() -> None:
     assert usage.cache_write_input_tokens == 20
     assert usage.cached_input_tokens == 30
     assert usage.pricing_model == "gpt-5.6-luna"
-    assert usage.estimated_cost_usd == 0.000276
+    assert usage.estimated_cost_usd == 0.000138
 
 
 def test_resolve_model_pricing_supports_gpt_5_6_families() -> None:
     expected = {
-        "gpt-5.6-sol": (10.0, 12.5, 1.0, 60.0),
-        "gpt-5.6-terra-preview": (5.0, 6.25, 0.5, 5.0),
-        "gpt-5.6-luna": (2.0, 2.5, 0.2, 12.0),
+        "gpt-5.6-sol": (5.0, 6.25, 0.5, 30.0),
+        "gpt-5.6-terra-preview": (2.5, 3.125, 0.25, 15.0),
+        "gpt-5.6-luna": (1.0, 1.25, 0.1, 6.0),
     }
 
     for model, rates in expected.items():
