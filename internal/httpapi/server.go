@@ -543,11 +543,23 @@ func (a *App) listTokenCosts(w http.ResponseWriter, r *http.Request) {
 	if err != nil && a.logger != nil {
 		a.logger.Warn("admin token observed costs load failed", "error", err)
 	}
+	remoteUsage, remoteErr := a.store.Sub2APIUsageByTokens(ctx, tokens)
+	if remoteErr != nil {
+		writeError(w, http.StatusServiceUnavailable, remoteErr)
+		return
+	}
 	items := make([]store.TokenObservedCost, 0, len(tokens))
 	for _, token := range tokens {
+		remote := remoteUsage[token.ID]
+		remoteCost := remote.AccountCostUSD
 		items = append(items, store.TokenObservedCost{
-			ID:              token.ID,
-			ObservedCostUSD: costs[token.ID],
+			ID:                      token.ID,
+			ObservedCostUSD:         costs[token.ID],
+			LocalObservedCostUSD:    costs[token.ID],
+			Sub2APIObservedCostUSD:  &remoteCost,
+			CombinedObservedCostUSD: combinedObservedCost(costs[token.ID], remoteCost),
+			Sub2APIUsageSyncedAt:    remote.SyncedAt,
+			Sub2APIUsageStale:       remote.Stale,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})

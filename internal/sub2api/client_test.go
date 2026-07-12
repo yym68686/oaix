@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestClientCountsActiveOAuthAccounts(t *testing.T) {
@@ -87,6 +88,83 @@ func TestClientCreateAccountsUnwrapsBatchResult(t *testing.T) {
 	}
 	if result.Success != 1 || len(result.Results) != 1 || result.Results[0].ID != 99 {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestClientGetAccountUsageTotalsBatch(t *testing.T) {
+	computedAt := time.Date(2026, 7, 13, 3, 4, 5, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts/usage-totals/batch" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var payload struct {
+			AccountIDs []int64 `json:"account_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(payload.AccountIDs) != 1 || payload.AccountIDs[0] != 42 {
+			t.Fatalf("payload = %#v", payload)
+		}
+		writeSub2APISuccess(t, w, AccountUsageTotalsBatch{
+			Stats: map[int64]*AccountUsageTotal{
+				42: {AccountID: 42, TotalRequests: 7, TotalTokens: 99, AccountCost: 1.25, StandardCost: 1, UserCost: 1.5, ComputedAt: computedAt},
+			},
+			BackfillComplete: true,
+			ComputedAt:       computedAt,
+		})
+	}))
+	defer server.Close()
+
+	got, err := NewClient(server.Client()).GetAccountUsageTotalsBatch(t.Context(), server.URL, "admin-fixture", []int64{42})
+	if err != nil {
+		t.Fatalf("GetAccountUsageTotalsBatch returned error: %v", err)
+	}
+	if got.Stats[42] == nil || got.Stats[42].AccountCost != 1.25 || got.Stats[42].TotalRequests != 7 {
+		t.Fatalf("result = %#v", got)
+	}
+}
+
+func TestClientGetAccountUsageTotalsBatchFallsBackWhenUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	_, err := NewClient(server.Client()).GetAccountUsageTotalsBatch(t.Context(), server.URL, "admin-fixture", []int64{42})
+	if !errors.Is(err, ErrUsageTotalsBatchUnsupported) {
+		t.Fatalf("err = %v, want ErrUsageTotalsBatchUnsupported", err)
+	}
+}
+
+func TestClientGetAccountUsageFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/admin/usage/stats" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.URL.Query().Get("account_id") != "42" || r.URL.Query().Get("timezone") != "UTC" || r.URL.Query().Get("nocache") != "true" {
+			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+		}
+		writeSub2APISuccess(t, w, map[string]any{
+			"total_requests":     10,
+			"total_tokens":       200,
+			"total_cost":         3.5,
+			"total_actual_cost":  4.5,
+			"total_account_cost": 4.0,
+		})
+	}))
+	defer server.Close()
+
+	got, err := NewClient(server.Client()).GetAccountUsageFallback(t.Context(), server.URL, "admin-fixture", 42, time.Now().UTC().AddDate(0, 0, -2))
+	if err != nil {
+		t.Fatalf("GetAccountUsageFallback returned error: %v", err)
+	}
+	if got.AccountCost != 4 || got.StandardCost != 3.5 || got.UserCost != 4.5 || got.TotalTokens != 200 {
+		t.Fatalf("result = %#v", got)
+	}
+}
+
+func TestClientGetAccountUsageFallbackRejectsUnsafeWindow(t *testing.T) {
+	_, err := NewClient(nil).GetAccountUsageFallback(t.Context(), "https://example.com", "admin-fixture", 42, time.Now().UTC().AddDate(0, 0, -100))
+	if !errors.Is(err, ErrUsageFallbackWindowExceeded) {
+		t.Fatalf("err = %v, want ErrUsageFallbackWindowExceeded", err)
 	}
 }
 

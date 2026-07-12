@@ -631,6 +631,25 @@ var migrationStatements = []string{
 		primary key(target_id, token_id)
 	)`,
 	`create index if not exists ix_sub2api_sync_mappings_token on sub2api_sync_mappings(token_id)`,
+	`create table if not exists sub2api_usage_snapshots (
+		target_id bigint not null,
+		remote_account_id bigint not null,
+		token_id integer not null,
+		account_cost_usd numeric(20, 10) not null default 0,
+		standard_cost_usd numeric(20, 10) not null default 0,
+		user_cost_usd numeric(20, 10) not null default 0,
+		total_requests bigint not null default 0,
+		total_tokens bigint not null default 0,
+		source_computed_at timestamptz,
+		synced_at timestamptz,
+		status varchar(32) not null default 'pending',
+		error_message text,
+		created_at timestamptz not null default now(),
+		updated_at timestamptz not null default now(),
+		primary key(target_id, remote_account_id)
+	)`,
+	`create index if not exists ix_sub2api_usage_snapshots_token on sub2api_usage_snapshots(token_id)`,
+	`create index if not exists ix_sub2api_usage_snapshots_synced on sub2api_usage_snapshots(target_id, synced_at)`,
 }
 
 var onlineMigrationStatements = []string{
@@ -652,6 +671,7 @@ var onlineMigrationStatements = []string{
 }
 
 var downMigrationStatements = []string{
+	`drop table if exists sub2api_usage_snapshots`,
 	`drop table if exists sub2api_sync_mappings`,
 	`drop table if exists sub2api_sync_runs`,
 	`drop table if exists sub2api_sync_targets`,

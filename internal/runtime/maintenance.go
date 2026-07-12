@@ -130,6 +130,16 @@ func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Log
 		}
 		return err
 	})
+	runStep(ctx, logger, "sub2api usage sync", maxDuration(45*time.Second, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
+		if sub2apiSyncer == nil {
+			return nil
+		}
+		synced, err := sub2apiSyncer.SyncDueUsage(stepCtx)
+		if synced > 0 && logger != nil {
+			logger.Info("sub2api usage snapshots synced", "count", synced)
+		}
+		return err
+	})
 	runStep(ctx, logger, "request log hourly aggregation", maxDuration(30*time.Second, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
 		aggregated, err := db.AggregateRequestHourlyStats(stepCtx)
 		if err == nil && aggregated > 0 && logger != nil {

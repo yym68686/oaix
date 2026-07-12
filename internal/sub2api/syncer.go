@@ -22,8 +22,9 @@ type Syncer struct {
 type SyncMode string
 
 const (
-	SyncModeCheck SyncMode = "check"
-	SyncModeSync  SyncMode = "sync"
+	SyncModeCheck             SyncMode = "check"
+	SyncModeSync              SyncMode = "sync"
+	sub2APIUsageFallbackLimit          = 8
 )
 
 type mappedAccountReconcileResult struct {
@@ -73,6 +74,113 @@ func (s *Syncer) RunDueTargets(ctx context.Context) ([]store.Sub2APISyncRun, err
 		runs = append(runs, run)
 	}
 	return runs, nil
+}
+
+// SyncDueUsage refreshes remote usage snapshots outside request and admin-page paths.
+func (s *Syncer) SyncDueUsage(ctx context.Context) (int, error) {
+	if s == nil || s.Store == nil || s.Client == nil {
+		return 0, nil
+	}
+	targets, err := s.Store.ListSub2APISyncTargets(ctx)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	var syncErrors []error
+	for _, target := range targets {
+		if !target.Enabled {
+			continue
+		}
+		mappings, listErr := s.Store.ListDueSub2APIUsageSyncMappings(ctx, target, 500)
+		if listErr != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("target %d list usage mappings: %w", target.ID, listErr))
+			continue
+		}
+		if len(mappings) == 0 {
+			continue
+		}
+		if distinctErr := store.ValidateDistinctSub2APIRemoteAccounts(mappings); distinctErr != nil {
+			_ = s.Store.MarkSub2APIUsageSyncError(ctx, target.ID, mappings, distinctErr.Error())
+			syncErrors = append(syncErrors, fmt.Errorf("target %d: %w", target.ID, distinctErr))
+			continue
+		}
+
+		accountIDs := make([]int64, 0, len(mappings))
+		for _, mapping := range mappings {
+			accountIDs = append(accountIDs, mapping.RemoteAccountID)
+		}
+		batch, batchErr := s.Client.GetAccountUsageTotalsBatch(ctx, target.BaseURL, target.AdminKey, accountIDs)
+		if batchErr == nil {
+			inputs := make([]store.Sub2APIUsageSnapshotInput, 0, len(mappings))
+			for _, mapping := range mappings {
+				usage := batch.Stats[mapping.RemoteAccountID]
+				if usage == nil {
+					batchErr = fmt.Errorf("usage total missing for remote account %d", mapping.RemoteAccountID)
+					break
+				}
+				inputs = append(inputs, usageSnapshotInput(mapping, usage, batch.ComputedAt))
+			}
+			if batchErr == nil {
+				if saveErr := s.Store.SaveSub2APIUsageSnapshots(ctx, target.ID, inputs); saveErr != nil {
+					syncErrors = append(syncErrors, fmt.Errorf("target %d save usage snapshots: %w", target.ID, saveErr))
+					continue
+				}
+				total += len(inputs)
+				continue
+			}
+		}
+
+		if errors.Is(batchErr, ErrUsageTotalsBatchUnsupported) || errors.Is(batchErr, ErrUsageTotalsBackfillIncomplete) {
+			fallbackMappings := mappings
+			if len(fallbackMappings) > sub2APIUsageFallbackLimit {
+				fallbackMappings = fallbackMappings[:sub2APIUsageFallbackLimit]
+			}
+			for _, mapping := range fallbackMappings {
+				usage, fallbackErr := s.Client.GetAccountUsageFallback(ctx, target.BaseURL, target.AdminKey, mapping.RemoteAccountID, mapping.MappingCreatedAt)
+				if fallbackErr != nil {
+					_ = s.Store.MarkSub2APIUsageSyncError(ctx, target.ID, []store.Sub2APIUsageSyncMapping{mapping}, fallbackErr.Error())
+					syncErrors = append(syncErrors, fmt.Errorf("target %d account %d fallback usage: %w", target.ID, mapping.RemoteAccountID, fallbackErr))
+					continue
+				}
+				input := usageSnapshotInput(mapping, &usage, usage.ComputedAt)
+				if saveErr := s.Store.SaveSub2APIUsageSnapshots(ctx, target.ID, []store.Sub2APIUsageSnapshotInput{input}); saveErr != nil {
+					syncErrors = append(syncErrors, fmt.Errorf("target %d account %d save fallback usage: %w", target.ID, mapping.RemoteAccountID, saveErr))
+					continue
+				}
+				total++
+			}
+			continue
+		}
+
+		message := "unknown sub2api usage sync error"
+		if batchErr != nil {
+			message = batchErr.Error()
+		}
+		_ = s.Store.MarkSub2APIUsageSyncError(ctx, target.ID, mappings, message)
+		syncErrors = append(syncErrors, fmt.Errorf("target %d batch usage: %s", target.ID, message))
+	}
+	return total, errors.Join(syncErrors...)
+}
+
+func usageSnapshotInput(mapping store.Sub2APIUsageSyncMapping, usage *AccountUsageTotal, batchComputedAt time.Time) store.Sub2APIUsageSnapshotInput {
+	computedAt := usage.ComputedAt
+	if computedAt.IsZero() {
+		computedAt = batchComputedAt
+	}
+	if computedAt.IsZero() {
+		computedAt = time.Now().UTC()
+	}
+	computedAt = computedAt.UTC()
+	return store.Sub2APIUsageSnapshotInput{
+		TokenID:          mapping.TokenID,
+		RemoteAccountID:  mapping.RemoteAccountID,
+		AccountCostUSD:   usage.AccountCost,
+		StandardCostUSD:  usage.StandardCost,
+		UserCostUSD:      usage.UserCost,
+		TotalRequests:    usage.TotalRequests,
+		TotalTokens:      usage.TotalTokens,
+		SourceComputedAt: &computedAt,
+	}
 }
 
 func (s *Syncer) CheckTarget(ctx context.Context, targetID int64, trigger string) (store.Sub2APISyncRun, error) {

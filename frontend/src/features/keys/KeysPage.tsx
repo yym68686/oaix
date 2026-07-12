@@ -708,7 +708,13 @@ function TokenRow({
       <TableCell className="px-1.5">
         <div className="flex max-h-11 min-w-0 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
           <TokenConcurrency fallbackCap={activeStreamCap} item={item} />
-          <TokenObservedCost value={item.observed_cost_usd} />
+          <TokenObservedCost
+            value={item.combined_observed_cost_usd ?? item.observed_cost_usd}
+            local={item.local_observed_cost_usd ?? item.observed_cost_usd}
+            remote={item.sub2api_observed_cost_usd}
+            stale={item.sub2api_usage_stale}
+            syncedAt={item.sub2api_usage_synced_at}
+          />
         </div>
       </TableCell>
       <TableCell className="px-1.5">
@@ -1055,7 +1061,13 @@ export function KeyDetailPage({
             <div className="rounded-lg border bg-muted/32 p-3">
               <div className="text-muted-foreground text-xs">已用金额</div>
               <div className="mt-2 text-[11px]">
-                <TokenObservedCost value={token.observed_cost_usd} />
+                <TokenObservedCost
+                  value={token.combined_observed_cost_usd ?? token.observed_cost_usd}
+                  local={token.local_observed_cost_usd ?? token.observed_cost_usd}
+                  remote={token.sub2api_observed_cost_usd}
+                  stale={token.sub2api_usage_stale}
+                  syncedAt={token.sub2api_usage_synced_at}
+                />
               </div>
             </div>
           </div>

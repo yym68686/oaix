@@ -704,8 +704,15 @@ function ImportBatchList({
                 </TableCell>
                 <TableCell>
                   <div className="grid gap-1 text-xs">
-                    <span className="oaix-tabular font-medium">{formatUSDOptional(job.observed_cost_usd)}</span>
-                    <span className="oaix-tabular text-muted-foreground">平均 {formatUSDOptional(job.average_observed_cost_usd)}</span>
+                    <span
+                      className="oaix-tabular font-medium"
+                      title={`OAIX ${formatUSDOptional(job.local_observed_cost_usd ?? job.observed_cost_usd)} + Sub2API ${formatUSDOptional(job.sub2api_observed_cost_usd)}`}
+                    >
+                      {formatUSDOptional(job.combined_observed_cost_usd ?? job.observed_cost_usd)}
+                    </span>
+                    <span className="oaix-tabular text-muted-foreground">
+                      平均 {formatUSDOptional(job.average_combined_observed_cost_usd ?? job.average_observed_cost_usd)}
+                    </span>
                   </div>
                 </TableCell>
                 <TableCell>
@@ -980,7 +987,13 @@ function ImportBatchTokenRow({ token }: { token: TokenItem }) {
       <TableCell className="py-2 align-middle">
         <div className="flex max-h-11 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
           <TokenConcurrency fallbackCap={Number(token.active_stream_cap || 0)} item={token} />
-          <TokenObservedCost value={token.observed_cost_usd} />
+          <TokenObservedCost
+            value={token.combined_observed_cost_usd ?? token.observed_cost_usd}
+            local={token.local_observed_cost_usd ?? token.observed_cost_usd}
+            remote={token.sub2api_observed_cost_usd}
+            stale={token.sub2api_usage_stale}
+            syncedAt={token.sub2api_usage_synced_at}
+          />
         </div>
       </TableCell>
       <TableCell className="py-2 align-middle">

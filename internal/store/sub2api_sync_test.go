@@ -63,3 +63,19 @@ func TestSub2APITokenCandidateQueryCastsRawPayloadToJSONB(t *testing.T) {
 		t.Fatal("sub2api candidate query must not coalesce json raw_payload directly with jsonb")
 	}
 }
+
+func TestValidateDistinctSub2APIRemoteAccounts(t *testing.T) {
+	if err := ValidateDistinctSub2APIRemoteAccounts([]Sub2APIUsageSyncMapping{
+		{TokenID: 1, RemoteAccountID: 10},
+		{TokenID: 1, RemoteAccountID: 10},
+		{TokenID: 2, RemoteAccountID: 11},
+	}); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if err := ValidateDistinctSub2APIRemoteAccounts([]Sub2APIUsageSyncMapping{
+		{TokenID: 1, RemoteAccountID: 10},
+		{TokenID: 2, RemoteAccountID: 10},
+	}); err == nil {
+		t.Fatal("expected duplicate remote account validation error")
+	}
+}

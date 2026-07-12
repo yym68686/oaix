@@ -84,12 +84,22 @@ export type TokenItem = {
   active_streams?: number | null;
   active_stream_cap?: number | null;
   observed_cost_usd?: number | null;
+  local_observed_cost_usd?: number | null;
+  sub2api_observed_cost_usd?: number | null;
+  combined_observed_cost_usd?: number | null;
+  sub2api_usage_synced_at?: string | null;
+  sub2api_usage_stale?: boolean;
   quota?: TokenQuotaSnapshot | null;
 };
 
 export type TokenObservedCostItem = {
   id: number;
   observed_cost_usd?: number | null;
+  local_observed_cost_usd?: number | null;
+  sub2api_observed_cost_usd?: number | null;
+  combined_observed_cost_usd?: number | null;
+  sub2api_usage_synced_at?: string | null;
+  sub2api_usage_stale?: boolean;
 };
 
 export type TokenProbeResponse = {
@@ -146,6 +156,10 @@ export type ImportBatch = {
   token_ids?: number[];
   observed_cost_usd?: number | null;
   average_observed_cost_usd?: number | null;
+  local_observed_cost_usd?: number | null;
+  sub2api_observed_cost_usd?: number | null;
+  combined_observed_cost_usd?: number | null;
+  average_combined_observed_cost_usd?: number | null;
   last_error?: string | null;
   error_message?: string | null;
 };
@@ -304,6 +318,9 @@ export type OwnerUsageSummary = {
   total_tokens?: number;
   estimated_cost_usd?: number;
   observed_cost_usd?: number;
+  local_observed_cost_usd?: number;
+  sub2api_observed_cost_usd?: number;
+  combined_observed_cost_usd?: number;
   success_rate?: number;
   cache_hit_ratio?: number;
 };

@@ -270,13 +270,29 @@ export function TokenConcurrency({ fallbackCap, item }: { fallbackCap: number; i
   );
 }
 
-export function TokenObservedCost({ value }: { value?: number | null }) {
+export function TokenObservedCost({
+  value,
+  local,
+  remote,
+  syncedAt,
+  stale,
+}: {
+  value?: number | null;
+  local?: number | null;
+  remote?: number | null;
+  syncedAt?: string | null;
+  stale?: boolean;
+}) {
   const amount = value === null || value === undefined ? 0 : Number(value);
   if (!Number.isFinite(amount)) {
     return null;
   }
+  const localAmount = Number.isFinite(Number(local)) ? Number(local) : amount;
+  const remoteAmount = Number.isFinite(Number(remote)) ? Number(remote) : 0;
+  const syncLabel = syncedAt ? `，Sub2API 同步于 ${formatDate(syncedAt)}${stale ? "（数据可能延迟）" : ""}` : stale ? "，Sub2API 数据正在同步" : "";
+  const title = `总使用金额 ${formatUSD(amount)}（OAIX ${formatUSD(localAmount)} + Sub2API ${formatUSD(remoteAmount)}）${syncLabel}`;
   return (
-    <div className="inline-flex min-w-[5.6rem] items-center gap-1 rounded-md border bg-muted/32 px-2 py-0.5" title={`已使用金额 ${formatUSD(amount)}`}>
+    <div className="inline-flex min-w-[5.6rem] items-center gap-1 rounded-md border bg-muted/32 px-2 py-0.5" title={title}>
       <span className="text-muted-foreground">已用</span>
       <span className="oaix-tabular font-medium">{formatUSD(amount)}</span>
     </div>

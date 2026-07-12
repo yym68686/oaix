@@ -30,14 +30,18 @@ type ImportJob struct {
 
 type ImportBatchSummary struct {
 	ImportJob
-	TokenCount             int      `json:"token_count"`
-	Available              int      `json:"available"`
-	Cooling                int      `json:"cooling"`
-	Disabled               int      `json:"disabled"`
-	Missing                int      `json:"missing"`
-	TokenIDs               []int64  `json:"token_ids"`
-	ObservedCostUSD        *float64 `json:"observed_cost_usd"`
-	AverageObservedCostUSD *float64 `json:"average_observed_cost_usd,omitempty"`
+	TokenCount                     int      `json:"token_count"`
+	Available                      int      `json:"available"`
+	Cooling                        int      `json:"cooling"`
+	Disabled                       int      `json:"disabled"`
+	Missing                        int      `json:"missing"`
+	TokenIDs                       []int64  `json:"token_ids"`
+	ObservedCostUSD                *float64 `json:"observed_cost_usd"`
+	AverageObservedCostUSD         *float64 `json:"average_observed_cost_usd,omitempty"`
+	LocalObservedCostUSD           *float64 `json:"local_observed_cost_usd"`
+	Sub2APIObservedCostUSD         *float64 `json:"sub2api_observed_cost_usd"`
+	CombinedObservedCostUSD        *float64 `json:"combined_observed_cost_usd"`
+	AverageCombinedObservedCostUSD *float64 `json:"average_combined_observed_cost_usd,omitempty"`
 }
 
 const importSummaryObservedCostTimeout = 2 * time.Second
@@ -609,15 +613,19 @@ func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includ
 	}
 
 	costByTokenID := map[int64]*float64{}
+	remoteUsageByTokenID := map[int64]Sub2APIUsageCost{}
 	observedCostLoaded := false
+	remoteUsageLoaded := false
 	if includeObservedCost && len(tokens) > 0 {
 		costByTokenID, observedCostLoaded = s.importSummaryObservedCosts(ctx, tokens)
+		remoteUsageByTokenID, remoteUsageLoaded = s.importSummarySub2APIUsage(ctx, tokens)
 	}
 
 	now := time.Now()
 	for index := range summaries {
 		present := 0
 		totalCost := 0.0
+		remoteCost := 0.0
 		for _, tokenID := range summaries[index].TokenIDs {
 			token, ok := tokenByID[tokenID]
 			if !ok {
@@ -637,19 +645,49 @@ func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includ
 				if value := costByTokenID[tokenID]; value != nil {
 					totalCost += *value
 				}
+				remoteCost += remoteUsageByTokenID[tokenID].AccountCostUSD
 			}
 		}
 		summaries[index].TokenCount = present
 		if includeObservedCost && observedCostLoaded {
 			observedCost := totalCost
 			summaries[index].ObservedCostUSD = &observedCost
+			summaries[index].LocalObservedCostUSD = &observedCost
 			if present > 0 {
 				average := totalCost / float64(present)
 				summaries[index].AverageObservedCostUSD = &average
 			}
 		}
+		if includeObservedCost && remoteUsageLoaded {
+			remote := remoteCost
+			summaries[index].Sub2APIObservedCostUSD = &remote
+		}
+		if includeObservedCost && observedCostLoaded && remoteUsageLoaded {
+			combined := totalCost + remoteCost
+			summaries[index].CombinedObservedCostUSD = &combined
+			if present > 0 {
+				average := combined / float64(present)
+				summaries[index].AverageCombinedObservedCostUSD = &average
+			}
+		} else if includeObservedCost && observedCostLoaded {
+			combined := totalCost
+			summaries[index].CombinedObservedCostUSD = &combined
+		}
 	}
 	return summaries, nil
+}
+
+func (s *Store) importSummarySub2APIUsage(ctx context.Context, tokens []Token) (map[int64]Sub2APIUsageCost, bool) {
+	if len(tokens) == 0 {
+		return map[int64]Sub2APIUsageCost{}, true
+	}
+	usageCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importSummaryObservedCostTimeout)
+	defer cancel()
+	usage, err := s.Sub2APIUsageByTokens(usageCtx, tokens)
+	if err != nil {
+		return map[int64]Sub2APIUsageCost{}, false
+	}
+	return usage, true
 }
 
 func (s *Store) importSummaryObservedCosts(ctx context.Context, tokens []Token) (map[int64]*float64, bool) {

@@ -17,6 +17,9 @@ import (
 const apiPrefix = "/api/v1"
 
 var ErrAccountNotFound = errors.New("sub2api account not found")
+var ErrUsageTotalsBatchUnsupported = errors.New("sub2api account usage totals batch API is unavailable")
+var ErrUsageTotalsBackfillIncomplete = errors.New("sub2api account usage totals backfill is incomplete")
+var ErrUsageFallbackWindowExceeded = errors.New("sub2api account is older than the safe raw usage fallback window")
 
 type Client struct {
 	HTTPClient *http.Client
@@ -104,6 +107,30 @@ type BatchAccountResult struct {
 	ID      int64  `json:"id"`
 	Success bool   `json:"success"`
 	Error   string `json:"error,omitempty"`
+}
+
+type AccountUsageTotal struct {
+	AccountID     int64     `json:"account_id"`
+	TotalRequests int64     `json:"total_requests"`
+	TotalTokens   int64     `json:"total_tokens"`
+	AccountCost   float64   `json:"account_cost"`
+	StandardCost  float64   `json:"standard_cost"`
+	UserCost      float64   `json:"user_cost"`
+	ComputedAt    time.Time `json:"computed_at"`
+}
+
+type AccountUsageTotalsBatch struct {
+	Stats            map[int64]*AccountUsageTotal `json:"stats"`
+	BackfillComplete bool                         `json:"backfill_complete"`
+	ComputedAt       time.Time                    `json:"computed_at"`
+}
+
+type accountUsageStats struct {
+	TotalRequests    int64   `json:"total_requests"`
+	TotalTokens      int64   `json:"total_tokens"`
+	TotalCost        float64 `json:"total_cost"`
+	TotalActualCost  float64 `json:"total_actual_cost"`
+	TotalAccountCost float64 `json:"total_account_cost"`
 }
 
 func NewClient(httpClient *http.Client) *Client {
@@ -213,6 +240,63 @@ func (c *Client) CreateAccounts(ctx context.Context, baseURL string, adminKey st
 	body := map[string]any{"accounts": accounts}
 	err := c.doJSON(ctx, http.MethodPost, baseURL, adminKey, "/admin/accounts/batch", body, &result)
 	return result, err
+}
+
+func (c *Client) GetAccountUsageTotalsBatch(ctx context.Context, baseURL string, adminKey string, accountIDs []int64) (AccountUsageTotalsBatch, error) {
+	var result AccountUsageTotalsBatch
+	if len(accountIDs) == 0 {
+		result.Stats = map[int64]*AccountUsageTotal{}
+		result.BackfillComplete = true
+		result.ComputedAt = time.Now().UTC()
+		return result, nil
+	}
+	err := c.doJSON(ctx, http.MethodPost, baseURL, adminKey, "/admin/accounts/usage-totals/batch", map[string]any{"account_ids": accountIDs}, &result)
+	if err != nil {
+		var httpErr *HTTPError
+		if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusNotFound || httpErr.StatusCode == http.StatusMethodNotAllowed) {
+			return AccountUsageTotalsBatch{}, ErrUsageTotalsBatchUnsupported
+		}
+		return AccountUsageTotalsBatch{}, err
+	}
+	if !result.BackfillComplete {
+		return result, ErrUsageTotalsBackfillIncomplete
+	}
+	if result.Stats == nil {
+		result.Stats = map[int64]*AccountUsageTotal{}
+	}
+	return result, nil
+}
+
+func (c *Client) GetAccountUsageFallback(ctx context.Context, baseURL string, adminKey string, accountID int64, from time.Time) (AccountUsageTotal, error) {
+	if accountID <= 0 {
+		return AccountUsageTotal{}, fmt.Errorf("sub2api account id is required")
+	}
+	if from.IsZero() {
+		from = time.Now().UTC().AddDate(0, 0, -89)
+	}
+	if from.Before(time.Now().UTC().AddDate(0, 0, -89)) {
+		return AccountUsageTotal{}, ErrUsageFallbackWindowExceeded
+	}
+	values := url.Values{}
+	values.Set("account_id", strconv.FormatInt(accountID, 10))
+	values.Set("start_date", from.UTC().Format("2006-01-02"))
+	values.Set("end_date", time.Now().UTC().Format("2006-01-02"))
+	values.Set("timezone", "UTC")
+	values.Set("nocache", "true")
+	var stats accountUsageStats
+	if err := c.doJSON(ctx, http.MethodGet, baseURL, adminKey, "/admin/usage/stats?"+values.Encode(), nil, &stats); err != nil {
+		return AccountUsageTotal{}, err
+	}
+	now := time.Now().UTC()
+	return AccountUsageTotal{
+		AccountID:     accountID,
+		TotalRequests: stats.TotalRequests,
+		TotalTokens:   stats.TotalTokens,
+		AccountCost:   stats.TotalAccountCost,
+		StandardCost:  stats.TotalCost,
+		UserCost:      stats.TotalActualCost,
+		ComputedAt:    now,
+	}, nil
 }
 
 func (c *Client) ApplyOAuthCredentials(ctx context.Context, baseURL string, adminKey string, accountID int64, credentials map[string]any, extra map[string]any) error {

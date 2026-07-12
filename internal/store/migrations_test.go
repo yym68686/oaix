@@ -95,6 +95,19 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 	}
 }
 
+func TestMigrationAddsSub2APIUsageSnapshots(t *testing.T) {
+	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	for _, fragment := range []string{
+		"create table if not exists sub2api_usage_snapshots",
+		"primary key(target_id, remote_account_id)",
+		"ix_sub2api_usage_snapshots_token",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing sub2api usage snapshot migration fragment %q", fragment)
+		}
+	}
+}
+
 func TestMigrationDropsLegacyHourlyStatsConstraints(t *testing.T) {
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
 	required := []string{

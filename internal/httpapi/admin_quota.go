@@ -42,12 +42,17 @@ const (
 
 type adminTokenItem struct {
 	store.Token
-	Status          string              `json:"status"`
-	ActiveStreams   int64               `json:"active_streams"`
-	ActiveStreamCap int64               `json:"active_stream_cap"`
-	ObservedCostUSD *float64            `json:"observed_cost_usd"`
-	ResetAt         *time.Time          `json:"reset_at,omitempty"`
-	Quota           *codexQuotaSnapshot `json:"quota,omitempty"`
+	Status                  string              `json:"status"`
+	ActiveStreams           int64               `json:"active_streams"`
+	ActiveStreamCap         int64               `json:"active_stream_cap"`
+	ObservedCostUSD         *float64            `json:"observed_cost_usd"`
+	LocalObservedCostUSD    *float64            `json:"local_observed_cost_usd"`
+	Sub2APIObservedCostUSD  *float64            `json:"sub2api_observed_cost_usd"`
+	CombinedObservedCostUSD *float64            `json:"combined_observed_cost_usd"`
+	Sub2APIUsageSyncedAt    *time.Time          `json:"sub2api_usage_synced_at,omitempty"`
+	Sub2APIUsageStale       bool                `json:"sub2api_usage_stale"`
+	ResetAt                 *time.Time          `json:"reset_at,omitempty"`
+	Quota                   *codexQuotaSnapshot `json:"quota,omitempty"`
 }
 
 type codexQuotaWindow struct {
@@ -164,6 +169,8 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 	}
 
 	observedCostByID := map[int64]*float64{}
+	sub2APIUsageByID := map[int64]store.Sub2APIUsageCost{}
+	sub2APIUsageLoaded := true
 	if len(tokens) > 0 {
 		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 		defer cancel()
@@ -177,6 +184,16 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 				a.logger.Warn("admin token observed costs load failed", "error", err)
 			}
 		}
+		usageCtx, usageCancel := context.WithTimeout(parent, 5*time.Second)
+		sub2APIUsageByID, err = a.store.Sub2APIUsageByTokens(usageCtx, tokens)
+		usageCancel()
+		if err != nil {
+			sub2APIUsageByID = map[int64]store.Sub2APIUsageCost{}
+			sub2APIUsageLoaded = false
+			if a.logger != nil {
+				a.logger.Warn("admin token sub2api usage load failed", "error", err)
+			}
+		}
 	}
 
 	activeByID := a.activeStreamsByTokenID(tokens)
@@ -184,6 +201,17 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 	items := make([]adminTokenItem, 0, len(tokens))
 	disabledFromQuota := false
 	for _, token := range tokens {
+		localCost := observedCostByID[token.ID]
+		remoteUsage := sub2APIUsageByID[token.ID]
+		remoteCost := remoteUsage.AccountCostUSD
+		var remoteCostPointer *float64
+		var combinedCost *float64
+		if sub2APIUsageLoaded {
+			remoteCostPointer = &remoteCost
+		}
+		if sub2APIUsageLoaded && localCost != nil {
+			combinedCost = combinedObservedCost(localCost, remoteCost)
+		}
 		quota := quotaByID[token.ID]
 		if quota != nil && quota.PlanType != nil {
 			token.PlanType = quota.PlanType
@@ -195,13 +223,18 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 			token.IsActive = false
 		}
 		items = append(items, adminTokenItem{
-			Token:           token,
-			Status:          adminTokenStatus(token, now),
-			ActiveStreams:   activeByID[token.ID],
-			ActiveStreamCap: cap,
-			ObservedCostUSD: observedCostByID[token.ID],
-			ResetAt:         quotaNextResetAt(quota, now),
-			Quota:           quota,
+			Token:                   token,
+			Status:                  adminTokenStatus(token, now),
+			ActiveStreams:           activeByID[token.ID],
+			ActiveStreamCap:         cap,
+			ObservedCostUSD:         localCost,
+			LocalObservedCostUSD:    localCost,
+			Sub2APIObservedCostUSD:  remoteCostPointer,
+			CombinedObservedCostUSD: combinedCost,
+			Sub2APIUsageSyncedAt:    remoteUsage.SyncedAt,
+			Sub2APIUsageStale:       !sub2APIUsageLoaded || remoteUsage.Stale,
+			ResetAt:                 quotaNextResetAt(quota, now),
+			Quota:                   quota,
 		})
 	}
 	if disabledFromQuota && a.tokens != nil {
@@ -212,6 +245,15 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		}
 	}
 	return items, pendingIDs
+}
+
+func combinedObservedCost(local *float64, remote float64) *float64 {
+	value := remote
+	if local != nil {
+		value += *local
+	}
+	value = math.Round(value*1e10) / 1e10
+	return &value
 }
 
 func quotaNextResetAt(snapshot *codexQuotaSnapshot, now time.Time) *time.Time {

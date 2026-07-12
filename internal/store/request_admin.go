@@ -47,20 +47,23 @@ type RequestUsageSummary struct {
 }
 
 type OwnerUsageSummary struct {
-	OwnerUserID           int64   `json:"owner_user_id"`
-	Hours                 int     `json:"hours"`
-	RequestCount          int64   `json:"request_count"`
-	SuccessCount          int64   `json:"success_count"`
-	FailureCount          int64   `json:"failure_count"`
-	StreamingCount        int64   `json:"streaming_count"`
-	InputTokens           int64   `json:"input_tokens"`
-	CacheWriteInputTokens int64   `json:"cache_write_input_tokens"`
-	CachedInputTokens     int64   `json:"cached_input_tokens"`
-	TotalTokens           int64   `json:"total_tokens"`
-	EstimatedCostUSD      float64 `json:"estimated_cost_usd"`
-	ObservedCostUSD       float64 `json:"observed_cost_usd"`
-	SuccessRate           float64 `json:"success_rate"`
-	CacheHitRatio         float64 `json:"cache_hit_ratio"`
+	OwnerUserID             int64   `json:"owner_user_id"`
+	Hours                   int     `json:"hours"`
+	RequestCount            int64   `json:"request_count"`
+	SuccessCount            int64   `json:"success_count"`
+	FailureCount            int64   `json:"failure_count"`
+	StreamingCount          int64   `json:"streaming_count"`
+	InputTokens             int64   `json:"input_tokens"`
+	CacheWriteInputTokens   int64   `json:"cache_write_input_tokens"`
+	CachedInputTokens       int64   `json:"cached_input_tokens"`
+	TotalTokens             int64   `json:"total_tokens"`
+	EstimatedCostUSD        float64 `json:"estimated_cost_usd"`
+	ObservedCostUSD         float64 `json:"observed_cost_usd"`
+	LocalObservedCostUSD    float64 `json:"local_observed_cost_usd"`
+	Sub2APIObservedCostUSD  float64 `json:"sub2api_observed_cost_usd"`
+	CombinedObservedCostUSD float64 `json:"combined_observed_cost_usd"`
+	SuccessRate             float64 `json:"success_rate"`
+	CacheHitRatio           float64 `json:"cache_hit_ratio"`
 }
 
 type CostAggregate struct {

@@ -311,8 +311,9 @@ func (a *App) platformUserUsage(w http.ResponseWriter, r *http.Request) {
 	counts, _ := a.store.TokenCountsScoped(ctx, store.OwnerResources(userID))
 	usageByOwner, _ := a.store.RequestUsageByTokenOwner(ctx, []int64{userID}, queryInt(r, "hours", 24))
 	observedCostsByOwner, _ := a.store.TokenObservedCostsByOwner(ctx, []int64{userID})
+	sub2APICostsByOwner, _ := a.store.Sub2APIUsageCostsByOwner(ctx, []int64{userID})
 	usage := usageByOwner[userID]
-	usage.ObservedCostUSD = observedCostsByOwner[userID]
+	applyOwnerObservedCosts(&usage, observedCostsByOwner[userID], sub2APICostsByOwner[userID])
 	writeJSON(w, http.StatusOK, map[string]any{"pool": counts, "usage": usage})
 }
 
@@ -368,7 +369,7 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 	for _, user := range users {
 		ownerIDs = append(ownerIDs, user.ID)
 	}
-	poolByOwner, usageByOwner, observedCostsByOwner, err := loadPlatformPoolSummaryData(ctx, a.store, ownerIDs, queryInt(r, "hours", 24), includeUsage)
+	poolByOwner, usageByOwner, _, err := loadPlatformPoolSummaryData(ctx, a.store, ownerIDs, queryInt(r, "hours", 24), includeUsage)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -377,7 +378,6 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 	for _, user := range users {
 		pool := poolByOwner[user.ID]
 		usage := usageByOwner[user.ID]
-		usage.ObservedCostUSD = observedCostsByOwner[user.ID]
 		items = append(items, map[string]any{"user": user, "counts": pool.Counts, "sharing_counts": pool.SharingCounts, "plan_counts": pool.PlanCounts, "usage": usage})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -391,6 +391,7 @@ type platformPoolSummaryStore interface {
 	TokenPoolSummariesByOwner(context.Context, []int64, time.Time) (map[int64]store.OwnerTokenPoolSummary, error)
 	RequestUsageByTokenOwner(context.Context, []int64, int) (map[int64]store.OwnerUsageSummary, error)
 	TokenObservedCostsByOwner(context.Context, []int64) (map[int64]float64, error)
+	Sub2APIUsageCostsByOwner(context.Context, []int64) (map[int64]float64, error)
 }
 
 func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStore, ownerIDs []int64, hours int, includeUsage bool) (
@@ -417,6 +418,7 @@ func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStor
 	var poolByOwner map[int64]store.OwnerTokenPoolSummary
 	var usageByOwner map[int64]store.OwnerUsageSummary
 	var observedCostsByOwner map[int64]float64
+	var sub2APICostsByOwner map[int64]float64
 
 	group.Go(func() error {
 		var err error
@@ -442,10 +444,33 @@ func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStor
 		}
 		return nil
 	})
+	group.Go(func() error {
+		var err error
+		sub2APICostsByOwner, err = db.Sub2APIUsageCostsByOwner(groupCtx, ownerIDs)
+		if err != nil {
+			return fmt.Errorf("load sub2api usage costs by owner: %w", err)
+		}
+		return nil
+	})
 	if err := group.Wait(); err != nil {
 		return nil, nil, nil, err
 	}
+	for _, ownerID := range ownerIDs {
+		usage := usageByOwner[ownerID]
+		applyOwnerObservedCosts(&usage, observedCostsByOwner[ownerID], sub2APICostsByOwner[ownerID])
+		usageByOwner[ownerID] = usage
+	}
 	return poolByOwner, usageByOwner, observedCostsByOwner, nil
+}
+
+func applyOwnerObservedCosts(usage *store.OwnerUsageSummary, local float64, remote float64) {
+	if usage == nil {
+		return
+	}
+	usage.ObservedCostUSD = local
+	usage.LocalObservedCostUSD = local
+	usage.Sub2APIObservedCostUSD = remote
+	usage.CombinedObservedCostUSD = local + remote
 }
 
 func (a *App) writeTokenList(w http.ResponseWriter, r *http.Request, scope store.ResourceScope) {

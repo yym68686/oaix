@@ -818,6 +818,10 @@ function RequestMiniTable({ items }: { items: RequestItem[] }) {
 }
 
 function readObservedCostUSD(usage: OwnerUsageSummary | null | undefined): number {
+  const combined = usage?.combined_observed_cost_usd;
+  if (typeof combined === "number" && Number.isFinite(combined)) {
+    return combined;
+  }
   const observed = usage?.observed_cost_usd;
   if (typeof observed === "number" && Number.isFinite(observed)) {
     return observed;

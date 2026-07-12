@@ -58,8 +58,13 @@ type Token struct {
 }
 
 type TokenObservedCost struct {
-	ID              int64    `json:"id"`
-	ObservedCostUSD *float64 `json:"observed_cost_usd"`
+	ID                      int64      `json:"id"`
+	ObservedCostUSD         *float64   `json:"observed_cost_usd"`
+	LocalObservedCostUSD    *float64   `json:"local_observed_cost_usd"`
+	Sub2APIObservedCostUSD  *float64   `json:"sub2api_observed_cost_usd"`
+	CombinedObservedCostUSD *float64   `json:"combined_observed_cost_usd"`
+	Sub2APIUsageSyncedAt    *time.Time `json:"sub2api_usage_synced_at,omitempty"`
+	Sub2APIUsageStale       bool       `json:"sub2api_usage_stale"`
 }
 
 type TokenCounts struct {

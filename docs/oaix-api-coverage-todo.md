@@ -110,7 +110,8 @@
 现状：
 
 - `GET /admin/tokens/quota?ids=...` 可查询指定 key 的 quota。
-- `GET /admin/tokens/costs?ids=...` 可查询已用金额。
+- `GET /admin/tokens/costs?ids=...` 可查询已用金额；`observed_cost_usd` 保持 OAIX 本地口径，`sub2api_observed_cost_usd` 为已同步到 Sub2API 的账号用量，`combined_observed_cost_usd` 为两者合计。
+- Sub2API 用量由后台限速同步并持久保存最后一次成功快照；远端查询失败不会把已有金额覆盖为 0，`sub2api_usage_synced_at` 和 `sub2api_usage_stale` 用于判断新鲜度。
 - `include_quota=true` 可让 token/detail/import job API 附带额度。
 
 缺口：
