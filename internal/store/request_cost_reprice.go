@@ -201,26 +201,7 @@ const repriceGPT56RequestLogsSQL = `
 		where pricing_model is not null
 	)
 	update gateway_request_logs logs
-	set
-		estimated_cost_usd = expected.estimated_cost_usd::float8,
-		prompt_cache_trace = case
-			when jsonb_typeof(logs.prompt_cache_trace->'billing') = 'object' then
-				jsonb_set(
-					logs.prompt_cache_trace,
-					'{billing}',
-					(logs.prompt_cache_trace->'billing') || jsonb_build_object(
-						'pricing_model', expected.pricing_model,
-						'mode', 'openai_prompt_cache',
-						'input_per_million_usd', expected.input_rate,
-						'cache_write_per_million_usd', expected.cache_write_rate,
-						'cached_input_per_million_usd', expected.cached_rate,
-						'output_per_million_usd', expected.output_rate,
-						'estimated_cost_usd', expected.estimated_cost_usd
-					),
-					false
-				)
-			else logs.prompt_cache_trace
-		end
+	set estimated_cost_usd = expected.estimated_cost_usd::float8
 	from expected
 	where logs.id = expected.id
 	  and abs(logs.estimated_cost_usd::numeric - expected.estimated_cost_usd) > 0.000000005

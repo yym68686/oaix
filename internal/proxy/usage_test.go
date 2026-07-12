@@ -36,6 +36,9 @@ func TestExtractUsageMetricsGPT56PromptCacheBilling(t *testing.T) {
 	if usage.CachedInputTokensSource != "response.usage.input_tokens_details.cached_tokens" {
 		t.Fatalf("cached source = %q", usage.CachedInputTokensSource)
 	}
+	if usage.InputPricePerMillionUSD != 1 || usage.OutputPricePerMillionUSD != 6 || usage.CacheWritePricePerMillionUSD == nil || *usage.CacheWritePricePerMillionUSD != 1.25 {
+		t.Fatalf("unexpected official pricing metadata: %+v", usage)
+	}
 	assertCost(t, usage.EstimatedCostUSD, 0.000138)
 }
 

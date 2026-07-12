@@ -108,21 +108,10 @@ func TestPostgresRepriceGPT56RequestCosts(t *testing.T) {
 	}
 
 	var logCost float64
-	var inputRate float64
-	var outputRate float64
-	if err := db.pool.QueryRow(ctx, `
-		select
-			estimated_cost_usd,
-			(prompt_cache_trace #>> '{billing,input_per_million_usd}')::float8,
-			(prompt_cache_trace #>> '{billing,output_per_million_usd}')::float8
-		from gateway_request_logs
-		where request_id = $1
-	`, gpt56RequestID).Scan(&logCost, &inputRate, &outputRate); err != nil {
+	if err := db.pool.QueryRow(ctx, `select estimated_cost_usd from gateway_request_logs where request_id = $1`, gpt56RequestID).Scan(&logCost); err != nil {
 		t.Fatalf("load repriced request: %v", err)
 	}
 	assertApprox(t, logCost, 0.00069)
-	assertApprox(t, inputRate, 5)
-	assertApprox(t, outputRate, 30)
 
 	var requestCount int64
 	var tokenCost float64
