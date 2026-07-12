@@ -11,12 +11,17 @@ import (
 const (
 	gpt56CostRepriceSettingKey        = "request_costs_gpt56_official_pricing_v2"
 	gpt56CostRepriceFinalizationDelay = 15 * time.Minute
+	gpt56CostRepriceBatchSize         = 20_000
 )
 
+var gpt56IncorrectPricingStartedAt = time.Date(2026, time.July, 9, 0, 0, 0, 0, time.UTC)
+
 type GPT56CostRepriceResult struct {
+	ScannedLogs        int64
 	UpdatedLogs        int64
 	RebuiltTokenCosts  int64
 	RebuiltHourlyCosts int64
+	Phase              string
 	Completed          bool
 }
 
@@ -38,17 +43,22 @@ func (s *Store) RepriceGPT56RequestCosts(ctx context.Context) (GPT56CostRepriceR
 
 	var completed bool
 	var firstSeenAt time.Time
+	var phase string
+	var cursor int64
 	firstRun := false
 	err = tx.QueryRow(ctx, `
 		select
 			coalesce((value->>'completed')::boolean, false),
-			coalesce((value->>'first_seen_at')::timestamptz, now())
+			coalesce((value->>'first_seen_at')::timestamptz, now()),
+			coalesce(nullif(value->>'phase', ''), 'initial'),
+			coalesce((value->>'cursor')::bigint, 0)
 		from gateway_settings
 		where key = $1
 		for update
-	`, gpt56CostRepriceSettingKey).Scan(&completed, &firstSeenAt)
+	`, gpt56CostRepriceSettingKey).Scan(&completed, &firstSeenAt, &phase, &cursor)
 	if errors.Is(err, pgx.ErrNoRows) {
 		firstRun = true
+		phase = "initial"
 		if err := tx.QueryRow(ctx, `select now()`).Scan(&firstSeenAt); err != nil {
 			return result, err
 		}
@@ -56,6 +66,7 @@ func (s *Store) RepriceGPT56RequestCosts(ctx context.Context) (GPT56CostRepriceR
 		return result, err
 	}
 	if completed {
+		result.Phase = "completed"
 		result.Completed = true
 		if err := tx.Commit(ctx); err != nil {
 			return result, err
@@ -67,60 +78,104 @@ func (s *Store) RepriceGPT56RequestCosts(ctx context.Context) (GPT56CostRepriceR
 	if err := tx.QueryRow(ctx, `select now()`).Scan(&databaseNow); err != nil {
 		return result, err
 	}
-	result.Completed = !databaseNow.Before(firstSeenAt.Add(gpt56CostRepriceFinalizationDelay))
-	if !firstRun && !result.Completed {
-		if err := tx.Commit(ctx); err != nil {
-			return result, err
-		}
-		return result, nil
-	}
 
-	var repairSince *time.Time
-	if !firstRun {
-		value := firstSeenAt.Add(-time.Hour)
-		repairSince = &value
-	}
-	tag, err := tx.Exec(ctx, repriceGPT56RequestLogsSQL, repairSince)
-	if err != nil {
-		return result, err
-	}
-	result.UpdatedLogs = tag.RowsAffected()
-
-	if firstRun || result.UpdatedLogs > 0 {
-		tag, err = tx.Exec(ctx, rebuildGPT56TokenCostsSQL)
-		if err != nil {
-			return result, err
-		}
-		result.RebuiltTokenCosts = tag.RowsAffected()
-
-		tag, err = tx.Exec(ctx, rebuildGPT56HourlyCostsSQL)
-		if err != nil {
-			return result, err
-		}
-		result.RebuiltHourlyCosts = tag.RowsAffected()
-	}
-
-	if firstRun || result.UpdatedLogs > 0 || result.Completed {
-		if _, err := tx.Exec(ctx, `
+	saveState := func(completed bool) error {
+		_, err := tx.Exec(ctx, `
 			insert into gateway_settings(key, value, updated_at)
 			values (
 				$1,
 				jsonb_build_object(
 					'completed', $2::boolean,
 					'first_seen_at', $3::timestamptz,
-					'last_repaired_at', now(),
-					'updated_log_count', $4::bigint,
-					'rebuilt_token_count', $5::bigint,
-					'rebuilt_hourly_count', $6::bigint
+					'phase', $4::text,
+					'cursor', $5::bigint,
+					'last_step_at', now(),
+					'scanned_log_count', $6::bigint,
+					'updated_log_count', $7::bigint,
+					'rebuilt_token_count', $8::bigint,
+					'rebuilt_hourly_count', $9::bigint
 				),
 				now()
 			)
 			on conflict (key) do update set
 				value = excluded.value,
 				updated_at = excluded.updated_at
-		`, gpt56CostRepriceSettingKey, result.Completed, firstSeenAt, result.UpdatedLogs, result.RebuiltTokenCosts, result.RebuiltHourlyCosts); err != nil {
+		`, gpt56CostRepriceSettingKey, completed, firstSeenAt, phase, cursor, result.ScannedLogs, result.UpdatedLogs, result.RebuiltTokenCosts, result.RebuiltHourlyCosts)
+		return err
+	}
+
+	result.Phase = phase
+	switch phase {
+	case "initial", "final":
+		scanSince := gpt56IncorrectPricingStartedAt
+		if phase == "final" {
+			scanSince = firstSeenAt.Add(-time.Hour)
+		}
+		var nextCursor int64
+		if err := tx.QueryRow(
+			ctx,
+			repriceGPT56RequestLogsBatchSQL,
+			cursor,
+			scanSince,
+			gpt56CostRepriceBatchSize,
+		).Scan(&nextCursor, &result.ScannedLogs, &result.UpdatedLogs); err != nil {
 			return result, err
 		}
+		if result.ScannedLogs > 0 {
+			cursor = nextCursor
+			if err := saveState(false); err != nil {
+				return result, err
+			}
+			break
+		}
+		if phase == "initial" {
+			if databaseNow.Before(firstSeenAt.Add(gpt56CostRepriceFinalizationDelay)) {
+				if firstRun {
+					if err := saveState(false); err != nil {
+						return result, err
+					}
+				}
+				break
+			}
+			phase = "final"
+			cursor = 0
+			result.Phase = phase
+			if err := saveState(false); err != nil {
+				return result, err
+			}
+			break
+		}
+		phase = "token_rebuild"
+		cursor = 0
+		result.Phase = phase
+		if err := saveState(false); err != nil {
+			return result, err
+		}
+	case "token_rebuild":
+		tag, err := tx.Exec(ctx, rebuildGPT56TokenCostsSQL, gpt56IncorrectPricingStartedAt)
+		if err != nil {
+			return result, err
+		}
+		result.RebuiltTokenCosts = tag.RowsAffected()
+		phase = "hourly_rebuild"
+		result.Phase = phase
+		if err := saveState(false); err != nil {
+			return result, err
+		}
+	case "hourly_rebuild":
+		tag, err := tx.Exec(ctx, rebuildGPT56HourlyCostsSQL, gpt56IncorrectPricingStartedAt)
+		if err != nil {
+			return result, err
+		}
+		result.RebuiltHourlyCosts = tag.RowsAffected()
+		phase = "completed"
+		result.Phase = phase
+		result.Completed = true
+		if err := saveState(true); err != nil {
+			return result, err
+		}
+	default:
+		return result, errors.New("unknown GPT-5.6 request cost reprice phase: " + phase)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -129,25 +184,27 @@ func (s *Store) RepriceGPT56RequestCosts(ctx context.Context) (GPT56CostRepriceR
 	return result, nil
 }
 
-const repriceGPT56RequestLogsSQL = `
-	with candidates as (
+const repriceGPT56RequestLogsBatchSQL = `
+	with candidates as materialized (
 		select
 			id,
 			lower(btrim(coalesce(model_name, model, ''))) as normalized_model,
 			coalesce(input_tokens, 0)::numeric as input_tokens,
 			coalesce(cache_write_input_tokens, 0)::numeric as cache_write_input_tokens,
 			coalesce(cached_input_tokens, 0)::numeric as cached_input_tokens,
-			coalesce(output_tokens, 0)::numeric as output_tokens
+			coalesce(output_tokens, 0)::numeric as output_tokens,
+			estimated_cost_usd::numeric as previous_cost_usd
 		from gateway_request_logs
-		where finished_at is not null
+		where id > $1::bigint
+		  and started_at >= $2::timestamptz
+		  and finished_at is not null
 		  and estimated_cost_usd is not null
-		  and ($1::timestamptz is null or started_at >= $1::timestamptz)
 		  and (
-			lower(btrim(coalesce(model_name, model, ''))) in ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna')
-			or lower(btrim(coalesce(model_name, model, ''))) like 'gpt-5.6-sol-%'
-			or lower(btrim(coalesce(model_name, model, ''))) like 'gpt-5.6-terra-%'
-			or lower(btrim(coalesce(model_name, model, ''))) like 'gpt-5.6-luna-%'
+			(model_name >= 'gpt-5.6-' and model_name < 'gpt-5.7')
+			or (model_name is null and model >= 'gpt-5.6-' and model < 'gpt-5.7')
 		  )
+		order by id
+		limit $3::integer
 	),
 	priced as (
 		select
@@ -156,6 +213,7 @@ const repriceGPT56RequestLogsSQL = `
 			cache_write_input_tokens,
 			cached_input_tokens,
 			output_tokens,
+			previous_cost_usd,
 			case
 				when normalized_model = 'gpt-5.6-sol' or normalized_model like 'gpt-5.6-sol-%' then 'gpt-5.6-sol'
 				when normalized_model = 'gpt-5.6-terra' or normalized_model like 'gpt-5.6-terra-%' then 'gpt-5.6-terra'
@@ -191,6 +249,7 @@ const repriceGPT56RequestLogsSQL = `
 			cache_write_rate,
 			cached_rate,
 			output_rate,
+			previous_cost_usd,
 			round((
 				greatest(input_tokens - cache_write_input_tokens - cached_input_tokens, 0) * input_rate
 				+ cache_write_input_tokens * cache_write_rate
@@ -199,24 +258,30 @@ const repriceGPT56RequestLogsSQL = `
 			) / 1000000.0, 8) as estimated_cost_usd
 		from priced
 		where pricing_model is not null
+	),
+	updated as (
+		update gateway_request_logs logs
+		set estimated_cost_usd = expected.estimated_cost_usd::float8
+		from expected
+		where logs.id = expected.id
+		  and abs(expected.previous_cost_usd - expected.estimated_cost_usd) > 0.000000005
+		returning logs.id
 	)
-	update gateway_request_logs logs
-	set estimated_cost_usd = expected.estimated_cost_usd::float8
-	from expected
-	where logs.id = expected.id
-	  and abs(logs.estimated_cost_usd::numeric - expected.estimated_cost_usd) > 0.000000005
+	select
+		coalesce((select max(id) from candidates), $1::bigint) as next_cursor,
+		(select count(*)::bigint from candidates) as scanned_logs,
+		(select count(*)::bigint from updated) as updated_logs
 `
 
 const rebuildGPT56TokenCostsSQL = `
 	with affected_tokens as (
 		select distinct token_id
 		from gateway_request_logs
-		where token_id is not null
+		where started_at >= $1::timestamptz
+		  and token_id is not null
 		  and (
-			lower(btrim(coalesce(model_name, model, ''))) in ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna')
-			or lower(btrim(coalesce(model_name, model, ''))) like 'gpt-5.6-sol-%'
-			or lower(btrim(coalesce(model_name, model, ''))) like 'gpt-5.6-terra-%'
-			or lower(btrim(coalesce(model_name, model, ''))) like 'gpt-5.6-luna-%'
+			(model_name >= 'gpt-5.6-' and model_name < 'gpt-5.7')
+			or (model_name is null and model >= 'gpt-5.6-' and model < 'gpt-5.7')
 		  )
 	),
 	exact as (
@@ -249,14 +314,13 @@ const rebuildGPT56HourlyCostsSQL = `
 			coalesce(model_name, model, '') as model_name,
 			coalesce(sum(estimated_cost_usd), 0)::float8 as estimated_cost_usd
 		from gateway_request_logs
-		where analytics_recorded_at is not null
+		where started_at >= $1::timestamptz
+		  and analytics_recorded_at is not null
 		  and owner_user_id is not null
 		  and estimated_cost_usd is not null
 		  and (
-			lower(btrim(coalesce(model_name, model, ''))) in ('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna')
-			or lower(btrim(coalesce(model_name, model, ''))) like 'gpt-5.6-sol-%'
-			or lower(btrim(coalesce(model_name, model, ''))) like 'gpt-5.6-terra-%'
-			or lower(btrim(coalesce(model_name, model, ''))) like 'gpt-5.6-luna-%'
+			(model_name >= 'gpt-5.6-' and model_name < 'gpt-5.7')
+			or (model_name is null and model >= 'gpt-5.6-' and model < 'gpt-5.7')
 		  )
 		group by owner_user_id, date_trunc('hour', started_at), coalesce(model_name, model, '')
 	)

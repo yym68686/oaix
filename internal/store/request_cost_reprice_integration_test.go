@@ -103,7 +103,7 @@ func TestPostgresRepriceGPT56RequestCosts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RepriceGPT56RequestCosts returned error: %v", err)
 	}
-	if result.UpdatedLogs != 1 || result.RebuiltTokenCosts < 1 || result.RebuiltHourlyCosts != 1 || result.Completed {
+	if result.Phase != "initial" || result.ScannedLogs != 1 || result.UpdatedLogs != 1 || result.RebuiltTokenCosts != 0 || result.RebuiltHourlyCosts != 0 || result.Completed {
 		t.Fatalf("unexpected initial reprice result: %+v", result)
 	}
 
@@ -112,30 +112,6 @@ func TestPostgresRepriceGPT56RequestCosts(t *testing.T) {
 		t.Fatalf("load repriced request: %v", err)
 	}
 	assertApprox(t, logCost, 0.00069)
-
-	var requestCount int64
-	var tokenCost float64
-	if err := db.pool.QueryRow(ctx, `
-		select request_count, estimated_cost_usd
-		from gateway_request_token_costs
-		where token_id = $1
-	`, tokenID).Scan(&requestCount, &tokenCost); err != nil {
-		t.Fatalf("load rebuilt token cost: %v", err)
-	}
-	if requestCount != 2 {
-		t.Fatalf("request count = %d, want 2", requestCount)
-	}
-	assertApprox(t, tokenCost, 1.25069)
-
-	var hourlyCost float64
-	if err := db.pool.QueryRow(ctx, `
-		select estimated_cost_usd
-		from gateway_request_hourly_stats
-		where owner_user_id = $1 and bucket_start = $2 and model_name = $3
-	`, ownerUserID, bucketStart, gpt56Model).Scan(&hourlyCost); err != nil {
-		t.Fatalf("load rebuilt hourly cost: %v", err)
-	}
-	assertApprox(t, hourlyCost, 0.00069)
 
 	lateStartedAt := time.Now().UTC()
 	lateBucketStart := lateStartedAt.Truncate(time.Hour)
@@ -172,15 +148,47 @@ func TestPostgresRepriceGPT56RequestCosts(t *testing.T) {
 	}
 	result, err = db.RepriceGPT56RequestCosts(ctx)
 	if err != nil {
-		t.Fatalf("final RepriceGPT56RequestCosts returned error: %v", err)
+		t.Fatalf("late RepriceGPT56RequestCosts returned error: %v", err)
 	}
-	if !result.Completed || result.UpdatedLogs != 1 || result.RebuiltTokenCosts < 1 || result.RebuiltHourlyCosts < 1 {
-		t.Fatalf("unexpected final reprice result: %+v", result)
+	if result.Phase != "initial" || result.ScannedLogs != 1 || result.UpdatedLogs != 1 || result.Completed {
+		t.Fatalf("unexpected late reprice result: %+v", result)
 	}
 	if err := db.pool.QueryRow(ctx, `select estimated_cost_usd from gateway_request_logs where request_id = $1`, lateGPT56RequestID).Scan(&logCost); err != nil {
 		t.Fatalf("load late repriced request: %v", err)
 	}
 	assertApprox(t, logCost, 0.00069)
+
+	result, err = db.RepriceGPT56RequestCosts(ctx)
+	if err != nil {
+		t.Fatalf("initial phase completion returned error: %v", err)
+	}
+	if result.Phase != "final" || result.ScannedLogs != 0 || result.Completed {
+		t.Fatalf("unexpected initial phase completion: %+v", result)
+	}
+	result, err = db.RepriceGPT56RequestCosts(ctx)
+	if err != nil {
+		t.Fatalf("final scan returned error: %v", err)
+	}
+	if result.Phase != "final" || result.ScannedLogs < 1 || result.UpdatedLogs != 0 || result.Completed {
+		t.Fatalf("unexpected final scan result: %+v", result)
+	}
+	result, err = db.RepriceGPT56RequestCosts(ctx)
+	if err != nil {
+		t.Fatalf("final phase completion returned error: %v", err)
+	}
+	if result.Phase != "token_rebuild" || result.ScannedLogs != 0 || result.Completed {
+		t.Fatalf("unexpected final phase completion: %+v", result)
+	}
+	result, err = db.RepriceGPT56RequestCosts(ctx)
+	if err != nil {
+		t.Fatalf("token cost rebuild returned error: %v", err)
+	}
+	if result.Phase != "hourly_rebuild" || result.RebuiltTokenCosts < 1 || result.Completed {
+		t.Fatalf("unexpected token rebuild result: %+v", result)
+	}
+
+	var requestCount int64
+	var tokenCost float64
 	if err := db.pool.QueryRow(ctx, `select request_count, estimated_cost_usd from gateway_request_token_costs where token_id = $1`, tokenID).Scan(&requestCount, &tokenCost); err != nil {
 		t.Fatalf("load final rebuilt token cost: %v", err)
 	}
@@ -191,9 +199,26 @@ func TestPostgresRepriceGPT56RequestCosts(t *testing.T) {
 
 	result, err = db.RepriceGPT56RequestCosts(ctx)
 	if err != nil {
+		t.Fatalf("hourly cost rebuild returned error: %v", err)
+	}
+	if result.Phase != "completed" || !result.Completed || result.RebuiltHourlyCosts < 1 {
+		t.Fatalf("unexpected hourly rebuild result: %+v", result)
+	}
+	var hourlyCost float64
+	if err := db.pool.QueryRow(ctx, `
+		select estimated_cost_usd
+		from gateway_request_hourly_stats
+		where owner_user_id = $1 and bucket_start = $2 and model_name = $3
+	`, ownerUserID, bucketStart, gpt56Model).Scan(&hourlyCost); err != nil {
+		t.Fatalf("load rebuilt hourly cost: %v", err)
+	}
+	assertApprox(t, hourlyCost, 0.00069)
+
+	result, err = db.RepriceGPT56RequestCosts(ctx)
+	if err != nil {
 		t.Fatalf("completed RepriceGPT56RequestCosts returned error: %v", err)
 	}
-	if !result.Completed || result.UpdatedLogs != 0 || result.RebuiltTokenCosts != 0 || result.RebuiltHourlyCosts != 0 {
+	if result.Phase != "completed" || !result.Completed || result.ScannedLogs != 0 || result.UpdatedLogs != 0 || result.RebuiltTokenCosts != 0 || result.RebuiltHourlyCosts != 0 {
 		t.Fatalf("completed reprice was not idempotent: %+v", result)
 	}
 }

@@ -119,9 +119,11 @@ func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Log
 	})
 	runStep(ctx, logger, "GPT-5.6 request cost repricing", maxDuration(2*time.Minute, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
 		result, err := db.RepriceGPT56RequestCosts(stepCtx)
-		if err == nil && (result.UpdatedLogs > 0 || result.RebuiltTokenCosts > 0 || result.RebuiltHourlyCosts > 0) && logger != nil {
+		if err == nil && (result.ScannedLogs > 0 || result.RebuiltTokenCosts > 0 || result.RebuiltHourlyCosts > 0) && logger != nil {
 			logger.Info(
 				"GPT-5.6 request costs repriced",
+				"phase", result.Phase,
+				"scanned_logs", result.ScannedLogs,
 				"updated_logs", result.UpdatedLogs,
 				"rebuilt_token_costs", result.RebuiltTokenCosts,
 				"rebuilt_hourly_costs", result.RebuiltHourlyCosts,
