@@ -2,8 +2,12 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var migrationStatements = []string{
@@ -733,6 +737,29 @@ func (s *Store) Migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// MigrateForStartup keeps ordinary gateway restarts off the DDL path. The
+// explicit oaix-migrate command continues to call Migrate so operators can
+// intentionally replay idempotent schema and online-index repairs.
+func (s *Store) MigrateForStartup(ctx context.Context) error {
+	var version int
+	err := s.pool.QueryRow(ctx, `select version from schema_migrations where name = 'oaix_go'`).Scan(&version)
+	if err == nil {
+		if version >= SchemaVersion {
+			return nil
+		}
+		return s.Migrate(ctx)
+	}
+	if errors.Is(err, pgx.ErrNoRows) || isUndefinedTableError(err) {
+		return s.Migrate(ctx)
+	}
+	return fmt.Errorf("read startup schema version: %w", err)
+}
+
+func isUndefinedTableError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
 }
 
 func (s *Store) MigrateDown(ctx context.Context) error {

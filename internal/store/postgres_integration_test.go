@@ -10,6 +10,35 @@ import (
 	"github.com/yym68686/oaix/internal/config"
 )
 
+func TestPostgresStartupMigrationBootstrapsSchema(t *testing.T) {
+	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set OAIX_TEST_DATABASE_URL to run Postgres integration fixture")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := Connect(ctx, config.DatabaseConfig{
+		URL:            configURL(dsn),
+		MaxConns:       4,
+		MinConns:       1,
+		ConnectTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Connect returned error: %v", err)
+	}
+	defer db.Close()
+	if err := db.MigrateForStartup(ctx); err != nil {
+		t.Fatalf("MigrateForStartup returned error: %v", err)
+	}
+	health, err := db.CheckSchema(ctx)
+	if err != nil {
+		t.Fatalf("CheckSchema returned error: %v", err)
+	}
+	if !health.OK || health.SchemaVersion != SchemaVersion {
+		t.Fatalf("unexpected schema health: %+v", health)
+	}
+}
+
 func TestPostgresIntegrationFixture(t *testing.T) {
 	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -32,6 +61,43 @@ func TestPostgresIntegrationFixture(t *testing.T) {
 	}
 	if _, err := db.TokenCounts(ctx); err != nil {
 		t.Fatalf("TokenCounts returned error: %v", err)
+	}
+}
+
+func TestPostgresStartupMigrationSkipsDDLWhenSchemaIsCurrent(t *testing.T) {
+	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set OAIX_TEST_DATABASE_URL to run Postgres integration fixture")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := Connect(ctx, config.DatabaseConfig{
+		URL:            configURL(dsn),
+		MaxConns:       4,
+		MinConns:       1,
+		ConnectTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Connect returned error: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+
+	lockTx, err := db.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock transaction: %v", err)
+	}
+	defer lockTx.Rollback(context.Background())
+	if _, err := lockTx.Exec(ctx, `lock table gateway_request_logs in access exclusive mode`); err != nil {
+		t.Fatalf("lock gateway_request_logs: %v", err)
+	}
+
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), time.Second)
+	defer startupCancel()
+	if err := db.MigrateForStartup(startupCtx); err != nil {
+		t.Fatalf("MigrateForStartup replayed DDL for current schema: %v", err)
 	}
 }
 

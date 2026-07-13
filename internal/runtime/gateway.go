@@ -33,7 +33,7 @@ func RunGateway(ctx context.Context) error {
 	defer db.Close()
 	if cfg.Database.AutoMigrate {
 		logger.Info("running startup database migration")
-		if err := db.Migrate(ctx); err != nil {
+		if err := db.MigrateForStartup(ctx); err != nil {
 			return err
 		}
 	}
