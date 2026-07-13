@@ -33,8 +33,8 @@ type Snapshot struct {
 
 type RuntimeToken struct {
 	Token        store.Token
-	Active       atomic.Int64
-	RecentTTFTMs atomic.Int64
+	Active       *atomic.Int64
+	RecentTTFTMs *atomic.Int64
 }
 
 type ReadyTransitionHandler func(ctx context.Context, tokens []store.Token)
@@ -893,11 +893,21 @@ func buildSnapshot(rows []store.Token, current *Snapshot, version int64) *Snapsh
 	nextCooling := make(map[int64]time.Time)
 	ready := make([]*RuntimeToken, 0, len(rows))
 	for _, token := range rows {
-		runtimeToken := current.ByID[token.ID]
-		if runtimeToken == nil {
-			runtimeToken = &RuntimeToken{}
+		active := new(atomic.Int64)
+		recentTTFTMs := new(atomic.Int64)
+		if currentToken := current.ByID[token.ID]; currentToken != nil {
+			if currentToken.Active != nil {
+				active = currentToken.Active
+			}
+			if currentToken.RecentTTFTMs != nil {
+				recentTTFTMs = currentToken.RecentTTFTMs
+			}
 		}
-		runtimeToken.Token = token
+		runtimeToken := &RuntimeToken{
+			Token:        token,
+			Active:       active,
+			RecentTTFTMs: recentTTFTMs,
+		}
 		nextByID[token.ID] = runtimeToken
 		nextByScope["default"] = append(nextByScope["default"], runtimeToken)
 		nextByModel["*"] = append(nextByModel["*"], runtimeToken)

@@ -261,6 +261,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			ExcludeOwnerUserID: intent.ExcludeOwnerUserID,
 			TargetTokenID:      intent.TargetTokenID,
 			ExcludeTokenIDs:    excluded,
+			RequireNonFree:     requiresNonFreeTokenPlan(intent.Model),
 		}
 		if promptCacheContext != nil {
 			tokenIntent.PromptCacheKeyHash = promptCacheContext.PromptCacheKeyHash
@@ -499,6 +500,11 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	}
 	writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, finalStatus, message)
 	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+}
+
+func requiresNonFreeTokenPlan(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	return normalized == "gpt-5.6-sol" || strings.HasPrefix(normalized, "gpt-5.6-sol-")
 }
 
 func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {

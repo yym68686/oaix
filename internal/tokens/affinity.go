@@ -273,6 +273,9 @@ func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 	if intent.TargetTokenID > 0 && candidate.Token.ID != intent.TargetTokenID {
 		return false
 	}
+	if intent.RequireNonFree && candidate.Token.PlanType != nil && strings.EqualFold(strings.TrimSpace(*candidate.Token.PlanType), "free") {
+		return false
+	}
 	if isMarketplaceSelection(intent.SelectionMode) {
 		if intent.ExcludeOwnerUserID > 0 && candidate.Token.OwnerUserID == intent.ExcludeOwnerUserID {
 			return false
@@ -285,9 +288,6 @@ func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 		}
 		return false
 	} else if intent.OwnerUserID > 0 && candidate.Token.OwnerUserID != intent.OwnerUserID {
-		return false
-	}
-	if intent.RequireNonFree && candidate.Token.PlanType != nil && *candidate.Token.PlanType == "free" {
 		return false
 	}
 	return true

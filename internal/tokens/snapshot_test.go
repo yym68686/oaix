@@ -469,3 +469,37 @@ func makeTokens(count int) []store.Token {
 	}
 	return tokens
 }
+
+func TestBuildSnapshotKeepsPublishedTokenMetadataImmutable(t *testing.T) {
+	free := "free"
+	pro := "pro"
+	rows := makeTokens(1)
+	rows[0].AccessToken = "old-access"
+	rows[0].PlanType = &free
+	current := buildSnapshot(rows, emptySnapshot(), 1)
+	currentToken := current.ByID[1]
+	currentToken.Active.Store(2)
+	currentToken.RecentTTFTMs.Store(150)
+
+	refreshedRows := makeTokens(1)
+	refreshedRows[0].AccessToken = "new-access"
+	refreshedRows[0].PlanType = &pro
+	next := buildSnapshot(refreshedRows, current, 2)
+	nextToken := next.ByID[1]
+
+	if currentToken == nextToken {
+		t.Fatal("snapshot refresh reused mutable runtime token metadata")
+	}
+	if currentToken.Token.AccessToken != "old-access" || currentToken.Token.PlanType == nil || *currentToken.Token.PlanType != "free" {
+		t.Fatalf("published snapshot metadata changed: %+v", currentToken.Token)
+	}
+	if nextToken.Token.AccessToken != "new-access" || nextToken.Token.PlanType == nil || *nextToken.Token.PlanType != "pro" {
+		t.Fatalf("refreshed snapshot metadata not applied: %+v", nextToken.Token)
+	}
+	if nextToken.Active != currentToken.Active || nextToken.Active.Load() != 2 {
+		t.Fatalf("active counter was not shared across refresh: current=%p next=%p value=%d", currentToken.Active, nextToken.Active, nextToken.Active.Load())
+	}
+	if nextToken.RecentTTFTMs != currentToken.RecentTTFTMs || nextToken.RecentTTFTMs.Load() != 150 {
+		t.Fatalf("latency counter was not shared across refresh: current=%p next=%p value=%d", currentToken.RecentTTFTMs, nextToken.RecentTTFTMs, nextToken.RecentTTFTMs.Load())
+	}
+}

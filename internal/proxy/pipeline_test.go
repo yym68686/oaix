@@ -52,6 +52,27 @@ func TestClassifyUpstreamFailures(t *testing.T) {
 	}
 }
 
+func TestRequiresNonFreeTokenPlan(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{model: "gpt-5.6-sol", want: true},
+		{model: " GPT-5.6-SOL ", want: true},
+		{model: "gpt-5.6-sol-2026-07-01", want: true},
+		{model: "gpt-5.6-terra", want: false},
+		{model: "gpt-5.5", want: false},
+		{model: "gpt-5.6-solar", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			if got := requiresNonFreeTokenPlan(tt.model); got != tt.want {
+				t.Fatalf("requiresNonFreeTokenPlan(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsDeactivatedWorkspaceFailure(t *testing.T) {
 	if !isDeactivatedWorkspaceFailure(http.StatusPaymentRequired, []byte(`{"error":{"code":"deactivated_workspace"}}`), nil) {
 		t.Fatal("expected deactivated workspace body to be terminal")
@@ -1155,6 +1176,103 @@ func TestProxyNonRetryableUpstream4xxDoesNotCooldownToken(t *testing.T) {
 	case until := <-fakes.tokenErrorCh:
 		t.Fatalf("unexpected token cooldown commit: %v", until)
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestProxyGpt56SolExcludesFreeTokensBeforeSelection(t *testing.T) {
+	tests := []struct {
+		name          string
+		selectionMode string
+		ownerUserID   int64
+	}{
+		{name: "default"},
+		{name: "marketplace priced", selectionMode: "marketplace-priced", ownerUserID: 10},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamAuthorization string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamAuthorization = r.Header.Get("Authorization")
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, strings.Join([]string{
+					`event: response.completed`,
+					`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}`,
+					``,
+				}, "\n"))
+			}))
+			defer upstream.Close()
+
+			cfg := config.Config{
+				Upstream: config.UpstreamConfig{
+					ResponsesURL:              upstream.URL,
+					MaxRetries:                1,
+					NonStreamMaxResponseBytes: 1 << 20,
+					DisableCompression:        true,
+				},
+				TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+				RequestLog: config.RequestLogConfig{
+					QueueMaxSize: 10,
+					BatchSize:    1,
+					Concurrency:  1,
+				},
+			}
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			pro := "pro"
+			free := "free"
+			proPrice := 250
+			freePrice := 100
+			now := time.Now().UTC()
+			fakes := &fakeProxyStore{tokens: []store.Token{
+				{
+					ID:                  1,
+					OwnerUserID:         10,
+					AccessToken:         "pro-token",
+					PlanType:            &pro,
+					IsActive:            true,
+					ShareEnabled:        true,
+					ShareStatus:         "active",
+					MarketplacePriceBPS: &proPrice,
+					CreatedAt:           now,
+					UpdatedAt:           now,
+				},
+				{
+					ID:                  2,
+					OwnerUserID:         20,
+					AccessToken:         "free-token",
+					PlanType:            &free,
+					IsActive:            true,
+					ShareEnabled:        true,
+					ShareStatus:         "active",
+					MarketplacePriceBPS: &freePrice,
+					CreatedAt:           now,
+					UpdatedAt:           now,
+				},
+			}}
+			manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+			if err := manager.Refresh(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			client := transport.New(cfg.Upstream)
+			defer client.CloseIdleConnections()
+			writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+			pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			pipeline.Proxy(recorder, req, RequestIntent{
+				Endpoint:      "/v1/responses",
+				SelectionMode: tt.selectionMode,
+				OwnerUserID:   tt.ownerUserID,
+			})
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if upstreamAuthorization != "Bearer pro-token" {
+				t.Fatalf("upstream authorization = %q, want pro token", upstreamAuthorization)
+			}
+		})
 	}
 }
 

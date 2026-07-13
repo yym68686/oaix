@@ -97,6 +97,34 @@ func TestClaimPromptAffinityPreviousOwnerStrictWhenBusy(t *testing.T) {
 	}
 }
 
+func TestClaimPromptAffinitySkipsFreePrimaryWhenNonFreeRequired(t *testing.T) {
+	free := "free"
+	pro := "pro"
+	rows := makeTokens(2)
+	rows[0].PlanType = &free
+	rows[1].PlanType = &pro
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := affinity.NewMemoryStore()
+	store.Put("cache-family-non-free", affinity.Lane{PrimaryTokenID: 1}, time.Hour)
+
+	claim, result, err := manager.ClaimPromptAffinity(context.Background(), store, Intent{RequireNonFree: true}, PromptAffinityOptions{
+		AffinityKey:           "cache-family-non-free",
+		MaxLanesPerKey:        3,
+		GlobalFallbackEnabled: true,
+		LaneTTL:               time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer claim.Release()
+	if claim.TokenID() != 2 || result.Result == "primary_hit" {
+		t.Fatalf("selected token=%d result=%+v, want non-free token 2 outside free primary", claim.TokenID(), result)
+	}
+}
+
 func TestMarketplacePriceAffinityLocksInitialExecutionPrice(t *testing.T) {
 	lowPrice := 50
 	highPrice := 250
