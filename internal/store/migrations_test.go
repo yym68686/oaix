@@ -113,6 +113,21 @@ func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
 	}
 }
 
+func TestStartupMigrationDoesNotBuildStreamDeliveryIndexes(t *testing.T) {
+	// Migrate runs synchronously before the gateway starts listening. Even a
+	// concurrent partial index must scan the existing request-log heap, so these
+	// optional diagnostic indexes must not be introduced on that path.
+	joinedOnline := strings.ToLower(strings.Join(onlineMigrationStatements, "\n"))
+	for _, indexName := range []string{
+		"ix_gateway_request_logs_delivery_state_started",
+		"ix_gateway_request_logs_downstream_connection_started",
+	} {
+		if strings.Contains(joinedOnline, indexName) {
+			t.Fatalf("startup migrations must not build large stream-delivery index %q", indexName)
+		}
+	}
+}
+
 func TestMigrationAddsSub2APIUsageSnapshots(t *testing.T) {
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
 	for _, fragment := range []string{

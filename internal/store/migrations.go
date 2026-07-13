@@ -674,8 +674,8 @@ var onlineMigrationStatements = []string{
 	`create index concurrently if not exists ix_gateway_request_attempts_token_started on gateway_request_attempts(token_id, started_at desc) where token_id is not null`,
 	`create index concurrently if not exists ix_gateway_request_attempts_owner_started on gateway_request_attempts(owner_user_id, started_at desc)`,
 	`create index concurrently if not exists ix_gateway_request_attempts_outcome_started on gateway_request_attempts(outcome, started_at desc)`,
-	`create index concurrently if not exists ix_gateway_request_logs_delivery_state_started on gateway_request_logs(stream_delivery_state, started_at desc) where stream_delivery_state is not null`,
-	`create index concurrently if not exists ix_gateway_request_logs_downstream_connection_started on gateway_request_logs(downstream_connection_id, started_at desc) where downstream_connection_id is not null`,
+	// Do not add the optional stream-delivery indexes here. Migrate runs before
+	// readiness, and concurrent partial indexes still scan the complete log heap.
 	`create index concurrently if not exists ix_token_state_events_request_attempt on token_state_events(request_id, gateway_request_attempt_id) where request_id is not null`,
 	`create index concurrently if not exists ix_token_import_items_existing_token on token_import_items(matched_existing_token_id) where matched_existing_token_id is not null`,
 }
