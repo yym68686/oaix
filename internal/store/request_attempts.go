@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -10,34 +11,35 @@ import (
 )
 
 type GatewayRequestAttempt struct {
-	ID                  int64      `json:"id"`
-	RequestID           string     `json:"request_id"`
-	GatewayRequestLogID *int64     `json:"gateway_request_log_id,omitempty"`
-	AttemptIndex        int        `json:"attempt_index"`
-	OwnerUserID         int64      `json:"owner_user_id"`
-	SelectionMode       *string    `json:"selection_mode,omitempty"`
-	CallerOwnerUserID   *int64     `json:"caller_owner_user_id,omitempty"`
-	ExcludeOwnerUserID  *int64     `json:"exclude_owner_user_id,omitempty"`
-	TokenID             *int64     `json:"token_id,omitempty"`
-	TokenOwnerUserID    *int64     `json:"token_owner_user_id,omitempty"`
-	Endpoint            string     `json:"endpoint,omitempty"`
-	Model               *string    `json:"model,omitempty"`
-	StartedAt           time.Time  `json:"started_at"`
-	FinishedAt          *time.Time `json:"finished_at,omitempty"`
-	DurationMs          *int       `json:"duration_ms,omitempty"`
-	StatusCode          *int       `json:"status_code,omitempty"`
-	Success             *bool      `json:"success,omitempty"`
-	Retry               *bool      `json:"retry,omitempty"`
-	Outcome             string     `json:"outcome,omitempty"`
-	Deactivated         bool       `json:"deactivated"`
-	CooldownUntil       *time.Time `json:"cooldown_until,omitempty"`
-	ErrorCode           *string    `json:"error_code,omitempty"`
-	ErrorMessageExcerpt *string    `json:"error_message_excerpt,omitempty"`
-	ErrorBodyHash       *string    `json:"error_body_hash,omitempty"`
-	ClaimID             *int64     `json:"claim_id,omitempty"`
-	CandidateCount      *int       `json:"candidate_count,omitempty"`
-	ReadyTokens         *int       `json:"ready_tokens,omitempty"`
-	SnapshotVersion     *int64     `json:"snapshot_version,omitempty"`
+	ID                  int64                `json:"id"`
+	RequestID           string               `json:"request_id"`
+	GatewayRequestLogID *int64               `json:"gateway_request_log_id,omitempty"`
+	AttemptIndex        int                  `json:"attempt_index"`
+	OwnerUserID         int64                `json:"owner_user_id"`
+	SelectionMode       *string              `json:"selection_mode,omitempty"`
+	CallerOwnerUserID   *int64               `json:"caller_owner_user_id,omitempty"`
+	ExcludeOwnerUserID  *int64               `json:"exclude_owner_user_id,omitempty"`
+	TokenID             *int64               `json:"token_id,omitempty"`
+	TokenOwnerUserID    *int64               `json:"token_owner_user_id,omitempty"`
+	Endpoint            string               `json:"endpoint,omitempty"`
+	Model               *string              `json:"model,omitempty"`
+	StartedAt           time.Time            `json:"started_at"`
+	FinishedAt          *time.Time           `json:"finished_at,omitempty"`
+	DurationMs          *int                 `json:"duration_ms,omitempty"`
+	StatusCode          *int                 `json:"status_code,omitempty"`
+	Success             *bool                `json:"success,omitempty"`
+	Retry               *bool                `json:"retry,omitempty"`
+	Outcome             string               `json:"outcome,omitempty"`
+	Deactivated         bool                 `json:"deactivated"`
+	CooldownUntil       *time.Time           `json:"cooldown_until,omitempty"`
+	ErrorCode           *string              `json:"error_code,omitempty"`
+	ErrorMessageExcerpt *string              `json:"error_message_excerpt,omitempty"`
+	ErrorBodyHash       *string              `json:"error_body_hash,omitempty"`
+	ClaimID             *int64               `json:"claim_id,omitempty"`
+	CandidateCount      *int                 `json:"candidate_count,omitempty"`
+	ReadyTokens         *int                 `json:"ready_tokens,omitempty"`
+	SnapshotVersion     *int64               `json:"snapshot_version,omitempty"`
+	StreamDeliveryTrace *StreamDeliveryTrace `json:"stream_delivery_trace,omitempty"`
 }
 
 type TokenStateEventContext struct {
@@ -89,15 +91,16 @@ func (s *Store) InsertGatewayRequestAttempt(ctx context.Context, item GatewayReq
 		item.StartedAt = time.Now().UTC()
 	}
 	var id int64
+	streamDeliveryTrace := streamDeliveryTraceBytes(item.StreamDeliveryTrace)
 	err := s.pool.QueryRow(ctx, `
 		insert into gateway_request_attempts (
 			request_id, gateway_request_log_id, attempt_index, owner_user_id, selection_mode,
 			caller_owner_user_id, exclude_owner_user_id, token_id, token_owner_user_id,
 			endpoint, model, started_at, finished_at, duration_ms, status_code, success, retry,
 			outcome, deactivated, cooldown_until, error_code, error_message_excerpt, error_body_hash,
-			claim_id, candidate_count, ready_tokens, snapshot_version
+			claim_id, candidate_count, ready_tokens, snapshot_version, stream_delivery_trace
 		)
-		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
 		returning id
 	`,
 		item.RequestID,
@@ -127,6 +130,7 @@ func (s *Store) InsertGatewayRequestAttempt(ctx context.Context, item GatewayReq
 		item.CandidateCount,
 		item.ReadyTokens,
 		item.SnapshotVersion,
+		streamDeliveryTrace,
 	).Scan(&id)
 	return id, err
 }
@@ -140,7 +144,7 @@ func (s *Store) ListGatewayRequestAttempts(ctx context.Context, requestID string
 		       caller_owner_user_id, exclude_owner_user_id, token_id, token_owner_user_id,
 		       endpoint, model, started_at, finished_at, duration_ms, status_code, success, retry,
 		       outcome, deactivated, cooldown_until, error_code, error_message_excerpt, error_body_hash,
-		       claim_id, candidate_count, ready_tokens, snapshot_version
+		       claim_id, candidate_count, ready_tokens, snapshot_version, stream_delivery_trace
 		from gateway_request_attempts
 		where request_id = $1
 		order by attempt_index asc, id asc
@@ -333,6 +337,7 @@ func scanGatewayRequestAttempts(rows pgx.Rows) ([]GatewayRequestAttempt, error) 
 	items := make([]GatewayRequestAttempt, 0)
 	for rows.Next() {
 		var item GatewayRequestAttempt
+		var streamDeliveryTrace []byte
 		if err := rows.Scan(
 			&item.ID,
 			&item.RequestID,
@@ -362,8 +367,14 @@ func scanGatewayRequestAttempts(rows pgx.Rows) ([]GatewayRequestAttempt, error) 
 			&item.CandidateCount,
 			&item.ReadyTokens,
 			&item.SnapshotVersion,
+			&streamDeliveryTrace,
 		); err != nil {
 			return nil, err
+		}
+		if len(streamDeliveryTrace) > 0 {
+			if err := json.Unmarshal(streamDeliveryTrace, &item.StreamDeliveryTrace); err != nil {
+				return nil, fmt.Errorf("decode stream delivery trace for attempt %d: %w", item.ID, err)
+			}
 		}
 		items = append(items, item)
 	}

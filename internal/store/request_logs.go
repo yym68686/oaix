@@ -13,53 +13,56 @@ import (
 )
 
 type RequestLog struct {
-	RequestID                     string         `json:"request_id"`
-	OwnerUserID                   *int64         `json:"owner_user_id,omitempty"`
-	APIKeyID                      *int64         `json:"api_key_id,omitempty"`
-	TokenOwnerUserID              *int64         `json:"token_owner_user_id,omitempty"`
-	SelectionMode                 *string        `json:"selection_mode,omitempty"`
-	CallerOwnerUserID             *int64         `json:"caller_owner_user_id,omitempty"`
-	Endpoint                      string         `json:"endpoint"`
-	Model                         *string        `json:"model,omitempty"`
-	ModelName                     *string        `json:"model_name,omitempty"`
-	IsStream                      bool           `json:"is_stream"`
-	StatusCode                    *int           `json:"status_code,omitempty"`
-	Success                       *bool          `json:"success,omitempty"`
-	AttemptCount                  int            `json:"attempt_count"`
-	TokenID                       *int64         `json:"token_id,omitempty"`
-	AccountID                     *string        `json:"account_id,omitempty"`
-	ClientIP                      *string        `json:"client_ip,omitempty"`
-	UserAgent                     *string        `json:"user_agent,omitempty"`
-	StartedAt                     time.Time      `json:"started_at"`
-	FinishedAt                    *time.Time     `json:"finished_at,omitempty"`
-	FirstTokenAt                  *time.Time     `json:"first_token_at,omitempty"`
-	TTFTMs                        *int           `json:"ttft_ms,omitempty"`
-	DurationMs                    *int           `json:"duration_ms,omitempty"`
-	TimingSpans                   map[string]any `json:"timing_spans,omitempty"`
-	InputTokens                   *int           `json:"input_tokens,omitempty"`
-	CacheWriteInputTokens         *int           `json:"cache_write_input_tokens,omitempty"`
-	CacheWriteTokensSource        *string        `json:"cache_write_tokens_source,omitempty"`
-	CachedInputTokens             *int           `json:"cached_input_tokens,omitempty"`
-	OutputTokens                  *int           `json:"output_tokens,omitempty"`
-	TotalTokens                   *int           `json:"total_tokens,omitempty"`
-	EstimatedCostUSD              *float64       `json:"estimated_cost_usd,omitempty"`
-	RequestPayloadHash            *string        `json:"request_payload_hash,omitempty"`
-	UpstreamPayloadHash           *string        `json:"upstream_payload_hash,omitempty"`
-	PromptTemplateHash            *string        `json:"prompt_template_hash,omitempty"`
-	PromptDynamicHash             *string        `json:"prompt_dynamic_hash,omitempty"`
-	PromptCacheSource             *string        `json:"prompt_cache_source,omitempty"`
-	PromptCacheKeyHash            *string        `json:"prompt_cache_key_hash,omitempty"`
-	PromptCacheRetentionRequested *string        `json:"prompt_cache_retention_requested,omitempty"`
-	PromptCacheRetentionSent      *string        `json:"prompt_cache_retention_sent,omitempty"`
-	SessionIDHash                 *string        `json:"session_id_hash,omitempty"`
-	SessionIDSource               *string        `json:"session_id_source,omitempty"`
-	PreviousResponseIDHash        *string        `json:"previous_response_id_hash,omitempty"`
-	UpstreamResponseID            *string        `json:"upstream_response_id,omitempty"`
-	CacheHitRatio                 *float64       `json:"cache_hit_ratio,omitempty"`
-	CacheAffinityResult           *string        `json:"cache_affinity_result,omitempty"`
-	CacheAffinityLaneIndex        *int           `json:"cache_affinity_lane_index,omitempty"`
-	PromptCacheTrace              map[string]any `json:"prompt_cache_trace,omitempty"`
-	ErrorMessage                  *string        `json:"error_message,omitempty"`
+	RequestID                     string               `json:"request_id"`
+	OwnerUserID                   *int64               `json:"owner_user_id,omitempty"`
+	APIKeyID                      *int64               `json:"api_key_id,omitempty"`
+	TokenOwnerUserID              *int64               `json:"token_owner_user_id,omitempty"`
+	SelectionMode                 *string              `json:"selection_mode,omitempty"`
+	CallerOwnerUserID             *int64               `json:"caller_owner_user_id,omitempty"`
+	Endpoint                      string               `json:"endpoint"`
+	Model                         *string              `json:"model,omitempty"`
+	ModelName                     *string              `json:"model_name,omitempty"`
+	IsStream                      bool                 `json:"is_stream"`
+	StatusCode                    *int                 `json:"status_code,omitempty"`
+	Success                       *bool                `json:"success,omitempty"`
+	AttemptCount                  int                  `json:"attempt_count"`
+	TokenID                       *int64               `json:"token_id,omitempty"`
+	AccountID                     *string              `json:"account_id,omitempty"`
+	ClientIP                      *string              `json:"client_ip,omitempty"`
+	UserAgent                     *string              `json:"user_agent,omitempty"`
+	StartedAt                     time.Time            `json:"started_at"`
+	FinishedAt                    *time.Time           `json:"finished_at,omitempty"`
+	FirstTokenAt                  *time.Time           `json:"first_token_at,omitempty"`
+	TTFTMs                        *int                 `json:"ttft_ms,omitempty"`
+	DurationMs                    *int                 `json:"duration_ms,omitempty"`
+	TimingSpans                   map[string]any       `json:"timing_spans,omitempty"`
+	StreamDeliveryState           *string              `json:"stream_delivery_state,omitempty"`
+	DownstreamConnectionID        *string              `json:"downstream_connection_id,omitempty"`
+	StreamDeliveryTrace           *StreamDeliveryTrace `json:"stream_delivery_trace,omitempty"`
+	InputTokens                   *int                 `json:"input_tokens,omitempty"`
+	CacheWriteInputTokens         *int                 `json:"cache_write_input_tokens,omitempty"`
+	CacheWriteTokensSource        *string              `json:"cache_write_tokens_source,omitempty"`
+	CachedInputTokens             *int                 `json:"cached_input_tokens,omitempty"`
+	OutputTokens                  *int                 `json:"output_tokens,omitempty"`
+	TotalTokens                   *int                 `json:"total_tokens,omitempty"`
+	EstimatedCostUSD              *float64             `json:"estimated_cost_usd,omitempty"`
+	RequestPayloadHash            *string              `json:"request_payload_hash,omitempty"`
+	UpstreamPayloadHash           *string              `json:"upstream_payload_hash,omitempty"`
+	PromptTemplateHash            *string              `json:"prompt_template_hash,omitempty"`
+	PromptDynamicHash             *string              `json:"prompt_dynamic_hash,omitempty"`
+	PromptCacheSource             *string              `json:"prompt_cache_source,omitempty"`
+	PromptCacheKeyHash            *string              `json:"prompt_cache_key_hash,omitempty"`
+	PromptCacheRetentionRequested *string              `json:"prompt_cache_retention_requested,omitempty"`
+	PromptCacheRetentionSent      *string              `json:"prompt_cache_retention_sent,omitempty"`
+	SessionIDHash                 *string              `json:"session_id_hash,omitempty"`
+	SessionIDSource               *string              `json:"session_id_source,omitempty"`
+	PreviousResponseIDHash        *string              `json:"previous_response_id_hash,omitempty"`
+	UpstreamResponseID            *string              `json:"upstream_response_id,omitempty"`
+	CacheHitRatio                 *float64             `json:"cache_hit_ratio,omitempty"`
+	CacheAffinityResult           *string              `json:"cache_affinity_result,omitempty"`
+	CacheAffinityLaneIndex        *int                 `json:"cache_affinity_lane_index,omitempty"`
+	PromptCacheTrace              map[string]any       `json:"prompt_cache_trace,omitempty"`
+	ErrorMessage                  *string              `json:"error_message,omitempty"`
 }
 
 type RequestLogSummary struct {
@@ -152,6 +155,7 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 		}
 		timing := jsonBytes(item.TimingSpans)
 		promptTrace := jsonBytes(item.PromptCacheTrace)
+		streamDeliveryTrace := streamDeliveryTraceBytes(item.StreamDeliveryTrace)
 		batch.Queue(`
 			insert into gateway_request_logs (
 				request_id, owner_user_id, api_key_id, token_owner_user_id, endpoint, model, model_name, is_stream, status_code, success,
@@ -163,9 +167,10 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
 				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
 				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message,
-				selection_mode, caller_owner_user_id
+				selection_mode, caller_owner_user_id, stream_delivery_state, downstream_connection_id,
+				stream_delivery_trace
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50)
 			on conflict (request_id) do update set
 				owner_user_id = coalesce(excluded.owner_user_id, gateway_request_logs.owner_user_id),
 				api_key_id = coalesce(excluded.api_key_id, gateway_request_logs.api_key_id),
@@ -212,7 +217,10 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				cache_affinity_result = coalesce(excluded.cache_affinity_result, gateway_request_logs.cache_affinity_result),
 				cache_affinity_lane_index = coalesce(excluded.cache_affinity_lane_index, gateway_request_logs.cache_affinity_lane_index),
 				prompt_cache_trace = coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace),
-				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message)
+				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message),
+				stream_delivery_state = coalesce(excluded.stream_delivery_state, gateway_request_logs.stream_delivery_state),
+				downstream_connection_id = coalesce(excluded.downstream_connection_id, gateway_request_logs.downstream_connection_id),
+				stream_delivery_trace = coalesce(excluded.stream_delivery_trace, gateway_request_logs.stream_delivery_trace)
 		`,
 			item.RequestID, item.OwnerUserID, item.APIKeyID, item.TokenOwnerUserID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
@@ -223,7 +231,8 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 			item.PromptCacheKeyHash, item.PromptCacheRetentionRequested, item.PromptCacheRetentionSent,
 			item.SessionIDHash, item.SessionIDSource, item.PreviousResponseIDHash, item.UpstreamResponseID,
 			item.CacheHitRatio, item.CacheAffinityResult, item.CacheAffinityLaneIndex, promptTrace, item.ErrorMessage,
-			item.SelectionMode, item.CallerOwnerUserID,
+			item.SelectionMode, item.CallerOwnerUserID, item.StreamDeliveryState, item.DownstreamConnectionID,
+			streamDeliveryTrace,
 		)
 	}
 	br := s.pool.SendBatch(ctx, batch)
@@ -319,6 +328,7 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 			modelName = item.Model
 		}
 		promptTrace := jsonBytes(item.PromptCacheTrace)
+		streamDeliveryTrace := streamDeliveryTraceBytes(item.StreamDeliveryTrace)
 		_, err := tx.Exec(ctx, `
 			insert into gateway_request_logs (
 				request_id, owner_user_id, api_key_id, token_owner_user_id, endpoint, model, model_name, is_stream, status_code, success,
@@ -330,9 +340,10 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
 				session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
 				cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message,
-				selection_mode, caller_owner_user_id
+				selection_mode, caller_owner_user_id, stream_delivery_state, downstream_connection_id,
+				stream_delivery_trace
 			)
-			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47)
+			values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50)
 			on conflict (request_id) do update set
 				owner_user_id = coalesce(excluded.owner_user_id, gateway_request_logs.owner_user_id),
 				api_key_id = coalesce(excluded.api_key_id, gateway_request_logs.api_key_id),
@@ -371,7 +382,10 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				cache_affinity_result = coalesce(excluded.cache_affinity_result, gateway_request_logs.cache_affinity_result),
 				cache_affinity_lane_index = coalesce(excluded.cache_affinity_lane_index, gateway_request_logs.cache_affinity_lane_index),
 				prompt_cache_trace = coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace),
-				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message)
+				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message),
+				stream_delivery_state = coalesce(excluded.stream_delivery_state, gateway_request_logs.stream_delivery_state),
+				downstream_connection_id = coalesce(excluded.downstream_connection_id, gateway_request_logs.downstream_connection_id),
+				stream_delivery_trace = coalesce(excluded.stream_delivery_trace, gateway_request_logs.stream_delivery_trace)
 		`,
 			item.RequestID, item.OwnerUserID, item.APIKeyID, item.TokenOwnerUserID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
@@ -383,6 +397,7 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 			item.PromptCacheRetentionSent, item.SessionIDHash, item.SessionIDSource, item.PreviousResponseIDHash,
 			item.UpstreamResponseID, item.CacheHitRatio, item.CacheAffinityResult, item.CacheAffinityLaneIndex,
 			promptTrace, item.ErrorMessage, item.SelectionMode, item.CallerOwnerUserID,
+			item.StreamDeliveryState, item.DownstreamConnectionID, streamDeliveryTrace,
 		)
 		if err != nil {
 			return err
@@ -914,50 +929,8 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.pool.Query(ctx, `
-		select request_id, endpoint, model, model_name, is_stream, status_code, success,
-		       owner_user_id, api_key_id, token_owner_user_id, selection_mode, caller_owner_user_id,
-		       attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
-		       first_token_at, ttft_ms, duration_ms, input_tokens, cache_write_input_tokens,
-		       cache_write_tokens_source, cached_input_tokens, output_tokens,
-		       total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
-		       prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
-		       prompt_cache_retention_requested, prompt_cache_retention_sent, session_id_hash,
-		       session_id_source, previous_response_id_hash, upstream_response_id, cache_hit_ratio,
-		       cache_affinity_result, cache_affinity_lane_index, prompt_cache_trace, error_message
-		from gateway_request_logs
-		order by started_at desc
-		limit $1
-	`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []RequestLog
-	for rows.Next() {
-		var item RequestLog
-		var promptTrace []byte
-		if err := rows.Scan(
-			&item.RequestID, &item.Endpoint, &item.Model, &item.ModelName, &item.IsStream, &item.StatusCode,
-			&item.Success, &item.OwnerUserID, &item.APIKeyID, &item.TokenOwnerUserID, &item.SelectionMode,
-			&item.CallerOwnerUserID, &item.AttemptCount, &item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
-			&item.StartedAt, &item.FinishedAt, &item.FirstTokenAt, &item.TTFTMs, &item.DurationMs,
-			&item.InputTokens, &item.CacheWriteInputTokens, &item.CacheWriteTokensSource,
-			&item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,
-			&item.RequestPayloadHash, &item.UpstreamPayloadHash, &item.PromptTemplateHash, &item.PromptDynamicHash,
-			&item.PromptCacheSource, &item.PromptCacheKeyHash, &item.PromptCacheRetentionRequested,
-			&item.PromptCacheRetentionSent, &item.SessionIDHash, &item.SessionIDSource, &item.PreviousResponseIDHash,
-			&item.UpstreamResponseID, &item.CacheHitRatio, &item.CacheAffinityResult, &item.CacheAffinityLaneIndex,
-			&promptTrace, &item.ErrorMessage,
-		); err != nil {
-			return nil, err
-		}
-		if len(promptTrace) > 0 {
-			_ = json.Unmarshal(promptTrace, &item.PromptCacheTrace)
-		}
-		items = append(items, item)
-	}
-	return items, rows.Err()
+	items, _, err := s.ListRequestLogsFiltered(ctx, RequestLogListOptions{Limit: limit})
+	return items, err
 }
 
 func (s *Store) RequestAnalytics(ctx context.Context, hours int) (RequestAnalytics, error) {

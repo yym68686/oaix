@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/oauth"
+	"github.com/yym68686/oaix/internal/observability"
+	"github.com/yym68686/oaix/internal/protocol/sse"
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/tokens"
 	"github.com/yym68686/oaix/internal/transport"
@@ -1509,6 +1512,282 @@ func TestStreamResponsesPreflightDoesNotDuplicateKeepaliveAfterRetry(t *testing.
 	}
 }
 
+func TestStreamResponsesDeliveryTraceRecordsTerminalFrame(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	createdData := []byte(`{"type":"response.created","sequence_number":6,"response":{"id":"resp_1","model":"upstream-model"}}`)
+	completedData := []byte(`{"type":"response.completed","sequence_number":7,"response":{"id":"resp_1","model":"upstream-model","status":"completed"}}`)
+	body := append(sse.Encode("response.created", createdData), sse.Encode("response.completed", completedData)...)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.streamResponsesWithPreflight(recorder, resp, Attempt{
+		Intent:                 RequestIntent{Endpoint: "/v1/responses", Model: "upstream-model", Stream: true, ResponseModelAlias: "public-model"},
+		DownstreamConnectionID: "oaixc-test-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Committed {
+		t.Fatalf("expected committed terminal stream: %+v", result)
+	}
+	trace := result.StreamDeliveryTrace
+	if trace == nil {
+		t.Fatal("missing stream delivery trace")
+	}
+	if trace.SchemaVersion != store.StreamDeliveryTraceSchemaVersion || trace.Semantics != "oaix_local_write_flush_only" {
+		t.Fatalf("unexpected trace envelope: %+v", trace)
+	}
+	if trace.Downstream.ConnectionID != "oaixc-test-1" {
+		t.Fatalf("connection id = %q", trace.Downstream.ConnectionID)
+	}
+	upstream := trace.Upstream.FirstResponseCompleted
+	if upstream == nil {
+		t.Fatal("missing upstream response.completed trace")
+	}
+	if trace.Upstream.ParserEventCount != 2 || trace.Upstream.ResponseCompletedCount != 1 || upstream.EventOrdinal != 2 {
+		t.Fatalf("unexpected upstream counters: %+v", trace.Upstream)
+	}
+	if upstream.PayloadSequenceNumber == nil || *upstream.PayloadSequenceNumber != 7 {
+		t.Fatalf("upstream sequence number = %v", upstream.PayloadSequenceNumber)
+	}
+	if upstream.DataBytes != len(completedData) || upstream.DataSHA256 != fmt.Sprintf("%x", sha256.Sum256(completedData)) {
+		t.Fatalf("unexpected upstream terminal bytes/hash: %+v", upstream)
+	}
+	if upstream.ReceivedAt.IsZero() || trace.Upstream.EOFAt == nil {
+		t.Fatalf("missing upstream timestamps: %+v", trace.Upstream)
+	}
+	expectedWire := sse.Encode("response.completed", []byte(`{"response":{"id":"resp_1","model":"public-model","status":"completed"},"sequence_number":7,"type":"response.completed"}`))
+	downstream := trace.Downstream.FirstResponseCompleted
+	if downstream == nil {
+		t.Fatal("missing downstream response.completed trace")
+	}
+	if downstream.EventOrdinal != 2 || downstream.PayloadSequenceNumber == nil || *downstream.PayloadSequenceNumber != 7 {
+		t.Fatalf("unexpected downstream terminal identity: %+v", downstream)
+	}
+	if downstream.WireBytes != len(expectedWire) || downstream.WireSHA256 != fmt.Sprintf("%x", sha256.Sum256(expectedWire)) {
+		t.Fatalf("unexpected downstream terminal bytes/hash: %+v", downstream)
+	}
+	if downstream.WrittenBytes != len(expectedWire) || downstream.WriteResult != "succeeded" || downstream.FlushResult != "succeeded" {
+		t.Fatalf("unexpected downstream write/flush result: %+v", downstream)
+	}
+	if downstream.WriteAttemptedAt.IsZero() || downstream.WriteCompletedAt.IsZero() || downstream.FlushAttemptedAt == nil || downstream.FlushCompletedAt == nil {
+		t.Fatalf("missing downstream timestamps: %+v", downstream)
+	}
+	if trace.Downstream.FinalBodyProducedAt == nil || trace.End.At.IsZero() || trace.End.Reason != "upstream_eof_after_terminal" {
+		t.Fatalf("unexpected stream end: downstream=%+v end=%+v", trace.Downstream, trace.End)
+	}
+	if trace.State() != "terminal_flushed" {
+		t.Fatalf("state = %q", trace.State())
+	}
+	if !bytes.Contains(recorder.Body.Bytes(), expectedWire) {
+		t.Fatalf("alias-rewritten terminal frame missing from output: %q", recorder.Body.Bytes())
+	}
+}
+
+func TestStreamResponsesDeliveryTraceBubblesFlushError(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	completedData := []byte(`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_flush","status":"completed"}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(sse.Encode("response.completed", completedData))),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	flushErr := errors.New("forced flush failure")
+	writer := &flushErrorResponseWriter{header: make(http.Header), flushErr: flushErr}
+	result, err := pipeline.streamResponsesWithPreflight(writer, resp, Attempt{Intent: RequestIntent{Endpoint: "/v1/responses", Stream: true}})
+	if !errors.Is(err, flushErr) {
+		t.Fatalf("error = %v, want wrapped flush error", err)
+	}
+	if !result.Committed || result.StreamDeliveryTrace == nil {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	completed := result.StreamDeliveryTrace.Downstream.FirstResponseCompleted
+	if completed == nil || completed.WriteResult != "succeeded" || completed.FlushResult != "failed" || completed.FlushError != flushErr.Error() {
+		t.Fatalf("unexpected terminal delivery trace: %+v", completed)
+	}
+	if completed.FlushAttemptedAt == nil || completed.FlushCompletedAt == nil {
+		t.Fatalf("missing flush timestamps: %+v", completed)
+	}
+	if result.StreamDeliveryTrace.End.Reason != "downstream_terminal_flush_error" || result.StreamDeliveryTrace.State() != "terminal_flush_failed" {
+		t.Fatalf("unexpected trace end/state: %+v state=%q", result.StreamDeliveryTrace.End, result.StreamDeliveryTrace.State())
+	}
+	if result.StreamDeliveryTrace.Downstream.FinalBodyProducedAt != nil {
+		t.Fatalf("failed flush must not claim final body completion: %+v", result.StreamDeliveryTrace.Downstream)
+	}
+}
+
+func TestStreamResponsesKeepaliveFlushErrorIsCommittedAndNotRetryable(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	createdData := []byte(`{"type":"response.created","sequence_number":1,"response":{"id":"resp_keepalive"}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(sse.Encode("response.created", createdData))),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	flushErr := errors.New("forced keepalive flush failure")
+	writer := &flushErrorResponseWriter{header: make(http.Header), flushErr: flushErr}
+	result, err := pipeline.streamResponsesWithPreflight(writer, resp, Attempt{Intent: RequestIntent{Endpoint: "/v1/responses", Stream: true}})
+	if !errors.Is(err, flushErr) {
+		t.Fatalf("error = %v, want wrapped flush error", err)
+	}
+	if !result.Committed || result.Retry || !result.StreamState.DownstreamStarted {
+		t.Fatalf("started downstream delivery error must be terminal and non-retryable: %+v", result)
+	}
+	if result.Status != http.StatusOK || result.StreamDeliveryTrace == nil {
+		t.Fatalf("healthy upstream status/trace must be preserved: %+v", result)
+	}
+	if result.StreamDeliveryTrace.End.Reason != "downstream_flush_error" {
+		t.Fatalf("end reason = %q", result.StreamDeliveryTrace.End.Reason)
+	}
+}
+
+func TestStreamResponsesDeliveryTraceRecordsUnsupportedFlush(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	completedData := []byte(`{"type":"response.completed","sequence_number":9,"response":{"id":"resp_no_flush","status":"completed"}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(sse.Encode("response.completed", completedData))),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	writer := &flushErrorResponseWriter{header: make(http.Header), flushErr: http.ErrNotSupported}
+	result, err := pipeline.streamResponsesWithPreflight(writer, resp, Attempt{Intent: RequestIntent{Endpoint: "/v1/responses", Stream: true}})
+	if !errors.Is(err, http.ErrNotSupported) {
+		t.Fatalf("error = %v, want http.ErrNotSupported", err)
+	}
+	if !result.Committed || result.StreamDeliveryTrace == nil {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	completed := result.StreamDeliveryTrace.Downstream.FirstResponseCompleted
+	if completed == nil || completed.WriteResult != "succeeded" || completed.FlushResult != "not_supported" {
+		t.Fatalf("unexpected unsupported flush trace: %+v", completed)
+	}
+	if result.StreamDeliveryTrace.End.Reason != "downstream_terminal_flush_not_supported" || result.StreamDeliveryTrace.State() != "terminal_flush_not_supported" {
+		t.Fatalf("unexpected trace end/state: %+v state=%q", result.StreamDeliveryTrace.End, result.StreamDeliveryTrace.State())
+	}
+	if result.StreamDeliveryTrace.Downstream.FinalBodyProducedAt != nil {
+		t.Fatalf("unsupported flush must not claim final body completion: %+v", result.StreamDeliveryTrace.Downstream)
+	}
+}
+
+func TestStreamResponsesDeliveryTraceRecordsPartialTerminalWrite(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	completedData := []byte(`{"type":"response.completed","sequence_number":4,"response":{"id":"resp_partial","status":"completed"}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(sse.Encode("response.completed", completedData))),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	writeErr := errors.New("forced partial write")
+	writer := &partialResponseWriter{header: make(http.Header), writeErr: writeErr}
+	result, err := pipeline.streamResponsesWithPreflight(writer, resp, Attempt{Intent: RequestIntent{Endpoint: "/v1/responses", Stream: true}})
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("error = %v, want wrapped write error", err)
+	}
+	if !result.Committed || result.StreamDeliveryTrace == nil {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	completed := result.StreamDeliveryTrace.Downstream.FirstResponseCompleted
+	if completed == nil || completed.WriteResult != "partial" || completed.WrittenBytes <= 0 || completed.WrittenBytes >= completed.WireBytes {
+		t.Fatalf("unexpected partial write trace: %+v", completed)
+	}
+	if completed.FlushResult != "not_attempted" || completed.FlushAttemptedAt != nil || completed.FlushCompletedAt != nil {
+		t.Fatalf("flush should not be attempted after partial write: %+v", completed)
+	}
+	if result.StreamDeliveryTrace.End.Reason != "downstream_terminal_write_error" || result.StreamDeliveryTrace.State() != "terminal_write_partial" {
+		t.Fatalf("unexpected trace end/state: %+v state=%q", result.StreamDeliveryTrace.End, result.StreamDeliveryTrace.State())
+	}
+	if result.StreamDeliveryTrace.Downstream.FinalBodyProducedAt != nil {
+		t.Fatalf("partial write must not claim final body completion: %+v", result.StreamDeliveryTrace.Downstream)
+	}
+}
+
+func TestStreamResponsesDeliveryTracePreservesTerminalMissingSuccess(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	deltaData := []byte(`{"type":"response.output_text.delta","sequence_number":1,"delta":"ok"}`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(sse.Encode("response.output_text.delta", deltaData))),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	result, err := pipeline.streamResponsesWithPreflight(httptest.NewRecorder(), resp, Attempt{Intent: RequestIntent{Endpoint: "/v1/responses", Stream: true}})
+	if err != nil {
+		t.Fatalf("terminal-missing clean EOF must preserve existing success semantics: %v", err)
+	}
+	if !result.Committed || result.Status != http.StatusOK || result.Retry {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	trace := result.StreamDeliveryTrace
+	if trace == nil || trace.Upstream.FirstResponseCompleted != nil || trace.Downstream.FirstResponseCompleted != nil {
+		t.Fatalf("unexpected terminal trace: %+v", trace)
+	}
+	if trace.Upstream.EOFAt == nil || trace.Downstream.FinalBodyProducedAt == nil || trace.End.Reason != "upstream_eof_before_terminal" || trace.End.Error != "" {
+		t.Fatalf("unexpected clean EOF trace: %+v", trace)
+	}
+	if trace.State() != "terminal_missing" {
+		t.Fatalf("state = %q", trace.State())
+	}
+}
+
+func TestChatCompletionStreamDoesNotEmitResponsesTerminalState(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+	}
+	result, err := pipeline.streamResponsesWithPreflight(httptest.NewRecorder(), resp, Attempt{
+		Intent: RequestIntent{Endpoint: "/v1/chat/completions", Stream: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Committed || result.StreamDeliveryTrace != nil {
+		t.Fatalf("chat stream must keep existing behavior without Responses terminal trace: %+v", result)
+	}
+}
+
+func TestProxyExposesConnectionIDBeforeEarlyError(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{MaxRequestBodyBytes: 1}}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("too large"))
+	req = req.WithContext(observability.ContextWithConnectionID(req.Context(), "oaixc-test-early"))
+	recorder := httptest.NewRecorder()
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses"})
+	if got := recorder.Header().Get("X-OAIX-Connection-ID"); got != "oaixc-test-early" {
+		t.Fatalf("connection header = %q", got)
+	}
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestRecordGatewayAttemptPersistsStreamDeliveryTrace(t *testing.T) {
+	fakeStore := &fakeProxyStore{}
+	pipeline := &Pipeline{store: fakeStore}
+	trace := store.NewStreamDeliveryTrace("oaixc-attempt")
+	pipeline.recordGatewayAttempt(context.Background(), Attempt{
+		Index:     1,
+		RequestID: "req-trace",
+		Intent:    RequestIntent{Endpoint: "/v1/responses"},
+		StartedAt: time.Now().UTC(),
+	}, AttemptResult{Status: http.StatusOK, StreamDeliveryTrace: trace}, nil, OutcomeSuccess, false, false, nil)
+	fakeStore.mu.Lock()
+	defer fakeStore.mu.Unlock()
+	if len(fakeStore.attempts) != 1 || fakeStore.attempts[0].StreamDeliveryTrace != trace {
+		t.Fatalf("attempt trace not persisted: %+v", fakeStore.attempts)
+	}
+}
+
 func TestWriteResponsesJSONFromSSECollectsTextPlainUpstream(t *testing.T) {
 	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
 	body := strings.Join([]string{
@@ -1662,6 +1941,45 @@ type failingWriter struct {
 type countingResponseRecorder struct {
 	*httptest.ResponseRecorder
 	writeHeaderCount int
+}
+
+type flushErrorResponseWriter struct {
+	header     http.Header
+	body       bytes.Buffer
+	status     int
+	flushErr   error
+	flushCalls int
+}
+
+func (w *flushErrorResponseWriter) Header() http.Header { return w.header }
+
+func (w *flushErrorResponseWriter) WriteHeader(status int) { w.status = status }
+
+func (w *flushErrorResponseWriter) Write(value []byte) (int, error) {
+	return w.body.Write(value)
+}
+
+func (w *flushErrorResponseWriter) FlushError() error {
+	w.flushCalls++
+	return w.flushErr
+}
+
+type partialResponseWriter struct {
+	header   http.Header
+	status   int
+	writeErr error
+}
+
+func (w *partialResponseWriter) Header() http.Header { return w.header }
+
+func (w *partialResponseWriter) WriteHeader(status int) { w.status = status }
+
+func (w *partialResponseWriter) Write(value []byte) (int, error) {
+	n := len(value) / 2
+	if n == 0 && len(value) > 0 {
+		n = 1
+	}
+	return n, w.writeErr
 }
 
 type fakeProxyStore struct {

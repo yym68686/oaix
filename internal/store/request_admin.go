@@ -12,23 +12,25 @@ import (
 )
 
 type RequestLogListOptions struct {
-	Limit            int
-	Offset           int
-	IncludeTotal     bool
-	RequestID        string
-	OwnerUserID      int64
-	TokenOwnerUserID int64
-	APIKeyID         int64
-	Model            string
-	Endpoint         string
-	StatusCode       *int
-	Success          *bool
-	TokenID          int64
-	AccountID        string
-	Stream           *bool
-	From             *time.Time
-	To               *time.Time
-	QueryError       string
+	Limit                  int
+	Offset                 int
+	IncludeTotal           bool
+	RequestID              string
+	OwnerUserID            int64
+	TokenOwnerUserID       int64
+	APIKeyID               int64
+	Model                  string
+	Endpoint               string
+	StatusCode             *int
+	Success                *bool
+	TokenID                int64
+	AccountID              string
+	Stream                 *bool
+	From                   *time.Time
+	To                     *time.Time
+	QueryError             string
+	StreamDeliveryState    string
+	DownstreamConnectionID string
 }
 
 type RequestUsageSummary struct {
@@ -158,7 +160,8 @@ func (s *Store) ListRequestLogsFilteredScoped(ctx context.Context, scope Resourc
 		select request_id, endpoint, model, model_name, is_stream, status_code, success,
 		       owner_user_id, api_key_id, token_owner_user_id, selection_mode, caller_owner_user_id,
 		       attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
-		       first_token_at, ttft_ms, duration_ms, input_tokens, cache_write_input_tokens,
+		       first_token_at, ttft_ms, duration_ms, stream_delivery_state,
+		       downstream_connection_id, stream_delivery_trace, input_tokens, cache_write_input_tokens,
 		       cache_write_tokens_source, cached_input_tokens, output_tokens,
 		       total_tokens, estimated_cost_usd, request_payload_hash, upstream_payload_hash,
 		       prompt_template_hash, prompt_dynamic_hash, prompt_cache_source, prompt_cache_key_hash,
@@ -258,6 +261,12 @@ func requestLogWhereScoped(opts RequestLogListOptions, scope ResourceScope) (str
 	if opts.QueryError != "" {
 		filters = append(filters, fmt.Sprintf("coalesce(error_message, '') ilike %s", arg("%"+opts.QueryError+"%")))
 	}
+	if opts.StreamDeliveryState != "" {
+		filters = append(filters, fmt.Sprintf("stream_delivery_state = %s", arg(opts.StreamDeliveryState)))
+	}
+	if opts.DownstreamConnectionID != "" {
+		filters = append(filters, fmt.Sprintf("downstream_connection_id = %s", arg(opts.DownstreamConnectionID)))
+	}
 	return strings.Join(filters, " and "), args
 }
 
@@ -266,12 +275,14 @@ func scanRequestLogs(rows pgxRows) ([]RequestLog, error) {
 	for rows.Next() {
 		var item RequestLog
 		var promptTrace []byte
+		var streamDeliveryTrace []byte
 		if err := rows.Scan(
 			&item.RequestID, &item.Endpoint, &item.Model, &item.ModelName, &item.IsStream, &item.StatusCode,
 			&item.Success, &item.OwnerUserID, &item.APIKeyID, &item.TokenOwnerUserID, &item.SelectionMode,
 			&item.CallerOwnerUserID, &item.AttemptCount,
 			&item.TokenID, &item.AccountID, &item.ClientIP, &item.UserAgent,
 			&item.StartedAt, &item.FinishedAt, &item.FirstTokenAt, &item.TTFTMs, &item.DurationMs,
+			&item.StreamDeliveryState, &item.DownstreamConnectionID, &streamDeliveryTrace,
 			&item.InputTokens, &item.CacheWriteInputTokens, &item.CacheWriteTokensSource,
 			&item.CachedInputTokens, &item.OutputTokens, &item.TotalTokens, &item.EstimatedCostUSD,
 			&item.RequestPayloadHash, &item.UpstreamPayloadHash, &item.PromptTemplateHash, &item.PromptDynamicHash,
@@ -284,6 +295,11 @@ func scanRequestLogs(rows pgxRows) ([]RequestLog, error) {
 		}
 		if len(promptTrace) > 0 {
 			_ = json.Unmarshal(promptTrace, &item.PromptCacheTrace)
+		}
+		if len(streamDeliveryTrace) > 0 {
+			if err := json.Unmarshal(streamDeliveryTrace, &item.StreamDeliveryTrace); err != nil {
+				return nil, fmt.Errorf("decode stream delivery trace for request %s: %w", item.RequestID, err)
+			}
 		}
 		items = append(items, item)
 	}

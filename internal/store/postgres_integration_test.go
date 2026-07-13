@@ -219,6 +219,94 @@ func TestPostgresGPT56CacheWriteObservability(t *testing.T) {
 	}
 }
 
+func TestPostgresRequestLogInitialAfterFinalPreservesStreamDelivery(t *testing.T) {
+	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set OAIX_TEST_DATABASE_URL to run Postgres integration fixture")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := Connect(ctx, config.DatabaseConfig{
+		URL:            configURL(dsn),
+		MaxConns:       4,
+		MinConns:       1,
+		ConnectTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Connect returned error: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+
+	requestID := fmt.Sprintf("stream-delivery-order-%d", time.Now().UnixNano())
+	connectionID := "oaixc-order-test"
+	state := "terminal_flushed"
+	startedAt := time.Now().UTC()
+	trace := NewStreamDeliveryTrace(connectionID)
+	trace.Upstream.ResponseCompletedCount = 1
+	trace.Upstream.FirstResponseCompleted = &StreamDeliveryCompletedUpstream{
+		EventOrdinal: 1,
+		ReceivedAt:   startedAt,
+		DataBytes:    2,
+		DataSHA256:   "00",
+	}
+	trace.Downstream.FirstResponseCompleted = &StreamDeliveryCompletedDownstream{
+		EventOrdinal:     1,
+		WireBytes:        2,
+		WireSHA256:       "11",
+		WriteAttemptedAt: startedAt,
+		WrittenBytes:     2,
+		WriteResult:      "succeeded",
+		WriteCompletedAt: startedAt,
+		FlushResult:      "succeeded",
+	}
+	trace.End = StreamDeliveryEndTrace{At: startedAt, Reason: "upstream_eof_after_terminal"}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = db.pool.Exec(cleanupCtx, "delete from gateway_request_logs where request_id = $1", requestID)
+	})
+
+	if err := db.UpsertRequestLogs(ctx, []RequestLog{{
+		RequestID:              requestID,
+		Endpoint:               "/v1/responses",
+		IsStream:               true,
+		StartedAt:              startedAt,
+		AttemptCount:           1,
+		StreamDeliveryState:    &state,
+		DownstreamConnectionID: &connectionID,
+		StreamDeliveryTrace:    trace,
+	}}); err != nil {
+		t.Fatalf("final UpsertRequestLogs returned error: %v", err)
+	}
+	if err := db.UpsertRequestLogs(ctx, []RequestLog{{
+		RequestID:              requestID,
+		Endpoint:               "/v1/responses",
+		IsStream:               true,
+		StartedAt:              startedAt.Add(-time.Millisecond),
+		AttemptCount:           0,
+		DownstreamConnectionID: &connectionID,
+	}}); err != nil {
+		t.Fatalf("late initial UpsertRequestLogs returned error: %v", err)
+	}
+
+	item, err := db.GetRequestLog(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetRequestLog returned error: %v", err)
+	}
+	if item.StreamDeliveryState == nil || *item.StreamDeliveryState != state {
+		t.Fatalf("stream delivery state = %v, want %q", item.StreamDeliveryState, state)
+	}
+	if item.StreamDeliveryTrace == nil || item.StreamDeliveryTrace.State() != state {
+		t.Fatalf("stream delivery trace was overwritten by late initial log: %+v", item.StreamDeliveryTrace)
+	}
+	if item.DownstreamConnectionID == nil || *item.DownstreamConnectionID != connectionID {
+		t.Fatalf("connection id = %v, want %q", item.DownstreamConnectionID, connectionID)
+	}
+}
+
 func configURL(value string) string {
 	return value
 }

@@ -147,6 +147,9 @@ var migrationStatements = []string{
 		ttft_ms integer,
 		duration_ms integer,
 		timing_spans jsonb,
+		stream_delivery_state varchar(64),
+		downstream_connection_id varchar(128),
+		stream_delivery_trace jsonb,
 		input_tokens integer,
 		cache_write_input_tokens integer,
 		cache_write_tokens_source varchar(128),
@@ -208,6 +211,7 @@ var migrationStatements = []string{
 		candidate_count integer,
 		ready_tokens integer,
 		snapshot_version bigint,
+		stream_delivery_trace jsonb,
 		created_at timestamptz not null default now()
 	)`,
 	`create table if not exists gateway_request_log_partitions (
@@ -516,6 +520,10 @@ var migrationStatements = []string{
 	`alter table gateway_request_logs add column if not exists caller_owner_user_id bigint references platform_users(id)`,
 	`alter table gateway_request_logs add column if not exists cache_write_input_tokens integer`,
 	`alter table gateway_request_logs add column if not exists cache_write_tokens_source varchar(128)`,
+	`alter table gateway_request_logs add column if not exists stream_delivery_state varchar(64)`,
+	`alter table gateway_request_logs add column if not exists downstream_connection_id varchar(128)`,
+	`alter table gateway_request_logs add column if not exists stream_delivery_trace jsonb`,
+	`alter table gateway_request_attempts add column if not exists stream_delivery_trace jsonb`,
 	`alter table gateway_request_token_costs add column if not exists owner_user_id bigint references platform_users(id)`,
 	`alter table gateway_request_hourly_stats add column if not exists owner_user_id bigint references platform_users(id)`,
 	`alter table gateway_request_hourly_stats add column if not exists cache_write_input_tokens bigint not null default 0`,
@@ -666,6 +674,8 @@ var onlineMigrationStatements = []string{
 	`create index concurrently if not exists ix_gateway_request_attempts_token_started on gateway_request_attempts(token_id, started_at desc) where token_id is not null`,
 	`create index concurrently if not exists ix_gateway_request_attempts_owner_started on gateway_request_attempts(owner_user_id, started_at desc)`,
 	`create index concurrently if not exists ix_gateway_request_attempts_outcome_started on gateway_request_attempts(outcome, started_at desc)`,
+	`create index concurrently if not exists ix_gateway_request_logs_delivery_state_started on gateway_request_logs(stream_delivery_state, started_at desc) where stream_delivery_state is not null`,
+	`create index concurrently if not exists ix_gateway_request_logs_downstream_connection_started on gateway_request_logs(downstream_connection_id, started_at desc) where downstream_connection_id is not null`,
 	`create index concurrently if not exists ix_token_state_events_request_attempt on token_state_events(request_id, gateway_request_attempt_id) where request_id is not null`,
 	`create index concurrently if not exists ix_token_import_items_existing_token on token_import_items(matched_existing_token_id) where matched_existing_token_id is not null`,
 }

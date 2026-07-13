@@ -1162,14 +1162,18 @@ func (a *App) exportRequests(w http.ResponseWriter, r *http.Request) {
 		"request_id", "endpoint", "model_name", "stream", "status_code", "success", "token_id", "account_id",
 		"started_at", "duration_ms", "input_tokens", "cache_write_input_tokens", "cache_write_tokens_source",
 		"cached_input_tokens", "output_tokens", "total_tokens", "estimated_cost_usd", "error_message",
+		"stream_delivery_state", "downstream_connection_id", "stream_delivery_trace",
 	})
 	for _, item := range items {
+		streamDeliveryTrace, _ := json.Marshal(item.StreamDeliveryTrace)
 		_ = writer.Write([]string{
 			item.RequestID, item.Endpoint, stringPtr(item.ModelName), strconv.FormatBool(item.IsStream),
 			intPtr(item.StatusCode), boolPtr(item.Success), int64Ptr(item.TokenID), stringPtr(item.AccountID),
 			item.StartedAt.Format(time.RFC3339), intPtr(item.DurationMs), intPtr(item.InputTokens),
 			intPtr(item.CacheWriteInputTokens), stringPtr(item.CacheWriteTokensSource), intPtr(item.CachedInputTokens),
-			intPtr(item.OutputTokens), intPtr(item.TotalTokens), floatPtr(item.EstimatedCostUSD), stringPtr(item.ErrorMessage),
+			intPtr(item.OutputTokens), intPtr(item.TotalTokens), floatPtr(item.EstimatedCostUSD),
+			stringPtr(item.ErrorMessage), stringPtr(item.StreamDeliveryState), stringPtr(item.DownstreamConnectionID),
+			string(streamDeliveryTrace),
 		})
 	}
 	writer.Flush()
@@ -1716,11 +1720,13 @@ func requestLogOptionsFromRequest(r *http.Request) store.RequestLogListOptions {
 		RequestID: r.URL.Query().Get("request_id"), Model: r.URL.Query().Get("model"),
 		Endpoint: r.URL.Query().Get("endpoint"), TokenID: queryInt64(r, "token_id", 0),
 		AccountID: r.URL.Query().Get("account_id"), From: queryTime(r, "from"), To: queryTime(r, "to"),
-		OwnerUserID:      queryInt64(r, "user_id", 0),
-		TokenOwnerUserID: queryInt64(r, "token_owner_user_id", 0),
-		APIKeyID:         queryInt64(r, "api_key_id", 0),
-		QueryError:       firstNonEmpty(r.URL.Query().Get("error"), r.URL.Query().Get("q")),
-		IncludeTotal:     strings.EqualFold(r.URL.Query().Get("include_total"), "true"),
+		OwnerUserID:            queryInt64(r, "user_id", 0),
+		TokenOwnerUserID:       queryInt64(r, "token_owner_user_id", 0),
+		APIKeyID:               queryInt64(r, "api_key_id", 0),
+		QueryError:             firstNonEmpty(r.URL.Query().Get("error"), r.URL.Query().Get("q")),
+		StreamDeliveryState:    r.URL.Query().Get("stream_delivery_state"),
+		DownstreamConnectionID: r.URL.Query().Get("downstream_connection_id"),
+		IncludeTotal:           strings.EqualFold(r.URL.Query().Get("include_total"), "true"),
 	}
 	if status := queryInt(r, "status_code", 0); status > 0 {
 		opts.StatusCode = &status

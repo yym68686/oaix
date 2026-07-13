@@ -18,6 +18,7 @@ import (
 
 	"github.com/yym68686/oaix/internal/protocol/openai"
 	"github.com/yym68686/oaix/internal/protocol/sse"
+	"github.com/yym68686/oaix/internal/store"
 )
 
 const (
@@ -1575,11 +1576,15 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 
 func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *http.Response, attempt Attempt) (AttemptResult, error) {
 	observer := newUsageObserver(attempt.Intent.Model)
-	flusher, _ := w.(http.Flusher)
-	var buffered [][]byte
+	var trace *store.StreamDeliveryTrace
+	if isResponsesStreamEndpoint(attempt.Intent.Endpoint) {
+		trace = store.NewStreamDeliveryTrace(attempt.DownstreamConnectionID)
+	}
+	var buffered []bufferedStreamEvent
 	committed := false
 	streamState := attempt.StreamState
 	firstTokenAt := (*time.Time)(nil)
+	eventOrdinal := 0
 	writeImmediateKeepalive := func() error {
 		if streamState.KeepaliveSent {
 			return nil
@@ -1591,21 +1596,32 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		}
 		raw := structuredKeepaliveRaw(0)
 		observer.Observe(raw)
-		if _, err := w.Write(raw); err != nil {
+		sequenceNumber := int64(0)
+		if err := writeDownstreamStreamEvent(w, trace, bufferedStreamEvent{
+			raw:                   raw,
+			eventType:             "keepalive",
+			payloadSequenceNumber: &sequenceNumber,
+		}, true); err != nil {
 			return err
-		}
-		if flusher != nil {
-			flusher.Flush()
 		}
 		streamState.KeepaliveSent = true
 		return nil
 	}
 	parser := sse.NewParser(int(p.cfg.Upstream.NonStreamMaxResponseBytes))
 	err := parser.Parse(responseContext(resp), resp.Body, func(event sse.Event) error {
+		eventOrdinal++
 		payload := parseEventPayload(event)
 		typ := eventType(event, payload)
+		sequenceNumber := payloadSequenceNumber(payload)
+		observeUpstreamStreamEvent(trace, typ, eventOrdinal, sequenceNumber, event.Data)
 		if status, message, failed := responseFailureStatus(payload); failed && !committed {
 			return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
+		}
+		downstreamEvent := bufferedStreamEvent{
+			raw:                   rawEventForDownstream(event, attempt.Intent.ResponseModelAlias),
+			eventType:             typ,
+			eventOrdinal:          eventOrdinal,
+			payloadSequenceNumber: sequenceNumber,
 		}
 		if !committed && isPreflightResponseEvent(typ) {
 			if typ == "response.created" {
@@ -1613,7 +1629,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 					return err
 				}
 			}
-			buffered = append(buffered, rawEventForDownstream(event, attempt.Intent.ResponseModelAlias))
+			buffered = append(buffered, downstreamEvent)
 			return nil
 		}
 		if !committed {
@@ -1621,9 +1637,9 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 				w.WriteHeader(resp.StatusCode)
 				streamState.DownstreamStarted = true
 			}
-			for _, raw := range buffered {
-				observer.Observe(raw)
-				if _, err := w.Write(raw); err != nil {
+			for _, bufferedEvent := range buffered {
+				observer.Observe(bufferedEvent.raw)
+				if err := writeDownstreamStreamEvent(w, trace, bufferedEvent, false); err != nil {
 					return err
 				}
 			}
@@ -1634,26 +1650,33 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 			now := time.Now().UTC()
 			firstTokenAt = &now
 		}
-		raw := rawEventForDownstream(event, attempt.Intent.ResponseModelAlias)
-		observer.Observe(raw)
-		if _, err := w.Write(raw); err != nil {
+		observer.Observe(downstreamEvent.raw)
+		if err := writeDownstreamStreamEvent(w, trace, downstreamEvent, true); err != nil {
 			return err
-		}
-		if flusher != nil {
-			flusher.Flush()
 		}
 		return nil
 	})
 	observer.flushEvent()
-	result := AttemptResult{
-		Status:       resp.StatusCode,
-		Committed:    committed,
-		StreamState:  streamState,
-		Usage:        observer.usage,
-		ResponseID:   observer.responseID,
-		FirstTokenAt: firstNonNilTime(firstTokenAt, observer.firstTokenAt),
+	newResult := func() AttemptResult {
+		return AttemptResult{
+			Status:              resp.StatusCode,
+			Committed:           committed,
+			StreamState:         streamState,
+			Usage:               observer.usage,
+			ResponseID:          observer.responseID,
+			FirstTokenAt:        firstNonNilTime(firstTokenAt, observer.firstTokenAt),
+			StreamDeliveryTrace: trace,
+		}
 	}
 	if err != nil {
+		finishStreamDeliveryTrace(trace, err)
+		result := newResult()
+		var deliveryErr streamDeliveryOperationError
+		if errors.As(err, &deliveryErr) && streamState.DownstreamStarted {
+			result.Committed = true
+			result.Retry = false
+			return result, err
+		}
 		var preflight streamPreflightError
 		if errors.As(err, &preflight) {
 			result.Status = preflight.status
@@ -1673,18 +1696,29 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 			w.WriteHeader(resp.StatusCode)
 			streamState.DownstreamStarted = true
 		}
-		for _, raw := range buffered {
-			observer.Observe(raw)
-			if _, err := w.Write(raw); err != nil {
+		for _, bufferedEvent := range buffered {
+			observer.Observe(bufferedEvent.raw)
+			if writeErr := writeDownstreamStreamEvent(w, trace, bufferedEvent, false); writeErr != nil {
+				committed = true
+				finishStreamDeliveryTrace(trace, writeErr)
+				result := newResult()
 				result.Committed = true
-				result.StreamState = streamState
-				return result, err
+				return result, writeErr
 			}
 		}
-		result.Committed = true
-		result.StreamState = streamState
+		committed = true
 	}
-	return result, nil
+	finishStreamDeliveryTrace(trace, nil)
+	return newResult(), nil
+}
+
+func isResponsesStreamEndpoint(endpoint string) bool {
+	switch endpoint {
+	case "/v1/responses", "/v1/responses/compact":
+		return true
+	default:
+		return false
+	}
 }
 
 type streamPreflightError struct {

@@ -22,6 +22,7 @@ import (
 	"github.com/yym68686/oaix/internal/cooldown"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/oauth"
+	"github.com/yym68686/oaix/internal/observability"
 	"github.com/yym68686/oaix/internal/protocol/openai"
 	"github.com/yym68686/oaix/internal/protocol/sse"
 	"github.com/yym68686/oaix/internal/store"
@@ -84,28 +85,30 @@ type RequestIntent struct {
 }
 
 type Attempt struct {
-	Index       int
-	RequestID   string
-	Intent      RequestIntent
-	Claim       *tokens.Claim
-	Body        []byte
-	StartedAt   time.Time
-	RetryCause  Outcome
-	UpstreamURL string
-	Method      string
-	PromptCache *PromptCacheContext
-	StreamState StreamAttemptState
+	Index                  int
+	RequestID              string
+	Intent                 RequestIntent
+	Claim                  *tokens.Claim
+	Body                   []byte
+	StartedAt              time.Time
+	RetryCause             Outcome
+	UpstreamURL            string
+	Method                 string
+	PromptCache            *PromptCacheContext
+	StreamState            StreamAttemptState
+	DownstreamConnectionID string
 }
 
 type AttemptResult struct {
-	Status       int
-	Retry        bool
-	Committed    bool
-	StreamState  StreamAttemptState
-	Usage        *UsageMetrics
-	ResponseID   string
-	FirstTokenAt *time.Time
-	ErrorBody    []byte
+	Status              int
+	Retry               bool
+	Committed           bool
+	StreamState         StreamAttemptState
+	Usage               *UsageMetrics
+	ResponseID          string
+	FirstTokenAt        *time.Time
+	ErrorBody           []byte
+	StreamDeliveryTrace *store.StreamDeliveryTrace
 }
 
 type StreamAttemptState struct {
@@ -165,7 +168,11 @@ func (p *Pipeline) CloseIdleConnections() {
 func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestIntent) {
 	started := time.Now().UTC()
 	requestID := requestID(r)
+	downstreamConnectionID := observability.ConnectionIDFromContext(r.Context())
 	w.Header().Set("X-Request-ID", requestID)
+	if downstreamConnectionID != "" {
+		w.Header().Set("X-OAIX-Connection-ID", downstreamConnectionID)
+	}
 	bodyBytes, bodyStatus, bodyMessage, err := readProxyRequestBody(r, p.cfg.Upstream.MaxRequestBodyBytes)
 	if err != nil {
 		writeJSONError(w, bodyStatus, bodyMessage)
@@ -215,6 +222,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		ClientIP:                      nullable(clientIP(r)),
 		UserAgent:                     nullable(r.UserAgent()),
 		TimingSpans:                   timing,
+		DownstreamConnectionID:        nullable(downstreamConnectionID),
 		AttemptCount:                  0,
 		RequestPayloadHash:            promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.RequestPayloadHash }),
 		UpstreamPayloadHash:           promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.UpstreamPayloadHash }),
@@ -240,6 +248,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var lastUsage *UsageMetrics
 	var lastResponseID string
 	var lastFirstTokenAt *time.Time
+	var lastStreamDeliveryTrace *store.StreamDeliveryTrace
 	var streamState StreamAttemptState
 	var refreshedAuthTokens = make(map[int64]struct{})
 	for attempt := 1; attempt <= p.cfg.Upstream.MaxRetries; attempt++ {
@@ -298,15 +307,16 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		accountID = claim.AccountID()
 		attemptStarted := time.Now()
 		attemptSpec := Attempt{
-			Index:       attempt,
-			RequestID:   requestID,
-			Intent:      intent,
-			Claim:       claim,
-			Body:        bodyBytes,
-			StartedAt:   attemptStarted.UTC(),
-			RetryCause:  classify(finalStatus, lastErr),
-			PromptCache: promptCacheContext,
-			StreamState: streamState,
+			Index:                  attempt,
+			RequestID:              requestID,
+			Intent:                 intent,
+			Claim:                  claim,
+			Body:                   bodyBytes,
+			StartedAt:              attemptStarted.UTC(),
+			RetryCause:             classify(finalStatus, lastErr),
+			PromptCache:            promptCacheContext,
+			StreamState:            streamState,
+			DownstreamConnectionID: downstreamConnectionID,
 		}
 		result, err := p.doAttempt(w, r, attemptSpec)
 		encryptedContentRetryStarted := time.Now()
@@ -337,6 +347,9 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 		if encryptedContentRetryCount >= maxRejectedEncryptedContentRetries {
 			timing["rejected_encrypted_content_retry_limit_reached"] = true
+		}
+		if result.StreamDeliveryTrace != nil {
+			lastStreamDeliveryTrace = result.StreamDeliveryTrace
 		}
 		if result.StreamState.DownstreamStarted {
 			streamState.DownstreamStarted = true
@@ -369,7 +382,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				text := err.Error()
 				msg = &text
 			}
-			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, selectedTokenOwnerID, accountID, msg, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, selectedTokenOwnerID, accountID, msg, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			if success {
 				p.commitSuccess(claim.TokenID())
 				p.recordPromptCacheSuccess(promptCacheContext, claim, lastResponseID)
@@ -380,7 +393,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, OutcomeSuccess, retry, false, nil)
 			p.commitSuccess(claim.TokenID())
 			p.recordPromptCacheSuccess(promptCacheContext, claim, lastResponseID)
-			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, selectedTokenOwnerID, accountID, nil, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, selectedTokenOwnerID, accountID, nil, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
 		lastErr = err
@@ -391,7 +404,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			if err != nil {
 				message = err.Error()
 			}
-			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
 		if isDeactivatedWorkspaceFailure(status, result.ErrorBody, err) {
@@ -477,7 +490,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	}
 	if errors.Is(lastErr, tokens.ErrNoToken) {
 		writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, http.StatusServiceUnavailable, "no available token")
-		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 		return
 	}
 	message := "upstream request failed"
@@ -485,7 +498,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		message = lastErr.Error()
 	}
 	writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, finalStatus, message)
-	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt)
+	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 }
 
 func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {
@@ -931,6 +944,7 @@ func (p *Pipeline) recordGatewayAttempt(ctx context.Context, attempt Attempt, re
 		ErrorCode:           attemptErrorCode(result.Status, result.ErrorBody, err, outcome),
 		ErrorMessageExcerpt: errorExcerpt(err),
 		ErrorBodyHash:       errorBodyHash(result.ErrorBody),
+		StreamDeliveryTrace: result.StreamDeliveryTrace,
 	}
 	if attempt.Claim != nil {
 		tokenID := attempt.Claim.TokenID()
@@ -1105,7 +1119,7 @@ func (p *Pipeline) withCommitRetry(ctx context.Context, fn func(context.Context)
 	return lastErr
 }
 
-func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent RequestIntent, started time.Time, status int, success bool, attempts int, tokenID *int64, tokenOwnerUserID *int64, accountID *string, errMsg *string, timing map[string]any, promptCacheContext *PromptCacheContext, affinityResult tokens.PromptAffinityResult, usage *UsageMetrics, upstreamResponseID string, firstTokenAt *time.Time) {
+func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent RequestIntent, started time.Time, status int, success bool, attempts int, tokenID *int64, tokenOwnerUserID *int64, accountID *string, errMsg *string, timing map[string]any, promptCacheContext *PromptCacheContext, affinityResult tokens.PromptAffinityResult, usage *UsageMetrics, upstreamResponseID string, firstTokenAt *time.Time, downstreamConnectionID string, streamDeliveryTrace *store.StreamDeliveryTrace) {
 	finished := time.Now().UTC()
 	duration := int(finished.Sub(started).Milliseconds())
 	if timing == nil {
@@ -1135,6 +1149,9 @@ func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent Reques
 		TTFTMs:                        ttftMillis(started, firstTokenAt),
 		DurationMs:                    &duration,
 		TimingSpans:                   timing,
+		StreamDeliveryState:           streamDeliveryState(streamDeliveryTrace),
+		DownstreamConnectionID:        nullable(downstreamConnectionID),
+		StreamDeliveryTrace:           streamDeliveryTrace,
 		InputTokens:                   usageInt(usage, func(u *UsageMetrics) int { return u.InputTokens }),
 		CacheWriteInputTokens:         usageInt(usage, func(u *UsageMetrics) int { return u.CacheWriteInputTokens }),
 		CacheWriteTokensSource:        usageString(usage, func(u *UsageMetrics) string { return u.CacheWriteTokensSource }),

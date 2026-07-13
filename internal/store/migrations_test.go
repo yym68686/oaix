@@ -95,6 +95,24 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 	}
 }
 
+func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
+	if SchemaVersion != 18 {
+		t.Fatalf("unexpected schema version: got %d want 18", SchemaVersion)
+	}
+
+	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	for _, fragment := range []string{
+		"alter table gateway_request_logs add column if not exists stream_delivery_state varchar(64)",
+		"alter table gateway_request_logs add column if not exists downstream_connection_id varchar(128)",
+		"alter table gateway_request_logs add column if not exists stream_delivery_trace jsonb",
+		"alter table gateway_request_attempts add column if not exists stream_delivery_trace jsonb",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing stream delivery migration fragment %q", fragment)
+		}
+	}
+}
+
 func TestMigrationAddsSub2APIUsageSnapshots(t *testing.T) {
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
 	for _, fragment := range []string{

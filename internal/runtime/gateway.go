@@ -73,12 +73,14 @@ func RunGateway(ctx context.Context) error {
 	oauthClient.Scope = cfg.Upstream.OAuthScope
 	pipeline.SetOAuthClient(oauthClient)
 	app := httpapi.NewApp(cfg, logger, db, tokenManager, logWriter, pipeline)
+	connectionIDs := observability.NewConnectionIDGenerator()
 	server := &http.Server{
 		Addr:         cfg.Address(),
 		Handler:      app.Handler(),
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
 		IdleTimeout:  cfg.Server.IdleTimeout,
+		ConnContext:  connectionIDs.ConnContext,
 	}
 	errCh := make(chan error, 1)
 	go func() {
