@@ -87,6 +87,10 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 	}
 	if tokenManager != nil {
 		tokenManager.SetReadyTransitionHandler(app.syncSub2APIReadyTransitions)
+		tokenManager.SetFastCapabilityResolver(func(ctx context.Context, ownerUserID int64) error {
+			_, _, err := app.resolveOfficialModelsCatalog(ctx, ownerUserID, defaultCodexClientVersion)
+			return err
+		})
 	}
 	return app
 }

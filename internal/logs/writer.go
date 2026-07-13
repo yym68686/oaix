@@ -86,6 +86,11 @@ func (w *Writer) Submit(ctx context.Context, item store.RequestLog, final bool) 
 	if item.StartedAt.IsZero() {
 		item.StartedAt = time.Now().UTC()
 	}
+	// Request handlers keep enriching these maps after the initial log is
+	// submitted. Snapshot them before handing the item to an async worker so
+	// queued writes never race with the live request.
+	item.TimingSpans = cloneAnyMap(item.TimingSpans)
+	item.PromptCacheTrace = cloneAnyMap(item.PromptCacheTrace)
 	select {
 	case w.queue <- item:
 		w.enqueued.Add(1)
@@ -104,6 +109,17 @@ func (w *Writer) Submit(ctx context.Context, item store.RequestLog, final bool) 
 		}
 	}
 	w.dropped.Add(1)
+}
+
+func cloneAnyMap(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }
 
 func (w *Writer) Stats() Stats {

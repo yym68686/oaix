@@ -85,3 +85,32 @@ func TestFinalLogDropCountWhenAllDurableWritesFail(t *testing.T) {
 		t.Fatalf("dropped = %d, want 1", got)
 	}
 }
+
+func TestSubmitSnapshotsMutableLogMaps(t *testing.T) {
+	writer := NewWriter(&fakeSink{}, nil, config.RequestLogConfig{
+		Concurrency:   1,
+		BatchSize:     10,
+		QueueMaxSize:  1,
+		FlushInterval: time.Hour,
+	})
+	timing := map[string]any{"phase": "submitted"}
+	trace := map[string]any{"source": "request"}
+
+	writer.Submit(context.Background(), store.RequestLog{
+		RequestID:        "snapshot",
+		Endpoint:         "/v1/responses",
+		StartedAt:        time.Now(),
+		TimingSpans:      timing,
+		PromptCacheTrace: trace,
+	}, false)
+	timing["phase"] = "mutated"
+	trace["source"] = "mutated"
+
+	queued := <-writer.queue
+	if got := queued.TimingSpans["phase"]; got != "submitted" {
+		t.Fatalf("queued timing phase = %v, want submitted", got)
+	}
+	if got := queued.PromptCacheTrace["source"]; got != "request" {
+		t.Fatalf("queued trace source = %v, want request", got)
+	}
+}

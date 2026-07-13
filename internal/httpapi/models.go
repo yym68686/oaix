@@ -117,11 +117,18 @@ type codexModelProfile struct {
 func (a *App) models(w http.ResponseWriter, r *http.Request) {
 	modelIDs := advertisedModelIDs()
 	if clientVersion := strings.TrimSpace(r.URL.Query().Get("client_version")); clientVersion != "" {
-		if a.writeOfficialModelsCatalog(w, r, clientVersion) {
+		if wrote, err := a.writeOfficialModelsCatalog(w, r, clientVersion); wrote {
+			return
+		} else if err != nil {
+			w.Header().Set("X-OAIX-Models-Source", "official-unavailable")
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"detail": "Model capability scan is incomplete; retry shortly",
+			})
 			return
 		}
 		w.Header().Set("X-OAIX-Models-Source", "static-fallback")
-		writeJSON(w, http.StatusOK, codexModelsCatalog(modelIDs))
+		writeJSON(w, http.StatusOK, codexModelsCatalog(modelIDs, a.cachedFastModelsForRequest(r, clientVersion)))
 		return
 	}
 
@@ -144,16 +151,43 @@ func advertisedModelIDs() []string {
 	return append(modelIDs, "gpt-image-2")
 }
 
-func codexModelsCatalog(modelIDs []string) codexModelsResponse {
+func (a *App) cachedFastModelsForRequest(r *http.Request, clientVersion string) map[string]struct{} {
+	if a == nil || a.tokens == nil || r == nil {
+		return nil
+	}
+	auth := authFromContext(r.Context())
+	ownerUserID, err := auth.proxyOwner(r.Context(), a.store)
+	if err != nil {
+		return nil
+	}
+	return a.tokens.FastModelsForOwner(ownerUserID, clientVersion, time.Now().UTC())
+}
+
+func codexModelsCatalog(modelIDs []string, fastModels map[string]struct{}) codexModelsResponse {
 	models := make([]codexModelInfo, 0, len(modelIDs))
 	for _, id := range modelIDs {
 		id = strings.TrimSpace(id)
 		if !isCodexCatalogModelID(id) {
 			continue
 		}
-		models = append(models, codexModelInfoForID(id, len(models)))
+		model := codexModelInfoForID(id, len(models))
+		if !catalogFastModelsMatch(fastModels, id) {
+			model.AdditionalSpeedTiers = []string{}
+			model.ServiceTiers = []codexServiceTier{}
+			model.DefaultServiceTier = nil
+		}
+		models = append(models, model)
 	}
 	return codexModelsResponse{Models: models}
+}
+
+func catalogFastModelsMatch(fastModels map[string]struct{}, model string) bool {
+	for fastModel := range fastModels {
+		if codexModelMatchesFamily(model, fastModel) {
+			return true
+		}
+	}
+	return false
 }
 
 func codexModelInfoForID(id string, priority int) codexModelInfo {

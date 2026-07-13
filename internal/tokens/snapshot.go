@@ -40,27 +40,31 @@ type RuntimeToken struct {
 type ReadyTransitionHandler func(ctx context.Context, tokens []store.Token)
 
 type Manager struct {
-	source          Source
-	logger          *slog.Logger
-	maxAge          time.Duration
-	refreshInterval time.Duration
-	activeCap       atomic.Int64
-	selector        Selector
-	selectorMisses  atomic.Int64
-	claimSequence   atomic.Uint64
-	claimsTotal     atomic.Int64
-	releasesTotal   atomic.Int64
-	overCapDenials  atomic.Int64
-	noTokenDenials  atomic.Int64
-	version         atomic.Int64
-	snapshot        atomic.Value
-	ownerSnapshots  sync.Map
-	cursor          atomic.Uint64
-	stopOnce        sync.Once
-	stopCh          chan struct{}
-	refreshMu       sync.Mutex
-	readyMu         sync.RWMutex
-	readyHandler    ReadyTransitionHandler
+	source           Source
+	logger           *slog.Logger
+	maxAge           time.Duration
+	refreshInterval  time.Duration
+	activeCap        atomic.Int64
+	selector         Selector
+	selectorMisses   atomic.Int64
+	claimSequence    atomic.Uint64
+	claimsTotal      atomic.Int64
+	releasesTotal    atomic.Int64
+	overCapDenials   atomic.Int64
+	noTokenDenials   atomic.Int64
+	version          atomic.Int64
+	snapshot         atomic.Value
+	ownerSnapshots   sync.Map
+	cursor           atomic.Uint64
+	stopOnce         sync.Once
+	stopCh           chan struct{}
+	refreshMu        sync.Mutex
+	readyMu          sync.RWMutex
+	readyHandler     ReadyTransitionHandler
+	capabilityMu     sync.RWMutex
+	capabilities     map[planCapabilityKey]planModelCapability
+	capabilityWrites atomic.Uint64
+	fastResolver     FastCapabilityResolver
 }
 
 type TokenPoolManager = Manager
@@ -154,6 +158,9 @@ type Intent struct {
 	PromptCacheKeyHash string
 	ExcludeTokenIDs    map[int64]struct{}
 	RequireNonFree     bool
+	RequiredPlan       string
+	RequireFast        bool
+	FastEligibleTokens map[int64]struct{}
 }
 
 type Claim struct {
@@ -184,6 +191,7 @@ func NewManager(source Source, logger *slog.Logger, maxAge, refreshInterval time
 		maxAge:          maxAge,
 		refreshInterval: refreshInterval,
 		stopCh:          make(chan struct{}),
+		capabilities:    make(map[planCapabilityKey]planModelCapability),
 	}
 	manager.SetActiveStreamCap(activeCap)
 	manager.snapshot.Store(emptySnapshot())

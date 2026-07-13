@@ -72,6 +72,8 @@ type RequestIntent struct {
 	CallerOwnerUserID   int64
 	ExcludeOwnerUserID  int64
 	TargetTokenID       int64
+	ServiceTier         string
+	RequireFast         bool
 	Stream              bool
 	Compact             bool
 	Method              string
@@ -208,6 +210,10 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	if intent.TargetTokenID > 0 {
 		timing["target_token_id"] = intent.TargetTokenID
 	}
+	if intent.RequireFast {
+		timing["fast_mode_requested"] = true
+		timing["service_tier"] = intent.ServiceTier
+	}
 	p.logs.Submit(r.Context(), store.RequestLog{
 		RequestID:                     requestID,
 		OwnerUserID:                   ptrInt64(intent.OwnerUserID),
@@ -251,18 +257,28 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var lastStreamDeliveryTrace *store.StreamDeliveryTrace
 	var streamState StreamAttemptState
 	var refreshedAuthTokens = make(map[int64]struct{})
+	baseTokenIntent := tokens.Intent{
+		Endpoint:           intent.Endpoint,
+		Model:              intent.Model,
+		OwnerUserID:        intent.OwnerUserID,
+		SelectionMode:      intent.SelectionMode,
+		ExcludeOwnerUserID: intent.ExcludeOwnerUserID,
+		TargetTokenID:      intent.TargetTokenID,
+		RequireNonFree:     requiresNonFreeTokenPlan(intent.Model),
+		RequireFast:        intent.RequireFast,
+	}
+	if intent.RequireFast {
+		eligible, eligibilityErr := p.tokens.FastEligibleTokenIDs(r.Context(), baseTokenIntent, intent.Model, time.Now().UTC())
+		baseTokenIntent.FastEligibleTokens = eligible
+		timing["fast_eligible_tokens"] = len(eligible)
+		if eligibilityErr != nil {
+			timing["fast_eligibility_error"] = eligibilityErr.Error()
+		}
+	}
 	for attempt := 1; attempt <= p.cfg.Upstream.MaxRetries; attempt++ {
 		selectStarted := time.Now()
-		tokenIntent := tokens.Intent{
-			Endpoint:           intent.Endpoint,
-			Model:              intent.Model,
-			OwnerUserID:        intent.OwnerUserID,
-			SelectionMode:      intent.SelectionMode,
-			ExcludeOwnerUserID: intent.ExcludeOwnerUserID,
-			TargetTokenID:      intent.TargetTokenID,
-			ExcludeTokenIDs:    excluded,
-			RequireNonFree:     requiresNonFreeTokenPlan(intent.Model),
-		}
+		tokenIntent := baseTokenIntent
+		tokenIntent.ExcludeTokenIDs = excluded
 		if promptCacheContext != nil {
 			tokenIntent.PromptCacheKeyHash = promptCacheContext.PromptCacheKeyHash
 		}
@@ -1312,6 +1328,16 @@ func requestID(r *http.Request) string {
 }
 
 func normalizeIntent(intent RequestIntent, body []byte) RequestIntent {
+	switch intent.Endpoint {
+	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions":
+		var metadata struct {
+			ServiceTier string `json:"service_tier"`
+		}
+		if err := json.Unmarshal(body, &metadata); err == nil {
+			intent.ServiceTier = strings.ToLower(strings.TrimSpace(metadata.ServiceTier))
+			intent.RequireFast = intent.ServiceTier == "priority" || intent.ServiceTier == "fast"
+		}
+	}
 	switch intent.Endpoint {
 	case "/v1/responses":
 		if req, err := openai.DecodeResponsesRequest(body); err == nil {

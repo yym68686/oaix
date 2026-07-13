@@ -134,27 +134,26 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		"gpt-5.4": {
 			displayName: "GPT-5.4", defaultReasoning: "medium", defaultVerbosity: "low",
 			contextWindow: 272000, maxContextWindow: 1000000, priority: 16, compHash: "2911",
-			speedTiers: 1, serviceTiers: 1,
 		},
 		"gpt-5.5": {
 			displayName: "GPT-5.5", defaultReasoning: "medium", defaultVerbosity: "low",
 			contextWindow: 272000, maxContextWindow: 272000, priority: 7, compHash: "2911",
-			speedTiers: 1, serviceTiers: 1, includeSkills: true,
+			includeSkills: true,
 		},
 		"gpt-5.6-sol": {
 			displayName: "GPT-5.6-Sol", defaultReasoning: "low", defaultVerbosity: "low",
 			contextWindow: 372000, maxContextWindow: 372000, priority: 1, compHash: "3000",
-			speedTiers: 1, serviceTiers: 1, useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
+			useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
 		},
 		"gpt-5.6-terra": {
 			displayName: "GPT-5.6-Terra", defaultReasoning: "medium", defaultVerbosity: "low",
 			contextWindow: 372000, maxContextWindow: 372000, priority: 2, compHash: "3000",
-			speedTiers: 1, serviceTiers: 1, useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
+			useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
 		},
 		"gpt-5.6-luna": {
 			displayName: "GPT-5.6-Luna", defaultReasoning: "medium", defaultVerbosity: "low",
 			contextWindow: 372000, maxContextWindow: 372000, priority: 3, compHash: "3000",
-			speedTiers: 1, serviceTiers: 1, useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v1",
+			useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v1",
 		},
 	}
 	for _, model := range payload.Models {
@@ -222,6 +221,22 @@ func TestModelsTreatsBlankClientVersionAsOpenAIList(t *testing.T) {
 	}
 	if _, ok := payload["data"]; !ok {
 		t.Fatalf("blank client_version should return OpenAI list: %s", response.Body.String())
+	}
+}
+
+func TestStaticCatalogOnlyAdvertisesCachedFastModels(t *testing.T) {
+	payload := codexModelsCatalog([]string{"gpt-5.4", "gpt-5.5", "gpt-5.6-sol"}, map[string]struct{}{
+		"gpt-5.5": {},
+	})
+	if len(payload.Models) != 3 {
+		t.Fatalf("models = %d", len(payload.Models))
+	}
+	for _, model := range payload.Models {
+		wantFast := model.Slug == "gpt-5.5"
+		gotFast := len(model.ServiceTiers) > 0 && len(model.AdditionalSpeedTiers) > 0
+		if gotFast != wantFast {
+			t.Fatalf("%s Fast = %t, want %t", model.Slug, gotFast, wantFast)
+		}
 	}
 }
 

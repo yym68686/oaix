@@ -60,6 +60,16 @@ func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) 
 			return body, intent, http.StatusBadRequest, err
 		}
 		return next, intent, http.StatusOK, nil
+	case "/v1/chat/completions":
+		if intent.RequireFast {
+			next, err := canonicalizeFastServiceTier(body)
+			if err != nil {
+				return body, intent, http.StatusBadRequest, err
+			}
+			intent.ServiceTier = "priority"
+			return next, intent, http.StatusOK, nil
+		}
+		return body, intent, http.StatusOK, nil
 	case "/v1/images/generations":
 		next, err := prepareImageGenerationPayload(body, &intent)
 		if err != nil {
@@ -77,12 +87,27 @@ func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) 
 	}
 }
 
+func canonicalizeFastServiceTier(body []byte) ([]byte, error) {
+	payload, err := decodeJSONObject(body)
+	if err != nil {
+		return body, err
+	}
+	payload["service_tier"] = "priority"
+	return openai.EncodeJSON(payload)
+}
+
 func prepareResponsesPayload(body []byte, intent *RequestIntent) ([]byte, error) {
 	payload, err := decodeJSONObject(body)
 	if err != nil {
 		return body, err
 	}
 	normalizeResponsesStringInput(payload)
+	if intent.RequireFast {
+		// The official wire value is "priority". Accept legacy/user-facing Fast
+		// aliases at the edge, but never forward a non-canonical tier upstream.
+		payload["service_tier"] = "priority"
+		intent.ServiceTier = "priority"
+	}
 	model := text(payload["model"])
 	preservePreviousResponseID := false
 	if model == defaultImagesToolModel {

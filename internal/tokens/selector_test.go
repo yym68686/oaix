@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestQuotaAwareSelectorPrefersNonFree(t *testing.T) {
@@ -99,6 +100,165 @@ func TestRequireNonFreeAllowsUnknownPlan(t *testing.T) {
 	claim, err := manager.Claim(context.Background(), Intent{RequireNonFree: true})
 	if err != nil || claim == nil {
 		t.Fatalf("Claim returned claim=%v err=%v, want unknown plan allowed", claim, err)
+	}
+	claim.Release()
+}
+
+func TestFastCapabilityIsHardConstraintAcrossSelectors(t *testing.T) {
+	free := "free"
+	k12 := "k12"
+	pro := "pro"
+	rows := makeTokens(3)
+	for index := range rows {
+		rows[index].OwnerUserID = 10
+	}
+	rows[0].PlanType = &free
+	rows[1].PlanType = &k12
+	rows[2].PlanType = &pro
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.RefreshOwner(context.Background(), 10); err != nil {
+		t.Fatal(err)
+	}
+	validUntil := time.Now().UTC().Add(time.Hour)
+	manager.SetPlanModelCapabilities(10, free, "0.144.0", nil, validUntil)
+	manager.SetPlanModelCapabilities(10, k12, "0.144.0", nil, validUntil)
+	manager.SetPlanModelCapabilities(10, pro, "0.144.0", []string{"gpt-5.5"}, validUntil)
+
+	base := Intent{OwnerUserID: 10}
+	eligible, err := manager.FastEligibleTokenIDs(context.Background(), base, "gpt-5.5", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eligible) != 1 {
+		t.Fatalf("eligible = %#v, want only Pro token", eligible)
+	}
+	fastIntent := Intent{OwnerUserID: 10, RequireFast: true, FastEligibleTokens: eligible}
+	claim, err := manager.Claim(context.Background(), fastIntent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.TokenID() != 3 {
+		t.Fatalf("selected token = %d, want Pro token 3", claim.TokenID())
+	}
+	claim.Release()
+
+	var cursor uint64
+	token, reason := PromptAffinitySelector{
+		PreferredTokenID: 1,
+		Fallback:         FillFirstSelector{},
+	}.Select(context.Background(), manager.SnapshotForOwner(10), fastIntent, 1, &cursor)
+	if token == nil || token.Token.ID != 3 || reason == "prompt_affinity_preferred" {
+		t.Fatalf("selected token=%v reason=%s, want Pro fallback token 3", token, reason)
+	}
+
+	fastIntent.TargetTokenID = 2
+	if claim, err := manager.Claim(context.Background(), fastIntent); err == nil || claim != nil {
+		if claim != nil {
+			claim.Release()
+		}
+		t.Fatalf("Fast target K12 returned claim=%v err=%v", claim, err)
+	}
+}
+
+func TestFastCapabilityExpiresAndIsModelSpecific(t *testing.T) {
+	pro := "pro"
+	rows := makeTokens(1)
+	rows[0].OwnerUserID = 10
+	rows[0].PlanType = &pro
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.RefreshOwner(context.Background(), 10); err != nil {
+		t.Fatal(err)
+	}
+	manager.SetPlanModelCapabilities(10, pro, "0.144.0", []string{"gpt-5.5"}, time.Now().UTC().Add(time.Minute))
+
+	base := Intent{OwnerUserID: 10}
+	eligible, err := manager.FastEligibleTokenIDs(context.Background(), base, "gpt-5.4", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eligible) != 0 {
+		t.Fatalf("gpt-5.4 eligible = %#v, want none", eligible)
+	}
+	eligible, err = manager.FastEligibleTokenIDs(context.Background(), base, "gpt-5.5", time.Now().UTC().Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eligible) != 0 {
+		t.Fatalf("expired eligible = %#v, want none", eligible)
+	}
+}
+
+func TestLatestPlanCapabilityReplacesOlderClientVersion(t *testing.T) {
+	pro := "pro"
+	rows := makeTokens(1)
+	rows[0].OwnerUserID = 10
+	rows[0].PlanType = &pro
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.RefreshOwner(context.Background(), 10); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	manager.SetPlanModelCapabilities(10, pro, "0.143.0", []string{"gpt-5.5"}, now.Add(time.Hour))
+	manager.SetPlanModelCapabilities(10, pro, "0.144.0", nil, now.Add(time.Hour))
+	manager.SetPlanModelCapabilities(10, pro, "0.143.9", []string{"gpt-5.5"}, now.Add(time.Hour))
+	manager.SetPlanModelCapabilities(10, pro, "not-a-version", []string{"gpt-5.5"}, now.Add(time.Hour))
+
+	eligible, err := manager.FastEligibleTokenIDs(context.Background(), Intent{OwnerUserID: 10}, "gpt-5.5", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eligible) != 0 {
+		t.Fatalf("eligible tokens = %#v, want newer no-Fast capability to revoke the old version", eligible)
+	}
+	if models := manager.FastModelsForOwner(10, "0.143.0", now); len(models) != 0 {
+		t.Fatalf("old-version fallback models = %#v, want no stale cross-version capability", models)
+	}
+}
+
+func TestFastEligibilityResolvesColdCapabilitiesOnDemand(t *testing.T) {
+	pro := "pro"
+	rows := makeTokens(1)
+	rows[0].OwnerUserID = 10
+	rows[0].PlanType = &pro
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.RefreshOwner(context.Background(), 10); err != nil {
+		t.Fatal(err)
+	}
+	resolverCalls := 0
+	manager.SetFastCapabilityResolver(func(_ context.Context, ownerUserID int64) error {
+		resolverCalls++
+		manager.SetPlanModelCapabilities(ownerUserID, pro, "0.144.0", []string{"gpt-5.5"}, time.Now().UTC().Add(time.Hour))
+		return nil
+	})
+
+	eligible, err := manager.FastEligibleTokenIDs(context.Background(), Intent{OwnerUserID: 10}, "gpt-5.5", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("resolver calls = %d, want 1", resolverCalls)
+	}
+	if _, ok := eligible[1]; !ok || len(eligible) != 1 {
+		t.Fatalf("eligible tokens = %#v, want token 1", eligible)
+	}
+}
+
+func TestRequiredPlanFiltersCatalogProbeClaims(t *testing.T) {
+	free := "free"
+	pro := "pro"
+	rows := makeTokens(2)
+	rows[0].PlanType = &free
+	rows[1].PlanType = &pro
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.Claim(context.Background(), Intent{RequiredPlan: " PRO "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.TokenID() != 2 {
+		t.Fatalf("selected token = %d, want Pro token 2", claim.TokenID())
 	}
 	claim.Release()
 }

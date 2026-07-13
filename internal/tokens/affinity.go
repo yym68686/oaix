@@ -276,6 +276,14 @@ func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 	if intent.RequireNonFree && candidate.Token.PlanType != nil && strings.EqualFold(strings.TrimSpace(*candidate.Token.PlanType), "free") {
 		return false
 	}
+	if intent.RequiredPlan != "" && planKeyForToken(candidate) != normalizePlanKey(intent.RequiredPlan) {
+		return false
+	}
+	if intent.RequireFast {
+		if _, ok := intent.FastEligibleTokens[candidate.Token.ID]; !ok {
+			return false
+		}
+	}
 	if isMarketplaceSelection(intent.SelectionMode) {
 		if intent.ExcludeOwnerUserID > 0 && candidate.Token.OwnerUserID == intent.ExcludeOwnerUserID {
 			return false

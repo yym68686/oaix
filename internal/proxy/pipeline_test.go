@@ -337,6 +337,121 @@ func TestProxyDecodesZstdRequestBeforeForwarding(t *testing.T) {
 	}
 }
 
+func TestProxyRoutesFastRequestOnlyToFastCapablePlan(t *testing.T) {
+	var upstreamAuthorization string
+	var upstreamServiceTier string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAuthorization = r.Header.Get("Authorization")
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		upstreamServiceTier, _ = payload["service_tier"].(string)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: response.completed`,
+			`data: {"type":"response.completed","response":{"id":"resp_fast","object":"response","model":"gpt-5.5","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+			``,
+		}, "\n"))
+	}))
+	defer upstream.Close()
+
+	free := "free"
+	k12 := "k12"
+	pro := "pro"
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{tokens: []store.Token{
+		{ID: 1, OwnerUserID: 42, AccessToken: "free-token", PlanType: &free, IsActive: true, CreatedAt: now, UpdatedAt: now},
+		{ID: 2, OwnerUserID: 42, AccessToken: "k12-token", PlanType: &k12, IsActive: true, CreatedAt: now, UpdatedAt: now},
+		{ID: 3, OwnerUserID: 42, AccessToken: "pro-token", PlanType: &pro, IsActive: true, CreatedAt: now, UpdatedAt: now},
+	}}
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                1,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool:  config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{QueueMaxSize: 10, BatchSize: 1, Concurrency: 1},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.RefreshOwner(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	validUntil := time.Now().UTC().Add(time.Hour)
+	manager.SetPlanModelCapabilities(42, free, "0.144.0", nil, validUntil)
+	manager.SetPlanModelCapabilities(42, k12, "0.144.0", nil, validUntil)
+	manager.SetPlanModelCapabilities(42, pro, "0.144.0", []string{"gpt-5.5"}, validUntil)
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","service_tier":"priority"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", OwnerUserID: 42})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamAuthorization != "Bearer pro-token" {
+		t.Fatalf("upstream Authorization = %q, want Pro token", upstreamAuthorization)
+	}
+	if upstreamServiceTier != "priority" {
+		t.Fatalf("upstream service_tier = %q", upstreamServiceTier)
+	}
+}
+
+func TestNormalizeIntentRecognizesFastServiceTierAliases(t *testing.T) {
+	for _, tier := range []string{"priority", "fast", " PRIORITY "} {
+		intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(fmt.Sprintf(`{"model":"gpt-5.5","service_tier":%q}`, tier)))
+		if !intent.RequireFast {
+			t.Fatalf("service_tier %q did not require Fast", tier)
+		}
+	}
+	for _, tier := range []string{"", "default", "auto"} {
+		intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(fmt.Sprintf(`{"model":"gpt-5.5","service_tier":%q}`, tier)))
+		if intent.RequireFast {
+			t.Fatalf("service_tier %q unexpectedly required Fast", tier)
+		}
+	}
+}
+
+func TestPrepareResponsesPayloadCanonicalizesFastServiceTierAliases(t *testing.T) {
+	for _, test := range []struct {
+		endpoint string
+		tier     string
+	}{
+		{endpoint: "/v1/responses", tier: "fast"},
+		{endpoint: "/v1/responses", tier: " PRIORITY "},
+		{endpoint: "/v1/chat/completions", tier: "Fast"},
+	} {
+		body := []byte(fmt.Sprintf(`{"model":"gpt-5.5","input":"hello","service_tier":%q}`, test.tier))
+		intent := normalizeIntent(RequestIntent{Endpoint: test.endpoint}, body)
+		prepared, preparedIntent, status, err := prepareUpstreamPayload(
+			httptest.NewRequest(http.MethodPost, test.endpoint, nil),
+			body,
+			intent,
+		)
+		if err != nil || status != http.StatusOK {
+			t.Fatalf("tier %q: status=%d err=%v", test.tier, status, err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(prepared, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if got := payload["service_tier"]; got != "priority" {
+			t.Fatalf("tier %q forwarded as %v", test.tier, got)
+		}
+		if preparedIntent.ServiceTier != "priority" || !preparedIntent.RequireFast {
+			t.Fatalf("tier %q intent = %#v", test.tier, preparedIntent)
+		}
+	}
+}
+
 func TestProxyRetriesAfterMalformedCompactionEncryptedContent400(t *testing.T) {
 	var upstreamBodies [][]byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

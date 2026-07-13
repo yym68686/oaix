@@ -87,7 +87,7 @@ func TestOfficialModelsRetriesAnotherAvailableAccount(t *testing.T) {
 	app.modelCatalog.upstreamURL = server.URL
 	app.modelCatalog.maxAttempts = 2
 
-	entry, err := app.fetchOfficialModelsCatalog(context.Background(), ownerUserID, "0.144.0")
+	entry, err := app.fetchOfficialModelsPlanCatalog(context.Background(), ownerUserID, "pro", "0.144.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestOfficialModelsRetriesAnotherAvailableAccount(t *testing.T) {
 	}
 }
 
-func TestModelsFallsBackWhileOfficialFetchContinues(t *testing.T) {
+func TestModelsReturnsRetryableErrorWhileOfficialFetchContinues(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
 		_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.6-sol"}]}`)
@@ -112,8 +112,8 @@ func TestModelsFallsBackWhileOfficialFetchContinues(t *testing.T) {
 	app.modelCatalog.waitTimeout = 5 * time.Millisecond
 
 	first := serveModelsForOwner(app, ownerUserID)
-	if first.Header().Get("X-OAIX-Models-Source") != "static-fallback" {
-		t.Fatalf("first source = %q", first.Header().Get("X-OAIX-Models-Source"))
+	if first.Code != http.StatusServiceUnavailable || first.Header().Get("X-OAIX-Models-Source") != "official-unavailable" {
+		t.Fatalf("first response = %d %s headers=%#v", first.Code, first.Body.String(), first.Header())
 	}
 
 	time.Sleep(100 * time.Millisecond)
@@ -169,6 +169,176 @@ func TestOfficialModelsCatalogIsIsolatedByOwner(t *testing.T) {
 	serveModelsForOwner(app, k12OwnerID)
 	if got := requests.Load(); got != 2 {
 		t.Fatalf("official requests = %d, want one request per owner", got)
+	}
+}
+
+func TestOfficialModelsCatalogUsesFastPlanAcrossMixedPool(t *testing.T) {
+	const fastBody = `{"models":[{"slug":"gpt-5.5","additional_speed_tiers":["fast"],"service_tiers":[{"id":"priority","name":"Fast","description":"1.5x speed"}]}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-pro":
+			_, _ = io.WriteString(w, fastBody)
+		case "Bearer access-free", "Bearer access-k12":
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.5","additional_speed_tiers":[],"service_tiers":[]}]}`)
+		default:
+			http.Error(w, "unexpected token", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ownerUserID := int64(47)
+	app := modelsCatalogTestApp(t, ownerUserID, []store.Token{
+		modelsCatalogToken(1, ownerUserID, "free", "access-free", "account-free"),
+		modelsCatalogToken(2, ownerUserID, "k12", "access-k12", "account-k12"),
+		modelsCatalogToken(3, ownerUserID, "pro", "access-pro", "account-pro"),
+	})
+	app.modelCatalog.upstreamURL = server.URL
+
+	response := serveModelsForOwner(app, ownerUserID)
+	if response.Code != http.StatusOK || response.Body.String() != fastBody {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("X-OAIX-Models-Plan") != "pro" {
+		t.Fatalf("selected plan = %q", response.Header().Get("X-OAIX-Models-Plan"))
+	}
+	if response.Header().Get("X-OAIX-Models-Plans") != "free,k12,pro" {
+		t.Fatalf("scanned plans = %q", response.Header().Get("X-OAIX-Models-Plans"))
+	}
+
+	second := serveModelsForOwner(app, ownerUserID)
+	if second.Body.String() != fastBody || second.Header().Get("X-OAIX-Models-Cache") != "hit" {
+		t.Fatalf("cached response = %d %s headers=%#v", second.Code, second.Body.String(), second.Header())
+	}
+}
+
+func TestFastRequestCapabilityProbeWorksBeforeModelsRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-pro":
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.5","service_tiers":[{"id":"priority","name":"Fast"}]}]}`)
+		case "Bearer access-k12":
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.5","service_tiers":[]}]}`)
+		default:
+			http.Error(w, "unexpected token", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ownerUserID := int64(471)
+	app := modelsCatalogTestApp(t, ownerUserID, []store.Token{
+		modelsCatalogToken(1, ownerUserID, "k12", "access-k12", "account-k12"),
+		modelsCatalogToken(2, ownerUserID, "pro", "access-pro", "account-pro"),
+	})
+	app.modelCatalog.upstreamURL = server.URL
+
+	eligible, err := app.tokens.FastEligibleTokenIDs(
+		context.Background(),
+		tokens.Intent{OwnerUserID: ownerUserID},
+		"gpt-5.5",
+		time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := eligible[2]; !ok || len(eligible) != 1 {
+		t.Fatalf("eligible tokens = %#v, want only Pro token 2", eligible)
+	}
+}
+
+func TestOfficialModelsCatalogHidesFastOnlyWhenEveryPlanLacksIt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.5","additional_speed_tiers":[],"service_tiers":[]}]}`)
+	}))
+	defer server.Close()
+
+	ownerUserID := int64(48)
+	app := modelsCatalogTestApp(t, ownerUserID, []store.Token{
+		modelsCatalogToken(1, ownerUserID, "free", "access-free", "account-free"),
+		modelsCatalogToken(2, ownerUserID, "k12", "access-k12", "account-k12"),
+	})
+	app.modelCatalog.upstreamURL = server.URL
+
+	response := serveModelsForOwner(app, ownerUserID)
+	if response.Code != http.StatusOK || response.Header().Get("X-OAIX-Models-Source") != "official" {
+		t.Fatalf("response = %d %s headers=%#v", response.Code, response.Body.String(), response.Header())
+	}
+	if strings.Contains(response.Body.String(), `"id":"priority"`) || strings.Contains(response.Body.String(), `"fast"`) {
+		t.Fatalf("all-no-Fast response advertised Fast: %s", response.Body.String())
+	}
+	if response.Header().Get("X-OAIX-Models-Plans") != "free,k12" {
+		t.Fatalf("scanned plans = %q", response.Header().Get("X-OAIX-Models-Plans"))
+	}
+}
+
+func TestOfficialModelsCatalogChoosesMostCompleteFastPlanDeterministically(t *testing.T) {
+	const proBody = `{"models":[{"slug":"gpt-5.5","service_tiers":[{"id":"priority","name":"Fast"}]}]}`
+	const teamBody = `{"models":[{"slug":"gpt-5.4","service_tiers":[{"id":"priority","name":"Fast"}]},{"slug":"gpt-5.5","service_tiers":[{"id":"priority","name":"Fast"}]}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-pro":
+			_, _ = io.WriteString(w, proBody)
+		case "Bearer access-team":
+			time.Sleep(20 * time.Millisecond)
+			_, _ = io.WriteString(w, teamBody)
+		default:
+			http.Error(w, "unexpected token", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ownerUserID := int64(481)
+	app := modelsCatalogTestApp(t, ownerUserID, []store.Token{
+		modelsCatalogToken(1, ownerUserID, "pro", "access-pro", "account-pro"),
+		modelsCatalogToken(2, ownerUserID, "team", "access-team", "account-team"),
+	})
+	app.modelCatalog.upstreamURL = server.URL
+
+	response := serveModelsForOwner(app, ownerUserID)
+	if response.Code != http.StatusOK || response.Body.String() != teamBody {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	if plan := response.Header().Get("X-OAIX-Models-Plan"); plan != "team" {
+		t.Fatalf("selected plan = %q, want team", plan)
+	}
+}
+
+func TestOfficialModelsCatalogDoesNotTreatIncompleteScanAsNoFast(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer access-k12" {
+			http.Error(w, "temporary failure", http.StatusBadGateway)
+			return
+		}
+		_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.5","additional_speed_tiers":[],"service_tiers":[]}]}`)
+	}))
+	defer server.Close()
+
+	ownerUserID := int64(49)
+	app := modelsCatalogTestApp(t, ownerUserID, []store.Token{
+		modelsCatalogToken(1, ownerUserID, "free", "access-free", "account-free"),
+		modelsCatalogToken(2, ownerUserID, "k12", "access-k12", "account-k12"),
+	})
+	app.modelCatalog.upstreamURL = server.URL
+
+	response := serveModelsForOwner(app, ownerUserID)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("X-OAIX-Models-Source") != "official-unavailable" {
+		t.Fatalf("response = %d %s headers=%#v", response.Code, response.Body.String(), response.Header())
+	}
+	if strings.Contains(response.Body.String(), `"models"`) {
+		t.Fatalf("incomplete scan returned a misleading model catalog: %s", response.Body.String())
+	}
+}
+
+func TestOfficialFastModelsPrefersServiceTiersOverLegacyField(t *testing.T) {
+	models, count, err := officialFastModels([]byte(`{"models":[
+		{"slug":"gpt-5.4","additional_speed_tiers":["fast"],"service_tiers":[]},
+		{"slug":"gpt-5.5","additional_speed_tiers":["fast"]},
+		{"slug":"gpt-5.6-sol","service_tiers":[{"id":"priority","name":"Fast"}]}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 || !equalStrings(models, []string{"gpt-5.5", "gpt-5.6-sol"}) {
+		t.Fatalf("models=%#v count=%d", models, count)
 	}
 }
 
