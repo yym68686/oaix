@@ -88,6 +88,16 @@ func TestStreamDeliveryTraceState(t *testing.T) {
 			want:  "http_error_delivered",
 		},
 		{
+			name:  "normalized provider HTTP error delivered",
+			trace: &StreamDeliveryTrace{End: StreamDeliveryEndTrace{Reason: "upstream_provider_error_normalized_http_error_delivered"}},
+			want:  "http_error_delivered",
+		},
+		{
+			name:  "normalized provider failure buffered",
+			trace: &StreamDeliveryTrace{End: StreamDeliveryEndTrace{Reason: "upstream_provider_error_normalized_failure_buffered"}},
+			want:  "terminal_received",
+		},
+		{
 			name:  "HTTP error write failed",
 			trace: &StreamDeliveryTrace{End: StreamDeliveryEndTrace{Reason: "downstream_http_error_write_error", Error: "broken pipe"}},
 			want:  "http_error_write_failed",

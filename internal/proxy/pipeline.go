@@ -1363,7 +1363,7 @@ func writeResponsesFailureResponse(w http.ResponseWriter, downstreamStarted bool
 	}
 	if downstreamStarted {
 		err := writeDownstreamStreamEvent(w, trace, failure.streamEvent(), true)
-		finishDeliveredResponsesFailureTrace(trace, err, false)
+		finishDeliveredResponsesFailureTrace(trace, err, false, failure.sourceEventType)
 		return err
 	}
 	status := failure.status
@@ -1371,7 +1371,7 @@ func writeResponsesFailureResponse(w http.ResponseWriter, downstreamStarted bool
 		status = http.StatusBadGateway
 	}
 	err := writeResponsesFailureJSON(w, status, failure.data)
-	finishDeliveredResponsesFailureTrace(trace, err, true)
+	finishDeliveredResponsesFailureTrace(trace, err, true, failure.sourceEventType)
 	return err
 }
 

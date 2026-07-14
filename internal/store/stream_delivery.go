@@ -89,8 +89,10 @@ func (t *StreamDeliveryTrace) State() string {
 		return ""
 	}
 	switch t.End.Reason {
-	case "upstream_response_failed_http_error_delivered":
+	case "upstream_response_failed_http_error_delivered", "upstream_provider_error_normalized_http_error_delivered":
 		return "http_error_delivered"
+	case "upstream_provider_error_normalized_failure_buffered":
+		return "terminal_received"
 	case "downstream_http_error_write_error":
 		return "http_error_write_failed"
 	}

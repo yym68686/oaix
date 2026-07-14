@@ -1623,6 +1623,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 	firstTokenAt := (*time.Time)(nil)
 	eventOrdinal := 0
 	var deliveredFailure *responsesFailureTerminal
+	var responseFailureMetadata map[string]any
 	writeImmediateKeepalive := func() error {
 		if streamState.KeepaliveSent {
 			return nil
@@ -1652,7 +1653,14 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		typ := eventType(event, payload)
 		sequenceNumber := payloadSequenceNumber(payload)
 		observeUpstreamStreamEvent(trace, typ, eventOrdinal, sequenceNumber, event.Data)
-		if failure := canonicalResponsesFailureTerminal(payload, typ, attempt.Intent.ResponseModelAlias, eventOrdinal, sequenceNumber); failure != nil {
+		if typ == "response.created" {
+			responseFailureMetadata = responsesFailureResponseMetadata(payload, attempt.Intent.ResponseModelAlias)
+		}
+		failure := canonicalResponsesFailureTerminal(payload, typ, attempt.Intent.ResponseModelAlias, eventOrdinal, sequenceNumber)
+		if failure == nil {
+			failure = canonicalProviderDeclaredResponsesErrorTerminal(payload, typ, attempt.Intent.ResponseModelAlias, eventOrdinal, sequenceNumber, responseFailureMetadata)
+		}
+		if failure != nil {
 			if !committed {
 				return streamPreflightError{
 					status:  failure.status,
@@ -1730,13 +1738,16 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		if errors.Is(err, errStopSSE) {
 			deliveryErr = nil
 		}
-		finishDeliveredResponsesFailureTrace(trace, deliveryErr, false)
+		finishDeliveredResponsesFailureTrace(trace, deliveryErr, false, deliveredFailure.sourceEventType)
 		result := newResult()
 		result.Status = deliveredFailure.status
 		result.Committed = true
 		result.Retry = false
 		result.ErrorBody = deliveredFailure.data
 		result.ResponsesFailure = deliveredFailure
+		if result.ResponseID == "" {
+			result.ResponseID = deliveredFailure.responseID
+		}
 		if deliveryErr != nil {
 			return result, fmt.Errorf("%s; downstream failure delivery failed: %w", deliveredFailure.message, deliveryErr)
 		}
@@ -1754,7 +1765,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		var preflight streamPreflightError
 		if errors.As(err, &preflight) {
 			if preflight.failure != nil {
-				finishBufferedResponsesFailureTrace(trace)
+				finishBufferedResponsesFailureTrace(trace, preflight.failure.sourceEventType)
 			} else {
 				finishStreamDeliveryTrace(trace, err)
 			}
@@ -1763,6 +1774,9 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 			result.Retry = retryableStatus(preflight.status)
 			result.ErrorBody = preflight.raw
 			result.ResponsesFailure = preflight.failure
+			if preflight.failure != nil && result.ResponseID == "" {
+				result.ResponseID = preflight.failure.responseID
+			}
 			return result, errors.New(preflight.message)
 		}
 		finishStreamDeliveryTrace(trace, err)
@@ -1821,6 +1835,8 @@ type responsesFailureTerminal struct {
 	payloadSequenceNumber *int64
 	status                int
 	message               string
+	sourceEventType       string
+	responseID            string
 }
 
 func (f *responsesFailureTerminal) streamEvent() bufferedStreamEvent {
@@ -1859,22 +1875,55 @@ func canonicalResponsesFailureTerminal(payload map[string]any, effectiveType, mo
 	if !ok {
 		return nil
 	}
+	return buildResponsesFailureTerminal(
+		errorObject,
+		boundedResponsesFailureResponseMetadata(response, modelAlias),
+		eventOrdinal,
+		sequenceNumber,
+		"response.failed",
+	)
+}
+
+func canonicalProviderDeclaredResponsesErrorTerminal(payload map[string]any, effectiveType, modelAlias string, eventOrdinal int, sequenceNumber *int64, fallbackResponseMetadata map[string]any) *responsesFailureTerminal {
+	if strings.ToLower(strings.TrimSpace(effectiveType)) != "error" || payload == nil {
+		return nil
+	}
+	rawType, ok := payload["type"].(string)
+	if !ok || strings.ToLower(strings.TrimSpace(rawType)) != "error" {
+		return nil
+	}
+	errorObject, ok := payload["error"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	hasSemanticSignal := false
+	for _, key := range []string{"message", "code", "type"} {
+		if value, ok := errorObject[key].(string); ok && strings.TrimSpace(value) != "" {
+			hasSemanticSignal = true
+			break
+		}
+	}
+	if !hasSemanticSignal {
+		return nil
+	}
+	metadata := cloneMap(fallbackResponseMetadata)
+	if alias := boundedResponsesFailureString(modelAlias, maxResponsesFailureMetadataBytes); alias != "" {
+		if metadata == nil {
+			metadata = make(map[string]any)
+		}
+		metadata["model"] = alias
+	}
+	return buildResponsesFailureTerminal(errorObject, metadata, eventOrdinal, sequenceNumber, "error")
+}
+
+func buildResponsesFailureTerminal(errorObject, responseMetadata map[string]any, eventOrdinal int, sequenceNumber *int64, sourceEventType string) *responsesFailureTerminal {
 	boundedError := boundedResponsesErrorObject(errorObject)
 	normalizedResponse := map[string]any{
 		"status": "failed",
 		"error":  boundedError,
 	}
-	for _, key := range []string{"id", "object"} {
-		if value := boundedResponsesFailureString(response[key], maxResponsesFailureMetadataBytes); value != "" {
-			normalizedResponse[key] = value
-		}
-	}
-	model := boundedResponsesFailureString(response["model"], maxResponsesFailureMetadataBytes)
-	if alias := boundedResponsesFailureString(modelAlias, maxResponsesFailureMetadataBytes); alias != "" {
-		model = alias
-	}
-	if model != "" {
-		normalizedResponse["model"] = model
+	for key, value := range responseMetadata {
+		normalizedResponse[key] = value
 	}
 	normalized := map[string]any{
 		"type":     "response.failed",
@@ -1888,13 +1937,40 @@ func canonicalResponsesFailureTerminal(payload map[string]any, effectiveType, mo
 		return nil
 	}
 	statusCode, message := responsesErrorStatus(boundedError)
+	responseID, _ := normalizedResponse["id"].(string)
 	return &responsesFailureTerminal{
 		data:                  data,
 		eventOrdinal:          eventOrdinal,
 		payloadSequenceNumber: cloneInt64(sequenceNumber),
 		status:                statusCode,
 		message:               message,
+		sourceEventType:       sourceEventType,
+		responseID:            responseID,
 	}
+}
+
+func responsesFailureResponseMetadata(payload map[string]any, modelAlias string) map[string]any {
+	response, ok := payload["response"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return boundedResponsesFailureResponseMetadata(response, modelAlias)
+}
+
+func boundedResponsesFailureResponseMetadata(response map[string]any, modelAlias string) map[string]any {
+	metadata := make(map[string]any)
+	for _, key := range []string{"id", "object", "model"} {
+		if value := boundedResponsesFailureString(response[key], maxResponsesFailureMetadataBytes); value != "" {
+			metadata[key] = value
+		}
+	}
+	if alias := boundedResponsesFailureString(modelAlias, maxResponsesFailureMetadataBytes); alias != "" {
+		metadata["model"] = alias
+	}
+	if len(metadata) == 0 {
+		return nil
+	}
+	return metadata
 }
 
 func boundedResponsesErrorObject(input map[string]any) map[string]any {

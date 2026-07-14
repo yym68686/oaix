@@ -1514,6 +1514,104 @@ func TestProxyPreservesContextLengthFailureAfterKeepalive(t *testing.T) {
 	}
 }
 
+func TestProxyNormalizesProviderDeclaredContextErrorAfterKeepalive(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: response.created`,
+			`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_provider_ctx","object":"response","model":"internal-model","status":"in_progress"}}`,
+			``,
+			`event: response.in_progress`,
+			`data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_provider_ctx","status":"in_progress"}}`,
+			``,
+			`event: error`,
+			`data: {"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","param":"input"},"sequence_number":2}`,
+			``,
+		}, "\n"))
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, AccessToken: "upstream-token-1", IsActive: true, CreatedAt: now, UpdatedAt: now},
+			{ID: 2, AccessToken: "upstream-token-2", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorCh: make(chan *time.Time, 1),
+	}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL, 3, fakes)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"public-model","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{
+		Endpoint:           "/v1/responses",
+		Model:              "internal-model",
+		ResponseModelAlias: "public-model",
+		Stream:             true,
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("wire status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want one non-retryable attempt", got)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: keepalive") || strings.Count(body, "event: response.failed") != 1 {
+		t.Fatalf("normalized provider failure stream is malformed: %q", body)
+	}
+	if strings.Contains(body, "event: error") || strings.Contains(body, "oaix_gateway_error") || strings.Contains(body, "[DONE]") || strings.Contains(body, "internal-model") {
+		t.Fatalf("provider error leaked or was followed by a fallback terminator: %q", body)
+	}
+
+	var terminal map[string]any
+	parseErr := sse.NewParser(1<<20).Parse(context.Background(), strings.NewReader(body), func(event sse.Event) error {
+		if event.Event != "response.failed" {
+			return nil
+		}
+		return json.Unmarshal(event.Data, &terminal)
+	})
+	if parseErr != nil {
+		t.Fatal(parseErr)
+	}
+	response, _ := terminal["response"].(map[string]any)
+	errorObject, _ := response["error"].(map[string]any)
+	if terminal["type"] != "response.failed" || terminal["sequence_number"] != float64(2) {
+		t.Fatalf("unexpected canonical terminal envelope: %v", terminal)
+	}
+	if response["id"] != "resp_provider_ctx" || response["object"] != "response" || response["model"] != "public-model" || response["status"] != "failed" {
+		t.Fatalf("unexpected canonical response metadata: %v", response)
+	}
+	if errorObject["type"] != "invalid_request_error" || errorObject["code"] != "context_length_exceeded" || errorObject["param"] != "input" || errorObject["message"] != "Your input exceeds the context window of this model. Please adjust your input and try again." {
+		t.Fatalf("provider error semantics were not preserved: %v", errorObject)
+	}
+
+	select {
+	case until := <-fakes.tokenErrorCh:
+		t.Fatalf("context failure must not cool down the token: %v", until)
+	case <-time.After(200 * time.Millisecond):
+	}
+	fakes.mu.Lock()
+	defer fakes.mu.Unlock()
+	if len(fakes.attempts) != 1 {
+		t.Fatalf("gateway attempts = %d, want 1", len(fakes.attempts))
+	}
+	attempt := fakes.attempts[0]
+	if attempt.StatusCode == nil || *attempt.StatusCode != http.StatusBadRequest || attempt.Success == nil || *attempt.Success || attempt.Retry == nil || *attempt.Retry || attempt.Outcome != string(OutcomeUpstream4xx) || attempt.ErrorCode == nil || *attempt.ErrorCode != "context_length_exceeded" || attempt.CooldownUntil != nil {
+		t.Fatalf("unexpected normalized provider failure attempt: %+v", attempt)
+	}
+	trace := attempt.StreamDeliveryTrace
+	if trace == nil || trace.Upstream.FirstResponseFailed != nil || trace.Upstream.ResponseFailedCount != 0 || trace.Downstream.FirstResponseFailed == nil {
+		t.Fatalf("normalized provider failure trace lost raw-vs-downstream provenance: %+v", trace)
+	}
+	if trace.State() != "terminal_flushed" || trace.End.Reason != "upstream_provider_error_normalized_failure_delivered" || trace.End.Error != "" {
+		t.Fatalf("unexpected normalized provider failure trace: %+v state=%q", trace, trace.State())
+	}
+}
+
 func TestProxyDiscardsRetriedFailureWhenLaterAttemptSucceeds(t *testing.T) {
 	var callsMu sync.Mutex
 	upstreamCalls := 0
@@ -2147,6 +2245,59 @@ func TestStreamResponsesPreflightFailureDoesNotCommit(t *testing.T) {
 	}
 }
 
+func TestStreamResponsesBuffersNormalizedProviderErrorWithRawProvenance(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := strings.Join([]string{
+		`event: response.created`,
+		`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_provider_error","object":"response","model":"internal-model","status":"in_progress"}}`,
+		``,
+		`event: error`,
+		`data: {"type":"error","sequence_number":2,"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"input is too long","param":"input"}}`,
+		``,
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.streamResponsesWithPreflight(recorder, resp, Attempt{Intent: RequestIntent{
+		Endpoint:           "/v1/responses",
+		Model:              "internal-model",
+		ResponseModelAlias: "public-model",
+		Stream:             true,
+	}})
+	if err == nil || result.Committed || result.Retry || result.Status != http.StatusBadRequest {
+		t.Fatalf("unexpected normalized provider error result: %+v err=%v", result, err)
+	}
+	if !result.StreamState.DownstreamStarted || !result.StreamState.KeepaliveSent {
+		t.Fatalf("response.created should start only the keepalive: %+v", result.StreamState)
+	}
+	if result.ResponseID != "resp_provider_error" || result.ResponsesFailure == nil || result.ResponsesFailure.sourceEventType != "error" {
+		t.Fatalf("normalized provider failure metadata was not retained: %+v", result)
+	}
+	if len(result.ErrorBody) == 0 || &result.ErrorBody[0] != &result.ResponsesFailure.data[0] {
+		t.Fatal("normalized provider failure must retain one owned canonical payload")
+	}
+	for _, expected := range []string{`"id":"resp_provider_error"`, `"model":"public-model"`, `"sequence_number":2`, `"code":"context_length_exceeded"`} {
+		if !bytes.Contains(result.ResponsesFailure.data, []byte(expected)) {
+			t.Fatalf("normalized provider terminal missing %s: %q", expected, result.ResponsesFailure.data)
+		}
+	}
+	trace := result.StreamDeliveryTrace
+	if trace == nil || trace.Upstream.ParserEventCount != 2 || trace.Upstream.LastEventOrdinal != 2 || trace.Upstream.LastPayloadSequenceNumber == nil || *trace.Upstream.LastPayloadSequenceNumber != 2 {
+		t.Fatalf("provider error parser provenance missing: %+v", trace)
+	}
+	if trace.Upstream.ResponseFailedCount != 0 || trace.Upstream.FirstResponseFailed != nil || trace.Downstream.FirstResponseFailed != nil || trace.End.Reason != "upstream_provider_error_normalized_failure_buffered" || trace.End.Error != "" {
+		t.Fatalf("raw provider error was misrepresented as an upstream response.failed: %+v", trace)
+	}
+	output := recorder.Body.String()
+	if !strings.Contains(output, "event: keepalive") || strings.Contains(output, "response.created") || strings.Contains(output, "response.failed") || strings.Contains(output, "event: error") {
+		t.Fatalf("preflight provider error should leave only the keepalive on wire: %q", output)
+	}
+}
+
 func TestResponseFailureStatusContextLengthExceededWithoutTypeIsBadRequest(t *testing.T) {
 	status, message, failed := responseFailureStatus(map[string]any{
 		"type": "response.failed",
@@ -2212,6 +2363,38 @@ func TestStreamResponsesNormalizesFailureAfterSemanticOutput(t *testing.T) {
 	}
 }
 
+func TestStreamResponsesNormalizesProviderErrorAfterSemanticOutput(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := append(
+		sse.Encode("response.output_text.delta", []byte(`{"type":"response.output_text.delta","sequence_number":1,"delta":"partial"}`)),
+		sse.Encode("error", []byte(`{"type":"error","sequence_number":2,"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"input is too long","param":"input"}}`))...,
+	)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.streamResponsesWithPreflight(recorder, resp, Attempt{
+		Intent: RequestIntent{Endpoint: "/v1/responses", Stream: true},
+	})
+	if err == nil || result.Status != http.StatusBadRequest || !result.Committed || result.Retry || result.ResponsesFailure == nil {
+		t.Fatalf("unexpected committed provider failure result: %+v err=%v", result, err)
+	}
+	bodyText := recorder.Body.String()
+	if !strings.Contains(bodyText, "response.output_text.delta") || strings.Count(bodyText, "event: response.failed") != 1 || !strings.Contains(bodyText, `"code":"context_length_exceeded"`) {
+		t.Fatalf("committed provider error was not normalized exactly once: %q", bodyText)
+	}
+	if strings.Contains(bodyText, "event: error") || strings.Contains(bodyText, "[DONE]") {
+		t.Fatalf("raw provider error or fake terminator leaked downstream: %q", bodyText)
+	}
+	trace := result.StreamDeliveryTrace
+	if trace == nil || trace.Upstream.FirstResponseFailed != nil || trace.Downstream.FirstResponseFailed == nil || trace.State() != "terminal_flushed" || trace.End.Reason != "upstream_provider_error_normalized_failure_delivered" {
+		t.Fatalf("unexpected committed provider failure trace: %+v", trace)
+	}
+}
+
 func TestCanonicalResponsesFailureTerminalNormalizesCompatiblePayloads(t *testing.T) {
 	validResponse := map[string]any{
 		"status": "failed",
@@ -2242,6 +2425,101 @@ func TestCanonicalResponsesFailureTerminalNormalizesCompatiblePayloads(t *testin
 				t.Fatalf("canonical terminal = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCanonicalProviderDeclaredResponsesErrorTerminalRequiresExplicitSemanticError(t *testing.T) {
+	sequenceNumber := int64(2)
+	validPayload := map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "invalid_request_error",
+			"code":    "context_length_exceeded",
+			"message": "input is too long",
+			"param":   "input",
+		},
+	}
+	metadata := map[string]any{
+		"id":     "resp_provider_error",
+		"object": "response",
+		"model":  "internal-model",
+	}
+	if got := eventType(sse.Event{}, validPayload); got != "error" {
+		t.Fatalf("data-only provider error effective type = %q", got)
+	}
+	failure := canonicalProviderDeclaredResponsesErrorTerminal(validPayload, "error", "public-model", 3, &sequenceNumber, metadata)
+	if failure == nil || failure.sourceEventType != "error" || failure.status != http.StatusBadRequest || failure.responseID != "resp_provider_error" {
+		t.Fatalf("unexpected canonical provider failure: %+v", failure)
+	}
+	for _, expected := range []string{
+		`"type":"response.failed"`,
+		`"sequence_number":2`,
+		`"id":"resp_provider_error"`,
+		`"object":"response"`,
+		`"model":"public-model"`,
+		`"status":"failed"`,
+		`"type":"invalid_request_error"`,
+		`"code":"context_length_exceeded"`,
+		`"message":"input is too long"`,
+		`"param":"input"`,
+	} {
+		if !bytes.Contains(failure.data, []byte(expected)) {
+			t.Fatalf("canonical provider failure missing %s: %q", expected, failure.data)
+		}
+	}
+	if bytes.Contains(failure.data, []byte("internal-model")) {
+		t.Fatalf("upstream model leaked through public alias: %q", failure.data)
+	}
+
+	codeOnly := canonicalProviderDeclaredResponsesErrorTerminal(map[string]any{
+		"type":  "error",
+		"error": map[string]any{"code": "context_length_exceeded"},
+	}, "error", "", 1, nil, nil)
+	if codeOnly == nil || codeOnly.status != http.StatusBadRequest {
+		t.Fatalf("explicit provider error code should be sufficient semantic evidence: %+v", codeOnly)
+	}
+
+	tests := []struct {
+		name          string
+		payload       map[string]any
+		effectiveType string
+	}{
+		{name: "nil payload", effectiveType: "error"},
+		{name: "non error effective type", payload: validPayload, effectiveType: "response.failed"},
+		{name: "missing top-level type", payload: map[string]any{"error": validPayload["error"]}, effectiveType: "error"},
+		{name: "conflicting top-level type", payload: map[string]any{"type": "response.failed", "error": validPayload["error"]}, effectiveType: "error"},
+		{name: "non-string top-level type", payload: map[string]any{"type": 1, "error": validPayload["error"]}, effectiveType: "error"},
+		{name: "scalar error", payload: map[string]any{"type": "error", "error": "input is too long"}, effectiveType: "error"},
+		{name: "empty error", payload: map[string]any{"type": "error", "error": map[string]any{}}, effectiveType: "error"},
+		{name: "blank semantic fields", payload: map[string]any{"type": "error", "error": map[string]any{"message": " ", "code": "", "type": "\t"}}, effectiveType: "error"},
+		{name: "non-string semantic fields", payload: map[string]any{"type": "error", "error": map[string]any{"message": 1, "code": true}}, effectiveType: "error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := canonicalProviderDeclaredResponsesErrorTerminal(tt.payload, tt.effectiveType, "", 1, nil, nil); got != nil {
+				t.Fatalf("unexpected provider error promotion: %+v", got)
+			}
+		})
+	}
+}
+
+func TestCanonicalProviderDeclaredResponsesErrorTerminalBoundsRetainedPayload(t *testing.T) {
+	failure := canonicalProviderDeclaredResponsesErrorTerminal(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"code":    "context_length_exceeded",
+			"message": strings.Repeat("x", 2<<20),
+			"ignored": strings.Repeat("y", 2<<20),
+		},
+	}, "error", "public-model", 1, nil, nil)
+	if failure == nil {
+		t.Fatal("expected bounded canonical provider failure")
+	}
+	if len(failure.data) >= maxResponsesFailurePayloadBytes || len(failure.message) > maxResponsesFailureMessageBytes {
+		t.Fatalf("provider failure retention is not bounded: payload=%d message=%d", len(failure.data), len(failure.message))
+	}
+	if bytes.Contains(failure.data, []byte(`"ignored"`)) || !bytes.Contains(failure.data, []byte(`"code":"context_length_exceeded"`)) {
+		t.Fatalf("provider failure retained untrusted object graph or lost semantics: %q", failure.data)
 	}
 }
 

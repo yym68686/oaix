@@ -196,17 +196,21 @@ func finishStreamDeliveryTrace(trace *store.StreamDeliveryTrace, parseErr error)
 	}
 }
 
-func finishBufferedResponsesFailureTrace(trace *store.StreamDeliveryTrace) {
+func finishBufferedResponsesFailureTrace(trace *store.StreamDeliveryTrace, sourceEventType string) {
 	if trace == nil {
 		return
 	}
 	now := time.Now().UTC()
 	trace.End.At = now
-	trace.End.Reason = "upstream_response_failed_terminal_buffered"
+	if strings.EqualFold(strings.TrimSpace(sourceEventType), "error") {
+		trace.End.Reason = "upstream_provider_error_normalized_failure_buffered"
+	} else {
+		trace.End.Reason = "upstream_response_failed_terminal_buffered"
+	}
 	trace.End.Error = ""
 }
 
-func finishDeliveredResponsesFailureTrace(trace *store.StreamDeliveryTrace, deliveryErr error, asHTTPError bool) {
+func finishDeliveredResponsesFailureTrace(trace *store.StreamDeliveryTrace, deliveryErr error, asHTTPError bool, sourceEventType string) {
 	if trace == nil {
 		return
 	}
@@ -220,7 +224,11 @@ func finishDeliveredResponsesFailureTrace(trace *store.StreamDeliveryTrace, deli
 	now := time.Now().UTC()
 	trace.Downstream.FinalBodyProducedAt = &now
 	trace.End.At = now
-	if asHTTPError {
+	if strings.EqualFold(strings.TrimSpace(sourceEventType), "error") && asHTTPError {
+		trace.End.Reason = "upstream_provider_error_normalized_http_error_delivered"
+	} else if strings.EqualFold(strings.TrimSpace(sourceEventType), "error") {
+		trace.End.Reason = "upstream_provider_error_normalized_failure_delivered"
+	} else if asHTTPError {
 		trace.End.Reason = "upstream_response_failed_http_error_delivered"
 	} else {
 		trace.End.Reason = "upstream_response_failed_terminal_delivered"
