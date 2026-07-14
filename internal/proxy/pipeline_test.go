@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -119,6 +120,98 @@ func TestWriteFinalErrorResponseDoesNotRewriteStartedStreamHeader(t *testing.T) 
 	body := recorder.Body.String()
 	if !strings.Contains(body, "event: error") || !strings.Contains(body, "no token") {
 		t.Fatalf("unexpected SSE body: %q", body)
+	}
+}
+
+func TestWriteFinalErrorResponsePreservesStartedResponsesFailure(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","sequence_number":3,"response":{"id":"resp_ctx","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"input is too long"}}}`)
+	failure := &responsesFailureTerminal{
+		data:         payload,
+		eventOrdinal: 2,
+		status:       http.StatusBadRequest,
+		message:      "input is too long",
+	}
+	recorder := &countingResponseRecorder{ResponseRecorder: httptest.NewRecorder()}
+	recorder.Header().Set("Content-Type", "text/event-stream")
+	recorder.WriteHeader(http.StatusOK)
+	trace := store.NewStreamDeliveryTrace("conn-failed")
+	trace.Upstream.FirstResponseFailed = &store.StreamDeliveryCompletedUpstream{}
+
+	if err := writeResponsesFailureResponse(recorder, true, failure, trace); err != nil {
+		t.Fatal(err)
+	}
+
+	if recorder.writeHeaderCount != 1 || recorder.Code != http.StatusOK {
+		t.Fatalf("started response header changed: writes=%d status=%d", recorder.writeHeaderCount, recorder.Code)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: response.failed") || !strings.Contains(body, `"code":"context_length_exceeded"`) {
+		t.Fatalf("structured failure was not preserved: %q", body)
+	}
+	if strings.Contains(body, "event: error") || strings.Contains(body, "oaix_gateway_error") || strings.Contains(body, "[DONE]") {
+		t.Fatalf("structured failure was downgraded or followed by a fake terminator: %q", body)
+	}
+	if trace.State() != "terminal_flushed" || trace.End.Reason != "upstream_response_failed_terminal_delivered" || trace.Downstream.FinalBodyProducedAt == nil {
+		t.Fatalf("unexpected delivered failure trace: %+v", trace)
+	}
+}
+
+func TestWriteFinalErrorResponseUsesJSONBeforeStreamStart(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","sequence_number":1,"response":{"id":"resp_ctx","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"input is too long"}}}`)
+	failure := &responsesFailureTerminal{
+		data:    payload,
+		status:  http.StatusBadRequest,
+		message: "input is too long",
+	}
+	recorder := httptest.NewRecorder()
+	trace := store.NewStreamDeliveryTrace("conn-http-error")
+	trace.Upstream.FirstResponseFailed = &store.StreamDeliveryCompletedUpstream{}
+
+	if err := writeResponsesFailureResponse(recorder, false, failure, trace); err != nil {
+		t.Fatal(err)
+	}
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
+		t.Fatalf("content-type = %q", got)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	errorObject, _ := body["error"].(map[string]any)
+	if errorObject["code"] != "context_length_exceeded" || errorObject["message"] != "input is too long" {
+		t.Fatalf("unexpected error body: %#v", body)
+	}
+	if trace.End.Reason != "upstream_response_failed_http_error_delivered" || trace.Downstream.FinalBodyProducedAt == nil {
+		t.Fatalf("unexpected HTTP error trace: %+v", trace)
+	}
+	if trace.State() != "http_error_delivered" {
+		t.Fatalf("HTTP error state = %q", trace.State())
+	}
+}
+
+func TestWriteFinalResponsesFailureDoesNotAppendFallbackAfterFlushError(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","sequence_number":3,"response":{"id":"resp_ctx","status":"failed","error":{"code":"context_length_exceeded","message":"input is too long"}}}`)
+	failure := &responsesFailureTerminal{data: payload, status: http.StatusBadRequest, message: "input is too long"}
+	flushErr := errors.New("forced terminal flush failure")
+	writer := &flushErrorResponseWriter{header: make(http.Header), flushErr: flushErr}
+	trace := store.NewStreamDeliveryTrace("conn-flush-failed")
+	trace.Upstream.FirstResponseFailed = &store.StreamDeliveryCompletedUpstream{}
+
+	err := writeResponsesFailureResponse(writer, true, failure, trace)
+
+	if !errors.Is(err, flushErr) {
+		t.Fatalf("error = %v, want flush failure", err)
+	}
+	body := string(writer.body.Bytes())
+	if strings.Count(body, "event: response.failed") != 1 || strings.Contains(body, "event: error") {
+		t.Fatalf("flush failure must not append a second terminal: %q", body)
+	}
+	if trace.State() != "terminal_flush_failed" || trace.End.Reason != "downstream_terminal_flush_error" || trace.End.Error == "" {
+		t.Fatalf("unexpected failed flush trace: %+v", trace)
 	}
 }
 
@@ -1322,6 +1415,345 @@ func TestProxyNonRetryableUpstream4xxDoesNotCooldownToken(t *testing.T) {
 	}
 }
 
+func TestProxyPreservesContextLengthFailureAfterKeepalive(t *testing.T) {
+	var callsMu sync.Mutex
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		upstreamCalls++
+		callsMu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: response.created`,
+			`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_ctx","object":"response","model":"gpt-5.5","status":"in_progress"}}`,
+			``,
+			`event: response.failed`,
+			`data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_ctx","object":"response","model":"gpt-5.5","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}}`,
+			``,
+		}, "\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                2,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, AccessToken: "upstream-token-1", IsActive: true, CreatedAt: now, UpdatedAt: now},
+			{ID: 2, AccessToken: "upstream-token-2", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorCh: make(chan *time.Time, 1),
+	}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", Stream: true})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("wire status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	callsMu.Lock()
+	gotCalls := upstreamCalls
+	callsMu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("upstream calls = %d, want one non-retryable attempt", gotCalls)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: keepalive") {
+		t.Fatalf("expected precommit keepalive: %q", body)
+	}
+	if strings.Count(body, "event: response.failed") != 1 || !strings.Contains(body, `"code":"context_length_exceeded"`) {
+		t.Fatalf("context failure terminal was not preserved exactly once: %q", body)
+	}
+	if strings.Contains(body, "event: error") || strings.Contains(body, "oaix_gateway_error") || strings.Contains(body, "[DONE]") {
+		t.Fatalf("context failure was downgraded or followed by a fake terminator: %q", body)
+	}
+	select {
+	case until := <-fakes.tokenErrorCh:
+		t.Fatalf("context failure must not cool down the token: %v", until)
+	case <-time.After(200 * time.Millisecond):
+	}
+	fakes.mu.Lock()
+	defer fakes.mu.Unlock()
+	if len(fakes.attempts) != 1 {
+		t.Fatalf("gateway attempts = %d, want 1", len(fakes.attempts))
+	}
+	attempt := fakes.attempts[0]
+	if attempt.ErrorCode == nil || *attempt.ErrorCode != "context_length_exceeded" {
+		t.Fatalf("attempt error code = %v", attempt.ErrorCode)
+	}
+	trace := attempt.StreamDeliveryTrace
+	if trace == nil || trace.Upstream.FirstResponseFailed == nil || trace.Downstream.FirstResponseFailed == nil {
+		t.Fatalf("response.failed delivery trace missing: %+v", trace)
+	}
+	if trace.State() != "terminal_flushed" || trace.End.Reason != "upstream_response_failed_terminal_delivered" || trace.End.Error != "" {
+		t.Fatalf("unexpected response.failed trace: %+v state=%q", trace, trace.State())
+	}
+}
+
+func TestProxyDiscardsRetriedFailureWhenLaterAttemptSucceeds(t *testing.T) {
+	var callsMu sync.Mutex
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		upstreamCalls++
+		call := upstreamCalls
+		callsMu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			_, _ = io.WriteString(w, strings.Join([]string{
+				`event: response.created`,
+				`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_rate","status":"in_progress"}}`,
+				``,
+				`event: response.failed`,
+				`data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_rate","status":"failed","error":{"code":"rate_limit_exceeded","message":"retry later"}}}`,
+				``,
+			}, "\n"))
+			return
+		}
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: response.created`,
+			`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_ok","status":"in_progress"}}`,
+			``,
+			`event: response.completed`,
+			`data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_ok","object":"response","model":"gpt-5.5","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+			``,
+		}, "\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                2,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{tokens: []store.Token{
+		{ID: 1, AccessToken: "upstream-token-1", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		{ID: 2, AccessToken: "upstream-token-2", IsActive: true, CreatedAt: now, UpdatedAt: now},
+	}}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", Stream: true})
+
+	callsMu.Lock()
+	gotCalls := upstreamCalls
+	callsMu.Unlock()
+	if gotCalls != 2 {
+		t.Fatalf("upstream calls = %d, want retry followed by success", gotCalls)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "response.failed") || strings.Contains(body, "retry later") {
+		t.Fatalf("failed attempt leaked into successful stream: %q", body)
+	}
+	if !strings.Contains(body, "response.completed") || !strings.Contains(body, "resp_ok") {
+		t.Fatalf("successful retry terminal missing: %q", body)
+	}
+}
+
+func TestProxyPreservesRetryableFailureWhenTokensAreExhausted(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(append(
+			sse.Encode("response.created", []byte(`{"type":"response.created","sequence_number":0,"response":{"id":"resp_rate","status":"in_progress"}}`)),
+			sse.Encode("response.failed", []byte(`{"type":"response.failed","sequence_number":1,"response":{"id":"resp_rate","status":"failed","error":{"code":"rate_limit_exceeded","message":"retry later"}}}`))...,
+		))
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{tokens: []store.Token{
+		{ID: 1, AccessToken: "upstream-token-1", IsActive: true, CreatedAt: now, UpdatedAt: now},
+	}}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL, 3, fakes)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", Stream: true})
+
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1 before token exhaustion", upstreamCalls.Load())
+	}
+	body := recorder.Body.String()
+	if strings.Count(body, "event: response.failed") != 1 || !strings.Contains(body, `"code":"rate_limit_exceeded"`) {
+		t.Fatalf("last structured failure was not preserved: %q", body)
+	}
+	if strings.Contains(body, "event: error") || strings.Contains(body, "no available token") || strings.Contains(body, "[DONE]") {
+		t.Fatalf("token exhaustion replaced the structured failure: %q", body)
+	}
+}
+
+func TestProxyCommittedResponsesFailureProtectsTokenHealth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(append(
+			sse.Encode("response.output_text.delta", []byte(`{"type":"response.output_text.delta","sequence_number":1,"delta":"partial"}`)),
+			sse.Encode("response.failed", []byte(`{"type":"response.failed","sequence_number":2,"response":{"id":"resp_rate_after_output","status":"failed","error":{"code":"rate_limit_exceeded","message":"retry later"}}}`))...,
+		))
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, AccessToken: "upstream-token-1", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorCh: make(chan *time.Time, 1),
+	}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL, 3, fakes)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", Stream: true})
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "response.output_text.delta") || strings.Count(body, "event: response.failed") != 1 {
+		t.Fatalf("committed failure stream is malformed: %q", body)
+	}
+	select {
+	case until := <-fakes.tokenErrorCh:
+		if until == nil || !until.After(now) {
+			t.Fatalf("committed rate-limit failure did not set a future cooldown: %v", until)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("committed rate-limit failure did not update token health")
+	}
+	fakes.mu.Lock()
+	defer fakes.mu.Unlock()
+	if len(fakes.attempts) != 1 || fakes.attempts[0].CooldownUntil == nil || fakes.attempts[0].StatusCode == nil || *fakes.attempts[0].StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("unexpected committed failure attempt: %+v", fakes.attempts)
+	}
+}
+
+func TestProxyCommittedFailureFlushErrorKeepsSemanticFailureAndTokenHealth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(append(
+			sse.Encode("response.output_text.delta", []byte(`{"type":"response.output_text.delta","sequence_number":1,"delta":"partial"}`)),
+			sse.Encode("response.failed", []byte(`{"type":"response.failed","sequence_number":2,"response":{"id":"resp_rate_flush_failure","status":"failed","error":{"code":"rate_limit_exceeded","message":"retry later"}}}`))...,
+		))
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, AccessToken: "upstream-token-1", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorCh: make(chan *time.Time, 1),
+	}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL, 3, fakes)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	flushErr := errors.New("forced response.failed flush failure")
+	writer := &failNthFlushResponseWriter{header: make(http.Header), failAt: 2, flushErr: flushErr}
+
+	pipeline.Proxy(writer, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", Stream: true})
+
+	body := writer.body.String()
+	if strings.Count(body, "event: response.failed") != 1 || strings.Contains(body, "event: error") {
+		t.Fatalf("delivery failure appended or lost the semantic terminal: %q", body)
+	}
+	select {
+	case until := <-fakes.tokenErrorCh:
+		if until == nil || !until.After(now) {
+			t.Fatalf("failed terminal flush did not protect token health: %v", until)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed terminal flush did not update token health")
+	}
+	fakes.mu.Lock()
+	defer fakes.mu.Unlock()
+	if len(fakes.attempts) != 1 {
+		t.Fatalf("attempt count = %d", len(fakes.attempts))
+	}
+	attempt := fakes.attempts[0]
+	if attempt.ErrorCode == nil || *attempt.ErrorCode != "rate_limit_exceeded" || attempt.CooldownUntil == nil {
+		t.Fatalf("semantic attempt data was lost: %+v", attempt)
+	}
+	trace := attempt.StreamDeliveryTrace
+	if trace == nil || trace.State() != "terminal_flush_failed" || trace.End.Reason != "downstream_terminal_flush_error" || trace.End.Error == "" {
+		t.Fatalf("unexpected failed delivery trace: %+v", trace)
+	}
+}
+
+func newProxyPipelineTestHarness(t *testing.T, upstreamURL string, maxRetries int, fakes *fakeProxyStore) *Pipeline {
+	t.Helper()
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstreamURL,
+			MaxRetries:                maxRetries,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	t.Cleanup(client.CloseIdleConnections)
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	return New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
+}
+
 func TestProxyGpt56SolExcludesFreeTokensBeforeSelection(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -1672,7 +2104,7 @@ func TestStreamResponsesPreflightFailureDoesNotCommit(t *testing.T) {
 		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}`,
 		``,
 		`event: response.failed`,
-		`data: {"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","message":"Concurrency limit exceeded for account, please retry later"}}}`,
+		`data: {"type":"response.failed","response":{"status":"failed","model":"upstream-model","error":{"code":"rate_limit_exceeded","type":"rate_limit_error","param":"input","message":"Concurrency limit exceeded for account, please retry later"}}}`,
 		``,
 	}, "\n")
 	resp := &http.Response{
@@ -1682,7 +2114,7 @@ func TestStreamResponsesPreflightFailureDoesNotCommit(t *testing.T) {
 		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
 	}
 	recorder := httptest.NewRecorder()
-	result, err := pipeline.streamResponsesWithPreflight(recorder, resp, Attempt{Intent: RequestIntent{Model: "gpt-5.5", Stream: true}})
+	result, err := pipeline.streamResponsesWithPreflight(recorder, resp, Attempt{Intent: RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", Stream: true, ResponseModelAlias: "public-model"}})
 	if err == nil {
 		t.Fatal("expected retryable preflight error")
 	}
@@ -1692,12 +2124,189 @@ func TestStreamResponsesPreflightFailureDoesNotCommit(t *testing.T) {
 	if !result.StreamState.DownstreamStarted || !result.StreamState.KeepaliveSent {
 		t.Fatalf("response.created should start downstream with keepalive: %+v", result.StreamState)
 	}
+	if result.ResponsesFailure == nil || !bytes.Contains(result.ResponsesFailure.data, []byte(`"type":"response.failed"`)) {
+		t.Fatalf("structured response.failed terminal was not retained: %+v", result.ResponsesFailure)
+	}
+	if len(result.ErrorBody) == 0 || &result.ErrorBody[0] != &result.ResponsesFailure.data[0] {
+		t.Fatal("response.failed metadata and terminal must share one owned payload buffer")
+	}
+	for _, expected := range []string{`"model":"public-model"`, `"code":"rate_limit_exceeded"`, `"type":"rate_limit_error"`, `"param":"input"`} {
+		if !bytes.Contains(result.ResponsesFailure.data, []byte(expected)) {
+			t.Fatalf("preserved terminal missing %s: %q", expected, result.ResponsesFailure.data)
+		}
+	}
+	if result.StreamDeliveryTrace == nil || result.StreamDeliveryTrace.Upstream.FirstResponseFailed == nil || result.StreamDeliveryTrace.End.Reason != "upstream_response_failed_terminal_buffered" || result.StreamDeliveryTrace.End.Error != "" {
+		t.Fatalf("unexpected buffered failure trace: %+v", result.StreamDeliveryTrace)
+	}
 	output := recorder.Body.String()
 	if !strings.Contains(output, "event: keepalive") || !strings.Contains(output, `"type":"keepalive"`) {
 		t.Fatalf("keepalive should be written immediately: %q", output)
 	}
 	if strings.Contains(output, "response.created") || strings.Contains(output, "response.failed") {
 		t.Fatalf("preflight failure should not flush buffered upstream events: %q", output)
+	}
+}
+
+func TestResponseFailureStatusContextLengthExceededWithoutTypeIsBadRequest(t *testing.T) {
+	status, message, failed := responseFailureStatus(map[string]any{
+		"type": "response.failed",
+		"response": map[string]any{
+			"status": "failed",
+			"error": map[string]any{
+				"code":    "context_length_exceeded",
+				"message": "input is too long",
+			},
+		},
+	})
+	if !failed || status != http.StatusBadRequest || message != "input is too long" {
+		t.Fatalf("status=%d message=%q failed=%v", status, message, failed)
+	}
+}
+
+func TestStreamResponsesNormalizesMissingJSONFailureType(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := sse.Encode("response.failed", []byte(`{"sequence_number":5,"response":{"id":"resp_missing_type","status":"failed","error":{"code":"context_length_exceeded","message":"input is too long"}}}`))
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	result, err := pipeline.streamResponsesWithPreflight(httptest.NewRecorder(), resp, Attempt{
+		Intent: RequestIntent{Endpoint: "/v1/responses", Stream: true},
+	})
+	if err == nil || result.Status != http.StatusBadRequest || result.Retry || result.ResponsesFailure == nil {
+		t.Fatalf("unexpected normalized failure result: %+v err=%v", result, err)
+	}
+	if !bytes.Contains(result.ResponsesFailure.data, []byte(`"type":"response.failed"`)) {
+		t.Fatalf("missing normalized discriminator: %q", result.ResponsesFailure.data)
+	}
+}
+
+func TestStreamResponsesNormalizesFailureAfterSemanticOutput(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	body := append(
+		sse.Encode("response.output_text.delta", []byte(`{"type":"response.output_text.delta","sequence_number":1,"delta":"partial"}`)),
+		sse.Encode("response.failed", []byte(`{"sequence_number":2,"response":{"id":"resp_committed_failure","status":"failed","error":{"code":"context_length_exceeded","message":"input is too long"}}}`))...,
+	)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.streamResponsesWithPreflight(recorder, resp, Attempt{
+		Intent: RequestIntent{Endpoint: "/v1/responses", Stream: true},
+	})
+	if err == nil || result.Status != http.StatusBadRequest || !result.Committed || result.Retry {
+		t.Fatalf("unexpected committed failure result: %+v err=%v", result, err)
+	}
+	bodyText := recorder.Body.String()
+	if !strings.Contains(bodyText, "response.output_text.delta") || strings.Count(bodyText, "event: response.failed") != 1 || !strings.Contains(bodyText, `"type":"response.failed"`) {
+		t.Fatalf("committed failure was not normalized exactly once: %q", bodyText)
+	}
+	trace := result.StreamDeliveryTrace
+	if trace == nil || trace.Downstream.FirstResponseFailed == nil || trace.State() != "terminal_flushed" || trace.End.Reason != "upstream_response_failed_terminal_delivered" {
+		t.Fatalf("unexpected committed failure trace: %+v", trace)
+	}
+}
+
+func TestCanonicalResponsesFailureTerminalNormalizesCompatiblePayloads(t *testing.T) {
+	validResponse := map[string]any{
+		"status": "failed",
+		"error": map[string]any{
+			"code":    "context_length_exceeded",
+			"message": "input is too long",
+		},
+	}
+	tests := []struct {
+		name    string
+		payload map[string]any
+		want    bool
+	}{
+		{name: "valid", payload: map[string]any{"type": "response.failed", "response": validResponse}, want: true},
+		{name: "missing type is compatible", payload: map[string]any{"response": validResponse}, want: true},
+		{name: "top level error", payload: map[string]any{"type": "error", "error": validResponse["error"]}},
+		{name: "contradictory type", payload: map[string]any{"type": "error", "response": validResponse}},
+		{name: "non-string type", payload: map[string]any{"type": 1, "response": validResponse}},
+		{name: "completed response", payload: map[string]any{"type": "response.failed", "response": map[string]any{"status": "completed", "error": validResponse["error"]}}},
+		{name: "non-string status", payload: map[string]any{"type": "response.failed", "response": map[string]any{"status": true, "error": validResponse["error"]}}},
+		{name: "missing error code is compatible", payload: map[string]any{"type": "response.failed", "response": map[string]any{"status": "failed", "error": map[string]any{"message": "input is too long"}}}, want: true},
+		{name: "empty error is compatible", payload: map[string]any{"type": "response.failed", "response": map[string]any{"status": "failed", "error": map[string]any{}}}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := canonicalResponsesFailureTerminal(tt.payload, "response.failed", "", 1, nil) != nil
+			if got != tt.want {
+				t.Fatalf("canonical terminal = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalResponsesFailureTerminalBoundsRetainedPayload(t *testing.T) {
+	message := strings.Repeat("x", 2<<20)
+	failure := canonicalResponsesFailureTerminal(map[string]any{
+		"type": "response.failed",
+		"response": map[string]any{
+			"status": "failed",
+			"error": map[string]any{
+				"code":    "context_length_exceeded",
+				"message": message,
+			},
+		},
+	}, "response.failed", "public-model", 3, nil)
+	if failure == nil {
+		t.Fatal("expected bounded canonical terminal")
+	}
+	if len(failure.data) >= maxResponsesFailurePayloadBytes || len(failure.message) > maxResponsesFailureMessageBytes {
+		t.Fatalf("failure retention is not bounded: payload=%d message=%d", len(failure.data), len(failure.message))
+	}
+	if !bytes.Contains(failure.data, []byte(`"type":"response.failed"`)) || !bytes.Contains(failure.data, []byte(`"code":"context_length_exceeded"`)) {
+		t.Fatalf("bounded terminal lost semantic discriminator: %q", failure.data)
+	}
+}
+
+func TestCanonicalResponsesFailureTerminalNormalizesRecognizedCode(t *testing.T) {
+	failure := canonicalResponsesFailureTerminal(map[string]any{
+		"type": "response.failed",
+		"response": map[string]any{
+			"status": "failed",
+			"error": map[string]any{
+				"code":      "  CONTEXT_LENGTH_EXCEEDED  ",
+				"message":   "input is too long",
+				"resets_at": "not-an-integer",
+			},
+		},
+	}, "response.failed", "", 1, nil)
+	if failure == nil || failure.status != http.StatusBadRequest {
+		t.Fatalf("unexpected normalized failure: %+v", failure)
+	}
+	if !bytes.Contains(failure.data, []byte(`"code":"context_length_exceeded"`)) {
+		t.Fatalf("Codex discriminator was not normalized: %q", failure.data)
+	}
+	if bytes.Contains(failure.data, []byte(`"resets_at"`)) {
+		t.Fatalf("malformed known field must not poison Codex error decoding: %q", failure.data)
+	}
+}
+
+func TestCanonicalResponsesFailureTerminalDropsInvalidCodeType(t *testing.T) {
+	failure := canonicalResponsesFailureTerminal(map[string]any{
+		"type": "response.failed",
+		"response": map[string]any{
+			"status": "failed",
+			"error": map[string]any{
+				"code":    123,
+				"message": "unknown failure",
+			},
+		},
+	}, "response.failed", "", 1, nil)
+	if failure == nil {
+		t.Fatal("expected generic structured failure")
+	}
+	if bytes.Contains(failure.data, []byte(`"code"`)) {
+		t.Fatalf("non-string code must not enter canonical payload: %q", failure.data)
 	}
 }
 
@@ -2210,6 +2819,31 @@ type flushErrorResponseWriter struct {
 	status     int
 	flushErr   error
 	flushCalls int
+}
+
+type failNthFlushResponseWriter struct {
+	header     http.Header
+	body       bytes.Buffer
+	status     int
+	failAt     int
+	flushErr   error
+	flushCalls int
+}
+
+func (w *failNthFlushResponseWriter) Header() http.Header { return w.header }
+
+func (w *failNthFlushResponseWriter) WriteHeader(status int) { w.status = status }
+
+func (w *failNthFlushResponseWriter) Write(value []byte) (int, error) {
+	return w.body.Write(value)
+}
+
+func (w *failNthFlushResponseWriter) FlushError() error {
+	w.flushCalls++
+	if w.flushCalls == w.failAt {
+		return w.flushErr
+	}
+	return nil
 }
 
 func (w *flushErrorResponseWriter) Header() http.Header { return w.header }

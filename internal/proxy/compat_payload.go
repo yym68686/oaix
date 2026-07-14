@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yym68686/oaix/internal/protocol/openai"
 	"github.com/yym68686/oaix/internal/protocol/sse"
@@ -22,10 +24,13 @@ import (
 )
 
 const (
-	defaultImagesMainModel = "gpt-5.5"
-	defaultImagesToolModel = "gpt-image-2"
-	defaultImageInputMax   = 249
-	defaultImageUploadMax  = 25 * 1024 * 1024
+	defaultImagesMainModel           = "gpt-5.5"
+	defaultImagesToolModel           = "gpt-image-2"
+	defaultImageInputMax             = 249
+	defaultImageUploadMax            = 25 * 1024 * 1024
+	maxResponsesFailurePayloadBytes  = 64 * 1024
+	maxResponsesFailureMessageBytes  = 16 * 1024
+	maxResponsesFailureMetadataBytes = 1024
 )
 
 var (
@@ -710,18 +715,25 @@ func responseFailureStatus(payload map[string]any) (int, string, bool) {
 	if errObj == nil {
 		return 0, "", false
 	}
+	status, message := responsesErrorStatus(errObj)
+	return status, message, true
+}
+
+func responsesErrorStatus(errObj map[string]any) (int, string) {
 	message := firstNonEmpty(text(errObj["message"]), "Responses upstream returned status=failed")
 	status := http.StatusInternalServerError
-	code := strings.ToLower(text(errObj["code"]))
-	typ := strings.ToLower(text(errObj["type"]))
-	if strings.Contains(code, "rate_limit") || strings.Contains(typ, "rate_limit") || strings.Contains(strings.ToLower(message), "concurrency limit") {
+	code := strings.ToLower(strings.TrimSpace(text(errObj["code"])))
+	typ := strings.ToLower(strings.TrimSpace(text(errObj["type"])))
+	if code == "context_length_exceeded" {
+		status = http.StatusBadRequest
+	} else if strings.Contains(code, "rate_limit") || strings.Contains(typ, "rate_limit") || strings.Contains(strings.ToLower(message), "concurrency limit") {
 		status = http.StatusTooManyRequests
 	} else if strings.Contains(code, "invalid") || strings.Contains(typ, "invalid") {
 		status = http.StatusBadRequest
 	} else if strings.Contains(code, "permission") || strings.Contains(typ, "permission") {
 		status = http.StatusForbidden
 	}
-	return status, message, true
+	return status, message
 }
 
 func retryableStatus(status int) bool {
@@ -1610,6 +1622,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 	streamState := attempt.StreamState
 	firstTokenAt := (*time.Time)(nil)
 	eventOrdinal := 0
+	var deliveredFailure *responsesFailureTerminal
 	writeImmediateKeepalive := func() error {
 		if streamState.KeepaliveSent {
 			return nil
@@ -1639,8 +1652,27 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		typ := eventType(event, payload)
 		sequenceNumber := payloadSequenceNumber(payload)
 		observeUpstreamStreamEvent(trace, typ, eventOrdinal, sequenceNumber, event.Data)
-		if status, message, failed := responseFailureStatus(payload); failed && !committed {
-			return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
+		if failure := canonicalResponsesFailureTerminal(payload, typ, attempt.Intent.ResponseModelAlias, eventOrdinal, sequenceNumber); failure != nil {
+			if !committed {
+				return streamPreflightError{
+					status:  failure.status,
+					message: failure.message,
+					raw:     failure.data,
+					failure: failure,
+				}
+			}
+			downstreamEvent := failure.streamEvent()
+			observer.Observe(downstreamEvent.raw)
+			deliveredFailure = failure
+			if err := writeDownstreamStreamEvent(w, trace, downstreamEvent, true); err != nil {
+				return err
+			}
+			return errStopSSE
+		}
+		if !committed {
+			if status, message, failed := responseFailureStatus(payload); failed {
+				return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
+			}
 		}
 		downstreamEvent := bufferedStreamEvent{
 			raw:                   rawEventForDownstream(event, attempt.Intent.ResponseModelAlias),
@@ -1693,22 +1725,48 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 			StreamDeliveryTrace: trace,
 		}
 	}
-	if err != nil {
-		finishStreamDeliveryTrace(trace, err)
+	if deliveredFailure != nil {
+		deliveryErr := err
+		if errors.Is(err, errStopSSE) {
+			deliveryErr = nil
+		}
+		finishDeliveredResponsesFailureTrace(trace, deliveryErr, false)
 		result := newResult()
+		result.Status = deliveredFailure.status
+		result.Committed = true
+		result.Retry = false
+		result.ErrorBody = deliveredFailure.data
+		result.ResponsesFailure = deliveredFailure
+		if deliveryErr != nil {
+			return result, fmt.Errorf("%s; downstream failure delivery failed: %w", deliveredFailure.message, deliveryErr)
+		}
+		return result, errors.New(deliveredFailure.message)
+	}
+	if err != nil {
 		var deliveryErr streamDeliveryOperationError
 		if errors.As(err, &deliveryErr) && streamState.DownstreamStarted {
+			finishStreamDeliveryTrace(trace, err)
+			result := newResult()
 			result.Committed = true
 			result.Retry = false
 			return result, err
 		}
 		var preflight streamPreflightError
 		if errors.As(err, &preflight) {
+			if preflight.failure != nil {
+				finishBufferedResponsesFailureTrace(trace)
+			} else {
+				finishStreamDeliveryTrace(trace, err)
+			}
+			result := newResult()
 			result.Status = preflight.status
 			result.Retry = retryableStatus(preflight.status)
 			result.ErrorBody = preflight.raw
+			result.ResponsesFailure = preflight.failure
 			return result, errors.New(preflight.message)
 		}
+		finishStreamDeliveryTrace(trace, err)
+		result := newResult()
 		if committed {
 			return result, err
 		}
@@ -1750,10 +1808,166 @@ type streamPreflightError struct {
 	status  int
 	message string
 	raw     []byte
+	failure *responsesFailureTerminal
 }
 
 func (e streamPreflightError) Error() string {
 	return e.message
+}
+
+type responsesFailureTerminal struct {
+	data                  []byte
+	eventOrdinal          int
+	payloadSequenceNumber *int64
+	status                int
+	message               string
+}
+
+func (f *responsesFailureTerminal) streamEvent() bufferedStreamEvent {
+	if f == nil {
+		return bufferedStreamEvent{}
+	}
+	return bufferedStreamEvent{
+		raw:                   sse.Encode("response.failed", f.data),
+		eventType:             "response.failed",
+		eventOrdinal:          f.eventOrdinal,
+		payloadSequenceNumber: cloneInt64(f.payloadSequenceNumber),
+	}
+}
+
+func canonicalResponsesFailureTerminal(payload map[string]any, effectiveType, modelAlias string, eventOrdinal int, sequenceNumber *int64) *responsesFailureTerminal {
+	if effectiveType != "response.failed" || payload == nil {
+		return nil
+	}
+	if rawType, exists := payload["type"]; exists {
+		payloadType, ok := rawType.(string)
+		if !ok || strings.ToLower(strings.TrimSpace(payloadType)) != "response.failed" {
+			return nil
+		}
+	}
+	response, ok := payload["response"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	if rawStatus, exists := response["status"]; exists {
+		status, ok := rawStatus.(string)
+		if !ok || strings.ToLower(strings.TrimSpace(status)) != "failed" {
+			return nil
+		}
+	}
+	errorObject, ok := response["error"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	boundedError := boundedResponsesErrorObject(errorObject)
+	normalizedResponse := map[string]any{
+		"status": "failed",
+		"error":  boundedError,
+	}
+	for _, key := range []string{"id", "object"} {
+		if value := boundedResponsesFailureString(response[key], maxResponsesFailureMetadataBytes); value != "" {
+			normalizedResponse[key] = value
+		}
+	}
+	model := boundedResponsesFailureString(response["model"], maxResponsesFailureMetadataBytes)
+	if alias := boundedResponsesFailureString(modelAlias, maxResponsesFailureMetadataBytes); alias != "" {
+		model = alias
+	}
+	if model != "" {
+		normalizedResponse["model"] = model
+	}
+	normalized := map[string]any{
+		"type":     "response.failed",
+		"response": normalizedResponse,
+	}
+	if sequenceNumber != nil {
+		normalized["sequence_number"] = *sequenceNumber
+	}
+	data, err := openai.EncodeJSON(normalized)
+	if err != nil || len(data) == 0 || len(data) > maxResponsesFailurePayloadBytes {
+		return nil
+	}
+	statusCode, message := responsesErrorStatus(boundedError)
+	return &responsesFailureTerminal{
+		data:                  data,
+		eventOrdinal:          eventOrdinal,
+		payloadSequenceNumber: cloneInt64(sequenceNumber),
+		status:                statusCode,
+		message:               message,
+	}
+}
+
+func boundedResponsesErrorObject(input map[string]any) map[string]any {
+	output := make(map[string]any)
+	for _, key := range []string{"type", "code", "message", "param", "plan_type"} {
+		value, ok := input[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			limit := maxResponsesFailureMetadataBytes
+			if key == "message" {
+				limit = maxResponsesFailureMessageBytes
+			} else if key == "code" || key == "type" {
+				typed = strings.ToLower(strings.TrimSpace(typed))
+			}
+			output[key] = boundedResponsesFailureString(typed, limit)
+		case nil:
+			output[key] = nil
+		}
+	}
+	if value, exists := input["resets_at"]; exists {
+		if integer, ok := responsesFailureInteger(value); ok {
+			output["resets_at"] = integer
+		} else if value == nil {
+			output["resets_at"] = nil
+		}
+	}
+	for _, key := range []string{"resetsAt", "resets_in_seconds", "resetsInSeconds", "retry_after", "retry_after_ms"} {
+		value, ok := input[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			output[key] = boundedResponsesFailureString(typed, maxResponsesFailureMetadataBytes)
+		case float64, bool, nil:
+			output[key] = typed
+		}
+	}
+	return output
+}
+
+func responsesFailureInteger(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) || math.Trunc(typed) != typed || typed < -9223372036854775808 || typed >= 9223372036854775808 {
+			return 0, false
+		}
+		return int64(typed), true
+	default:
+		return 0, false
+	}
+}
+
+func boundedResponsesFailureString(value any, limit int) string {
+	textValue, ok := value.(string)
+	if !ok || limit <= 0 {
+		return ""
+	}
+	if len(textValue) <= limit {
+		return textValue
+	}
+	textValue = textValue[:limit]
+	for len(textValue) > 0 && !utf8.ValidString(textValue) {
+		textValue = textValue[:len(textValue)-1]
+	}
+	return strings.Clone(textValue)
 }
 
 func cloneBytes(input []byte) []byte {

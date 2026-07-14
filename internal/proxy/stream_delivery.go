@@ -38,14 +38,21 @@ func observeUpstreamStreamEvent(trace *store.StreamDeliveryTrace, eventType stri
 	trace.Upstream.ParserEventCount++
 	trace.Upstream.LastEventOrdinal = eventOrdinal
 	trace.Upstream.LastPayloadSequenceNumber = cloneInt64(payloadSequenceNumber)
-	if eventType != "response.completed" {
+	var first **store.StreamDeliveryCompletedUpstream
+	switch eventType {
+	case "response.completed":
+		trace.Upstream.ResponseCompletedCount++
+		first = &trace.Upstream.FirstResponseCompleted
+	case "response.failed":
+		trace.Upstream.ResponseFailedCount++
+		first = &trace.Upstream.FirstResponseFailed
+	default:
 		return
 	}
-	trace.Upstream.ResponseCompletedCount++
-	if trace.Upstream.FirstResponseCompleted != nil {
+	if *first != nil {
 		return
 	}
-	trace.Upstream.FirstResponseCompleted = &store.StreamDeliveryCompletedUpstream{
+	*first = &store.StreamDeliveryCompletedUpstream{
 		EventOrdinal:          eventOrdinal,
 		PayloadSequenceNumber: cloneInt64(payloadSequenceNumber),
 		ReceivedAt:            time.Now().UTC(),
@@ -59,26 +66,34 @@ func writeDownstreamStreamEvent(w http.ResponseWriter, trace *store.StreamDelive
 		trace.Downstream.EventWriteAttemptCount++
 		trace.Downstream.BytesWriteAttempted += int64(len(event.raw))
 	}
-	isCompleted := event.eventType == "response.completed"
-	var completed *store.StreamDeliveryCompletedDownstream
-	if isCompleted && trace != nil && trace.Downstream.FirstResponseCompleted == nil {
-		completed = &store.StreamDeliveryCompletedDownstream{
-			EventOrdinal:          event.eventOrdinal,
-			PayloadSequenceNumber: cloneInt64(event.payloadSequenceNumber),
-			WireBytes:             len(event.raw),
-			WireSHA256:            sha256Bytes(event.raw),
-			WriteAttemptedAt:      time.Now().UTC(),
-			FlushResult:           "not_attempted",
+	isTerminal := event.eventType == "response.completed" || event.eventType == "response.failed"
+	var terminal *store.StreamDeliveryCompletedDownstream
+	if isTerminal && trace != nil {
+		var first **store.StreamDeliveryCompletedDownstream
+		if event.eventType == "response.completed" {
+			first = &trace.Downstream.FirstResponseCompleted
+		} else {
+			first = &trace.Downstream.FirstResponseFailed
 		}
-		trace.Downstream.FirstResponseCompleted = completed
+		if *first == nil {
+			terminal = &store.StreamDeliveryCompletedDownstream{
+				EventOrdinal:          event.eventOrdinal,
+				PayloadSequenceNumber: cloneInt64(event.payloadSequenceNumber),
+				WireBytes:             len(event.raw),
+				WireSHA256:            sha256Bytes(event.raw),
+				WriteAttemptedAt:      time.Now().UTC(),
+				FlushResult:           "not_attempted",
+			}
+			*first = terminal
+		}
 	}
 	n, writeErr := w.Write(event.raw)
 	if trace != nil {
 		trace.Downstream.BytesWritten += int64(n)
 	}
-	if completed != nil {
-		completed.WrittenBytes = n
-		completed.WriteCompletedAt = time.Now().UTC()
+	if terminal != nil {
+		terminal.WrittenBytes = n
+		terminal.WriteCompletedAt = time.Now().UTC()
 	}
 	if writeErr == nil && n != len(event.raw) {
 		writeErr = io.ErrShortWrite
@@ -88,12 +103,12 @@ func writeDownstreamStreamEvent(w http.ResponseWriter, trace *store.StreamDelive
 		if n > 0 && n < len(event.raw) {
 			result = "partial"
 		}
-		if completed != nil {
-			completed.WriteResult = result
-			completed.WriteError = streamDeliveryError(writeErr)
+		if terminal != nil {
+			terminal.WriteResult = result
+			terminal.WriteError = streamDeliveryError(writeErr)
 		}
 		reason := "downstream_write_error"
-		if isCompleted {
+		if isTerminal {
 			reason = "downstream_terminal_write_error"
 		}
 		return streamDeliveryOperationError{reason: reason, err: writeErr}
@@ -101,44 +116,44 @@ func writeDownstreamStreamEvent(w http.ResponseWriter, trace *store.StreamDelive
 	if trace != nil {
 		trace.Downstream.EventWriteSuccessCount++
 	}
-	if completed != nil {
-		completed.WriteResult = "succeeded"
+	if terminal != nil {
+		terminal.WriteResult = "succeeded"
 	}
 	if !flush {
 		return nil
 	}
 	flushAttemptedAt := time.Now().UTC()
-	if completed != nil {
-		completed.FlushAttemptedAt = &flushAttemptedAt
+	if terminal != nil {
+		terminal.FlushAttemptedAt = &flushAttemptedAt
 	}
 	flushErr := http.NewResponseController(w).Flush()
 	flushCompletedAt := time.Now().UTC()
-	if completed != nil {
-		completed.FlushCompletedAt = &flushCompletedAt
+	if terminal != nil {
+		terminal.FlushCompletedAt = &flushCompletedAt
 	}
 	if flushErr == nil {
-		if completed != nil {
-			completed.FlushResult = "succeeded"
+		if terminal != nil {
+			terminal.FlushResult = "succeeded"
 		}
 		return nil
 	}
 	if errors.Is(flushErr, http.ErrNotSupported) {
-		if completed != nil {
-			completed.FlushResult = "not_supported"
-			completed.FlushError = streamDeliveryError(flushErr)
+		if terminal != nil {
+			terminal.FlushResult = "not_supported"
+			terminal.FlushError = streamDeliveryError(flushErr)
 		}
 		reason := "downstream_flush_not_supported"
-		if isCompleted {
+		if isTerminal {
 			reason = "downstream_terminal_flush_not_supported"
 		}
 		return streamDeliveryOperationError{reason: reason, err: flushErr}
 	}
-	if completed != nil {
-		completed.FlushResult = "failed"
-		completed.FlushError = streamDeliveryError(flushErr)
+	if terminal != nil {
+		terminal.FlushResult = "failed"
+		terminal.FlushError = streamDeliveryError(flushErr)
 	}
 	reason := "downstream_flush_error"
-	if isCompleted {
+	if isTerminal {
 		reason = "downstream_terminal_flush_error"
 	}
 	return streamDeliveryOperationError{reason: reason, err: flushErr}
@@ -153,7 +168,7 @@ func finishStreamDeliveryTrace(trace *store.StreamDeliveryTrace, parseErr error)
 	if parseErr == nil {
 		trace.Upstream.EOFAt = &now
 		trace.Downstream.FinalBodyProducedAt = &now
-		if trace.Upstream.FirstResponseCompleted == nil {
+		if !hasUpstreamStreamTerminal(trace) {
 			trace.End.Reason = "upstream_eof_before_terminal"
 		} else {
 			trace.End.Reason = "upstream_eof_after_terminal"
@@ -167,18 +182,54 @@ func finishStreamDeliveryTrace(trace *store.StreamDeliveryTrace, parseErr error)
 		return
 	}
 	if errors.Is(parseErr, context.Canceled) {
-		if trace.Upstream.FirstResponseCompleted == nil {
+		if !hasUpstreamStreamTerminal(trace) {
 			trace.End.Reason = "request_context_canceled_before_terminal"
 		} else {
 			trace.End.Reason = "request_context_canceled_after_terminal"
 		}
 		return
 	}
-	if trace.Upstream.FirstResponseCompleted == nil {
+	if !hasUpstreamStreamTerminal(trace) {
 		trace.End.Reason = "upstream_stream_error_before_terminal"
 	} else {
 		trace.End.Reason = "upstream_stream_error_after_terminal"
 	}
+}
+
+func finishBufferedResponsesFailureTrace(trace *store.StreamDeliveryTrace) {
+	if trace == nil {
+		return
+	}
+	now := time.Now().UTC()
+	trace.End.At = now
+	trace.End.Reason = "upstream_response_failed_terminal_buffered"
+	trace.End.Error = ""
+}
+
+func finishDeliveredResponsesFailureTrace(trace *store.StreamDeliveryTrace, deliveryErr error, asHTTPError bool) {
+	if trace == nil {
+		return
+	}
+	if deliveryErr != nil {
+		finishStreamDeliveryTrace(trace, deliveryErr)
+		if asHTTPError {
+			trace.End.Reason = "downstream_http_error_write_error"
+		}
+		return
+	}
+	now := time.Now().UTC()
+	trace.Downstream.FinalBodyProducedAt = &now
+	trace.End.At = now
+	if asHTTPError {
+		trace.End.Reason = "upstream_response_failed_http_error_delivered"
+	} else {
+		trace.End.Reason = "upstream_response_failed_terminal_delivered"
+	}
+	trace.End.Error = ""
+}
+
+func hasUpstreamStreamTerminal(trace *store.StreamDeliveryTrace) bool {
+	return trace != nil && (trace.Upstream.FirstResponseCompleted != nil || trace.Upstream.FirstResponseFailed != nil)
 }
 
 func payloadSequenceNumber(payload map[string]any) *int64 {

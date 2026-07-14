@@ -83,6 +83,16 @@ func TestStreamDeliveryTraceState(t *testing.T) {
 		{name: "nil", trace: nil, want: ""},
 		{name: "terminal missing", trace: NewStreamDeliveryTrace(""), want: "terminal_missing"},
 		{
+			name:  "HTTP error delivered",
+			trace: &StreamDeliveryTrace{End: StreamDeliveryEndTrace{Reason: "upstream_response_failed_http_error_delivered"}},
+			want:  "http_error_delivered",
+		},
+		{
+			name:  "HTTP error write failed",
+			trace: &StreamDeliveryTrace{End: StreamDeliveryEndTrace{Reason: "downstream_http_error_write_error", Error: "broken pipe"}},
+			want:  "http_error_write_failed",
+		},
+		{
 			name:  "stream error",
 			trace: &StreamDeliveryTrace{End: StreamDeliveryEndTrace{Error: "upstream reset"}},
 			want:  "stream_error",
@@ -91,6 +101,13 @@ func TestStreamDeliveryTraceState(t *testing.T) {
 			name: "terminal received",
 			trace: &StreamDeliveryTrace{Upstream: StreamDeliveryUpstreamTrace{
 				FirstResponseCompleted: &StreamDeliveryCompletedUpstream{},
+			}},
+			want: "terminal_received",
+		},
+		{
+			name: "failure terminal received",
+			trace: &StreamDeliveryTrace{Upstream: StreamDeliveryUpstreamTrace{
+				FirstResponseFailed: &StreamDeliveryCompletedUpstream{},
 			}},
 			want: "terminal_received",
 		},
@@ -112,6 +129,11 @@ func TestStreamDeliveryTraceState(t *testing.T) {
 		{
 			name:  "terminal flushed",
 			trace: traceWithCompletedDelivery("succeeded", "succeeded"),
+			want:  "terminal_flushed",
+		},
+		{
+			name:  "failure terminal flushed",
+			trace: traceWithFailedDelivery("succeeded", "succeeded"),
 			want:  "terminal_flushed",
 		},
 		{
@@ -138,6 +160,15 @@ func TestStreamDeliveryTraceState(t *testing.T) {
 func traceWithCompletedDelivery(writeResult, flushResult string) *StreamDeliveryTrace {
 	return &StreamDeliveryTrace{Downstream: StreamDeliveryDownstreamTrace{
 		FirstResponseCompleted: &StreamDeliveryCompletedDownstream{
+			WriteResult: writeResult,
+			FlushResult: flushResult,
+		},
+	}}
+}
+
+func traceWithFailedDelivery(writeResult, flushResult string) *StreamDeliveryTrace {
+	return &StreamDeliveryTrace{Downstream: StreamDeliveryDownstreamTrace{
+		FirstResponseFailed: &StreamDeliveryCompletedDownstream{
 			WriteResult: writeResult,
 			FlushResult: flushResult,
 		},

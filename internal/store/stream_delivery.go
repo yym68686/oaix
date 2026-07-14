@@ -2,7 +2,7 @@ package store
 
 import "time"
 
-const StreamDeliveryTraceSchemaVersion = 1
+const StreamDeliveryTraceSchemaVersion = 2
 
 // StreamDeliveryTrace records only what the OAIX process observed locally.
 // Successful writes and flush calls do not assert that the downstream
@@ -21,6 +21,8 @@ type StreamDeliveryUpstreamTrace struct {
 	LastPayloadSequenceNumber *int64                           `json:"last_payload_sequence_number,omitempty"`
 	ResponseCompletedCount    int                              `json:"response_completed_count"`
 	FirstResponseCompleted    *StreamDeliveryCompletedUpstream `json:"first_response_completed,omitempty"`
+	ResponseFailedCount       int                              `json:"response_failed_count"`
+	FirstResponseFailed       *StreamDeliveryCompletedUpstream `json:"first_response_failed,omitempty"`
 	EOFAt                     *time.Time                       `json:"eof_at,omitempty"`
 }
 
@@ -39,6 +41,7 @@ type StreamDeliveryDownstreamTrace struct {
 	BytesWriteAttempted    int64                              `json:"bytes_write_attempted"`
 	BytesWritten           int64                              `json:"bytes_written"`
 	FirstResponseCompleted *StreamDeliveryCompletedDownstream `json:"first_response_completed,omitempty"`
+	FirstResponseFailed    *StreamDeliveryCompletedDownstream `json:"first_response_failed,omitempty"`
 	FinalBodyProducedAt    *time.Time                         `json:"final_body_produced_at,omitempty"`
 }
 
@@ -85,15 +88,24 @@ func (t *StreamDeliveryTrace) State() string {
 	if t == nil {
 		return ""
 	}
-	completed := t.Downstream.FirstResponseCompleted
-	if completed != nil {
-		switch completed.WriteResult {
+	switch t.End.Reason {
+	case "upstream_response_failed_http_error_delivered":
+		return "http_error_delivered"
+	case "downstream_http_error_write_error":
+		return "http_error_write_failed"
+	}
+	terminal := t.Downstream.FirstResponseCompleted
+	if terminal == nil {
+		terminal = t.Downstream.FirstResponseFailed
+	}
+	if terminal != nil {
+		switch terminal.WriteResult {
 		case "partial":
 			return "terminal_write_partial"
 		case "failed":
 			return "terminal_write_failed"
 		case "succeeded":
-			switch completed.FlushResult {
+			switch terminal.FlushResult {
 			case "succeeded":
 				return "terminal_flushed"
 			case "not_supported":
@@ -105,7 +117,7 @@ func (t *StreamDeliveryTrace) State() string {
 			}
 		}
 	}
-	if t.Upstream.FirstResponseCompleted != nil {
+	if t.Upstream.FirstResponseCompleted != nil || t.Upstream.FirstResponseFailed != nil {
 		return "terminal_received"
 	}
 	if t.End.Error != "" {

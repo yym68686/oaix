@@ -110,6 +110,7 @@ type AttemptResult struct {
 	ResponseID          string
 	FirstTokenAt        *time.Time
 	ErrorBody           []byte
+	ResponsesFailure    *responsesFailureTerminal
 	StreamDeliveryTrace *store.StreamDeliveryTrace
 }
 
@@ -255,6 +256,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var lastResponseID string
 	var lastFirstTokenAt *time.Time
 	var lastStreamDeliveryTrace *store.StreamDeliveryTrace
+	var lastResponsesFailure *responsesFailureTerminal
 	var streamState StreamAttemptState
 	var refreshedAuthTokens = make(map[int64]struct{})
 	baseTokenIntent := tokens.Intent{
@@ -368,6 +370,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		if result.StreamDeliveryTrace != nil {
 			lastStreamDeliveryTrace = result.StreamDeliveryTrace
 		}
+		lastResponsesFailure = result.ResponsesFailure
 		if result.StreamState.DownstreamStarted {
 			streamState.DownstreamStarted = true
 		}
@@ -393,7 +396,18 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		finalStatus = status
 		if committed {
 			success := err == nil && status >= 200 && status < 400
-			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, classify(status, err), retry, false, nil)
+			action := classify(status, err)
+			decision := tokenFailureDecision{}
+			if result.ResponsesFailure != nil && !success {
+				decision = p.decideTokenFailure(r.Context(), claim, status, result, err, action, refreshedAuthTokens, timing)
+			}
+			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, retry, decision.deactivate, decision.cooldownUntil)
+			if decision.commitRequired {
+				p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, decision.commitMessage, decision.deactivate, decision.cooldownUntil, p.tokenStateEventContext(requestID, intent, status, action, attemptID))
+				if decision.deactivate {
+					p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+				}
+			}
 			var msg *string
 			if err != nil {
 				text := err.Error()
@@ -436,65 +450,33 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			}
 			break
 		}
-		var (
-			deactivate     bool
-			cooldownUntil  *time.Time
-			commitMessage  string
-			commitRequired bool
-			retrySameToken bool
-		)
-		if action == OutcomeUpstream401Invalid || action == OutcomeUpstream403Invalid {
-			_, alreadyRefreshed := refreshedAuthTokens[claim.TokenID()]
-			refreshResult := p.refreshAccessTokenAfterAuthFailure(r.Context(), claim, alreadyRefreshed)
-			switch {
-			case refreshResult.Refreshed:
-				refreshedAuthTokens[claim.TokenID()] = struct{}{}
-				retrySameToken = true
-				timing["oauth_refresh_on_auth_failure"] = true
-			case refreshResult.Inconclusive:
-				cooldownUntil = authFailureCooldownUntil()
-				commitRequired = true
-				commitMessage = refreshResult.Message
-				if commitMessage == "" {
-					commitMessage = fmt.Sprintf("non-terminal upstream status %d after oauth refresh check", status)
-				}
-			default:
-				deactivate = true
-				commitRequired = true
-				commitMessage = refreshResult.Message
-				if commitMessage == "" {
-					commitMessage = fmt.Sprintf("terminal upstream status %d", status)
-				}
+		decision := p.decideTokenFailure(r.Context(), claim, status, result, err, action, refreshedAuthTokens, timing)
+		terminalFailure := result.ResponsesFailure != nil && (!retry || attempt == p.cfg.Upstream.MaxRetries)
+		if terminalFailure {
+			deliveryErr := writeResponsesFailureResponse(w, streamState.DownstreamStarted, result.ResponsesFailure, result.StreamDeliveryTrace)
+			if deliveryErr != nil {
+				deliveryMessage := fmt.Sprintf("%v; downstream failure delivery failed: %v", err, deliveryErr)
+				err = errors.New(deliveryMessage)
+				lastErr = err
 			}
-		} else if action == OutcomeUpstream429Cooldown {
-			now := time.Now().UTC()
-			cooldownUntil = cooldown.UsageLimitUntil(status, result.ErrorBody, now, p.cfg.TokenPool.DefaultCooldown)
-			commitMessage = "upstream 429 cooldown"
-			if cooldownUntil == nil {
-				fallback := p.cfg.TokenPool.DefaultCooldown
-				if fallback <= 0 {
-					fallback = 300 * time.Second
-				}
-				until := now.Add(fallback)
-				cooldownUntil = &until
-			} else {
-				commitMessage = "upstream usage limit cooldown"
-			}
-			commitRequired = true
-		} else if retry && (action == OutcomeUpstream5xx || action == OutcomeTransportError) {
-			cooldown := time.Now().UTC().Add(5 * time.Second)
-			cooldownUntil = &cooldown
-			commitMessage = fmt.Sprintf("retryable upstream failure: %v", err)
-			commitRequired = true
+			result.Committed = true
 		}
-		attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, retry, deactivate, cooldownUntil)
-		if commitRequired {
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, commitMessage, deactivate, cooldownUntil, p.tokenStateEventContext(requestID, intent, status, action, attemptID))
-			if deactivate {
+		attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, retry, decision.deactivate, decision.cooldownUntil)
+		if decision.commitRequired {
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, decision.commitMessage, decision.deactivate, decision.cooldownUntil, p.tokenStateEventContext(requestID, intent, status, action, attemptID))
+			if decision.deactivate {
 				p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			}
 		}
-		if retrySameToken {
+		if terminalFailure {
+			message := result.ResponsesFailure.message
+			if err != nil {
+				message = err.Error()
+			}
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+			return
+		}
+		if decision.retrySameToken {
 			if attempt < p.cfg.Upstream.MaxRetries {
 				continue
 			}
@@ -506,6 +488,15 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 	}
 	if errors.Is(lastErr, tokens.ErrNoToken) {
+		if lastResponsesFailure != nil {
+			message := lastResponsesFailure.message
+			status := lastResponsesFailure.status
+			if deliveryErr := writeResponsesFailureResponse(w, streamState.DownstreamStarted, lastResponsesFailure, lastStreamDeliveryTrace); deliveryErr != nil {
+				message = fmt.Sprintf("%s; downstream failure delivery failed: %v", message, deliveryErr)
+			}
+			p.finalLog(r.Context(), requestID, intent, started, status, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+			return
+		}
 		writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, http.StatusServiceUnavailable, "no available token")
 		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 		return
@@ -887,6 +878,76 @@ func classify(status int, err error) Outcome {
 	return OutcomeSuccess
 }
 
+type tokenFailureDecision struct {
+	deactivate     bool
+	cooldownUntil  *time.Time
+	commitMessage  string
+	commitRequired bool
+	retrySameToken bool
+}
+
+func (p *Pipeline) decideTokenFailure(
+	ctx context.Context,
+	claim *tokens.Claim,
+	status int,
+	result AttemptResult,
+	err error,
+	action Outcome,
+	refreshedAuthTokens map[int64]struct{},
+	timing map[string]any,
+) tokenFailureDecision {
+	decision := tokenFailureDecision{}
+	if action == OutcomeUpstream401Invalid || action == OutcomeUpstream403Invalid {
+		_, alreadyRefreshed := refreshedAuthTokens[claim.TokenID()]
+		refreshResult := p.refreshAccessTokenAfterAuthFailure(ctx, claim, alreadyRefreshed)
+		switch {
+		case refreshResult.Refreshed:
+			refreshedAuthTokens[claim.TokenID()] = struct{}{}
+			decision.retrySameToken = true
+			timing["oauth_refresh_on_auth_failure"] = true
+		case refreshResult.Inconclusive:
+			decision.cooldownUntil = authFailureCooldownUntil()
+			decision.commitRequired = true
+			decision.commitMessage = refreshResult.Message
+			if decision.commitMessage == "" {
+				decision.commitMessage = fmt.Sprintf("non-terminal upstream status %d after oauth refresh check", status)
+			}
+		default:
+			decision.deactivate = true
+			decision.commitRequired = true
+			decision.commitMessage = refreshResult.Message
+			if decision.commitMessage == "" {
+				decision.commitMessage = fmt.Sprintf("terminal upstream status %d", status)
+			}
+		}
+		return decision
+	}
+	if action == OutcomeUpstream429Cooldown {
+		now := time.Now().UTC()
+		decision.cooldownUntil = cooldown.UsageLimitUntil(status, result.ErrorBody, now, p.cfg.TokenPool.DefaultCooldown)
+		decision.commitMessage = "upstream 429 cooldown"
+		if decision.cooldownUntil == nil {
+			fallback := p.cfg.TokenPool.DefaultCooldown
+			if fallback <= 0 {
+				fallback = 300 * time.Second
+			}
+			until := now.Add(fallback)
+			decision.cooldownUntil = &until
+		} else {
+			decision.commitMessage = "upstream usage limit cooldown"
+		}
+		decision.commitRequired = true
+		return decision
+	}
+	if (result.Retry || result.ResponsesFailure != nil) && (action == OutcomeUpstream5xx || action == OutcomeTransportError) {
+		until := time.Now().UTC().Add(5 * time.Second)
+		decision.cooldownUntil = &until
+		decision.commitMessage = fmt.Sprintf("retryable upstream failure: %v", err)
+		decision.commitRequired = true
+	}
+	return decision
+}
+
 func isDeactivatedWorkspaceFailure(status int, raw []byte, err error) bool {
 	if status != http.StatusPaymentRequired {
 		return false
@@ -1104,13 +1165,19 @@ func errorCodeFromBody(raw []byte) string {
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return ""
 	}
-	if code := errorCodeFromMap(payload); code != "" {
-		return code
-	}
 	if nested, ok := payload["error"].(map[string]any); ok {
-		return errorCodeFromMap(nested)
+		if code := errorCodeFromMap(nested); code != "" {
+			return code
+		}
 	}
-	return ""
+	if response, ok := payload["response"].(map[string]any); ok {
+		if nested, ok := response["error"].(map[string]any); ok {
+			if code := errorCodeFromMap(nested); code != "" {
+				return code
+			}
+		}
+	}
+	return errorCodeFromMap(payload)
 }
 
 func errorCodeFromMap(payload map[string]any) string {
@@ -1288,6 +1355,42 @@ func writeFinalErrorResponse(w http.ResponseWriter, stream bool, downstreamStart
 		return
 	}
 	writeErrorResponse(w, stream, status, message)
+}
+
+func writeResponsesFailureResponse(w http.ResponseWriter, downstreamStarted bool, failure *responsesFailureTerminal, trace *store.StreamDeliveryTrace) error {
+	if failure == nil {
+		return errors.New("missing response.failed terminal")
+	}
+	if downstreamStarted {
+		err := writeDownstreamStreamEvent(w, trace, failure.streamEvent(), true)
+		finishDeliveredResponsesFailureTrace(trace, err, false)
+		return err
+	}
+	status := failure.status
+	if status <= 0 {
+		status = http.StatusBadGateway
+	}
+	err := writeResponsesFailureJSON(w, status, failure.data)
+	finishDeliveredResponsesFailureTrace(trace, err, true)
+	return err
+}
+
+func writeResponsesFailureJSON(w http.ResponseWriter, status int, raw []byte) error {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return err
+	}
+	response, ok := payload["response"].(map[string]any)
+	if !ok {
+		return errors.New("response.failed terminal is missing response")
+	}
+	errorObject, ok := response["error"].(map[string]any)
+	if !ok {
+		return errors.New("response.failed terminal is missing response.error")
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	return json.NewEncoder(w).Encode(map[string]any{"error": errorObject})
 }
 
 func writeSSEError(w http.ResponseWriter, status int, message string) {
