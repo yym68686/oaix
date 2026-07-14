@@ -389,19 +389,26 @@ func TestProxyRoutesFastRequestOnlyToFastCapablePlan(t *testing.T) {
 	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
 	pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","service_tier":"priority"}`))
-	req.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", OwnerUserID: 42})
+	for _, body := range []string{
+		`{"model":"gpt-5.5","input":"hello","service_tier":"priority"}`,
+		`{"model":"gpt-5.5","input":"hello","service_tier":{},"service_tier":"priority"}`,
+	} {
+		upstreamAuthorization = ""
+		upstreamServiceTier = ""
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", OwnerUserID: 42})
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
-	}
-	if upstreamAuthorization != "Bearer pro-token" {
-		t.Fatalf("upstream Authorization = %q, want Pro token", upstreamAuthorization)
-	}
-	if upstreamServiceTier != "priority" {
-		t.Fatalf("upstream service_tier = %q", upstreamServiceTier)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("body %s: status = %d response=%s", body, recorder.Code, recorder.Body.String())
+		}
+		if upstreamAuthorization != "Bearer pro-token" {
+			t.Fatalf("body %s: upstream Authorization = %q, want Pro token", body, upstreamAuthorization)
+		}
+		if upstreamServiceTier != "priority" {
+			t.Fatalf("body %s: upstream service_tier = %q", body, upstreamServiceTier)
+		}
 	}
 }
 
@@ -416,6 +423,27 @@ func TestNormalizeIntentRecognizesFastServiceTierAliases(t *testing.T) {
 		intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(fmt.Sprintf(`{"model":"gpt-5.5","service_tier":%q}`, tier)))
 		if intent.RequireFast {
 			t.Fatalf("service_tier %q unexpectedly required Fast", tier)
+		}
+	}
+	for _, endpoint := range []string{"/v1/responses", "/v1/responses/compact", "/v1/chat/completions"} {
+		duplicate := normalizeIntent(
+			RequestIntent{Endpoint: endpoint},
+			[]byte(`{"model":"gpt-5.5","service_tier":{},"service_tier":"priority"}`),
+		)
+		if !duplicate.RequireFast || duplicate.ServiceTier != "priority" {
+			t.Fatalf("endpoint %s duplicate service_tier intent = %#v, want priority Fast", endpoint, duplicate)
+		}
+	}
+	for _, test := range []struct {
+		body     string
+		wantTier string
+	}{
+		{body: `{"service_tier":"priority","service_tier":"default"}`, wantTier: "default"},
+		{body: `{"service_tier":"priority","service_tier":{}}`, wantTier: ""},
+	} {
+		intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(test.body))
+		if intent.RequireFast || intent.ServiceTier != test.wantTier {
+			t.Fatalf("body %s intent = %#v, want non-Fast tier %q", test.body, intent, test.wantTier)
 		}
 	}
 }

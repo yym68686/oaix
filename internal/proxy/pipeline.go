@@ -1330,11 +1330,14 @@ func requestID(r *http.Request) string {
 func normalizeIntent(intent RequestIntent, body []byte) RequestIntent {
 	switch intent.Endpoint {
 	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions":
-		var metadata struct {
-			ServiceTier string `json:"service_tier"`
-		}
-		if err := json.Unmarshal(body, &metadata); err == nil {
-			intent.ServiceTier = strings.ToLower(strings.TrimSpace(metadata.ServiceTier))
+		// Read service_tier through the same map decoder used to prepare the
+		// upstream payload. In particular, duplicate JSON keys must resolve the
+		// same way here and upstream; otherwise an earlier value with the wrong
+		// type can make struct decoding fail while a later "priority" value is
+		// still forwarded, bypassing the Fast token allow-list.
+		if payload, err := decodeJSONObject(body); err == nil {
+			serviceTier, _ := payload["service_tier"].(string)
+			intent.ServiceTier = strings.ToLower(strings.TrimSpace(serviceTier))
 			intent.RequireFast = intent.ServiceTier == "priority" || intent.ServiceTier == "fast"
 		}
 	}
