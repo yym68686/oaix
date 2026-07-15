@@ -198,7 +198,11 @@ type fastCostRepricer interface {
 }
 
 func runFastRequestCostRepricing(ctx context.Context, logger *slog.Logger, db fastCostRepricer) error {
-	const cycleWriteBudget = 45 * time.Second
+	// Keep the one-time repair deliberately below the duty cycle of normal
+	// maintenance and request-log writes. Each database call also carries its
+	// own five-second statement timeout, so a cold page cannot monopolize the
+	// small production database.
+	const cycleWriteBudget = 5 * time.Second
 	deadline := time.Now().Add(cycleWriteBudget)
 	var total store.FastCostRepriceResult
 	batchCount := 0

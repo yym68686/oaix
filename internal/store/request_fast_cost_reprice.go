@@ -48,7 +48,7 @@ func (s *Store) RepriceFastRequestCosts(ctx context.Context) (FastCostRepriceRes
 	if _, err := tx.Exec(ctx, `set local lock_timeout = '2s'`); err != nil {
 		return result, err
 	}
-	if _, err := tx.Exec(ctx, `set local statement_timeout = '20s'`); err != nil {
+	if _, err := tx.Exec(ctx, `set local statement_timeout = '5s'`); err != nil {
 		return result, err
 	}
 
@@ -89,17 +89,34 @@ func (s *Store) RepriceFastRequestCosts(ctx context.Context) (FastCostRepriceRes
 	var firstSeenAt time.Time
 	var phase string
 	var cursor int64
+	var lowerBoundID int64
+	var scanUntilID int64
+	var rawIDCursor bool
 	firstRun := false
 	err = tx.QueryRow(ctx, `
 		select
 			coalesce((value->>'completed')::boolean, false),
 			coalesce((value->>'first_seen_at')::timestamptz, now()),
 			coalesce(nullif(value->>'phase', ''), 'initial'),
-			coalesce((value->>'cursor')::bigint, 0)
+			case
+				when value->>'cursor_mode' = 'raw_id' then coalesce((value->>'cursor')::bigint, 0)
+				else 0
+			end,
+			coalesce((value->>'lower_bound_id')::bigint, 0),
+			coalesce((value->>'scan_until_id')::bigint, 0),
+			coalesce(value->>'cursor_mode' = 'raw_id', false)
 		from gateway_settings
 		where key = $1
 		for update
-	`, fastCostRepriceSettingKey).Scan(&completed, &firstSeenAt, &phase, &cursor)
+	`, fastCostRepriceSettingKey).Scan(
+		&completed,
+		&firstSeenAt,
+		&phase,
+		&cursor,
+		&lowerBoundID,
+		&scanUntilID,
+		&rawIDCursor,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		firstRun = true
 		phase = "initial"
@@ -122,6 +139,27 @@ func (s *Store) RepriceFastRequestCosts(ctx context.Context) (FastCostRepriceRes
 	if err := tx.QueryRow(ctx, `select now()`).Scan(&databaseNow); err != nil {
 		return result, err
 	}
+	resetRawIDScan := func() error {
+		if err := tx.QueryRow(ctx, `
+			select
+				coalesce((select id from gateway_request_logs order by id limit 1), 0),
+				coalesce((select id from gateway_request_logs order by id desc limit 1), 0)
+		`).Scan(&lowerBoundID, &scanUntilID); err != nil {
+			return err
+		}
+		cursor = 0
+		if lowerBoundID > 0 {
+			cursor = lowerBoundID - 1
+		}
+		return nil
+	}
+	if firstRun || !rawIDCursor {
+		firstRun = true
+		phase = "initial"
+		if err := resetRawIDScan(); err != nil {
+			return result, err
+		}
+	}
 
 	saveState := func(done bool) error {
 		_, err := tx.Exec(ctx, `
@@ -133,18 +171,21 @@ func (s *Store) RepriceFastRequestCosts(ctx context.Context) (FastCostRepriceRes
 					'first_seen_at', $3::timestamptz,
 					'phase', $4::text,
 					'cursor', $5::bigint,
+					'cursor_mode', 'raw_id',
+					'lower_bound_id', $6::bigint,
+					'scan_until_id', $7::bigint,
 					'last_step_at', now(),
-					'scanned_log_count', $6::bigint,
-					'updated_log_count', $7::bigint,
-					'updated_token_count', $8::bigint,
-					'updated_hourly_count', $9::bigint
+					'scanned_log_count', $8::bigint,
+					'updated_log_count', $9::bigint,
+					'updated_token_count', $10::bigint,
+					'updated_hourly_count', $11::bigint
 				),
 				now()
 			)
 			on conflict (key) do update set
 				value = excluded.value,
 				updated_at = excluded.updated_at
-		`, fastCostRepriceSettingKey, done, firstSeenAt, phase, cursor, result.ScannedLogs, result.UpdatedLogs, result.UpdatedTokenCosts, result.UpdatedHourlyCosts)
+		`, fastCostRepriceSettingKey, done, firstSeenAt, phase, cursor, lowerBoundID, scanUntilID, result.ScannedLogs, result.UpdatedLogs, result.UpdatedTokenCosts, result.UpdatedHourlyCosts)
 		return err
 	}
 
@@ -161,6 +202,7 @@ func (s *Store) RepriceFastRequestCosts(ctx context.Context) (FastCostRepriceRes
 			ctx,
 			repriceFastRequestLogsBatchSQL,
 			cursor,
+			scanUntilID,
 			scanSince,
 			fastCostRepriceBatchSize,
 		).Scan(
@@ -200,7 +242,9 @@ func (s *Store) RepriceFastRequestCosts(ctx context.Context) (FastCostRepriceRes
 				break
 			}
 			phase = "final"
-			cursor = 0
+			if err := resetRawIDScan(); err != nil {
+				return result, err
+			}
 			result.Phase = phase
 			if err := saveState(false); err != nil {
 				return result, err
@@ -208,7 +252,7 @@ func (s *Store) RepriceFastRequestCosts(ctx context.Context) (FastCostRepriceRes
 			break
 		}
 		phase = "completed"
-		cursor = 0
+		cursor = scanUntilID
 		result.Phase = phase
 		result.Completed = true
 		if err := saveState(true); err != nil {
@@ -225,33 +269,39 @@ func (s *Store) RepriceFastRequestCosts(ctx context.Context) (FastCostRepriceRes
 }
 
 const repriceFastRequestLogsBatchSQL = `
-	with candidates as materialized (
-		select
-			id,
-			lower(btrim(coalesce(model_name, model, ''))) as normalized_model,
-			coalesce(model_name, model, '') as aggregate_model,
-			coalesce(input_tokens, 0)::numeric as input_tokens,
-			coalesce(cache_write_input_tokens, 0)::numeric as cache_write_input_tokens,
-			coalesce(cached_input_tokens, 0)::numeric as cached_input_tokens,
-			coalesce(output_tokens, 0)::numeric as output_tokens,
-			estimated_cost_usd::numeric as previous_cost_usd,
-			case when jsonb_typeof(prompt_cache_trace::jsonb) = 'object' then prompt_cache_trace::jsonb else '{}'::jsonb end as request_trace,
-			analytics_recorded_at,
-			token_id,
-			owner_user_id,
-			date_trunc('hour', started_at) as bucket_start
+	with scan_window as materialized (
+		select id
 		from gateway_request_logs
 		where id > $1::bigint
-		  and started_at >= $2::timestamptz
-		  and finished_at is not null
-		  and estimated_cost_usd is not null
-		  and timing_spans->>'fast_mode_requested' = 'true'
-		  and timing_spans->>'service_tier' = 'priority'
-		  and lower(btrim(coalesce(model_name, model, ''))) >= 'gpt-5.4'
-		  and lower(btrim(coalesce(model_name, model, ''))) < 'gpt-5.7'
+		  and id <= $2::bigint
 		order by id
-		limit $3::integer
-		for update
+		limit $4::integer
+	),
+	candidates as materialized (
+		select
+			logs.id,
+			lower(btrim(coalesce(logs.model_name, logs.model, ''))) as normalized_model,
+			coalesce(logs.model_name, logs.model, '') as aggregate_model,
+			coalesce(logs.input_tokens, 0)::numeric as input_tokens,
+			coalesce(logs.cache_write_input_tokens, 0)::numeric as cache_write_input_tokens,
+			coalesce(logs.cached_input_tokens, 0)::numeric as cached_input_tokens,
+			coalesce(logs.output_tokens, 0)::numeric as output_tokens,
+			logs.estimated_cost_usd::numeric as previous_cost_usd,
+			case when jsonb_typeof(logs.prompt_cache_trace::jsonb) = 'object' then logs.prompt_cache_trace::jsonb else '{}'::jsonb end as request_trace,
+			logs.analytics_recorded_at,
+			logs.token_id,
+			logs.owner_user_id,
+			date_trunc('hour', logs.started_at) as bucket_start
+		from scan_window scanned
+		join gateway_request_logs logs on logs.id = scanned.id
+		where logs.started_at >= $3::timestamptz
+		  and logs.finished_at is not null
+		  and logs.estimated_cost_usd is not null
+		  and logs.timing_spans->>'fast_mode_requested' = 'true'
+		  and logs.timing_spans->>'service_tier' = 'priority'
+		  and lower(btrim(coalesce(logs.model_name, logs.model, ''))) >= 'gpt-5.4'
+		  and lower(btrim(coalesce(logs.model_name, logs.model, ''))) < 'gpt-5.7'
+		for update of logs
 	),
 	classified as (
 		select
@@ -499,8 +549,8 @@ const repriceFastRequestLogsBatchSQL = `
 		returning id
 	)
 	select
-		coalesce((select max(id) from candidates), $1::bigint) as next_cursor,
-		(select count(*)::bigint from candidates) as scanned_logs,
+		coalesce((select max(id) from scan_window), $2::bigint) as next_cursor,
+		(select count(*)::bigint from scan_window) as scanned_logs,
 		(select count(*)::bigint from updated) as updated_logs,
 		((select count(*)::bigint from token_updates) + (select count(*)::bigint from token_inserts)) as updated_token_costs,
 		(select count(*)::bigint from token_deltas) as expected_token_costs,

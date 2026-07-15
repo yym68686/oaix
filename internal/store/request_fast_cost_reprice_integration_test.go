@@ -37,6 +37,7 @@ func TestPostgresRepriceFastRequestCosts(t *testing.T) {
 	}
 
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	fillerRequestPrefix := "fast-reprice-filler-" + suffix + "-"
 	requestIDs := []string{
 		"fast-reprice-sol-" + suffix,
 		"fast-reprice-mini-" + suffix,
@@ -66,6 +67,7 @@ func TestPostgresRepriceFastRequestCosts(t *testing.T) {
 		defer cleanupCancel()
 		_, _ = db.pool.Exec(cleanupCtx, `delete from gateway_request_hourly_stats where owner_user_id = $1 and model_name = any($2::text[])`, ownerUserID, models)
 		_, _ = db.pool.Exec(cleanupCtx, `delete from gateway_request_logs where request_id = any($1::text[])`, requestIDs)
+		_, _ = db.pool.Exec(cleanupCtx, `delete from gateway_request_logs where request_id like $1`, fillerRequestPrefix+"%")
 		_, _ = db.pool.Exec(cleanupCtx, `delete from gateway_request_token_costs where token_id = $1`, tokenID)
 		_, _ = db.pool.Exec(cleanupCtx, `delete from codex_tokens where id = $1`, tokenID)
 		_, _ = db.pool.Exec(cleanupCtx, `delete from gateway_settings where key = any($1::text[])`, []string{fastCostRepriceSettingKey, gpt56CostRepriceSettingKey})
@@ -73,6 +75,21 @@ func TestPostgresRepriceFastRequestCosts(t *testing.T) {
 
 	if _, err := db.pool.Exec(ctx, `delete from gateway_settings where key = any($1::text[])`, []string{fastCostRepriceSettingKey, gpt56CostRepriceSettingKey}); err != nil {
 		t.Fatalf("clear cost reprice markers: %v", err)
+	}
+	if _, err := db.pool.Exec(ctx, `
+		insert into gateway_request_logs (
+			request_id, owner_user_id, endpoint, model, model_name, started_at, finished_at,
+			success, input_tokens, cached_input_tokens, output_tokens, total_tokens,
+			estimated_cost_usd, timing_spans
+		)
+		select
+			$1 || series::text, $2, '/v1/responses', 'gpt-5.6-luna', 'gpt-5.6-luna',
+			$3::timestamptz - interval '1 minute' + series * interval '1 millisecond',
+			$3::timestamptz - interval '59 seconds' + series * interval '1 millisecond',
+			true, 1, 0, 1, 2, 0.000007, '{"service_tier":"default"}'::jsonb
+		from generate_series(1, $4::integer) as series
+	`, fillerRequestPrefix, ownerUserID, startedAt, fastCostRepriceBatchSize); err != nil {
+		t.Fatalf("insert non-Fast cursor filler logs: %v", err)
 	}
 	if _, err := db.pool.Exec(ctx, `
 		insert into gateway_request_logs (
@@ -186,7 +203,14 @@ func TestPostgresRepriceFastRequestCosts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RepriceFastRequestCosts returned error: %v", err)
 	}
-	if result.Phase != "initial" || result.ScannedLogs != 3 || result.UpdatedLogs != 3 || result.UpdatedTokenCosts != 1 || result.UpdatedHourlyCosts != 2 || result.Completed {
+	if result.Phase != "initial" || result.ScannedLogs != int64(fastCostRepriceBatchSize) || result.UpdatedLogs != 0 || result.UpdatedTokenCosts != 0 || result.UpdatedHourlyCosts != 0 || result.Completed {
+		t.Fatalf("non-Fast raw page did not advance safely: %+v", result)
+	}
+	result, err = db.RepriceFastRequestCosts(ctx)
+	if err != nil {
+		t.Fatalf("second RepriceFastRequestCosts returned error: %v", err)
+	}
+	if result.Phase != "initial" || result.ScannedLogs != 5 || result.UpdatedLogs != 3 || result.UpdatedTokenCosts != 1 || result.UpdatedHourlyCosts != 2 || result.Completed {
 		t.Fatalf("unexpected initial Fast reprice result: %+v", result)
 	}
 
@@ -278,7 +302,14 @@ func TestPostgresRepriceFastRequestCosts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("final scan returned error: %v", err)
 	}
-	if result.Phase != "final" || result.ScannedLogs != 3 || result.UpdatedLogs != 0 || result.UpdatedTokenCosts != 0 || result.UpdatedHourlyCosts != 0 || result.Completed {
+	if result.Phase != "final" || result.ScannedLogs != int64(fastCostRepriceBatchSize) || result.UpdatedLogs != 0 || result.UpdatedTokenCosts != 0 || result.UpdatedHourlyCosts != 0 || result.Completed {
+		t.Fatalf("final non-Fast raw page was not idempotent: %+v", result)
+	}
+	result, err = db.RepriceFastRequestCosts(ctx)
+	if err != nil {
+		t.Fatalf("final candidate scan returned error: %v", err)
+	}
+	if result.Phase != "final" || result.ScannedLogs != 5 || result.UpdatedLogs != 0 || result.UpdatedTokenCosts != 0 || result.UpdatedHourlyCosts != 0 || result.Completed {
 		t.Fatalf("final scan was not idempotent: %+v", result)
 	}
 	result, err = db.RepriceFastRequestCosts(ctx)
