@@ -3,13 +3,16 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/yym68686/oaix/internal/config"
+	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -94,6 +97,322 @@ func TestQuotaRecoveryEffectiveConcurrencyReservesDatabaseConnections(t *testing
 			}
 		})
 	}
+}
+
+func TestQuotaRecoveryHTTPErrorReasonUsesFixedCredentialAndStatusClasses(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   quotaRecoveryCheckErrorReason
+	}{
+		{
+			name:   "inactive personal access token",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"message":"Personal access token inactive"}}`,
+			want:   quotaRecoveryCheckErrorAccessTokenInactive,
+		},
+		{
+			name:   "invalidated authentication token",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"message":"The authentication token has been invalidated"}}`,
+			want:   quotaRecoveryCheckErrorAuthenticationInvalidated,
+		},
+		{
+			name:   "inactive owner",
+			status: http.StatusForbidden,
+			body:   `{"error":{"message":"Account owner inactive"}}`,
+			want:   quotaRecoveryCheckErrorOwnerInactive,
+		},
+		{
+			name:   "expired authentication token",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"message":"Authentication token expired"}}`,
+			want:   quotaRecoveryCheckErrorAuthenticationTokenExpired,
+		},
+		{
+			name:   "unknown unauthorized response",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"message":"unknown credential problem"}}`,
+			want:   quotaRecoveryCheckErrorHTTPUnauthorized,
+		},
+		{
+			name:   "rate limited response",
+			status: http.StatusTooManyRequests,
+			body:   `{"error":{"message":"slow down"}}`,
+			want:   quotaRecoveryCheckErrorHTTPRateLimited,
+		},
+		{
+			name:   "server response",
+			status: http.StatusBadGateway,
+			body:   `upstream unavailable`,
+			want:   quotaRecoveryCheckErrorHTTPServer,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := quotaRecoveryHTTPErrorReason(test.status, []byte(test.body), responseErrorDetail(test.status, []byte(test.body))); got != test.want {
+				t.Fatalf("quotaRecoveryHTTPErrorReason = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestQuotaRecoveryCheckErrorStatsAreCompleteAndLowCardinality(t *testing.T) {
+	worker := &quotaRecoveryWorker{}
+	worker.recordQuotaCheckError(quotaRecoveryCheckErrorAccessTokenInactive)
+	worker.recordQuotaCheckError(quotaRecoveryCheckErrorAccessTokenInactive)
+	worker.recordQuotaCheckError("unbounded-upstream-message")
+	worker.recordFreshQuotaErrorSkip(quotaRecoveryCheckErrorCredentialRefreshRejected)
+
+	stats := worker.Stats()
+	if stats.QuotaCheckErrors != 3 {
+		t.Fatalf("quota check errors = %d, want 3", stats.QuotaCheckErrors)
+	}
+	if got := stats.QuotaCheckErrorsByReason[string(quotaRecoveryCheckErrorAccessTokenInactive)]; got != 2 {
+		t.Fatalf("inactive access token errors = %d, want 2", got)
+	}
+	if got := stats.QuotaCheckErrorsByReason[string(quotaRecoveryCheckErrorOther)]; got != 1 {
+		t.Fatalf("other errors = %d, want 1", got)
+	}
+	if len(stats.QuotaCheckErrorsByReason) != len(quotaRecoveryCheckErrorReasons) {
+		t.Fatalf("reason cardinality = %d, want fixed %d", len(stats.QuotaCheckErrorsByReason), len(quotaRecoveryCheckErrorReasons))
+	}
+	var total int64
+	for _, count := range stats.QuotaCheckErrorsByReason {
+		total += count
+	}
+	if total != stats.QuotaCheckErrors {
+		t.Fatalf("categorized errors = %d, total errors = %d", total, stats.QuotaCheckErrors)
+	}
+	if stats.FreshQuotaErrorSkips != 1 || stats.FreshQuotaErrorSkipsByReason[string(quotaRecoveryCheckErrorCredentialRefreshRejected)] != 1 {
+		t.Fatalf("fresh quota error skip stats = %+v", stats)
+	}
+}
+
+func TestQuotaRecoveryHTTPErrorReasonUsesStructuredCodeBeforeLocalizedMessage(t *testing.T) {
+	body := []byte(`{"message":"owner inactive","error":{"message":"登录状态异常","code":"authentication_token_invalidated"}}`)
+	if got := quotaRecoveryHTTPErrorReason(http.StatusUnauthorized, body, responseErrorDetail(http.StatusUnauthorized, body)); got != quotaRecoveryCheckErrorAuthenticationInvalidated {
+		t.Fatalf("structured error reason = %q, want %q", got, quotaRecoveryCheckErrorAuthenticationInvalidated)
+	}
+}
+
+func TestQuotaRecoveryCredentialRefreshErrorReason(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want quotaRecoveryCheckErrorReason
+	}{
+		{name: "concurrent credential update", err: store.ErrTokenCredentialsChanged, want: quotaRecoveryCheckErrorCredentialRefreshConflict},
+		{name: "permanent oauth rejection", err: errors.New(`oauth refresh failed with status 400: {"error":"invalid_grant"}`), want: quotaRecoveryCheckErrorCredentialRefreshRejected},
+		{name: "generic oauth forbidden", err: errors.New(`oauth refresh failed with status 403: forbidden`), want: quotaRecoveryCheckErrorCredentialRefreshRejected},
+		{name: "deadline", err: context.DeadlineExceeded, want: quotaRecoveryCheckErrorDeadlineExceeded},
+		{name: "other refresh failure", err: errors.New("oauth backend unavailable"), want: quotaRecoveryCheckErrorCredentialRefreshOther},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := quotaRecoveryCredentialRefreshErrorReason(test.err); got != test.want {
+				t.Fatalf("refresh error reason = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestQuotaRecoveryFetchDiagnosticPreservesBehaviorAndClassifiesFailureStage(t *testing.T) {
+	t.Run("refresh rejection takes precedence over stale access token response", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"authentication_token_invalidated"}}`))
+		}))
+		defer upstream.Close()
+		service := quotaRecoveryTestQuotaService(upstream.URL, &quotaRecoveryOAuthStub{
+			err: errors.New(`oauth refresh failed with status 400: {"error":"invalid_grant"}`),
+		})
+		snapshot, reason := service.fetchSnapshotWithoutHistory(t.Context(), store.Token{
+			ID: 1, AccessToken: "stale-access", RefreshToken: "rejected-refresh",
+		})
+		if snapshot == nil || snapshot.Error == nil || !strings.Contains(*snapshot.Error, "authentication_token_invalidated") {
+			t.Fatalf("original quota error behavior changed: %#v", snapshot)
+		}
+		if reason != quotaRecoveryCheckErrorCredentialRefreshRejected {
+			t.Fatalf("diagnostic reason = %q, want %q", reason, quotaRecoveryCheckErrorCredentialRefreshRejected)
+		}
+	})
+
+	t.Run("successful refresh followed by unauthorized response uses new response", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			if r.Header.Get("Authorization") == "Bearer refreshed-access" {
+				_, _ = w.Write([]byte(`{"error":{"message":"unknown credential problem"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"error":{"code":"authentication_token_invalidated"}}`))
+		}))
+		defer upstream.Close()
+		service := quotaRecoveryTestQuotaService(upstream.URL, &quotaRecoveryOAuthStub{
+			result: oauth.RefreshResult{AccessToken: "refreshed-access"},
+		})
+		_, reason := service.fetchSnapshotWithoutHistory(t.Context(), store.Token{
+			ID: 2, AccessToken: "stale-access", RefreshToken: "valid-refresh",
+		})
+		if reason != quotaRecoveryCheckErrorHTTPUnauthorized {
+			t.Fatalf("diagnostic reason = %q, want %q", reason, quotaRecoveryCheckErrorHTTPUnauthorized)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   quotaRecoveryCheckErrorReason
+	}{
+		{name: "rate limit", status: http.StatusTooManyRequests, body: `{"error":{"message":"slow down"}}`, want: quotaRecoveryCheckErrorHTTPRateLimited},
+		{name: "server error cannot masquerade as credential failure", status: http.StatusBadGateway, body: `{"error":{"code":"authentication_token_invalidated"}}`, want: quotaRecoveryCheckErrorHTTPServer},
+		{name: "invalid json", status: http.StatusOK, body: `{`, want: quotaRecoveryCheckErrorInvalidJSON},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer upstream.Close()
+			service := quotaRecoveryTestQuotaService(upstream.URL, &quotaRecoveryOAuthStub{})
+			_, reason := service.fetchSnapshotWithoutHistory(t.Context(), store.Token{ID: 3, AccessToken: "access"})
+			if reason != test.want {
+				t.Fatalf("diagnostic reason = %q, want %q", reason, test.want)
+			}
+		})
+	}
+}
+
+func TestQuotaRecoveryFetchDiagnosticClassifiesHTTPClientDeadline(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+	service := quotaRecoveryTestQuotaService(upstream.URL, &quotaRecoveryOAuthStub{})
+	service.client.Timeout = 20 * time.Millisecond
+	snapshot, reason := service.fetchSnapshotWithoutHistory(t.Context(), store.Token{ID: 4, AccessToken: "access"})
+	if snapshot != nil {
+		t.Fatalf("deadline must not poison quota cache: %#v", snapshot)
+	}
+	if reason != quotaRecoveryCheckErrorDeadlineExceeded {
+		t.Fatalf("diagnostic reason = %q, want %q", reason, quotaRecoveryCheckErrorDeadlineExceeded)
+	}
+}
+
+func TestQuotaRecoveryFreshPersistedErrorSkipIsObservable(t *testing.T) {
+	now := time.Now().UTC()
+	errorText := "HTTP 401: authentication_token_invalidated"
+	snapshot := codexQuotaSnapshot{FetchedAt: now, Error: &errorText, Windows: []codexQuotaWindow{}}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetchedAt := now
+	candidate := store.QuotaRecoveryCandidate{
+		TokenID: 8, OwnerUserID: 9, CooldownUntil: now.Add(time.Hour), SourceEventID: 10,
+		QuotaSnapshot: raw, QuotaFetchedAt: &fetchedAt,
+	}
+	fake := &fakeQuotaRecoveryStore{candidates: []store.QuotaRecoveryCandidate{candidate}}
+	worker := &quotaRecoveryWorker{
+		cfg:   config.QuotaRecoveryConfig{BatchSize: 1, Concurrency: 1, QuotaMaxAge: time.Minute},
+		store: fake, quota: &adminQuotaService{}, nextCheck: map[int64]time.Time{}, nextProbe: map[int64]time.Time{},
+	}
+	worker.scan(t.Context())
+	stats := worker.Stats()
+	if stats.FreshQuotaErrorSkips != 1 || stats.FreshQuotaErrorSkipsByReason[string(quotaRecoveryCheckErrorFreshSnapshotUnknown)] != 1 {
+		t.Fatalf("fresh error skip stats = %+v", stats)
+	}
+}
+
+func TestQuotaRecoveryProcessCandidateClassifiesPreflightFailures(t *testing.T) {
+	now := time.Now().UTC()
+	newCandidate := func() store.QuotaRecoveryCandidate {
+		candidate := recoveryTestCandidate(t, now, 30, 20)
+		candidate.QuotaSnapshot = nil
+		candidate.QuotaFetchedAt = nil
+		return candidate
+	}
+	t.Run("lease error", func(t *testing.T) {
+		worker := &quotaRecoveryWorker{
+			cfg:   config.QuotaRecoveryConfig{QuotaMaxAge: time.Minute},
+			store: &fakeQuotaRecoveryStore{leaseErr: errors.New("lease failed")},
+			quota: quotaRecoveryTestQuotaService("https://example.invalid", &quotaRecoveryOAuthStub{}),
+		}
+		worker.processCandidate(t.Context(), newCandidate())
+		stats := worker.Stats()
+		if stats.QuotaCheckErrors != 1 || stats.QuotaCheckErrorsByReason[string(quotaRecoveryCheckErrorCheckLease)] != 1 {
+			t.Fatalf("lease error stats = %+v", stats)
+		}
+	})
+	t.Run("lease contention is not an error", func(t *testing.T) {
+		worker := &quotaRecoveryWorker{
+			cfg:   config.QuotaRecoveryConfig{QuotaMaxAge: time.Minute},
+			store: &fakeQuotaRecoveryStore{leaseContended: true},
+			quota: quotaRecoveryTestQuotaService("https://example.invalid", &quotaRecoveryOAuthStub{}),
+		}
+		worker.processCandidate(t.Context(), newCandidate())
+		if got := worker.Stats().QuotaCheckErrors; got != 0 {
+			t.Fatalf("lease contention counted as error: %d", got)
+		}
+	})
+	t.Run("token disappeared", func(t *testing.T) {
+		worker := &quotaRecoveryWorker{
+			cfg:   config.QuotaRecoveryConfig{QuotaMaxAge: time.Minute},
+			store: &fakeQuotaRecoveryStore{nilToken: true},
+			quota: quotaRecoveryTestQuotaService("https://example.invalid", &quotaRecoveryOAuthStub{}),
+		}
+		worker.processCandidate(t.Context(), newCandidate())
+		stats := worker.Stats()
+		if stats.QuotaCheckErrors != 1 || stats.QuotaCheckErrorsByReason[string(quotaRecoveryCheckErrorTokenLoad)] != 1 {
+			t.Fatalf("token load error stats = %+v", stats)
+		}
+	})
+	t.Run("canceled context", func(t *testing.T) {
+		candidate := newCandidate()
+		worker := &quotaRecoveryWorker{
+			cfg:   config.QuotaRecoveryConfig{QuotaMaxAge: time.Minute},
+			store: &fakeQuotaRecoveryStore{token: store.Token{ID: candidate.TokenID, AccessToken: "access", IsActive: true}},
+			quota: quotaRecoveryTestQuotaService("https://example.invalid", &quotaRecoveryOAuthStub{}),
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		worker.processCandidate(ctx, candidate)
+		stats := worker.Stats()
+		if stats.QuotaCheckErrors != 1 || stats.QuotaCheckErrorsByReason[string(quotaRecoveryCheckErrorContextCanceled)] != 1 {
+			t.Fatalf("context cancellation stats = %+v", stats)
+		}
+	})
+}
+
+func TestQuotaRecoveryDiagnosticReasonIsNotSerialized(t *testing.T) {
+	snapshot := quotaErrorSnapshotForRecovery(time.Now().UTC(), "fixture-secret", quotaRecoveryCheckErrorCredentialRefreshRejected)
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), string(quotaRecoveryCheckErrorCredentialRefreshRejected)) || strings.Contains(string(raw), "recoveryErrorReason") {
+		t.Fatalf("internal diagnostic leaked into quota payload: %s", raw)
+	}
+}
+
+func quotaRecoveryTestQuotaService(usageURL string, oauthClient oauth.Client) *adminQuotaService {
+	return &adminQuotaService{
+		client: &http.Client{Timeout: time.Second}, oauthClient: oauthClient, usageURL: usageURL,
+		userAgent: "test", ttl: time.Minute, concurrency: 1, sem: make(chan struct{}, 1),
+		cache: map[int64]cachedQuotaSnapshot{}, pending: map[int64]struct{}{},
+	}
+}
+
+type quotaRecoveryOAuthStub struct {
+	result oauth.RefreshResult
+	err    error
+}
+
+func (s *quotaRecoveryOAuthStub) Refresh(context.Context, string) (oauth.RefreshResult, error) {
+	return s.result, s.err
 }
 
 func TestQuotaRecoveryScanPrioritizesFreshCapacityOverEarlierZeroSnapshot(t *testing.T) {
@@ -359,6 +678,10 @@ type fakeQuotaRecoveryStore struct {
 	usageCalls     int
 	recordCalls    int
 	completedFence store.QuotaRecoveryCredentialFence
+	leaseErr       error
+	leaseContended bool
+	nilToken       bool
+	getTokenErr    error
 }
 
 func (s *fakeQuotaRecoveryStore) ListQuotaRecoveryCandidates(context.Context) ([]store.QuotaRecoveryCandidate, error) {
@@ -368,6 +691,12 @@ func (s *fakeQuotaRecoveryStore) ListQuotaRecoveryCandidates(context.Context) ([
 }
 
 func (s *fakeQuotaRecoveryStore) TryQuotaRecoveryCheckLease(context.Context, int64) (*store.QuotaRecoveryCheckLease, bool, error) {
+	if s.leaseErr != nil {
+		return nil, false, s.leaseErr
+	}
+	if s.leaseContended {
+		return nil, false, nil
+	}
 	return &store.QuotaRecoveryCheckLease{}, true, nil
 }
 
@@ -391,6 +720,12 @@ func (s *fakeQuotaRecoveryStore) BeginQuotaRecoveryProbe(_ context.Context, cand
 func (s *fakeQuotaRecoveryStore) GetToken(context.Context, int64) (*store.Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.getTokenErr != nil {
+		return nil, s.getTokenErr
+	}
+	if s.nilToken {
+		return nil, nil
+	}
 	copy := s.token
 	return &copy, nil
 }

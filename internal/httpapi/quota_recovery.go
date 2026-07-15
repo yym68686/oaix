@@ -26,46 +26,105 @@ type quotaRecoveryStore interface {
 
 const quotaRecoveryMinimumLeadTime = 3 * time.Minute
 
+type quotaRecoveryCheckErrorReason string
+
+const (
+	quotaRecoveryCheckErrorCheckLease                 quotaRecoveryCheckErrorReason = "check_lease"
+	quotaRecoveryCheckErrorTokenLoad                  quotaRecoveryCheckErrorReason = "token_load"
+	quotaRecoveryCheckErrorContextCanceled            quotaRecoveryCheckErrorReason = "context_canceled"
+	quotaRecoveryCheckErrorDeadlineExceeded           quotaRecoveryCheckErrorReason = "deadline_exceeded"
+	quotaRecoveryCheckErrorCredentialRefreshConflict  quotaRecoveryCheckErrorReason = "credential_refresh_conflict"
+	quotaRecoveryCheckErrorCredentialRefreshRejected  quotaRecoveryCheckErrorReason = "credential_refresh_rejected"
+	quotaRecoveryCheckErrorCredentialRefreshOther     quotaRecoveryCheckErrorReason = "credential_refresh_other"
+	quotaRecoveryCheckErrorTransport                  quotaRecoveryCheckErrorReason = "transport"
+	quotaRecoveryCheckErrorAccessTokenInactive        quotaRecoveryCheckErrorReason = "access_token_inactive"
+	quotaRecoveryCheckErrorAuthenticationInvalidated  quotaRecoveryCheckErrorReason = "authentication_token_invalidated"
+	quotaRecoveryCheckErrorOwnerInactive              quotaRecoveryCheckErrorReason = "owner_inactive"
+	quotaRecoveryCheckErrorAuthenticationTokenExpired quotaRecoveryCheckErrorReason = "authentication_token_expired"
+	quotaRecoveryCheckErrorHTTPUnauthorized           quotaRecoveryCheckErrorReason = "http_unauthorized"
+	quotaRecoveryCheckErrorHTTPForbidden              quotaRecoveryCheckErrorReason = "http_forbidden"
+	quotaRecoveryCheckErrorHTTPNotFound               quotaRecoveryCheckErrorReason = "http_not_found"
+	quotaRecoveryCheckErrorHTTPRateLimited            quotaRecoveryCheckErrorReason = "http_rate_limited"
+	quotaRecoveryCheckErrorHTTPOtherClient            quotaRecoveryCheckErrorReason = "http_other_4xx"
+	quotaRecoveryCheckErrorHTTPServer                 quotaRecoveryCheckErrorReason = "http_5xx"
+	quotaRecoveryCheckErrorInvalidJSON                quotaRecoveryCheckErrorReason = "invalid_json"
+	quotaRecoveryCheckErrorInvalidPayload             quotaRecoveryCheckErrorReason = "invalid_payload"
+	quotaRecoveryCheckErrorFreshSnapshotUnknown       quotaRecoveryCheckErrorReason = "fresh_snapshot_unknown"
+	quotaRecoveryCheckErrorOther                      quotaRecoveryCheckErrorReason = "other"
+)
+
+var quotaRecoveryCheckErrorReasons = [...]quotaRecoveryCheckErrorReason{
+	quotaRecoveryCheckErrorCheckLease,
+	quotaRecoveryCheckErrorTokenLoad,
+	quotaRecoveryCheckErrorContextCanceled,
+	quotaRecoveryCheckErrorDeadlineExceeded,
+	quotaRecoveryCheckErrorCredentialRefreshConflict,
+	quotaRecoveryCheckErrorCredentialRefreshRejected,
+	quotaRecoveryCheckErrorCredentialRefreshOther,
+	quotaRecoveryCheckErrorTransport,
+	quotaRecoveryCheckErrorAccessTokenInactive,
+	quotaRecoveryCheckErrorAuthenticationInvalidated,
+	quotaRecoveryCheckErrorOwnerInactive,
+	quotaRecoveryCheckErrorAuthenticationTokenExpired,
+	quotaRecoveryCheckErrorHTTPUnauthorized,
+	quotaRecoveryCheckErrorHTTPForbidden,
+	quotaRecoveryCheckErrorHTTPNotFound,
+	quotaRecoveryCheckErrorHTTPRateLimited,
+	quotaRecoveryCheckErrorHTTPOtherClient,
+	quotaRecoveryCheckErrorHTTPServer,
+	quotaRecoveryCheckErrorInvalidJSON,
+	quotaRecoveryCheckErrorInvalidPayload,
+	quotaRecoveryCheckErrorFreshSnapshotUnknown,
+	quotaRecoveryCheckErrorOther,
+}
+
 type quotaRecoveryStats struct {
-	Scans             int64 `json:"scans"`
-	Candidates        int64 `json:"candidates"`
-	QuotaChecks       int64 `json:"quota_checks"`
-	QuotaCheckErrors  int64 `json:"quota_check_errors"`
-	CapacityPositive  int64 `json:"capacity_positive"`
-	ProbesStarted     int64 `json:"probes_started"`
-	ProbeCompleted    int64 `json:"probe_completed"`
-	Reactivated       int64 `json:"reactivated"`
-	UsageLimited      int64 `json:"usage_limited"`
-	Inconclusive      int64 `json:"inconclusive"`
-	StateConflicts    int64 `json:"state_conflicts"`
-	PersistenceErrors int64 `json:"persistence_errors"`
-	LastScanUnix      int64 `json:"last_scan_unix"`
+	Scans                        int64            `json:"scans"`
+	Candidates                   int64            `json:"candidates"`
+	QuotaChecks                  int64            `json:"quota_checks"`
+	QuotaCheckErrors             int64            `json:"quota_check_errors"`
+	QuotaCheckErrorsByReason     map[string]int64 `json:"quota_check_errors_by_reason"`
+	FreshQuotaErrorSkips         int64            `json:"fresh_quota_error_skips"`
+	FreshQuotaErrorSkipsByReason map[string]int64 `json:"fresh_quota_error_skips_by_reason"`
+	CapacityPositive             int64            `json:"capacity_positive"`
+	ProbesStarted                int64            `json:"probes_started"`
+	ProbeCompleted               int64            `json:"probe_completed"`
+	Reactivated                  int64            `json:"reactivated"`
+	UsageLimited                 int64            `json:"usage_limited"`
+	Inconclusive                 int64            `json:"inconclusive"`
+	StateConflicts               int64            `json:"state_conflicts"`
+	PersistenceErrors            int64            `json:"persistence_errors"`
+	LastScanUnix                 int64            `json:"last_scan_unix"`
 }
 
 type quotaRecoveryWorker struct {
-	app        *App
-	cfg        config.QuotaRecoveryConfig
-	store      quotaRecoveryStore
-	quota      *adminQuotaService
-	logger     *slog.Logger
-	startOnce  sync.Once
-	scheduleMu sync.Mutex
-	nextCheck  map[int64]time.Time
-	nextProbe  map[int64]time.Time
+	app                     *App
+	cfg                     config.QuotaRecoveryConfig
+	store                   quotaRecoveryStore
+	quota                   *adminQuotaService
+	logger                  *slog.Logger
+	startOnce               sync.Once
+	scheduleMu              sync.Mutex
+	nextCheck               map[int64]time.Time
+	nextProbe               map[int64]time.Time
+	errorMu                 sync.Mutex
+	checkErrorsByReason     map[quotaRecoveryCheckErrorReason]int64
+	freshErrorSkipsByReason map[quotaRecoveryCheckErrorReason]int64
 
-	scans             atomic.Int64
-	candidates        atomic.Int64
-	quotaChecks       atomic.Int64
-	quotaCheckErrors  atomic.Int64
-	capacityPositive  atomic.Int64
-	probesStarted     atomic.Int64
-	probeCompleted    atomic.Int64
-	reactivated       atomic.Int64
-	usageLimited      atomic.Int64
-	inconclusive      atomic.Int64
-	stateConflicts    atomic.Int64
-	persistenceErrors atomic.Int64
-	lastScanUnix      atomic.Int64
+	scans                atomic.Int64
+	candidates           atomic.Int64
+	quotaChecks          atomic.Int64
+	quotaCheckErrors     atomic.Int64
+	freshQuotaErrorSkips atomic.Int64
+	capacityPositive     atomic.Int64
+	probesStarted        atomic.Int64
+	probeCompleted       atomic.Int64
+	reactivated          atomic.Int64
+	usageLimited         atomic.Int64
+	inconclusive         atomic.Int64
+	stateConflicts       atomic.Int64
+	persistenceErrors    atomic.Int64
+	lastScanUnix         atomic.Int64
 }
 
 func newQuotaRecoveryWorker(app *App) *quotaRecoveryWorker {
@@ -83,13 +142,15 @@ func newQuotaRecoveryWorker(app *App) *quotaRecoveryWorker {
 		}
 	}
 	return &quotaRecoveryWorker{
-		app:       app,
-		cfg:       recoveryCfg,
-		store:     app.store,
-		quota:     app.quota,
-		logger:    app.logger,
-		nextCheck: make(map[int64]time.Time),
-		nextProbe: make(map[int64]time.Time),
+		app:                     app,
+		cfg:                     recoveryCfg,
+		store:                   app.store,
+		quota:                   app.quota,
+		logger:                  app.logger,
+		nextCheck:               make(map[int64]time.Time),
+		nextProbe:               make(map[int64]time.Time),
+		checkErrorsByReason:     make(map[quotaRecoveryCheckErrorReason]int64),
+		freshErrorSkipsByReason: make(map[quotaRecoveryCheckErrorReason]int64),
 	}
 }
 
@@ -212,7 +273,14 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 		if !candidate.CooldownUntil.After(now.Add(quotaRecoveryMinimumLeadTime)) {
 			continue
 		}
-		if _, fresh := w.snapshotForCandidate(candidate, now); fresh {
+		if snapshot, fresh := w.snapshotForCandidate(candidate, now); fresh {
+			if snapshot != nil && snapshot.Error != nil {
+				reason := snapshot.recoveryErrorReason
+				if reason == "" {
+					reason = quotaRecoveryCheckErrorFreshSnapshotUnknown
+				}
+				w.recordFreshQuotaErrorSkip(reason)
+			}
 			continue
 		}
 		if next, ok := w.nextCheck[candidate.TokenID]; ok && next.After(now) {
@@ -259,7 +327,7 @@ func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate st
 	if !fresh {
 		lease, acquired, err := w.store.TryQuotaRecoveryCheckLease(ctx, candidate.TokenID)
 		if err != nil {
-			w.quotaCheckErrors.Add(1)
+			w.recordQuotaCheckError(quotaRecoveryCheckErrorCheckLease)
 			if w.logger != nil && ctx.Err() == nil {
 				w.logger.Warn("automatic quota recovery check lease failed", "token_id", candidate.TokenID, "error", err)
 			}
@@ -271,13 +339,18 @@ func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate st
 		checkLease = lease
 		token, err := w.store.GetToken(ctx, candidate.TokenID)
 		if err != nil || token == nil {
-			w.quotaCheckErrors.Add(1)
+			w.recordQuotaCheckError(quotaRecoveryCheckErrorTokenLoad)
 			return
 		}
 		w.quotaChecks.Add(1)
-		snapshot = w.quota.fetchSnapshotWithoutHistory(ctx, *token)
-		if snapshot == nil || snapshot.Error != nil {
-			w.quotaCheckErrors.Add(1)
+		var failureReason quotaRecoveryCheckErrorReason
+		snapshot, failureReason = w.quota.fetchSnapshotWithoutHistory(ctx, *token)
+		if snapshot == nil {
+			w.recordQuotaCheckError(failureReason)
+			return
+		}
+		if snapshot.Error != nil {
+			w.recordQuotaCheckError(failureReason)
 			return
 		}
 	}
@@ -441,21 +514,74 @@ func (w *quotaRecoveryWorker) Stats() quotaRecoveryStats {
 	if w == nil {
 		return quotaRecoveryStats{}
 	}
+	quotaCheckErrors, quotaCheckErrorsByReason, freshQuotaErrorSkips, freshQuotaErrorSkipsByReason := w.quotaErrorStats()
 	return quotaRecoveryStats{
-		Scans:             w.scans.Load(),
-		Candidates:        w.candidates.Load(),
-		QuotaChecks:       w.quotaChecks.Load(),
-		QuotaCheckErrors:  w.quotaCheckErrors.Load(),
-		CapacityPositive:  w.capacityPositive.Load(),
-		ProbesStarted:     w.probesStarted.Load(),
-		ProbeCompleted:    w.probeCompleted.Load(),
-		Reactivated:       w.reactivated.Load(),
-		UsageLimited:      w.usageLimited.Load(),
-		Inconclusive:      w.inconclusive.Load(),
-		StateConflicts:    w.stateConflicts.Load(),
-		PersistenceErrors: w.persistenceErrors.Load(),
-		LastScanUnix:      w.lastScanUnix.Load(),
+		Scans:                        w.scans.Load(),
+		Candidates:                   w.candidates.Load(),
+		QuotaChecks:                  w.quotaChecks.Load(),
+		QuotaCheckErrors:             quotaCheckErrors,
+		QuotaCheckErrorsByReason:     quotaCheckErrorsByReason,
+		FreshQuotaErrorSkips:         freshQuotaErrorSkips,
+		FreshQuotaErrorSkipsByReason: freshQuotaErrorSkipsByReason,
+		CapacityPositive:             w.capacityPositive.Load(),
+		ProbesStarted:                w.probesStarted.Load(),
+		ProbeCompleted:               w.probeCompleted.Load(),
+		Reactivated:                  w.reactivated.Load(),
+		UsageLimited:                 w.usageLimited.Load(),
+		Inconclusive:                 w.inconclusive.Load(),
+		StateConflicts:               w.stateConflicts.Load(),
+		PersistenceErrors:            w.persistenceErrors.Load(),
+		LastScanUnix:                 w.lastScanUnix.Load(),
 	}
+}
+
+func (w *quotaRecoveryWorker) recordQuotaCheckError(reason quotaRecoveryCheckErrorReason) {
+	if w == nil {
+		return
+	}
+	reason = normalizeQuotaRecoveryCheckErrorReason(reason)
+	w.errorMu.Lock()
+	if w.checkErrorsByReason == nil {
+		w.checkErrorsByReason = make(map[quotaRecoveryCheckErrorReason]int64)
+	}
+	w.checkErrorsByReason[reason]++
+	w.quotaCheckErrors.Add(1)
+	w.errorMu.Unlock()
+}
+
+func (w *quotaRecoveryWorker) recordFreshQuotaErrorSkip(reason quotaRecoveryCheckErrorReason) {
+	if w == nil {
+		return
+	}
+	reason = normalizeQuotaRecoveryCheckErrorReason(reason)
+	w.errorMu.Lock()
+	if w.freshErrorSkipsByReason == nil {
+		w.freshErrorSkipsByReason = make(map[quotaRecoveryCheckErrorReason]int64)
+	}
+	w.freshErrorSkipsByReason[reason]++
+	w.freshQuotaErrorSkips.Add(1)
+	w.errorMu.Unlock()
+}
+
+func (w *quotaRecoveryWorker) quotaErrorStats() (int64, map[string]int64, int64, map[string]int64) {
+	w.errorMu.Lock()
+	defer w.errorMu.Unlock()
+	checkCounts := make(map[string]int64, len(quotaRecoveryCheckErrorReasons))
+	skipCounts := make(map[string]int64, len(quotaRecoveryCheckErrorReasons))
+	for _, reason := range quotaRecoveryCheckErrorReasons {
+		checkCounts[string(reason)] = w.checkErrorsByReason[reason]
+		skipCounts[string(reason)] = w.freshErrorSkipsByReason[reason]
+	}
+	return w.quotaCheckErrors.Load(), checkCounts, w.freshQuotaErrorSkips.Load(), skipCounts
+}
+
+func normalizeQuotaRecoveryCheckErrorReason(reason quotaRecoveryCheckErrorReason) quotaRecoveryCheckErrorReason {
+	for _, known := range quotaRecoveryCheckErrorReasons {
+		if reason == known {
+			return reason
+		}
+	}
+	return quotaRecoveryCheckErrorOther
 }
 
 func quotaRecoveryPersistedSnapshot(candidate store.QuotaRecoveryCandidate, now time.Time, maxAge time.Duration) (*codexQuotaSnapshot, bool) {

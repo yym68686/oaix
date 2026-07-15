@@ -79,6 +79,7 @@ type codexQuotaSnapshot struct {
 	LimitReached          *bool                   `json:"limit_reached,omitempty"`
 	Windows               []codexQuotaWindow      `json:"windows"`
 	RateLimitResetCredits *codexQuotaResetCredits `json:"rate_limit_reset_credits,omitempty"`
+	recoveryErrorReason   quotaRecoveryCheckErrorReason
 }
 
 type codexQuotaResetCredit struct {
@@ -488,29 +489,31 @@ func (s *adminQuotaService) fetchMany(ctx context.Context, tokens []store.Token)
 }
 
 func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token) *codexQuotaSnapshot {
-	return s.fetchSnapshotWithPersistence(ctx, token, true)
+	snapshot, _ := s.fetchSnapshotWithDiagnostic(ctx, token, true)
+	return snapshot
 }
 
-func (s *adminQuotaService) fetchSnapshotWithoutHistory(ctx context.Context, token store.Token) *codexQuotaSnapshot {
-	return s.fetchSnapshotWithPersistence(ctx, token, false)
+func (s *adminQuotaService) fetchSnapshotWithoutHistory(ctx context.Context, token store.Token) (*codexQuotaSnapshot, quotaRecoveryCheckErrorReason) {
+	return s.fetchSnapshotWithDiagnostic(ctx, token, false)
 }
 
-func (s *adminQuotaService) fetchSnapshotWithPersistence(ctx context.Context, token store.Token, persist bool) *codexQuotaSnapshot {
+func (s *adminQuotaService) fetchSnapshotWithDiagnostic(ctx context.Context, token store.Token, persist bool) (*codexQuotaSnapshot, quotaRecoveryCheckErrorReason) {
 	now := time.Now().UTC()
 	select {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	case <-ctx.Done():
-		return nil
+		return nil, quotaRecoveryContextErrorReason(ctx.Err())
 	}
 
 	if strings.TrimSpace(token.AccessToken) == "" {
 		refreshed, err := s.refreshQuotaToken(ctx, token)
 		if err != nil {
 			if contextError(err) {
-				return nil
+				return nil, quotaRecoveryContextErrorReason(err)
 			}
-			return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, err.Error()), persist)
+			reason := quotaRecoveryCredentialRefreshErrorReason(err)
+			return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, err.Error(), reason), persist), reason
 		}
 		token = refreshed
 	}
@@ -518,20 +521,23 @@ func (s *adminQuotaService) fetchSnapshotWithPersistence(ctx context.Context, to
 	statusCode, body, err := s.requestUsage(ctx, token)
 	if err != nil {
 		if contextError(err) {
-			return nil
+			return nil, quotaRecoveryContextErrorReason(err)
 		}
-		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, err.Error()), persist)
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, err.Error(), quotaRecoveryCheckErrorTransport), persist), quotaRecoveryCheckErrorTransport
 	}
+	var refreshFailureReason quotaRecoveryCheckErrorReason
 	if quotaStatusShouldRefresh(statusCode) {
 		if refreshed, refreshErr := s.refreshQuotaToken(ctx, token); refreshErr == nil {
 			token = refreshed
 			statusCode, body, err = s.requestUsage(ctx, token)
 			if err != nil {
 				if contextError(err) {
-					return nil
+					return nil, quotaRecoveryContextErrorReason(err)
 				}
-				return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, err.Error()), persist)
+				return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, err.Error(), quotaRecoveryCheckErrorTransport), persist), quotaRecoveryCheckErrorTransport
 			}
+		} else {
+			refreshFailureReason = quotaRecoveryCredentialRefreshErrorReason(refreshErr)
 		}
 	}
 	if statusCode < 200 || statusCode >= 300 {
@@ -539,18 +545,22 @@ func (s *adminQuotaService) fetchSnapshotWithPersistence(ctx context.Context, to
 		if persist && quotaResponseShouldDisable(statusCode, body) {
 			s.disableTokenFromQuota(ctx, token.ID)
 		}
-		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, detail), persist)
+		reason := refreshFailureReason
+		if reason == "" {
+			reason = quotaRecoveryHTTPErrorReason(statusCode, body, detail)
+		}
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, detail, reason), persist), reason
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, "Quota endpoint returned invalid JSON"), persist)
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, "Quota endpoint returned invalid JSON", quotaRecoveryCheckErrorInvalidJSON), persist), quotaRecoveryCheckErrorInvalidJSON
 	}
 	snapshot, err := parseCodexQuotaPayload(payload, now)
 	if err != nil {
-		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, err.Error()), persist)
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, err.Error(), quotaRecoveryCheckErrorInvalidPayload), persist), quotaRecoveryCheckErrorInvalidPayload
 	}
-	return s.storeSnapshotWithPersistence(token.ID, snapshot, persist)
+	return s.storeSnapshotWithPersistence(token.ID, snapshot, persist), ""
 }
 
 func (s *adminQuotaService) queryResetCredits(ctx context.Context, token store.Token) (*codexQuotaSnapshot, error) {
@@ -1012,12 +1022,120 @@ func (s *adminQuotaService) storeSnapshotWithPersistence(tokenID int64, snapshot
 }
 
 func quotaErrorSnapshot(fetchedAt time.Time, message string) *codexQuotaSnapshot {
+	return quotaErrorSnapshotForRecovery(fetchedAt, message, quotaRecoveryCheckErrorOther)
+}
+
+func quotaErrorSnapshotForRecovery(fetchedAt time.Time, message string, reason quotaRecoveryCheckErrorReason) *codexQuotaSnapshot {
 	errText := shortenError(message, 220)
 	return &codexQuotaSnapshot{
-		FetchedAt: fetchedAt,
-		Error:     &errText,
-		Disabled:  quotaErrorMessageShouldDisable(errText),
-		Windows:   []codexQuotaWindow{},
+		FetchedAt:           fetchedAt,
+		Error:               &errText,
+		Disabled:            quotaErrorMessageShouldDisable(errText),
+		Windows:             []codexQuotaWindow{},
+		recoveryErrorReason: normalizeQuotaRecoveryCheckErrorReason(reason),
+	}
+}
+
+func quotaRecoveryHTTPErrorReason(status int, body []byte, detail string) quotaRecoveryCheckErrorReason {
+	if status >= 400 && status < 500 {
+		signals := quotaRecoveryStructuredErrorSignals(body)
+		signals = append(signals, strings.ToLower(detail))
+		for _, signal := range signals {
+			normalized := strings.NewReplacer("-", "_", " ", "_").Replace(signal)
+			switch {
+			case normalized == "personal_access_token_inactive" || strings.Contains(signal, "personal access token inactive"):
+				return quotaRecoveryCheckErrorAccessTokenInactive
+			case normalized == "authentication_token_invalidated" || (strings.Contains(signal, "authentication token") && strings.Contains(signal, "invalidat")):
+				return quotaRecoveryCheckErrorAuthenticationInvalidated
+			case normalized == "owner_inactive" || (strings.Contains(signal, "owner") && strings.Contains(signal, "inactive")):
+				return quotaRecoveryCheckErrorOwnerInactive
+			case normalized == "authentication_token_expired" || (strings.Contains(signal, "authentication token") && strings.Contains(signal, "expired")):
+				return quotaRecoveryCheckErrorAuthenticationTokenExpired
+			}
+		}
+	}
+	switch {
+	case status == http.StatusUnauthorized:
+		return quotaRecoveryCheckErrorHTTPUnauthorized
+	case status == http.StatusForbidden:
+		return quotaRecoveryCheckErrorHTTPForbidden
+	case status == http.StatusNotFound:
+		return quotaRecoveryCheckErrorHTTPNotFound
+	case status == http.StatusTooManyRequests:
+		return quotaRecoveryCheckErrorHTTPRateLimited
+	case status >= 400 && status < 500:
+		return quotaRecoveryCheckErrorHTTPOtherClient
+	case status >= 500:
+		return quotaRecoveryCheckErrorHTTPServer
+	default:
+		return quotaRecoveryCheckErrorOther
+	}
+}
+
+func quotaRecoveryStructuredErrorSignals(body []byte) []string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	containers := make([]map[string]any, 0, 2)
+	if nested, ok := payload["error"].(map[string]any); ok {
+		containers = append(containers, nested)
+	}
+	containers = append(containers, payload)
+	signals := make([]string, 0, len(containers)*5)
+	// Structured code/type values are stable protocol signals and must win
+	// across every container before localized or free-form text is considered.
+	for _, container := range containers {
+		for _, key := range []string{"code", "type"} {
+			if value := quotaRecoveryNormalizedSignal(container[key]); value != "" {
+				signals = append(signals, value)
+			}
+		}
+	}
+	for _, container := range containers {
+		for _, key := range []string{"message", "detail", "error"} {
+			if value := quotaRecoveryNormalizedSignal(container[key]); value != "" {
+				signals = append(signals, value)
+			}
+		}
+	}
+	return signals
+}
+
+func quotaRecoveryNormalizedSignal(value any) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(text))
+}
+
+func quotaRecoveryCredentialRefreshErrorReason(err error) quotaRecoveryCheckErrorReason {
+	if err == nil {
+		return quotaRecoveryCheckErrorOther
+	}
+	if contextError(err) {
+		return quotaRecoveryContextErrorReason(err)
+	}
+	if errors.Is(err, store.ErrTokenCredentialsChanged) {
+		return quotaRecoveryCheckErrorCredentialRefreshConflict
+	}
+	detail := err.Error()
+	status := oauth.RefreshErrorStatus(detail)
+	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden || oauth.IsPermanentlyInvalidRefreshTokenError(status, detail) {
+		return quotaRecoveryCheckErrorCredentialRefreshRejected
+	}
+	return quotaRecoveryCheckErrorCredentialRefreshOther
+}
+
+func quotaRecoveryContextErrorReason(err error) quotaRecoveryCheckErrorReason {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return quotaRecoveryCheckErrorDeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		return quotaRecoveryCheckErrorContextCanceled
+	default:
+		return quotaRecoveryCheckErrorOther
 	}
 }
 

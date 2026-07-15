@@ -318,6 +318,16 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"checked\"} %d\n", recoveryStats.QuotaChecks)
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"error\"} %d\n", recoveryStats.QuotaCheckErrors)
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"capacity_positive\"} %d\n", recoveryStats.CapacityPositive)
+	_, _ = fmt.Fprintf(w, "# HELP oaix_quota_recovery_check_errors_total Automatic quota recovery check failures by fixed reason.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_quota_recovery_check_errors_total counter\n")
+	for _, reason := range quotaRecoveryCheckErrorReasons {
+		_, _ = fmt.Fprintf(w, "oaix_quota_recovery_check_errors_total{reason=\"%s\"} %d\n", reason, recoveryStats.QuotaCheckErrorsByReason[string(reason)])
+	}
+	_, _ = fmt.Fprintf(w, "# HELP oaix_quota_recovery_fresh_quota_error_skips_total Automatic recovery decisions skipped because a fresh quota snapshot contained an error.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_quota_recovery_fresh_quota_error_skips_total counter\n")
+	for _, reason := range quotaRecoveryCheckErrorReasons {
+		_, _ = fmt.Fprintf(w, "oaix_quota_recovery_fresh_quota_error_skips_total{reason=\"%s\"} %d\n", reason, recoveryStats.FreshQuotaErrorSkipsByReason[string(reason)])
+	}
 	_, _ = fmt.Fprintf(w, "# HELP oaix_quota_recovery_probes_total Automatic recovery probes by outcome.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_quota_recovery_probes_total counter\n")
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"started\"} %d\n", recoveryStats.ProbesStarted)
