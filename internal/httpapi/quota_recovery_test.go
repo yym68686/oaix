@@ -96,6 +96,54 @@ func TestQuotaRecoveryEffectiveConcurrencyReservesDatabaseConnections(t *testing
 	}
 }
 
+func TestQuotaRecoveryScanPrioritizesFreshCapacityOverEarlierZeroSnapshot(t *testing.T) {
+	now := time.Now().UTC()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"status":"completed","model":"gpt-5.4-mini"}}` + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	zero := recoveryTestCandidate(t, now, 30, 0)
+	positive := recoveryTestCandidate(t, now, 30, 20)
+	positive.TokenID = zero.TokenID + 1
+	positive.SourceEventID = zero.SourceEventID + 1
+	fake := &fakeQuotaRecoveryStore{
+		candidates: []store.QuotaRecoveryCandidate{zero, positive},
+		token: store.Token{
+			ID:            positive.TokenID,
+			OwnerUserID:   positive.OwnerUserID,
+			AccessToken:   "access",
+			IsActive:      true,
+			CooldownUntil: &positive.CooldownUntil,
+		},
+	}
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	worker := &quotaRecoveryWorker{
+		app: app,
+		cfg: config.QuotaRecoveryConfig{
+			BatchSize:          1,
+			Concurrency:        1,
+			QuotaMaxAge:        time.Minute,
+			RecheckInterval:    time.Minute,
+			ProbeRetryInterval: time.Minute,
+		},
+		store:     fake,
+		quota:     &adminQuotaService{},
+		nextCheck: map[int64]time.Time{},
+		nextProbe: map[int64]time.Time{},
+	}
+	app.recovery = worker
+	worker.scan(t.Context())
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.claimCalls != 1 || fake.completeCalls != 1 {
+		t.Fatalf("fresh positive candidate was starved by earlier zero snapshot: claims=%d completes=%d", fake.claimCalls, fake.completeCalls)
+	}
+}
+
 func TestAutomaticQuotaRecoveryRequiresStrictCompletedProbe(t *testing.T) {
 	now := time.Now().UTC()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -247,6 +295,7 @@ func float64Pointer(value float64) *float64 {
 
 type fakeQuotaRecoveryStore struct {
 	mu             sync.Mutex
+	candidates     []store.QuotaRecoveryCandidate
 	token          store.Token
 	claimCalls     int
 	completeCalls  int
@@ -256,7 +305,9 @@ type fakeQuotaRecoveryStore struct {
 }
 
 func (s *fakeQuotaRecoveryStore) ListQuotaRecoveryCandidates(context.Context) ([]store.QuotaRecoveryCandidate, error) {
-	return nil, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]store.QuotaRecoveryCandidate(nil), s.candidates...), nil
 }
 
 func (s *fakeQuotaRecoveryStore) TryQuotaRecoveryCheckLease(context.Context, int64) (*store.QuotaRecoveryCheckLease, bool, error) {

@@ -177,6 +177,10 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 	}
 	now := time.Now().UTC()
 	selected := make([]store.QuotaRecoveryCandidate, 0, w.cfg.BatchSize)
+	selectedIDs := make(map[int64]struct{}, w.cfg.BatchSize)
+	// A fresh positive UI snapshot already gives us the signal the user cares
+	// about. Scan the whole candidate set for those first so stale/zero entries
+	// near the front cannot consume the batch and delay a real recovery.
 	for _, candidate := range candidates {
 		if len(selected) >= w.cfg.BatchSize {
 			break
@@ -189,6 +193,26 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 		}
 		if snapshot, fresh := quotaRecoveryPersistedSnapshot(candidate, now, w.cfg.QuotaMaxAge); fresh && quotaSnapshotHasCapacity(snapshot) {
 			selected = append(selected, candidate)
+			selectedIDs[candidate.TokenID] = struct{}{}
+		}
+	}
+	// Spend any remaining batch capacity on stale/missing snapshots. A fresh
+	// non-positive snapshot is authoritative until it ages out and must not
+	// displace a later fresh-positive candidate.
+	for _, candidate := range candidates {
+		if len(selected) >= w.cfg.BatchSize {
+			break
+		}
+		if _, ok := selectedIDs[candidate.TokenID]; ok {
+			continue
+		}
+		if next, ok := w.nextProbe[candidate.TokenID]; ok && next.After(now) {
+			continue
+		}
+		if !candidate.CooldownUntil.After(now.Add(quotaRecoveryMinimumLeadTime)) {
+			continue
+		}
+		if _, fresh := quotaRecoveryPersistedSnapshot(candidate, now, w.cfg.QuotaMaxAge); fresh {
 			continue
 		}
 		if next, ok := w.nextCheck[candidate.TokenID]; ok && next.After(now) {
@@ -196,6 +220,7 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 		}
 		w.nextCheck[candidate.TokenID] = now.Add(w.cfg.RecheckInterval)
 		selected = append(selected, candidate)
+		selectedIDs[candidate.TokenID] = struct{}{}
 	}
 	if len(selected) == 0 {
 		return
