@@ -112,6 +112,44 @@ func TestParseCodexQuotaPayloadClampsNegativeResetCredits(t *testing.T) {
 	}
 }
 
+func TestParseCodexQuotaPayloadKeepsActualNonstandardWindowWithoutDuplication(t *testing.T) {
+	now := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+	snapshot, err := parseCodexQuotaPayload(map[string]any{
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"limit_window_seconds": 30 * 24 * 60 * 60,
+				"used_percent":         25.0,
+			},
+		},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Windows) != 1 {
+		t.Fatalf("actual single window was duplicated: %+v", snapshot.Windows)
+	}
+	if got := snapshot.Windows[0]; got.ID != "code-primary" || got.Label != "30d" || got.RemainingPercent == nil || *got.RemainingPercent != 75 {
+		t.Fatalf("nonstandard window = %+v", got)
+	}
+}
+
+func TestParseCodexQuotaPayloadDoesNotRelabelSingle7DWindowAs5H(t *testing.T) {
+	snapshot, err := parseCodexQuotaPayload(map[string]any{
+		"rate_limit": map[string]any{
+			"primary_window": map[string]any{
+				"limit_window_seconds": quotaWindow7DSeconds,
+				"used_percent":         80.0,
+			},
+		},
+	}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Windows) != 1 || snapshot.Windows[0].ID != "code-7d" || snapshot.Windows[0].Label != "7d" {
+		t.Fatalf("single 7d window was mislabeled or duplicated: %+v", snapshot.Windows)
+	}
+}
+
 func TestQuotaStatusShouldRefresh(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
 		if !quotaStatusShouldRefresh(status) {

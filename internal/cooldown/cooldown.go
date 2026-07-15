@@ -8,31 +8,58 @@ import (
 	"time"
 )
 
-func UsageLimitUntil(status int, raw []byte, now time.Time, fallback time.Duration) *time.Time {
+type UsageLimit struct {
+	Matched       bool
+	ExplicitKind  bool
+	ResetAt       *time.Time
+	ExplicitReset bool
+}
+
+func ParseUsageLimit(status int, raw []byte, now time.Time) UsageLimit {
 	if status != 429 {
-		return nil
+		return UsageLimit{}
 	}
 	errObj := errorObject(raw)
 	if errObj == nil {
-		return nil
+		return UsageLimit{}
 	}
 	errorType := strings.TrimSpace(strings.ToLower(text(errObj["type"])))
 	errorCode := strings.TrimSpace(strings.ToLower(text(errObj["code"])))
 	message := strings.TrimSpace(strings.ToLower(text(errObj["message"])))
-	if errorType != "usage_limit_reached" && errorCode != "usage_limit_reached" && !strings.Contains(message, "usage limit") {
-		return nil
+	explicitKind := errorType == "usage_limit_reached" || errorCode == "usage_limit_reached"
+	if !explicitKind && !strings.Contains(message, "usage limit") {
+		return UsageLimit{}
 	}
+	result := UsageLimit{Matched: true, ExplicitKind: explicitKind}
 	if seconds, ok := floatValue(errObj["resets_in_seconds"]); ok {
-		return ptr(now.UTC().Add(secondsDuration(seconds)))
+		result.ResetAt = ptr(now.UTC().Add(secondsDuration(seconds)))
+		result.ExplicitReset = true
+		return result
 	}
 	if seconds, ok := floatValue(errObj["resetsInSeconds"]); ok {
-		return ptr(now.UTC().Add(secondsDuration(seconds)))
+		result.ResetAt = ptr(now.UTC().Add(secondsDuration(seconds)))
+		result.ExplicitReset = true
+		return result
 	}
 	if resetAt := epochTime(errObj["resets_at"]); resetAt != nil {
-		return resetAt
+		result.ResetAt = resetAt
+		result.ExplicitReset = true
+		return result
 	}
 	if resetAt := epochTime(errObj["resetsAt"]); resetAt != nil {
-		return resetAt
+		result.ResetAt = resetAt
+		result.ExplicitReset = true
+	}
+	return result
+}
+
+func UsageLimitUntil(status int, raw []byte, now time.Time, fallback time.Duration) *time.Time {
+	parsed := ParseUsageLimit(status, raw, now)
+	if !parsed.Matched {
+		return nil
+	}
+	if parsed.ResetAt != nil {
+		return parsed.ResetAt
 	}
 	if fallback <= 0 {
 		fallback = 300 * time.Second

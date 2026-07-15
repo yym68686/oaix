@@ -34,6 +34,7 @@ type App struct {
 	logs         *logs.Writer
 	proxy        *proxy.Pipeline
 	quota        *adminQuotaService
+	recovery     *quotaRecoveryWorker
 	quotaJobs    *quotaRefreshRegistry
 	oauth        *openAIOAuthSessionStore
 	modelCatalog *officialModelsCatalog
@@ -77,7 +78,7 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		tokens:       tokenManager,
 		logs:         logWriter,
 		proxy:        pipeline,
-		quota:        newAdminQuotaService(cfg, store),
+		quota:        newAdminQuotaService(cfg, store, logger),
 		quotaJobs:    newQuotaRefreshRegistry(),
 		oauth:        newOpenAIOAuthSessionStore(),
 		modelCatalog: newOfficialModelsCatalog(),
@@ -92,6 +93,7 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 			return err
 		})
 	}
+	app.recovery = newQuotaRecoveryWorker(app)
 	return app
 }
 
@@ -208,11 +210,16 @@ func (a *App) webBundleVersion() (string, string) {
 }
 
 func (a *App) livez(w http.ResponseWriter, r *http.Request) {
+	recoveryStats := quotaRecoveryStats{}
+	if a.recovery != nil {
+		recoveryStats = a.recovery.Stats()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":             true,
 		"uptime_seconds": int(time.Since(a.started).Seconds()),
 		"token_pool":     a.tokens.Stats(),
 		"request_log":    a.logs.Stats(),
+		"quota_recovery": recoveryStats,
 	})
 }
 
@@ -296,6 +303,33 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP oaix_token_state_commit_failures_total Token runtime state commit failures after retry.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_state_commit_failures_total counter\n")
 	_, _ = fmt.Fprintf(w, "oaix_token_state_commit_failures_total %d\n", a.proxy.StateCommitFailures())
+	recoveryStats := quotaRecoveryStats{}
+	if a.recovery != nil {
+		recoveryStats = a.recovery.Stats()
+	}
+	_, _ = fmt.Fprintf(w, "# HELP oaix_quota_recovery_candidates Cooling usage-limit tokens currently eligible for reconciliation.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_quota_recovery_candidates gauge\n")
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_candidates %d\n", recoveryStats.Candidates)
+	_, _ = fmt.Fprintf(w, "# HELP oaix_quota_recovery_scans_total Automatic quota recovery scans.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_quota_recovery_scans_total counter\n")
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_scans_total %d\n", recoveryStats.Scans)
+	_, _ = fmt.Fprintf(w, "# HELP oaix_quota_recovery_quota_checks_total Upstream quota checks made by automatic recovery.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_quota_recovery_quota_checks_total counter\n")
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"checked\"} %d\n", recoveryStats.QuotaChecks)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"error\"} %d\n", recoveryStats.QuotaCheckErrors)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"capacity_positive\"} %d\n", recoveryStats.CapacityPositive)
+	_, _ = fmt.Fprintf(w, "# HELP oaix_quota_recovery_probes_total Automatic recovery probes by outcome.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_quota_recovery_probes_total counter\n")
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"started\"} %d\n", recoveryStats.ProbesStarted)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"completed\"} %d\n", recoveryStats.ProbeCompleted)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"reactivated\"} %d\n", recoveryStats.Reactivated)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"usage_limited\"} %d\n", recoveryStats.UsageLimited)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"inconclusive\"} %d\n", recoveryStats.Inconclusive)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"state_conflict\"} %d\n", recoveryStats.StateConflicts)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"persistence_error\"} %d\n", recoveryStats.PersistenceErrors)
+	_, _ = fmt.Fprintf(w, "# HELP oaix_quota_recovery_last_scan_unixtime Unix timestamp of the latest automatic recovery scan.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE oaix_quota_recovery_last_scan_unixtime gauge\n")
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_last_scan_unixtime %d\n", recoveryStats.LastScanUnix)
 	_, _ = fmt.Fprintf(w, "# HELP oaix_request_log_queue_depth Request log writer queue depth.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_request_log_queue_depth gauge\n")
 	_, _ = fmt.Fprintf(w, "oaix_request_log_queue_depth %d\n", logStats.Queued)

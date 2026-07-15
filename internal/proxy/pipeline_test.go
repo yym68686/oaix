@@ -3256,9 +3256,15 @@ func (s *fakeProxyStore) MarkTokenErrorWithContext(_ context.Context, tokenID in
 func (s *fakeProxyStore) UpdateTokenSecret(_ context.Context, update store.TokenSecretUpdate) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !update.RequireCredentialMatch {
+		return fmt.Errorf("credential refresh update must be fenced")
+	}
 	for i := range s.tokens {
 		if s.tokens[i].ID != update.TokenID {
 			continue
+		}
+		if update.RequireCredentialMatch && (s.tokens[i].AccessToken != update.ExpectedAccessToken || s.tokens[i].RefreshToken != update.ExpectedRefreshToken) {
+			return store.ErrTokenCredentialsChanged
 		}
 		if update.AccessToken != "" {
 			s.tokens[i].AccessToken = update.AccessToken

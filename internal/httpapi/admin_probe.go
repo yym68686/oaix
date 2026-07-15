@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,9 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/yym68686/oaix/internal/cooldown"
 	"github.com/yym68686/oaix/internal/oauth"
-	"github.com/yym68686/oaix/internal/protocol/sse"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -111,116 +108,54 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 	if model == "" {
 		model = defaultAdminProbeModel
 	}
-	baseURL := strings.TrimSpace(a.cfg.Upstream.ResponsesURL)
-	if baseURL == "" {
-		return tokenProbeResult(token.ID, "inconclusive", 500, "测试未得出结论：CODEX_BASE_URL 为空，当前状态未改变。", "CODEX_BASE_URL is empty", model)
+	attempt, probedToken := a.executeTokenProbeWithAuth(parent, token, model)
+	statusCode := attempt.StatusCode
+	if statusCode == 0 {
+		statusCode = http.StatusRequestTimeout
 	}
-	accessToken := strings.TrimSpace(token.AccessToken)
-	if accessToken == "" {
-		return tokenProbeResult(token.ID, "inconclusive", 400, "测试未得出结论：该 key 缺少 access token，当前状态未改变。", "missing access token", model)
-	}
-	body, _ := json.Marshal(map[string]any{
-		"model":        model,
-		"stream":       true,
-		"store":        false,
-		"instructions": "",
-		"input": []map[string]any{
-			{
-				"type": "message",
-				"role": "user",
-				"content": []map[string]any{
-					{"type": "input_text", "text": adminTokenProbeInput},
-				},
-			},
-		},
-	})
-	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(body))
-	if err != nil {
-		return tokenProbeResult(token.ID, "inconclusive", 500, "测试未得出结论：构造上游请求失败，当前状态未改变。", err.Error(), model)
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Openai-Beta", "responses=experimental")
-	req.Header.Set("Originator", codexOriginator)
-	req.Header.Set("User-Agent", codexUserAgent)
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Session_id", fmt.Sprintf("oaix-admin-probe-%d", token.ID))
-	if token.AccountID != nil && strings.TrimSpace(*token.AccountID) != "" {
-		req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(*token.AccountID))
-	}
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return tokenProbeResult(token.ID, "inconclusive", 502, "测试未得出结论：上游请求失败，当前状态未改变。", err.Error(), model)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, defaultAdminProbeBodyLimit))
-	detail := responseErrorDetail(resp.StatusCode, respBody)
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		streamDetail, streamRaw, responseModel := extractProbeStreamResult(parent, respBody)
-		if streamDetail != "" {
-			if isProbeUsageLimit(resp.StatusCode, streamDetail) {
-				now := time.Now().UTC()
-				until := cooldown.UsageLimitUntil(http.StatusTooManyRequests, []byte(streamRaw), now, a.cfg.TokenPool.DefaultCooldown)
-				if until == nil {
-					until = defaultCooldownUntil(now, a.cfg.TokenPool.DefaultCooldown)
-				}
-				a.markProbeError(token.ID, streamDetail, false, until, false)
-				result := tokenProbeResult(token.ID, "cooling", http.StatusTooManyRequests, "测试结果：上游返回额度限制，当前已转为冷却。", streamDetail, model)
-				result["cooldown_seconds"] = cooldownSeconds(now, until)
-				return result
-			}
-			if isPermanentProbeDisableError(resp.StatusCode, streamDetail) {
-				a.markProbeError(token.ID, streamDetail, true, nil, true)
-				return tokenProbeResult(token.ID, "disabled", http.StatusForbidden, "测试失败：使用当前 access token 请求上游后仍返回鉴权/停用错误，当前已标记为禁用。", streamDetail, model)
-			}
-			return tokenProbeResult(token.ID, "inconclusive", resp.StatusCode, "测试未得出结论：上游流式事件失败，当前状态未改变。", streamDetail, model)
+	switch attempt.Outcome {
+	case tokenProbeCompleted:
+		if err := a.markProbeSuccess(token, probedToken); err != nil {
+			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试已完成，但保存恢复状态失败；当前状态未被报告为可用。", err.Error(), model)
 		}
-		a.markProbeSuccess(token.ID)
-		result := tokenProbeResult(token.ID, "reactivated", resp.StatusCode, "测试成功：使用当前 access token 请求上游成功，当前已标记为可用。", "", model)
-		if responseModel == "" {
-			responseModel = extractProbeResponseModel(respBody)
-		}
-		if responseModel != "" {
-			result["response_model"] = responseModel
+		result := tokenProbeResult(token.ID, "reactivated", statusCode, "测试成功：收到完整的 response.completed，当前已标记为可用。", "", model)
+		if attempt.ResponseModel != "" {
+			result["response_model"] = attempt.ResponseModel
 		}
 		return result
-	}
-
-	if isUsageLimitError(resp.StatusCode, detail) {
+	case tokenProbeUsageLimited:
 		now := time.Now().UTC()
-		until := cooldown.UsageLimitUntil(resp.StatusCode, respBody, now, a.cfg.TokenPool.DefaultCooldown)
-		if until == nil {
-			until = defaultCooldownUntil(now, a.cfg.TokenPool.DefaultCooldown)
+		until := manualProbeUsageLimitCooldown(token.CooldownUntil, attempt.UsageLimit.ResetAt, now, a.cfg.TokenPool.DefaultCooldown)
+		if err := a.markProbeUsageLimit(token, probedToken, attempt.Detail, until, model); err != nil {
+			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试确认仍受额度限制，但保存冷却状态失败。", err.Error(), model)
 		}
-		a.markProbeError(token.ID, detail, false, until, false)
-		result := tokenProbeResult(token.ID, "cooling", resp.StatusCode, "测试结果：上游返回额度限制，当前已转为冷却。", detail, model)
+		result := tokenProbeResult(token.ID, "cooling", statusCode, "测试结果：上游明确返回 usage_limit_reached，当前保持冷却。", attempt.Detail, model)
 		result["cooldown_seconds"] = cooldownSeconds(now, until)
 		return result
+	case tokenProbeDisabled:
+		if err := a.markProbeDisabled(token, probedToken, attempt.Detail, false, statusCode, model); err != nil {
+			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试确认工作区已停用，但保存禁用状态失败。", err.Error(), model)
+		}
+		return tokenProbeResult(token.ID, "disabled", statusCode, "测试失败：上游明确返回工作区已停用，当前已标记为禁用。", attempt.Detail, model)
+	case tokenProbeCanceled:
+		return tokenProbeResult(token.ID, "inconclusive", statusCode, "测试在完整终止事件前被取消，当前状态未改变。", attempt.Detail, model)
+	case tokenProbeAuthRejected:
+		return tokenProbeResult(token.ID, "inconclusive", statusCode, "刷新凭据后上游仍拒绝鉴权，当前状态未改变。", attempt.Detail, model)
+	case tokenProbeTransient:
+		return tokenProbeResult(token.ID, "inconclusive", statusCode, "上游暂时不可用或限流，当前状态未改变。", attempt.Detail, model)
+	default:
+		return tokenProbeResult(token.ID, "inconclusive", statusCode, "测试未收到可信的完整成功事件，当前状态未改变。", attempt.Detail, model)
 	}
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || isPermanentProbeDisableError(resp.StatusCode, detail) {
-		a.markProbeError(token.ID, detail, true, nil, true)
-		return tokenProbeResult(token.ID, "disabled", resp.StatusCode, "测试失败：使用当前 access token 请求上游后仍返回鉴权/停用错误，当前已标记为禁用。", detail, model)
-	}
-
-	result := tokenProbeResult(token.ID, "inconclusive", resp.StatusCode, "测试未得出结论：上游返回非成功状态，当前状态未改变。", detail, model)
-	if len(respBody) > 0 {
-		result["raw_response"] = string(respBody)
-	}
-	return result
 }
 
 func (a *App) refreshProbeAccessToken(parent context.Context, token store.Token, model string) (store.Token, map[string]any) {
 	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 	defer cancel()
-	client := oauth.NewHTTPClient(a.cfg.Upstream.OAuthTokenURL)
-	client.ClientID = a.cfg.Upstream.OAuthClientID
-	client.Scope = a.cfg.Upstream.OAuthScope
-	result, err := client.Refresh(ctx, strings.TrimSpace(token.RefreshToken))
+	service := a.quota
+	if service == nil {
+		service = newAdminQuotaService(a.cfg, a.store, a.logger)
+	}
+	refreshed, err := service.refreshQuotaToken(ctx, token)
 	if err != nil {
 		detail := err.Error()
 		status := oauthRefreshErrorStatus(detail)
@@ -228,52 +163,17 @@ func (a *App) refreshProbeAccessToken(parent context.Context, token store.Token,
 			status = http.StatusInternalServerError
 		}
 		if isPermanentlyInvalidRefreshTokenError(status, detail) {
-			a.markProbeError(token.ID, detail, true, nil, true)
+			if err := a.markProbeDisabled(token, token, detail, true, status, model); err != nil {
+				return token, tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试确认 refresh token 已失效，但保存禁用状态失败；当前状态未被报告为禁用。", err.Error(), model)
+			}
 			return token, tokenProbeResult(token.ID, "disabled", status, "测试失败：refresh token 已失效，当前已标记为禁用。", detail, model)
 		}
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
-			a.markProbeError(token.ID, detail, false, nil, true)
 			return token, tokenProbeResult(token.ID, "inconclusive", status, fmt.Sprintf("测试未得出结论：刷新最新 access token 失败（%d），当前状态未改变。", status), detail, model)
 		}
 		return token, tokenProbeResult(token.ID, "inconclusive", status, fmt.Sprintf("测试未得出结论：刷新最新 access token 时返回 %d，当前状态未改变。", status), detail, model)
 	}
-	expiresAt := (*time.Time)(nil)
-	if result.ExpiresIn > 0 {
-		expires := time.Now().UTC().Add(time.Duration(result.ExpiresIn) * time.Second)
-		expiresAt = &expires
-	}
-	if a.store != nil {
-		if err := a.store.UpdateTokenSecret(ctx, store.TokenSecretUpdate{
-			TokenID:            token.ID,
-			AccessToken:        result.AccessToken,
-			RefreshToken:       result.RefreshToken,
-			IDToken:            result.IDToken,
-			ExpiresAt:          expiresAt,
-			AccountID:          result.AccountID,
-			Email:              result.Email,
-			PlanType:           result.PlanType,
-			PreserveActivation: true,
-		}); err != nil {
-			return token, tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试未得出结论：保存最新 access token 失败，当前状态未改变。", err.Error(), model)
-		}
-	}
-	token.AccessToken = result.AccessToken
-	if strings.TrimSpace(result.RefreshToken) != "" {
-		token.RefreshToken = result.RefreshToken
-	}
-	if strings.TrimSpace(result.AccountID) != "" {
-		value := result.AccountID
-		token.AccountID = &value
-	}
-	if strings.TrimSpace(result.Email) != "" {
-		value := result.Email
-		token.Email = &value
-	}
-	if strings.TrimSpace(result.PlanType) != "" {
-		value := result.PlanType
-		token.PlanType = &value
-	}
-	return token, nil
+	return refreshed, nil
 }
 
 func (a *App) resolveTokenProbeModel(parent context.Context, ownerUserID *int64, requestedModel string) string {
@@ -334,30 +234,65 @@ func normalizeConfiguredTokenProbeModel(value string) string {
 	return ""
 }
 
-func (a *App) markProbeSuccess(tokenID int64) {
+func (a *App) markProbeSuccess(observed store.Token, probed store.Token) error {
 	if a.store == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := a.store.MarkTokenSuccess(ctx, tokenID); err == nil && a.tokens != nil {
-		_ = a.tokens.Refresh(ctx)
+	if err := a.store.MarkManualProbeSuccess(ctx, observed.ID, manualProbeStateFence(observed, probed)); err != nil {
+		return err
+	}
+	if a.tokens != nil {
+		if err := a.tokens.Refresh(ctx); err != nil {
+			if a.logger != nil {
+				a.logger.Warn("token snapshot refresh after manual probe success failed", "token_id", observed.ID, "error", err)
+			}
+		}
+	}
+	return nil
+}
+
+func (a *App) markProbeUsageLimit(observed store.Token, probed store.Token, detail string, cooldownUntil *time.Time, model string) error {
+	if a.store == nil || cooldownUntil == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.store.MarkManualProbeUsageLimit(ctx, observed.ID, manualProbeStateFence(observed, probed), detail, *cooldownUntil, model); err != nil {
+		return err
+	}
+	if a.tokens != nil {
+		if err := a.tokens.Refresh(ctx); err != nil && a.logger != nil {
+			a.logger.Warn("token snapshot refresh after manual usage-limit probe failed", "token_id", observed.ID, "error", err)
+		}
+	}
+	return nil
+}
+
+func manualProbeStateFence(observed store.Token, probed store.Token) store.ManualProbeStateFence {
+	return store.ManualProbeStateFence{
+		IsActive:      observed.IsActive,
+		DisabledAt:    observed.DisabledAt,
+		CooldownUntil: observed.CooldownUntil,
+		LastError:     observed.LastError,
+		Credentials:   quotaRecoveryCredentialFence(probed),
 	}
 }
 
-func (a *App) markProbeError(tokenID int64, detail string, deactivate bool, cooldownUntil *time.Time, clearAccess bool) {
+func (a *App) markProbeDisabled(observed store.Token, probed store.Token, detail string, clearAccess bool, statusCode int, model string) error {
 	if a.store == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err := a.store.MarkTokenError(ctx, tokenID, detail, deactivate, cooldownUntil)
-	if err == nil && clearAccess {
-		err = a.store.ClearTokenAccess(ctx, tokenID)
-	}
+	err := a.store.MarkManualProbeDisabled(ctx, observed.ID, manualProbeStateFence(observed, probed), detail, clearAccess, statusCode, model)
 	if err == nil && a.tokens != nil {
-		_ = a.tokens.Refresh(ctx)
+		if refreshErr := a.tokens.Refresh(ctx); refreshErr != nil && a.logger != nil {
+			a.logger.Warn("token snapshot refresh after manual probe disable failed", "token_id", observed.ID, "error", refreshErr)
+		}
 	}
+	return err
 }
 
 func tokenProbeResult(id int64, outcome string, statusCode int, message string, detail string, model string) map[string]any {
@@ -407,20 +342,24 @@ func parseAdminTokenIDs(value string, limit int) ([]int64, error) {
 	return ids, nil
 }
 
-func isUsageLimitError(status int, detail string) bool {
-	if status != http.StatusTooManyRequests {
-		return false
-	}
-	lowered := strings.ToLower(detail)
-	return strings.Contains(lowered, "usage_limit_reached") || strings.Contains(lowered, "usage limit")
-}
-
 func defaultCooldownUntil(now time.Time, duration time.Duration) *time.Time {
 	if duration <= 0 {
 		duration = 300 * time.Second
 	}
 	until := now.UTC().Add(duration)
 	return &until
+}
+
+func manualProbeUsageLimitCooldown(previous *time.Time, resetAt *time.Time, now time.Time, fallback time.Duration) *time.Time {
+	if resetAt != nil && resetAt.After(now) {
+		value := resetAt.UTC()
+		return &value
+	}
+	if previous != nil && previous.After(now) {
+		value := previous.UTC()
+		return &value
+	}
+	return defaultCooldownUntil(now, fallback)
 }
 
 func cooldownSeconds(now time.Time, until *time.Time) int {
@@ -434,83 +373,12 @@ func cooldownSeconds(now time.Time, until *time.Time) int {
 	return seconds
 }
 
-func isProbeUsageLimit(status int, detail string) bool {
-	if isUsageLimitError(status, detail) {
-		return true
-	}
-	lowered := strings.ToLower(detail)
-	return strings.Contains(lowered, "rate_limit_exceeded") ||
-		strings.Contains(lowered, "concurrency limit exceeded") ||
-		strings.Contains(lowered, "usage_limit_reached") ||
-		strings.Contains(lowered, "usage limit")
-}
-
-func isPermanentProbeDisableError(status int, detail string) bool {
-	lowered := strings.ToLower(detail)
-	if status == http.StatusPaymentRequired && strings.Contains(lowered, "deactivated_workspace") {
-		return true
-	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		return true
-	}
-	for _, marker := range []string{
-		"account_deactivated",
-		"token_invalidated",
-		"deactivated_workspace",
-		"authentication token has been invalidated",
-		"app_session_terminated",
-		"session_terminated",
-		"your session has ended",
-		"please log in again",
-	} {
-		if strings.Contains(lowered, marker) {
-			return true
-		}
-	}
-	return false
-}
-
 func oauthRefreshErrorStatus(detail string) int {
 	return oauth.RefreshErrorStatus(detail)
 }
 
 func isPermanentlyInvalidRefreshTokenError(status int, detail string) bool {
 	return oauth.IsPermanentlyInvalidRefreshTokenError(status, detail)
-}
-
-func extractProbeStreamResult(ctx context.Context, body []byte) (string, string, string) {
-	if !bytes.Contains(body, []byte("data:")) && !bytes.Contains(body, []byte("event:")) {
-		return "", "", ""
-	}
-	var failure string
-	var failureRaw string
-	var responseModel string
-	_ = sse.NewParser(defaultAdminProbeBodyLimit).Parse(ctx, bytes.NewReader(body), func(event sse.Event) error {
-		var payload map[string]any
-		if err := json.Unmarshal(event.Data, &payload); err != nil {
-			return nil
-		}
-		eventType := strings.TrimSpace(event.Event)
-		if eventType == "" {
-			eventType = stringFromAny(firstValue(payload, "type"))
-		}
-		if eventType == "response.failed" {
-			failure = probeFailureDetail(http.StatusOK, event.Data)
-			failureRaw = string(event.Data)
-			return nil
-		}
-		if eventType == "response.completed" {
-			if model := extractProbeResponseModel(event.Data); model != "" {
-				responseModel = model
-				return nil
-			}
-			if response, ok := payload["response"].(map[string]any); ok {
-				responseModel = stringFromAny(firstValue(response, "model"))
-			}
-		}
-		return nil
-	})
-	return failure, failureRaw, responseModel
 }
 
 func probeFailureDetail(status int, body []byte) string {
@@ -530,22 +398,6 @@ func probeFailureDetail(status int, body []byte) string {
 func stringFromAny(value any) string {
 	if text := normalizeText(value); text != nil {
 		return *text
-	}
-	return ""
-}
-
-func extractProbeResponseModel(body []byte) string {
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return ""
-	}
-	if value, ok := payload["model"].(string); ok {
-		return strings.TrimSpace(value)
-	}
-	if response, ok := payload["response"].(map[string]any); ok {
-		if value, ok := response["model"].(string); ok {
-			return strings.TrimSpace(value)
-		}
 	}
 	return ""
 }

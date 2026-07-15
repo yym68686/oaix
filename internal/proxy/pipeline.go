@@ -582,15 +582,18 @@ func (p *Pipeline) refreshAccessTokenAfterAuthFailure(parent context.Context, cl
 		expiresAt = &expires
 	}
 	if err := updater.UpdateTokenSecret(ctx, store.TokenSecretUpdate{
-		TokenID:            token.ID,
-		AccessToken:        result.AccessToken,
-		RefreshToken:       result.RefreshToken,
-		IDToken:            result.IDToken,
-		ExpiresAt:          expiresAt,
-		AccountID:          result.AccountID,
-		Email:              result.Email,
-		PlanType:           result.PlanType,
-		PreserveActivation: true,
+		TokenID:                token.ID,
+		AccessToken:            result.AccessToken,
+		RefreshToken:           result.RefreshToken,
+		IDToken:                result.IDToken,
+		ExpiresAt:              expiresAt,
+		AccountID:              result.AccountID,
+		Email:                  result.Email,
+		PlanType:               result.PlanType,
+		PreserveActivation:     true,
+		RequireCredentialMatch: true,
+		ExpectedAccessToken:    token.AccessToken,
+		ExpectedRefreshToken:   token.RefreshToken,
 	}); err != nil {
 		return authFailureRefreshResult{
 			Inconclusive: true,

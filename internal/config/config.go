@@ -16,6 +16,7 @@ type Config struct {
 	Auth          AuthConfig
 	Upstream      UpstreamConfig
 	TokenPool     TokenPoolConfig
+	QuotaRecovery QuotaRecoveryConfig
 	PromptCache   PromptCacheConfig
 	RequestLog    RequestLogConfig
 	Import        ImportConfig
@@ -73,6 +74,17 @@ type TokenPoolConfig struct {
 	DefaultCooldown      time.Duration
 	CompactErrorCooldown time.Duration
 	AccessTokenFile      string
+}
+
+type QuotaRecoveryConfig struct {
+	Enabled            bool
+	StartupDelay       time.Duration
+	ScanInterval       time.Duration
+	RecheckInterval    time.Duration
+	QuotaMaxAge        time.Duration
+	ProbeRetryInterval time.Duration
+	BatchSize          int
+	Concurrency        int
 }
 
 type PromptCacheConfig struct {
@@ -167,6 +179,16 @@ func Load() (Config, error) {
 			CompactErrorCooldown: envDurationSeconds("COMPACT_SERVER_ERROR_COOLDOWN_SECONDS", 60*time.Second),
 			AccessTokenFile:      envString("OAIX_ACCESS_TOKEN_FILE", envString("ACCESS_TOKEN_FILE", "")),
 		},
+		QuotaRecovery: QuotaRecoveryConfig{
+			Enabled:            envBool("OAIX_AUTO_QUOTA_RECOVERY_ENABLED", true),
+			StartupDelay:       envDurationSeconds("OAIX_AUTO_QUOTA_RECOVERY_STARTUP_DELAY_SECONDS", 30*time.Second),
+			ScanInterval:       envDurationSeconds("OAIX_AUTO_QUOTA_RECOVERY_SCAN_INTERVAL_SECONDS", 30*time.Second),
+			RecheckInterval:    envDurationSeconds("OAIX_AUTO_QUOTA_RECOVERY_RECHECK_INTERVAL_SECONDS", 15*time.Minute),
+			QuotaMaxAge:        envDurationSeconds("OAIX_AUTO_QUOTA_RECOVERY_QUOTA_MAX_AGE_SECONDS", 2*time.Minute),
+			ProbeRetryInterval: envDurationSeconds("OAIX_AUTO_QUOTA_RECOVERY_PROBE_RETRY_SECONDS", 15*time.Minute),
+			BatchSize:          envInt("OAIX_AUTO_QUOTA_RECOVERY_BATCH_SIZE", 24),
+			Concurrency:        envInt("OAIX_AUTO_QUOTA_RECOVERY_CONCURRENCY", 4),
+		},
 		PromptCache: PromptCacheConfig{
 			AffinityEnabled:       envBool("PROMPT_CACHE_AFFINITY_ENABLED", true),
 			AutoKeyEnabled:        envBool("PROMPT_CACHE_AUTO_KEY_ENABLED", true),
@@ -226,6 +248,29 @@ func (c Config) Validate() error {
 	if c.TokenPool.ActiveStreamCap <= 0 {
 		errs = append(errs, fmt.Errorf("TOKEN_ACTIVE_STREAM_CAP must be positive"))
 	}
+	if c.QuotaRecovery.Enabled {
+		if c.QuotaRecovery.StartupDelay < 0 {
+			errs = append(errs, fmt.Errorf("OAIX_AUTO_QUOTA_RECOVERY_STARTUP_DELAY_SECONDS must be zero or positive"))
+		}
+		if c.QuotaRecovery.ScanInterval <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_AUTO_QUOTA_RECOVERY_SCAN_INTERVAL_SECONDS must be positive"))
+		}
+		if c.QuotaRecovery.RecheckInterval <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_AUTO_QUOTA_RECOVERY_RECHECK_INTERVAL_SECONDS must be positive"))
+		}
+		if c.QuotaRecovery.QuotaMaxAge <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_AUTO_QUOTA_RECOVERY_QUOTA_MAX_AGE_SECONDS must be positive"))
+		}
+		if c.QuotaRecovery.ProbeRetryInterval <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_AUTO_QUOTA_RECOVERY_PROBE_RETRY_SECONDS must be positive"))
+		}
+		if c.QuotaRecovery.BatchSize <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_AUTO_QUOTA_RECOVERY_BATCH_SIZE must be positive"))
+		}
+		if c.QuotaRecovery.Concurrency <= 0 || c.QuotaRecovery.Concurrency > c.QuotaRecovery.BatchSize {
+			errs = append(errs, fmt.Errorf("OAIX_AUTO_QUOTA_RECOVERY_CONCURRENCY must be positive and no greater than batch size"))
+		}
+	}
 	if c.PromptCache.MaxLanesPerKey <= 0 {
 		errs = append(errs, fmt.Errorf("PROMPT_CACHE_MAX_LANES_PER_KEY must be positive"))
 	}
@@ -278,6 +323,16 @@ func (c Config) SanitizedSummary() map[string]any {
 			"refresh_interval":  c.TokenPool.RefreshInterval.String(),
 			"active_stream_cap": c.TokenPool.ActiveStreamCap,
 			"access_token_file": c.TokenPool.AccessTokenFile != "",
+		},
+		"quota_recovery": map[string]any{
+			"enabled":              c.QuotaRecovery.Enabled,
+			"startup_delay":        c.QuotaRecovery.StartupDelay.String(),
+			"scan_interval":        c.QuotaRecovery.ScanInterval.String(),
+			"recheck_interval":     c.QuotaRecovery.RecheckInterval.String(),
+			"quota_max_age":        c.QuotaRecovery.QuotaMaxAge.String(),
+			"probe_retry_interval": c.QuotaRecovery.ProbeRetryInterval.String(),
+			"batch_size":           c.QuotaRecovery.BatchSize,
+			"concurrency":          c.QuotaRecovery.Concurrency,
 		},
 		"prompt_cache": map[string]any{
 			"affinity_enabled":        c.PromptCache.AffinityEnabled,

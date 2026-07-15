@@ -181,25 +181,33 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 }
 
 func (s *Store) SetTokenCooldown(ctx context.Context, tokenID int64, until time.Time, reason string) (*Token, error) {
-	row := s.pool.QueryRow(ctx, `
-		update codex_tokens
-		set cooldown_until = $2,
-		    last_error = nullif($3, ''),
-		    is_active = true,
-		    disabled_at = null,
-		    updated_at = now()
-		where id = $1 and merged_into_token_id is null
-		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
-	`, tokenID, until, truncate(reason, 4000))
-	token, err := scanToken(row)
+	var token Token
+	err := s.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			update codex_tokens
+			set cooldown_until = $2,
+			    last_error = nullif($3, ''),
+			    is_active = true,
+			    disabled_at = null,
+			    updated_at = now()
+			where id = $1 and merged_into_token_id is null
+			returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
+			          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		`, tokenID, until, truncate(reason, 4000))
+		updated, err := scanToken(row)
+		if err != nil {
+			return err
+		}
+		token = updated
+		_, err = tx.Exec(ctx, `
+			insert into token_state_events(token_id, owner_user_id, event_type, reason, cooldown_until)
+			values ($1, nullif($2, 0), 'cooldown_set', $3, $4)
+		`, tokenID, token.OwnerUserID, truncate(reason, 4000), until)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	_, _ = s.pool.Exec(ctx, `
-		insert into token_state_events(token_id, event_type, reason, cooldown_until)
-		values ($1, 'cooldown_set', $2, $3)
-	`, tokenID, truncate(reason, 4000), until)
 	return &token, nil
 }
 

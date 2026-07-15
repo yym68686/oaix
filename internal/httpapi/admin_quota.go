@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -74,6 +75,8 @@ type codexQuotaSnapshot struct {
 	Error                 *string                 `json:"error"`
 	PlanType              *string                 `json:"plan_type"`
 	Disabled              bool                    `json:"disabled,omitempty"`
+	Allowed               *bool                   `json:"allowed,omitempty"`
+	LimitReached          *bool                   `json:"limit_reached,omitempty"`
 	Windows               []codexQuotaWindow      `json:"windows"`
 	RateLimitResetCredits *codexQuotaResetCredits `json:"rate_limit_reset_credits,omitempty"`
 }
@@ -103,6 +106,7 @@ type adminQuotaService struct {
 	client            *http.Client
 	oauthClient       oauth.Client
 	store             *store.Store
+	logger            *slog.Logger
 	usageURL          string
 	resetURL          string
 	userAgent         string
@@ -116,7 +120,7 @@ type adminQuotaService struct {
 	pending           map[int64]struct{}
 }
 
-func newAdminQuotaService(cfg config.Config, tokenStore *store.Store) *adminQuotaService {
+func newAdminQuotaService(cfg config.Config, tokenStore *store.Store, logger *slog.Logger) *adminQuotaService {
 	concurrency := envIntDefault("OAIX_ADMIN_QUOTA_CONCURRENCY", defaultQuotaConcurrency)
 	if concurrency <= 0 {
 		concurrency = defaultQuotaConcurrency
@@ -138,6 +142,7 @@ func newAdminQuotaService(cfg config.Config, tokenStore *store.Store) *adminQuot
 		},
 		oauthClient:       oauthClient,
 		store:             tokenStore,
+		logger:            logger,
 		usageURL:          firstEnv("OAIX_WHAM_USAGE_URL", "WHAM_USAGE_URL", defaultWHAMUsageURL),
 		resetURL:          firstEnv("OAIX_WHAM_RATE_LIMIT_RESET_URL", "WHAM_RATE_LIMIT_RESET_URL", defaultWHAMResetURL),
 		userAgent:         firstEnv("OAIX_WHAM_USER_AGENT", "WHAM_USER_AGENT", defaultWHAMUserAgent),
@@ -483,6 +488,14 @@ func (s *adminQuotaService) fetchMany(ctx context.Context, tokens []store.Token)
 }
 
 func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token) *codexQuotaSnapshot {
+	return s.fetchSnapshotWithPersistence(ctx, token, true)
+}
+
+func (s *adminQuotaService) fetchSnapshotWithoutHistory(ctx context.Context, token store.Token) *codexQuotaSnapshot {
+	return s.fetchSnapshotWithPersistence(ctx, token, false)
+}
+
+func (s *adminQuotaService) fetchSnapshotWithPersistence(ctx context.Context, token store.Token, persist bool) *codexQuotaSnapshot {
 	now := time.Now().UTC()
 	select {
 	case s.sem <- struct{}{}:
@@ -497,7 +510,7 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 			if contextError(err) {
 				return nil
 			}
-			return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
+			return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, err.Error()), persist)
 		}
 		token = refreshed
 	}
@@ -507,7 +520,7 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 		if contextError(err) {
 			return nil
 		}
-		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, err.Error()), persist)
 	}
 	if quotaStatusShouldRefresh(statusCode) {
 		if refreshed, refreshErr := s.refreshQuotaToken(ctx, token); refreshErr == nil {
@@ -517,27 +530,27 @@ func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token
 				if contextError(err) {
 					return nil
 				}
-				return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
+				return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, err.Error()), persist)
 			}
 		}
 	}
 	if statusCode < 200 || statusCode >= 300 {
 		detail := responseErrorDetail(statusCode, body)
-		if quotaResponseShouldDisable(statusCode, body) {
+		if persist && quotaResponseShouldDisable(statusCode, body) {
 			s.disableTokenFromQuota(ctx, token.ID)
 		}
-		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, detail))
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, detail), persist)
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, "Quota endpoint returned invalid JSON"))
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, "Quota endpoint returned invalid JSON"), persist)
 	}
 	snapshot, err := parseCodexQuotaPayload(payload, now)
 	if err != nil {
-		return s.storeSnapshot(token.ID, quotaErrorSnapshot(now, err.Error()))
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, err.Error()), persist)
 	}
-	return s.storeSnapshot(token.ID, snapshot)
+	return s.storeSnapshotWithPersistence(token.ID, snapshot, persist)
 }
 
 func (s *adminQuotaService) queryResetCredits(ctx context.Context, token store.Token) (*codexQuotaSnapshot, error) {
@@ -622,7 +635,10 @@ func (s *adminQuotaService) requestUsage(ctx context.Context, token store.Token)
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, defaultQuotaBodyMaxBytes))
+	body, err := readQuotaResponseBody(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
 	return resp.StatusCode, body, nil
 }
 
@@ -646,7 +662,10 @@ func (s *adminQuotaService) requestResetCredit(ctx context.Context, token store.
 		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
-	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, defaultQuotaBodyMaxBytes))
+	responseBody, err := readQuotaResponseBody(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, nil, err
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return resp.StatusCode, responseBody, nil, nil
 	}
@@ -655,6 +674,18 @@ func (s *adminQuotaService) requestResetCredit(ctx context.Context, token store.
 		return resp.StatusCode, responseBody, nil, fmt.Errorf("quota reset endpoint returned invalid JSON")
 	}
 	return resp.StatusCode, responseBody, &payload, nil
+}
+
+func readQuotaResponseBody(reader io.Reader) ([]byte, error) {
+	limited := &io.LimitedReader{R: reader, N: defaultQuotaBodyMaxBytes + 1}
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > defaultQuotaBodyMaxBytes {
+		return nil, fmt.Errorf("quota response exceeds %d bytes", defaultQuotaBodyMaxBytes)
+	}
+	return body, nil
 }
 
 func (s *adminQuotaService) setWHAMHeaders(req *http.Request, token store.Token, contentJSON bool) {
@@ -731,14 +762,18 @@ func (s *adminQuotaService) refreshQuotaToken(ctx context.Context, token store.T
 	}
 	if s.store != nil {
 		if err := s.store.UpdateTokenSecret(ctx, store.TokenSecretUpdate{
-			TokenID:      token.ID,
-			AccessToken:  result.AccessToken,
-			RefreshToken: result.RefreshToken,
-			IDToken:      result.IDToken,
-			ExpiresAt:    expiresAt,
-			AccountID:    result.AccountID,
-			Email:        result.Email,
-			PlanType:     result.PlanType,
+			TokenID:                token.ID,
+			AccessToken:            result.AccessToken,
+			RefreshToken:           result.RefreshToken,
+			IDToken:                result.IDToken,
+			ExpiresAt:              expiresAt,
+			AccountID:              result.AccountID,
+			Email:                  result.Email,
+			PlanType:               result.PlanType,
+			PreserveActivation:     true,
+			RequireCredentialMatch: true,
+			ExpectedAccessToken:    token.AccessToken,
+			ExpectedRefreshToken:   token.RefreshToken,
 		}); err != nil {
 			return token, err
 		}
@@ -944,8 +979,20 @@ func tokenQuotaActivationScope(token store.Token) store.ResourceScope {
 }
 
 func (s *adminQuotaService) storeSnapshot(tokenID int64, snapshot *codexQuotaSnapshot) *codexQuotaSnapshot {
-	if s.store != nil && snapshot != nil {
-		_ = s.store.SaveQuotaSnapshot(context.Background(), tokenID, snapshot, snapshot.PlanType, snapshot.Error)
+	return s.storeSnapshotWithPersistence(tokenID, snapshot, true)
+}
+
+func (s *adminQuotaService) storeSnapshotWithPersistence(tokenID int64, snapshot *codexQuotaSnapshot, persist bool) *codexQuotaSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	if persist && s.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := s.store.SaveQuotaSnapshot(ctx, tokenID, snapshot, snapshot.PlanType, snapshot.Error)
+		cancel()
+		if err != nil && s.logger != nil {
+			s.logger.Warn("quota snapshot persistence failed", "token_id", tokenID, "error", err)
+		}
 	}
 	s.mu.Lock()
 	s.cache[tokenID] = cachedQuotaSnapshot{
@@ -1009,21 +1056,21 @@ func parseCodexQuotaPayload(payload map[string]any, now time.Time) (*codexQuotaS
 		return nil, fmt.Errorf("Quota payload must be a JSON object")
 	}
 	rateLimit := firstMapping(payload, "rate_limit", "rateLimit")
-	fiveHour, weekly := findCodexWindows(rateLimit)
 	limitReached := firstValue(rateLimit, "limit_reached", "limitReached")
 	allowed := firstValue(rateLimit, "allowed")
 	windows := make([]codexQuotaWindow, 0, 2)
-	if window := buildCodexWindow("code-5h", "5h", fiveHour, limitReached, allowed, now); window != nil {
-		windows = append(windows, *window)
-	}
-	if window := buildCodexWindow("code-7d", "7d", weekly, limitReached, allowed, now); window != nil {
-		windows = append(windows, *window)
+	for _, item := range codexQuotaWindows(rateLimit) {
+		if window := buildCodexWindow(item.id, item.label, item.window, limitReached, allowed, now); window != nil {
+			windows = append(windows, *window)
+		}
 	}
 	planType := normalizePlanType(firstValue(payload, "plan_type", "planType"))
 	return &codexQuotaSnapshot{
 		FetchedAt:             now,
 		Error:                 nil,
 		PlanType:              planType,
+		Allowed:               coerceBool(allowed),
+		LimitReached:          coerceBool(limitReached),
 		Windows:               windows,
 		RateLimitResetCredits: parseQuotaResetCredits(payload),
 	}, nil
@@ -1045,27 +1092,53 @@ func parseQuotaResetCredits(payload map[string]any) *codexQuotaResetCredits {
 	return &codexQuotaResetCredits{AvailableCount: available}
 }
 
-func findCodexWindows(rateLimit map[string]any) (map[string]any, map[string]any) {
-	primary := firstMapping(rateLimit, "primary_window", "primaryWindow")
-	secondary := firstMapping(rateLimit, "secondary_window", "secondaryWindow")
-	var fiveHour map[string]any
-	var weekly map[string]any
-	for _, candidate := range []map[string]any{primary, secondary} {
-		duration := coerceInt(firstValue(candidate, "limit_window_seconds", "limitWindowSeconds"))
-		if duration != nil && *duration == quotaWindow5HSeconds && fiveHour == nil {
-			fiveHour = candidate
+type codexQuotaWindowInput struct {
+	id     string
+	label  string
+	window map[string]any
+}
+
+func codexQuotaWindows(rateLimit map[string]any) []codexQuotaWindowInput {
+	inputs := []struct {
+		name   string
+		window map[string]any
+	}{
+		{name: "primary", window: firstMapping(rateLimit, "primary_window", "primaryWindow")},
+		{name: "secondary", window: firstMapping(rateLimit, "secondary_window", "secondaryWindow")},
+	}
+	result := make([]codexQuotaWindowInput, 0, len(inputs))
+	for _, input := range inputs {
+		if input.window == nil {
+			continue
 		}
-		if duration != nil && *duration == quotaWindow7DSeconds && weekly == nil {
-			weekly = candidate
+		id := "code-" + input.name
+		label := input.name
+		if duration := coerceInt(firstValue(input.window, "limit_window_seconds", "limitWindowSeconds")); duration != nil {
+			switch *duration {
+			case quotaWindow5HSeconds:
+				id, label = "code-5h", "5h"
+			case quotaWindow7DSeconds:
+				id, label = "code-7d", "7d"
+			default:
+				label = formatQuotaWindowDuration(*duration, input.name)
+			}
 		}
+		result = append(result, codexQuotaWindowInput{id: id, label: label, window: input.window})
 	}
-	if fiveHour == nil {
-		fiveHour = primary
+	return result
+}
+
+func formatQuotaWindowDuration(seconds int, fallback string) string {
+	if seconds <= 0 {
+		return fallback
 	}
-	if weekly == nil {
-		weekly = secondary
+	if seconds%(24*60*60) == 0 {
+		return fmt.Sprintf("%dd", seconds/(24*60*60))
 	}
-	return fiveHour, weekly
+	if seconds%(60*60) == 0 {
+		return fmt.Sprintf("%dh", seconds/(60*60))
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 func buildCodexWindow(id, label string, window map[string]any, limitReached any, allowed any, now time.Time) *codexQuotaWindow {

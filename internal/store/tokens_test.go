@@ -257,6 +257,34 @@ func TestTokenListWhereSupportsOwnerOption(t *testing.T) {
 	}
 }
 
+func TestValidQuotaRecoverySourceFailsClosed(t *testing.T) {
+	tests := []struct {
+		name        string
+		eventType   string
+		statusCode  sql.NullInt64
+		reason      string
+		failureKind string
+		want        bool
+	}{
+		{name: "gateway usage limit", eventType: "error", statusCode: sql.NullInt64{Int64: 429, Valid: true}, reason: "upstream usage limit cooldown", want: true},
+		{name: "legacy gateway usage limit", eventType: "error", reason: "upstream usage limit cooldown", want: true},
+		{name: "legacy explicit message", eventType: "error", reason: "HTTP 429: The usage limit has been reached", want: true},
+		{name: "structured recovery", eventType: QuotaRecoveryUsageLimitedEvent, statusCode: sql.NullInt64{Int64: 429, Valid: true}, reason: "usage_limit_reached: still cooling", failureKind: "usage_limit_reached", want: true},
+		{name: "structured manual probe", eventType: TokenUsageLimitConfirmedEvent, statusCode: sql.NullInt64{Int64: 429, Valid: true}, reason: "usage_limit_reached: still cooling", failureKind: "usage_limit_reached", want: true},
+		{name: "structured event missing metadata rejected", eventType: QuotaRecoveryUsageLimitedEvent, statusCode: sql.NullInt64{Int64: 429, Valid: true}, reason: "usage_limit_reached", want: false},
+		{name: "fuzzy phrase rejected", eventType: "error", statusCode: sql.NullInt64{Int64: 429, Valid: true}, reason: "maybe usage limit related", want: false},
+		{name: "wrong status rejected", eventType: "error", statusCode: sql.NullInt64{Int64: 500, Valid: true}, reason: "upstream usage limit cooldown", want: false},
+		{name: "wrong event rejected", eventType: "cooldown_set", statusCode: sql.NullInt64{Int64: 429, Valid: true}, reason: "upstream usage limit cooldown", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validQuotaRecoverySource(test.eventType, test.statusCode, test.reason, test.failureKind); got != test.want {
+				t.Fatalf("validQuotaRecoverySource = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestScanTokenAllowsMissingSecretColumns(t *testing.T) {
 	now := time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC)
 	token, err := scanToken(fakeTokenRow{values: []any{

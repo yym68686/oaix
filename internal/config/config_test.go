@@ -45,6 +45,20 @@ func TestLoadUsesTypedDefaultsAndEnvOverrides(t *testing.T) {
 	if !cfg.Worker.Embedded {
 		t.Fatal("embedded worker should default to enabled")
 	}
+	if !cfg.QuotaRecovery.Enabled || cfg.QuotaRecovery.ScanInterval != 30*time.Second || cfg.QuotaRecovery.RecheckInterval != 15*time.Minute {
+		t.Fatalf("QuotaRecovery defaults = %#v", cfg.QuotaRecovery)
+	}
+	if cfg.QuotaRecovery.BatchSize != 24 || cfg.QuotaRecovery.Concurrency != 4 {
+		t.Fatalf("QuotaRecovery limits = %#v", cfg.QuotaRecovery)
+	}
+}
+
+func TestLoadRejectsQuotaRecoveryConcurrencyAboveBatchSize(t *testing.T) {
+	t.Setenv("OAIX_AUTO_QUOTA_RECOVERY_BATCH_SIZE", "2")
+	t.Setenv("OAIX_AUTO_QUOTA_RECOVERY_CONCURRENCY", "3")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "OAIX_AUTO_QUOTA_RECOVERY_CONCURRENCY") {
+		t.Fatalf("expected quota recovery concurrency validation error, got %v", err)
+	}
 }
 
 func TestLoadReadsRequestBodyLimitOverride(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -174,16 +175,22 @@ type RefreshTokenIdentity struct {
 }
 
 type TokenSecretUpdate struct {
-	TokenID            int64
-	AccessToken        string
-	RefreshToken       string
-	IDToken            string
-	ExpiresAt          *time.Time
-	AccountID          string
-	Email              string
-	PlanType           string
-	PreserveActivation bool
+	TokenID                int64
+	AccessToken            string
+	RefreshToken           string
+	IDToken                string
+	ExpiresAt              *time.Time
+	AccountID              string
+	Email                  string
+	PlanType               string
+	PreserveActivation     bool
+	RequireCredentialMatch bool
+	ExpectedAccessToken    string
+	ExpectedRefreshToken   string
 }
+
+var ErrTokenCredentialsChanged = errors.New("token credentials changed concurrently")
+var ErrTokenStateChanged = errors.New("token state changed concurrently")
 
 func (s *Store) ListAvailableTokens(ctx context.Context) ([]Token, error) {
 	return s.ListAvailableTokensScoped(ctx, AllResources())
@@ -1135,25 +1142,223 @@ func (s *Store) TouchTokens(ctx context.Context, tokenIDs []int64, usedAt time.T
 
 func (s *Store) MarkTokenSuccess(ctx context.Context, tokenID int64) error {
 	_, err := s.pool.Exec(ctx, `
-		update codex_tokens
-		set is_active = true,
-		    cooldown_until = null,
-		    disabled_at = null,
-		    last_used_at = now(),
-		    last_error = null,
-		    updated_at = now()
-		where id = $1
-	`, tokenID)
-	if err != nil {
-		return err
-	}
-	_, err = s.pool.Exec(ctx, `
-		insert into token_runtime_state(token_id, active_streams, failure_streak, last_success_at, updated_at)
-		values ($1, 0, 0, now(), now())
+		with succeeded as (
+			update codex_tokens
+			set last_used_at = now(),
+			    last_error = null,
+			    updated_at = now()
+			where id = $1
+			  and merged_into_token_id is null
+			  and is_active = true
+			  and disabled_at is null
+			  and (cooldown_until is null or cooldown_until <= now())
+			returning id, owner_user_id
+		)
+		insert into token_runtime_state(
+			token_id, owner_user_id, active_streams, cooldown_until, disabled_reason,
+			failure_streak, last_success_at, updated_at
+		)
+		select id, owner_user_id, 0, null, null, 0, now(), now()
+		from succeeded
 		on conflict (token_id) do update
-		set failure_streak = 0, last_success_at = now(), updated_at = now()
+		set owner_user_id = coalesce(excluded.owner_user_id, token_runtime_state.owner_user_id),
+		    cooldown_until = null,
+		    disabled_reason = null,
+		    failure_streak = 0,
+		    last_success_at = now(),
+		    updated_at = now()
 	`, tokenID)
 	return err
+}
+
+type ManualProbeStateFence struct {
+	IsActive      bool
+	DisabledAt    *time.Time
+	CooldownUntil *time.Time
+	LastError     *string
+	Credentials   QuotaRecoveryCredentialFence
+}
+
+func (s *Store) MarkManualProbeSuccess(ctx context.Context, tokenID int64, fence ManualProbeStateFence) error {
+	return s.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			update codex_tokens
+			set is_active = true,
+			    cooldown_until = null,
+			    disabled_at = null,
+			    last_used_at = now(),
+			    last_error = null,
+			    updated_at = now()
+			where id = $1
+			  and merged_into_token_id is null
+			  and is_active = $2
+			  and disabled_at is not distinct from $3::timestamptz
+			  and cooldown_until is not distinct from $4::timestamptz
+			  and last_error is not distinct from $5::text
+			  and coalesce(access_token, '') = $6
+			  and coalesce(refresh_token, '') = $7
+			  and btrim(coalesce(account_id, '')) = $8
+		`, tokenID, fence.IsActive, fence.DisabledAt, fence.CooldownUntil,
+			fence.LastError, fence.Credentials.AccessToken, fence.Credentials.RefreshToken, strings.TrimSpace(fence.Credentials.AccountID))
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrTokenStateChanged
+		}
+		_, err = tx.Exec(ctx, `
+			insert into token_runtime_state(
+				token_id, active_streams, cooldown_until, disabled_reason,
+				failure_streak, last_success_at, updated_at
+			)
+			values ($1, 0, null, null, 0, now(), now())
+			on conflict (token_id) do update
+			set cooldown_until = null,
+			    disabled_reason = null,
+			    failure_streak = 0,
+			    last_success_at = now(),
+			    updated_at = now()
+		`, tokenID)
+		return err
+	})
+}
+
+func (s *Store) MarkManualProbeUsageLimit(ctx context.Context, tokenID int64, fence ManualProbeStateFence, message string, cooldownUntil time.Time, model string) error {
+	message = truncate(strings.TrimSpace(message), 4000)
+	if message == "" {
+		message = "usage_limit_reached"
+	} else if !strings.Contains(strings.ToLower(message), "usage_limit_reached") {
+		message = truncate("usage_limit_reached: "+message, 4000)
+	}
+	return s.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var ownerUserID sql.NullInt64
+		err := tx.QueryRow(ctx, `
+			update codex_tokens
+			set last_error = $9,
+			    cooldown_until = $10,
+			    updated_at = now()
+			where id = $1
+			  and merged_into_token_id is null
+			  and is_active = $2
+			  and disabled_at is not distinct from $3::timestamptz
+			  and cooldown_until is not distinct from $4::timestamptz
+			  and last_error is not distinct from $5::text
+			  and coalesce(access_token, '') = $6
+			  and coalesce(refresh_token, '') = $7
+			  and btrim(coalesce(account_id, '')) = $8
+			returning owner_user_id
+		`, tokenID, fence.IsActive, fence.DisabledAt, fence.CooldownUntil,
+			fence.LastError, fence.Credentials.AccessToken, fence.Credentials.RefreshToken, strings.TrimSpace(fence.Credentials.AccountID),
+			truncate(message, 4000), cooldownUntil.UTC()).Scan(&ownerUserID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrTokenStateChanged
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			insert into token_runtime_state(
+				token_id, owner_user_id, cooldown_until, disabled_reason,
+				failure_streak, last_failure_at, updated_at
+			)
+			values ($1, $2, $3, $4, 1, now(), now())
+			on conflict (token_id) do update
+			set owner_user_id = coalesce(excluded.owner_user_id, token_runtime_state.owner_user_id),
+			    cooldown_until = excluded.cooldown_until,
+			    disabled_reason = excluded.disabled_reason,
+			    failure_streak = token_runtime_state.failure_streak + 1,
+			    last_failure_at = now(),
+			    updated_at = now()
+		`, tokenID, nullableOwnerID(ownerUserID), cooldownUntil.UTC(), truncate(message, 4000)); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
+			insert into token_state_events(
+				token_id, owner_user_id, event_type, reason, cooldown_until,
+				model, status_code, previous_is_active, next_is_active, metadata
+			)
+			values ($1, $2, $3, $4, $5, nullif($6, ''), 429, $7, $7, '{"failure_kind":"usage_limit_reached"}'::jsonb)
+		`, tokenID, nullableOwnerID(ownerUserID), TokenUsageLimitConfirmedEvent, message, cooldownUntil.UTC(), strings.TrimSpace(model), fence.IsActive)
+		return err
+	})
+}
+
+func (s *Store) MarkManualProbeDisabled(ctx context.Context, tokenID int64, fence ManualProbeStateFence, message string, clearAccess bool, statusCode int, model string) error {
+	message = truncate(strings.TrimSpace(message), 4000)
+	if message == "" {
+		message = "manual probe confirmed token is disabled"
+	}
+	return s.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var ownerUserID sql.NullInt64
+		var cooldownUntil sql.NullTime
+		err := tx.QueryRow(ctx, `
+			update codex_tokens
+			set last_error = $9,
+			    is_active = false,
+			    disabled_at = now(),
+			    access_token = case when $10 then null else access_token end,
+			    updated_at = now()
+			where id = $1
+			  and merged_into_token_id is null
+			  and is_active = $2
+			  and disabled_at is not distinct from $3::timestamptz
+			  and cooldown_until is not distinct from $4::timestamptz
+			  and last_error is not distinct from $5::text
+			  and coalesce(access_token, '') = $6
+			  and coalesce(refresh_token, '') = $7
+			  and btrim(coalesce(account_id, '')) = $8
+			returning owner_user_id, cooldown_until
+		`, tokenID, fence.IsActive, fence.DisabledAt, fence.CooldownUntil,
+			fence.LastError, fence.Credentials.AccessToken, fence.Credentials.RefreshToken, strings.TrimSpace(fence.Credentials.AccountID),
+			message, clearAccess).Scan(&ownerUserID, &cooldownUntil)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrTokenStateChanged
+		}
+		if err != nil {
+			return err
+		}
+		var cooldownValue any
+		if cooldownUntil.Valid {
+			cooldownValue = cooldownUntil.Time.UTC()
+		}
+		if clearAccess {
+			if _, err := tx.Exec(ctx, `
+				update token_secrets
+				set access_token = null, updated_at = now()
+				where token_id = $1
+			`, tokenID); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			insert into token_runtime_state(
+				token_id, owner_user_id, cooldown_until, disabled_reason,
+				failure_streak, last_failure_at, updated_at
+			)
+			values ($1, $2, $3, $4, 1, now(), now())
+			on conflict (token_id) do update
+			set owner_user_id = coalesce(excluded.owner_user_id, token_runtime_state.owner_user_id),
+			    cooldown_until = excluded.cooldown_until,
+			    disabled_reason = excluded.disabled_reason,
+			    failure_streak = token_runtime_state.failure_streak + 1,
+			    last_failure_at = now(),
+			    updated_at = now()
+		`, tokenID, nullableOwnerID(ownerUserID), cooldownValue, message); err != nil {
+			return err
+		}
+		metadata := map[string]any{
+			"source":                    "manual_probe",
+			"credential_access_cleared": clearAccess,
+		}
+		_, err = tx.Exec(ctx, `
+			insert into token_state_events(
+				token_id, owner_user_id, event_type, reason, cooldown_until,
+				model, status_code, previous_is_active, next_is_active, metadata
+			)
+			values ($1, $2, 'disabled', $3, $4, nullif($5, ''), nullif($6, 0), $7, false, $8)
+		`, tokenID, nullableOwnerID(ownerUserID), message, cooldownValue, strings.TrimSpace(model), statusCode, fence.IsActive, jsonBytes(metadata))
+		return err
+	})
 }
 
 func (s *Store) MarkTokenError(ctx context.Context, tokenID int64, message string, deactivate bool, cooldownUntil *time.Time) error {
@@ -1535,7 +1740,7 @@ func (s *Store) UpdateTokenSecret(ctx context.Context, update TokenSecretUpdate)
 		return err
 	}
 	defer tx.Rollback(ctx)
-	_, err = tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		update codex_tokens
 		set access_token = coalesce(nullif($2, ''), access_token),
 		    refresh_token = coalesce(nullif($3, ''), refresh_token),
@@ -1549,10 +1754,25 @@ func (s *Store) UpdateTokenSecret(ctx context.Context, update TokenSecretUpdate)
 		    is_active = case when $9 then is_active else true end,
 		    disabled_at = case when $9 then disabled_at else null end,
 		    updated_at = now()
-		where id = $1 and merged_into_token_id is null
-	`, update.TokenID, update.AccessToken, update.RefreshToken, update.IDToken, update.ExpiresAt, update.AccountID, update.Email, update.PlanType, update.PreserveActivation)
+		where id = $1
+		  and merged_into_token_id is null
+		  and (
+		    not $10::boolean
+		    or (
+		      coalesce(access_token, '') = $11
+		      and coalesce(refresh_token, '') = $12
+		    )
+		  )
+	`, update.TokenID, update.AccessToken, update.RefreshToken, update.IDToken, update.ExpiresAt, update.AccountID, update.Email, update.PlanType, update.PreserveActivation,
+		update.RequireCredentialMatch, update.ExpectedAccessToken, update.ExpectedRefreshToken)
 	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() != 1 {
+		if update.RequireCredentialMatch {
+			return ErrTokenCredentialsChanged
+		}
+		return pgx.ErrNoRows
 	}
 	_, err = tx.Exec(ctx, `
 		insert into token_secrets(token_id, access_token, refresh_token, id_token, updated_at)

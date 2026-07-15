@@ -48,3 +48,19 @@ func TestUsageLimitUntilIgnoresOtherRateLimits(t *testing.T) {
 		t.Fatalf("unexpected cooldown: %s", got.Format(time.RFC3339))
 	}
 }
+
+func TestParseUsageLimitDistinguishesExplicitKindAndReset(t *testing.T) {
+	now := time.Date(2026, 6, 21, 1, 2, 3, 0, time.UTC)
+	parsed := ParseUsageLimit(429, []byte(`{"error":{"code":"usage_limit_reached","message":"quota exhausted"}}`), now)
+	if !parsed.Matched || !parsed.ExplicitKind {
+		t.Fatalf("explicit usage limit was not recognized: %+v", parsed)
+	}
+	if parsed.ResetAt != nil || parsed.ExplicitReset {
+		t.Fatalf("missing reset must stay explicit-reset=false: %+v", parsed)
+	}
+
+	messageOnly := ParseUsageLimit(429, []byte(`{"error":{"message":"usage limit reached"}}`), now)
+	if !messageOnly.Matched || messageOnly.ExplicitKind {
+		t.Fatalf("message fallback should not be classified as an explicit kind: %+v", messageOnly)
+	}
+}
