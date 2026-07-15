@@ -373,6 +373,107 @@ func TestPostgresRequestLogInitialAfterFinalPreservesStreamDelivery(t *testing.T
 	}
 }
 
+func TestPostgresLateInitialOutboxPreservesFinalBillingTrace(t *testing.T) {
+	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set OAIX_TEST_DATABASE_URL to run Postgres integration fixture")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := Connect(ctx, config.DatabaseConfig{
+		URL:            configURL(dsn),
+		MaxConns:       4,
+		MinConns:       1,
+		ConnectTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Connect returned error: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+
+	requestID := fmt.Sprintf("late-initial-billing-trace-%d", time.Now().UnixNano())
+	startedAt := time.Now().UTC().Add(-time.Second)
+	finishedAt := startedAt.Add(1500 * time.Millisecond)
+	durationMS := 1500
+	cost := 0.001725
+	initial := RequestLog{
+		RequestID:   requestID,
+		Endpoint:    "/v1/responses",
+		StartedAt:   startedAt,
+		TimingSpans: map[string]any{"request_body_bytes": 123, "fast_mode_requested": true, "service_tier": "priority"},
+		PromptCacheTrace: map[string]any{
+			"usage": map[string]any{},
+		},
+	}
+	final := initial
+	final.FinishedAt = &finishedAt
+	final.DurationMs = &durationMS
+	final.EstimatedCostUSD = &cost
+	final.TimingSpans = map[string]any{"request_body_bytes": 123, "total_ms": 1500, "fast_mode_requested": true, "service_tier": "priority"}
+	final.PromptCacheTrace = map[string]any{
+		"usage": map[string]any{
+			"billing": map[string]any{
+				"base_cost_usd":  0.00069,
+				"multiplier":     2.5,
+				"final_cost_usd": cost,
+			},
+		},
+	}
+
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = db.pool.Exec(cleanupCtx, `delete from request_log_outbox where request_id = $1`, requestID)
+		_, _ = db.pool.Exec(cleanupCtx, `delete from gateway_request_logs where request_id = $1`, requestID)
+	}()
+
+	// Reproduce the production ordering: the initial write falls back to the
+	// durable outbox, the final write succeeds, then the older initial payload
+	// is replayed after the completed row already exists.
+	if err := db.EnqueueRequestLogOutbox(ctx, initial); err != nil {
+		t.Fatalf("enqueue initial request log: %v", err)
+	}
+	if err := db.UpsertRequestLogs(ctx, []RequestLog{final}); err != nil {
+		t.Fatalf("write final request log: %v", err)
+	}
+	drained, err := db.DrainRequestLogOutbox(ctx, 1000)
+	if err != nil {
+		t.Fatalf("drain initial request log: %v", err)
+	}
+	if drained == 0 {
+		t.Fatal("initial request log was not replayed")
+	}
+	var pendingOutbox int
+	if err := db.pool.QueryRow(ctx, `select count(*) from request_log_outbox where request_id = $1`, requestID).Scan(&pendingOutbox); err != nil {
+		t.Fatalf("check replayed initial request log: %v", err)
+	}
+	if pendingOutbox != 0 {
+		t.Fatalf("initial request log is still pending after drain: %d", pendingOutbox)
+	}
+
+	var finished bool
+	var totalMS, multiplier string
+	var persistedCost float64
+	if err := db.pool.QueryRow(ctx, `
+		select
+			finished_at is not null,
+			timing_spans->>'total_ms',
+			prompt_cache_trace#>>'{usage,billing,multiplier}',
+			estimated_cost_usd
+		from gateway_request_logs
+		where request_id = $1
+	`, requestID).Scan(&finished, &totalMS, &multiplier, &persistedCost); err != nil {
+		t.Fatalf("load replayed request log: %v", err)
+	}
+	if !finished || totalMS != "1500" || multiplier != "2.5" {
+		t.Fatalf("late initial log overwrote final observability: finished=%v total_ms=%q multiplier=%q", finished, totalMS, multiplier)
+	}
+	assertApprox(t, persistedCost, cost)
+}
+
 func configURL(value string) string {
 	return value
 }

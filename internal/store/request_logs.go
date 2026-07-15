@@ -193,7 +193,11 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				first_token_at = coalesce(gateway_request_logs.first_token_at, excluded.first_token_at),
 				ttft_ms = coalesce(excluded.ttft_ms, gateway_request_logs.ttft_ms),
 				duration_ms = coalesce(excluded.duration_ms, gateway_request_logs.duration_ms),
-				timing_spans = coalesce(excluded.timing_spans, gateway_request_logs.timing_spans),
+				timing_spans = case
+					when gateway_request_logs.finished_at is not null and excluded.finished_at is null
+						then gateway_request_logs.timing_spans
+					else coalesce(excluded.timing_spans, gateway_request_logs.timing_spans)
+				end,
 				input_tokens = coalesce(excluded.input_tokens, gateway_request_logs.input_tokens),
 				cache_write_input_tokens = coalesce(excluded.cache_write_input_tokens, gateway_request_logs.cache_write_input_tokens),
 				cache_write_tokens_source = coalesce(excluded.cache_write_tokens_source, gateway_request_logs.cache_write_tokens_source),
@@ -216,7 +220,11 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				cache_hit_ratio = coalesce(excluded.cache_hit_ratio, gateway_request_logs.cache_hit_ratio),
 				cache_affinity_result = coalesce(excluded.cache_affinity_result, gateway_request_logs.cache_affinity_result),
 				cache_affinity_lane_index = coalesce(excluded.cache_affinity_lane_index, gateway_request_logs.cache_affinity_lane_index),
-				prompt_cache_trace = coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace),
+				prompt_cache_trace = case
+					when gateway_request_logs.finished_at is not null and excluded.finished_at is null
+						then gateway_request_logs.prompt_cache_trace
+					else coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace)
+				end,
 				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message),
 				stream_delivery_state = coalesce(excluded.stream_delivery_state, gateway_request_logs.stream_delivery_state),
 				downstream_connection_id = coalesce(excluded.downstream_connection_id, gateway_request_logs.downstream_connection_id),
@@ -358,7 +366,11 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				first_token_at = coalesce(gateway_request_logs.first_token_at, excluded.first_token_at),
 				ttft_ms = coalesce(excluded.ttft_ms, gateway_request_logs.ttft_ms),
 				duration_ms = coalesce(excluded.duration_ms, gateway_request_logs.duration_ms),
-				timing_spans = coalesce(excluded.timing_spans, gateway_request_logs.timing_spans),
+				timing_spans = case
+					when gateway_request_logs.finished_at is not null and excluded.finished_at is null
+						then gateway_request_logs.timing_spans
+					else coalesce(excluded.timing_spans, gateway_request_logs.timing_spans)
+				end,
 				input_tokens = coalesce(excluded.input_tokens, gateway_request_logs.input_tokens),
 				cache_write_input_tokens = coalesce(excluded.cache_write_input_tokens, gateway_request_logs.cache_write_input_tokens),
 				cache_write_tokens_source = coalesce(excluded.cache_write_tokens_source, gateway_request_logs.cache_write_tokens_source),
@@ -381,7 +393,11 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				cache_hit_ratio = coalesce(excluded.cache_hit_ratio, gateway_request_logs.cache_hit_ratio),
 				cache_affinity_result = coalesce(excluded.cache_affinity_result, gateway_request_logs.cache_affinity_result),
 				cache_affinity_lane_index = coalesce(excluded.cache_affinity_lane_index, gateway_request_logs.cache_affinity_lane_index),
-				prompt_cache_trace = coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace),
+				prompt_cache_trace = case
+					when gateway_request_logs.finished_at is not null and excluded.finished_at is null
+						then gateway_request_logs.prompt_cache_trace
+					else coalesce(excluded.prompt_cache_trace, gateway_request_logs.prompt_cache_trace)
+				end,
 				error_message = coalesce(excluded.error_message, gateway_request_logs.error_message),
 				stream_delivery_state = coalesce(excluded.stream_delivery_state, gateway_request_logs.stream_delivery_state),
 				downstream_connection_id = coalesce(excluded.downstream_connection_id, gateway_request_logs.downstream_connection_id),
