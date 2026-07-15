@@ -22,6 +22,7 @@ func TestFastCostRepriceSQLIsPreciseAndBounded(t *testing.T) {
 		"'base_cost_usd'",
 		"'multiplier'",
 		"'final_cost_usd'",
+		"jsonb_typeof(prompt_cache_trace::jsonb)",
 		"update gateway_request_token_costs",
 		"update gateway_request_hourly_stats",
 		"on conflict (token_id) do nothing",

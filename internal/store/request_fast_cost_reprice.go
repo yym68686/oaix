@@ -235,7 +235,7 @@ const repriceFastRequestLogsBatchSQL = `
 			coalesce(cached_input_tokens, 0)::numeric as cached_input_tokens,
 			coalesce(output_tokens, 0)::numeric as output_tokens,
 			estimated_cost_usd::numeric as previous_cost_usd,
-			case when jsonb_typeof(prompt_cache_trace) = 'object' then prompt_cache_trace else '{}'::jsonb end as request_trace,
+			case when jsonb_typeof(prompt_cache_trace::jsonb) = 'object' then prompt_cache_trace::jsonb else '{}'::jsonb end as request_trace,
 			analytics_recorded_at,
 			token_id,
 			owner_user_id,
