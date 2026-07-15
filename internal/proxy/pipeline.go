@@ -760,14 +760,13 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		return p.streamResponsesWithPreflight(w, resp, attempt)
 	}
 	w.WriteHeader(resp.StatusCode)
-	if attempt.PromptCache != nil {
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, p.cfg.Upstream.NonStreamMaxResponseBytes))
-		if readErr != nil {
-			return AttemptResult{Status: resp.StatusCode, Committed: true}, readErr
+	if supportsUsageMetrics(attempt.Intent.Endpoint) {
+		capture := newUsageBodyCapture(p.cfg.Upstream.NonStreamMaxResponseBytes)
+		_, copyErr := io.Copy(w, io.TeeReader(resp.Body, capture))
+		result := AttemptResult{Status: resp.StatusCode, Committed: true}
+		if !capture.Truncated() {
+			result.Usage, result.ResponseID = extractResponseMetrics(capture.Bytes(), attempt.Intent.Model, attempt.Intent.RequireFast)
 		}
-		usage, responseID := extractResponseMetrics(body, attempt.Intent.Model)
-		_, copyErr := w.Write(body)
-		result := AttemptResult{Status: resp.StatusCode, Committed: true, Usage: usage, ResponseID: responseID}
 		if copyErr != nil {
 			return result, copyErr
 		}
@@ -779,6 +778,15 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		return result, copyErr
 	}
 	return result, nil
+}
+
+func supportsUsageMetrics(endpoint string) bool {
+	switch endpoint {
+	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions":
+		return true
+	default:
+		return false
+	}
 }
 
 func isMarketplaceIntent(intent RequestIntent) bool {
@@ -1443,8 +1451,8 @@ func normalizeIntent(intent RequestIntent, body []byte) RequestIntent {
 		// still forwarded, bypassing the Fast token allow-list.
 		if payload, err := decodeJSONObject(body); err == nil {
 			serviceTier, _ := payload["service_tier"].(string)
-			intent.ServiceTier = strings.ToLower(strings.TrimSpace(serviceTier))
-			intent.RequireFast = intent.ServiceTier == "priority" || intent.ServiceTier == "fast"
+			intent.ServiceTier = serviceTier
+			intent.RequireFast = serviceTier == "priority"
 		}
 	}
 	switch intent.Endpoint {

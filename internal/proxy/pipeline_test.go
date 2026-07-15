@@ -505,14 +505,12 @@ func TestProxyRoutesFastRequestOnlyToFastCapablePlan(t *testing.T) {
 	}
 }
 
-func TestNormalizeIntentRecognizesFastServiceTierAliases(t *testing.T) {
-	for _, tier := range []string{"priority", "fast", " PRIORITY "} {
-		intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(fmt.Sprintf(`{"model":"gpt-5.5","service_tier":%q}`, tier)))
-		if !intent.RequireFast {
-			t.Fatalf("service_tier %q did not require Fast", tier)
-		}
+func TestNormalizeIntentRecognizesOnlyExactPriorityServiceTier(t *testing.T) {
+	intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(`{"model":"gpt-5.5","service_tier":"priority"}`))
+	if !intent.RequireFast || intent.ServiceTier != "priority" {
+		t.Fatalf("service_tier priority did not require Fast: %#v", intent)
 	}
-	for _, tier := range []string{"", "default", "auto"} {
+	for _, tier := range []string{"", "default", "auto", "fast", "PRIORITY", " priority "} {
 		intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(fmt.Sprintf(`{"model":"gpt-5.5","service_tier":%q}`, tier)))
 		if intent.RequireFast {
 			t.Fatalf("service_tier %q unexpectedly required Fast", tier)
@@ -541,14 +539,13 @@ func TestNormalizeIntentRecognizesFastServiceTierAliases(t *testing.T) {
 	}
 }
 
-func TestPrepareResponsesPayloadCanonicalizesFastServiceTierAliases(t *testing.T) {
+func TestPrepareUpstreamPayloadPreservesPriorityServiceTier(t *testing.T) {
 	for _, test := range []struct {
 		endpoint string
 		tier     string
 	}{
-		{endpoint: "/v1/responses", tier: "fast"},
-		{endpoint: "/v1/responses", tier: " PRIORITY "},
-		{endpoint: "/v1/chat/completions", tier: "Fast"},
+		{endpoint: "/v1/responses", tier: "priority"},
+		{endpoint: "/v1/chat/completions", tier: "priority"},
 	} {
 		body := []byte(fmt.Sprintf(`{"model":"gpt-5.5","input":"hello","service_tier":%q}`, test.tier))
 		intent := normalizeIntent(RequestIntent{Endpoint: test.endpoint}, body)
@@ -569,6 +566,27 @@ func TestPrepareResponsesPayloadCanonicalizesFastServiceTierAliases(t *testing.T
 		}
 		if preparedIntent.ServiceTier != "priority" || !preparedIntent.RequireFast {
 			t.Fatalf("tier %q intent = %#v", test.tier, preparedIntent)
+		}
+	}
+}
+
+func TestPrepareUpstreamPayloadRejectsFastAlias(t *testing.T) {
+	for _, endpoint := range []string{"/v1/responses", "/v1/responses/compact", "/v1/chat/completions"} {
+		body := []byte(`{"model":"gpt-5.5","service_tier":"fast"}`)
+		intent := normalizeIntent(RequestIntent{Endpoint: endpoint}, body)
+		prepared, preparedIntent, status, err := prepareUpstreamPayload(
+			httptest.NewRequest(http.MethodPost, endpoint, nil),
+			body,
+			intent,
+		)
+		if err == nil || status != http.StatusBadRequest {
+			t.Fatalf("endpoint %s: status=%d err=%v", endpoint, status, err)
+		}
+		if preparedIntent.RequireFast || preparedIntent.ServiceTier != "fast" {
+			t.Fatalf("endpoint %s alias was upgraded: %#v", endpoint, preparedIntent)
+		}
+		if string(prepared) != string(body) {
+			t.Fatalf("endpoint %s alias payload was rewritten: %s", endpoint, prepared)
 		}
 	}
 }
@@ -2956,12 +2974,17 @@ func TestWriteResponsesJSONFromSSECollectsTextPlainUpstream(t *testing.T) {
 		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
 	}
 	recorder := httptest.NewRecorder()
-	result, err := pipeline.writeResponsesJSONFromSSE(recorder, resp, Attempt{Intent: RequestIntent{Model: "gpt-5.5"}})
+	result, err := pipeline.writeResponsesJSONFromSSE(recorder, resp, Attempt{Intent: RequestIntent{Model: "gpt-5.5", RequireFast: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !result.Committed || result.ResponseID != "resp_1" || result.Usage == nil {
 		t.Fatalf("unexpected result: %+v", result)
+	}
+	assertCost(t, result.Usage.BaseCostUSD, 0.00019)
+	assertCost(t, result.Usage.EstimatedCostUSD, 0.000475)
+	if result.Usage.BillingMultiplier != 2.5 {
+		t.Fatalf("Fast multiplier = %v, want 2.5", result.Usage.BillingMultiplier)
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
@@ -2974,6 +2997,173 @@ func TestWriteResponsesJSONFromSSECollectsTextPlainUpstream(t *testing.T) {
 	content := output[0].(map[string]any)["content"].([]any)
 	if content[0].(map[string]any)["text"] != "test" {
 		t.Fatalf("output_item.done fallback was not patched: %v", payload)
+	}
+}
+
+func TestDoAttemptCapturesFastUsageForNonStreamResponseModes(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/compact") {
+			_, _ = io.WriteString(w, `{"id":"resp_compact","response":{"usage":{"input_tokens":100,"input_tokens_details":{"cache_write_tokens":20,"cached_tokens":30},"output_tokens":10,"total_tokens":110}}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"chatcmpl_fast","usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{Upstream: config.UpstreamConfig{
+		ResponsesURL:              upstream.URL,
+		ChatCompletionsURL:        upstream.URL,
+		NonStreamMaxResponseBytes: 1 << 20,
+		DisableCompression:        true,
+	}}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	pipeline := &Pipeline{cfg: cfg, transport: client}
+	claim := &tokens.Claim{Token: &tokens.RuntimeToken{Token: store.Token{ID: 1, AccessToken: "token"}}}
+	tests := []struct {
+		name      string
+		intent    RequestIntent
+		baseCost  float64
+		finalCost float64
+	}{
+		{
+			name:      "chat completions JSON",
+			intent:    RequestIntent{Endpoint: "/v1/chat/completions", Model: "gpt-5.5", RequireFast: true},
+			baseCost:  0.0008,
+			finalCost: 0.002,
+		},
+		{
+			name:      "responses compact JSON",
+			intent:    RequestIntent{Endpoint: "/v1/responses/compact", Model: "gpt-5.6-luna", Compact: true, RequireFast: true},
+			baseCost:  0.000138,
+			finalCost: 0.000345,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, test.intent.Endpoint, strings.NewReader(`{"model":"`+test.intent.Model+`"}`))
+			result, err := pipeline.doAttempt(recorder, request, Attempt{
+				RequestID: "fast-non-stream",
+				Intent:    test.intent,
+				Claim:     claim,
+				Body:      []byte(`{"model":"` + test.intent.Model + `"}`),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Committed || result.Usage == nil {
+				t.Fatalf("usage was not captured: %+v", result)
+			}
+			assertCost(t, result.Usage.BaseCostUSD, test.baseCost)
+			assertCost(t, result.Usage.EstimatedCostUSD, test.finalCost)
+			if result.Usage.BillingMultiplier != fastCostMultiplierForPricingModel(result.Usage.PricingModel) {
+				t.Fatalf("unexpected Fast usage: %+v", result.Usage)
+			}
+		})
+	}
+}
+
+func TestDoAttemptUsageCaptureNeverTruncatesLargeDownstreamBody(t *testing.T) {
+	largeBody := `{"id":"chatcmpl_large","usage":{"prompt_tokens":100,"completion_tokens":10},"padding":"` + strings.Repeat("x", 512) + `"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, largeBody)
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{Upstream: config.UpstreamConfig{
+		ChatCompletionsURL:        upstream.URL,
+		NonStreamMaxResponseBytes: 64,
+		DisableCompression:        true,
+	}}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	pipeline := &Pipeline{cfg: cfg, transport: client}
+	claim := &tokens.Claim{Token: &tokens.RuntimeToken{Token: store.Token{ID: 1, AccessToken: "token"}}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.5"}`))
+	result, err := pipeline.doAttempt(recorder, request, Attempt{
+		RequestID: "large-non-stream",
+		Intent: RequestIntent{
+			Endpoint:    "/v1/chat/completions",
+			Model:       "gpt-5.5",
+			RequireFast: true,
+		},
+		Claim: claim,
+		Body:  []byte(`{"model":"gpt-5.5"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Committed || result.Usage != nil {
+		t.Fatalf("truncated observation must not guess usage: %+v", result)
+	}
+	if got := recorder.Body.String(); got != largeBody {
+		t.Fatalf("downstream body was truncated: got %d bytes, want %d", len(got), len(largeBody))
+	}
+}
+
+func TestStreamResponsesCapturesFastUsageForChatAndResponses(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	tests := []struct {
+		name      string
+		endpoint  string
+		model     string
+		body      string
+		baseCost  float64
+		finalCost float64
+	}{
+		{
+			name:     "chat completions SSE",
+			endpoint: "/v1/chat/completions",
+			model:    "gpt-5.5",
+			body: strings.Join([]string{
+				`data: {"id":"chatcmpl_fast","usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}`,
+				``,
+				`data: [DONE]`,
+				``,
+			}, "\n"),
+			baseCost:  0.0008,
+			finalCost: 0.002,
+		},
+		{
+			name:     "responses SSE",
+			endpoint: "/v1/responses",
+			model:    "gpt-5.6-luna",
+			body: strings.Join([]string{
+				`event: response.completed`,
+				`data: {"type":"response.completed","response":{"id":"resp_fast","status":"completed","usage":{"input_tokens":100,"input_tokens_details":{"cache_write_tokens":20,"cached_tokens":30},"output_tokens":10,"total_tokens":110}}}`,
+				``,
+			}, "\n"),
+			baseCost:  0.000138,
+			finalCost: 0.000345,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(test.body)),
+				Request:    httptest.NewRequest(http.MethodPost, test.endpoint, nil),
+			}
+			result, err := pipeline.streamResponsesWithPreflight(httptest.NewRecorder(), resp, Attempt{Intent: RequestIntent{
+				Endpoint:    test.endpoint,
+				Model:       test.model,
+				Stream:      true,
+				RequireFast: true,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Committed || result.Usage == nil {
+				t.Fatalf("usage was not captured: %+v", result)
+			}
+			assertCost(t, result.Usage.BaseCostUSD, test.baseCost)
+			assertCost(t, result.Usage.EstimatedCostUSD, test.finalCost)
+		})
 	}
 }
 

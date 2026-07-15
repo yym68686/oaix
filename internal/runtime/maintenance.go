@@ -120,6 +120,9 @@ func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Log
 	runStep(ctx, logger, "GPT-5.6 request cost repricing", maxDuration(2*time.Minute, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
 		return runGPT56RequestCostRepricing(stepCtx, logger, db)
 	})
+	runStep(ctx, logger, "Fast request cost repricing", maxDuration(2*time.Minute, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
+		return runFastRequestCostRepricing(stepCtx, logger, db)
+	})
 	runStep(ctx, logger, "sub2api sync", maxDuration(30*time.Second, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
 		if sub2apiSyncer == nil {
 			return nil
@@ -184,6 +187,48 @@ func runGPT56RequestCostRepricing(ctx context.Context, logger *slog.Logger, db *
 			"updated_logs", total.UpdatedLogs,
 			"rebuilt_token_costs", total.RebuiltTokenCosts,
 			"rebuilt_hourly_costs", total.RebuiltHourlyCosts,
+			"completed", total.Completed,
+		)
+	}
+	return nil
+}
+
+type fastCostRepricer interface {
+	RepriceFastRequestCosts(context.Context) (store.FastCostRepriceResult, error)
+}
+
+func runFastRequestCostRepricing(ctx context.Context, logger *slog.Logger, db fastCostRepricer) error {
+	const cycleWriteBudget = 45 * time.Second
+	deadline := time.Now().Add(cycleWriteBudget)
+	var total store.FastCostRepriceResult
+	batchCount := 0
+	for {
+		result, err := db.RepriceFastRequestCosts(ctx)
+		if err != nil {
+			return err
+		}
+		batchCount++
+		total.ScannedLogs += result.ScannedLogs
+		total.UpdatedLogs += result.UpdatedLogs
+		total.UpdatedTokenCosts += result.UpdatedTokenCosts
+		total.UpdatedHourlyCosts += result.UpdatedHourlyCosts
+		total.Phase = result.Phase
+		total.Completed = result.Completed
+
+		progressed := result.ScannedLogs > 0
+		if result.Completed || result.Phase == "busy" || result.Phase == "waiting_gpt56" || !progressed || time.Now().After(deadline) {
+			break
+		}
+	}
+	if logger != nil && (total.ScannedLogs > 0 || total.UpdatedTokenCosts > 0 || total.UpdatedHourlyCosts > 0) {
+		logger.Info(
+			"Fast request costs repriced",
+			"phase", total.Phase,
+			"batches", batchCount,
+			"scanned_logs", total.ScannedLogs,
+			"updated_logs", total.UpdatedLogs,
+			"updated_token_costs", total.UpdatedTokenCosts,
+			"updated_hourly_costs", total.UpdatedHourlyCosts,
 			"completed", total.Completed,
 		)
 	}

@@ -39,7 +39,11 @@ func TestExtractUsageMetricsGPT56PromptCacheBilling(t *testing.T) {
 	if usage.InputPricePerMillionUSD != 1 || usage.OutputPricePerMillionUSD != 6 || usage.CacheWritePricePerMillionUSD == nil || *usage.CacheWritePricePerMillionUSD != 1.25 {
 		t.Fatalf("unexpected official pricing metadata: %+v", usage)
 	}
+	assertCost(t, usage.BaseCostUSD, 0.000138)
 	assertCost(t, usage.EstimatedCostUSD, 0.000138)
+	if usage.BillingMultiplier != 1 || usage.FastMode {
+		t.Fatalf("standard request was multiplied: %+v", usage)
+	}
 }
 
 func TestGPT56PricingFamilies(t *testing.T) {
@@ -71,6 +75,72 @@ func TestGPT56PricingFamilies(t *testing.T) {
 				t.Fatalf("unexpected rates: %+v", pricing)
 			}
 		})
+	}
+}
+
+func TestFastUsageCostMultipliersUseNormalizedIntent(t *testing.T) {
+	payload := map[string]any{
+		"usage": map[string]any{
+			"input_tokens": 100,
+			"input_tokens_details": map[string]any{
+				"cache_write_tokens": 20,
+				"cached_tokens":      30,
+			},
+			"output_tokens": 10,
+		},
+	}
+	tests := []struct {
+		model      string
+		multiplier float64
+		baseCost   float64
+		finalCost  float64
+	}{
+		{model: "gpt-5.6-sol", multiplier: 2.5, baseCost: 0.00069, finalCost: 0.001725},
+		{model: "gpt-5.6-terra-preview", multiplier: 2.5, baseCost: 0.000345, finalCost: 0.0008625},
+		{model: "gpt-5.6-luna-2026-07-10", multiplier: 2.5, baseCost: 0.000138, finalCost: 0.000345},
+		{model: "gpt-5.5-2026-05-01", multiplier: 2.5, baseCost: 0.000665, finalCost: 0.0016625},
+		{model: "gpt-5.4", multiplier: 2, baseCost: 0.0003325, finalCost: 0.000665},
+	}
+	for _, test := range tests {
+		t.Run(test.model, func(t *testing.T) {
+			intent := normalizeIntent(
+				RequestIntent{Endpoint: "/v1/responses", Model: test.model},
+				[]byte(`{"service_tier":"priority"}`),
+			)
+			if !intent.RequireFast || intent.ServiceTier != "priority" {
+				t.Fatalf("normalized Fast intent = %+v", intent)
+			}
+			usage := extractUsageMetricsForIntent(payload, test.model, intent.RequireFast)
+			if usage == nil {
+				t.Fatal("usage is nil")
+			}
+			assertCost(t, usage.BaseCostUSD, test.baseCost)
+			assertCost(t, usage.EstimatedCostUSD, test.finalCost)
+			if usage.BillingMultiplier != test.multiplier || !usage.FastMode || usage.ServiceTier != "priority" {
+				t.Fatalf("Fast billing metadata = %+v", usage)
+			}
+			billing, _ := usage.Trace()["billing"].(map[string]any)
+			if billing["base_cost_usd"] != test.baseCost || billing["multiplier"] != test.multiplier || billing["final_cost_usd"] != test.finalCost {
+				t.Fatalf("ambiguous Fast billing trace: %#v", billing)
+			}
+		})
+	}
+}
+
+func TestDatedGPT54VariantsKeepSpecificBasePricing(t *testing.T) {
+	tests := []struct {
+		model   string
+		pricing string
+	}{
+		{model: "gpt-5.4-mini-2026-04-01", pricing: "gpt-5.4-mini"},
+		{model: "gpt-5.4-nano-preview", pricing: "gpt-5.4-nano"},
+		{model: "gpt-5.4-compact", pricing: "gpt-5.4-mini"},
+	}
+	for _, test := range tests {
+		pricing, ok := pricingForModel(test.model)
+		if !ok || pricing.name != test.pricing {
+			t.Fatalf("pricingForModel(%q) = %+v, %v; want %q", test.model, pricing, ok, test.pricing)
+		}
 	}
 }
 

@@ -58,6 +58,9 @@ type imageCallResult struct {
 }
 
 func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) ([]byte, RequestIntent, int, error) {
+	if intent.ServiceTier == "fast" {
+		return body, intent, http.StatusBadRequest, errors.New(`service_tier "fast" is unsupported; use "priority" for Fast mode`)
+	}
 	switch intent.Endpoint {
 	case "/v1/responses", "/v1/responses/compact":
 		next, err := prepareResponsesPayload(body, &intent)
@@ -1208,7 +1211,7 @@ func (p *Pipeline) writeResponsesJSONFromSSE(w http.ResponseWriter, resp *http.R
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	_, writeErr := w.Write(body)
-	usage, responseID := extractResponseMetrics(body, firstNonEmpty(attempt.Intent.ResponseModelAlias, attempt.Intent.Model))
+	usage, responseID := extractResponseMetrics(body, firstNonEmpty(attempt.Intent.ResponseModelAlias, attempt.Intent.Model), attempt.Intent.RequireFast)
 	result.Committed = true
 	result.Usage = usage
 	result.ResponseID = responseID
@@ -1612,7 +1615,7 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 }
 
 func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *http.Response, attempt Attempt) (AttemptResult, error) {
-	observer := newUsageObserver(attempt.Intent.Model)
+	observer := newUsageObserver(attempt.Intent.Model, attempt.Intent.RequireFast)
 	var trace *store.StreamDeliveryTrace
 	if isResponsesStreamEndpoint(attempt.Intent.Endpoint) {
 		trace = store.NewStreamDeliveryTrace(attempt.DownstreamConnectionID)
