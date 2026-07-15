@@ -182,6 +182,33 @@ func TestAutomaticQuotaRecoveryRequiresStrictCompletedProbe(t *testing.T) {
 	}
 }
 
+func TestRejectedDurableClaimDoesNotStartAnotherFullRetryWindow(t *testing.T) {
+	now := time.Now().UTC()
+	candidate := recoveryTestCandidate(t, now, 30, 20)
+	fake := &fakeQuotaRecoveryStore{rejectClaims: true}
+	worker := &quotaRecoveryWorker{
+		cfg: config.QuotaRecoveryConfig{
+			ProbeRetryInterval: 15 * time.Minute,
+			QuotaMaxAge:        time.Minute,
+		},
+		store:     fake,
+		quota:     &adminQuotaService{},
+		nextCheck: map[int64]time.Time{},
+		nextProbe: map[int64]time.Time{},
+	}
+	worker.processCandidate(t.Context(), candidate)
+	worker.processCandidate(t.Context(), candidate)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.claimCalls != 2 {
+		t.Fatalf("durable claim was not retried on the next scan: calls=%d", fake.claimCalls)
+	}
+	if len(worker.nextProbe) != 0 {
+		t.Fatalf("rejected durable claim created an extra in-memory retry window: %+v", worker.nextProbe)
+	}
+}
+
 func TestAutomaticQuotaRecoveryProbesRawPointFourPercent(t *testing.T) {
 	now := time.Now().UTC()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -297,6 +324,7 @@ type fakeQuotaRecoveryStore struct {
 	mu             sync.Mutex
 	candidates     []store.QuotaRecoveryCandidate
 	token          store.Token
+	rejectClaims   bool
 	claimCalls     int
 	completeCalls  int
 	usageCalls     int
@@ -318,6 +346,9 @@ func (s *fakeQuotaRecoveryStore) BeginQuotaRecoveryProbe(_ context.Context, cand
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
+	if s.rejectClaims {
+		return nil, false, nil
+	}
 	return &store.QuotaRecoveryClaim{
 		TokenID:       candidate.TokenID,
 		OwnerUserID:   candidate.OwnerUserID,

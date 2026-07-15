@@ -298,7 +298,10 @@ func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate st
 	}
 	if !acquired || claim == nil {
 		w.stateConflicts.Add(1)
-		w.deferProbe(candidate.TokenID)
+		// The durable claim is authoritative and may simply be waiting for a
+		// prior probe's retry window to expire. Do not start a second full retry
+		// interval here, or a near-expiry rejection can unnecessarily double the
+		// recovery delay.
 		return
 	}
 	w.deferProbe(candidate.TokenID)
