@@ -194,17 +194,18 @@ func (s *Store) ListQuotaRecoveryCandidates(ctx context.Context) ([]QuotaRecover
 	return candidates, rows.Err()
 }
 
-func (s *Store) BeginQuotaRecoveryProbe(ctx context.Context, candidate QuotaRecoveryCandidate, retryInterval time.Duration, minimumLeadTime time.Duration) (*QuotaRecoveryClaim, bool, error) {
+func (s *Store) BeginQuotaRecoveryProbe(ctx context.Context, candidate QuotaRecoveryCandidate, retryInterval time.Duration, minimumLeadTime time.Duration) (*QuotaRecoveryClaim, *time.Time, error) {
 	if candidate.TokenID <= 0 || candidate.SourceEventID <= 0 || candidate.CooldownUntil.IsZero() {
-		return nil, false, fmt.Errorf("invalid quota recovery candidate")
+		return nil, nil, fmt.Errorf("invalid quota recovery candidate")
 	}
 	if retryInterval <= 0 {
-		return nil, false, fmt.Errorf("quota recovery retry interval must be positive")
+		return nil, nil, fmt.Errorf("quota recovery retry interval must be positive")
 	}
 	if minimumLeadTime < 0 {
-		return nil, false, fmt.Errorf("quota recovery minimum lead time must not be negative")
+		return nil, nil, fmt.Errorf("quota recovery minimum lead time must not be negative")
 	}
 	var claim *QuotaRecoveryClaim
+	var nextEligibleAt *time.Time
 	err := s.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		var ownerUserID sql.NullInt64
 		var isActive bool
@@ -242,6 +243,8 @@ func (s *Store) BeginQuotaRecoveryProbe(ctx context.Context, candidate QuotaReco
 			return err
 		}
 		if lastStartedAt.Valid && lastStartedAt.Time.After(databaseNow.Add(-retryInterval)) {
+			value := lastStartedAt.Time.UTC().Add(retryInterval)
+			nextEligibleAt = &value
 			return nil
 		}
 		ownerID := int64(0)
@@ -279,9 +282,9 @@ func (s *Store) BeginQuotaRecoveryProbe(ctx context.Context, candidate QuotaReco
 		return nil
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
-	return claim, claim != nil, nil
+	return claim, nextEligibleAt, nil
 }
 
 func (s *Store) CompleteQuotaRecovery(ctx context.Context, claim QuotaRecoveryClaim, fence QuotaRecoveryCredentialFence, metadata map[string]any) (bool, error) {

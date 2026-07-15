@@ -17,7 +17,7 @@ import (
 type quotaRecoveryStore interface {
 	ListQuotaRecoveryCandidates(context.Context) ([]store.QuotaRecoveryCandidate, error)
 	TryQuotaRecoveryCheckLease(context.Context, int64) (*store.QuotaRecoveryCheckLease, bool, error)
-	BeginQuotaRecoveryProbe(context.Context, store.QuotaRecoveryCandidate, time.Duration, time.Duration) (*store.QuotaRecoveryClaim, bool, error)
+	BeginQuotaRecoveryProbe(context.Context, store.QuotaRecoveryCandidate, time.Duration, time.Duration) (*store.QuotaRecoveryClaim, *time.Time, error)
 	GetToken(context.Context, int64) (*store.Token, error)
 	CompleteQuotaRecovery(context.Context, store.QuotaRecoveryClaim, store.QuotaRecoveryCredentialFence, map[string]any) (bool, error)
 	ApplyQuotaRecoveryUsageLimit(context.Context, store.QuotaRecoveryClaim, store.QuotaRecoveryCredentialFence, *time.Time, time.Duration, string, map[string]any) (bool, *time.Time, error)
@@ -191,7 +191,7 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 		if !candidate.CooldownUntil.After(now.Add(quotaRecoveryMinimumLeadTime)) {
 			continue
 		}
-		if snapshot, fresh := quotaRecoveryPersistedSnapshot(candidate, now, w.cfg.QuotaMaxAge); fresh && quotaSnapshotHasCapacity(snapshot) {
+		if snapshot, fresh := w.snapshotForCandidate(candidate, now); fresh && quotaSnapshotHasCapacity(snapshot) {
 			selected = append(selected, candidate)
 			selectedIDs[candidate.TokenID] = struct{}{}
 		}
@@ -212,7 +212,7 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 		if !candidate.CooldownUntil.After(now.Add(quotaRecoveryMinimumLeadTime)) {
 			continue
 		}
-		if _, fresh := quotaRecoveryPersistedSnapshot(candidate, now, w.cfg.QuotaMaxAge); fresh {
+		if _, fresh := w.snapshotForCandidate(candidate, now); fresh {
 			continue
 		}
 		if next, ok := w.nextCheck[candidate.TokenID]; ok && next.After(now) {
@@ -246,7 +246,7 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 
 func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate store.QuotaRecoveryCandidate) {
 	now := time.Now().UTC()
-	snapshot, fresh := quotaRecoveryPersistedSnapshot(candidate, now, w.cfg.QuotaMaxAge)
+	snapshot, fresh := w.snapshotForCandidate(candidate, now)
 	var checkLease *store.QuotaRecoveryCheckLease
 	releaseCheckLease := func() {
 		if checkLease == nil {
@@ -285,7 +285,7 @@ func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate st
 		return
 	}
 	w.capacityPositive.Add(1)
-	claim, acquired, err := w.store.BeginQuotaRecoveryProbe(ctx, candidate, w.cfg.ProbeRetryInterval, quotaRecoveryMinimumLeadTime)
+	claim, nextEligibleAt, err := w.store.BeginQuotaRecoveryProbe(ctx, candidate, w.cfg.ProbeRetryInterval, quotaRecoveryMinimumLeadTime)
 	// The durable probe claim now prevents duplicate model probes. Release the
 	// session advisory lock before the potentially long upstream model request.
 	releaseCheckLease()
@@ -296,12 +296,11 @@ func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate st
 		}
 		return
 	}
-	if !acquired || claim == nil {
+	if claim == nil {
 		w.stateConflicts.Add(1)
-		// The durable claim is authoritative and may simply be waiting for a
-		// prior probe's retry window to expire. Do not start a second full retry
-		// interval here, or a near-expiry rejection can unnecessarily double the
-		// recovery delay.
+		if nextEligibleAt != nil {
+			w.scheduleDurableClaimRetry(candidate.TokenID, *nextEligibleAt)
+		}
 		return
 	}
 	w.deferProbe(candidate.TokenID)
@@ -428,6 +427,16 @@ func (w *quotaRecoveryWorker) deferProbe(tokenID int64) {
 	w.scheduleMu.Unlock()
 }
 
+func (w *quotaRecoveryWorker) scheduleDurableClaimRetry(tokenID int64, nextEligibleAt time.Time) {
+	nextEligibleAt = nextEligibleAt.UTC()
+	w.scheduleMu.Lock()
+	w.nextProbe[tokenID] = nextEligibleAt
+	if current, ok := w.nextCheck[tokenID]; !ok || current.After(nextEligibleAt) {
+		w.nextCheck[tokenID] = nextEligibleAt
+	}
+	w.scheduleMu.Unlock()
+}
+
 func (w *quotaRecoveryWorker) Stats() quotaRecoveryStats {
 	if w == nil {
 		return quotaRecoveryStats{}
@@ -458,6 +467,16 @@ func quotaRecoveryPersistedSnapshot(candidate store.QuotaRecoveryCandidate, now 
 		return nil, false
 	}
 	return &snapshot, true
+}
+
+func (w *quotaRecoveryWorker) snapshotForCandidate(candidate store.QuotaRecoveryCandidate, now time.Time) (*codexQuotaSnapshot, bool) {
+	if snapshot, fresh := quotaRecoveryPersistedSnapshot(candidate, now, w.cfg.QuotaMaxAge); fresh {
+		return snapshot, true
+	}
+	if w != nil && w.quota != nil {
+		return w.quota.cached(candidate.TokenID, now, false)
+	}
+	return nil, false
 }
 
 func quotaSnapshotHasCapacity(snapshot *codexQuotaSnapshot) bool {

@@ -182,10 +182,12 @@ func TestAutomaticQuotaRecoveryRequiresStrictCompletedProbe(t *testing.T) {
 	}
 }
 
-func TestRejectedDurableClaimDoesNotStartAnotherFullRetryWindow(t *testing.T) {
+func TestRejectedDurableClaimUsesDatabaseAbsoluteRetryTime(t *testing.T) {
 	now := time.Now().UTC()
 	candidate := recoveryTestCandidate(t, now, 30, 20)
-	fake := &fakeQuotaRecoveryStore{rejectClaims: true}
+	nextEligibleAt := now.Add(7 * time.Minute)
+	fake := &fakeQuotaRecoveryStore{rejectClaims: true, nextEligibleAt: &nextEligibleAt}
+	nextCheck := map[int64]time.Time{candidate.TokenID: now.Add(15 * time.Minute)}
 	worker := &quotaRecoveryWorker{
 		cfg: config.QuotaRecoveryConfig{
 			ProbeRetryInterval: 15 * time.Minute,
@@ -193,19 +195,45 @@ func TestRejectedDurableClaimDoesNotStartAnotherFullRetryWindow(t *testing.T) {
 		},
 		store:     fake,
 		quota:     &adminQuotaService{},
-		nextCheck: map[int64]time.Time{},
+		nextCheck: nextCheck,
 		nextProbe: map[int64]time.Time{},
 	}
-	worker.processCandidate(t.Context(), candidate)
 	worker.processCandidate(t.Context(), candidate)
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if fake.claimCalls != 2 {
-		t.Fatalf("durable claim was not retried on the next scan: calls=%d", fake.claimCalls)
+	if fake.claimCalls != 1 {
+		t.Fatalf("durable claim calls=%d, want 1", fake.claimCalls)
 	}
-	if len(worker.nextProbe) != 0 {
-		t.Fatalf("rejected durable claim created an extra in-memory retry window: %+v", worker.nextProbe)
+	if got := worker.nextProbe[candidate.TokenID]; !got.Equal(nextEligibleAt) {
+		t.Fatalf("probe retry = %s, want database time %s", got, nextEligibleAt)
+	}
+	if got := worker.nextCheck[candidate.TokenID]; !got.Equal(nextEligibleAt) {
+		t.Fatalf("quota recheck = %s, want database time %s", got, nextEligibleAt)
+	}
+}
+
+func TestQuotaRecoveryReusesFreshInMemoryQuotaSnapshot(t *testing.T) {
+	now := time.Now().UTC()
+	candidate := recoveryTestCandidate(t, now, 30, 20)
+	var snapshot codexQuotaSnapshot
+	if err := json.Unmarshal(candidate.QuotaSnapshot, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	candidate.QuotaSnapshot = nil
+	candidate.QuotaFetchedAt = nil
+	quota := &adminQuotaService{
+		cache: map[int64]cachedQuotaSnapshot{
+			candidate.TokenID: {snapshot: &snapshot, expiresAt: now.Add(time.Minute)},
+		},
+	}
+	worker := &quotaRecoveryWorker{
+		cfg:   config.QuotaRecoveryConfig{QuotaMaxAge: time.Minute},
+		quota: quota,
+	}
+	got, fresh := worker.snapshotForCandidate(candidate, now)
+	if !fresh || !quotaSnapshotHasCapacity(got) {
+		t.Fatalf("fresh in-memory quota result was not reused: fresh=%v snapshot=%+v", fresh, got)
 	}
 }
 
@@ -325,6 +353,7 @@ type fakeQuotaRecoveryStore struct {
 	candidates     []store.QuotaRecoveryCandidate
 	token          store.Token
 	rejectClaims   bool
+	nextEligibleAt *time.Time
 	claimCalls     int
 	completeCalls  int
 	usageCalls     int
@@ -342,12 +371,12 @@ func (s *fakeQuotaRecoveryStore) TryQuotaRecoveryCheckLease(context.Context, int
 	return &store.QuotaRecoveryCheckLease{}, true, nil
 }
 
-func (s *fakeQuotaRecoveryStore) BeginQuotaRecoveryProbe(_ context.Context, candidate store.QuotaRecoveryCandidate, _ time.Duration, _ time.Duration) (*store.QuotaRecoveryClaim, bool, error) {
+func (s *fakeQuotaRecoveryStore) BeginQuotaRecoveryProbe(_ context.Context, candidate store.QuotaRecoveryCandidate, _ time.Duration, _ time.Duration) (*store.QuotaRecoveryClaim, *time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
 	if s.rejectClaims {
-		return nil, false, nil
+		return nil, s.nextEligibleAt, nil
 	}
 	return &store.QuotaRecoveryClaim{
 		TokenID:       candidate.TokenID,
@@ -356,7 +385,7 @@ func (s *fakeQuotaRecoveryStore) BeginQuotaRecoveryProbe(_ context.Context, cand
 		SourceEventID: candidate.SourceEventID,
 		ProbeEventID:  44,
 		StartedAt:     time.Now().UTC(),
-	}, true, nil
+	}, nil, nil
 }
 
 func (s *fakeQuotaRecoveryStore) GetToken(context.Context, int64) (*store.Token, error) {
