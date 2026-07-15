@@ -94,9 +94,14 @@ func (a *App) executeTokenProbe(parent context.Context, token store.Token, model
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return readProbeHTTPFailure(ctx, resp)
 	}
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type"))), "text/event-stream") {
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if contentType != "" && !strings.HasPrefix(contentType, "text/event-stream") {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, defaultAdminProbeBodyLimit+1))
-		return tokenProbeAttempt{Outcome: tokenProbeInconclusive, StatusCode: resp.StatusCode, Detail: "upstream probe did not return an event stream"}
+		return tokenProbeAttempt{
+			Outcome:    tokenProbeInconclusive,
+			StatusCode: resp.StatusCode,
+			Detail:     fmt.Sprintf("upstream probe returned unexpected content type %q", shortenError(contentType, 120)),
+		}
 	}
 	return readStrictProbeStream(ctx, resp.StatusCode, resp.Body, time.Now().UTC())
 }

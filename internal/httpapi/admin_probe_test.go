@@ -84,6 +84,23 @@ func TestProbeTokenUsesCurrentAccessTokenAndStreamingPayload(t *testing.T) {
 	}
 }
 
+func TestProbeAcceptsStrictCompletedStreamWhenContentTypeHeaderIsMissing(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Some valid ChatGPT Codex responses omit Content-Type entirely. A nil
+		// value suppresses net/http's automatic content sniffing in this fixture.
+		w.Header()["Content-Type"] = nil
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"status":"completed","model":"gpt-5.4-mini"}}` + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	attempt := app.executeTokenProbe(t.Context(), store.Token{ID: 8, AccessToken: "access"}, defaultAdminProbeModel)
+	if attempt.Outcome != tokenProbeCompleted || attempt.StatusCode != http.StatusOK {
+		t.Fatalf("missing Content-Type rejected a strict completed stream: %+v", attempt)
+	}
+}
+
 func TestProbeTokenIgnoresInvalidRefreshTokenWhenCurrentAccessTokenWorks(t *testing.T) {
 	oauthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("oauth refresh should not be called by token probe")
