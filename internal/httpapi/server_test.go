@@ -16,6 +16,19 @@ func TestHandlerRegistersRoutes(t *testing.T) {
 	_ = app.Handler()
 }
 
+func TestAlphaSearchRouteRequiresAuthentication(t *testing.T) {
+	app := NewApp(config.Config{Auth: config.AuthConfig{ServiceAPIKeys: []string{"service-key"}}}, nil, nil, nil, nil, nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/alpha/search", strings.NewReader(`{"id":"session-1","model":"gpt-5.4"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	app.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestIndexInjectsVersionedAssets(t *testing.T) {
 	webDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(webDir, "src"), 0o755); err != nil {

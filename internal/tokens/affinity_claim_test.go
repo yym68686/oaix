@@ -42,6 +42,132 @@ func TestClaimPromptAffinityReusesPrimaryLane(t *testing.T) {
 	}
 }
 
+func TestClaimStrictAffinityPinsOneTokenAndFailsClosedWhenBusy(t *testing.T) {
+	rows := makeTokens(2)
+	accountA := "account-a"
+	accountB := "account-b"
+	rows[0].AccountID = &accountA
+	rows[1].AccountID = &accountB
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := affinity.NewMemoryStore()
+	first, result, err := manager.ClaimStrictAffinity(context.Background(), store, Intent{}, "search-session", 0, time.Hour)
+	if err != nil || first == nil || result.Result != "strict_affinity_created" {
+		t.Fatalf("unexpected first strict claim: claim=%v result=%+v err=%v", first, result, err)
+	}
+	firstID := first.TokenID()
+
+	busy, result, err := manager.ClaimStrictAffinity(context.Background(), store, Intent{}, "search-session", 0, time.Hour)
+	if !errors.Is(err, ErrNoToken) || busy != nil || result.Result != "strict_affinity_busy" {
+		t.Fatalf("strict affinity switched while busy: claim=%v result=%+v err=%v", busy, result, err)
+	}
+	first.Release()
+
+	again, result, err := manager.ClaimStrictAffinity(context.Background(), store, Intent{}, "search-session", 0, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Release()
+	if again.TokenID() != firstID || result.Result != "strict_affinity_hit" {
+		t.Fatalf("strict affinity token=%d want=%d result=%+v", again.TokenID(), firstID, result)
+	}
+}
+
+func TestClaimStrictAffinityFailsClosedAfterAccountIdentityChanges(t *testing.T) {
+	rows := makeTokens(1)
+	accountA := "account-a"
+	rows[0].AccountID = &accountA
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := affinity.NewMemoryStore()
+	first, _, err := manager.ClaimStrictAffinity(context.Background(), store, Intent{}, "search-account-session", 0, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+
+	accountB := "account-b"
+	source.tokens[0].AccountID = &accountB
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	claim, result, err := manager.ClaimStrictAffinity(context.Background(), store, Intent{}, "search-account-session", 0, time.Hour)
+	if !errors.Is(err, ErrNoToken) || claim != nil || result.Result != "strict_identity_mismatch" {
+		t.Fatalf("account replacement did not fail closed: claim=%v result=%+v err=%v", claim, result, err)
+	}
+}
+
+func TestClaimStrictAffinityValidatesIdentityWhenCASReturnsSameToken(t *testing.T) {
+	rows := makeTokens(1)
+	accountB := "account-b"
+	rows[0].AccountID = &accountB
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	base := affinity.NewMemoryStore()
+	if _, ok := base.BindPrimaryIfAbsent(
+		"search-cas-session",
+		1,
+		strictIdentityHash("account", "account-a"),
+		time.Hour,
+		affinity.PolicyVersionStrictToken,
+	); !ok {
+		t.Fatal("failed to seed strict affinity")
+	}
+	store := &firstMissAffinityStore{Store: base}
+
+	claim, result, err := manager.ClaimStrictAffinity(context.Background(), store, Intent{}, "search-cas-session", 0, time.Hour)
+	if !errors.Is(err, ErrNoToken) || claim != nil || result.Result != "strict_identity_mismatch" {
+		t.Fatalf("same-token CAS identity mismatch did not fail closed: claim=%v result=%+v err=%v", claim, result, err)
+	}
+}
+
+func TestClaimStrictAffinityDoesNotFallbackToEmailWhenAccountAppears(t *testing.T) {
+	rows := makeTokens(1)
+	email := "same@example.com"
+	rows[0].Email = &email
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store := affinity.NewMemoryStore()
+	first, _, err := manager.ClaimStrictAffinity(context.Background(), store, Intent{}, "search-email-session", 0, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+
+	accountID := "new-account"
+	source.tokens[0].AccountID = &accountID
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	claim, result, err := manager.ClaimStrictAffinity(context.Background(), store, Intent{}, "search-email-session", 0, time.Hour)
+	if !errors.Is(err, ErrNoToken) || claim != nil || result.Result != "strict_identity_mismatch" {
+		t.Fatalf("email fallback accepted a new account: claim=%v result=%+v err=%v", claim, result, err)
+	}
+}
+
+type firstMissAffinityStore struct {
+	affinity.Store
+	missed bool
+}
+
+func (s *firstMissAffinityStore) Get(promptKey string) (affinity.Lane, bool) {
+	if !s.missed {
+		s.missed = true
+		return affinity.Lane{}, false
+	}
+	return s.Store.Get(promptKey)
+}
+
 func TestClaimPromptAffinityCreatesSecondaryLaneWhenPrimaryBusy(t *testing.T) {
 	manager := NewManager(&fakeSource{tokens: makeTokens(2)}, nil, testMaxAge, testRefreshInterval, 1)
 	if err := manager.Refresh(context.Background()); err != nil {

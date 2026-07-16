@@ -110,6 +110,7 @@ type AttemptResult struct {
 	ResponseID          string
 	FirstTokenAt        *time.Time
 	ErrorBody           []byte
+	ErrorHeaders        http.Header
 	ResponsesFailure    *responsesFailureTerminal
 	StreamDeliveryTrace *store.StreamDeliveryTrace
 }
@@ -181,7 +182,9 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		writeJSONError(w, bodyStatus, bodyMessage)
 		return
 	}
-	bodyBytes, _ = sanitizeReasoningContentBody(bodyBytes)
+	if !isAlphaSearchEndpoint(intent) {
+		bodyBytes, _ = sanitizeReasoningContentBody(bodyBytes)
+	}
 	intent = normalizeIntent(intent, bodyBytes)
 	var status int
 	bodyBytes, intent, status, err = prepareUpstreamPayload(r, bodyBytes, intent)
@@ -191,6 +194,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	}
 	promptCacheContext, upstreamBody := buildPromptCacheContext(r.Header, intent, bodyBytes, p.cfg.PromptCache)
 	bodyBytes = upstreamBody
+	searchAffinityContext := buildSearchAffinityContext(r.Header, intent, bodyBytes)
 	if promptCacheContext != nil && intent.Model == "" {
 		intent.Model = promptCacheContext.Model
 	}
@@ -198,6 +202,9 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	if promptCacheContext != nil {
 		timing["prompt_cache_key_hash"] = promptCacheContext.PromptCacheKeyHash
 		timing["prompt_cache_source"] = promptCacheContext.Source
+	}
+	if searchAffinityContext != nil {
+		timing["search_affinity_id_hash"] = searchAffinityContext.IDHash
 	}
 	if strings.TrimSpace(intent.SelectionMode) != "" {
 		timing["selection_mode"] = strings.TrimSpace(intent.SelectionMode)
@@ -257,7 +264,10 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var lastFirstTokenAt *time.Time
 	var lastStreamDeliveryTrace *store.StreamDeliveryTrace
 	var lastResponsesFailure *responsesFailureTerminal
+	var lastUpstreamErrorBody []byte
+	var lastUpstreamErrorHeaders http.Header
 	var streamState StreamAttemptState
+	var attemptsMade int
 	var refreshedAuthTokens = make(map[int64]struct{})
 	baseTokenIntent := tokens.Intent{
 		Endpoint:           intent.Endpoint,
@@ -284,10 +294,14 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		if promptCacheContext != nil {
 			tokenIntent.PromptCacheKeyHash = promptCacheContext.PromptCacheKeyHash
 		}
-		claim, affinityResult, err := p.claimToken(r.Context(), tokenIntent, promptCacheContext)
+		claim, affinityResult, err := p.claimToken(r.Context(), tokenIntent, promptCacheContext, searchAffinityContext)
 		lastAffinityResult = affinityResult
 		if affinityResult.Result != "" {
-			timing["cache_affinity_result"] = affinityResult.Result
+			if searchAffinityContext != nil {
+				timing["search_affinity_result"] = affinityResult.Result
+			} else {
+				timing["cache_affinity_result"] = affinityResult.Result
+			}
 		}
 		if affinityResult.LaneIndex != nil {
 			timing["cache_affinity_lane_index"] = *affinityResult.LaneIndex
@@ -337,6 +351,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			StreamState:            streamState,
 			DownstreamConnectionID: downstreamConnectionID,
 		}
+		attemptsMade = attempt
 		result, err := p.doAttempt(w, r, attemptSpec)
 		encryptedContentRetryStarted := time.Now()
 		encryptedContentRetryCount := 0
@@ -388,6 +403,12 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 		if result.FirstTokenAt != nil {
 			lastFirstTokenAt = result.FirstTokenAt
+		}
+		lastUpstreamErrorBody = nil
+		lastUpstreamErrorHeaders = nil
+		if result.ErrorHeaders != nil {
+			lastUpstreamErrorBody = append(lastUpstreamErrorBody[:0], result.ErrorBody...)
+			lastUpstreamErrorHeaders = result.ErrorHeaders.Clone()
 		}
 		timing["upstream_attempt_ms"] = int(time.Since(attemptStarted).Milliseconds())
 		timing["upstream_attempt_count"] = attempt
@@ -445,7 +466,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream402Deactivated, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if searchAffinityContext == nil && attempt < p.cfg.Upstream.MaxRetries {
 				continue
 			}
 			break
@@ -482,10 +503,17 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			}
 			break
 		}
+		if searchAffinityContext != nil {
+			break
+		}
 		excluded[claim.TokenID()] = struct{}{}
 		if !retry || attempt == p.cfg.Upstream.MaxRetries {
 			break
 		}
+	}
+	finalAttemptCount := attemptsMade
+	if len(excluded) > finalAttemptCount {
+		finalAttemptCount = len(excluded)
 	}
 	if errors.Is(lastErr, tokens.ErrNoToken) {
 		if lastResponsesFailure != nil {
@@ -494,19 +522,34 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			if deliveryErr := writeResponsesFailureResponse(w, streamState.DownstreamStarted, lastResponsesFailure, lastStreamDeliveryTrace); deliveryErr != nil {
 				message = fmt.Sprintf("%s; downstream failure delivery failed: %v", message, deliveryErr)
 			}
-			p.finalLog(r.Context(), requestID, intent, started, status, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+			p.finalLog(r.Context(), requestID, intent, started, status, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
 		writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, http.StatusServiceUnavailable, "no available token")
-		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 		return
 	}
 	message := "upstream request failed"
 	if lastErr != nil {
 		message = lastErr.Error()
 	}
+	if searchAffinityContext != nil && lastUpstreamErrorHeaders != nil {
+		copyResponseHeaders(w.Header(), lastUpstreamErrorHeaders)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-OAIX-Request-ID", requestID)
+		if selectedTokenID != nil {
+			w.Header().Set("X-OAIX-Token-ID", fmt.Sprint(*selectedTokenID))
+		}
+		if selectedTokenOwnerID != nil {
+			w.Header().Set("X-OAIX-Token-Owner-User-ID", fmt.Sprint(*selectedTokenOwnerID))
+		}
+		w.WriteHeader(finalStatus)
+		_, _ = w.Write(lastUpstreamErrorBody)
+		p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+		return
+	}
 	writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, finalStatus, message)
-	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, len(excluded), selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 }
 
 func requiresNonFreeTokenPlan(model string) bool {
@@ -514,7 +557,21 @@ func requiresNonFreeTokenPlan(model string) bool {
 	return normalized == "gpt-5.6-sol" || strings.HasPrefix(normalized, "gpt-5.6-sol-")
 }
 
-func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {
+func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext, searchAffinityContext *SearchAffinityContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {
+	if searchAffinityContext != nil {
+		wait := p.cfg.PromptCache.PreviousOwnerWait
+		if wait <= 0 {
+			wait = p.cfg.PromptCache.PrimaryWait
+		}
+		return p.tokens.ClaimStrictAffinity(
+			ctx,
+			p.affinity,
+			intent,
+			searchAffinityContext.AffinityKey,
+			wait,
+			p.cfg.PromptCache.ResponseTTL,
+		)
+	}
 	if promptCacheContext == nil {
 		claim, err := p.tokens.Claim(ctx, intent)
 		return claim, tokens.PromptAffinityResult{Result: claimReason(claim)}, err
@@ -709,6 +766,11 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	copyProxyHeaders(req.Header, r.Header)
 	req.Header.Set("X-Request-ID", attempt.RequestID)
 	req.Header.Set("Authorization", "Bearer "+attempt.Claim.AccessToken())
+	if accountID := attempt.Claim.AccountID(); accountID != nil && strings.TrimSpace(*accountID) != "" {
+		req.Header.Set("ChatGPT-Account-ID", strings.TrimSpace(*accountID))
+	} else {
+		req.Header.Del("ChatGPT-Account-ID")
+	}
 	req.Header.Set("Content-Type", contentType(firstNonEmpty(attempt.Intent.UpstreamContentType, r.Header.Get("Content-Type"))))
 	if attempt.Intent.UpstreamAccept != "" {
 		req.Header.Set("Accept", attempt.Intent.UpstreamAccept)
@@ -727,26 +789,14 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 			resp.StatusCode == http.StatusForbidden ||
 			resp.StatusCode == http.StatusTooManyRequests ||
 			resp.StatusCode >= 500
-		return AttemptResult{Status: resp.StatusCode, Retry: retry, ErrorBody: raw}, fmt.Errorf("%s", detail)
+		errorHeaders := make(http.Header)
+		copyResponseHeaders(errorHeaders, resp.Header)
+		return AttemptResult{Status: resp.StatusCode, Retry: retry, ErrorBody: raw, ErrorHeaders: errorHeaders}, fmt.Errorf("%s", detail)
 	}
-	copyResponseHeaders(w.Header(), resp.Header)
-	w.Header().Set("X-OAIX-Request-ID", attempt.RequestID)
-	w.Header().Set("X-OAIX-Token-ID", fmt.Sprint(attempt.Claim.TokenID()))
-	if attempt.Claim != nil && attempt.Claim.Token != nil {
-		w.Header().Set("X-OAIX-Token-Owner-User-ID", fmt.Sprint(attempt.Claim.Token.Token.OwnerUserID))
-		if isMarketplaceIntent(attempt.Intent) {
-			w.Header().Set("X-OAIX-Selection-Mode", "marketplace")
-			w.Header().Set("X-OAIX-Marketplace-Price-BPS", fmt.Sprint(claimMarketplacePriceBPS(attempt.Claim)))
-			w.Header().Set("X-OAIX-Marketplace-Price-Source", claimMarketplacePriceSource(attempt.Claim))
-			w.Header().Set("X-OAIX-Marketplace-Price-Locked", strconv.FormatBool(attempt.Claim.MarketplacePriceLocked))
-			if attempt.Claim.MarketplacePriceLockedAt != nil {
-				w.Header().Set("X-OAIX-Marketplace-Price-Locked-At", attempt.Claim.MarketplacePriceLockedAt.UTC().Format(time.RFC3339Nano))
-			}
-			if attempt.Claim.MarketplacePriceContractKey != "" {
-				w.Header().Set("X-OAIX-Marketplace-Contract-Key", attempt.Claim.MarketplacePriceContractKey)
-			}
-		}
+	if isAlphaSearchEndpoint(attempt.Intent) {
+		return p.writeAlphaSearchJSONResponse(w, resp, attempt)
 	}
+	p.copySuccessResponseHeaders(w, resp, attempt)
 	if attempt.Intent.ImageResponseFormat != "" {
 		if attempt.Intent.Stream {
 			return p.streamImageResponse(w, resp, attempt)
@@ -778,6 +828,78 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		return result, copyErr
 	}
 	return result, nil
+}
+
+func (p *Pipeline) copySuccessResponseHeaders(w http.ResponseWriter, resp *http.Response, attempt Attempt) {
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.Header().Set("X-OAIX-Request-ID", attempt.RequestID)
+	w.Header().Set("X-OAIX-Token-ID", fmt.Sprint(attempt.Claim.TokenID()))
+	if attempt.Claim == nil || attempt.Claim.Token == nil {
+		return
+	}
+	w.Header().Set("X-OAIX-Token-Owner-User-ID", fmt.Sprint(attempt.Claim.Token.Token.OwnerUserID))
+	if !isMarketplaceIntent(attempt.Intent) || isAlphaSearchEndpoint(attempt.Intent) {
+		return
+	}
+	w.Header().Set("X-OAIX-Selection-Mode", "marketplace")
+	w.Header().Set("X-OAIX-Marketplace-Price-BPS", fmt.Sprint(claimMarketplacePriceBPS(attempt.Claim)))
+	w.Header().Set("X-OAIX-Marketplace-Price-Source", claimMarketplacePriceSource(attempt.Claim))
+	w.Header().Set("X-OAIX-Marketplace-Price-Locked", strconv.FormatBool(attempt.Claim.MarketplacePriceLocked))
+	if attempt.Claim.MarketplacePriceLockedAt != nil {
+		w.Header().Set("X-OAIX-Marketplace-Price-Locked-At", attempt.Claim.MarketplacePriceLockedAt.UTC().Format(time.RFC3339Nano))
+	}
+	if attempt.Claim.MarketplacePriceContractKey != "" {
+		w.Header().Set("X-OAIX-Marketplace-Contract-Key", attempt.Claim.MarketplacePriceContractKey)
+	}
+}
+
+func (p *Pipeline) writeAlphaSearchJSONResponse(w http.ResponseWriter, resp *http.Response, attempt Attempt) (AttemptResult, error) {
+	w.Header().Set("Cache-Control", "no-store")
+	limit := p.cfg.Upstream.NonStreamMaxResponseBytes
+	if limit <= 0 {
+		limit = 64 * 1024 * 1024
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "failed to read alpha search response")
+		return AttemptResult{Status: http.StatusBadGateway, Committed: true}, err
+	}
+	if int64(len(raw)) > limit {
+		err = errors.New("alpha search response body too large")
+		writeJSONError(w, http.StatusBadGateway, err.Error())
+		return AttemptResult{Status: http.StatusBadGateway, Committed: true}, err
+	}
+	if err = validateAlphaSearchResponse(raw); err != nil {
+		writeJSONError(w, http.StatusBadGateway, err.Error())
+		return AttemptResult{Status: http.StatusBadGateway, Committed: true}, err
+	}
+	p.copySuccessResponseHeaders(w, resp, attempt)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(resp.StatusCode)
+	_, err = w.Write(raw)
+	return AttemptResult{Status: resp.StatusCode, Committed: true}, err
+}
+
+func validateAlphaSearchResponse(raw []byte) error {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &payload); err != nil || payload == nil {
+		return errors.New("upstream returned an invalid alpha search JSON response")
+	}
+	outputRaw, ok := payload["output"]
+	if !ok {
+		return errors.New("upstream alpha search response is missing string output")
+	}
+	var output string
+	if err := json.Unmarshal(outputRaw, &output); err != nil {
+		return errors.New("upstream alpha search response is missing string output")
+	}
+	if encryptedRaw, ok := payload["encrypted_output"]; ok && string(bytes.TrimSpace(encryptedRaw)) != "null" {
+		var encrypted string
+		if err := json.Unmarshal(encryptedRaw, &encrypted); err != nil {
+			return errors.New("upstream alpha search response has invalid encrypted_output")
+		}
+	}
+	return nil
 }
 
 func supportsUsageMetrics(endpoint string) bool {
@@ -848,6 +970,9 @@ func (p *Pipeline) upstreamURL(intent RequestIntent) (string, error) {
 	if base == "" {
 		return "", errors.New("CODEX_BASE_URL is empty")
 	}
+	if endpoint == alphaSearchEndpoint {
+		return alphaSearchUpstreamURL(base)
+	}
 	if intent.Compact && !strings.HasSuffix(base, "/compact") {
 		return strings.TrimRight(base, "/") + "/compact", nil
 	}
@@ -863,6 +988,26 @@ func (p *Pipeline) upstreamURL(intent RequestIntent) (string, error) {
 		return parsed.String(), nil
 	}
 	return base, nil
+}
+
+func alphaSearchUpstreamURL(base string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(base))
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	switch {
+	case strings.HasSuffix(path, "/alpha/search"):
+		parsed.Path = path
+	case strings.HasSuffix(path, "/responses/compact"):
+		parsed.Path = strings.TrimSuffix(path, "/responses/compact") + "/alpha/search"
+	case strings.HasSuffix(path, "/responses"):
+		parsed.Path = strings.TrimSuffix(path, "/responses") + "/alpha/search"
+	default:
+		return "", fmt.Errorf("CODEX_BASE_URL must end with /responses for %s", alphaSearchEndpoint)
+	}
+	parsed.RawPath = ""
+	return parsed.String(), nil
 }
 
 func classify(status int, err error) Outcome {
@@ -1291,7 +1436,7 @@ func (p *Pipeline) recordPromptCacheSuccess(promptCacheContext *PromptCacheConte
 func copyProxyHeaders(dst, src http.Header) {
 	for key, values := range src {
 		lower := strings.ToLower(key)
-		if lower == "host" || lower == "authorization" || lower == "content-length" || lower == "content-encoding" || lower == "accept-encoding" || strings.HasPrefix(lower, "x-oaix-") {
+		if lower == "host" || lower == "authorization" || lower == "x-api-key" || lower == "proxy-authorization" || lower == "cookie" || lower == "chatgpt-account-id" || lower == "content-length" || lower == "content-encoding" || lower == "accept-encoding" || strings.HasPrefix(lower, "x-oaix-") {
 			continue
 		}
 		for _, value := range values {
@@ -1478,6 +1623,14 @@ func normalizeIntent(intent RequestIntent, body []byte) RequestIntent {
 		if req, err := openai.DecodeImageGenerationRequest(body); err == nil && intent.Model == "" {
 			intent.Model = req.Model
 		}
+	case alphaSearchEndpoint:
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err == nil && intent.Model == "" {
+			if model, ok := payload["model"].(string); ok {
+				intent.Model = model
+			}
+		}
+		intent.Stream = false
 	default:
 		var payload map[string]any
 		if err := json.Unmarshal(body, &payload); err == nil {

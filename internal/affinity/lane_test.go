@@ -3,6 +3,7 @@ package affinity
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,48 @@ import (
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/store"
 )
+
+func TestMemoryStoreBindPrimaryIfAbsentIsAtomic(t *testing.T) {
+	store := NewMemoryStore()
+	const callers = 32
+	results := make(chan int64, callers)
+	var wg sync.WaitGroup
+	for tokenID := int64(1); tokenID <= callers; tokenID++ {
+		wg.Add(1)
+		go func(tokenID int64) {
+			defer wg.Done()
+			lane, ok := store.BindPrimaryIfAbsent("search-session", tokenID, "account-hash", time.Hour, PolicyVersionStrictToken)
+			if !ok {
+				results <- 0
+				return
+			}
+			results <- lane.PrimaryTokenID
+		}(tokenID)
+	}
+	wg.Wait()
+	close(results)
+	var winner int64
+	for tokenID := range results {
+		if tokenID <= 0 {
+			t.Fatal("atomic binding failed")
+		}
+		if winner == 0 {
+			winner = tokenID
+		}
+		if tokenID != winner {
+			t.Fatalf("multiple tokens won the same binding: %d and %d", winner, tokenID)
+		}
+	}
+	stored, ok := store.Get("search-session")
+	if !ok || stored.PrimaryTokenID != winner || stored.PolicyVersion != PolicyVersionStrictToken || stored.StrictTokenIdentityHash() != "account-hash" {
+		t.Fatalf("stored binding = %+v ok=%v, want token %d", stored, ok, winner)
+	}
+	store.RemoveToken(winner)
+	stored, ok = store.Get("search-session")
+	if !ok || stored.PrimaryTokenID != winner {
+		t.Fatalf("strict binding was removed with unavailable token: %+v ok=%v", stored, ok)
+	}
+}
 
 func TestMemoryStoreRemoveTokenAndMetrics(t *testing.T) {
 	s := NewMemoryStore()

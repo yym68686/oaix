@@ -88,6 +88,47 @@ func (s *RedisStore) Put(promptKey string, lane Lane, ttl time.Duration) {
 	_, _ = pipe.Exec(ctx)
 }
 
+func (s *RedisStore) BindPrimaryIfAbsent(promptKey string, tokenID int64, identityHash string, ttl time.Duration, policyVersion int) (Lane, bool) {
+	atomic.AddInt64(&s.stats.Puts, 1)
+	if tokenID <= 0 || identityHash == "" {
+		return Lane{}, false
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	if policyVersion == 0 {
+		policyVersion = 1
+	}
+	now := time.Now().UTC()
+	lane := newPrimaryLane(tokenID, identityHash, policyVersion)
+	lane.UpdatedAt = now
+	lane.ExpiresAt = now.Add(ttl)
+	payload, _ := json.Marshal(lane)
+	ctx, cancel := s.context()
+	defer cancel()
+	key := laneKey(promptKey)
+	created, err := s.client.SetNX(ctx, key, payload, ttl).Result()
+	if err != nil {
+		return Lane{}, false
+	}
+	if created {
+		pipe := s.client.Pipeline()
+		pipe.SAdd(ctx, redisTokenIndexKey(tokenID), key)
+		pipe.Expire(ctx, redisTokenIndexKey(tokenID), ttl)
+		_, _ = pipe.Exec(ctx)
+		return lane, true
+	}
+	currentPayload, err := s.client.Get(ctx, key).Bytes()
+	if err != nil {
+		return Lane{}, false
+	}
+	var current Lane
+	if err := json.Unmarshal(currentPayload, &current); err != nil || current.PrimaryTokenID <= 0 {
+		return Lane{}, false
+	}
+	return current, true
+}
+
 func (s *RedisStore) RemoveToken(tokenID int64) {
 	atomic.AddInt64(&s.stats.Removals, 1)
 	if tokenID <= 0 {
@@ -107,6 +148,9 @@ func (s *RedisStore) RemoveToken(tokenID int64) {
 		}
 		var lane Lane
 		if err := json.Unmarshal(payload, &lane); err != nil {
+			continue
+		}
+		if lane.PolicyVersion == PolicyVersionStrictToken {
 			continue
 		}
 		next, changed := removeTokenFromLane(lane, tokenID)

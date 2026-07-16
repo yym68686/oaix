@@ -323,6 +323,10 @@ func TestCopyProxyHeadersStripsBodyEncodingHeaders(t *testing.T) {
 	src.Set("Content-Encoding", "zstd")
 	src.Set("Accept-Encoding", "zstd")
 	src.Set("Authorization", "Bearer client")
+	src.Set("X-API-Key", "client-api-key")
+	src.Set("Proxy-Authorization", "Basic client-proxy")
+	src.Set("Cookie", "session=client")
+	src.Set("ChatGPT-Account-ID", "client-account")
 	src.Set("X-Custom", "ok")
 	dst := http.Header{}
 
@@ -337,8 +341,216 @@ func TestCopyProxyHeadersStripsBodyEncodingHeaders(t *testing.T) {
 	if got := dst.Get("Authorization"); got != "" {
 		t.Fatalf("Authorization forwarded as %q", got)
 	}
+	if got := dst.Get("X-API-Key"); got != "" {
+		t.Fatalf("X-API-Key forwarded as %q", got)
+	}
+	if got := dst.Get("Proxy-Authorization"); got != "" {
+		t.Fatalf("Proxy-Authorization forwarded as %q", got)
+	}
+	if got := dst.Get("Cookie"); got != "" {
+		t.Fatalf("Cookie forwarded as %q", got)
+	}
+	if got := dst.Get("ChatGPT-Account-ID"); got != "" {
+		t.Fatalf("ChatGPT-Account-ID forwarded as %q", got)
+	}
 	if got := dst.Get("X-Custom"); got != "ok" {
 		t.Fatalf("X-Custom = %q", got)
+	}
+}
+
+func TestAlphaSearchUpstreamURLUsesResponsesSibling(t *testing.T) {
+	tests := []struct {
+		base string
+		want string
+	}{
+		{
+			base: "https://chatgpt.com/backend-api/codex/responses",
+			want: "https://chatgpt.com/backend-api/codex/alpha/search",
+		},
+		{
+			base: "https://provider.example/v1/responses/compact?region=us",
+			want: "https://provider.example/v1/alpha/search?region=us",
+		},
+		{
+			base: "https://provider.example/v1/alpha/search",
+			want: "https://provider.example/v1/alpha/search",
+		},
+	}
+	for _, tt := range tests {
+		got, err := alphaSearchUpstreamURL(tt.base)
+		if err != nil {
+			t.Fatalf("alphaSearchUpstreamURL(%q): %v", tt.base, err)
+		}
+		if got != tt.want {
+			t.Fatalf("alphaSearchUpstreamURL(%q) = %q, want %q", tt.base, got, tt.want)
+		}
+	}
+	if _, err := alphaSearchUpstreamURL("https://provider.example/v1/chat/completions"); err == nil {
+		t.Fatal("expected an error for a non-responses CODEX_BASE_URL")
+	}
+}
+
+func TestAlphaSearchPayloadAndResponseValidation(t *testing.T) {
+	validRequest := []byte(`{"id":"session-1","model":"gpt-5.4","commands":{"search_query":[{"q":"news"}]}}`)
+	if err := validateAlphaSearchPayload(validRequest); err != nil {
+		t.Fatalf("valid request rejected: %v", err)
+	}
+	for _, body := range [][]byte{
+		[]byte(`{"model":"gpt-5.4"}`),
+		[]byte(`{"id":"session-1"}`),
+		[]byte(`[]`),
+	} {
+		if err := validateAlphaSearchPayload(body); err == nil {
+			t.Fatalf("invalid request accepted: %s", body)
+		}
+	}
+
+	if err := validateAlphaSearchResponse([]byte(`{"encrypted_output":null,"output":"ok","future":true}`)); err != nil {
+		t.Fatalf("valid response rejected: %v", err)
+	}
+	for _, body := range [][]byte{
+		[]byte(`{"output":["not-a-string"]}`),
+		[]byte(`{"id":"resp_1","object":"response","output":[]}`),
+		[]byte(`{"output":"ok","encrypted_output":42}`),
+	} {
+		if err := validateAlphaSearchResponse(body); err == nil {
+			t.Fatalf("invalid response accepted: %s", body)
+		}
+	}
+}
+
+func TestProxyAlphaSearchPreservesWireContractAndTokenAffinity(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	var bodies []string
+	var authorizations []string
+	var xAPIKeys []string
+	var accountIDs []string
+	var accepts []string
+	upstreamResponse := `{"encrypted_output":null,"output":"result with turn0search0","future":true}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		bodies = append(bodies, string(raw))
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		xAPIKeys = append(xAPIKeys, r.Header.Get("X-API-Key"))
+		accountIDs = append(accountIDs, r.Header.Get("ChatGPT-Account-ID"))
+		accepts = append(accepts, r.Header.Get("Accept"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, upstreamResponse)
+	}))
+	defer upstream.Close()
+
+	accountA := "account-a"
+	accountB := "account-b"
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{tokens: []store.Token{
+		{ID: 1, AccessToken: "upstream-token-a", AccountID: &accountA, IsActive: true, CreatedAt: now, UpdatedAt: now},
+		{ID: 2, AccessToken: "upstream-token-b", AccountID: &accountB, IsActive: true, CreatedAt: now, UpdatedAt: now},
+	}}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL+"/backend-api/codex/responses", 3, fakes)
+	body := `{"id":"session-contract-001","model":"gpt-5.4","input":[{"reasoning_content":"keep-me"}],"commands":{"search_query":[{"q":"news"}]},"settings":{"external_web_access":true},"max_output_tokens":2500,"stream":true}`
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, alphaSearchEndpoint, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer caller-secret")
+		req.Header.Set("X-API-Key", "caller-x-api-key")
+		req.Header.Set("ChatGPT-Account-ID", "client-controlled-account")
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		pipeline.Proxy(recorder, req, RequestIntent{
+			Endpoint:            alphaSearchEndpoint,
+			Method:              http.MethodPost,
+			UpstreamContentType: "application/json",
+			UpstreamAccept:      "application/json",
+		})
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if recorder.Body.String() != upstreamResponse {
+			t.Fatalf("response body changed: %q", recorder.Body.String())
+		}
+		if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("Cache-Control = %q, want no-store", got)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 2 || paths[0] != "/backend-api/codex/alpha/search" || paths[1] != paths[0] {
+		t.Fatalf("upstream paths = %v", paths)
+	}
+	if len(bodies) != 2 || bodies[0] != body || bodies[1] != body {
+		t.Fatalf("upstream bodies changed: %v", bodies)
+	}
+	if len(authorizations) != 2 || authorizations[0] == "Bearer caller-secret" || authorizations[0] != authorizations[1] {
+		t.Fatalf("upstream authorization was not replaced and pinned: %v", authorizations)
+	}
+	if len(xAPIKeys) != 2 || xAPIKeys[0] != "" || xAPIKeys[1] != "" {
+		t.Fatalf("caller X-API-Key leaked upstream: %v", xAPIKeys)
+	}
+	if len(accountIDs) != 2 || accountIDs[0] == "client-controlled-account" || accountIDs[0] != accountIDs[1] || accountIDs[0] == "" {
+		t.Fatalf("upstream account id was not replaced and pinned: %v", accountIDs)
+	}
+	if (authorizations[0] == "Bearer upstream-token-a" && accountIDs[0] != accountA) ||
+		(authorizations[0] == "Bearer upstream-token-b" && accountIDs[0] != accountB) {
+		t.Fatalf("upstream token/account mismatch: auth=%q account=%q", authorizations[0], accountIDs[0])
+	}
+	if len(accepts) != 2 || accepts[0] != "application/json" || accepts[1] != "application/json" {
+		t.Fatalf("upstream accept headers = %v", accepts)
+	}
+}
+
+func TestProxyAlphaSearchDoesNotFailOverAcrossAccounts(t *testing.T) {
+	var calls atomic.Int64
+	upstreamError := `{"error":{"message":"rate limited"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, upstreamError)
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	accountA := "account-a"
+	accountB := "account-b"
+	fakes := &fakeProxyStore{tokens: []store.Token{
+		{ID: 1, AccessToken: "upstream-token-a", AccountID: &accountA, IsActive: true, CreatedAt: now, UpdatedAt: now},
+		{ID: 2, AccessToken: "upstream-token-b", AccountID: &accountB, IsActive: true, CreatedAt: now, UpdatedAt: now},
+	}}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL+"/v1/responses", 3, fakes)
+	req := httptest.NewRequest(http.MethodPost, alphaSearchEndpoint, strings.NewReader(`{"id":"session-rate-limit","model":"gpt-5.4","commands":{"search_query":[{"q":"news"}]}}`))
+	req.Header.Set("Authorization", "Bearer caller-secret")
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: alphaSearchEndpoint, UpstreamAccept: "application/json"})
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 pinned account attempt", got)
+	}
+	if recorder.Body.String() != upstreamError {
+		t.Fatalf("upstream error body changed: %q", recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q, want 5", got)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	fakes.mu.Lock()
+	defer fakes.mu.Unlock()
+	if len(fakes.attempts) != 1 {
+		t.Fatalf("recorded attempts = %d, want 1", len(fakes.attempts))
 	}
 }
 

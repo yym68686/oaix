@@ -136,6 +136,7 @@ func (a *App) Handler() http.Handler {
 	a.registerAdminAPIRoutes(mux)
 	mux.HandleFunc("GET /v1/models", a.requireAuth(a.models))
 	mux.HandleFunc("POST /v1/responses", a.requireAuth(a.responses))
+	mux.HandleFunc("POST /v1/alpha/search", a.requireAuth(a.alphaSearch))
 	mux.HandleFunc("GET /v1/responses/{response_id}", a.requireAuth(a.getResponse))
 	mux.HandleFunc("DELETE /v1/responses/{response_id}", a.requireAuth(a.deleteResponse))
 	mux.HandleFunc("POST /v1/responses/{response_id}/cancel", a.requireAuth(a.cancelResponse))
@@ -1308,6 +1309,15 @@ func (a *App) updateSetting(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) responses(w http.ResponseWriter, r *http.Request) {
 	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/responses", Stream: requestStream(r)})
+}
+
+func (a *App) alphaSearch(w http.ResponseWriter, r *http.Request) {
+	a.proxyRequest(w, r, proxy.RequestIntent{
+		Endpoint:            "/v1/alpha/search",
+		Method:              http.MethodPost,
+		UpstreamContentType: "application/json",
+		UpstreamAccept:      "application/json",
+	})
 }
 
 func (a *App) getResponse(w http.ResponseWriter, r *http.Request) {

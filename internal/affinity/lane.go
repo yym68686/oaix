@@ -15,6 +15,11 @@ type Lane struct {
 	PolicyVersion         int                            `json:"policy_version"`
 }
 
+const (
+	PolicyVersionStrictToken  = 2
+	strictTokenIdentitySource = "strict_token_identity"
+)
+
 type MarketplacePriceLock struct {
 	PriceBPS    int       `json:"price_bps"`
 	Source      string    `json:"source"`
@@ -31,6 +36,7 @@ type ResponseOwnerBinding struct {
 type Store interface {
 	Get(promptKey string) (Lane, bool)
 	Put(promptKey string, lane Lane, ttl time.Duration)
+	BindPrimaryIfAbsent(promptKey string, tokenID int64, identityHash string, ttl time.Duration, policyVersion int) (Lane, bool)
 	RemoveToken(tokenID int64)
 	BindResponseOwner(responseID string, binding ResponseOwnerBinding, ttl time.Duration)
 	GetResponseOwner(responseID string) (ResponseOwnerBinding, bool)
@@ -69,16 +75,14 @@ func NewMemoryStore() *MemoryStore {
 
 func (s *MemoryStore) Get(promptKey string) (Lane, bool) {
 	atomic.AddInt64(&s.stats.Gets, 1)
-	s.mu.RLock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	lane, ok := s.lanes[promptKey]
-	s.mu.RUnlock()
 	if !ok {
 		return Lane{}, false
 	}
 	if !lane.ExpiresAt.IsZero() && s.now().After(lane.ExpiresAt) {
-		s.mu.Lock()
 		delete(s.lanes, promptKey)
-		s.mu.Unlock()
 		return Lane{}, false
 	}
 	atomic.AddInt64(&s.stats.Hits, 1)
@@ -101,11 +105,62 @@ func (s *MemoryStore) Put(promptKey string, lane Lane, ttl time.Duration) {
 	s.mu.Unlock()
 }
 
+func (s *MemoryStore) BindPrimaryIfAbsent(promptKey string, tokenID int64, identityHash string, ttl time.Duration, policyVersion int) (Lane, bool) {
+	atomic.AddInt64(&s.stats.Puts, 1)
+	if tokenID <= 0 || identityHash == "" {
+		return Lane{}, false
+	}
+	now := s.now().UTC()
+	lane := newPrimaryLane(tokenID, identityHash, policyVersion)
+	lane.UpdatedAt = now
+	if lane.PolicyVersion == 0 {
+		lane.PolicyVersion = 1
+	}
+	if ttl > 0 {
+		lane.ExpiresAt = now.Add(ttl)
+	}
+	s.mu.Lock()
+	if current, ok := s.lanes[promptKey]; ok && (current.ExpiresAt.IsZero() || now.Before(current.ExpiresAt)) {
+		s.mu.Unlock()
+		return current, true
+	}
+	s.lanes[promptKey] = lane
+	s.mu.Unlock()
+	return lane, true
+}
+
+func newPrimaryLane(tokenID int64, identityHash string, policyVersion int) Lane {
+	lane := Lane{PrimaryTokenID: tokenID, PolicyVersion: policyVersion}
+	if policyVersion == PolicyVersionStrictToken && identityHash != "" {
+		lane.MarketplacePriceLocks = map[int64]MarketplacePriceLock{
+			tokenID: {
+				Source:      strictTokenIdentitySource,
+				ContractKey: identityHash,
+			},
+		}
+	}
+	return lane
+}
+
+func (lane Lane) StrictTokenIdentityHash() string {
+	if lane.PolicyVersion != PolicyVersionStrictToken || lane.PrimaryTokenID <= 0 {
+		return ""
+	}
+	lock, ok := lane.MarketplacePriceLocks[lane.PrimaryTokenID]
+	if !ok || lock.Source != strictTokenIdentitySource {
+		return ""
+	}
+	return lock.ContractKey
+}
+
 func (s *MemoryStore) RemoveToken(tokenID int64) {
 	atomic.AddInt64(&s.stats.Removals, 1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for key, lane := range s.lanes {
+		if lane.PolicyVersion == PolicyVersionStrictToken {
+			continue
+		}
 		if lane.PrimaryTokenID == tokenID {
 			if len(lane.SecondaryTokenIDs) > 0 {
 				lane.PrimaryTokenID = lane.SecondaryTokenIDs[0]

@@ -62,6 +62,11 @@ func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) 
 		return body, intent, http.StatusBadRequest, errors.New(`service_tier "fast" is unsupported; use "priority" for Fast mode`)
 	}
 	switch intent.Endpoint {
+	case alphaSearchEndpoint:
+		if err := validateAlphaSearchPayload(body); err != nil {
+			return body, intent, http.StatusBadRequest, err
+		}
+		return body, intent, http.StatusOK, nil
 	case "/v1/responses", "/v1/responses/compact":
 		next, err := prepareResponsesPayload(body, &intent)
 		if err != nil {
@@ -93,6 +98,25 @@ func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) 
 	default:
 		return body, intent, http.StatusOK, nil
 	}
+}
+
+func validateAlphaSearchPayload(body []byte) error {
+	var payload map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(body), &payload); err != nil {
+		return errors.New("request body must be valid JSON")
+	}
+	if payload == nil {
+		return errors.New("request body must be a JSON object")
+	}
+	id, idOK := payload["id"].(string)
+	if !idOK || strings.TrimSpace(id) == "" {
+		return errors.New("request body requires a non-empty string id")
+	}
+	model, modelOK := payload["model"].(string)
+	if !modelOK || strings.TrimSpace(model) == "" {
+		return errors.New("request body requires a non-empty string model")
+	}
+	return nil
 }
 
 func canonicalizeFastServiceTier(body []byte) ([]byte, error) {

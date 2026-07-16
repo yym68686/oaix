@@ -75,6 +75,42 @@ func (s *PostgresStore) Put(promptKey string, lane Lane, ttl time.Duration) {
 	`, stableHash(promptKey), lane.PrimaryTokenID, secondary, priceLocks, lane.PolicyVersion, lane.ExpiresAt, lane.UpdatedAt)
 }
 
+func (s *PostgresStore) BindPrimaryIfAbsent(promptKey string, tokenID int64, identityHash string, ttl time.Duration, policyVersion int) (Lane, bool) {
+	atomic.AddInt64(&s.stats.Puts, 1)
+	if tokenID <= 0 || identityHash == "" {
+		return Lane{}, false
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	if policyVersion == 0 {
+		policyVersion = 1
+	}
+	now := time.Now().UTC()
+	lane := newPrimaryLane(tokenID, identityHash, policyVersion)
+	priceLocks, _ := json.Marshal(lane.MarketplacePriceLocks)
+	ctx, cancel := s.context()
+	defer cancel()
+	_, err := s.pool.Exec(ctx, `
+		insert into prompt_affinity_lanes(
+			prompt_key_hash, primary_token_id, secondary_token_ids, marketplace_price_locks, policy_version, expires_at, updated_at
+		)
+		values ($1, $2, '[]'::jsonb, $3, $4, $5, $6)
+		on conflict (prompt_key_hash) do update
+		set primary_token_id = excluded.primary_token_id,
+		    secondary_token_ids = excluded.secondary_token_ids,
+		    marketplace_price_locks = excluded.marketplace_price_locks,
+		    policy_version = excluded.policy_version,
+		    expires_at = excluded.expires_at,
+		    updated_at = excluded.updated_at
+		where prompt_affinity_lanes.expires_at <= now()
+	`, stableHash(promptKey), tokenID, priceLocks, policyVersion, now.Add(ttl), now)
+	if err != nil {
+		return Lane{}, false
+	}
+	return s.Get(promptKey)
+}
+
 func (s *PostgresStore) RemoveToken(tokenID int64) {
 	atomic.AddInt64(&s.stats.Removals, 1)
 	ctx, cancel := s.context()
@@ -102,6 +138,9 @@ func (s *PostgresStore) RemoveToken(tokenID int64) {
 		}
 		_ = json.Unmarshal(secondary, &item.lane.SecondaryTokenIDs)
 		_ = json.Unmarshal(priceLocks, &item.lane.MarketplacePriceLocks)
+		if item.lane.PolicyVersion == PolicyVersionStrictToken {
+			continue
+		}
 		next, ok := removeTokenFromLane(item.lane, tokenID)
 		if !ok {
 			continue
