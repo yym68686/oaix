@@ -1448,7 +1448,7 @@ func copyProxyHeaders(dst, src http.Header) {
 func copyResponseHeaders(dst, src http.Header) {
 	for key, values := range src {
 		lower := strings.ToLower(key)
-		if lower == "content-length" || lower == "connection" {
+		if lower == "content-length" || lower == "connection" || lower == "set-cookie" || lower == "set-cookie2" {
 			continue
 		}
 		for _, value := range values {

@@ -358,6 +358,39 @@ func TestCopyProxyHeadersStripsBodyEncodingHeaders(t *testing.T) {
 	}
 }
 
+func TestCopyResponseHeadersStripsUpstreamCookies(t *testing.T) {
+	src := http.Header{}
+	src.Add("Set-Cookie", "first=must-not-leak")
+	src.Add("Set-Cookie", "second=must-not-leak")
+	src.Add("Set-Cookie2", "legacy=must-not-leak")
+	src.Set("Content-Length", "123")
+	src.Set("Connection", "close")
+	src.Set("Content-Type", "application/json")
+	src.Set("Retry-After", "5")
+	dst := http.Header{}
+
+	copyResponseHeaders(dst, src)
+
+	if got := dst.Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("Set-Cookie forwarded as %v", got)
+	}
+	if got := dst.Values("Set-Cookie2"); len(got) != 0 {
+		t.Fatalf("Set-Cookie2 forwarded as %v", got)
+	}
+	if got := dst.Get("Content-Length"); got != "" {
+		t.Fatalf("Content-Length forwarded as %q", got)
+	}
+	if got := dst.Get("Connection"); got != "" {
+		t.Fatalf("Connection forwarded as %q", got)
+	}
+	if got := dst.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := dst.Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q", got)
+	}
+}
+
 func TestAlphaSearchUpstreamURLUsesResponsesSibling(t *testing.T) {
 	tests := []struct {
 		base string
@@ -442,6 +475,8 @@ func TestProxyAlphaSearchPreservesWireContractAndTokenAffinity(t *testing.T) {
 		accepts = append(accepts, r.Header.Get("Accept"))
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Add("Set-Cookie", "upstream_session=must-not-leak; Secure; HttpOnly")
+		w.Header().Add("Set-Cookie2", "legacy_upstream_session=must-not-leak; Secure; HttpOnly")
 		_, _ = io.WriteString(w, upstreamResponse)
 	}))
 	defer upstream.Close()
@@ -476,6 +511,12 @@ func TestProxyAlphaSearchPreservesWireContractAndTokenAffinity(t *testing.T) {
 		}
 		if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
 			t.Fatalf("Cache-Control = %q, want no-store", got)
+		}
+		if got := recorder.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("upstream Set-Cookie leaked downstream: %v", got)
+		}
+		if got := recorder.Header().Values("Set-Cookie2"); len(got) != 0 {
+			t.Fatalf("upstream Set-Cookie2 leaked downstream: %v", got)
 		}
 	}
 
@@ -512,6 +553,8 @@ func TestProxyAlphaSearchDoesNotFailOverAcrossAccounts(t *testing.T) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "5")
+		w.Header().Add("Set-Cookie", "upstream_error_session=must-not-leak; Secure; HttpOnly")
+		w.Header().Add("Set-Cookie2", "legacy_upstream_error_session=must-not-leak; Secure; HttpOnly")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, upstreamError)
 	}))
@@ -546,6 +589,12 @@ func TestProxyAlphaSearchDoesNotFailOverAcrossAccounts(t *testing.T) {
 	}
 	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := recorder.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("upstream error Set-Cookie leaked downstream: %v", got)
+	}
+	if got := recorder.Header().Values("Set-Cookie2"); len(got) != 0 {
+		t.Fatalf("upstream error Set-Cookie2 leaked downstream: %v", got)
 	}
 	fakes.mu.Lock()
 	defer fakes.mu.Unlock()
