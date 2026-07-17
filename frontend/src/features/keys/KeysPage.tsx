@@ -54,6 +54,7 @@ import {
   SORT_OPTIONS,
   errorMessage,
   planOptionsWithCounts,
+  probeResultNeedsRawInspection,
   probeToastVariant,
   sortParam,
   statusOptionsWithCounts,
@@ -95,6 +96,11 @@ type KeyListPageConfig = {
   ownerFilterOptions?: OwnerFilterOption[];
   searchId?: string;
   title?: string;
+};
+
+type ProbeResultTarget = {
+  result: TokenProbeResponse;
+  title: string;
 };
 
 function probeResultMessage(result: TokenProbeResponse): string {
@@ -207,6 +213,7 @@ export function KeyListPage({
   const [error, setError] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
   const [probeBusyIds, setProbeBusyIds] = useState<Set<number>>(() => new Set());
+  const [probeResultTarget, setProbeResultTarget] = useState<ProbeResultTarget | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
@@ -336,6 +343,10 @@ export function KeyListPage({
     try {
       const result = await api.probeToken(id, { model: probeModel }, apiScope);
       pushToast(probeResultMessage(result), probeToastVariant(result.outcome));
+      if (probeResultNeedsRawInspection(result)) {
+        const item = tokens.find((token) => token.id === id);
+        setProbeResultTarget({ result, title: item ? tokenTitle(item) : `Token #${id}` });
+      }
       await loadTokens();
     } catch (caught) {
       pushToast(errorMessage(caught), "error");
@@ -519,6 +530,7 @@ export function KeyListPage({
         </CardPanel>
       </Card>
       <DeleteDialog target={deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)} onConfirm={() => void confirmDelete()} />
+      <ProbeResultDialog target={probeResultTarget} onOpenChange={(open) => !open && setProbeResultTarget(null)} />
       <RemarkDialog
         target={remarkTarget}
         onChange={(remark) => setRemarkTarget((target) => (target ? { ...target, remark } : target))}
@@ -1133,6 +1145,29 @@ function DeleteDialog({
             <Trash2Icon />
             删除 Key
           </Button>
+        </DialogFooter>
+      </DialogPopup>
+    </Dialog>
+  );
+}
+
+function ProbeResultDialog({
+  onOpenChange,
+  target,
+}: {
+  onOpenChange: (open: boolean) => void;
+  target: ProbeResultTarget | null;
+}) {
+  return (
+    <Dialog open={Boolean(target)} onOpenChange={onOpenChange}>
+      <DialogPopup className="sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>测试结果</DialogTitle>
+          <DialogDescription>{target?.title || "-"} · 请结合上游原始响应核对测试结论。</DialogDescription>
+        </DialogHeader>
+        <DialogPanel>{target && <TokenProbeResult result={target.result} />}</DialogPanel>
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline" />}>关闭</DialogClose>
         </DialogFooter>
       </DialogPopup>
     </Dialog>

@@ -10,6 +10,7 @@ import { clamp, formatDate } from "@/lib/format";
 import type { ImportEntry, ThemePreference, ToastMessage, TokenStatus } from "./types";
 
 export const PAGE_SIZE = 100;
+export const INCONCLUSIVE_PROBE_MESSAGE = "测试未收到可信的完整成功事件，当前状态未改变。";
 
 export const STATUS_OPTION_DEFINITIONS: Array<{ label: string; value: TokenStatus }> = [
   { label: "全部", value: "all" },
@@ -24,6 +25,10 @@ export const SORT_OPTIONS = [
   { label: "最近使用", value: "-last_used_at" },
   { label: "状态优先", value: "status" },
 ];
+
+export function probeResultNeedsRawInspection(result: TokenProbeResponse): boolean {
+  return String(result.message || "").trim() === INCONCLUSIVE_PROBE_MESSAGE;
+}
 
 export function tokenTitle(item: TokenItem): string {
   return item.email || item.account_id || `Token #${item.id}`;

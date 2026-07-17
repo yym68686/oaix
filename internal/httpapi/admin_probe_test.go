@@ -161,8 +161,36 @@ func TestProbeTokenReturnsRawBodyForInconclusiveNonSuccess(t *testing.T) {
 	if result["outcome"] != "inconclusive" || result["status_code"] != http.StatusBadGateway {
 		t.Fatalf("unexpected result: %#v", result)
 	}
+	if result["raw_response"] != upstreamBody {
+		t.Fatalf("raw_response = %#v", result["raw_response"])
+	}
 	if detail := fmt.Sprint(result["detail"]); !strings.Contains(detail, "upstream unavailable") {
 		t.Fatalf("detail = %#v", result["detail"])
+	}
+}
+
+func TestProbeTokenReturnsRawStreamForUntrustedIncompleteSuccess(t *testing.T) {
+	upstreamBody := "event: response.created\n" + `data: {"type":"response.created","response":{"status":"in_progress"}}` + "\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:          12,
+		AccessToken: "still-valid-access-token",
+	}, "gpt-5.4-mini")
+
+	if result["outcome"] != "inconclusive" || result["status_code"] != http.StatusOK {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if result["message"] != "测试未收到可信的完整成功事件，当前状态未改变。" {
+		t.Fatalf("message = %#v", result["message"])
+	}
+	if result["raw_response"] != upstreamBody {
+		t.Fatalf("raw_response = %#v", result["raw_response"])
 	}
 }
 
@@ -329,6 +357,9 @@ func TestStrictProbeStreamTerminalMatrix(t *testing.T) {
 			if got.Outcome != test.outcome {
 				t.Fatalf("outcome = %s, want %s; detail=%q", got.Outcome, test.outcome, got.Detail)
 			}
+			if got.RawResponse != test.body {
+				t.Fatalf("raw response = %q, want %q", got.RawResponse, test.body)
+			}
 			if got.Outcome == tokenProbeUsageLimited {
 				if !got.UsageLimit.ExplicitKind || got.UsageLimit.ResetAt == nil || !got.UsageLimit.ResetAt.Equal(now.Add(90*time.Second)) {
 					t.Fatalf("usage limit metadata = %+v", got.UsageLimit)
@@ -346,6 +377,9 @@ func TestStrictProbeStreamReadErrorCannotReactivate(t *testing.T) {
 	got := readStrictProbeStream(context.Background(), http.StatusOK, reader, time.Now().UTC())
 	if got.Outcome != tokenProbeInconclusive {
 		t.Fatalf("read error outcome = %s, want inconclusive", got.Outcome)
+	}
+	if !strings.Contains(got.RawResponse, `{"type":"response.created"}`) {
+		t.Fatalf("partial raw response was lost: %q", got.RawResponse)
 	}
 }
 

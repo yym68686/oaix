@@ -129,22 +129,22 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		if err := a.markProbeUsageLimit(token, probedToken, attempt.Detail, until, model); err != nil {
 			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试确认仍受额度限制，但保存冷却状态失败。", err.Error(), model)
 		}
-		result := tokenProbeResult(token.ID, "cooling", statusCode, "测试结果：上游明确返回 usage_limit_reached，当前保持冷却。", attempt.Detail, model)
+		result := tokenProbeResultWithRawResponse(token.ID, "cooling", statusCode, "测试结果：上游明确返回 usage_limit_reached，当前保持冷却。", attempt.Detail, model, attempt.RawResponse)
 		result["cooldown_seconds"] = cooldownSeconds(now, until)
 		return result
 	case tokenProbeDisabled:
 		if err := a.markProbeDisabled(token, probedToken, attempt.Detail, false, statusCode, model); err != nil {
 			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试确认工作区已停用，但保存禁用状态失败。", err.Error(), model)
 		}
-		return tokenProbeResult(token.ID, "disabled", statusCode, "测试失败：上游明确返回工作区已停用，当前已标记为禁用。", attempt.Detail, model)
+		return tokenProbeResultWithRawResponse(token.ID, "disabled", statusCode, "测试失败：上游明确返回工作区已停用，当前已标记为禁用。", attempt.Detail, model, attempt.RawResponse)
 	case tokenProbeCanceled:
-		return tokenProbeResult(token.ID, "inconclusive", statusCode, "测试在完整终止事件前被取消，当前状态未改变。", attempt.Detail, model)
+		return tokenProbeResultWithRawResponse(token.ID, "inconclusive", statusCode, "测试在完整终止事件前被取消，当前状态未改变。", attempt.Detail, model, attempt.RawResponse)
 	case tokenProbeAuthRejected:
-		return tokenProbeResult(token.ID, "inconclusive", statusCode, "刷新凭据后上游仍拒绝鉴权，当前状态未改变。", attempt.Detail, model)
+		return tokenProbeResultWithRawResponse(token.ID, "inconclusive", statusCode, "刷新凭据后上游仍拒绝鉴权，当前状态未改变。", attempt.Detail, model, attempt.RawResponse)
 	case tokenProbeTransient:
-		return tokenProbeResult(token.ID, "inconclusive", statusCode, "上游暂时不可用或限流，当前状态未改变。", attempt.Detail, model)
+		return tokenProbeResultWithRawResponse(token.ID, "inconclusive", statusCode, "上游暂时不可用或限流，当前状态未改变。", attempt.Detail, model, attempt.RawResponse)
 	default:
-		return tokenProbeResult(token.ID, "inconclusive", statusCode, "测试未收到可信的完整成功事件，当前状态未改变。", attempt.Detail, model)
+		return tokenProbeResultWithRawResponse(token.ID, "inconclusive", statusCode, "测试未收到可信的完整成功事件，当前状态未改变。", attempt.Detail, model, attempt.RawResponse)
 	}
 }
 
@@ -308,6 +308,14 @@ func tokenProbeResult(id int64, outcome string, statusCode int, message string, 
 		result["detail"] = nil
 	} else {
 		result["detail"] = shortenError(detail, 1000)
+	}
+	return result
+}
+
+func tokenProbeResultWithRawResponse(id int64, outcome string, statusCode int, message string, detail string, model string, rawResponse string) map[string]any {
+	result := tokenProbeResult(id, outcome, statusCode, message, detail, model)
+	if rawResponse != "" {
+		result["raw_response"] = rawResponse
 	}
 	return result
 }

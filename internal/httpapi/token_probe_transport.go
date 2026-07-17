@@ -35,6 +35,7 @@ type tokenProbeAttempt struct {
 	Outcome       tokenProbeOutcome
 	StatusCode    int
 	Detail        string
+	RawResponse   string
 	ResponseModel string
 	UsageLimit    cooldown.UsageLimit
 }
@@ -96,11 +97,17 @@ func (a *App) executeTokenProbe(parent context.Context, token store.Token, model
 	}
 	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
 	if contentType != "" && !strings.HasPrefix(contentType, "text/event-stream") {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, defaultAdminProbeBodyLimit+1))
+		body, readErr := readProbeBody(ctx, resp.Body)
+		if readErr != nil {
+			attempt := probeReadErrorAttempt(ctx, resp.StatusCode, readErr)
+			attempt.RawResponse = string(body)
+			return attempt
+		}
 		return tokenProbeAttempt{
-			Outcome:    tokenProbeInconclusive,
-			StatusCode: resp.StatusCode,
-			Detail:     fmt.Sprintf("upstream probe returned unexpected content type %q", shortenError(contentType, 120)),
+			Outcome:     tokenProbeInconclusive,
+			StatusCode:  resp.StatusCode,
+			Detail:      fmt.Sprintf("upstream probe returned unexpected content type %q", shortenError(contentType, 120)),
+			RawResponse: string(body),
 		}
 	}
 	return readStrictProbeStream(ctx, resp.StatusCode, resp.Body, time.Now().UTC())
@@ -109,36 +116,45 @@ func (a *App) executeTokenProbe(parent context.Context, token store.Token, model
 func readProbeHTTPFailure(ctx context.Context, resp *http.Response) tokenProbeAttempt {
 	body, err := readProbeBody(ctx, resp.Body)
 	if err != nil {
-		return probeReadErrorAttempt(ctx, resp.StatusCode, err)
+		attempt := probeReadErrorAttempt(ctx, resp.StatusCode, err)
+		attempt.RawResponse = string(body)
+		return attempt
 	}
 	detail := responseErrorDetail(resp.StatusCode, body)
 	usage := cooldown.ParseUsageLimit(resp.StatusCode, body, time.Now().UTC())
+	result := tokenProbeAttempt{StatusCode: resp.StatusCode, Detail: detail, RawResponse: string(body)}
 	if usage.Matched && usage.ExplicitKind {
-		return tokenProbeAttempt{Outcome: tokenProbeUsageLimited, StatusCode: resp.StatusCode, Detail: detail, UsageLimit: usage}
+		result.Outcome = tokenProbeUsageLimited
+		result.UsageLimit = usage
+		return result
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return tokenProbeAttempt{Outcome: tokenProbeAuthRejected, StatusCode: resp.StatusCode, Detail: detail}
+		result.Outcome = tokenProbeAuthRejected
+		return result
 	}
 	if quotaResponseShouldDisable(resp.StatusCode, body) {
-		return tokenProbeAttempt{Outcome: tokenProbeDisabled, StatusCode: resp.StatusCode, Detail: detail}
+		result.Outcome = tokenProbeDisabled
+		return result
 	}
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return tokenProbeAttempt{Outcome: tokenProbeTransient, StatusCode: resp.StatusCode, Detail: detail}
+		result.Outcome = tokenProbeTransient
+		return result
 	}
-	return tokenProbeAttempt{Outcome: tokenProbeInconclusive, StatusCode: resp.StatusCode, Detail: detail}
+	result.Outcome = tokenProbeInconclusive
+	return result
 }
 
 func readProbeBody(ctx context.Context, reader io.Reader) ([]byte, error) {
 	limited := &io.LimitedReader{R: reader, N: defaultAdminProbeBodyLimit + 1}
 	body, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, err
+		return body, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return body, err
 	}
 	if len(body) > defaultAdminProbeBodyLimit {
-		return nil, fmt.Errorf("probe response exceeds %d bytes", defaultAdminProbeBodyLimit)
+		return body, fmt.Errorf("probe response exceeds %d bytes", defaultAdminProbeBodyLimit)
 	}
 	return body, nil
 }
@@ -153,8 +169,9 @@ func probeReadErrorAttempt(ctx context.Context, status int, err error) tokenProb
 func readStrictProbeStream(ctx context.Context, status int, reader io.Reader, now time.Time) tokenProbeAttempt {
 	limited := &io.LimitedReader{R: reader, N: defaultAdminProbeBodyLimit + 1}
 	result := tokenProbeAttempt{Outcome: tokenProbeInconclusive, StatusCode: status, Detail: "event stream ended before response.completed"}
+	var rawResponse bytes.Buffer
 	eventCount := 0
-	err := sse.NewParser(defaultAdminProbeBodyLimit).Parse(ctx, limited, func(event sse.Event) error {
+	err := sse.NewParser(defaultAdminProbeBodyLimit).Parse(ctx, io.TeeReader(limited, &rawResponse), func(event sse.Event) error {
 		if len(event.Data) == 0 {
 			return nil
 		}
@@ -208,17 +225,30 @@ func readStrictProbeStream(ctx context.Context, status int, reader io.Reader, no
 		}
 		return nil
 	})
+	result.RawResponse = rawResponse.String()
 	if errors.Is(err, errProbeTerminal) {
 		return result
 	}
 	if err != nil {
-		return probeReadErrorAttempt(ctx, status, err)
+		attempt := probeReadErrorAttempt(ctx, status, err)
+		attempt.RawResponse = rawResponse.String()
+		return attempt
 	}
 	if limited.N <= 0 {
-		return tokenProbeAttempt{Outcome: tokenProbeInconclusive, StatusCode: status, Detail: fmt.Sprintf("probe response exceeds %d bytes", defaultAdminProbeBodyLimit)}
+		return tokenProbeAttempt{
+			Outcome:     tokenProbeInconclusive,
+			StatusCode:  status,
+			Detail:      fmt.Sprintf("probe response exceeds %d bytes", defaultAdminProbeBodyLimit),
+			RawResponse: rawResponse.String(),
+		}
 	}
 	if eventCount == 0 {
-		return tokenProbeAttempt{Outcome: tokenProbeInconclusive, StatusCode: status, Detail: "event stream contained no response events"}
+		return tokenProbeAttempt{
+			Outcome:     tokenProbeInconclusive,
+			StatusCode:  status,
+			Detail:      "event stream contained no response events",
+			RawResponse: rawResponse.String(),
+		}
 	}
 	return result
 }
@@ -259,9 +289,10 @@ func (a *App) executeTokenProbeWithAuth(parent context.Context, token store.Toke
 			status = http.StatusBadGateway
 		}
 		return tokenProbeAttempt{
-			Outcome:    tokenProbeInconclusive,
-			StatusCode: status,
-			Detail:     "OAuth refresh did not produce usable credentials; token state was preserved",
+			Outcome:     tokenProbeInconclusive,
+			StatusCode:  status,
+			Detail:      "OAuth refresh did not produce usable credentials; token state was preserved",
+			RawResponse: attempt.RawResponse,
 		}, token
 	}
 	return a.executeTokenProbe(parent, refreshed, model), refreshed

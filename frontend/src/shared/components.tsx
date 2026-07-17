@@ -23,6 +23,7 @@ import {
   formatPercent,
   formatUSD,
   probeOutcomeLabel,
+  probeResultNeedsRawInspection,
   quotaWindowFor,
   tokenStatusLabel,
 } from "./domain";
@@ -301,22 +302,29 @@ export function TokenObservedCost({
 
 export function TokenProbeResult({ result }: { result: TokenProbeResponse }) {
   const text = result.message || result.detail || "测试完成";
-  const rawResponse = result.raw_response || "";
+  const rawResponse = String(result.raw_response || "");
+  const showRawResponse = rawResponse !== "" || probeResultNeedsRawInspection(result);
   return (
     <div className="grid min-w-0 gap-2">
-      <div className="flex min-w-0 items-center gap-2">
+      <div className="flex min-w-0 items-start gap-2">
         <Badge size="sm" variant={probeBadgeVariant(result.outcome)}>
           {probeOutcomeLabel(result.outcome)}
           {result.status_code ? ` ${result.status_code}` : ""}
         </Badge>
-        <span className="min-w-0 truncate text-muted-foreground" title={result.detail || text}>
+        <span className="min-w-0 break-words text-muted-foreground [overflow-wrap:anywhere]" title={result.detail || text}>
           {text}
         </span>
       </div>
-      {rawResponse && (
-        <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border bg-background p-3 font-mono text-foreground text-xs oaix-scrollbar">
-          {rawResponse}
-        </pre>
+      {showRawResponse && (
+        <div className="grid min-w-0 gap-1.5">
+          <div className="font-medium text-foreground text-xs">上游原始响应</div>
+          <pre
+            aria-label="上游原始响应"
+            className="max-h-72 min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-lg border bg-background p-3 font-mono text-foreground text-xs [overflow-wrap:anywhere] oaix-scrollbar"
+          >
+            {rawResponse || "（未收到上游响应正文）"}
+          </pre>
+        </div>
       )}
     </div>
   );
