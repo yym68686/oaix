@@ -310,24 +310,31 @@ func (s *Store) RequestUsageSummaryScoped(ctx context.Context, scope ResourceSco
 	if hours <= 0 {
 		hours = 24
 	}
-	from := time.Now().Add(-time.Duration(hours) * time.Hour)
-	where, args := requestLogWhereScoped(RequestLogListOptions{From: &from}, scope)
+	args := []any{hours}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
 	var out RequestUsageSummary
 	out.Hours = hours
 	err := s.pool.QueryRow(ctx, `
 		select
-			count(*)::bigint,
-			count(*) filter (where success = true)::bigint,
-			count(*) filter (where success = false)::bigint,
+			coalesce(sum(request_count), 0)::bigint,
+			coalesce(sum(success_count), 0)::bigint,
+			coalesce(sum(failure_count), 0)::bigint,
 			coalesce(sum(input_tokens), 0)::bigint,
 			coalesce(sum(cache_write_input_tokens), 0)::bigint,
 			coalesce(sum(cached_input_tokens), 0)::bigint,
 			coalesce(sum(total_tokens), 0)::bigint,
 			coalesce(sum(estimated_cost_usd), 0)::float8,
-			coalesce(avg(ttft_ms) filter (where ttft_ms is not null), 0)::float8,
-			coalesce(avg(duration_ms) filter (where duration_ms is not null), 0)::float8
-		from gateway_request_logs
-		where `+where, args...).Scan(
+			case when coalesce(sum(ttft_count), 0) > 0
+				then coalesce(sum(ttft_ms_sum), 0)::float8 / sum(ttft_count)
+				else 0
+			end,
+			case when coalesce(sum(duration_count), 0) > 0
+				then coalesce(sum(duration_ms_sum), 0)::float8 / sum(duration_count)
+				else 0
+			end
+		from gateway_request_hourly_stats
+		where bucket_start >= date_trunc('hour', now() - make_interval(hours => $1))
+		  and `+ownerWhere, args...).Scan(
 		&out.Total, &out.Success, &out.Failure, &out.InputTokens, &out.CacheWriteInputTokens, &out.CachedInputTokens,
 		&out.TotalTokens, &out.EstimatedCostUSD, &out.AverageTTFTMS, &out.AverageDurationMS,
 	)

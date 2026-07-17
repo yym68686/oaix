@@ -1,6 +1,7 @@
 package store
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -59,6 +60,54 @@ func TestGPT56CacheAnalyticsModelFilterIsExplicit(t *testing.T) {
 	for _, forbidden := range []string{"= 'gpt-5.6'", "like ", "lower(", "coalesce("} {
 		if strings.Contains(filter, forbidden) {
 			t.Fatalf("GPT-5.6 analytics filter uses overbroad match %q: %s", forbidden, filter)
+		}
+	}
+}
+
+func TestRequestUsageSummaryUsesHourlyAggregate(t *testing.T) {
+	source, err := os.ReadFile("request_admin.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func (s *Store) RequestUsageSummaryScoped")
+	if start < 0 {
+		t.Fatal("RequestUsageSummaryScoped source not found")
+	}
+	endOffset := strings.Index(text[start:], "func (s *Store) RequestUsageByOwner")
+	if endOffset < 0 {
+		t.Fatal("RequestUsageByOwner source not found")
+	}
+	body := compactSQL(text[start : start+endOffset])
+	if !strings.Contains(body, "from gateway_request_hourly_stats") {
+		t.Fatalf("usage summary does not use hourly aggregates: %s", body)
+	}
+	if strings.Contains(body, "from gateway_request_logs") {
+		t.Fatalf("usage summary still scans request logs: %s", body)
+	}
+}
+
+func TestAggregateObservedCostSnapshotAvoidsRequestLogFallback(t *testing.T) {
+	source, err := os.ReadFile("request_logs.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func (s *Store) TokenObservedCostsAggregateSnapshot")
+	if start < 0 {
+		t.Fatal("TokenObservedCostsAggregateSnapshot source not found")
+	}
+	endOffset := strings.Index(text[start:], "func (s *Store) tokenObservedCosts")
+	if endOffset < 0 {
+		t.Fatal("tokenObservedCosts source not found")
+	}
+	body := text[start : start+endOffset]
+	if !strings.Contains(body, "addRequestCostsByTokenAggregate") {
+		t.Fatalf("aggregate snapshot does not read token aggregates: %s", body)
+	}
+	for _, forbidden := range []string{"addRequestCostsByTokenLogs", "addRequestCostsByUniqueAccountFallback"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("aggregate snapshot uses unbounded fallback %q: %s", forbidden, body)
 		}
 	}
 }

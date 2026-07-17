@@ -24,7 +24,7 @@ func main() {
 		os.Exit(1)
 	}
 	logger := observability.NewLogger(cfg.Observability.LogLevel)
-	db, err := store.Connect(ctx, cfg.Database)
+	db, err := store.ConnectObserved(ctx, cfg.Database, logger)
 	if err != nil {
 		logger.Error("database connect failed", "error", err)
 		os.Exit(1)

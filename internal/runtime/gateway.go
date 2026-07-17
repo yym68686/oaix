@@ -26,7 +26,7 @@ func RunGateway(ctx context.Context) error {
 	}
 	logger := observability.NewLogger(cfg.Observability.LogLevel)
 	logger.Info("starting oaix gateway", "config", cfg.SanitizedSummary())
-	db, err := store.Connect(ctx, cfg.Database)
+	db, err := store.ConnectObserved(ctx, cfg.Database, logger)
 	if err != nil {
 		return err
 	}

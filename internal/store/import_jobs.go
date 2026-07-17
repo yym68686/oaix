@@ -696,7 +696,7 @@ func (s *Store) importSummaryObservedCosts(ctx context.Context, tokens []Token) 
 	}
 	costCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importSummaryObservedCostTimeout)
 	defer cancel()
-	costs, err := s.TokenObservedCosts(costCtx, tokens)
+	costs, err := s.TokenObservedCostsAggregateSnapshot(costCtx, tokens)
 	if err != nil {
 		return map[int64]*float64{}, false
 	}

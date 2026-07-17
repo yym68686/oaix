@@ -41,6 +41,7 @@ type App struct {
 	webDir       string
 	started      time.Time
 	authKeys     []string
+	httpRoutes   *httpRouteMetrics
 }
 
 type adminImportItem struct {
@@ -85,6 +86,7 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		webDir:       filepath.Join("oaix_gateway", "web"),
 		started:      time.Now().UTC(),
 		authKeys:     cfg.Auth.ServiceAPIKeys,
+		httpRoutes:   newHTTPRouteMetrics(),
 	}
 	if tokenManager != nil {
 		tokenManager.SetReadyTransitionHandler(app.syncSub2APIReadyTransitions)
@@ -144,7 +146,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/chat/completions", a.requireAuth(a.chatCompletions))
 	mux.HandleFunc("POST /v1/images/generations", a.requireAuth(a.imagesGenerations))
 	mux.HandleFunc("POST /v1/images/edits", a.requireAuth(a.imagesEdits))
-	return a.recoverer(a.cors(mux))
+	return a.observeHTTP(a.recoverer(a.cors(mux)))
 }
 
 func (a *App) assets() http.Handler {
@@ -374,6 +376,7 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP oaix_db_pool_acquire_count_total Database pool acquire count.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_db_pool_acquire_count_total counter\n")
 	_, _ = fmt.Fprintf(w, "oaix_db_pool_acquire_count_total %d\n", dbStats.AcquireCount)
+	a.writeHTTPRouteMetrics(w)
 }
 
 func (a *App) writeRouteObservabilityMetrics(w io.Writer, parent context.Context) {
@@ -1417,6 +1420,7 @@ func (a *App) cors(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,Content-Encoding,X-API-Key,X-Request-ID,Idempotency-Key,X-OAIX-Act-As-User,X-OAIX-Selection-Mode,X-OAIX-Exclude-Owner,X-OAIX-Target-Token-ID")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -1653,7 +1657,7 @@ func writeError(w http.ResponseWriter, status int, err error) {
 			"message":   message,
 			"retryable": status == http.StatusTooManyRequests || status >= 500,
 		},
-		"request_id": "",
+		"request_id": w.Header().Get("X-Request-ID"),
 	})
 }
 

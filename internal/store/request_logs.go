@@ -567,6 +567,46 @@ func (s *Store) TokenObservedCostsSnapshot(ctx context.Context, tokens []Token) 
 	return costs, err
 }
 
+// TokenObservedCostsAggregateSnapshot returns the reconciled, asynchronously
+// maintained token-cost snapshot without falling back to the large request-log
+// heap. Wide list views use this bounded snapshot so one response cannot start
+// a lifetime account-log scan.
+func (s *Store) TokenObservedCostsAggregateSnapshot(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
+	result := make(map[int64]*float64, len(tokens))
+	requestedIDs := make([]int64, 0, len(tokens))
+	requested := map[int64]struct{}{}
+	for _, token := range tokens {
+		if token.ID <= 0 {
+			continue
+		}
+		if _, ok := requested[token.ID]; ok {
+			continue
+		}
+		requested[token.ID] = struct{}{}
+		requestedIDs = append(requestedIDs, token.ID)
+	}
+	if len(requestedIDs) == 0 {
+		return result, nil
+	}
+
+	reconciled, err := s.RequestTokenCostsReconciled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !reconciled {
+		return nil, errors.New("request token costs are not reconciled")
+	}
+	canonicalByLogTokenID, err := s.canonicalTokenMap(ctx, requestedIDs, requested)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.addRequestCostsByTokenAggregate(ctx, canonicalByLogTokenID, result); err != nil {
+		return nil, err
+	}
+	fillMissingObservedCosts(tokens, result)
+	return result, nil
+}
+
 func (s *Store) tokenObservedCosts(ctx context.Context, tokens []Token, includePendingLogs bool) (map[int64]*float64, error) {
 	result := make(map[int64]*float64, len(tokens))
 	requestedIDs := make([]int64, 0, len(tokens))

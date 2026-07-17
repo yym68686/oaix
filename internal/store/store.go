@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"strings"
@@ -79,6 +80,10 @@ type PoolStats struct {
 }
 
 func Connect(ctx context.Context, cfg config.DatabaseConfig) (*Store, error) {
+	return ConnectObserved(ctx, cfg, nil)
+}
+
+func ConnectObserved(ctx context.Context, cfg config.DatabaseConfig, logger *slog.Logger) (*Store, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.URL)
 	if err != nil {
 		return nil, err
@@ -87,6 +92,9 @@ func Connect(ctx context.Context, cfg config.DatabaseConfig) (*Store, error) {
 	poolCfg.MinConns = cfg.MinConns
 	poolCfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
 	poolCfg.ConnConfig.RuntimeParams["application_name"] = "oaix-go"
+	if logger != nil {
+		poolCfg.ConnConfig.Tracer = newSlowQueryTracer(logger, 250*time.Millisecond)
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, err
