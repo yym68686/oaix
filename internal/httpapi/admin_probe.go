@@ -15,6 +15,7 @@ import (
 
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
+	"github.com/yym68686/oaix/internal/upstreamerror"
 )
 
 const (
@@ -133,10 +134,17 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		result["cooldown_seconds"] = cooldownSeconds(now, until)
 		return result
 	case tokenProbeDisabled:
-		if err := a.markProbeDisabled(token, probedToken, attempt.Detail, false, statusCode, model); err != nil {
-			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试确认工作区已停用，但保存禁用状态失败。", err.Error(), model)
+		clearAccess := upstreamerror.IsTokenInvalidated(statusCode, []byte(attempt.RawResponse))
+		failureMessage := "测试确认工作区已停用，但保存禁用状态失败。"
+		resultMessage := "测试失败：上游明确返回工作区已停用，当前已标记为禁用。"
+		if clearAccess {
+			failureMessage = "测试确认 authentication token 已失效，但保存禁用状态失败。"
+			resultMessage = "测试失败：上游明确返回 token_invalidated，当前已标记为禁用。"
 		}
-		return tokenProbeResultWithRawResponse(token.ID, "disabled", statusCode, "测试失败：上游明确返回工作区已停用，当前已标记为禁用。", attempt.Detail, model, attempt.RawResponse)
+		if err := a.markProbeDisabled(token, probedToken, attempt.Detail, clearAccess, statusCode, model); err != nil {
+			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, failureMessage, err.Error(), model)
+		}
+		return tokenProbeResultWithRawResponse(token.ID, "disabled", statusCode, resultMessage, attempt.Detail, model, attempt.RawResponse)
 	case tokenProbeCanceled:
 		return tokenProbeResultWithRawResponse(token.ID, "inconclusive", statusCode, "测试在完整终止事件前被取消，当前状态未改变。", attempt.Detail, model, attempt.RawResponse)
 	case tokenProbeAuthRejected:

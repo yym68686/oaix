@@ -276,6 +276,46 @@ func TestProbeTokenKeepsStateWhenAuthStillRejectedAfterRefresh(t *testing.T) {
 	}
 }
 
+func TestProbeTokenDisablesExplicitTokenInvalidatedWithoutOAuthRefresh(t *testing.T) {
+	oauthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("token_invalidated must not trigger an OAuth refresh")
+	}))
+	defer oauthServer.Close()
+
+	upstreamBody := `{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","code":"token_invalidated","param":null},"status":401}`
+	var upstreamCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{
+		ResponsesURL:  upstream.URL,
+		OAuthTokenURL: oauthServer.URL,
+	}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:           22,
+		AccessToken:  "invalidated-access-token",
+		RefreshToken: "refresh-token",
+	}, defaultAdminProbeModel)
+
+	if upstreamCalls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", upstreamCalls)
+	}
+	if result["outcome"] != "disabled" || result["status_code"] != http.StatusUnauthorized {
+		t.Fatalf("probe result = %#v", result)
+	}
+	if result["raw_response"] != upstreamBody {
+		t.Fatalf("raw_response = %#v", result["raw_response"])
+	}
+	if message := fmt.Sprint(result["message"]); !strings.Contains(message, "token_invalidated") {
+		t.Fatalf("message = %q", message)
+	}
+}
+
 func TestProbeTokenDoesNotTreatOrdinary429AsUsageLimit(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

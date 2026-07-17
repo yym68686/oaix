@@ -28,6 +28,7 @@ import (
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/tokens"
 	"github.com/yym68686/oaix/internal/transport"
+	"github.com/yym68686/oaix/internal/upstreamerror"
 )
 
 const (
@@ -127,6 +128,7 @@ const (
 	OutcomeClientCanceled         Outcome = "client_canceled"
 	OutcomeUpstream429Cooldown    Outcome = "upstream_429_cooldown"
 	OutcomeUpstream401Invalid     Outcome = "upstream_401_invalid"
+	OutcomeUpstream401Invalidated Outcome = "upstream_401_token_invalidated"
 	OutcomeUpstream402Deactivated Outcome = "upstream_402_deactivated_workspace"
 	OutcomeUpstream403Invalid     Outcome = "upstream_403_invalid"
 	OutcomeUpstream4xx            Outcome = "upstream_4xx"
@@ -458,6 +460,18 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			}
 			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
+		}
+		if upstreamerror.IsTokenInvalidated(status, result.ErrorBody) {
+			message := "terminal upstream status 401: token_invalidated"
+			lastErr = errors.New(message)
+			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream401Invalidated, retry, true, nil)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Invalidated, attemptID))
+			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+			excluded[claim.TokenID()] = struct{}{}
+			if searchAffinityContext == nil && attempt < p.cfg.Upstream.MaxRetries {
+				continue
+			}
+			break
 		}
 		if isDeactivatedWorkspaceFailure(status, result.ErrorBody, err) {
 			message := "terminal upstream status 402: deactivated_workspace"

@@ -119,6 +119,12 @@ func TestQuotaRecoveryHTTPErrorReasonUsesFixedCredentialAndStatusClasses(t *test
 			want:   quotaRecoveryCheckErrorAuthenticationInvalidated,
 		},
 		{
+			name:   "structured token invalidated code",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"code":"token_invalidated"}}`,
+			want:   quotaRecoveryCheckErrorAuthenticationInvalidated,
+		},
+		{
 			name:   "inactive owner",
 			status: http.StatusForbidden,
 			body:   `{"error":{"message":"Account owner inactive"}}`,

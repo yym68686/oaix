@@ -128,12 +128,12 @@ func readProbeHTTPFailure(ctx context.Context, resp *http.Response) tokenProbeAt
 		result.UsageLimit = usage
 		return result
 	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		result.Outcome = tokenProbeAuthRejected
-		return result
-	}
 	if quotaResponseShouldDisable(resp.StatusCode, body) {
 		result.Outcome = tokenProbeDisabled
+		return result
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		result.Outcome = tokenProbeAuthRejected
 		return result
 	}
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {

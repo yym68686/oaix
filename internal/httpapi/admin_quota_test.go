@@ -3,9 +3,11 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/tokens"
 )
@@ -163,7 +165,7 @@ func TestQuotaStatusShouldRefresh(t *testing.T) {
 	}
 }
 
-func TestQuotaResponseShouldDisableOnlyForDeactivatedWorkspace(t *testing.T) {
+func TestQuotaResponseShouldDisableOnlyForPermanentSignals(t *testing.T) {
 	if !quotaResponseShouldDisable(http.StatusPaymentRequired, []byte(`{"error":{"code":"deactivated_workspace"}}`)) {
 		t.Fatal("expected deactivated workspace to disable token")
 	}
@@ -176,6 +178,60 @@ func TestQuotaResponseShouldDisableOnlyForDeactivatedWorkspace(t *testing.T) {
 	if quotaResponseShouldDisable(http.StatusTooManyRequests, []byte(`{"error":{"code":"deactivated_workspace"}}`)) {
 		t.Fatal("non-402 should not disable token")
 	}
+	if !quotaResponseShouldDisable(http.StatusUnauthorized, []byte(`{"error":{"code":"token_invalidated"},"status":401}`)) {
+		t.Fatal("explicit token_invalidated should disable token")
+	}
+	if quotaResponseShouldDisable(http.StatusUnauthorized, []byte(`{"error":{"message":"authentication token invalidated"}}`)) {
+		t.Fatal("free-form invalidation message should not disable token")
+	}
+	if quotaResponseShouldDisable(http.StatusForbidden, []byte(`{"error":{"code":"token_invalidated"}}`)) {
+		t.Fatal("token_invalidated under a non-401 status should not disable token")
+	}
+}
+
+func TestQuotaFetchDoesNotRefreshExplicitTokenInvalidated(t *testing.T) {
+	upstreamBody := `{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","code":"token_invalidated","param":null},"status":401}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	oauthClient := &countingQuotaOAuthClient{}
+	service := &adminQuotaService{
+		client:      upstream.Client(),
+		oauthClient: oauthClient,
+		usageURL:    upstream.URL,
+		ttl:         time.Minute,
+		sem:         make(chan struct{}, 1),
+		cache:       map[int64]cachedQuotaSnapshot{},
+		pending:     map[int64]struct{}{},
+	}
+	snapshot, reason := service.fetchSnapshotWithoutHistory(t.Context(), store.Token{
+		ID:           71,
+		AccessToken:  "invalidated-access-token",
+		RefreshToken: "refresh-token",
+	})
+
+	if oauthClient.calls != 0 {
+		t.Fatalf("OAuth refresh calls = %d, want 0", oauthClient.calls)
+	}
+	if snapshot == nil || !snapshot.Disabled {
+		t.Fatalf("snapshot should report disabled: %+v", snapshot)
+	}
+	if reason != quotaRecoveryCheckErrorAuthenticationInvalidated {
+		t.Fatalf("reason = %q, want %q", reason, quotaRecoveryCheckErrorAuthenticationInvalidated)
+	}
+}
+
+type countingQuotaOAuthClient struct {
+	calls int
+}
+
+func (c *countingQuotaOAuthClient) Refresh(context.Context, string) (oauth.RefreshResult, error) {
+	c.calls++
+	return oauth.RefreshResult{AccessToken: "refreshed-access-token"}, nil
 }
 
 func TestActiveStreamsByTokenIDUsesOwnerSnapshot(t *testing.T) {

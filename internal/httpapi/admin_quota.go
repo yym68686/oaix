@@ -23,6 +23,7 @@ import (
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
+	"github.com/yym68686/oaix/internal/upstreamerror"
 )
 
 const (
@@ -526,7 +527,7 @@ func (s *adminQuotaService) fetchSnapshotWithDiagnostic(ctx context.Context, tok
 		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, err.Error(), quotaRecoveryCheckErrorTransport), persist), quotaRecoveryCheckErrorTransport
 	}
 	var refreshFailureReason quotaRecoveryCheckErrorReason
-	if quotaStatusShouldRefresh(statusCode) {
+	if quotaStatusShouldRefresh(statusCode) && !quotaResponseShouldDisable(statusCode, body) {
 		if refreshed, refreshErr := s.refreshQuotaToken(ctx, token); refreshErr == nil {
 			token = refreshed
 			statusCode, body, err = s.requestUsage(ctx, token)
@@ -542,14 +543,17 @@ func (s *adminQuotaService) fetchSnapshotWithDiagnostic(ctx context.Context, tok
 	}
 	if statusCode < 200 || statusCode >= 300 {
 		detail := responseErrorDetail(statusCode, body)
-		if persist && quotaResponseShouldDisable(statusCode, body) {
+		shouldDisable := quotaResponseShouldDisable(statusCode, body)
+		if persist && shouldDisable {
 			s.disableTokenFromQuota(ctx, token.ID)
 		}
 		reason := refreshFailureReason
 		if reason == "" {
 			reason = quotaRecoveryHTTPErrorReason(statusCode, body, detail)
 		}
-		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, detail, reason), persist), reason
+		snapshot := quotaErrorSnapshotForRecovery(now, detail, reason)
+		snapshot.Disabled = shouldDisable
+		return s.storeSnapshotWithPersistence(token.ID, snapshot, persist), reason
 	}
 
 	var payload map[string]any
@@ -610,7 +614,7 @@ func (s *adminQuotaService) resetCredit(ctx context.Context, token store.Token) 
 	if err != nil {
 		return nil, err
 	}
-	if quotaStatusShouldRefresh(statusCode) {
+	if quotaStatusShouldRefresh(statusCode) && !quotaResponseShouldDisable(statusCode, body) {
 		if refreshed, refreshErr := s.refreshQuotaToken(ctx, token); refreshErr == nil {
 			token = refreshed
 			statusCode, body, result, err = s.requestResetCredit(ctx, token, redeemRequestID)
@@ -620,6 +624,9 @@ func (s *adminQuotaService) resetCredit(ctx context.Context, token store.Token) 
 		}
 	}
 	if statusCode < 200 || statusCode >= 300 {
+		if quotaResponseShouldDisable(statusCode, body) {
+			s.disableTokenFromQuota(ctx, token.ID)
+		}
 		return nil, &quotaUpstreamError{status: quotaUpstreamHTTPStatus(statusCode), detail: responseErrorDetail(statusCode, body)}
 	}
 	if result == nil {
@@ -1045,7 +1052,7 @@ func quotaRecoveryHTTPErrorReason(status int, body []byte, detail string) quotaR
 			switch {
 			case normalized == "personal_access_token_inactive" || strings.Contains(signal, "personal access token inactive"):
 				return quotaRecoveryCheckErrorAccessTokenInactive
-			case normalized == "authentication_token_invalidated" || (strings.Contains(signal, "authentication token") && strings.Contains(signal, "invalidat")):
+			case normalized == "token_invalidated" || normalized == "authentication_token_invalidated" || (strings.Contains(signal, "authentication token") && strings.Contains(signal, "invalidat")):
 				return quotaRecoveryCheckErrorAuthenticationInvalidated
 			case normalized == "owner_inactive" || (strings.Contains(signal, "owner") && strings.Contains(signal, "inactive")):
 				return quotaRecoveryCheckErrorOwnerInactive
@@ -1149,6 +1156,9 @@ func (s *adminQuotaService) disableTokenFromQuota(ctx context.Context, tokenID i
 }
 
 func quotaResponseShouldDisable(status int, body []byte) bool {
+	if upstreamerror.IsTokenInvalidated(status, body) {
+		return true
+	}
 	if status != http.StatusPaymentRequired {
 		return false
 	}
