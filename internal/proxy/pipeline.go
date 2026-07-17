@@ -114,6 +114,7 @@ type AttemptResult struct {
 	ErrorHeaders        http.Header
 	ResponsesFailure    *responsesFailureTerminal
 	StreamDeliveryTrace *store.StreamDeliveryTrace
+	ImageStreamTrace    *imageStreamTrace
 }
 
 type StreamAttemptState struct {
@@ -386,6 +387,9 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 		if result.StreamDeliveryTrace != nil {
 			lastStreamDeliveryTrace = result.StreamDeliveryTrace
+		}
+		if result.ImageStreamTrace != nil {
+			timing["image_stream"] = result.ImageStreamTrace
 		}
 		lastResponsesFailure = result.ResponsesFailure
 		if result.StreamState.DownstreamStarted {

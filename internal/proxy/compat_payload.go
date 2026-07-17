@@ -26,6 +26,11 @@ import (
 const (
 	defaultImagesMainModel           = "gpt-5.5"
 	defaultImagesToolModel           = "gpt-image-2"
+	imageGenerationStreamPrefix      = "image_generation"
+	imageEditStreamPrefix            = "image_edit"
+	imageGenerationCompletedEvent    = imageGenerationStreamPrefix + ".completed"
+	imageEditCompletedEvent          = imageEditStreamPrefix + ".completed"
+	imageStreamContractVersion       = 1
 	defaultImageInputMax             = 249
 	defaultImageUploadMax            = 25 * 1024 * 1024
 	maxResponsesFailurePayloadBytes  = 64 * 1024
@@ -55,6 +60,55 @@ type imageCallResult struct {
 	Size          string
 	Background    string
 	Quality       string
+}
+
+// imageStreamTrace deliberately records event metadata only. It never records
+// an SSE data payload, prompt, image, token, or account identifier.
+type imageStreamTrace struct {
+	ContractVersion   int    `json:"contract_version"`
+	StreamPrefix      string `json:"stream_prefix"`
+	TerminalEventType string `json:"terminal_event_type,omitempty"`
+	LastEventType     string `json:"last_event_type,omitempty"`
+	EOF               bool   `json:"eof"`
+	TerminalSeen      bool   `json:"terminal_seen"`
+	SyntheticTerminal bool   `json:"synthetic_terminal"`
+}
+
+func imageStreamTerminalEvent(streamPrefix string) (string, error) {
+	switch strings.TrimSpace(streamPrefix) {
+	case imageGenerationStreamPrefix:
+		return imageGenerationCompletedEvent, nil
+	case imageEditStreamPrefix:
+		return imageEditCompletedEvent, nil
+	default:
+		return "", fmt.Errorf("unsupported image stream prefix")
+	}
+}
+
+func redactedImageStreamEventType(eventType string) string {
+	value := strings.TrimSpace(eventType)
+	if value == "[DONE]" {
+		return value
+	}
+	if value == "" || len(value) > 96 {
+		return "redacted"
+	}
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '.' || char == '_' || char == '-' {
+			continue
+		}
+		return "redacted"
+	}
+	return value
+}
+
+func newImageStreamTrace(streamPrefix string) *imageStreamTrace {
+	terminalEvent, _ := imageStreamTerminalEvent(streamPrefix)
+	return &imageStreamTrace{
+		ContractVersion:   imageStreamContractVersion,
+		StreamPrefix:      redactedImageStreamEventType(streamPrefix),
+		TerminalEventType: terminalEvent,
+	}
 }
 
 func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) ([]byte, RequestIntent, int, error) {
@@ -218,7 +272,7 @@ func prepareImageGenerationPayload(body []byte, intent *RequestIntent) ([]byte, 
 	intent.UpstreamContentType = "application/json"
 	intent.UpstreamAccept = "text/event-stream"
 	intent.ImageResponseFormat = normalizeImageResponseFormat(payload["response_format"])
-	intent.ImageStreamPrefix = "image_generation"
+	intent.ImageStreamPrefix = imageGenerationStreamPrefix
 	if stream, ok := payload["stream"].(bool); ok {
 		intent.Stream = stream
 	}
@@ -270,7 +324,7 @@ func prepareImageEditJSONPayload(body []byte, intent *RequestIntent) ([]byte, er
 	intent.UpstreamContentType = "application/json"
 	intent.UpstreamAccept = "text/event-stream"
 	intent.ImageResponseFormat = normalizeImageResponseFormat(payload["response_format"])
-	intent.ImageStreamPrefix = "image_edit"
+	intent.ImageStreamPrefix = imageEditStreamPrefix
 	if stream, ok := payload["stream"].(bool); ok {
 		intent.Stream = stream
 	}
@@ -325,7 +379,7 @@ func prepareImageEditMultipartPayload(contentType string, body []byte, intent *R
 	intent.UpstreamContentType = "application/json"
 	intent.UpstreamAccept = "text/event-stream"
 	intent.ImageResponseFormat = normalizeImageResponseFormat(firstFormValueAny(form.Value, "response_format"))
-	intent.ImageStreamPrefix = "image_edit"
+	intent.ImageStreamPrefix = imageEditStreamPrefix
 	if stream, ok := parseBool(firstFormValueAny(form.Value, "stream")); ok {
 		intent.Stream = stream
 	}
@@ -1480,13 +1534,17 @@ func transformImageStreamEvent(eventType string, payload map[string]any, respons
 	}
 	normalizedFormat := normalizeImageResponseFormat(responseFormat)
 	if eventType == "response.image_generation_call.partial_image" {
+		terminalEvent, err := imageStreamTerminalEvent(streamPrefix)
+		if err != nil {
+			return nil, false, err
+		}
 		partialB64 := text(payload["partial_image_b64"])
 		if partialB64 == "" {
 			return nil, false, nil
 		}
 		partialIndex, _ := coerceInt(payload["partial_image_index"])
 		outputFormat := text(payload["output_format"])
-		eventName := streamPrefix + ".partial_image"
+		eventName := strings.TrimSuffix(terminalEvent, ".completed") + ".partial_image"
 		responsePayload := map[string]any{
 			"type":                eventName,
 			"partial_image_index": partialIndex,
@@ -1506,7 +1564,10 @@ func transformImageStreamEvent(eventType string, payload map[string]any, respons
 	if err != nil {
 		return nil, false, err
 	}
-	eventName := streamPrefix + ".completed"
+	eventName, err := imageStreamTerminalEvent(streamPrefix)
+	if err != nil {
+		return nil, false, err
+	}
 	events := make([][]byte, 0, len(results))
 	for _, item := range results {
 		responsePayload := map[string]any{"type": eventName}
@@ -1535,6 +1596,7 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 	var firstTokenAt *time.Time
 	committed := false
 	done := false
+	trace := newImageStreamTrace(attempt.Intent.ImageStreamPrefix)
 	flusher, _ := w.(http.Flusher)
 	writeEvents := func(events [][]byte) error {
 		if len(events) == 0 {
@@ -1558,6 +1620,7 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 	parser := sse.NewParser(int(p.cfg.Upstream.NonStreamMaxResponseBytes))
 	err := parser.Parse(responseContext(resp), resp.Body, func(event sse.Event) error {
 		if strings.TrimSpace(string(event.Data)) == "[DONE]" {
+			trace.LastEventType = redactedImageStreamEventType("[DONE]")
 			if synthetic := syntheticCompletedEvent(responseID, modelName, createdAt, outputItemsByIndex, outputItemsFallback); synthetic != nil {
 				events, completed, err := transformImageStreamEvent("response.completed", synthetic, attempt.Intent.ImageResponseFormat, attempt.Intent.ImageStreamPrefix)
 				if err != nil {
@@ -1567,11 +1630,16 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 					return err
 				}
 				done = completed
+				if completed {
+					trace.TerminalSeen = true
+					trace.SyntheticTerminal = true
+				}
 			}
 			return errStopSSE
 		}
 		payload := parseEventPayload(event)
 		typ := eventType(event, payload)
+		trace.LastEventType = redactedImageStreamEventType(typ)
 		if status, message, failed := responseFailureStatus(payload); failed {
 			if !committed {
 				return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
@@ -1606,14 +1674,44 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 		}
 		if completed {
 			done = true
+			trace.TerminalSeen = true
+			trace.SyntheticTerminal = false
 			return errStopSSE
 		}
 		return nil
 	})
+	trace.EOF = err == nil
+	if err == nil && !done {
+		if synthetic := syntheticCompletedEvent(responseID, modelName, createdAt, outputItemsByIndex, outputItemsFallback); synthetic != nil {
+			events, completed, syntheticErr := transformImageStreamEvent("response.completed", synthetic, attempt.Intent.ImageResponseFormat, attempt.Intent.ImageStreamPrefix)
+			if syntheticErr != nil {
+				err = syntheticErr
+			} else if writeErr := writeEvents(events); writeErr != nil {
+				err = writeErr
+			} else if completed {
+				done = true
+				trace.TerminalSeen = true
+				trace.SyntheticTerminal = true
+			}
+		}
+	}
 	result := AttemptResult{
-		Status:       resp.StatusCode,
-		Committed:    committed,
-		FirstTokenAt: firstTokenAt,
+		Status:           resp.StatusCode,
+		Committed:        committed,
+		FirstTokenAt:     firstTokenAt,
+		ImageStreamTrace: trace,
+	}
+	if p.logger != nil {
+		p.logger.Info(
+			"image stream terminal observation",
+			"request_id", attempt.RequestID,
+			"endpoint", attempt.Intent.Endpoint,
+			"stream_prefix", trace.StreamPrefix,
+			"last_event_type", trace.LastEventType,
+			"eof", trace.EOF,
+			"terminal_seen", trace.TerminalSeen,
+			"synthetic_terminal", trace.SyntheticTerminal,
+		)
 	}
 	if err != nil && !errors.Is(err, errStopSSE) {
 		var preflight streamPreflightError
@@ -1630,9 +1728,9 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 		result.Retry = true
 		return result, err
 	}
-	if !done && !committed {
+	if !done {
 		result.Status = http.StatusBadGateway
-		result.Retry = true
+		result.Retry = !committed
 		return result, errors.New("upstream closed image stream before completion")
 	}
 	return result, nil

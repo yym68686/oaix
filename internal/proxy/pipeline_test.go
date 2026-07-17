@@ -3563,6 +3563,138 @@ func TestWriteImageJSONResponseFromSSE(t *testing.T) {
 	}
 }
 
+func TestTransformImageStreamCompletedEventContract(t *testing.T) {
+	payload := map[string]any{
+		"type": "response.completed",
+		"response": map[string]any{
+			"output": []any{map[string]any{
+				"type":          "image_generation_call",
+				"result":        "QUJD",
+				"output_format": "png",
+			}},
+		},
+	}
+	tests := []struct {
+		name         string
+		streamPrefix string
+		wantEvent    string
+	}{
+		{name: "generation", streamPrefix: imageGenerationStreamPrefix, wantEvent: imageGenerationCompletedEvent},
+		{name: "edit", streamPrefix: imageEditStreamPrefix, wantEvent: imageEditCompletedEvent},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events, completed, err := transformImageStreamEvent("response.completed", payload, "b64_json", tt.streamPrefix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !completed || len(events) != 1 {
+				t.Fatalf("completed=%v events=%d", completed, len(events))
+			}
+			var gotEvent string
+			var gotPayload map[string]any
+			parser := sse.NewParser(1 << 20)
+			if err := parser.Parse(context.Background(), bytes.NewReader(events[0]), func(event sse.Event) error {
+				gotEvent = event.Event
+				return json.Unmarshal(event.Data, &gotPayload)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if gotEvent != tt.wantEvent || gotPayload["type"] != tt.wantEvent {
+				t.Fatalf("event=%q data.type=%v, want %q", gotEvent, gotPayload["type"], tt.wantEvent)
+			}
+		})
+	}
+}
+
+func TestStreamImageResponseRecordsTerminalContract(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	completedPayload, err := json.Marshal(map[string]any{
+		"type": "response.completed",
+		"response": map[string]any{
+			"output": []any{map[string]any{
+				"type":          "image_generation_call",
+				"result":        "QUJD",
+				"output_format": "png",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(sse.Encode("response.completed", completedPayload))),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/images/edits", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.streamImageResponse(recorder, resp, Attempt{
+		RequestID: "req-image-contract",
+		Intent: RequestIntent{
+			Endpoint:            "/v1/images/edits",
+			Stream:              true,
+			ImageResponseFormat: "b64_json",
+			ImageStreamPrefix:   imageEditStreamPrefix,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := result.ImageStreamTrace
+	if !result.Committed || trace == nil {
+		t.Fatalf("missing committed image stream trace: %+v", result)
+	}
+	if trace.ContractVersion != imageStreamContractVersion || trace.StreamPrefix != imageEditStreamPrefix || trace.TerminalEventType != imageEditCompletedEvent {
+		t.Fatalf("unexpected image stream contract: %+v", trace)
+	}
+	if trace.LastEventType != "response.completed" || trace.EOF || !trace.TerminalSeen || trace.SyntheticTerminal {
+		t.Fatalf("unexpected image stream terminal observation: %+v", trace)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "event: "+imageEditCompletedEvent) || !strings.Contains(body, `"type":"`+imageEditCompletedEvent+`"`) {
+		t.Fatalf("image edit terminal contract missing from body: %q", body)
+	}
+}
+
+func TestStreamImageResponseSynthesizesTerminalAtCleanEOF(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	outputItemPayload, err := json.Marshal(map[string]any{
+		"type":         "response.output_item.done",
+		"output_index": 0,
+		"item": map[string]any{
+			"type":          "image_generation_call",
+			"result":        "QUJD",
+			"output_format": "png",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(sse.Encode("response.output_item.done", outputItemPayload))),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/images/edits", nil),
+	}
+	recorder := httptest.NewRecorder()
+	result, err := pipeline.streamImageResponse(recorder, resp, Attempt{Intent: RequestIntent{
+		Endpoint:            "/v1/images/edits",
+		Stream:              true,
+		ImageResponseFormat: "b64_json",
+		ImageStreamPrefix:   imageEditStreamPrefix,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := result.ImageStreamTrace
+	if trace == nil || !trace.EOF || !trace.TerminalSeen || !trace.SyntheticTerminal || trace.LastEventType != "response.output_item.done" {
+		t.Fatalf("unexpected synthetic terminal observation: %+v", trace)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "event: "+imageEditCompletedEvent) || !strings.Contains(body, `"type":"`+imageEditCompletedEvent+`"`) {
+		t.Fatalf("synthetic image edit terminal contract missing from body: %q", body)
+	}
+}
+
 func TestWriteImageJSONResponseTreatsEventStreamAcceptAsSSE(t *testing.T) {
 	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
 	body := strings.Join([]string{
