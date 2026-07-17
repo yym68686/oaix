@@ -186,6 +186,10 @@ var migrationStatements = []string{
 	`create index if not exists ix_gateway_request_logs_finished_at on gateway_request_logs (finished_at desc)`,
 	`create index if not exists ix_gateway_request_logs_token_id on gateway_request_logs (token_id)`,
 	`create index if not exists ix_gateway_request_logs_model_name on gateway_request_logs (model_name)`,
+	`create table if not exists gateway_request_analytics_queue (
+		request_log_id integer primary key,
+		created_at timestamptz not null default now()
+	)`,
 	`create table if not exists gateway_request_attempts (
 		id bigserial primary key,
 		request_id varchar(64) not null,
@@ -700,6 +704,7 @@ var downMigrationStatements = []string{
 	`drop table if exists prompt_affinity_lanes`,
 	`drop table if exists gateway_request_log_partitions`,
 	`drop table if exists gateway_request_attempts`,
+	`drop table if exists gateway_request_analytics_queue`,
 	`drop table if exists request_log_outbox`,
 	`drop table if exists token_state_events`,
 	`drop table if exists token_runtime_state`,

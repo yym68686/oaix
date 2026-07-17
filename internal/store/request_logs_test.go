@@ -8,17 +8,64 @@ import (
 
 func TestAggregateRequestHourlyStatsTokenCostsGroupByTokenOnly(t *testing.T) {
 	sql := compactSQL(aggregateRequestTokenCostsSQL)
-	if !strings.Contains(sql, "coalesce(token_owner_user_id, owner_user_id) as owner_user_id") {
+	if !strings.Contains(sql, "max(coalesce(token_owner_user_id, owner_user_id)) as owner_user_id") {
 		t.Fatal("token cost aggregation should prefer token owner metadata")
-	}
-	if !strings.Contains(sql, "max(owner_user_id) as owner_user_id") {
-		t.Fatal("token cost aggregation should collapse owner metadata per token")
 	}
 	if !strings.Contains(sql, "group by token_id") {
 		t.Fatal("token cost aggregation must group by token_id")
 	}
 	if strings.Contains(sql, "group by token_id, owner_user_id") {
 		t.Fatal("token cost aggregation must not emit duplicate rows for one token")
+	}
+}
+
+func TestRequestAnalyticsQueueOnlyAggregatesClaimedIDs(t *testing.T) {
+	sql := compactSQL(aggregateRequestTokenCostsSQL)
+	for _, fragment := range []string{
+		"id = any($1::integer[])",
+		"analytics_recorded_at is null",
+		"finished_at is not null",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("token aggregation missing bounded queue fragment %q: %s", fragment, sql)
+		}
+	}
+	if strings.Contains(sql, "order by id") || strings.Contains(sql, "limit 5000") {
+		t.Fatalf("token aggregation still discovers work from the request-log heap: %s", sql)
+	}
+}
+
+func TestRequestAnalyticsQueueEnqueuesOnlyFinishedPendingLogs(t *testing.T) {
+	source, err := os.ReadFile("request_logs.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func (s *Store) UpsertRequestLogs")
+	if start < 0 {
+		t.Fatal("UpsertRequestLogs source not found")
+	}
+	endOffset := strings.Index(text[start:], "func (s *Store) EnqueueRequestLogOutbox")
+	if endOffset < 0 {
+		t.Fatal("EnqueueRequestLogOutbox source not found")
+	}
+	sql := compactSQL(text[start : start+endOffset])
+	for _, fragment := range []string{
+		"with upserted as",
+		"insert into gateway_request_analytics_queue",
+		"finished_at is not null",
+		"analytics_recorded_at is null",
+		"on conflict (request_log_id) do nothing",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("request analytics enqueue missing fragment %q: %s", fragment, sql)
+		}
+	}
+	if requestAnalyticsLegacyBackfillWindow != 6_000 {
+		t.Fatalf("legacy backfill window = %d, want 6000 proven ID range", requestAnalyticsLegacyBackfillWindow)
+	}
+	if requestAnalyticsQueueBatchSize != 500 {
+		t.Fatalf("analytics queue batch size = %d, want 500", requestAnalyticsQueueBatchSize)
 	}
 }
 

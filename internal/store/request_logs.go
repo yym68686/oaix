@@ -86,30 +86,29 @@ type ModelStat struct {
 	Failure   int64  `json:"failure"`
 }
 
-const requestTokenCostReconcileSettingKey = "request_token_costs_go_recorded_reconciled_at"
+const (
+	requestTokenCostReconcileSettingKey  = "request_token_costs_go_recorded_reconciled_at"
+	requestAnalyticsBackfillSettingKey   = "request_analytics_queue_backfill_v1"
+	requestAnalyticsMaintenanceLockKey   = "request_analytics_maintenance_v1"
+	// Production EXPLAIN ANALYZE showed this ID range stays on the bounded
+	// partial-index plan even while the full pending index is heavily bloated.
+	requestAnalyticsLegacyBackfillWindow = int64(6_000)
+	requestAnalyticsQueueBatchSize       = 500
+)
 
 const aggregateRequestTokenCostsSQL = `
-	with pending as (
+	with agg as (
 		select
 			token_id,
-			coalesce(token_owner_user_id, owner_user_id) as owner_user_id,
-			coalesce(estimated_cost_usd, 0) as estimated_cost_usd
+			max(coalesce(token_owner_user_id, owner_user_id)) as owner_user_id,
+			count(*)::bigint as request_count,
+			sum(coalesce(estimated_cost_usd, 0))::float8 as estimated_cost_usd
 		from gateway_request_logs
-		where analytics_recorded_at is null
+		where id = any($1::integer[])
+		  and analytics_recorded_at is null
 		  and finished_at is not null
 		  and token_id is not null
 		  and estimated_cost_usd is not null
-		order by id
-		limit 5000
-		for update skip locked
-	),
-	agg as (
-		select
-			token_id,
-			max(owner_user_id) as owner_user_id,
-			count(*)::bigint as request_count,
-			sum(estimated_cost_usd)::float8 as estimated_cost_usd
-		from pending
 		group by token_id
 	)
 	insert into gateway_request_token_costs(token_id, owner_user_id, request_count, estimated_cost_usd, updated_at)
@@ -157,6 +156,7 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 		promptTrace := jsonBytes(item.PromptCacheTrace)
 		streamDeliveryTrace := streamDeliveryTraceBytes(item.StreamDeliveryTrace)
 		batch.Queue(`
+			with upserted as (
 			insert into gateway_request_logs (
 				request_id, owner_user_id, api_key_id, token_owner_user_id, endpoint, model, model_name, is_stream, status_code, success,
 				attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
@@ -229,6 +229,14 @@ func (s *Store) UpsertRequestLogs(ctx context.Context, logs []RequestLog) error 
 				stream_delivery_state = coalesce(excluded.stream_delivery_state, gateway_request_logs.stream_delivery_state),
 				downstream_connection_id = coalesce(excluded.downstream_connection_id, gateway_request_logs.downstream_connection_id),
 				stream_delivery_trace = coalesce(excluded.stream_delivery_trace, gateway_request_logs.stream_delivery_trace)
+			returning id, finished_at, analytics_recorded_at
+			)
+			insert into gateway_request_analytics_queue(request_log_id)
+			select id
+			from upserted
+			where finished_at is not null
+			  and analytics_recorded_at is null
+			on conflict (request_log_id) do nothing
 		`,
 			item.RequestID, item.OwnerUserID, item.APIKeyID, item.TokenOwnerUserID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
@@ -338,6 +346,7 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 		promptTrace := jsonBytes(item.PromptCacheTrace)
 		streamDeliveryTrace := streamDeliveryTraceBytes(item.StreamDeliveryTrace)
 		_, err := tx.Exec(ctx, `
+			with upserted as (
 			insert into gateway_request_logs (
 				request_id, owner_user_id, api_key_id, token_owner_user_id, endpoint, model, model_name, is_stream, status_code, success,
 				attempt_count, token_id, account_id, client_ip, user_agent, started_at, finished_at,
@@ -402,6 +411,14 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 				stream_delivery_state = coalesce(excluded.stream_delivery_state, gateway_request_logs.stream_delivery_state),
 				downstream_connection_id = coalesce(excluded.downstream_connection_id, gateway_request_logs.downstream_connection_id),
 				stream_delivery_trace = coalesce(excluded.stream_delivery_trace, gateway_request_logs.stream_delivery_trace)
+			returning id, finished_at, analytics_recorded_at
+			)
+			insert into gateway_request_analytics_queue(request_log_id)
+			select id
+			from upserted
+			where finished_at is not null
+			  and analytics_recorded_at is null
+			on conflict (request_log_id) do nothing
 		`,
 			item.RequestID, item.OwnerUserID, item.APIKeyID, item.TokenOwnerUserID, item.Endpoint, item.Model, modelName, item.IsStream, item.StatusCode, item.Success,
 			item.AttemptCount, item.TokenID, item.AccountID, item.ClientIP, item.UserAgent, item.StartedAt,
@@ -452,52 +469,79 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx, `
-		with pending as (
+	if _, err := tx.Exec(ctx, `set local lock_timeout = '500ms'`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `set local statement_timeout = '1s'`); err != nil {
+		return 0, err
+	}
+	var locked bool
+	if err := tx.QueryRow(ctx, `select pg_try_advisory_xact_lock(hashtext($1))`, requestAnalyticsMaintenanceLockKey).Scan(&locked); err != nil {
+		return 0, err
+	}
+	if !locked {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	rows, err := tx.Query(ctx, `
+		select request_log_id
+		from gateway_request_analytics_queue
+		order by request_log_id
+		limit $1
+		for update skip locked
+	`, requestAnalyticsQueueBatchSize)
+	if err != nil {
+		return 0, err
+	}
+	requestLogIDs := make([]int64, 0, requestAnalyticsQueueBatchSize)
+	for rows.Next() {
+		var requestLogID int64
+		if err := rows.Scan(&requestLogID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		requestLogIDs = append(requestLogIDs, requestLogID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	ids := postgresIntIDs(requestLogIDs)
+	if len(ids) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return 0, s.backfillRequestAnalyticsQueue(ctx)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		with agg as (
 			select
-				id,
-				owner_user_id,
 				date_trunc('hour', started_at) as bucket_start,
-				coalesce(model_name, model, '') as model_name,
-				success,
-				is_stream,
-				coalesce(input_tokens, 0) as input_tokens,
-				coalesce(cache_write_input_tokens, 0) as cache_write_input_tokens,
-				coalesce(cached_input_tokens, 0) as cached_input_tokens,
-				coalesce(output_tokens, 0) as output_tokens,
-				coalesce(total_tokens, 0) as total_tokens,
-				coalesce(estimated_cost_usd, 0) as estimated_cost_usd,
-				ttft_ms,
-				duration_ms
-			from gateway_request_logs
-			where analytics_recorded_at is null
-			  and finished_at is not null
-			order by id
-			limit 5000
-			for update skip locked
-		),
-		agg as (
-			select
-				bucket_start,
 				owner_user_id,
-				model_name,
+				coalesce(model_name, model, '') as model_name,
 				count(*)::bigint as request_count,
 				count(*) filter (where success = true)::bigint as success_count,
 				count(*) filter (where success = false)::bigint as failure_count,
 				count(*) filter (where is_stream = true)::bigint as streaming_count,
-				coalesce(sum(input_tokens), 0)::bigint as input_tokens,
-				coalesce(sum(cache_write_input_tokens), 0)::bigint as cache_write_input_tokens,
-				coalesce(sum(cached_input_tokens), 0)::bigint as cached_input_tokens,
-				coalesce(sum(output_tokens), 0)::bigint as output_tokens,
-				coalesce(sum(total_tokens), 0)::bigint as total_tokens,
-				sum(estimated_cost_usd)::float8 as estimated_cost_usd,
+				coalesce(sum(coalesce(input_tokens, 0)), 0)::bigint as input_tokens,
+				coalesce(sum(coalesce(cache_write_input_tokens, 0)), 0)::bigint as cache_write_input_tokens,
+				coalesce(sum(coalesce(cached_input_tokens, 0)), 0)::bigint as cached_input_tokens,
+				coalesce(sum(coalesce(output_tokens, 0)), 0)::bigint as output_tokens,
+				coalesce(sum(coalesce(total_tokens, 0)), 0)::bigint as total_tokens,
+				sum(coalesce(estimated_cost_usd, 0))::float8 as estimated_cost_usd,
 				coalesce(sum(ttft_ms) filter (where ttft_ms is not null), 0)::bigint as ttft_ms_sum,
 				count(ttft_ms)::bigint as ttft_count,
 				coalesce(sum(duration_ms) filter (where duration_ms is not null), 0)::bigint as duration_ms_sum,
 				count(duration_ms)::bigint as duration_count
-			from pending
-			where owner_user_id is not null
-			group by owner_user_id, bucket_start, model_name
+			from gateway_request_logs
+			where id = any($1::integer[])
+			  and analytics_recorded_at is null
+			  and finished_at is not null
+			  and owner_user_id is not null
+			group by owner_user_id, date_trunc('hour', started_at), coalesce(model_name, model, '')
 		)
 		insert into gateway_request_hourly_stats (
 			owner_user_id, bucket_start, model_name, request_count, success_count, failure_count, streaming_count,
@@ -524,35 +568,120 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 			duration_ms_sum = gateway_request_hourly_stats.duration_ms_sum + excluded.duration_ms_sum,
 			duration_count = gateway_request_hourly_stats.duration_count + excluded.duration_count,
 			updated_at = now()
-	`)
-	if err != nil {
+	`, ids); err != nil {
 		return 0, err
 	}
-	_, err = tx.Exec(ctx, aggregateRequestTokenCostsSQL)
-	if err != nil {
+	if _, err := tx.Exec(ctx, aggregateRequestTokenCostsSQL, ids); err != nil {
 		return 0, err
 	}
 	updated, err := tx.Exec(ctx, `
 		update gateway_request_logs
 		set analytics_recorded_at = now()
-		where id in (
-			select id from gateway_request_logs
-			where analytics_recorded_at is null
-			  and finished_at is not null
-			order by id
-			limit 5000
-		)
-	`)
+		where id = any($1::integer[])
+		  and analytics_recorded_at is null
+		  and finished_at is not null
+	`, ids)
 	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `delete from gateway_request_analytics_queue where request_log_id = any($1::integer[])`, ids); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	if tag.RowsAffected() == 0 {
-		return updated.RowsAffected(), nil
+	return updated.RowsAffected(), s.backfillRequestAnalyticsQueue(ctx)
+}
+
+func (s *Store) backfillRequestAnalyticsQueue(ctx context.Context) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
 	}
-	return updated.RowsAffected(), nil
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `set local lock_timeout = '500ms'`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `set local statement_timeout = '1s'`); err != nil {
+		return err
+	}
+	var locked bool
+	if err := tx.QueryRow(ctx, `select pg_try_advisory_xact_lock(hashtext($1))`, requestAnalyticsMaintenanceLockKey).Scan(&locked); err != nil {
+		return err
+	}
+	if !locked {
+		return tx.Commit(ctx)
+	}
+	if err := backfillRequestAnalyticsQueueTx(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func backfillRequestAnalyticsQueueTx(ctx context.Context, tx pgx.Tx) error {
+	// New writers enqueue atomically. This bounded cursor only repairs rows
+	// written by older binaries during rollout and pre-queue legacy rows; it
+	// never performs the former unbounded pending-log discovery scan.
+	var cursor int64
+	var completed bool
+	err := tx.QueryRow(ctx, `
+		select
+			coalesce((value->>'cursor')::bigint, 0),
+			coalesce((value->>'completed')::boolean, false)
+		from gateway_settings
+		where key = $1
+		for update
+	`, requestAnalyticsBackfillSettingKey).Scan(&cursor, &completed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `select coalesce(max(id), 0) from gateway_request_logs`).Scan(&cursor); err != nil {
+			return err
+		}
+		completed = cursor <= 0
+	} else if err != nil {
+		return err
+	}
+	if completed {
+		return nil
+	}
+
+	var currentMaxID int64
+	if err := tx.QueryRow(ctx, `select coalesce(max(id), 0) from gateway_request_logs`).Scan(&currentMaxID); err != nil {
+		return err
+	}
+	legacyLower := max(cursor-requestAnalyticsLegacyBackfillWindow, int64(0))
+	recentLower := max(currentMaxID-requestAnalyticsLegacyBackfillWindow, int64(0))
+	if _, err := tx.Exec(ctx, `
+		insert into gateway_request_analytics_queue(request_log_id)
+		select id
+		from gateway_request_logs
+		where analytics_recorded_at is null
+		  and finished_at is not null
+		  and (
+			(id > $1 and id <= $2)
+			or (id > $3 and id <= $4)
+		  )
+		on conflict (request_log_id) do nothing
+	`, recentLower, currentMaxID, legacyLower, cursor); err != nil {
+		return err
+	}
+	cursor = legacyLower
+	completed = cursor <= 0
+	_, err = tx.Exec(ctx, `
+		insert into gateway_settings(key, value, updated_at)
+		values (
+			$1,
+			jsonb_build_object(
+				'cursor', $2::bigint,
+				'completed', $3::boolean,
+				'updated_at', now()
+			),
+			now()
+		)
+		on conflict (key) do update set
+			value = excluded.value,
+			updated_at = excluded.updated_at
+	`, requestAnalyticsBackfillSettingKey, cursor, completed)
+	return err
 }
 
 func (s *Store) TokenObservedCosts(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
@@ -966,7 +1095,28 @@ func (s *Store) DeleteOldRequestLogs(ctx context.Context, retentionDays int) (in
 	if retentionDays <= 0 {
 		return 0, nil
 	}
-	tag, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `set local lock_timeout = '500ms'`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `set local statement_timeout = '2s'`); err != nil {
+		return 0, err
+	}
+	var locked bool
+	if err := tx.QueryRow(ctx, `select pg_try_advisory_xact_lock(hashtext($1))`, requestAnalyticsMaintenanceLockKey).Scan(&locked); err != nil {
+		return 0, err
+	}
+	if !locked {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	tag, err := tx.Exec(ctx, `
 		delete from gateway_request_logs
 		where id in (
 			select id from gateway_request_logs
@@ -976,6 +1126,17 @@ func (s *Store) DeleteOldRequestLogs(ctx context.Context, retentionDays int) (in
 		)
 	`, retentionDays)
 	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		delete from gateway_request_analytics_queue q
+		where not exists (
+			select 1 from gateway_request_logs logs where logs.id = q.request_log_id
+		)
+	`); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	return tag.RowsAffected(), nil

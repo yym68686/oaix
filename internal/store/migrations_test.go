@@ -96,8 +96,8 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 }
 
 func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
-	if SchemaVersion != 18 {
-		t.Fatalf("unexpected schema version: got %d want 18", SchemaVersion)
+	if SchemaVersion != 19 {
+		t.Fatalf("unexpected schema version: got %d want 19", SchemaVersion)
 	}
 
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
@@ -109,6 +109,18 @@ func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
 	} {
 		if !strings.Contains(joined, fragment) {
 			t.Fatalf("missing stream delivery migration fragment %q", fragment)
+		}
+	}
+}
+
+func TestMigrationAddsBoundedRequestAnalyticsQueue(t *testing.T) {
+	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	for _, fragment := range []string{
+		"create table if not exists gateway_request_analytics_queue",
+		"request_log_id integer primary key",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing request analytics queue migration fragment %q", fragment)
 		}
 	}
 }
