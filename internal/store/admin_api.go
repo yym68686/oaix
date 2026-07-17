@@ -856,11 +856,18 @@ func (s *Store) CancelOAuthSession(ctx context.Context, sessionID string) error 
 	return nil
 }
 
+const saveQuotaSnapshotSQL = `
+	insert into token_quota_snapshots(token_id, owner_user_id, snapshot, plan_type, error_message, fetched_at)
+	select id, owner_user_id, $2, $3, $4, now()
+	from codex_tokens
+	where id = $1
+`
+
 func (s *Store) SaveQuotaSnapshot(ctx context.Context, tokenID int64, snapshot any, planType *string, errorMessage *string) error {
-	_, err := s.pool.Exec(ctx, `
-		insert into token_quota_snapshots(token_id, snapshot, plan_type, error_message, fetched_at)
-		values ($1, $2, $3, $4, now())
-	`, tokenID, jsonBytes(snapshot), planType, errorMessage)
+	tag, err := s.pool.Exec(ctx, saveQuotaSnapshotSQL, tokenID, jsonBytes(snapshot), planType, errorMessage)
+	if err == nil && tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
 	return err
 }
 
