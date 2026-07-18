@@ -73,6 +73,7 @@ func RunGateway(ctx context.Context) error {
 	oauthClient.Scope = cfg.Upstream.OAuthScope
 	pipeline.SetOAuthClient(oauthClient)
 	app := httpapi.NewApp(cfg, logger, db, tokenManager, logWriter, pipeline)
+	pipeline.SetTokenModelCapabilityLossHandler(app.HandleTokenModelCapabilityLoss)
 	app.StartQuotaRecovery(ctx)
 	connectionIDs := observability.NewConnectionIDGenerator()
 	server := &http.Server{

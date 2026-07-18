@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/logs"
@@ -27,21 +28,22 @@ import (
 )
 
 type App struct {
-	cfg          config.Config
-	logger       *slog.Logger
-	store        *store.Store
-	tokens       *tokens.Manager
-	logs         *logs.Writer
-	proxy        *proxy.Pipeline
-	quota        *adminQuotaService
-	recovery     *quotaRecoveryWorker
-	quotaJobs    *quotaRefreshRegistry
-	oauth        *openAIOAuthSessionStore
-	modelCatalog *officialModelsCatalog
-	webDir       string
-	started      time.Time
-	authKeys     []string
-	httpRoutes   *httpRouteMetrics
+	cfg                    config.Config
+	logger                 *slog.Logger
+	store                  *store.Store
+	tokens                 *tokens.Manager
+	logs                   *logs.Writer
+	proxy                  *proxy.Pipeline
+	quota                  *adminQuotaService
+	recovery               *quotaRecoveryWorker
+	quotaJobs              *quotaRefreshRegistry
+	oauth                  *openAIOAuthSessionStore
+	modelCatalog           *officialModelsCatalog
+	webDir                 string
+	started                time.Time
+	authKeys               []string
+	httpRoutes             *httpRouteMetrics
+	capabilityQuotaRefresh singleflight.Group
 }
 
 type adminImportItem struct {

@@ -65,6 +65,8 @@ type Manager struct {
 	capabilities     map[planCapabilityKey]planModelCapability
 	capabilityWrites atomic.Uint64
 	fastResolver     FastCapabilityResolver
+	modelLossMu      sync.RWMutex
+	modelLosses      map[tokenModelCapabilityKey]tokenModelCapabilityLoss
 }
 
 type TokenPoolManager = Manager
@@ -192,6 +194,7 @@ func NewManager(source Source, logger *slog.Logger, maxAge, refreshInterval time
 		refreshInterval: refreshInterval,
 		stopCh:          make(chan struct{}),
 		capabilities:    make(map[planCapabilityKey]planModelCapability),
+		modelLosses:     make(map[tokenModelCapabilityKey]tokenModelCapabilityLoss),
 	}
 	manager.SetActiveStreamCap(activeCap)
 	manager.snapshot.Store(emptySnapshot())
@@ -267,6 +270,9 @@ func (m *Manager) Refresh(ctx context.Context) error {
 		m.refreshMu.Unlock()
 		return err
 	}
+	if err := m.refreshTokenModelCapabilityLosses(ctx, store.AllResources()); err != nil && m.logger != nil {
+		m.logger.Warn("token model capability loss refresh failed", "error", err)
+	}
 	version := m.version.Add(1)
 	current := m.Snapshot()
 	next := buildSnapshot(rows, current, version)
@@ -290,6 +296,9 @@ func (m *Manager) RefreshOwner(ctx context.Context, ownerUserID int64) error {
 	rows, err := m.listAvailableTokens(ctx, store.OwnerResources(ownerUserID))
 	if err != nil {
 		return err
+	}
+	if err := m.refreshTokenModelCapabilityLosses(ctx, store.OwnerResources(ownerUserID)); err != nil && m.logger != nil {
+		m.logger.Warn("owner token model capability loss refresh failed", "owner_user_id", ownerUserID, "error", err)
 	}
 	version := m.version.Add(1)
 	next := buildSnapshot(rows, state.snapshotValue(), version)
@@ -609,6 +618,7 @@ func snapshotTokenActive(snapshot *Snapshot, tokenID int64) int64 {
 }
 
 func (m *Manager) Claim(ctx context.Context, intent Intent) (*Claim, error) {
+	intent = m.withTokenModelCapabilityLossExclusions(intent)
 	claimSnapshot, cursorState, err := m.snapshotForClaim(ctx, intent)
 	if err != nil {
 		if errors.Is(err, ErrNoToken) {

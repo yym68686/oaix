@@ -18,3 +18,15 @@ func TestSaveQuotaSnapshotPersistsTokenOwner(t *testing.T) {
 		}
 	}
 }
+
+func TestTokenModelCapabilityScopeIsExactAndBounded(t *testing.T) {
+	if got := TokenModelCapabilityScope(" GPT-5.6-SOL "); got != "gpt-5.6-sol:model-compatibility" {
+		t.Fatalf("scope = %q", got)
+	}
+	if got := TokenModelCapabilityScope(""); got != "" {
+		t.Fatalf("empty model scope = %q", got)
+	}
+	if got := TokenModelCapabilityScope(strings.Repeat("x", 128)); got != "" {
+		t.Fatalf("oversized model scope = %q", got)
+	}
+}

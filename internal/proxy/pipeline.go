@@ -35,19 +35,33 @@ const (
 	maxRejectedEncryptedContentRetries = 64
 	authFailureRefreshTimeout          = 15 * time.Second
 	authFailureCooldown                = 5 * time.Second
+	tokenModelCapabilityLossTTL        = time.Hour
+	tokenModelCapabilityRefreshTimeout = 30 * time.Second
 )
 
 type Pipeline struct {
-	cfg            config.Config
-	logger         *slog.Logger
-	tokens         *tokens.Manager
-	transport      *transport.Client
-	logs           *logs.Writer
-	store          tokenStateStore
-	affinity       affinity.Store
-	oauthClient    oauth.Client
-	commitFailures atomic.Int64
+	cfg                        config.Config
+	logger                     *slog.Logger
+	tokens                     *tokens.Manager
+	transport                  *transport.Client
+	logs                       *logs.Writer
+	store                      tokenStateStore
+	affinity                   affinity.Store
+	oauthClient                oauth.Client
+	modelCapabilityLossHandler TokenModelCapabilityLossHandler
+	commitFailures             atomic.Int64
 }
+
+type TokenModelCapabilityLoss struct {
+	TokenID     int64
+	OwnerUserID int64
+	Model       string
+	Detail      string
+	RequestID   string
+	ValidUntil  time.Time
+}
+
+type TokenModelCapabilityLossHandler func(ctx context.Context, loss TokenModelCapabilityLoss) error
 
 type tokenStateStore interface {
 	MarkTokenSuccess(ctx context.Context, tokenID int64) error
@@ -125,17 +139,18 @@ type StreamAttemptState struct {
 type Outcome string
 
 const (
-	OutcomeSuccess                Outcome = "success"
-	OutcomeClientCanceled         Outcome = "client_canceled"
-	OutcomeUpstream429Cooldown    Outcome = "upstream_429_cooldown"
-	OutcomeUpstream401Invalid     Outcome = "upstream_401_invalid"
-	OutcomeUpstream401Invalidated Outcome = "upstream_401_token_invalidated"
-	OutcomeUpstream402Deactivated Outcome = "upstream_402_deactivated_workspace"
-	OutcomeUpstream403Invalid     Outcome = "upstream_403_invalid"
-	OutcomeUpstream4xx            Outcome = "upstream_4xx"
-	OutcomeUpstream5xx            Outcome = "upstream_5xx"
-	OutcomeTransportError         Outcome = "transport_error"
-	OutcomeNoToken                Outcome = "no_token"
+	OutcomeSuccess                        Outcome = "success"
+	OutcomeClientCanceled                 Outcome = "client_canceled"
+	OutcomeUpstream429Cooldown            Outcome = "upstream_429_cooldown"
+	OutcomeUpstream401Invalid             Outcome = "upstream_401_invalid"
+	OutcomeUpstream401Invalidated         Outcome = "upstream_401_token_invalidated"
+	OutcomeUpstream400ModelCapabilityLoss Outcome = "upstream_400_model_capability_loss"
+	OutcomeUpstream402Deactivated         Outcome = "upstream_402_deactivated_workspace"
+	OutcomeUpstream403Invalid             Outcome = "upstream_403_invalid"
+	OutcomeUpstream4xx                    Outcome = "upstream_4xx"
+	OutcomeUpstream5xx                    Outcome = "upstream_5xx"
+	OutcomeTransportError                 Outcome = "transport_error"
+	OutcomeNoToken                        Outcome = "no_token"
 )
 
 func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, client *transport.Client, writer *logs.Writer, stateStore tokenStateStore, affinityStore affinity.Store) *Pipeline {
@@ -155,6 +170,13 @@ func (p *Pipeline) SetOAuthClient(client oauth.Client) {
 		return
 	}
 	p.oauthClient = client
+}
+
+func (p *Pipeline) SetTokenModelCapabilityLossHandler(handler TokenModelCapabilityLossHandler) {
+	if p == nil {
+		return
+	}
+	p.modelCapabilityLossHandler = handler
 }
 
 func (p *Pipeline) TransportStats() transport.Stats {
@@ -464,6 +486,35 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			}
 			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
+		}
+		if detail, ok := chatGPTAccountModelCapabilityLossDetail(status, result.ErrorBody, intent.Model); ok {
+			validUntil := time.Now().UTC().Add(tokenModelCapabilityLossTTL)
+			ownerUserID := int64(0)
+			if claim.Token != nil {
+				ownerUserID = claim.Token.Token.OwnerUserID
+			}
+			p.tokens.MarkTokenModelCapabilityLoss(claim.TokenID(), ownerUserID, intent.Model, validUntil)
+			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+			excluded[claim.TokenID()] = struct{}{}
+			result.Retry = true
+			retry = true
+			action = OutcomeUpstream400ModelCapabilityLoss
+			lastErr = errors.New(detail)
+			p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, action, true, false, nil)
+			timing["token_model_capability_loss"] = true
+			timing["token_model_capability_loss_token_id"] = claim.TokenID()
+			p.triggerTokenModelCapabilityLoss(TokenModelCapabilityLoss{
+				TokenID:     claim.TokenID(),
+				OwnerUserID: ownerUserID,
+				Model:       intent.Model,
+				Detail:      detail,
+				RequestID:   requestID,
+				ValidUntil:  validUntil,
+			})
+			if searchAffinityContext == nil && attempt < p.cfg.Upstream.MaxRetries {
+				continue
+			}
+			break
 		}
 		if upstreamerror.IsTokenInvalidated(status, result.ErrorBody) {
 			message := "terminal upstream status 401: token_invalidated"
@@ -1130,6 +1181,50 @@ func isDeactivatedWorkspaceFailure(status int, raw []byte, err error) bool {
 		return true
 	}
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "deactivated_workspace")
+}
+
+func chatGPTAccountModelCapabilityLossDetail(status int, raw []byte, model string) (string, bool) {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if status != http.StatusBadRequest || model == "" {
+		return "", false
+	}
+	detail := strings.TrimSpace(decodeUpstreamErrorBytes(raw))
+	expected := fmt.Sprintf("The '%s' model is not supported when using Codex with a ChatGPT account.", model)
+	if detail == expected {
+		return detail, true
+	}
+	matched := false
+	_ = sse.NewParser(len(raw)+1).Parse(context.Background(), bytes.NewReader(raw), func(event sse.Event) error {
+		if strings.TrimSpace(decodeUpstreamErrorBytes(event.Data)) == expected {
+			matched = true
+		}
+		return nil
+	})
+	if matched {
+		return expected, true
+	}
+	return detail, false
+}
+
+func (p *Pipeline) triggerTokenModelCapabilityLoss(loss TokenModelCapabilityLoss) {
+	if p == nil || p.modelCapabilityLossHandler == nil {
+		return
+	}
+	handler := p.modelCapabilityLossHandler
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), tokenModelCapabilityRefreshTimeout)
+		defer cancel()
+		if err := handler(ctx, loss); err != nil && p.logger != nil {
+			p.logger.Warn(
+				"token model capability loss handling failed",
+				"token_id", loss.TokenID,
+				"owner_user_id", loss.OwnerUserID,
+				"model", loss.Model,
+				"request_id", loss.RequestID,
+				"error", err,
+			)
+		}
+	}()
 }
 
 func (p *Pipeline) commitSuccess(tokenID int64) {

@@ -89,6 +89,33 @@ func TestIsDeactivatedWorkspaceFailure(t *testing.T) {
 	}
 }
 
+func TestChatGPTAccountModelCapabilityLossDetailMatchesOnlyExact400(t *testing.T) {
+	const detail = "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."
+	for _, body := range [][]byte{
+		[]byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`),
+		[]byte(`{"detail":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}`),
+		sse.Encode("error", []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)),
+	} {
+		got, ok := chatGPTAccountModelCapabilityLossDetail(http.StatusBadRequest, body, "gpt-5.6-sol")
+		if !ok || got != detail {
+			t.Fatalf("exact capability loss = (%q, %v), want (%q, true)", got, ok, detail)
+		}
+	}
+	for _, test := range []struct {
+		status int
+		model  string
+		body   []byte
+	}{
+		{status: http.StatusForbidden, model: "gpt-5.6-sol", body: []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)},
+		{status: http.StatusBadRequest, model: "gpt-5.5", body: []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)},
+		{status: http.StatusBadRequest, model: "gpt-5.6-sol", body: []byte(`{"error":{"message":"gpt-5.6-sol is not supported for this account"}}`)},
+	} {
+		if got, ok := chatGPTAccountModelCapabilityLossDetail(test.status, test.body, test.model); ok {
+			t.Fatalf("non-exact capability loss unexpectedly matched: detail=%q status=%d model=%q body=%s", got, test.status, test.model, test.body)
+		}
+	}
+}
+
 func TestWriteSSEError(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writeSSEError(recorder, http.StatusServiceUnavailable, "no token")
@@ -1790,6 +1817,122 @@ func TestProxyNonRetryableUpstream4xxDoesNotCooldownToken(t *testing.T) {
 		t.Fatalf("unexpected token cooldown commit: %v", until)
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+func TestProxyRetriesNextEligibleTokenAfterExactModelCapabilityLoss(t *testing.T) {
+	const capabilityLoss = "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."
+	var mu sync.Mutex
+	var authHeaders []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		authHeaders = append(authHeaders, auth)
+		mu.Unlock()
+		if auth == "Bearer token-2" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: response.completed`,
+			`data: {"type":"response.completed","response":{"id":"resp_capability_fallback","object":"response","model":"gpt-5.6-sol","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+			``,
+		}, "\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Upstream: config.UpstreamConfig{
+			ResponsesURL:              upstream.URL,
+			MaxRetries:                2,
+			NonStreamMaxResponseBytes: 1 << 20,
+			DisableCompression:        true,
+		},
+		TokenPool: config.TokenPoolConfig{DefaultCooldown: time.Second},
+		RequestLog: config.RequestLogConfig{
+			QueueMaxSize: 10,
+			BatchSize:    1,
+			Concurrency:  1,
+		},
+	}
+	now := time.Now().UTC()
+	plan := "pro"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fakes := &fakeProxyStore{tokens: []store.Token{
+		{ID: 1, OwnerUserID: 10, AccessToken: "token-1", PlanType: &plan, IsActive: true, CreatedAt: now, UpdatedAt: now},
+		{ID: 2, OwnerUserID: 10, AccessToken: "token-2", PlanType: &plan, IsActive: true, CreatedAt: now, UpdatedAt: now},
+	}}
+	manager := tokens.NewManager(fakes, logger, time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := transport.New(cfg.Upstream)
+	defer client.CloseIdleConnections()
+	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
+	affinityStore := affinity.NewMemoryStore()
+	affinityStore.BindResponseOwner("resp_old", affinity.ResponseOwnerBinding{TokenID: 2}, time.Hour)
+	pipeline := New(cfg, logger, manager, client, writer, fakes, affinityStore)
+	losses := make(chan TokenModelCapabilityLoss, 1)
+	pipeline.SetTokenModelCapabilityLossHandler(func(_ context.Context, loss TokenModelCapabilityLoss) error {
+		losses <- loss
+		return nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.6-sol"})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "resp_capability_fallback") {
+		t.Fatalf("fallback response missing: %s", recorder.Body.String())
+	}
+	mu.Lock()
+	gotAuthHeaders := append([]string(nil), authHeaders...)
+	mu.Unlock()
+	if len(gotAuthHeaders) != 2 || gotAuthHeaders[0] != "Bearer token-2" || gotAuthHeaders[1] != "Bearer token-1" {
+		t.Fatalf("upstream auth sequence = %v, want token-2 then token-1", gotAuthHeaders)
+	}
+	if _, ok := affinityStore.GetResponseOwner("resp_old"); ok {
+		t.Fatal("token-2 response affinity was not removed")
+	}
+	select {
+	case loss := <-losses:
+		if loss.TokenID != 2 || loss.OwnerUserID != 10 || loss.Model != "gpt-5.6-sol" || loss.Detail != capabilityLoss || !loss.ValidUntil.After(now) {
+			t.Fatalf("capability loss event = %+v", loss)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for capability loss handler")
+	}
+
+	fakes.mu.Lock()
+	attempts := append([]store.GatewayRequestAttempt(nil), fakes.attempts...)
+	fakes.mu.Unlock()
+	if len(attempts) != 2 {
+		t.Fatalf("recorded attempts = %d, want 2", len(attempts))
+	}
+	if attempts[0].Outcome != string(OutcomeUpstream400ModelCapabilityLoss) || attempts[0].Retry == nil || !*attempts[0].Retry {
+		t.Fatalf("first attempt = %+v", attempts[0])
+	}
+	blockGoodToken := map[int64]struct{}{1: {}}
+	if claim, err := manager.Claim(context.Background(), tokens.Intent{Model: "gpt-5.6-sol", ExcludeTokenIDs: blockGoodToken}); !errors.Is(err, tokens.ErrNoToken) {
+		if claim != nil {
+			claim.Release()
+		}
+		t.Fatalf("capability-lost token remained eligible for gpt-5.6-sol: claim=%v err=%v", claim, err)
+	}
+	claim, err := manager.Claim(context.Background(), tokens.Intent{Model: "gpt-5.5", ExcludeTokenIDs: blockGoodToken})
+	if err != nil {
+		t.Fatalf("model-scoped loss incorrectly blocked another model: %v", err)
+	}
+	if claim.TokenID() != 2 {
+		t.Fatalf("other-model claim token = %d, want 2", claim.TokenID())
+	}
+	claim.Release()
 }
 
 func TestProxyPreservesContextLengthFailureAfterKeepalive(t *testing.T) {

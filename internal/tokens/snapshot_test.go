@@ -2,6 +2,7 @@ package tokens
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 
 type fakeSource struct {
 	tokens      []store.Token
+	modelLosses []store.TokenModelCapabilityLoss
 	err         error
 	allCalls    atomic.Int64
 	scopedCalls int
@@ -49,6 +51,19 @@ func (f *fakeSource) ListAvailableTokensScoped(_ context.Context, scope store.Re
 	return out, nil
 }
 
+func (f *fakeSource) ListTokenModelCapabilityLosses(_ context.Context, scope store.ResourceScope) ([]store.TokenModelCapabilityLoss, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([]store.TokenModelCapabilityLoss, 0, len(f.modelLosses))
+	for _, loss := range f.modelLosses {
+		if scope.AllowAll || (scope.OwnerUserID != nil && loss.OwnerUserID == *scope.OwnerUserID) {
+			out = append(out, loss)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeSource) TouchTokens(context.Context, []int64, time.Time) error { return nil }
 func (f *fakeSource) MarkTokenSuccess(context.Context, int64) error         { return nil }
 func (f *fakeSource) MarkTokenError(context.Context, int64, string, bool, *time.Time) error {
@@ -74,6 +89,67 @@ func TestManagerClaimRelease(t *testing.T) {
 	if claim.Token.Active.Load() != 0 {
 		t.Fatalf("active count after release = %d, want 0", claim.Token.Active.Load())
 	}
+}
+
+func TestManagerTokenModelCapabilityLossIsImmediateScopedAndReloadable(t *testing.T) {
+	now := time.Now().UTC()
+	rows := makeTokens(2)
+	rows[0].OwnerUserID = 10
+	rows[1].OwnerUserID = 10
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, slog.Default(), time.Minute, time.Minute, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	validUntil := now.Add(time.Hour)
+	manager.MarkTokenModelCapabilityLoss(1, 10, "gpt-5.6-sol", validUntil)
+	excludeSecond := map[int64]struct{}{2: {}}
+	if claim, err := manager.Claim(context.Background(), Intent{Model: "gpt-5.6-sol", ExcludeTokenIDs: excludeSecond}); !errors.Is(err, ErrNoToken) {
+		if claim != nil {
+			claim.Release()
+		}
+		t.Fatalf("capability-lost token remained immediately eligible: claim=%v err=%v", claim, err)
+	}
+	claim, err := manager.Claim(context.Background(), Intent{Model: "gpt-5.5", ExcludeTokenIDs: excludeSecond})
+	if err != nil {
+		t.Fatalf("model-scoped loss blocked another model: %v", err)
+	}
+	if claim.TokenID() != 1 {
+		t.Fatalf("other-model token = %d, want 1", claim.TokenID())
+	}
+	claim.Release()
+
+	manager.ConfirmTokenModelCapabilityLoss(1, "gpt-5.6-sol")
+	source.modelLosses = []store.TokenModelCapabilityLoss{{
+		TokenID: 1, OwnerUserID: 10, Model: "gpt-5.6-sol", ValidUntil: validUntil,
+	}}
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	freshManager := NewManager(source, slog.Default(), time.Minute, time.Minute, 1)
+	if err := freshManager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if claim, err := freshManager.Claim(context.Background(), Intent{Model: "gpt-5.6-sol", ExcludeTokenIDs: excludeSecond}); !errors.Is(err, ErrNoToken) {
+		if claim != nil {
+			claim.Release()
+		}
+		t.Fatalf("persisted capability loss was not loaded: claim=%v err=%v", claim, err)
+	}
+
+	source.modelLosses = nil
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = manager.Claim(context.Background(), Intent{Model: "gpt-5.6-sol", ExcludeTokenIDs: excludeSecond})
+	if err != nil {
+		t.Fatalf("removed persisted capability loss remained active: %v", err)
+	}
+	if claim.TokenID() != 1 {
+		t.Fatalf("recovered token = %d, want 1", claim.TokenID())
+	}
+	claim.Release()
 }
 
 func TestManagerClaimTelemetryRecordsLifecycle(t *testing.T) {

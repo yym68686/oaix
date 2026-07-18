@@ -35,6 +35,7 @@ type PromptAffinityResult struct {
 }
 
 func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store, intent Intent, opts PromptAffinityOptions) (*Claim, PromptAffinityResult, error) {
+	intent = m.withTokenModelCapabilityLossExclusions(intent)
 	if intent.TargetTokenID > 0 {
 		claim, err := m.Claim(ctx, intent)
 		return claim, PromptAffinityResult{Result: claimReason(claim)}, err
@@ -163,6 +164,7 @@ func (m *Manager) ClaimPromptAffinity(ctx context.Context, store affinity.Store,
 }
 
 func (m *Manager) ClaimStrictAffinity(ctx context.Context, store affinity.Store, intent Intent, affinityKey string, wait, ttl time.Duration) (*Claim, PromptAffinityResult, error) {
+	intent = m.withTokenModelCapabilityLossExclusions(intent)
 	if store == nil || strings.TrimSpace(affinityKey) == "" {
 		m.recordNoTokenDenial()
 		return nil, PromptAffinityResult{Result: "strict_store_unavailable"}, ErrNoToken

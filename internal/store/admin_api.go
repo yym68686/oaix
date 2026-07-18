@@ -864,11 +864,76 @@ const saveQuotaSnapshotSQL = `
 `
 
 func (s *Store) SaveQuotaSnapshot(ctx context.Context, tokenID int64, snapshot any, planType *string, errorMessage *string) error {
-	tag, err := s.pool.Exec(ctx, saveQuotaSnapshotSQL, tokenID, jsonBytes(snapshot), planType, errorMessage)
-	if err == nil && tag.RowsAffected() == 0 {
-		return pgx.ErrNoRows
-	}
+	_, err := s.SaveQuotaSnapshotAndPlan(ctx, tokenID, snapshot, planType, errorMessage)
 	return err
+}
+
+type QuotaSnapshotSaveResult struct {
+	OwnerUserID int64
+	PlanType    string
+	PlanChanged bool
+}
+
+func (s *Store) SaveQuotaSnapshotAndPlan(ctx context.Context, tokenID int64, snapshot any, planType *string, errorMessage *string) (QuotaSnapshotSaveResult, error) {
+	result := QuotaSnapshotSaveResult{}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return result, err
+	}
+	defer tx.Rollback(ctx)
+
+	var ownerUserID *int64
+	var currentPlan *string
+	if err := tx.QueryRow(ctx, `
+		select owner_user_id, plan_type
+		from codex_tokens
+		where id = $1 and merged_into_token_id is null
+		for update
+	`, tokenID).Scan(&ownerUserID, &currentPlan); err != nil {
+		return result, err
+	}
+	if ownerUserID != nil {
+		result.OwnerUserID = *ownerUserID
+	}
+
+	tag, err := tx.Exec(ctx, saveQuotaSnapshotSQL, tokenID, jsonBytes(snapshot), planType, errorMessage)
+	if err != nil {
+		return result, err
+	}
+	if tag.RowsAffected() == 0 {
+		return result, pgx.ErrNoRows
+	}
+
+	if planType != nil {
+		result.PlanType = normalizePlanFilter(*planType)
+	}
+	if result.PlanType != "" && len(result.PlanType) <= 32 {
+		current := ""
+		if currentPlan != nil {
+			current = normalizePlanFilter(*currentPlan)
+		}
+		if current != result.PlanType {
+			tag, err = tx.Exec(ctx, `
+				update codex_tokens
+				set plan_type = $2, updated_at = now()
+				where id = $1 and merged_into_token_id is null
+			`, tokenID, result.PlanType)
+			if err != nil {
+				return result, err
+			}
+			if tag.RowsAffected() == 0 {
+				return result, pgx.ErrNoRows
+			}
+			if err := deleteTokenModelCapabilityLossesTx(ctx, tx, tokenID); err != nil {
+				return result, err
+			}
+			result.PlanChanged = true
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func (s *Store) ListQuotaSnapshots(ctx context.Context, tokenID int64, limit int) ([]QuotaSnapshot, error) {

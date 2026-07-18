@@ -172,7 +172,6 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 		defer cancel()
 		quotaByID, pendingIDs = a.quota.collect(ctx, tokens)
-		a.syncQuotaPlanTypes(parent, quotaByID)
 	}
 
 	observedCostByID := map[int64]*float64{}
@@ -295,31 +294,6 @@ func adminTokenStatus(token store.Token, now time.Time) string {
 		return "cooling"
 	}
 	return "active"
-}
-
-func (a *App) syncQuotaPlanTypes(parent context.Context, quotaByID map[int64]*codexQuotaSnapshot) {
-	if a.store == nil || len(quotaByID) == 0 {
-		return
-	}
-	planByTokenID := make(map[int64]string, len(quotaByID))
-	for tokenID, quota := range quotaByID {
-		if quota == nil || quota.PlanType == nil {
-			continue
-		}
-		plan := strings.TrimSpace(*quota.PlanType)
-		if plan == "" {
-			continue
-		}
-		planByTokenID[tokenID] = plan
-	}
-	if len(planByTokenID) == 0 {
-		return
-	}
-	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
-	defer cancel()
-	if err := a.store.UpdateTokenPlanTypes(ctx, planByTokenID); err != nil && a.logger != nil {
-		a.logger.Warn("admin quota plan type sync failed", "error", err)
-	}
 }
 
 func (a *App) activeStreamsByTokenID(tokenRows []store.Token) map[int64]int64 {
@@ -492,6 +466,32 @@ func (s *adminQuotaService) fetchMany(ctx context.Context, tokens []store.Token)
 func (s *adminQuotaService) fetchSnapshot(ctx context.Context, token store.Token) *codexQuotaSnapshot {
 	snapshot, _ := s.fetchSnapshotWithDiagnostic(ctx, token, true)
 	return snapshot
+}
+
+func (s *adminQuotaService) fetchAuthoritativeSnapshot(ctx context.Context, token store.Token) (*codexQuotaSnapshot, store.QuotaSnapshotSaveResult, error) {
+	result := store.QuotaSnapshotSaveResult{}
+	if s == nil {
+		return nil, result, errors.New("quota service is not configured")
+	}
+	snapshot, _ := s.fetchSnapshotWithDiagnostic(ctx, token, false)
+	if snapshot == nil {
+		if err := ctx.Err(); err != nil {
+			return nil, result, err
+		}
+		return nil, result, errors.New("authoritative quota refresh did not return a snapshot")
+	}
+	if s.store == nil {
+		return snapshot, result, errors.New("quota store is not configured")
+	}
+	var err error
+	result, err = s.store.SaveQuotaSnapshotAndPlan(ctx, token.ID, snapshot, snapshot.PlanType, snapshot.Error)
+	if err != nil {
+		return snapshot, result, fmt.Errorf("persist authoritative quota snapshot and plan: %w", err)
+	}
+	if snapshot.Error != nil {
+		return snapshot, result, fmt.Errorf("authoritative quota refresh failed: %s", strings.TrimSpace(*snapshot.Error))
+	}
+	return snapshot, result, nil
 }
 
 func (s *adminQuotaService) fetchSnapshotWithoutHistory(ctx context.Context, token store.Token) (*codexQuotaSnapshot, quotaRecoveryCheckErrorReason) {
