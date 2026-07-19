@@ -222,6 +222,28 @@ var migrationStatements = []string{
 		stream_delivery_trace jsonb,
 		created_at timestamptz not null default now()
 	)`,
+	`create table if not exists gateway_idempotency_records (
+		owner_user_id bigint not null references platform_users(id) on delete cascade,
+		key_hash varchar(64) not null,
+		request_hash varchar(64) not null,
+		request_id varchar(128) not null,
+		generation bigint not null default 1,
+		state varchar(32) not null,
+		lease_token varchar(64),
+		lease_expires_at timestamptz,
+		status_code integer,
+		response_headers jsonb,
+		response_body bytea,
+		replayable boolean not null default false,
+		failure_reason varchar(128),
+		created_at timestamptz not null default now(),
+		started_at timestamptz not null default now(),
+		completed_at timestamptz,
+		updated_at timestamptz not null default now(),
+		expires_at timestamptz not null,
+		primary key(owner_user_id, key_hash)
+	)`,
+	`create index if not exists ix_gateway_idempotency_records_expires_at on gateway_idempotency_records(expires_at)`,
 	`create table if not exists gateway_request_log_partitions (
 		partition_date date primary key,
 		table_name varchar(128) not null unique,
@@ -689,6 +711,7 @@ var onlineMigrationStatements = []string{
 }
 
 var downMigrationStatements = []string{
+	`drop table if exists gateway_idempotency_records`,
 	`drop table if exists sub2api_usage_snapshots`,
 	`drop table if exists sub2api_sync_mappings`,
 	`drop table if exists sub2api_sync_runs`,

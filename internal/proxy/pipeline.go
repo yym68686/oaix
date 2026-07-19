@@ -223,7 +223,27 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	if promptCacheContext != nil && intent.Model == "" {
 		intent.Model = promptCacheContext.Model
 	}
+	idempotencyExecution, handled := p.beginGatewayIdempotency(w, r, intent, bodyBytes, promptCacheContext, requestID)
+	if handled {
+		return
+	}
+	if idempotencyExecution != nil {
+		w = idempotencyExecution.writer
+		r = idempotencyExecution.request
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				idempotencyExecution.failAfterPanic()
+				panic(recovered)
+			}
+			idempotencyExecution.finish()
+		}()
+	}
 	timing := map[string]any{"request_body_bytes": len(bodyBytes)}
+	if idempotencyExecution != nil {
+		timing["idempotency_mode"] = "routing_attempt"
+		timing["routing_attempt_id_hash"] = idempotencyExecution.keyHash
+		timing["idempotency_generation"] = idempotencyExecution.generation
+	}
 	if promptCacheContext != nil {
 		timing["prompt_cache_key_hash"] = promptCacheContext.PromptCacheKeyHash
 		timing["prompt_cache_source"] = promptCacheContext.Source
@@ -462,6 +482,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				text := err.Error()
 				msg = &text
 			}
+			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
 			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, selectedTokenOwnerID, accountID, msg, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			if success {
 				p.commitSuccess(claim.TokenID())
@@ -473,6 +494,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, OutcomeSuccess, retry, false, nil)
 			p.commitSuccess(claim.TokenID())
 			p.recordPromptCacheSuccess(promptCacheContext, claim, lastResponseID)
+			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
 			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, selectedTokenOwnerID, accountID, nil, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
@@ -484,6 +506,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			if err != nil {
 				message = err.Error()
 			}
+			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
 			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
@@ -563,6 +586,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			if err != nil {
 				message = err.Error()
 			}
+			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
 			p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
@@ -591,10 +615,12 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			if deliveryErr := writeResponsesFailureResponse(w, streamState.DownstreamStarted, lastResponsesFailure, lastStreamDeliveryTrace); deliveryErr != nil {
 				message = fmt.Sprintf("%s; downstream failure delivery failed: %v", message, deliveryErr)
 			}
+			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
 			p.finalLog(r.Context(), requestID, intent, started, status, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
 		writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, http.StatusServiceUnavailable, "no available token")
+		observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
 		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 		return
 	}
@@ -614,10 +640,12 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 		w.WriteHeader(finalStatus)
 		_, _ = w.Write(lastUpstreamErrorBody)
+		observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
 		p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 		return
 	}
 	writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, finalStatus, message)
+	observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
 	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 }
 

@@ -96,8 +96,8 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 }
 
 func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
-	if SchemaVersion != 19 {
-		t.Fatalf("unexpected schema version: got %d want 19", SchemaVersion)
+	if SchemaVersion != 20 {
+		t.Fatalf("unexpected schema version: got %d want 20", SchemaVersion)
 	}
 
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
@@ -109,6 +109,21 @@ func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
 	} {
 		if !strings.Contains(joined, fragment) {
 			t.Fatalf("missing stream delivery migration fragment %q", fragment)
+		}
+	}
+}
+
+func TestMigrationAddsGatewayIdempotencyRecords(t *testing.T) {
+	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	for _, fragment := range []string{
+		"create table if not exists gateway_idempotency_records",
+		"primary key(owner_user_id, key_hash)",
+		"lease_token varchar(64)",
+		"response_body bytea",
+		"ix_gateway_idempotency_records_expires_at",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing gateway idempotency migration fragment %q", fragment)
 		}
 	}
 }

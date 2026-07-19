@@ -42,6 +42,12 @@ func TestLoadUsesTypedDefaultsAndEnvOverrides(t *testing.T) {
 	if cfg.Upstream.MaxRequestBodyBytes != 0 {
 		t.Fatalf("MaxRequestBodyBytes = %d, want unlimited default", cfg.Upstream.MaxRequestBodyBytes)
 	}
+	if !cfg.Idempotency.Enabled || cfg.Idempotency.RecordTTL != 15*time.Minute || cfg.Idempotency.LeaseDuration != 2*time.Minute {
+		t.Fatalf("Idempotency defaults = %#v", cfg.Idempotency)
+	}
+	if cfg.Idempotency.HeartbeatInterval != 30*time.Second || cfg.Idempotency.MaxResponseBytes != 16*1024*1024 {
+		t.Fatalf("Idempotency heartbeat/capture defaults = %#v", cfg.Idempotency)
+	}
 	if !cfg.Worker.Embedded {
 		t.Fatal("embedded worker should default to enabled")
 	}
@@ -76,6 +82,20 @@ func TestLoadRejectsNegativeRequestBodyLimit(t *testing.T) {
 	t.Setenv("UPSTREAM_MAX_REQUEST_BODY_BYTES", "-1")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected negative request body limit error")
+	}
+}
+
+func TestLoadRejectsUnsafeIdempotencyLeaseConfiguration(t *testing.T) {
+	t.Setenv("OAIX_IDEMPOTENCY_TTL_SECONDS", "60")
+	t.Setenv("OAIX_IDEMPOTENCY_LEASE_SECONDS", "60")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "OAIX_IDEMPOTENCY_TTL_SECONDS") {
+		t.Fatalf("expected idempotency TTL validation error, got %v", err)
+	}
+
+	t.Setenv("OAIX_IDEMPOTENCY_TTL_SECONDS", "120")
+	t.Setenv("OAIX_IDEMPOTENCY_HEARTBEAT_SECONDS", "30")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "OAIX_IDEMPOTENCY_HEARTBEAT_SECONDS") {
+		t.Fatalf("expected idempotency heartbeat validation error, got %v", err)
 	}
 }
 

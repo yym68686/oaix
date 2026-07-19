@@ -150,6 +150,15 @@ func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Log
 		}
 		return err
 	})
+	if cfg.Idempotency.Enabled {
+		runStep(ctx, logger, "gateway idempotency retention cleanup", 10*time.Second, func(stepCtx context.Context) error {
+			deleted, err := db.DeleteExpiredGatewayIdempotencyRecords(stepCtx, 1000)
+			if err == nil && deleted > 0 && logger != nil {
+				logger.Info("gateway idempotency retention cleanup deleted rows", "count", deleted)
+			}
+			return err
+		})
+	}
 	if includeCleanup {
 		runRequestLogCleanup(ctx, cfg, logger, db)
 	}

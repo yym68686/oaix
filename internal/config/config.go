@@ -15,6 +15,7 @@ type Config struct {
 	Database      DatabaseConfig
 	Auth          AuthConfig
 	Upstream      UpstreamConfig
+	Idempotency   IdempotencyConfig
 	TokenPool     TokenPoolConfig
 	QuotaRecovery QuotaRecoveryConfig
 	PromptCache   PromptCacheConfig
@@ -65,6 +66,16 @@ type UpstreamConfig struct {
 	ForceAttemptHTTP2         bool
 	MaxRequestBodyBytes       int64
 	NonStreamMaxResponseBytes int64
+}
+
+type IdempotencyConfig struct {
+	Enabled           bool
+	RecordTTL         time.Duration
+	LeaseDuration     time.Duration
+	HeartbeatInterval time.Duration
+	WaitTimeout       time.Duration
+	ExecutionTimeout  time.Duration
+	MaxResponseBytes  int64
 }
 
 type TokenPoolConfig struct {
@@ -170,6 +181,15 @@ func Load() (Config, error) {
 			ForceAttemptHTTP2:         envBool("UPSTREAM_HTTP_FORCE_HTTP2", false),
 			MaxRequestBodyBytes:       int64(envInt("UPSTREAM_MAX_REQUEST_BODY_BYTES", 0)),
 			NonStreamMaxResponseBytes: int64(envInt("UPSTREAM_NON_STREAM_MAX_RESPONSE_BYTES", 64*1024*1024)),
+		},
+		Idempotency: IdempotencyConfig{
+			Enabled:           envBool("OAIX_IDEMPOTENCY_ENABLED", true),
+			RecordTTL:         envDurationSeconds("OAIX_IDEMPOTENCY_TTL_SECONDS", 15*time.Minute),
+			LeaseDuration:     envDurationSeconds("OAIX_IDEMPOTENCY_LEASE_SECONDS", 2*time.Minute),
+			HeartbeatInterval: envDurationSeconds("OAIX_IDEMPOTENCY_HEARTBEAT_SECONDS", 30*time.Second),
+			WaitTimeout:       envDurationSeconds("OAIX_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS", 30*time.Minute),
+			ExecutionTimeout:  envDurationSeconds("OAIX_IDEMPOTENCY_EXECUTION_TIMEOUT_SECONDS", 30*time.Minute),
+			MaxResponseBytes:  int64(envInt("OAIX_IDEMPOTENCY_MAX_RESPONSE_BYTES", 16*1024*1024)),
 		},
 		TokenPool: TokenPoolConfig{
 			SnapshotMaxAge:       envDurationSeconds("TOKEN_POOL_SNAPSHOT_MAX_AGE_SECONDS", 10*time.Second),
@@ -289,6 +309,29 @@ func (c Config) Validate() error {
 	if c.Upstream.MaxRequestBodyBytes < 0 {
 		errs = append(errs, fmt.Errorf("UPSTREAM_MAX_REQUEST_BODY_BYTES must be zero or positive"))
 	}
+	if c.Idempotency.Enabled {
+		if c.Idempotency.RecordTTL <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_IDEMPOTENCY_TTL_SECONDS must be positive"))
+		}
+		if c.Idempotency.LeaseDuration <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_IDEMPOTENCY_LEASE_SECONDS must be positive"))
+		}
+		if c.Idempotency.RecordTTL <= c.Idempotency.LeaseDuration {
+			errs = append(errs, fmt.Errorf("OAIX_IDEMPOTENCY_TTL_SECONDS must be greater than the lease duration"))
+		}
+		if c.Idempotency.HeartbeatInterval <= 0 || c.Idempotency.HeartbeatInterval >= c.Idempotency.LeaseDuration/2 {
+			errs = append(errs, fmt.Errorf("OAIX_IDEMPOTENCY_HEARTBEAT_SECONDS must be positive and less than half the lease duration"))
+		}
+		if c.Idempotency.WaitTimeout <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS must be positive"))
+		}
+		if c.Idempotency.ExecutionTimeout <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_IDEMPOTENCY_EXECUTION_TIMEOUT_SECONDS must be positive"))
+		}
+		if c.Idempotency.MaxResponseBytes <= 0 {
+			errs = append(errs, fmt.Errorf("OAIX_IDEMPOTENCY_MAX_RESPONSE_BYTES must be positive"))
+		}
+	}
 	return errors.Join(errs...)
 }
 
@@ -317,6 +360,15 @@ func (c Config) SanitizedSummary() map[string]any {
 			"shard_count":             c.Upstream.ShardCount,
 			"max_conns_per_host":      c.Upstream.MaxConnsPerHost,
 			"max_idle_conns_per_host": c.Upstream.MaxIdleConnsPerHost,
+		},
+		"idempotency": map[string]any{
+			"enabled":            c.Idempotency.Enabled,
+			"record_ttl":         c.Idempotency.RecordTTL.String(),
+			"lease_duration":     c.Idempotency.LeaseDuration.String(),
+			"heartbeat_interval": c.Idempotency.HeartbeatInterval.String(),
+			"wait_timeout":       c.Idempotency.WaitTimeout.String(),
+			"execution_timeout":  c.Idempotency.ExecutionTimeout.String(),
+			"max_response_bytes": c.Idempotency.MaxResponseBytes,
 		},
 		"token_pool": map[string]any{
 			"snapshot_max_age":  c.TokenPool.SnapshotMaxAge.String(),

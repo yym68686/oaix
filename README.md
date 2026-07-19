@@ -55,6 +55,12 @@
 - `IMAGE_UPLOAD_MAX_BYTES`: multipart 图片上传单文件最大字节数，默认 `26214400`（25 MiB）
 - `UPSTREAM_MAX_REQUEST_BODY_BYTES`: 入站代理请求体最大字节数，默认 `0`（不限制；由上游 edge / 调用入口控制）
 - `UPSTREAM_NON_STREAM_MAX_RESPONSE_BYTES`: 非流式上游响应聚合最大字节数，默认 `67108864`（64 MiB）
+- `OAIX_IDEMPOTENCY_ENABLED`: 是否接受 `/v1/*` 请求的路由尝试级幂等协议，默认 `true`；只有显式携带 `X-OAIX-Routing-Attempt-ID` 才启用
+- `OAIX_IDEMPOTENCY_TTL_SECONDS`: 已完成响应可重放的保留时间，默认 `900`
+- `OAIX_IDEMPOTENCY_LEASE_SECONDS` / `OAIX_IDEMPOTENCY_HEARTBEAT_SECONDS`: 执行租约与续租间隔，默认 `120` / `30`
+- `OAIX_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS`: 同一尝试的并发副本等待原执行完成的最长时间，默认 `1800`
+- `OAIX_IDEMPOTENCY_EXECUTION_TIMEOUT_SECONDS`: 调用方断连后，原尝试继续完成的最长时间，默认 `1800`
+- `OAIX_IDEMPOTENCY_MAX_RESPONSE_BYTES`: 单个可重放响应的最大捕获字节数，默认 `16777216`（16 MiB）；超限响应仍正常返回，但不会缓存为可重放结果
 - `STREAM_CAPTURE_MAX_BYTES`: 流式响应中用于错误/统计解析的最大捕获字节数，默认 `8388608`（8 MiB）；超过后继续透传但停止内存捕获
 - `IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS`: `gpt-image-2` 撞到上游 `input-images` 短速率限制且未返回明确重试时间时的 scoped 冷却秒数，默认 `5`
 - `IMAGE_RATE_LIMIT_MIN_COOLDOWN_SECONDS`: 解析到 `Please try again in ...` 时的最小 scoped 冷却秒数，默认 `1`
@@ -133,6 +139,12 @@ oaix 现在区分三类 API Key：
 - 管理员 API Key：数据库 `api_keys` 中 role 为 `admin` / `readonly_admin` / `service` 的 key。`readonly_admin` 可以读取管理资源，但不能执行 POST/PATCH/DELETE。
 
 资源归属以 `owner_user_id` 为边界。用户导入的 key、OAuth 会话、导入批次、请求日志、成本聚合和 prompt-cache 亲和状态都会写入 owner 维度。管理员读取全局资源时使用 `/api/admin/*` 或旧 `/admin/*`；普通用户自助管理使用 `/api/*`。
+
+## 路由尝试级幂等
+
+受信任的路由层可在 `/v1/*` 请求上发送 `X-OAIX-Routing-Attempt-ID`。同一 owner、同一尝试 ID、同一请求指纹的并发请求只执行一次；已完成的 `<500` 响应会原样重放，并通过 `X-OAIX-Idempotency-Status` 返回 `executed` 或 `replayed`。同一尝试 ID 搭配不同请求会返回 `409`，协调存储不可用时会在调用上游前返回 `503`。
+
+该 ID 表示“路由层已经选定 OAIX 后的一次渠道尝试”，不是整个用户请求 ID。路由层主动切换到另一个渠道时必须生成新的尝试 ID；这样既能消除同一次 OAIX 调用的传输重发，又不会阻止现有的跨渠道 fallback。OAIX 的 5xx、超过捕获上限的响应和过期/失败租约不会被重放，后续同 ID 可以开启新的 generation，保持 availability-first 语义。
 
 注册只需要邮箱和密码：
 
