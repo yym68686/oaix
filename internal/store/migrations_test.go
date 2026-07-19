@@ -128,6 +128,24 @@ func TestMigrationAddsGatewayIdempotencyRecords(t *testing.T) {
 	}
 }
 
+func TestStartupMigrationsCoverEveryVersionAfterBaseline(t *testing.T) {
+	for version := startupMigrationBaseVersion + 1; version <= SchemaVersion; version++ {
+		migration, ok := startupMigrations[version]
+		if !ok {
+			t.Fatalf("missing startup migration for schema version %d", version)
+		}
+		if len(migration.statements) == 0 {
+			t.Fatalf("startup migration for schema version %d has no statements", version)
+		}
+		for index, statement := range migration.statements {
+			normalized := strings.ToLower(strings.Join(strings.Fields(statement), " "))
+			if !strings.Contains(normalized, "if not exists") {
+				t.Fatalf("startup migration version %d statement %d is not restart-safe: %s", version, index+1, statement)
+			}
+		}
+	}
+}
+
 func TestMigrationAddsBoundedRequestAnalyticsQueue(t *testing.T) {
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
 	for _, fragment := range []string{

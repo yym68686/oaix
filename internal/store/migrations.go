@@ -10,6 +10,43 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+const createGatewayIdempotencyRecordsTable = `create table if not exists gateway_idempotency_records (
+	owner_user_id bigint not null references platform_users(id) on delete cascade,
+	key_hash varchar(64) not null,
+	request_hash varchar(64) not null,
+	request_id varchar(128) not null,
+	generation bigint not null default 1,
+	state varchar(32) not null,
+	lease_token varchar(64),
+	lease_expires_at timestamptz,
+	status_code integer,
+	response_headers jsonb,
+	response_body bytea,
+	replayable boolean not null default false,
+	failure_reason varchar(128),
+	created_at timestamptz not null default now(),
+	started_at timestamptz not null default now(),
+	completed_at timestamptz,
+	updated_at timestamptz not null default now(),
+	expires_at timestamptz not null,
+	primary key(owner_user_id, key_hash)
+)`
+
+const createGatewayIdempotencyExpiryIndex = `create index if not exists ix_gateway_idempotency_records_expires_at on gateway_idempotency_records(expires_at)`
+
+type startupMigration struct {
+	statements []string
+}
+
+const startupMigrationBaseVersion = 19
+
+var startupMigrations = map[int]startupMigration{
+	20: {statements: []string{
+		createGatewayIdempotencyRecordsTable,
+		createGatewayIdempotencyExpiryIndex,
+	}},
+}
+
 var migrationStatements = []string{
 	`create table if not exists schema_migrations (
 		name text primary key,
@@ -222,28 +259,8 @@ var migrationStatements = []string{
 		stream_delivery_trace jsonb,
 		created_at timestamptz not null default now()
 	)`,
-	`create table if not exists gateway_idempotency_records (
-		owner_user_id bigint not null references platform_users(id) on delete cascade,
-		key_hash varchar(64) not null,
-		request_hash varchar(64) not null,
-		request_id varchar(128) not null,
-		generation bigint not null default 1,
-		state varchar(32) not null,
-		lease_token varchar(64),
-		lease_expires_at timestamptz,
-		status_code integer,
-		response_headers jsonb,
-		response_body bytea,
-		replayable boolean not null default false,
-		failure_reason varchar(128),
-		created_at timestamptz not null default now(),
-		started_at timestamptz not null default now(),
-		completed_at timestamptz,
-		updated_at timestamptz not null default now(),
-		expires_at timestamptz not null,
-		primary key(owner_user_id, key_hash)
-	)`,
-	`create index if not exists ix_gateway_idempotency_records_expires_at on gateway_idempotency_records(expires_at)`,
+	createGatewayIdempotencyRecordsTable,
+	createGatewayIdempotencyExpiryIndex,
 	`create table if not exists gateway_request_log_partitions (
 		partition_date date primary key,
 		table_name varchar(128) not null unique,
@@ -767,9 +784,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// MigrateForStartup keeps ordinary gateway restarts off the DDL path. The
-// explicit oaix-migrate command continues to call Migrate so operators can
-// intentionally replay idempotent schema and online-index repairs.
+// MigrateForStartup keeps ordinary gateway restarts off the DDL path and uses
+// version-specific additive migrations for upgrades. Replaying the complete
+// historical repair list in one transaction can hold unrelated table locks for
+// the duration of an old data repair, so it is reserved for bootstrapping an
+// unversioned database or an explicit oaix-migrate invocation.
 func (s *Store) MigrateForStartup(ctx context.Context) error {
 	var version int
 	err := s.pool.QueryRow(ctx, `select version from schema_migrations where name = 'oaix_go'`).Scan(&version)
@@ -777,12 +796,61 @@ func (s *Store) MigrateForStartup(ctx context.Context) error {
 		if version >= SchemaVersion {
 			return nil
 		}
-		return s.Migrate(ctx)
+		if version < startupMigrationBaseVersion {
+			return s.Migrate(ctx)
+		}
+		for targetVersion := version + 1; targetVersion <= SchemaVersion; targetVersion++ {
+			migration, ok := startupMigrations[targetVersion]
+			if !ok {
+				return fmt.Errorf("startup migration from schema version %d to %d is not defined", targetVersion-1, targetVersion)
+			}
+			if err := s.applyStartupMigration(ctx, targetVersion, migration); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	if errors.Is(err, pgx.ErrNoRows) || isUndefinedTableError(err) {
 		return s.Migrate(ctx)
 	}
 	return fmt.Errorf("read startup schema version: %w", err)
+}
+
+func (s *Store) applyStartupMigration(ctx context.Context, targetVersion int, migration startupMigration) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var currentVersion int
+	if err := tx.QueryRow(ctx, `
+		select version
+		from schema_migrations
+		where name = 'oaix_go'
+		for update
+	`).Scan(&currentVersion); err != nil {
+		return fmt.Errorf("lock startup schema version: %w", err)
+	}
+	if currentVersion >= targetVersion {
+		return tx.Commit(ctx)
+	}
+	if currentVersion != targetVersion-1 {
+		return fmt.Errorf("cannot apply startup schema version %d from current version %d", targetVersion, currentVersion)
+	}
+	for index, statement := range migration.statements {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return fmt.Errorf("startup migration version %d statement %d failed: %w\n%s", targetVersion, index+1, err, strings.TrimSpace(statement))
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		update schema_migrations
+		set version = $1, updated_at = now()
+		where name = 'oaix_go'
+	`, targetVersion); err != nil {
+		return fmt.Errorf("record startup schema version %d: %w", targetVersion, err)
+	}
+	return tx.Commit(ctx)
 }
 
 func isUndefinedTableError(err error) bool {

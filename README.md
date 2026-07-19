@@ -21,7 +21,7 @@
 ## 目录
 
 - `cmd/oaix-gateway`: Go 网关主进程，承载 OpenAI-compatible API、管理 API、token snapshot 调度、流式代理。
-- `cmd/oaix-migrate`: Go 数据库迁移工具。源码本地运行时 gateway 默认只检查 schema；容器镜像为适配 Fugue 单容器部署，默认 `OAIX_AUTO_MIGRATE_ON_STARTUP=true`，会在 gateway 启动前执行同一套幂等迁移。
+- `cmd/oaix-migrate`: Go 数据库完整迁移/修复工具。源码本地运行时 gateway 默认只检查 schema；容器镜像为适配 Fugue 单容器部署，默认 `OAIX_AUTO_MIGRATE_ON_STARTUP=true`，只按当前 schema version 执行对应的增量启动迁移，避免在线升级重放历史数据修复并长时间持有无关表锁。
 - `cmd/oaix-worker`: Go 后台 worker，当前负责 request log outbox drain。
 - `internal/*`: Go 终局实现的配置、存储、代理、token 池、日志、transport、observability 等模块。
 - `oaix_gateway/*`: Python 旧实现，保留为行为参考和回归测试来源。
@@ -184,7 +184,7 @@ docker compose up -d --build
 
 - `postgres`: PostgreSQL 16
 - `migrate`: 显式执行 Go schema migration
-- `gateway`: Go Web 控制台 + `/v1/responses`、`/v1/chat/completions`、`/v1/images/*` 网关；容器内默认启动前执行幂等迁移，避免没有独立 migration job 的部署平台启动失败
+- `gateway`: Go Web 控制台 + `/v1/responses`、`/v1/chat/completions`、`/v1/images/*` 网关；容器内默认启动前执行版本化增量迁移，避免没有独立 migration job 的部署平台启动失败
 - `worker`: Go request log outbox worker
 
 常用环境变量：

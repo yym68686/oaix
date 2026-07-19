@@ -101,6 +101,60 @@ func TestPostgresStartupMigrationSkipsDDLWhenSchemaIsCurrent(t *testing.T) {
 	}
 }
 
+func TestPostgresStartupMigrationFromVersion19DoesNotReplayHistoricalRepairs(t *testing.T) {
+	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set OAIX_TEST_DATABASE_URL to run Postgres integration fixture")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := Connect(ctx, config.DatabaseConfig{
+		URL:            configURL(dsn),
+		MaxConns:       4,
+		MinConns:       1,
+		ConnectTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Connect returned error: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	if _, err := db.pool.Exec(ctx, `drop table if exists gateway_idempotency_records`); err != nil {
+		t.Fatalf("drop version 20 table: %v", err)
+	}
+	if _, err := db.pool.Exec(ctx, `update schema_migrations set version = 19 where name = 'oaix_go'`); err != nil {
+		t.Fatalf("set schema version 19: %v", err)
+	}
+
+	lockTx, err := db.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin historical table lock: %v", err)
+	}
+	defer lockTx.Rollback(context.Background())
+	if _, err := lockTx.Exec(ctx, `lock table token_quota_snapshots in access exclusive mode`); err != nil {
+		t.Fatalf("lock historical repair table: %v", err)
+	}
+
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer startupCancel()
+	if err := db.MigrateForStartup(startupCtx); err != nil {
+		t.Fatalf("incremental startup migration touched a historical repair table: %v", err)
+	}
+	var version int
+	var tableName *string
+	if err := db.pool.QueryRow(ctx, `
+		select (select version from schema_migrations where name = 'oaix_go'),
+		       to_regclass('public.gateway_idempotency_records')::text
+	`).Scan(&version, &tableName); err != nil {
+		t.Fatalf("inspect incremental migration result: %v", err)
+	}
+	if version != SchemaVersion || tableName == nil || *tableName != "gateway_idempotency_records" {
+		t.Fatalf("unexpected incremental migration result: version=%d table=%v", version, tableName)
+	}
+}
+
 func TestPostgresGPT56CacheWriteObservability(t *testing.T) {
 	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
 	if dsn == "" {
