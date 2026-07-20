@@ -7,6 +7,7 @@ export default defineConfig(({ command }) => ({
   base: command === "serve" ? "/" : "/assets/",
   plugins: [react(), tailwindcss()],
   resolve: {
+    dedupe: ["react", "react-dom"],
     alias: {
       "@": resolve(__dirname, "frontend/src"),
     },
