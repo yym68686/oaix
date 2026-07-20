@@ -219,7 +219,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	}
 	promptCacheContext, upstreamBody := buildPromptCacheContext(r.Header, intent, bodyBytes, p.cfg.PromptCache)
 	bodyBytes = upstreamBody
-	searchAffinityContext := buildSearchAffinityContext(r.Header, intent, bodyBytes)
+	searchSessionContext := buildSearchSessionContext(intent, bodyBytes)
 	if promptCacheContext != nil && intent.Model == "" {
 		intent.Model = promptCacheContext.Model
 	}
@@ -248,8 +248,10 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		timing["prompt_cache_key_hash"] = promptCacheContext.PromptCacheKeyHash
 		timing["prompt_cache_source"] = promptCacheContext.Source
 	}
-	if searchAffinityContext != nil {
-		timing["search_affinity_id_hash"] = searchAffinityContext.IDHash
+	if searchSessionContext != nil {
+		timing["search_session_id_hash"] = searchSessionContext.IDHash
+		timing["search_account_affinity"] = false
+		timing["search_routing_mode"] = "account_failover"
 	}
 	if strings.TrimSpace(intent.SelectionMode) != "" {
 		timing["selection_mode"] = strings.TrimSpace(intent.SelectionMode)
@@ -339,14 +341,10 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		if promptCacheContext != nil {
 			tokenIntent.PromptCacheKeyHash = promptCacheContext.PromptCacheKeyHash
 		}
-		claim, affinityResult, err := p.claimToken(r.Context(), tokenIntent, promptCacheContext, searchAffinityContext)
+		claim, affinityResult, err := p.claimToken(r.Context(), tokenIntent, promptCacheContext)
 		lastAffinityResult = affinityResult
-		if affinityResult.Result != "" {
-			if searchAffinityContext != nil {
-				timing["search_affinity_result"] = affinityResult.Result
-			} else {
-				timing["cache_affinity_result"] = affinityResult.Result
-			}
+		if promptCacheContext != nil && affinityResult.Result != "" {
+			timing["cache_affinity_result"] = affinityResult.Result
 		}
 		if affinityResult.LaneIndex != nil {
 			timing["cache_affinity_lane_index"] = *affinityResult.LaneIndex
@@ -534,7 +532,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				RequestID:   requestID,
 				ValidUntil:  validUntil,
 			})
-			if searchAffinityContext == nil && attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < p.cfg.Upstream.MaxRetries {
 				continue
 			}
 			break
@@ -546,7 +544,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Invalidated, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if searchAffinityContext == nil && attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < p.cfg.Upstream.MaxRetries {
 				continue
 			}
 			break
@@ -558,7 +556,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream402Deactivated, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if searchAffinityContext == nil && attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < p.cfg.Upstream.MaxRetries {
 				continue
 			}
 			break
@@ -596,9 +594,6 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			}
 			break
 		}
-		if searchAffinityContext != nil {
-			break
-		}
 		excluded[claim.TokenID()] = struct{}{}
 		if !retry || attempt == p.cfg.Upstream.MaxRetries {
 			break
@@ -628,7 +623,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	if lastErr != nil {
 		message = lastErr.Error()
 	}
-	if searchAffinityContext != nil && lastUpstreamErrorHeaders != nil {
+	if isAlphaSearchEndpoint(intent) && lastUpstreamErrorHeaders != nil {
 		copyResponseHeaders(w.Header(), lastUpstreamErrorHeaders)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-OAIX-Request-ID", requestID)
@@ -654,21 +649,7 @@ func requiresNonFreeTokenPlan(model string) bool {
 	return normalized == "gpt-5.6-sol" || strings.HasPrefix(normalized, "gpt-5.6-sol-")
 }
 
-func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext, searchAffinityContext *SearchAffinityContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {
-	if searchAffinityContext != nil {
-		wait := p.cfg.PromptCache.PreviousOwnerWait
-		if wait <= 0 {
-			wait = p.cfg.PromptCache.PrimaryWait
-		}
-		return p.tokens.ClaimStrictAffinity(
-			ctx,
-			p.affinity,
-			intent,
-			searchAffinityContext.AffinityKey,
-			wait,
-			p.cfg.PromptCache.ResponseTTL,
-		)
-	}
+func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {
 	if promptCacheContext == nil {
 		claim, err := p.tokens.Claim(ctx, intent)
 		return claim, tokens.PromptAffinityResult{Result: claimReason(claim)}, err
