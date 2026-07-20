@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yym68686/oaix/internal/store"
@@ -22,9 +23,12 @@ type Syncer struct {
 type SyncMode string
 
 const (
-	SyncModeCheck             SyncMode = "check"
-	SyncModeSync              SyncMode = "sync"
-	sub2APIUsageFallbackLimit          = 8
+	SyncModeCheck                 SyncMode = "check"
+	SyncModeSync                  SyncMode = "sync"
+	sub2APIUsageTodayBatchLimit            = 500
+	sub2APIUsageBaselineLimit              = 32
+	sub2APIUsageFinalizationLimit          = 8
+	sub2APIUsageQueryConcurrency           = 4
 )
 
 type mappedAccountReconcileResult struct {
@@ -87,82 +91,191 @@ func (s *Syncer) SyncDueUsage(ctx context.Context) (int, error) {
 	}
 	total := 0
 	var syncErrors []error
+	type serverClock struct {
+		timezoneName string
+		location     *time.Location
+	}
+	clocks := make(map[string]serverClock)
 	for _, target := range targets {
 		if !target.Enabled {
 			continue
 		}
-		mappings, listErr := s.Store.ListDueSub2APIUsageSyncMappings(ctx, target, 500)
-		if listErr != nil {
-			syncErrors = append(syncErrors, fmt.Errorf("target %d list usage mappings: %w", target.ID, listErr))
-			continue
-		}
-		if len(mappings) == 0 {
-			continue
-		}
-		if distinctErr := store.ValidateDistinctSub2APIRemoteAccounts(mappings); distinctErr != nil {
-			_ = s.Store.MarkSub2APIUsageSyncError(ctx, target.ID, mappings, distinctErr.Error())
-			syncErrors = append(syncErrors, fmt.Errorf("target %d: %w", target.ID, distinctErr))
-			continue
-		}
-
-		accountIDs := make([]int64, 0, len(mappings))
-		for _, mapping := range mappings {
-			accountIDs = append(accountIDs, mapping.RemoteAccountID)
-		}
-		batch, batchErr := s.Client.GetAccountUsageTotalsBatch(ctx, target.BaseURL, target.AdminKey, accountIDs)
-		if batchErr == nil {
-			inputs := make([]store.Sub2APIUsageSnapshotInput, 0, len(mappings))
-			for _, mapping := range mappings {
-				usage := batch.Stats[mapping.RemoteAccountID]
-				if usage == nil {
-					batchErr = fmt.Errorf("usage total missing for remote account %d", mapping.RemoteAccountID)
-					break
-				}
-				inputs = append(inputs, usageSnapshotInput(mapping, usage, batch.ComputedAt))
-			}
-			if batchErr == nil {
-				if saveErr := s.Store.SaveSub2APIUsageSnapshots(ctx, target.ID, inputs); saveErr != nil {
-					syncErrors = append(syncErrors, fmt.Errorf("target %d save usage snapshots: %w", target.ID, saveErr))
-					continue
-				}
-				total += len(inputs)
+		clock, ok := clocks[target.BaseURL]
+		if !ok {
+			timezoneName, location, clockErr := s.Client.GetServerTimezone(ctx, target.BaseURL)
+			if clockErr != nil {
+				syncErrors = append(syncErrors, fmt.Errorf("target %d load server timezone: %w", target.ID, clockErr))
 				continue
 			}
+			clock = serverClock{timezoneName: timezoneName, location: location}
+			clocks[target.BaseURL] = clock
+		}
+		today := startOfUsageDay(time.Now(), clock.location)
+		yesterday := today.AddDate(0, 0, -1)
+
+		todaySynced, todayErr := s.syncTargetTodayUsage(ctx, target, today)
+		total += todaySynced
+		if todayErr != nil {
+			syncErrors = append(syncErrors, todayErr)
 		}
 
-		if errors.Is(batchErr, ErrUsageTotalsBatchUnsupported) || errors.Is(batchErr, ErrUsageTotalsBackfillIncomplete) {
-			fallbackMappings := mappings
-			if len(fallbackMappings) > sub2APIUsageFallbackLimit {
-				fallbackMappings = fallbackMappings[:sub2APIUsageFallbackLimit]
-			}
-			for _, mapping := range fallbackMappings {
-				usage, fallbackErr := s.Client.GetAccountUsageFallback(ctx, target.BaseURL, target.AdminKey, mapping.RemoteAccountID, mapping.MappingCreatedAt)
-				if fallbackErr != nil {
-					_ = s.Store.MarkSub2APIUsageSyncError(ctx, target.ID, []store.Sub2APIUsageSyncMapping{mapping}, fallbackErr.Error())
-					syncErrors = append(syncErrors, fmt.Errorf("target %d account %d fallback usage: %w", target.ID, mapping.RemoteAccountID, fallbackErr))
-					continue
-				}
-				input := usageSnapshotInput(mapping, &usage, usage.ComputedAt)
-				if saveErr := s.Store.SaveSub2APIUsageSnapshots(ctx, target.ID, []store.Sub2APIUsageSnapshotInput{input}); saveErr != nil {
-					syncErrors = append(syncErrors, fmt.Errorf("target %d account %d save fallback usage: %w", target.ID, mapping.RemoteAccountID, saveErr))
-					continue
-				}
-				total++
-			}
-			continue
+		baselineSynced, baselineErr := s.syncTargetUsageBaselines(ctx, target, yesterday, clock.timezoneName, clock.location)
+		total += baselineSynced
+		if baselineErr != nil {
+			syncErrors = append(syncErrors, baselineErr)
 		}
 
-		message := "unknown sub2api usage sync error"
-		if batchErr != nil {
-			message = batchErr.Error()
+		finalized, finalizeErr := s.finalizeTargetDailyUsage(ctx, target, today, clock.timezoneName)
+		total += finalized
+		if finalizeErr != nil {
+			syncErrors = append(syncErrors, finalizeErr)
 		}
-		_ = s.Store.MarkSub2APIUsageSyncError(ctx, target.ID, mappings, message)
-		syncErrors = append(syncErrors, fmt.Errorf("target %d batch usage: %s", target.ID, message))
 	}
 	return total, errors.Join(syncErrors...)
 }
 
-func usageSnapshotInput(mapping store.Sub2APIUsageSyncMapping, usage *AccountUsageTotal, batchComputedAt time.Time) store.Sub2APIUsageSnapshotInput {
+func startOfUsageDay(now time.Time, location *time.Location) time.Time {
+	local := now.In(location)
+	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+}
+
+func (s *Syncer) syncTargetTodayUsage(ctx context.Context, target store.Sub2APISyncTarget, usageDate time.Time) (int, error) {
+	mappings, err := s.Store.ListDueSub2APITodayUsageSyncMappings(ctx, target, usageDate, sub2APIUsageTodayBatchLimit)
+	if err != nil || len(mappings) == 0 {
+		return 0, err
+	}
+	if err := store.ValidateDistinctSub2APIRemoteAccounts(mappings); err != nil {
+		_ = s.Store.MarkSub2APIDailyUsageSyncError(ctx, target.ID, usageDate, mappings, err.Error())
+		return 0, fmt.Errorf("target %d validate today usage mappings: %w", target.ID, err)
+	}
+	accountIDs := make([]int64, 0, len(mappings))
+	for _, mapping := range mappings {
+		accountIDs = append(accountIDs, mapping.RemoteAccountID)
+	}
+	batch, err := s.Client.GetAccountTodayUsageBatch(ctx, target.BaseURL, target.AdminKey, accountIDs)
+	if err != nil {
+		_ = s.Store.MarkSub2APIDailyUsageSyncError(ctx, target.ID, usageDate, mappings, err.Error())
+		return 0, fmt.Errorf("target %d batch today usage: %w", target.ID, err)
+	}
+	inputs := make([]store.Sub2APIDailyUsageSnapshotInput, 0, len(mappings))
+	for _, mapping := range mappings {
+		usage := batch.Stats[mapping.RemoteAccountID]
+		if usage == nil {
+			err := fmt.Errorf("today usage missing for remote account %d", mapping.RemoteAccountID)
+			_ = s.Store.MarkSub2APIDailyUsageSyncError(ctx, target.ID, usageDate, []store.Sub2APIUsageSyncMapping{mapping}, err.Error())
+			return 0, fmt.Errorf("target %d: %w", target.ID, err)
+		}
+		inputs = append(inputs, dailyUsageSnapshotInput(mapping, usage, batch.ComputedAt, usageDate, false))
+	}
+	if err := s.Store.SaveSub2APIDailyUsageSnapshots(ctx, target.ID, inputs); err != nil {
+		return 0, fmt.Errorf("target %d save today usage: %w", target.ID, err)
+	}
+	return len(inputs), nil
+}
+
+func (s *Syncer) syncTargetUsageBaselines(ctx context.Context, target store.Sub2APISyncTarget, throughDate time.Time, timezoneName string, location *time.Location) (int, error) {
+	mappings, err := s.Store.ListSub2APIUsageBaselineMappings(ctx, target, sub2APIUsageBaselineLimit)
+	if err != nil || len(mappings) == 0 {
+		return 0, err
+	}
+	if err := store.ValidateDistinctSub2APIRemoteAccounts(mappings); err != nil {
+		_ = s.Store.MarkSub2APIUsageSyncError(ctx, target.ID, mappings, err.Error())
+		return 0, fmt.Errorf("target %d validate usage baselines: %w", target.ID, err)
+	}
+	inputs := make([]store.Sub2APIUsageSnapshotInput, 0, len(mappings))
+	var queryErrors []error
+	var mu sync.Mutex
+	semaphore := make(chan struct{}, sub2APIUsageQueryConcurrency)
+	var workers sync.WaitGroup
+	for _, mapping := range mappings {
+		mapping := mapping
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				mu.Lock()
+				queryErrors = append(queryErrors, ctx.Err())
+				mu.Unlock()
+				return
+			}
+			startDate := startOfUsageDay(mapping.MappingCreatedAt, location).Format("2006-01-02")
+			usage, queryErr := s.Client.GetAccountUsageRange(ctx, target.BaseURL, target.AdminKey, mapping.RemoteAccountID, startDate, throughDate.Format("2006-01-02"), timezoneName)
+			if queryErr != nil {
+				_ = s.Store.MarkSub2APIUsageSyncError(ctx, target.ID, []store.Sub2APIUsageSyncMapping{mapping}, queryErr.Error())
+				mu.Lock()
+				queryErrors = append(queryErrors, fmt.Errorf("target %d account %d baseline usage: %w", target.ID, mapping.RemoteAccountID, queryErr))
+				mu.Unlock()
+				return
+			}
+			input := usageSnapshotInput(mapping, &usage, usage.ComputedAt, throughDate)
+			mu.Lock()
+			inputs = append(inputs, input)
+			mu.Unlock()
+		}()
+	}
+	workers.Wait()
+	if len(inputs) > 0 {
+		if err := s.Store.SaveSub2APIUsageSnapshots(ctx, target.ID, inputs); err != nil {
+			queryErrors = append(queryErrors, fmt.Errorf("target %d save usage baselines: %w", target.ID, err))
+			return 0, errors.Join(queryErrors...)
+		}
+	}
+	return len(inputs), errors.Join(queryErrors...)
+}
+
+func (s *Syncer) finalizeTargetDailyUsage(ctx context.Context, target store.Sub2APISyncTarget, beforeDate time.Time, timezoneName string) (int, error) {
+	items, err := s.Store.ListPendingSub2APIDailyUsageFinalizations(ctx, target, beforeDate, sub2APIUsageFinalizationLimit)
+	if err != nil || len(items) == 0 {
+		return 0, err
+	}
+	inputs := make([]store.Sub2APIDailyUsageSnapshotInput, 0, len(items))
+	var queryErrors []error
+	var mu sync.Mutex
+	semaphore := make(chan struct{}, sub2APIUsageQueryConcurrency)
+	var workers sync.WaitGroup
+	for _, item := range items {
+		item := item
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				mu.Lock()
+				queryErrors = append(queryErrors, ctx.Err())
+				mu.Unlock()
+				return
+			}
+			date := item.UsageDate.Format("2006-01-02")
+			usage, queryErr := s.Client.GetAccountUsageRange(ctx, target.BaseURL, target.AdminKey, item.RemoteAccountID, date, date, timezoneName)
+			if queryErr != nil {
+				_ = s.Store.MarkSub2APIDailyUsageSyncError(ctx, target.ID, item.UsageDate, []store.Sub2APIUsageSyncMapping{item.Sub2APIUsageSyncMapping}, queryErr.Error())
+				mu.Lock()
+				queryErrors = append(queryErrors, fmt.Errorf("target %d account %d finalize %s usage: %w", target.ID, item.RemoteAccountID, date, queryErr))
+				mu.Unlock()
+				return
+			}
+			input := dailyUsageSnapshotInput(item.Sub2APIUsageSyncMapping, &usage, usage.ComputedAt, item.UsageDate, true)
+			mu.Lock()
+			inputs = append(inputs, input)
+			mu.Unlock()
+		}()
+	}
+	workers.Wait()
+	if len(inputs) > 0 {
+		if err := s.Store.SaveSub2APIDailyUsageSnapshots(ctx, target.ID, inputs); err != nil {
+			queryErrors = append(queryErrors, fmt.Errorf("target %d save finalized daily usage: %w", target.ID, err))
+			return 0, errors.Join(queryErrors...)
+		}
+	}
+	return len(inputs), errors.Join(queryErrors...)
+}
+
+func usageSnapshotInput(mapping store.Sub2APIUsageSyncMapping, usage *AccountUsageTotal, batchComputedAt time.Time, throughDate time.Time) store.Sub2APIUsageSnapshotInput {
 	computedAt := usage.ComputedAt
 	if computedAt.IsZero() {
 		computedAt = batchComputedAt
@@ -180,6 +293,30 @@ func usageSnapshotInput(mapping store.Sub2APIUsageSyncMapping, usage *AccountUsa
 		TotalRequests:    usage.TotalRequests,
 		TotalTokens:      usage.TotalTokens,
 		SourceComputedAt: &computedAt,
+		ThroughDate:      &throughDate,
+	}
+}
+
+func dailyUsageSnapshotInput(mapping store.Sub2APIUsageSyncMapping, usage *AccountUsageTotal, batchComputedAt time.Time, usageDate time.Time, finalized bool) store.Sub2APIDailyUsageSnapshotInput {
+	computedAt := usage.ComputedAt
+	if computedAt.IsZero() {
+		computedAt = batchComputedAt
+	}
+	if computedAt.IsZero() {
+		computedAt = time.Now().UTC()
+	}
+	computedAt = computedAt.UTC()
+	return store.Sub2APIDailyUsageSnapshotInput{
+		TokenID:          mapping.TokenID,
+		RemoteAccountID:  mapping.RemoteAccountID,
+		UsageDate:        usageDate,
+		AccountCostUSD:   usage.AccountCost,
+		StandardCostUSD:  usage.StandardCost,
+		UserCostUSD:      usage.UserCost,
+		TotalRequests:    usage.TotalRequests,
+		TotalTokens:      usage.TotalTokens,
+		SourceComputedAt: &computedAt,
+		Finalized:        finalized,
 	}
 }
 

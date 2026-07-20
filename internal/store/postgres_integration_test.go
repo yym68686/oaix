@@ -155,6 +155,62 @@ func TestPostgresStartupMigrationFromVersion19DoesNotReplayHistoricalRepairs(t *
 	}
 }
 
+func TestPostgresStartupMigrationFromVersion20AddsSub2APIUsageDailySnapshots(t *testing.T) {
+	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set OAIX_TEST_DATABASE_URL to run Postgres integration fixture")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := Connect(ctx, config.DatabaseConfig{
+		URL:            configURL(dsn),
+		MaxConns:       4,
+		MinConns:       1,
+		ConnectTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Connect returned error: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+	if _, err := db.pool.Exec(ctx, `drop table if exists sub2api_usage_daily_snapshots`); err != nil {
+		t.Fatalf("drop daily snapshot table: %v", err)
+	}
+	if _, err := db.pool.Exec(ctx, `alter table sub2api_usage_snapshots drop column if exists through_date`); err != nil {
+		t.Fatalf("drop baseline through date: %v", err)
+	}
+	if _, err := db.pool.Exec(ctx, `update schema_migrations set version = 20 where name = 'oaix_go'`); err != nil {
+		t.Fatalf("set schema version 20: %v", err)
+	}
+	if err := db.MigrateForStartup(ctx); err != nil {
+		t.Fatalf("MigrateForStartup returned error: %v", err)
+	}
+	var tableName *string
+	if err := db.pool.QueryRow(ctx, `select to_regclass('sub2api_usage_daily_snapshots')::text`).Scan(&tableName); err != nil {
+		t.Fatalf("check daily snapshot table: %v", err)
+	}
+	if tableName == nil || *tableName != "sub2api_usage_daily_snapshots" {
+		t.Fatalf("daily snapshot table = %v", tableName)
+	}
+	var throughDateColumn bool
+	if err := db.pool.QueryRow(ctx, `
+		select exists(
+			select 1
+			from information_schema.columns
+			where table_schema = current_schema()
+			  and table_name = 'sub2api_usage_snapshots'
+			  and column_name = 'through_date'
+		)
+	`).Scan(&throughDateColumn); err != nil {
+		t.Fatalf("check through_date column: %v", err)
+	}
+	if !throughDateColumn {
+		t.Fatal("through_date column was not added")
+	}
+}
+
 func TestPostgresGPT56CacheWriteObservability(t *testing.T) {
 	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
 	if dsn == "" {

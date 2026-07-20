@@ -44,7 +44,7 @@ type ImportBatchSummary struct {
 	AverageCombinedObservedCostUSD *float64 `json:"average_combined_observed_cost_usd,omitempty"`
 }
 
-const importSummaryObservedCostTimeout = 2 * time.Second
+const importSummaryObservedCostTimeout = 6 * time.Second
 
 type DeletedImportJob struct {
 	ImportJob
@@ -696,8 +696,8 @@ func (s *Store) importSummaryObservedCosts(ctx context.Context, tokens []Token) 
 	}
 	costCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importSummaryObservedCostTimeout)
 	defer cancel()
-	costs, err := s.TokenObservedCostsAggregateSnapshot(costCtx, tokens)
-	if err != nil {
+	costs, err := s.TokenObservedCostsCurrentSnapshot(costCtx, tokens)
+	if err != nil && !IsObservedCostsPartialError(err) {
 		return map[int64]*float64{}, false
 	}
 	return costs, true

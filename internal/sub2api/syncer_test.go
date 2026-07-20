@@ -70,16 +70,33 @@ func TestCreateAccountRequestCopiesCodexMetadata(t *testing.T) {
 
 func TestUsageSnapshotInputUsesBatchTimestampFallback(t *testing.T) {
 	computedAt := time.Date(2026, 7, 13, 3, 4, 5, 0, time.FixedZone("fixture", 8*60*60))
+	throughDate := time.Date(2026, 7, 12, 0, 0, 0, 0, time.FixedZone("fixture", 8*60*60))
 	got := usageSnapshotInput(
 		store.Sub2APIUsageSyncMapping{TokenID: 9, RemoteAccountID: 42},
 		&AccountUsageTotal{AccountCost: 1.5, StandardCost: 1.25, UserCost: 2, TotalRequests: 3, TotalTokens: 4},
 		computedAt,
+		throughDate,
 	)
 	if got.TokenID != 9 || got.RemoteAccountID != 42 || got.AccountCostUSD != 1.5 || got.TotalRequests != 3 {
 		t.Fatalf("snapshot = %#v", got)
 	}
 	if got.SourceComputedAt == nil || !got.SourceComputedAt.Equal(computedAt.UTC()) {
 		t.Fatalf("source computed at = %#v", got.SourceComputedAt)
+	}
+	if got.ThroughDate == nil || !got.ThroughDate.Equal(throughDate) {
+		t.Fatalf("through date = %#v", got.ThroughDate)
+	}
+}
+
+func TestStartOfUsageDayUsesTargetTimezone(t *testing.T) {
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := startOfUsageDay(time.Date(2026, 7, 20, 18, 30, 0, 0, time.UTC), location)
+	want := time.Date(2026, 7, 21, 0, 0, 0, 0, location)
+	if !got.Equal(want) || got.Location() != location {
+		t.Fatalf("startOfUsageDay = %s (%s), want %s (%s)", got, got.Location(), want, want.Location())
 	}
 }
 

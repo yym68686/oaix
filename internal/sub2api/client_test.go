@@ -134,6 +134,79 @@ func TestClientGetAccountUsageTotalsBatchFallsBackWhenUnavailable(t *testing.T) 
 	}
 }
 
+func TestClientGetsServerTimezoneAndTodayUsageBatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/settings/public":
+			writeSub2APISuccess(t, w, map[string]any{"server_timezone": "Asia/Shanghai"})
+		case "/api/v1/admin/accounts/today-stats/batch":
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s, want POST", r.Method)
+			}
+			var payload struct {
+				AccountIDs []int64 `json:"account_ids"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if len(payload.AccountIDs) != 2 || payload.AccountIDs[0] != 42 || payload.AccountIDs[1] != 43 {
+				t.Fatalf("payload = %#v", payload)
+			}
+			writeSub2APISuccess(t, w, map[string]any{"stats": map[string]any{
+				"42": map[string]any{"requests": 3, "tokens": 90, "cost": 1.25, "standard_cost": 1.0, "user_cost": 1.5},
+				"43": map[string]any{"requests": 0, "tokens": 0, "cost": 0, "standard_cost": 0, "user_cost": 0},
+			}})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	timezoneName, location, err := client.GetServerTimezone(t.Context(), server.URL)
+	if err != nil {
+		t.Fatalf("GetServerTimezone returned error: %v", err)
+	}
+	if timezoneName != "Asia/Shanghai" || location.String() != timezoneName {
+		t.Fatalf("timezone = %q location=%v", timezoneName, location)
+	}
+	batch, err := client.GetAccountTodayUsageBatch(t.Context(), server.URL, "admin-fixture", []int64{42, 43})
+	if err != nil {
+		t.Fatalf("GetAccountTodayUsageBatch returned error: %v", err)
+	}
+	if len(batch.Stats) != 2 || batch.Stats[42].AccountCost != 1.25 || batch.Stats[42].TotalRequests != 3 || batch.Stats[43].AccountCost != 0 {
+		t.Fatalf("batch = %#v", batch)
+	}
+}
+
+func TestClientGetAccountUsageRange(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/admin/usage/stats" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		query := r.URL.Query()
+		if query.Get("account_id") != "42" || query.Get("start_date") != "2026-07-19" || query.Get("end_date") != "2026-07-20" || query.Get("timezone") != "Asia/Shanghai" || query.Get("nocache") != "true" {
+			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+		}
+		writeSub2APISuccess(t, w, map[string]any{
+			"total_requests":     2,
+			"total_tokens":       80,
+			"total_cost":         2.5,
+			"total_actual_cost":  3.5,
+			"total_account_cost": 3.0,
+		})
+	}))
+	defer server.Close()
+
+	got, err := NewClient(server.Client()).GetAccountUsageRange(t.Context(), server.URL, "admin-fixture", 42, "2026-07-19", "2026-07-20", "Asia/Shanghai")
+	if err != nil {
+		t.Fatalf("GetAccountUsageRange returned error: %v", err)
+	}
+	if got.AccountCost != 3 || got.StandardCost != 2.5 || got.UserCost != 3.5 || got.TotalRequests != 2 {
+		t.Fatalf("result = %#v", got)
+	}
+}
+
 func TestClientGetAccountUsageFallback(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/admin/usage/stats" {

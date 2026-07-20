@@ -640,7 +640,7 @@ function ImportBatchList({
             <TableHead>数量</TableHead>
             <TableHead>进度</TableHead>
             <TableHead>变更</TableHead>
-            <TableHead>余额</TableHead>
+            <TableHead>金额</TableHead>
             <TableHead>时间</TableHead>
             <TableHead className="text-right">操作</TableHead>
           </TableRow>

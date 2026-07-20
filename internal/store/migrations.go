@@ -34,6 +34,31 @@ const createGatewayIdempotencyRecordsTable = `create table if not exists gateway
 
 const createGatewayIdempotencyExpiryIndex = `create index if not exists ix_gateway_idempotency_records_expires_at on gateway_idempotency_records(expires_at)`
 
+const addSub2APIUsageThroughDate = `alter table sub2api_usage_snapshots add column if not exists through_date date`
+
+const createSub2APIUsageDailySnapshots = `create table if not exists sub2api_usage_daily_snapshots (
+	target_id bigint not null,
+	remote_account_id bigint not null,
+	token_id integer not null,
+	usage_date date not null,
+	account_cost_usd numeric(20, 10) not null default 0,
+	standard_cost_usd numeric(20, 10) not null default 0,
+	user_cost_usd numeric(20, 10) not null default 0,
+	total_requests bigint not null default 0,
+	total_tokens bigint not null default 0,
+	source_computed_at timestamptz,
+	synced_at timestamptz,
+	finalized_at timestamptz,
+	status varchar(32) not null default 'pending',
+	error_message text,
+	created_at timestamptz not null default now(),
+	updated_at timestamptz not null default now(),
+	primary key(target_id, remote_account_id, usage_date)
+)`
+
+const createSub2APIUsageDailyTokenIndex = `create index if not exists ix_sub2api_usage_daily_token on sub2api_usage_daily_snapshots(token_id, usage_date)`
+const createSub2APIUsageDailySyncIndex = `create index if not exists ix_sub2api_usage_daily_sync on sub2api_usage_daily_snapshots(target_id, usage_date, synced_at)`
+
 type startupMigration struct {
 	statements []string
 }
@@ -44,6 +69,12 @@ var startupMigrations = map[int]startupMigration{
 	20: {statements: []string{
 		createGatewayIdempotencyRecordsTable,
 		createGatewayIdempotencyExpiryIndex,
+	}},
+	21: {statements: []string{
+		addSub2APIUsageThroughDate,
+		createSub2APIUsageDailySnapshots,
+		createSub2APIUsageDailyTokenIndex,
+		createSub2APIUsageDailySyncIndex,
 	}},
 }
 
@@ -705,6 +736,10 @@ var migrationStatements = []string{
 	)`,
 	`create index if not exists ix_sub2api_usage_snapshots_token on sub2api_usage_snapshots(token_id)`,
 	`create index if not exists ix_sub2api_usage_snapshots_synced on sub2api_usage_snapshots(target_id, synced_at)`,
+	addSub2APIUsageThroughDate,
+	createSub2APIUsageDailySnapshots,
+	createSub2APIUsageDailyTokenIndex,
+	createSub2APIUsageDailySyncIndex,
 }
 
 var onlineMigrationStatements = []string{
@@ -729,6 +764,7 @@ var onlineMigrationStatements = []string{
 
 var downMigrationStatements = []string{
 	`drop table if exists gateway_idempotency_records`,
+	`drop table if exists sub2api_usage_daily_snapshots`,
 	`drop table if exists sub2api_usage_snapshots`,
 	`drop table if exists sub2api_sync_mappings`,
 	`drop table if exists sub2api_sync_runs`,

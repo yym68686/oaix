@@ -87,13 +87,15 @@ type ModelStat struct {
 }
 
 const (
-	requestTokenCostReconcileSettingKey  = "request_token_costs_go_recorded_reconciled_at"
-	requestAnalyticsBackfillSettingKey   = "request_analytics_queue_backfill_v1"
-	requestAnalyticsMaintenanceLockKey   = "request_analytics_maintenance_v1"
+	requestTokenCostReconcileSettingKey = "request_token_costs_go_recorded_reconciled_at"
+	requestAnalyticsBackfillSettingKey  = "request_analytics_queue_backfill_v1"
+	requestAnalyticsMaintenanceLockKey  = "request_analytics_maintenance_v1"
 	// Production EXPLAIN ANALYZE showed this ID range stays on the bounded
 	// partial-index plan even while the full pending index is heavily bloated.
 	requestAnalyticsLegacyBackfillWindow = int64(6_000)
 	requestAnalyticsQueueBatchSize       = 500
+	requestAnalyticsMaxBatchesPerRun     = 4
+	requestAnalyticsStatementTimeout     = 10 * time.Second
 )
 
 const aggregateRequestTokenCostsSQL = `
@@ -464,26 +466,44 @@ func (s *Store) RequestLogSummary(ctx context.Context, hours int) (RequestLogSum
 }
 
 func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) {
+	var total int64
+	for batchIndex := 0; batchIndex < requestAnalyticsMaxBatchesPerRun; batchIndex++ {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		updated, claimed, err := s.aggregateRequestHourlyStatsBatch(ctx)
+		total += updated
+		if err != nil {
+			return total, err
+		}
+		if claimed < requestAnalyticsQueueBatchSize {
+			break
+		}
+	}
+	return total, s.backfillRequestAnalyticsQueue(ctx)
+}
+
+func (s *Store) aggregateRequestHourlyStatsBatch(ctx context.Context) (int64, int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx, `set local lock_timeout = '500ms'`); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	if _, err := tx.Exec(ctx, `set local statement_timeout = '1s'`); err != nil {
-		return 0, err
+	if _, err := tx.Exec(ctx, `select set_config('statement_timeout', $1, true)`, requestAnalyticsStatementTimeout.String()); err != nil {
+		return 0, 0, err
 	}
 	var locked bool
 	if err := tx.QueryRow(ctx, `select pg_try_advisory_xact_lock(hashtext($1))`, requestAnalyticsMaintenanceLockKey).Scan(&locked); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if !locked {
 		if err := tx.Commit(ctx); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
-		return 0, nil
+		return 0, 0, nil
 	}
 	rows, err := tx.Query(ctx, `
 		select request_log_id
@@ -493,27 +513,27 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 		for update skip locked
 	`, requestAnalyticsQueueBatchSize)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	requestLogIDs := make([]int64, 0, requestAnalyticsQueueBatchSize)
 	for rows.Next() {
 		var requestLogID int64
 		if err := rows.Scan(&requestLogID); err != nil {
 			rows.Close()
-			return 0, err
+			return 0, 0, err
 		}
 		requestLogIDs = append(requestLogIDs, requestLogID)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	ids := postgresIntIDs(requestLogIDs)
 	if len(ids) == 0 {
 		if err := tx.Commit(ctx); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
-		return 0, s.backfillRequestAnalyticsQueue(ctx)
+		return 0, 0, nil
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -569,10 +589,10 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 			duration_count = gateway_request_hourly_stats.duration_count + excluded.duration_count,
 			updated_at = now()
 	`, ids); err != nil {
-		return 0, err
+		return 0, len(ids), err
 	}
 	if _, err := tx.Exec(ctx, aggregateRequestTokenCostsSQL, ids); err != nil {
-		return 0, err
+		return 0, len(ids), err
 	}
 	updated, err := tx.Exec(ctx, `
 		update gateway_request_logs
@@ -582,15 +602,15 @@ func (s *Store) AggregateRequestHourlyStats(ctx context.Context) (int64, error) 
 		  and finished_at is not null
 	`, ids)
 	if err != nil {
-		return 0, err
+		return 0, len(ids), err
 	}
 	if _, err := tx.Exec(ctx, `delete from gateway_request_analytics_queue where request_log_id = any($1::integer[])`, ids); err != nil {
-		return 0, err
+		return 0, len(ids), err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, err
+		return 0, len(ids), err
 	}
-	return updated.RowsAffected(), s.backfillRequestAnalyticsQueue(ctx)
+	return updated.RowsAffected(), len(ids), nil
 }
 
 func (s *Store) backfillRequestAnalyticsQueue(ctx context.Context) error {
@@ -602,7 +622,7 @@ func (s *Store) backfillRequestAnalyticsQueue(ctx context.Context) error {
 	if _, err := tx.Exec(ctx, `set local lock_timeout = '500ms'`); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `set local statement_timeout = '1s'`); err != nil {
+	if _, err := tx.Exec(ctx, `select set_config('statement_timeout', $1, true)`, requestAnalyticsStatementTimeout.String()); err != nil {
 		return err
 	}
 	var locked bool
@@ -701,6 +721,18 @@ func (s *Store) TokenObservedCostsSnapshot(ctx context.Context, tokens []Token) 
 // heap. Wide list views use this bounded snapshot so one response cannot start
 // a lifetime account-log scan.
 func (s *Store) TokenObservedCostsAggregateSnapshot(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
+	return s.tokenObservedCostsAggregateSnapshot(ctx, tokens, false)
+}
+
+// TokenObservedCostsCurrentSnapshot returns the reconciled aggregate plus
+// completed request logs that are still waiting in the analytics queue. The
+// pending-only lookup uses the bounded partial index, so import summaries stay
+// current without falling back to a lifetime request-log scan.
+func (s *Store) TokenObservedCostsCurrentSnapshot(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
+	return s.tokenObservedCostsAggregateSnapshot(ctx, tokens, true)
+}
+
+func (s *Store) tokenObservedCostsAggregateSnapshot(ctx context.Context, tokens []Token, includePendingLogs bool) (map[int64]*float64, error) {
 	result := make(map[int64]*float64, len(tokens))
 	requestedIDs := make([]int64, 0, len(tokens))
 	requested := map[int64]struct{}{}
@@ -731,6 +763,12 @@ func (s *Store) TokenObservedCostsAggregateSnapshot(ctx context.Context, tokens 
 	}
 	if err := s.addRequestCostsByTokenAggregate(ctx, canonicalByLogTokenID, result); err != nil {
 		return nil, err
+	}
+	if includePendingLogs {
+		if err := s.addRequestCostsByTokenLogs(ctx, canonicalByLogTokenID, result, true); err != nil {
+			fillMissingObservedCosts(tokens, result)
+			return result, &observedCostsPartialError{step: "pending_token_logs", err: err}
+		}
 	}
 	fillMissingObservedCosts(tokens, result)
 	return result, nil

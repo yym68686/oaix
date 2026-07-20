@@ -125,6 +125,22 @@ type AccountUsageTotalsBatch struct {
 	ComputedAt       time.Time                    `json:"computed_at"`
 }
 
+type accountTodayStats struct {
+	Requests     int64   `json:"requests"`
+	Tokens       int64   `json:"tokens"`
+	Cost         float64 `json:"cost"`
+	StandardCost float64 `json:"standard_cost"`
+	UserCost     float64 `json:"user_cost"`
+}
+
+type accountTodayStatsBatch struct {
+	Stats map[int64]*accountTodayStats `json:"stats"`
+}
+
+type publicSettings struct {
+	ServerTimezone string `json:"server_timezone"`
+}
+
 type accountUsageStats struct {
 	TotalRequests    int64   `json:"total_requests"`
 	TotalTokens      int64   `json:"total_tokens"`
@@ -267,6 +283,53 @@ func (c *Client) GetAccountUsageTotalsBatch(ctx context.Context, baseURL string,
 	return result, nil
 }
 
+func (c *Client) GetServerTimezone(ctx context.Context, baseURL string) (string, *time.Location, error) {
+	var settings publicSettings
+	if err := c.doJSON(ctx, http.MethodGet, baseURL, "", "/settings/public", nil, &settings); err != nil {
+		return "", nil, err
+	}
+	timezoneName := strings.TrimSpace(settings.ServerTimezone)
+	if timezoneName == "" {
+		return "", nil, errors.New("sub2api server timezone is missing")
+	}
+	location, err := time.LoadLocation(timezoneName)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid sub2api server timezone %q: %w", timezoneName, err)
+	}
+	return timezoneName, location, nil
+}
+
+func (c *Client) GetAccountTodayUsageBatch(ctx context.Context, baseURL string, adminKey string, accountIDs []int64) (AccountUsageTotalsBatch, error) {
+	result := AccountUsageTotalsBatch{
+		Stats:            make(map[int64]*AccountUsageTotal, len(accountIDs)),
+		BackfillComplete: true,
+		ComputedAt:       time.Now().UTC(),
+	}
+	if len(accountIDs) == 0 {
+		return result, nil
+	}
+	var payload accountTodayStatsBatch
+	if err := c.doJSON(ctx, http.MethodPost, baseURL, adminKey, "/admin/accounts/today-stats/batch", map[string]any{"account_ids": accountIDs}, &payload); err != nil {
+		return AccountUsageTotalsBatch{}, err
+	}
+	for _, accountID := range accountIDs {
+		stats := payload.Stats[accountID]
+		if stats == nil {
+			return AccountUsageTotalsBatch{}, fmt.Errorf("today usage missing for remote account %d", accountID)
+		}
+		result.Stats[accountID] = &AccountUsageTotal{
+			AccountID:     accountID,
+			TotalRequests: stats.Requests,
+			TotalTokens:   stats.Tokens,
+			AccountCost:   stats.Cost,
+			StandardCost:  stats.StandardCost,
+			UserCost:      stats.UserCost,
+			ComputedAt:    result.ComputedAt,
+		}
+	}
+	return result, nil
+}
+
 func (c *Client) GetAccountUsageFallback(ctx context.Context, baseURL string, adminKey string, accountID int64, from time.Time) (AccountUsageTotal, error) {
 	if accountID <= 0 {
 		return AccountUsageTotal{}, fmt.Errorf("sub2api account id is required")
@@ -277,11 +340,36 @@ func (c *Client) GetAccountUsageFallback(ctx context.Context, baseURL string, ad
 	if from.Before(time.Now().UTC().AddDate(0, 0, -89)) {
 		return AccountUsageTotal{}, ErrUsageFallbackWindowExceeded
 	}
+	return c.GetAccountUsageRange(ctx, baseURL, adminKey, accountID, from.UTC().Format("2006-01-02"), time.Now().UTC().Format("2006-01-02"), "UTC")
+}
+
+func (c *Client) GetAccountUsageRange(ctx context.Context, baseURL string, adminKey string, accountID int64, startDate string, endDate string, timezoneName string) (AccountUsageTotal, error) {
+	if accountID <= 0 {
+		return AccountUsageTotal{}, fmt.Errorf("sub2api account id is required")
+	}
+	location, err := time.LoadLocation(strings.TrimSpace(timezoneName))
+	if err != nil {
+		return AccountUsageTotal{}, fmt.Errorf("invalid usage timezone %q: %w", timezoneName, err)
+	}
+	start, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(startDate), location)
+	if err != nil {
+		return AccountUsageTotal{}, fmt.Errorf("invalid usage start date %q: %w", startDate, err)
+	}
+	end, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(endDate), location)
+	if err != nil {
+		return AccountUsageTotal{}, fmt.Errorf("invalid usage end date %q: %w", endDate, err)
+	}
+	if end.Before(start) {
+		return AccountUsageTotal{AccountID: accountID, ComputedAt: time.Now().UTC()}, nil
+	}
+	if start.Before(end.AddDate(0, 0, -89)) {
+		return AccountUsageTotal{}, ErrUsageFallbackWindowExceeded
+	}
 	values := url.Values{}
 	values.Set("account_id", strconv.FormatInt(accountID, 10))
-	values.Set("start_date", from.UTC().Format("2006-01-02"))
-	values.Set("end_date", time.Now().UTC().Format("2006-01-02"))
-	values.Set("timezone", "UTC")
+	values.Set("start_date", start.Format("2006-01-02"))
+	values.Set("end_date", end.Format("2006-01-02"))
+	values.Set("timezone", timezoneName)
 	values.Set("nocache", "true")
 	var stats accountUsageStats
 	if err := c.doJSON(ctx, http.MethodGet, baseURL, adminKey, "/admin/usage/stats?"+values.Encode(), nil, &stats); err != nil {

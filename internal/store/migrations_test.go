@@ -96,8 +96,8 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 }
 
 func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
-	if SchemaVersion != 20 {
-		t.Fatalf("unexpected schema version: got %d want 20", SchemaVersion)
+	if SchemaVersion != 21 {
+		t.Fatalf("unexpected schema version: got %d want 21", SchemaVersion)
 	}
 
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
@@ -179,6 +179,11 @@ func TestMigrationAddsSub2APIUsageSnapshots(t *testing.T) {
 		"create table if not exists sub2api_usage_snapshots",
 		"primary key(target_id, remote_account_id)",
 		"ix_sub2api_usage_snapshots_token",
+		"add column if not exists through_date date",
+		"create table if not exists sub2api_usage_daily_snapshots",
+		"primary key(target_id, remote_account_id, usage_date)",
+		"ix_sub2api_usage_daily_token",
+		"ix_sub2api_usage_daily_sync",
 	} {
 		if !strings.Contains(joined, fragment) {
 			t.Fatalf("missing sub2api usage snapshot migration fragment %q", fragment)

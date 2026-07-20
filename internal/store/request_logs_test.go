@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAggregateRequestHourlyStatsTokenCostsGroupByTokenOnly(t *testing.T) {
@@ -32,6 +33,35 @@ func TestRequestAnalyticsQueueOnlyAggregatesClaimedIDs(t *testing.T) {
 	}
 	if strings.Contains(sql, "order by id") || strings.Contains(sql, "limit 5000") {
 		t.Fatalf("token aggregation still discovers work from the request-log heap: %s", sql)
+	}
+}
+
+func TestCurrentObservedCostSnapshotAddsOnlyPendingLogs(t *testing.T) {
+	source, err := os.ReadFile("request_logs.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func (s *Store) TokenObservedCostsCurrentSnapshot")
+	if start < 0 {
+		t.Fatal("TokenObservedCostsCurrentSnapshot source not found")
+	}
+	endOffset := strings.Index(text[start:], "func (s *Store) tokenObservedCosts(")
+	if endOffset < 0 {
+		t.Fatal("tokenObservedCosts boundary not found")
+	}
+	body := compactSQL(text[start : start+endOffset])
+	for _, fragment := range []string{
+		"tokenobservedcostsaggregatesnapshot(ctx, tokens, true)",
+		"addrequestcostsbytokenaggregate",
+		"addrequestcostsbytokenlogs(ctx, canonicalbylogtokenid, result, true)",
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("current observed cost snapshot missing %q: %s", fragment, body)
+		}
+	}
+	if strings.Contains(body, "addrequestcostsbyuniqueaccountfallback") {
+		t.Fatalf("current observed cost snapshot must not scan lifetime account logs: %s", body)
 	}
 }
 
@@ -66,6 +96,12 @@ func TestRequestAnalyticsQueueEnqueuesOnlyFinishedPendingLogs(t *testing.T) {
 	}
 	if requestAnalyticsQueueBatchSize != 500 {
 		t.Fatalf("analytics queue batch size = %d, want 500", requestAnalyticsQueueBatchSize)
+	}
+	if requestAnalyticsMaxBatchesPerRun != 4 {
+		t.Fatalf("analytics max batches = %d, want 4", requestAnalyticsMaxBatchesPerRun)
+	}
+	if requestAnalyticsStatementTimeout != 10*time.Second {
+		t.Fatalf("analytics statement timeout = %s, want 10s", requestAnalyticsStatementTimeout)
 	}
 }
 
@@ -144,13 +180,13 @@ func TestAggregateObservedCostSnapshotAvoidsRequestLogFallback(t *testing.T) {
 	if start < 0 {
 		t.Fatal("TokenObservedCostsAggregateSnapshot source not found")
 	}
-	endOffset := strings.Index(text[start:], "func (s *Store) tokenObservedCosts")
+	endOffset := strings.Index(text[start:], "func (s *Store) TokenObservedCostsCurrentSnapshot")
 	if endOffset < 0 {
-		t.Fatal("tokenObservedCosts source not found")
+		t.Fatal("TokenObservedCostsCurrentSnapshot source not found")
 	}
 	body := text[start : start+endOffset]
-	if !strings.Contains(body, "addRequestCostsByTokenAggregate") {
-		t.Fatalf("aggregate snapshot does not read token aggregates: %s", body)
+	if !strings.Contains(body, "tokenObservedCostsAggregateSnapshot(ctx, tokens, false)") {
+		t.Fatalf("aggregate snapshot does not select aggregate-only mode: %s", body)
 	}
 	for _, forbidden := range []string{"addRequestCostsByTokenLogs", "addRequestCostsByUniqueAccountFallback"} {
 		if strings.Contains(body, forbidden) {
