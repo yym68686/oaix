@@ -59,6 +59,78 @@ type Sub2APIUsageCost struct {
 	Stale           bool
 }
 
+// Sub2APIAccountCostsByTokens loads only the account cost consumed by import
+// summaries. The full Sub2APIUsageByTokens query also computes stale state and
+// other counters used by detail views, which are not part of this list path.
+func (s *Store) Sub2APIAccountCostsByTokens(ctx context.Context, tokens []Token) (map[int64]float64, error) {
+	result := make(map[int64]float64, len(tokens))
+	requestedIDs := make([]int64, 0, len(tokens))
+	requested := make(map[int64]struct{}, len(tokens))
+	for _, token := range tokens {
+		if token.ID <= 0 {
+			continue
+		}
+		if _, exists := requested[token.ID]; exists {
+			continue
+		}
+		requested[token.ID] = struct{}{}
+		requestedIDs = append(requestedIDs, token.ID)
+		result[token.ID] = 0
+	}
+	if len(requestedIDs) == 0 {
+		return result, nil
+	}
+
+	canonicalBySnapshotTokenID, err := s.canonicalTokenMap(ctx, requestedIDs, requested)
+	if err != nil {
+		return nil, err
+	}
+	snapshotTokenIDs := make([]int64, 0, len(canonicalBySnapshotTokenID))
+	for tokenID := range canonicalBySnapshotTokenID {
+		snapshotTokenIDs = append(snapshotTokenIDs, tokenID)
+	}
+	if len(snapshotTokenIDs) == 0 {
+		return result, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		with per_account as (
+			select baseline.token_id,
+			       case when baseline.through_date is null
+				then baseline.account_cost_usd
+				else baseline.account_cost_usd + coalesce(sum(daily.account_cost_usd) filter (where daily.status = 'synced' and daily.usage_date > baseline.through_date), 0)
+			       end as account_cost_usd
+			from sub2api_usage_snapshots baseline
+			left join sub2api_usage_daily_snapshots daily
+			  on daily.target_id = baseline.target_id
+			 and daily.remote_account_id = baseline.remote_account_id
+			where baseline.token_id = any($1::integer[])
+			group by baseline.target_id, baseline.remote_account_id, baseline.token_id, baseline.through_date, baseline.account_cost_usd
+		)
+		select token_id,
+		       coalesce(sum(account_cost_usd), 0)::float8
+		from per_account
+		group by token_id
+	`, postgresIntIDs(snapshotTokenIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tokenID int64
+		var accountCost float64
+		if err := rows.Scan(&tokenID, &accountCost); err != nil {
+			return nil, err
+		}
+		canonicalID, ok := canonicalBySnapshotTokenID[tokenID]
+		if !ok {
+			continue
+		}
+		result[canonicalID] = roundCostUSD(result[canonicalID] + accountCost)
+	}
+	return result, rows.Err()
+}
+
 func (s *Store) ListSub2APIUsageBaselineMappings(ctx context.Context, target Sub2APISyncTarget, limit int) ([]Sub2APIUsageSyncMapping, error) {
 	if target.ID <= 0 || !target.Enabled {
 		return nil, nil

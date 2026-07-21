@@ -628,7 +628,7 @@ func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includ
 	}
 
 	costByTokenID := map[int64]*float64{}
-	remoteUsageByTokenID := map[int64]Sub2APIUsageCost{}
+	remoteUsageByTokenID := map[int64]float64{}
 	observedCostLoaded := false
 	remoteUsageLoaded := false
 	if includeObservedCost && len(tokens) > 0 {
@@ -660,7 +660,7 @@ func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includ
 				if value := costByTokenID[tokenID]; value != nil {
 					totalCost += *value
 				}
-				remoteCost += remoteUsageByTokenID[tokenID].AccountCostUSD
+				remoteCost += remoteUsageByTokenID[tokenID]
 			}
 		}
 		summaries[index].TokenCount = present
@@ -718,15 +718,15 @@ func (s *Store) listImportSummaryTokensByIDs(ctx context.Context, tokenIDs []int
 	return tokens, rows.Err()
 }
 
-func (s *Store) importSummarySub2APIUsage(ctx context.Context, tokens []Token) (map[int64]Sub2APIUsageCost, bool) {
+func (s *Store) importSummarySub2APIUsage(ctx context.Context, tokens []Token) (map[int64]float64, bool) {
 	if len(tokens) == 0 {
-		return map[int64]Sub2APIUsageCost{}, true
+		return map[int64]float64{}, true
 	}
 	usageCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importSummaryObservedCostTimeout)
 	defer cancel()
-	usage, err := s.Sub2APIUsageByTokens(usageCtx, tokens)
+	usage, err := s.Sub2APIAccountCostsByTokens(usageCtx, tokens)
 	if err != nil {
-		return map[int64]Sub2APIUsageCost{}, false
+		return map[int64]float64{}, false
 	}
 	return usage, true
 }
