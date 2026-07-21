@@ -16,7 +16,7 @@ type fakeRefreshClient struct{}
 
 func (fakeRefreshClient) Refresh(ctx context.Context, refreshToken string) (oauth.RefreshResult, error) {
 	return oauth.RefreshResult{
-		AccessToken:  "at-" + refreshToken,
+		AccessToken:  "access-" + refreshToken,
 		RefreshToken: "rt-next",
 		AccountID:    "acct-1",
 		Email:        "user@example.com",
@@ -93,6 +93,10 @@ func TestWorkerValidateBatchAccessTokens(t *testing.T) {
 	if updates[0].Status != string(ItemValidated) || updates[0].ValidatedPayload["access_token"] != "at-1" {
 		t.Fatalf("unexpected first update: %+v", updates[0])
 	}
+	if updates[0].ValidatedPayload["auth_mode"] != store.CodexPersonalAccessTokenAuthMode ||
+		updates[0].ValidatedPayload["openai_auth_mode"] != store.CodexPersonalAccessTokenLegacyAuthMode {
+		t.Fatalf("personal access token mode was not normalized: %+v", updates[0].ValidatedPayload)
+	}
 	if updates[1].Status != string(ItemFailed) || updates[1].ErrorMessage == "" {
 		t.Fatalf("unexpected second update: %+v", updates[1])
 	}
@@ -118,13 +122,50 @@ func TestWorkerValidateBatchRefreshTokens(t *testing.T) {
 	if updates[0].Status != string(ItemValidated) {
 		t.Fatalf("unexpected status: %+v", updates[0])
 	}
-	if updates[0].ValidatedPayload["access_token"] != "at-rt-1" {
+	if updates[0].ValidatedPayload["access_token"] != "access-rt-1" {
 		t.Fatalf("access token was not refreshed: %+v", updates[0].ValidatedPayload)
 	}
 	if updates[0].ValidatedPayload["refresh_token"] != "rt-next" ||
 		updates[0].ValidatedPayload["account_id"] != "acct-1" ||
 		updates[0].ValidatedPayload["plan_type"] != "pro" {
 		t.Fatalf("refresh metadata was not preserved: %+v", updates[0].ValidatedPayload)
+	}
+}
+
+func TestWorkerValidateBatchPersonalAccessTokenPreservesNestedMetadata(t *testing.T) {
+	worker := &Worker{Validator: TokenPayloadValidator{}}
+	updates := worker.ValidateBatch(context.Background(), []store.ImportItem{{
+		ID: 1,
+		Payload: map[string]any{
+			"name":     "pat@example.com",
+			"platform": "openai",
+			"type":     "oauth",
+			"credentials": map[string]any{
+				"access_token":               "at-personal-token",
+				"refresh_token":              "",
+				"chatgpt_account_id":         "workspace-123",
+				"chatgpt_user_id":            "user-123",
+				"chatgpt_plan_type":          "team",
+				"email":                      "pat@example.com",
+				"chatgpt_account_is_fedramp": false,
+			},
+		},
+	}})
+	if len(updates) != 1 || updates[0].Status != string(ItemValidated) {
+		t.Fatalf("unexpected update: %+v", updates)
+	}
+	payload := updates[0].ValidatedPayload
+	if payload["access_token"] != "at-personal-token" ||
+		payload["chatgpt_account_id"] != "workspace-123" ||
+		payload["chatgpt_user_id"] != "user-123" ||
+		payload["plan_type"] != "team" ||
+		payload["email"] != "pat@example.com" ||
+		payload["auth_mode"] != store.CodexPersonalAccessTokenAuthMode ||
+		payload["openai_auth_mode"] != store.CodexPersonalAccessTokenLegacyAuthMode {
+		t.Fatalf("personal access token metadata was not preserved: %#v", payload)
+	}
+	if payload["chatgpt_account_is_fedramp"] != false {
+		t.Fatalf("FedRAMP metadata was not preserved: %#v", payload)
 	}
 }
 

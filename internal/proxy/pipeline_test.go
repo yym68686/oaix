@@ -672,34 +672,96 @@ func TestProxyAlphaSearchFailsOverAcrossAccounts(t *testing.T) {
 	}
 }
 
-func TestProxyAlphaSearchDoesNotRefreshOrDeactivateAccessTokenOnlyOnUnstructured401(t *testing.T) {
+func TestProxyAlphaSearch401OnlyFailsOverWithoutGlobalTokenState(t *testing.T) {
+	tests := []struct {
+		name         string
+		refreshToken string
+		body         string
+	}{
+		{name: "access only", refreshToken: store.AccessTokenOnlyRefreshTokenPrefix + "fixture", body: "Unauthorized"},
+		{name: "refreshable OAuth", refreshToken: "refresh-token-a", body: `{"error":{"code":"no_matching_rule","message":"Unauthorized"}}`},
+		{name: "structured invalidation", refreshToken: "refresh-token-a", body: `{"error":{"code":"token_invalidated","message":"authentication token invalidated"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int64
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if calls.Add(1) == 1 {
+					w.WriteHeader(http.StatusUnauthorized)
+					_, _ = io.WriteString(w, tt.body)
+					return
+				}
+				_, _ = io.WriteString(w, `{"encrypted_output":null,"output":"recovered on another account"}`)
+			}))
+			defer upstream.Close()
+
+			now := time.Now().UTC()
+			accountA := "account-a"
+			accountB := "account-b"
+			firstLastUsed := now
+			fakes := &fakeProxyStore{
+				tokens: []store.Token{
+					{ID: 1, AccessToken: "access-token-a", RefreshToken: tt.refreshToken, AccountID: &accountA, IsActive: true, LastUsedAt: &firstLastUsed, CreatedAt: now, UpdatedAt: now},
+					{ID: 2, AccessToken: "access-token-b", RefreshToken: "refresh-token-b", AccountID: &accountB, IsActive: true, CreatedAt: now, UpdatedAt: now},
+				},
+				tokenErrorEvents: make(chan tokenErrorEvent, 1),
+			}
+			pipeline := newProxyPipelineTestHarness(t, upstream.URL+"/v1/responses", 2, fakes)
+			oauthClient := &countingProxyOAuthClient{}
+			pipeline.SetOAuthClient(oauthClient)
+			req := httptest.NewRequest(http.MethodPost, alphaSearchEndpoint, strings.NewReader(`{"id":"session-auth-failover","model":"gpt-5.6-terra","commands":{"search_query":[{"q":"news"}]}}`))
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			pipeline.Proxy(recorder, req, RequestIntent{Endpoint: alphaSearchEndpoint, Model: "gpt-5.6-terra", UpstreamAccept: "application/json"})
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if got := oauthClient.calls.Load(); got != 0 {
+				t.Fatalf("OAuth refresh calls = %d, want 0", got)
+			}
+			select {
+			case event := <-fakes.tokenErrorEvents:
+				t.Fatalf("alpha-search 401 changed global token state: %+v", event)
+			case <-time.After(100 * time.Millisecond):
+			}
+			fakes.mu.Lock()
+			defer fakes.mu.Unlock()
+			if !fakes.tokens[0].IsActive || fakes.tokens[0].DisabledAt != nil || fakes.tokens[0].CooldownUntil != nil {
+				t.Fatalf("alpha-search 401 changed token availability: %+v", fakes.tokens[0])
+			}
+			if len(fakes.attempts) != 2 || fakes.attempts[0].Deactivated || fakes.attempts[0].CooldownUntil != nil {
+				t.Fatalf("attempts = %+v", fakes.attempts)
+			}
+			if fakes.attempts[0].Outcome != string(OutcomeAlphaSearch401Failover) {
+				t.Fatalf("first outcome = %q, want %q", fakes.attempts[0].Outcome, OutcomeAlphaSearch401Failover)
+			}
+		})
+	}
+}
+
+func TestProxyAlphaSearchSkipsPersonalAccessTokenBeforeUpstream(t *testing.T) {
 	var calls atomic.Int64
+	var authorization string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		authorization = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		if calls.Add(1) == 1 {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = io.WriteString(w, "Unauthorized")
-			return
-		}
-		_, _ = io.WriteString(w, `{"encrypted_output":null,"output":"recovered on another account"}`)
+		_, _ = io.WriteString(w, `{"encrypted_output":null,"output":"direct search result"}`)
 	}))
 	defer upstream.Close()
 
 	now := time.Now().UTC()
-	accountA := "account-a"
-	accountB := "account-b"
-	accessOnlyLastUsed := now
-	fakes := &fakeProxyStore{
-		tokens: []store.Token{
-			{ID: 1, AccessToken: "access-only-token", RefreshToken: store.AccessTokenOnlyRefreshTokenPrefix + "fixture", AccountID: &accountA, IsActive: true, LastUsedAt: &accessOnlyLastUsed, CreatedAt: now, UpdatedAt: now},
-			{ID: 2, AccessToken: "fallback-token", RefreshToken: "refresh-token", AccountID: &accountB, IsActive: true, CreatedAt: now, UpdatedAt: now},
-		},
-		tokenErrorEvents: make(chan tokenErrorEvent, 1),
-	}
+	patAccount := "pat-account"
+	oauthAccount := "oauth-account"
+	fakes := &fakeProxyStore{tokens: []store.Token{
+		{ID: 1, AccessToken: "at-personal-token", RefreshToken: store.AccessTokenOnlyRefreshTokenPrefix + "pat", AccountID: &patAccount, IsActive: true, CreatedAt: now, UpdatedAt: now},
+		{ID: 2, AccessToken: "oauth-access-token", RefreshToken: "oauth-refresh-token", AccountID: &oauthAccount, IsActive: true, CreatedAt: now, UpdatedAt: now},
+	}}
 	pipeline := newProxyPipelineTestHarness(t, upstream.URL+"/v1/responses", 2, fakes)
-	oauthClient := &countingProxyOAuthClient{}
-	pipeline.SetOAuthClient(oauthClient)
-	req := httptest.NewRequest(http.MethodPost, alphaSearchEndpoint, strings.NewReader(`{"id":"session-access-only","model":"gpt-5.6-terra","commands":{"search_query":[{"q":"news"}]}}`))
+	req := httptest.NewRequest(http.MethodPost, alphaSearchEndpoint, strings.NewReader(`{"id":"session-pat-filter","model":"gpt-5.6-terra","commands":{"search_query":[{"q":"news"}]}}`))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 
@@ -708,27 +770,83 @@ func TestProxyAlphaSearchDoesNotRefreshOrDeactivateAccessTokenOnlyOnUnstructured
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
 	}
-	if got := oauthClient.calls.Load(); got != 0 {
-		t.Fatalf("OAuth refresh calls = %d, want 0", got)
+	if calls.Load() != 1 || authorization != "Bearer oauth-access-token" {
+		t.Fatalf("upstream calls=%d authorization=%q, want one non-PAT request", calls.Load(), authorization)
+	}
+}
+
+func TestProxyAlphaSearchPATOnlyPoolReturnsUnavailableWithoutUpstreamCall(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{tokens: []store.Token{{
+		ID: 1, AccessToken: "at-personal-token", RefreshToken: store.AccessTokenOnlyRefreshTokenPrefix + "pat", IsActive: true, CreatedAt: now, UpdatedAt: now,
+	}}}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL+"/v1/responses", 2, fakes)
+	req := httptest.NewRequest(http.MethodPost, alphaSearchEndpoint, strings.NewReader(`{"id":"session-pat-only","model":"gpt-5.6-terra","commands":{"search_query":[{"q":"news"}]}}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: alphaSearchEndpoint, Model: "gpt-5.6-terra", UpstreamAccept: "application/json"})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("PAT-only alpha-search made %d upstream calls, want 0", calls.Load())
+	}
+	if !strings.Contains(recorder.Body.String(), "no alpha-search-capable token") {
+		t.Fatalf("unexpected downstream error: %s", recorder.Body.String())
+	}
+}
+
+func TestProxyAlphaSearchReturnsUnavailableAfter401Exhaustion(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, "Unauthorized")
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, AccessToken: "access-token-a", RefreshToken: "refresh-token-a", IsActive: true, CreatedAt: now, UpdatedAt: now},
+			{ID: 2, AccessToken: "access-token-b", RefreshToken: "refresh-token-b", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorEvents: make(chan tokenErrorEvent, 1),
+	}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL+"/v1/responses", 2, fakes)
+	req := httptest.NewRequest(http.MethodPost, alphaSearchEndpoint, strings.NewReader(`{"id":"session-auth-exhausted","model":"gpt-5.6-terra","commands":{"search_query":[{"q":"news"}]}}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: alphaSearchEndpoint, Model: "gpt-5.6-terra", UpstreamAccept: "application/json"})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls.Load())
+	}
+	if !strings.Contains(recorder.Body.String(), "alpha search unavailable after account failover") || strings.Contains(recorder.Body.String(), "Unauthorized") {
+		t.Fatalf("downstream error misrepresented upstream auth: %s", recorder.Body.String())
+	}
+	if recorder.Header().Get("Retry-After") != "" {
+		t.Fatalf("upstream Retry-After leaked: %q", recorder.Header().Get("Retry-After"))
 	}
 	select {
 	case event := <-fakes.tokenErrorEvents:
-		if event.TokenID != 1 || event.Deactivate || event.CooldownUntil == nil {
-			t.Fatalf("unexpected access-only auth failure state: %+v", event)
-		}
-		if !strings.Contains(event.Message, "access-token-only credential cannot refresh") {
-			t.Fatalf("message = %q", event.Message)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for access-only cooldown commit")
-	}
-	fakes.mu.Lock()
-	defer fakes.mu.Unlock()
-	if !fakes.tokens[0].IsActive || fakes.tokens[0].DisabledAt != nil || fakes.tokens[0].AccessToken != "access-only-token" {
-		t.Fatalf("access-only token was disabled or cleared: %+v", fakes.tokens[0])
-	}
-	if len(fakes.attempts) != 2 || fakes.attempts[0].Deactivated {
-		t.Fatalf("attempts = %+v", fakes.attempts)
+		t.Fatalf("alpha-search exhaustion changed global token state: %+v", event)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

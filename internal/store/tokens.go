@@ -29,6 +29,9 @@ const (
 
 	AccessTokenOnlyRefreshTokenPrefix       = "access:"
 	legacyAccessTokenOnlyRefreshTokenPrefix = "__oaix_access_token_only__:"
+	CodexPersonalAccessTokenPrefix          = "at-"
+	CodexPersonalAccessTokenAuthMode        = "personalAccessToken"
+	CodexPersonalAccessTokenLegacyAuthMode  = "personal_access_token"
 
 	transientRetryCooldownPrefix        = "retryable upstream failure:"
 	transientRetryCooldownDisplayWindow = time.Minute
@@ -72,6 +75,10 @@ func (t Token) IsAccessTokenOnly() bool {
 	return IsAccessTokenOnlyRefreshToken(t.RefreshToken)
 }
 
+func (t Token) IsCodexPersonalAccessToken() bool {
+	return IsCodexPersonalAccessToken(t.AccessToken)
+}
+
 func (t Token) HasRefreshableOAuthToken() bool {
 	return !t.IsAgentIdentity() && !t.IsAccessTokenOnly() && strings.TrimSpace(t.RefreshToken) != ""
 }
@@ -80,6 +87,10 @@ func IsAccessTokenOnlyRefreshToken(value string) bool {
 	value = strings.TrimSpace(value)
 	return strings.HasPrefix(value, AccessTokenOnlyRefreshTokenPrefix) ||
 		strings.HasPrefix(value, legacyAccessTokenOnlyRefreshTokenPrefix)
+}
+
+func IsCodexPersonalAccessToken(value string) bool {
+	return strings.HasPrefix(strings.TrimSpace(value), CodexPersonalAccessTokenPrefix)
 }
 
 func accessTokenOnlyRefreshToken(accessToken string) string {
@@ -2387,6 +2398,10 @@ func normalizeTokenPayload(payload map[string]any) map[string]any {
 				out["refresh_token"] = value
 			}
 		}
+	}
+	if accessToken := stringFromPayload(out, "access_token"); IsCodexPersonalAccessToken(accessToken) {
+		out["auth_mode"] = CodexPersonalAccessTokenAuthMode
+		out["openai_auth_mode"] = CodexPersonalAccessTokenLegacyAuthMode
 	}
 	return out
 }

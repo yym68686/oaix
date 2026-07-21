@@ -153,10 +153,16 @@ func (AccessTokenValidator) Validate(ctx context.Context, item store.ImportItem)
 		return ValidatedItem{}, ctx.Err()
 	default:
 	}
-	payload := flattenNestedCredentialsPayload(item.Payload)
+	payload := clonePayload(flattenNestedCredentialsPayload(item.Payload))
 	for _, key := range []string{"access_token", "accessToken", "token"} {
 		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			return ValidatedItem{AccessToken: strings.TrimSpace(value), Action: "upsert_access_token"}, nil
+			accessToken := strings.TrimSpace(value)
+			payload["access_token"] = accessToken
+			if store.IsCodexPersonalAccessToken(accessToken) {
+				payload["auth_mode"] = store.CodexPersonalAccessTokenAuthMode
+				payload["openai_auth_mode"] = store.CodexPersonalAccessTokenLegacyAuthMode
+			}
+			return ValidatedItem{AccessToken: accessToken, Action: "upsert_access_token", Payload: payload}, nil
 		}
 	}
 	return ValidatedItem{}, fmt.Errorf("import item %d does not contain an access token", item.ID)
@@ -238,9 +244,11 @@ func flattenNestedCredentialsPayload(payload map[string]any) map[string]any {
 	copyStringPayloadField(flattened, credentials, "clientId", "client_id")
 	copyStringPayloadField(flattened, credentials, "oauth_client_id", "oauth_client_id")
 	copyStringPayloadField(flattened, credentials, "plan_type", "plan_type")
+	copyStringPayloadField(flattened, credentials, "chatgpt_plan_type", "plan_type")
 	copyStringPayloadField(flattened, credentials, "type", "type")
 	copyStringPayloadField(flattened, credentials, "auth_mode", "auth_mode")
 	copyStringPayloadField(flattened, credentials, "authMode", "auth_mode")
+	copyStringPayloadField(flattened, credentials, "openai_auth_mode", "openai_auth_mode")
 	copyStringPayloadField(flattened, credentials, "agent_runtime_id", "agent_runtime_id")
 	copyStringPayloadField(flattened, credentials, "agentRuntimeId", "agent_runtime_id")
 	copyStringPayloadField(flattened, credentials, "agent_private_key", "agent_private_key")

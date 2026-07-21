@@ -285,6 +285,9 @@ func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 			return false
 		}
 	}
+	if intent.RequireAlphaSearch && candidate.Token.IsCodexPersonalAccessToken() {
+		return false
+	}
 	if isMarketplaceSelection(intent.SelectionMode) {
 		if intent.ExcludeOwnerUserID > 0 && candidate.Token.OwnerUserID == intent.ExcludeOwnerUserID {
 			return false

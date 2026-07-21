@@ -158,6 +158,7 @@ const (
 	OutcomeUpstream429Cooldown            Outcome = "upstream_429_cooldown"
 	OutcomeUpstream401Invalid             Outcome = "upstream_401_invalid"
 	OutcomeUpstream401Invalidated         Outcome = "upstream_401_token_invalidated"
+	OutcomeAlphaSearch401Failover         Outcome = "alpha_search_401_account_failover"
 	OutcomeUpstream400ModelCapabilityLoss Outcome = "upstream_400_model_capability_loss"
 	OutcomeUpstream402Deactivated         Outcome = "upstream_402_deactivated_workspace"
 	OutcomeUpstream403Invalid             Outcome = "upstream_403_invalid"
@@ -329,6 +330,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var lastUpstreamErrorHeaders http.Header
 	var streamState StreamAttemptState
 	var attemptsMade int
+	var alphaSearch401Failovers int
 	var refreshedAuthTokens = make(map[int64]struct{})
 	baseTokenIntent := tokens.Intent{
 		Endpoint:           intent.Endpoint,
@@ -339,6 +341,10 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		TargetTokenID:      intent.TargetTokenID,
 		RequireNonFree:     requiresNonFreeTokenPlan(intent.Model),
 		RequireFast:        intent.RequireFast,
+		RequireAlphaSearch: isAlphaSearchEndpoint(intent),
+	}
+	if baseTokenIntent.RequireAlphaSearch {
+		timing["alpha_search_requires_direct_support"] = true
 	}
 	if intent.RequireFast {
 		eligible, eligibilityErr := p.tokens.FastEligibleTokenIDs(r.Context(), baseTokenIntent, intent.Model, time.Now().UTC())
@@ -522,6 +528,20 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
+		if isAlphaSearchEndpoint(intent) && status == http.StatusUnauthorized {
+			action = OutcomeAlphaSearch401Failover
+			retry = true
+			result.Retry = true
+			excluded[claim.TokenID()] = struct{}{}
+			alphaSearch401Failovers++
+			timing["alpha_search_401_failover"] = true
+			timing["alpha_search_401_failover_count"] = alphaSearch401Failovers
+			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, true, false, nil)
+			if attempt < p.cfg.Upstream.MaxRetries {
+				continue
+			}
+			break
+		}
 		if detail, ok := chatGPTAccountModelCapabilityLossDetail(status, result.ErrorBody, intent.Model); ok {
 			validUntil := time.Now().UTC().Add(tokenModelCapabilityLossTTL)
 			ownerUserID := int64(0)
@@ -628,14 +648,28 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.finalLog(r.Context(), requestID, intent, started, status, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
-		writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, http.StatusServiceUnavailable, "no available token")
+		message := "no available token"
+		if isAlphaSearchEndpoint(intent) {
+			message = "no alpha-search-capable token"
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, http.StatusServiceUnavailable, message)
 		observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, stringPtr("no available token"), timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 		return
 	}
 	message := "upstream request failed"
 	if lastErr != nil {
 		message = lastErr.Error()
+	}
+	if isAlphaSearchEndpoint(intent) && finalStatus == http.StatusUnauthorized {
+		message = "alpha search unavailable after account failover"
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-OAIX-Request-ID", requestID)
+		writeFinalErrorResponse(w, false, false, http.StatusServiceUnavailable, message)
+		observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
+		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+		return
 	}
 	if isAlphaSearchEndpoint(intent) && lastUpstreamErrorHeaders != nil {
 		copyResponseHeaders(w.Header(), lastUpstreamErrorHeaders)

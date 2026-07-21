@@ -164,6 +164,7 @@ type Intent struct {
 	RequiredPlan       string
 	RequireFast        bool
 	FastEligibleTokens map[int64]struct{}
+	RequireAlphaSearch bool
 }
 
 type Claim struct {

@@ -84,6 +84,30 @@ func TestAccessTokenOnlyCredentialClassification(t *testing.T) {
 	}
 }
 
+func TestCodexPersonalAccessTokenClassificationAndPayloadNormalization(t *testing.T) {
+	for _, value := range []string{"at-token", "  at-token  "} {
+		if !IsCodexPersonalAccessToken(value) {
+			t.Fatalf("personal access token was not recognized: %q", value)
+		}
+		if token := (Token{AccessToken: value}); !token.IsCodexPersonalAccessToken() {
+			t.Fatalf("Token did not recognize personal access token: %+v", token)
+		}
+	}
+	if IsCodexPersonalAccessToken("eyJ.oauth-token") {
+		t.Fatal("OAuth JWT was classified as a personal access token")
+	}
+
+	payload := normalizeTokenPayload(map[string]any{
+		"access_token":       "at-token",
+		"chatgpt_account_id": "workspace-123",
+	})
+	if payload["auth_mode"] != CodexPersonalAccessTokenAuthMode ||
+		payload["openai_auth_mode"] != CodexPersonalAccessTokenLegacyAuthMode ||
+		payload["chatgpt_account_id"] != "workspace-123" {
+		t.Fatalf("personal access token payload was not normalized: %#v", payload)
+	}
+}
+
 func TestNormalizeTokenPayloadDropsImportMetadata(t *testing.T) {
 	payload := normalizeTokenPayload(map[string]any{
 		"_import_index":           7,

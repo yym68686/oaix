@@ -89,6 +89,33 @@ func TestRequireNonFreeSkipsFreePromptAffinityAndTargetToken(t *testing.T) {
 	}
 }
 
+func TestAlphaSearchSkipsPersonalAccessTokenWithoutRemovingItFromResponses(t *testing.T) {
+	rows := makeTokens(2)
+	rows[0].AccessToken = "at-personal-token"
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh returned error: %v", err)
+	}
+
+	searchClaim, err := manager.Claim(context.Background(), Intent{RequireAlphaSearch: true})
+	if err != nil {
+		t.Fatalf("alpha-search Claim returned error: %v", err)
+	}
+	if searchClaim.TokenID() != 2 {
+		t.Fatalf("alpha-search selected token %d, want non-PAT token 2", searchClaim.TokenID())
+	}
+	searchClaim.Release()
+
+	responsesClaim, err := manager.Claim(context.Background(), Intent{TargetTokenID: 1})
+	if err != nil {
+		t.Fatalf("responses Claim returned error: %v", err)
+	}
+	if responsesClaim.TokenID() != 1 {
+		t.Fatalf("responses selected token %d, want PAT token 1", responsesClaim.TokenID())
+	}
+	responsesClaim.Release()
+}
+
 func TestRequireNonFreeAllowsUnknownPlan(t *testing.T) {
 	rows := makeTokens(1)
 	rows[0].PlanType = nil
