@@ -117,10 +117,11 @@ func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) 
 	}
 	switch intent.Endpoint {
 	case alphaSearchEndpoint:
-		if err := validateAlphaSearchPayload(body); err != nil {
+		next, err := prepareAlphaSearchPayload(body)
+		if err != nil {
 			return body, intent, http.StatusBadRequest, err
 		}
-		return body, intent, http.StatusOK, nil
+		return next, intent, http.StatusOK, nil
 	case "/v1/responses", "/v1/responses/compact":
 		next, err := prepareResponsesPayload(body, &intent)
 		if err != nil {
@@ -152,6 +153,41 @@ func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) 
 	default:
 		return body, intent, http.StatusOK, nil
 	}
+}
+
+var alphaSearchUnsupportedResponsesFields = [...]string{
+	"prompt_cache_key",
+	"prompt_cache_retention",
+}
+
+// prepareAlphaSearchPayload keeps the standalone Codex SearchRequest wire
+// contract separate from the Responses request schema. Some clients attach
+// Responses prompt-cache fields to every Codex request, but alpha/search
+// rejects those top-level fields as unknown parameters.
+func prepareAlphaSearchPayload(body []byte) ([]byte, error) {
+	if err := validateAlphaSearchPayload(body); err != nil {
+		return body, err
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(body), &payload); err != nil {
+		return body, errors.New("request body must be valid JSON")
+	}
+	changed := false
+	for _, field := range alphaSearchUnsupportedResponsesFields {
+		if _, ok := payload[field]; !ok {
+			continue
+		}
+		delete(payload, field)
+		changed = true
+	}
+	if !changed {
+		return body, nil
+	}
+	next, err := json.Marshal(payload)
+	if err != nil {
+		return body, errors.New("failed to sanitize alpha search request body")
+	}
+	return next, nil
 }
 
 func validateAlphaSearchPayload(body []byte) error {

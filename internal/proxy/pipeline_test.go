@@ -460,6 +460,39 @@ func TestAlphaSearchPayloadAndResponseValidation(t *testing.T) {
 	if err := validateAlphaSearchPayload(validRequest); err != nil {
 		t.Fatalf("valid request rejected: %v", err)
 	}
+	prepared, preparedIntent, status, err := prepareUpstreamPayload(nil, validRequest, RequestIntent{Endpoint: alphaSearchEndpoint})
+	if err != nil || status != http.StatusOK || preparedIntent.Endpoint != alphaSearchEndpoint {
+		t.Fatalf("prepare valid alpha search: status=%d intent=%+v err=%v", status, preparedIntent, err)
+	}
+	if !bytes.Equal(prepared, validRequest) {
+		t.Fatalf("alpha search body without unsupported fields changed: got=%s want=%s", prepared, validRequest)
+	}
+
+	requestWithResponsesFields := []byte(`{
+		"id":"session-cache-fields",
+		"model":"gpt-5.4",
+		"commands":{"search_query":[{"q":"news"}]},
+		"settings":{"external_web_access":true},
+		"prompt_cache_key":"responses-cache-key",
+		"prompt_cache_retention":"24h",
+		"future_field":{"keep":true}
+	}`)
+	prepared, _, status, err = prepareUpstreamPayload(nil, requestWithResponsesFields, RequestIntent{Endpoint: alphaSearchEndpoint})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("prepare alpha search cache fields: status=%d err=%v", status, err)
+	}
+	var sanitized map[string]any
+	if err := json.Unmarshal(prepared, &sanitized); err != nil {
+		t.Fatalf("decode sanitized alpha search request: %v", err)
+	}
+	for _, field := range alphaSearchUnsupportedResponsesFields {
+		if _, ok := sanitized[field]; ok {
+			t.Fatalf("%s should be removed from alpha search request: %s", field, prepared)
+		}
+	}
+	if future, ok := sanitized["future_field"].(map[string]any); !ok || future["keep"] != true {
+		t.Fatalf("future alpha search field was not preserved: %s", prepared)
+	}
 	for _, body := range [][]byte{
 		[]byte(`{"model":"gpt-5.4"}`),
 		[]byte(`{"id":"session-1"}`),
