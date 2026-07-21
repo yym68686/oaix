@@ -28,6 +28,10 @@ FRONTEND_API = FRONTEND_SRC / "lib" / "api.ts"
 COSS_UI_DIR = FRONTEND_SRC / "registry" / "default" / "ui"
 
 
+def _frontend_text(*relative_paths: str) -> str:
+    return "\n".join((FRONTEND_SRC / path).read_text() for path in relative_paths)
+
+
 async def _request(
     app,
     method: str,
@@ -91,7 +95,7 @@ def test_frontend_index_includes_token_search_input() -> None:
 
 
 def test_frontend_uses_react_vite_and_coss_registry() -> None:
-    app_tsx = FRONTEND_APP.read_text()
+    app_tsx = _frontend_text("features/keys/KeysPage.tsx", "features/imports/ImportsPage.tsx")
     main_tsx = (FRONTEND_SRC / "main.tsx").read_text()
     styles_css = (FRONTEND_SRC / "styles.css").read_text()
 
@@ -120,6 +124,17 @@ def test_frontend_probe_result_distinguishes_local_failure_from_upstream_respons
     assert "没有向模型上游发送请求" in components_tsx
     assert 'result.upstream_attempted === false ? "未执行"' in components_tsx
     assert "原因：${detail}" in keys_tsx
+
+
+def test_frontend_hides_oauth_refresh_action_for_agent_identity() -> None:
+    api_ts = FRONTEND_API.read_text()
+    keys_tsx = (FRONTEND_SRC / "features" / "keys" / "KeysPage.tsx").read_text()
+
+    assert 'credential_mode?: "oauth" | "agent_identity" | null' in api_ts
+    assert 'token.credential_mode !== "agent_identity" ? (' in keys_tsx
+    assert 'token.credential_mode === "agent_identity"' in keys_tsx
+    assert "Agent Identity 不使用 refresh_token" in keys_tsx
+    assert "api.resetTokenQuota(token.id, apiScope)" in keys_tsx
 
 
 def test_livez_returns_without_token_count_query(monkeypatch) -> None:
@@ -191,44 +206,50 @@ def test_browser_icon_routes_do_not_404() -> None:
 
 
 def test_frontend_token_explorer_keeps_core_admin_actions() -> None:
-    app_tsx = FRONTEND_APP.read_text()
+    keys_tsx = (FRONTEND_SRC / "features" / "keys" / "KeysPage.tsx").read_text()
+    imports_tsx = (FRONTEND_SRC / "features" / "imports" / "ImportsPage.tsx").read_text()
+    domain_ts = (FRONTEND_SRC / "shared" / "domain.ts").read_text()
+    types_ts = (FRONTEND_SRC / "shared" / "types.ts").read_text()
     api_ts = FRONTEND_API.read_text()
 
-    assert "const PAGE_SIZE = 100" in app_tsx
-    assert 'type TokenStatus = "all" | "available" | "cooling" | "disabled"' in app_tsx
-    assert 'type TokenMode = "keys" | "import_batches"' in app_tsx
-    assert "api.listTokens(params)" in app_tsx
-    assert "api.batchTokens" in app_tsx
-    assert "api.updateActivation" in app_tsx
-    assert "api.updateRemark" in app_tsx
-    assert "api.deleteToken" in app_tsx
-    assert "api.importJobs(50)" in app_tsx
-    assert 'listTokens: (params: URLSearchParams)' in api_ts
-    assert 'batchTokens: (payload: Record<string, unknown>)' in api_ts
+    assert "export const PAGE_SIZE = 100" in domain_ts
+    assert 'export type TokenStatus = "all" | "available" | "cooling" | "disabled"' in types_ts
+    assert "api.listTokens(params, apiScope)" in keys_tsx
+    assert "api.batchTokens" in keys_tsx
+    assert "api.updateActivation" in keys_tsx
+    assert "api.updateRemark" in keys_tsx
+    assert "api.deleteToken" in keys_tsx
+    assert "api.importJobs(80)" in imports_tsx
+    assert 'listTokens: (params: URLSearchParams, scope: TokenAPIScope = "auto")' in api_ts
+    assert 'batchTokens: async (payload: Record<string, unknown>, scope: TokenAPIScope = "auto")' in api_ts
 
 
 def test_frontend_import_panel_supports_queue_position_and_token_formats() -> None:
-    app_tsx = FRONTEND_APP.read_text()
+    app_tsx = _frontend_text("features/imports/ImportsPage.tsx", "shared/domain.ts")
 
     assert 'const [queuePosition, setQueuePosition] = useState<"front" | "back">("front")' in app_tsx
     assert "import_queue_position: queuePosition" in app_tsx
-    assert 'tokens: entries' in app_tsx
-    assert "collectImportEntries(tokenInput, fileInputRef.current?.files)" in app_tsx
-    assert "parseTokenText(await file.text())" in app_tsx
+    assert "tokens: entries" in app_tsx
+    assert "api.uploadImport(form)" in app_tsx
+    assert "api.parseImport({ text: tokenInput })" in app_tsx
     assert '"access_token"' in app_tsx
     assert '"refresh_token"' in app_tsx
     assert '"refreshToken"' in app_tsx
     assert "sub2api 导出 JSON" in app_tsx
 
 
-def test_frontend_dashboard_refresh_loads_admin_panels_together() -> None:
+def test_frontend_dashboard_refresh_drives_modular_page_loading() -> None:
     app_tsx = FRONTEND_APP.read_text()
+    keys_tsx = (FRONTEND_SRC / "features" / "keys" / "KeysPage.tsx").read_text()
+    requests_tsx = (FRONTEND_SRC / "features" / "requests" / "RequestsPage.tsx").read_text()
+    runtime_tsx = (FRONTEND_SRC / "features" / "runtime" / "RuntimePage.tsx").read_text()
 
-    assert "await Promise.allSettled([loadTokenSelection(), loadTokens(), loadRequests(), loadSettings()])" in app_tsx
+    assert "const healthPayload = await api.health()" in app_tsx
+    assert "setRefreshNonce((value) => value + 1)" in app_tsx
     assert "window.setInterval(() => void refreshAll(), 30_000)" in app_tsx
-    assert "loading && !counts.total" in app_tsx
-    assert "tokenLoading && !tokens.length" in app_tsx
-    assert "requestLoading && !requests.length && !requestSummary.total" in app_tsx
+    assert "loading && !counts.total" in runtime_tsx
+    assert "const tableLoading = loading && (!tokens.length || loadedQueryKey !== queryKey)" in keys_tsx
+    assert "loading && !requests.length" in requests_tsx
 
 
 def test_frontend_service_key_storage_keeps_legacy_compatibility() -> None:
@@ -242,15 +263,15 @@ def test_frontend_service_key_storage_keeps_legacy_compatibility() -> None:
 
 
 def test_frontend_request_settings_and_dispatch_panels_are_wired() -> None:
-    app_tsx = FRONTEND_APP.read_text()
+    app_tsx = _frontend_text("features/requests/RequestsPage.tsx", "features/settings/SettingsPage.tsx")
     api_ts = FRONTEND_API.read_text()
 
-    assert "api.requests(80)" in app_tsx
+    assert "api.requests(120)" in app_tsx
     assert "api.analytics(24)" in app_tsx
     assert "api.settings()" in app_tsx
     assert "api.updateSetting(settingKey.trim(), value)" in app_tsx
     assert "api.updateTokenSelection({ active_stream_cap: streamCap })" in app_tsx
-    assert 'requests: (limit = 80)' in api_ts
+    assert 'requests: async (limit = 80)' in api_ts
     assert 'analytics: (hours = 24)' in api_ts
     assert 'settings: ()' in api_ts
     assert 'updateSetting: (key: string, value: unknown)' in api_ts
@@ -333,39 +354,39 @@ def test_admin_requests_expired_cache_refreshes_on_request(monkeypatch) -> None:
 
 
 def test_frontend_uses_state_driven_token_loading_without_stale_closure_requests() -> None:
-    app_tsx = FRONTEND_APP.read_text()
+    app_tsx = (FRONTEND_SRC / "features" / "keys" / "KeysPage.tsx").read_text()
 
     assert "useEffect(() => {" in app_tsx
     assert "window.setTimeout(" in app_tsx
-    assert "tokenSearch.trim() ? 260 : 0" in app_tsx
-    assert "setTokenPage(1)" in app_tsx
-    assert "sortParam(tokenSort)" in app_tsx
-    assert "params.set(\"status\", tokenStatus)" in app_tsx
-    assert "params.set(\"q\", tokenSearch.trim())" in app_tsx
+    assert "search.trim() ? 260 : 0" in app_tsx
+    assert "updateQuery({ page: 1, q: event.currentTarget.value })" in app_tsx
+    assert "sortParam(sort)" in app_tsx
+    assert 'params.set("status", status)' in app_tsx
+    assert 'params.set("q", search.trim())' in app_tsx
 
 
 def test_frontend_token_cards_show_status_timestamps_and_coss_badges() -> None:
-    app_tsx = FRONTEND_APP.read_text()
+    app_tsx = _frontend_text("features/keys/KeysPage.tsx", "shared/domain.ts", "shared/components.tsx")
 
     assert "function tokenStatusOf" in app_tsx
     assert "item.disabled_at" in app_tsx
     assert "item.cooldown_until" in app_tsx
-    assert "最近使用 {formatDate(item.last_used_at)}" in app_tsx
-    assert "冷却至 {formatDate(item.cooldown_until)}" in app_tsx
+    assert "最近 {formatDate(item.last_used_at)}" in app_tsx
+    assert "item.cooldown_until" in app_tsx
     assert "statusBadge(status)" in app_tsx
     assert "<Badge" in app_tsx
 
 
 def test_frontend_delete_and_remark_dialogs_use_coss_dialogs() -> None:
-    app_tsx = FRONTEND_APP.read_text()
+    app_tsx = (FRONTEND_SRC / "features" / "keys" / "KeysPage.tsx").read_text()
 
     assert "function DeleteDialog" in app_tsx
     assert "function RemarkDialog" in app_tsx
     assert "<Dialog open={Boolean(target)}" in app_tsx
     assert "<DialogPopup" in app_tsx
     assert "<DialogFooter>" in app_tsx
-    assert "api.updateRemark(remarkTarget.id, remarkTarget.remark)" in app_tsx
-    assert "api.batchTokens({ action: \"delete\", token_ids: deleteTarget.ids })" in app_tsx
+    assert "api.updateRemark(remarkTarget.id, remarkTarget.remark, apiScope)" in app_tsx
+    assert 'api.batchTokens({ action: "delete", token_ids: deleteTarget.ids }, apiScope)' in app_tsx
 
 
 def test_frontend_fetch_errors_preserve_backend_detail_messages() -> None:

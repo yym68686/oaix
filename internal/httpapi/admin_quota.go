@@ -49,6 +49,7 @@ const (
 
 type adminTokenItem struct {
 	store.Token
+	CredentialMode          string              `json:"credential_mode"`
 	Status                  string              `json:"status"`
 	ActiveStreams           int64               `json:"active_streams"`
 	ActiveStreamCap         int64               `json:"active_stream_cap"`
@@ -246,6 +247,7 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		}
 		items = append(items, adminTokenItem{
 			Token:                   token,
+			CredentialMode:          tokenProbeCredentialMode(token),
 			Status:                  adminTokenStatus(token, now),
 			ActiveStreams:           activeByID[token.ID],
 			ActiveStreamCap:         cap,
@@ -390,10 +392,7 @@ func quotaEligible(token store.Token) bool {
 }
 
 func quotaActionEligible(token store.Token) bool {
-	if token.IsAgentIdentity() {
-		return false
-	}
-	return strings.TrimSpace(token.AccessToken) != "" || token.HasRefreshableOAuthToken()
+	return token.IsAgentIdentity() || strings.TrimSpace(token.AccessToken) != "" || token.HasRefreshableOAuthToken()
 }
 
 var errQuotaTokenUnavailable = errors.New("token has no usable access or refresh token")
@@ -637,7 +636,7 @@ func (s *adminQuotaService) resetCredit(ctx context.Context, token store.Token) 
 		return nil, ctx.Err()
 	}
 
-	if strings.TrimSpace(token.AccessToken) == "" {
+	if !token.IsAgentIdentity() && strings.TrimSpace(token.AccessToken) == "" {
 		refreshed, err := s.refreshQuotaToken(ctx, token)
 		if err != nil {
 			return nil, err
@@ -773,10 +772,65 @@ func (s *adminQuotaService) requestUsageWithAuthorization(ctx context.Context, t
 }
 
 func (s *adminQuotaService) requestResetCredit(ctx context.Context, token store.Token, redeemRequestID string) (int, []byte, *codexQuotaResetResult, error) {
+	if token.IsAgentIdentity() {
+		return s.requestAgentIdentityResetCredit(ctx, token, redeemRequestID)
+	}
 	accessToken := strings.TrimSpace(token.AccessToken)
 	if accessToken == "" {
 		return 0, nil, nil, fmt.Errorf("token has no access token")
 	}
+	authorization := tokenProbeAuthorization{Value: "Bearer " + accessToken}
+	if token.AccountID != nil {
+		authorization.AccountID = strings.TrimSpace(*token.AccountID)
+	}
+	return s.requestResetCreditWithAuthorization(ctx, token, redeemRequestID, authorization)
+}
+
+func (s *adminQuotaService) requestAgentIdentityResetCredit(ctx context.Context, token store.Token, redeemRequestID string) (int, []byte, *codexQuotaResetResult, error) {
+	if s.app == nil {
+		return 0, nil, nil, errors.New("agent identity quota authentication is unavailable")
+	}
+	authorization, failure, ok := s.app.prepareTokenProbeAuthorization(ctx, token)
+	if !ok {
+		detail := strings.TrimSpace(failure.Detail)
+		if detail == "" {
+			detail = "agent identity quota authentication failed"
+		}
+		return 0, nil, nil, errors.New(detail)
+	}
+	for recovered := false; ; {
+		statusCode, body, result, err := s.requestResetCreditWithAuthorization(ctx, token, redeemRequestID, authorization)
+		if err != nil {
+			return statusCode, body, result, err
+		}
+		redactedBody := body
+		if authorization.AgentIdentity != nil {
+			redactedBody = agentidentity.RedactSensitiveBody(body, *authorization.AgentIdentity)
+		}
+		if authorization.AgentIdentity == nil || recovered || !agentidentity.IsInvalidTaskResponse(statusCode, body) {
+			return statusCode, redactedBody, result, nil
+		}
+
+		recovered = true
+		credentials, recoverErr := s.app.recoverAgentIdentityProbeTask(ctx, token, authorization.AgentIdentity.TaskID)
+		if recoverErr != nil {
+			return 0, nil, nil, errors.New("agent identity quota task recovery failed")
+		}
+		assertion, assertionErr := credentials.BuildAssertion(time.Now())
+		if assertionErr != nil {
+			return 0, nil, nil, errors.New("agent identity quota assertion could not be created")
+		}
+		credentialsCopy := credentials
+		authorization = tokenProbeAuthorization{
+			Value:         assertion,
+			AccountID:     strings.TrimSpace(credentials.AccountID),
+			FedRAMP:       credentials.FedRAMP,
+			AgentIdentity: &credentialsCopy,
+		}
+	}
+}
+
+func (s *adminQuotaService) requestResetCreditWithAuthorization(ctx context.Context, token store.Token, redeemRequestID string, authorization tokenProbeAuthorization) (int, []byte, *codexQuotaResetResult, error) {
 	bodyBytes, err := json.Marshal(map[string]string{"redeem_request_id": redeemRequestID})
 	if err != nil {
 		return 0, nil, nil, err
@@ -786,6 +840,16 @@ func (s *adminQuotaService) requestResetCredit(ctx context.Context, token store.
 		return 0, nil, nil, err
 	}
 	s.setWHAMHeaders(req, token, true)
+	req.Header.Set("Authorization", authorization.Value)
+	if authorization.AccountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", authorization.AccountID)
+	}
+	if authorization.FedRAMP {
+		req.Header.Set("X-OpenAI-FedRAMP", "true")
+	}
+	if authorization.AgentIdentity != nil {
+		req.Header.Set("OpenAI-Beta", "codex-1")
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

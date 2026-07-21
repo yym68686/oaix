@@ -907,6 +907,10 @@ export function KeyDetailPage({
     if (!token) {
       return;
     }
+    if (token.credential_mode === "agent_identity") {
+      pushToast("Agent Identity 不使用 refresh_token", "warning");
+      return;
+    }
     setCopyRefreshBusy(true);
     try {
       const payload = await api.tokenRefreshToken(token.id, apiScope);
@@ -1043,10 +1047,12 @@ export function KeyDetailPage({
                 <ActivityIcon />
                 测试
               </Button>
-              <Button loading={copyRefreshBusy} onClick={() => void copyRefreshToken()} size="sm" variant="outline">
-                <CopyIcon />
-                复制 refresh_token
-              </Button>
+              {token.credential_mode !== "agent_identity" ? (
+                <Button loading={copyRefreshBusy} onClick={() => void copyRefreshToken()} size="sm" variant="outline">
+                  <CopyIcon />
+                  复制 refresh_token
+                </Button>
+              ) : null}
               <Button
                 disabled={quotaResetBusy}
                 loading={quotaCreditBusy}

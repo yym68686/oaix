@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -61,6 +63,31 @@ func TestParseCodexQuotaPayloadExtracts5HAnd7DWindows(t *testing.T) {
 	}
 	if snapshot.RateLimitResetCredits == nil || snapshot.RateLimitResetCredits.AvailableCount != 2 {
 		t.Fatalf("reset credits = %+v", snapshot.RateLimitResetCredits)
+	}
+}
+
+func TestAdminTokenItemExposesCredentialMode(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		token store.Token
+		want  string
+	}{
+		{name: "oauth", token: store.Token{ID: 1}, want: probeCredentialModeOAuth},
+		{name: "agent identity", token: store.Token{ID: 2, RefreshToken: agentidentity.SyntheticRefreshPrefix + "runtime"}, want: probeCredentialModeAgentIdentity},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoded, err := json.Marshal(adminTokenItem{Token: test.token, CredentialMode: tokenProbeCredentialMode(test.token)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(encoded, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if got := payload["credential_mode"]; got != test.want {
+				t.Fatalf("credential_mode = %#v, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -469,6 +496,98 @@ func TestQuotaFetchAgentIdentityRedactsSensitiveUpstreamErrors(t *testing.T) {
 		if secret != "" && strings.Contains(*snapshot.Error, secret) {
 			t.Fatalf("quota error leaked sensitive value: %q", *snapshot.Error)
 		}
+	}
+}
+
+func TestQuotaResetAgentIdentityUsesAssertionWithoutOAuthToken(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-reset")
+	var requestBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := decodeProbeAgentAssertionTask(t, r.Header.Get("Authorization")); got != credentials.TaskID {
+			t.Errorf("assertion task = %q", got)
+		}
+		if got := r.Header.Get("Chatgpt-Account-Id"); got != credentials.AccountID {
+			t.Errorf("Chatgpt-Account-Id = %q", got)
+		}
+		if got := r.Header.Get("X-OpenAI-FedRAMP"); got != "true" {
+			t.Errorf("X-OpenAI-FedRAMP = %q", got)
+		}
+		if got := r.Header.Get("OpenAI-Beta"); got != "codex-1" {
+			t.Errorf("OpenAI-Beta = %q", got)
+		}
+		body, _ := io.ReadAll(r.Body)
+		requestBody = string(body)
+		_, _ = w.Write([]byte(`{"code":"ok","windows_reset":2}`))
+	}))
+	defer upstream.Close()
+
+	service := agentIdentityQuotaTestService(&App{}, upstream.Client(), upstream.URL)
+	service.resetURL = upstream.URL
+	result, err := service.resetCredit(t.Context(), store.Token{
+		ID:            14539,
+		OwnerUserID:   1,
+		RefreshToken:  credentials.IdentityToken(),
+		AgentIdentity: &credentials,
+		IsActive:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Code != "ok" || result.WindowsReset != 2 {
+		t.Fatalf("reset result = %#v", result)
+	}
+	if !strings.Contains(requestBody, `"redeem_request_id"`) {
+		t.Fatalf("request body = %q", requestBody)
+	}
+}
+
+func TestQuotaResetAgentIdentityRecoversInvalidTaskExactlyOnce(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-reset-old")
+	credentialStore := &fakeAgentIdentityProbeStore{credentials: credentials}
+	registrationCalls := 0
+	registration := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		registrationCalls++
+		_, _ = w.Write([]byte(`{"task_id":"task-reset-new"}`))
+	}))
+	defer registration.Close()
+
+	upstreamCalls := 0
+	var tasks []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		tasks = append(tasks, decodeProbeAgentAssertionTask(t, r.Header.Get("Authorization")))
+		if upstreamCalls == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"invalid_task_id"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":"ok","windows_reset":1}`))
+	}))
+	defer upstream.Close()
+
+	app := &App{
+		cfg:                config.Config{Upstream: config.UpstreamConfig{AgentIdentityAuthAPIURL: registration.URL}},
+		probeIdentityStore: credentialStore,
+	}
+	service := agentIdentityQuotaTestService(app, upstream.Client(), upstream.URL)
+	service.resetURL = upstream.URL
+	result, err := service.resetCredit(t.Context(), store.Token{
+		ID:           14540,
+		OwnerUserID:  1,
+		RefreshToken: credentials.IdentityToken(),
+		IsActive:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.WindowsReset != 1 {
+		t.Fatalf("reset result = %#v", result)
+	}
+	if upstreamCalls != 2 || registrationCalls != 1 || credentialStore.updateCalls != 1 {
+		t.Fatalf("calls upstream=%d registration=%d updates=%d", upstreamCalls, registrationCalls, credentialStore.updateCalls)
+	}
+	if len(tasks) != 2 || tasks[0] != "task-reset-old" || tasks[1] != "task-reset-new" {
+		t.Fatalf("assertion tasks = %v", tasks)
 	}
 }
 

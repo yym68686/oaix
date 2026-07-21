@@ -9,11 +9,20 @@ import (
 	"testing"
 
 	"github.com/yym68686/oaix/internal/config"
+	"github.com/yym68686/oaix/internal/proxy"
 )
 
 func TestHandlerRegistersRoutes(t *testing.T) {
 	app := NewApp(config.Config{Auth: config.AuthConfig{ServiceAPIKeys: []string{"service-key"}}}, nil, nil, nil, nil, nil)
 	_ = app.Handler()
+}
+
+func TestNewAppSharesAgentIdentityTaskCoordinatorWithProxy(t *testing.T) {
+	pipeline := proxy.New(config.Config{}, nil, nil, nil, nil, nil, nil)
+	app := NewApp(config.Config{}, nil, nil, nil, nil, pipeline)
+	if app.agentIdentityTasks == nil || app.agentIdentityTasks != pipeline.AgentIdentityTaskCoordinator() {
+		t.Fatal("app and proxy do not share the agent identity task coordinator")
+	}
 }
 
 func TestAlphaSearchRouteRequiresAuthentication(t *testing.T) {

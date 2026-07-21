@@ -71,6 +71,7 @@ export type TokenItem = {
   owner_user_id?: number | null;
   email?: string | null;
   account_id?: string | null;
+  credential_mode?: "oauth" | "agent_identity" | null;
   plan_type?: string | null;
   remark?: string | null;
   source_file?: string | null;

@@ -469,6 +469,10 @@ func (a *App) getMyTokenRefreshToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+	if token.IsAgentIdentity() {
+		writeError(w, http.StatusBadRequest, errors.New("refresh_token is not available for agent identity credentials"))
+		return
+	}
 	refreshToken := strings.TrimSpace(token.RefreshToken)
 	if refreshToken == "" {
 		writeError(w, http.StatusNotFound, errors.New("refresh_token not found"))

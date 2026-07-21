@@ -20,6 +20,7 @@ import (
 
 	"github.com/yym68686/oaix/internal/affinity"
 	"github.com/yym68686/oaix/internal/agentidentity"
+	"github.com/yym68686/oaix/internal/agentidentitytask"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/cooldown"
 	"github.com/yym68686/oaix/internal/logs"
@@ -51,7 +52,8 @@ type Pipeline struct {
 	affinity                   affinity.Store
 	oauthClient                oauth.Client
 	modelCapabilityLossHandler TokenModelCapabilityLossHandler
-	agentIdentityTaskLocks     sync.Map
+	agentIdentityTaskMu        sync.Mutex
+	agentIdentityTasks         *agentidentitytask.Coordinator
 	agentIdentityCredentials   sync.Map
 	commitFailures             atomic.Int64
 }
@@ -80,11 +82,6 @@ type tokenSecretUpdater interface {
 
 type tokenOAuthClientIDStore interface {
 	TokenOAuthClientID(ctx context.Context, tokenID int64) (string, error)
-}
-
-type agentIdentityCredentialStore interface {
-	GetAgentIdentityCredentials(ctx context.Context, tokenID int64) (agentidentity.Credentials, error)
-	UpdateAgentIdentityTask(ctx context.Context, tokenID int64, expectedTaskID string, taskID string) error
 }
 
 type agentIdentityCredentialCacheEntry struct {
@@ -178,6 +175,34 @@ func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, c
 		store:     stateStore,
 		affinity:  affinityStore,
 	}
+}
+
+func (p *Pipeline) AgentIdentityTaskCoordinator() *agentidentitytask.Coordinator {
+	if p == nil {
+		return nil
+	}
+	p.agentIdentityTaskMu.Lock()
+	defer p.agentIdentityTaskMu.Unlock()
+	if p.agentIdentityTasks != nil {
+		return p.agentIdentityTasks
+	}
+	credentialStore, _ := p.store.(agentidentitytask.CredentialStore)
+	var doer agentidentity.RequestDoer
+	if p.transport != nil {
+		doer = p.transport
+	}
+	var refresher agentidentitytask.SnapshotRefresher
+	if p.tokens != nil {
+		refresher = p.tokens
+	}
+	p.agentIdentityTasks = agentidentitytask.New(
+		credentialStore,
+		doer,
+		p.cfg.Upstream.AgentIdentityAuthAPIURL,
+		refresher,
+		p.logger,
+	)
+	return p.agentIdentityTasks
 }
 
 func (p *Pipeline) SetOAuthClient(client oauth.Client) {
@@ -896,54 +921,18 @@ func (p *Pipeline) recoverAgentIdentityTask(parent context.Context, claim *token
 	if p == nil || claim == nil || claim.TokenID() <= 0 {
 		return agentidentity.Credentials{}, errors.New("agent identity claim is unavailable")
 	}
-	credentialStore, ok := p.store.(agentIdentityCredentialStore)
-	if !ok || credentialStore == nil {
-		return agentidentity.Credentials{}, errors.New("agent identity credential store is unavailable")
+	coordinator := p.AgentIdentityTaskCoordinator()
+	if coordinator == nil {
+		return agentidentity.Credentials{}, errors.New("agent identity task coordinator is unavailable")
 	}
-	lockValue, _ := p.agentIdentityTaskLocks.LoadOrStore(claim.TokenID(), &sync.Mutex{})
-	lock, ok := lockValue.(*sync.Mutex)
-	if !ok {
-		return agentidentity.Credentials{}, errors.New("agent identity task lock is invalid")
-	}
-	lock.Lock()
-	defer lock.Unlock()
-
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	defer cancel()
-	credentials, err := credentialStore.GetAgentIdentityCredentials(ctx, claim.TokenID())
-	if err != nil {
-		return agentidentity.Credentials{}, fmt.Errorf("load agent identity credentials: %w", err)
-	}
-	currentTaskID := strings.TrimSpace(credentials.TaskID)
-	expectedTaskID = strings.TrimSpace(expectedTaskID)
-	if currentTaskID != "" && (expectedTaskID == "" || currentTaskID != expectedTaskID) {
-		p.agentIdentityCredentials.Store(claim.TokenID(), agentIdentityCredentialCacheEntry{
-			Credentials: credentials, TokenUpdatedAt: claim.Token.Token.UpdatedAt,
-		})
-		return credentials, nil
-	}
-	newTaskID, err := agentidentity.RegisterTask(ctx, p.transport, p.cfg.Upstream.AgentIdentityAuthAPIURL, credentials)
+	result, err := coordinator.Recover(parent, claim.TokenID(), claim.Token.Token.OwnerUserID, expectedTaskID)
 	if err != nil {
 		return agentidentity.Credentials{}, err
 	}
-	if err := credentialStore.UpdateAgentIdentityTask(ctx, claim.TokenID(), currentTaskID, newTaskID); err != nil {
-		if !errors.Is(err, store.ErrAgentIdentityTaskChanged) {
-			return agentidentity.Credentials{}, fmt.Errorf("persist agent identity task: %w", err)
-		}
-		credentials, err = credentialStore.GetAgentIdentityCredentials(ctx, claim.TokenID())
-		if err != nil {
-			return agentidentity.Credentials{}, fmt.Errorf("reload agent identity credentials: %w", err)
-		}
-	} else {
-		credentials.TaskID = newTaskID
-	}
+	credentials := result.Credentials
 	p.agentIdentityCredentials.Store(claim.TokenID(), agentIdentityCredentialCacheEntry{
 		Credentials: credentials, TokenUpdatedAt: claim.Token.Token.UpdatedAt,
 	})
-	p.refreshTokenSnapshotsAfterSecretUpdate(ctx, claim.Token.Token.OwnerUserID)
-	if p.logger != nil {
-		p.logger.Info("agent identity task registered", "token_id", claim.TokenID(), "owner_user_id", claim.Token.Token.OwnerUserID)
-	}
 	return credentials, nil
 }
 

@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/tokens"
 )
 
@@ -277,6 +278,9 @@ func (a *App) fetchOfficialModelsPlanCatalog(ctx context.Context, ownerUserID in
 }
 
 func (a *App) fetchOfficialModelsWithClaim(ctx context.Context, claim *tokens.Claim, clientVersion string) (officialModelsCacheEntry, error) {
+	if claim == nil || claim.Token == nil {
+		return officialModelsCacheEntry{}, errors.New("official models token claim is unavailable")
+	}
 	requestURL, err := url.Parse(a.modelCatalog.upstreamURL)
 	if err != nil {
 		return officialModelsCacheEntry{}, err
@@ -285,65 +289,111 @@ func (a *App) fetchOfficialModelsWithClaim(ctx context.Context, claim *tokens.Cl
 	query.Set("client_version", clientVersion)
 	requestURL.RawQuery = query.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
-	if err != nil {
-		return officialModelsCacheEntry{}, err
+	token := claim.Token.Token
+	isAgentIdentity := token.IsAgentIdentity()
+	authorization := tokenProbeAuthorization{Value: "Bearer " + claim.AccessToken()}
+	if accountID := claim.AccountID(); accountID != nil {
+		authorization.AccountID = strings.TrimSpace(*accountID)
 	}
-	req.Header.Set("Authorization", "Bearer "+claim.AccessToken())
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Originator", codexOriginator)
-	req.Header.Set("User-Agent", codexUserAgent)
-	if accountID := claim.AccountID(); accountID != nil && strings.TrimSpace(*accountID) != "" {
-		req.Header.Set("ChatGPT-Account-Id", strings.TrimSpace(*accountID))
-	}
-
-	resp, err := a.modelCatalog.client.Do(req)
-	if err != nil {
-		return officialModelsCacheEntry{}, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, officialModelsMaxBodyBytes+1))
-	if err != nil {
-		return officialModelsCacheEntry{}, err
-	}
-	if len(body) > officialModelsMaxBodyBytes {
-		return officialModelsCacheEntry{}, errors.New("official models response is too large")
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return officialModelsCacheEntry{}, fmt.Errorf("official models status %d", resp.StatusCode)
-	}
-	fastModels, modelCount, err := officialFastModels(body)
-	if err != nil {
-		return officialModelsCacheEntry{}, fmt.Errorf("decode official models response: %w", err)
-	}
-	if modelCount == 0 {
-		return officialModelsCacheEntry{}, errors.New("official models response contains no models")
+	if isAgentIdentity {
+		var failure tokenProbeAttempt
+		var ok bool
+		authorization, failure, ok = a.prepareTokenProbeAuthorization(ctx, token)
+		if !ok {
+			detail := strings.TrimSpace(failure.Detail)
+			if detail == "" {
+				detail = "agent identity authentication failed"
+			}
+			return officialModelsCacheEntry{}, errors.New(detail)
+		}
 	}
 
-	now := time.Now().UTC()
-	cacheTTL := a.modelCatalog.cacheTTL
-	if cacheTTL <= 0 {
-		cacheTTL = officialModelsCacheTTL
+	for recovered := false; ; {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
+		if err != nil {
+			return officialModelsCacheEntry{}, err
+		}
+		req.Header.Set("Authorization", authorization.Value)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Originator", codexOriginator)
+		req.Header.Set("User-Agent", codexUserAgent)
+		if isAgentIdentity {
+			req.Header.Set("Version", clientVersion)
+		}
+		if authorization.AccountID != "" {
+			req.Header.Set("ChatGPT-Account-ID", authorization.AccountID)
+		}
+		if authorization.FedRAMP {
+			req.Header.Set("X-OpenAI-FedRAMP", "true")
+		}
+
+		resp, err := a.modelCatalog.client.Do(req)
+		if err != nil {
+			return officialModelsCacheEntry{}, err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, officialModelsMaxBodyBytes+1))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return officialModelsCacheEntry{}, readErr
+		}
+		if len(body) > officialModelsMaxBodyBytes {
+			return officialModelsCacheEntry{}, errors.New("official models response is too large")
+		}
+		if isAgentIdentity && !recovered && authorization.AgentIdentity != nil && agentidentity.IsInvalidTaskResponse(resp.StatusCode, body) {
+			recovered = true
+			credentials, recoverErr := a.recoverAgentIdentityProbeTask(ctx, token, authorization.AgentIdentity.TaskID)
+			if recoverErr != nil {
+				return officialModelsCacheEntry{}, errors.New("agent identity models task recovery failed")
+			}
+			assertion, assertionErr := credentials.BuildAssertion(time.Now())
+			if assertionErr != nil {
+				return officialModelsCacheEntry{}, errors.New("agent identity models assertion could not be created")
+			}
+			credentialsCopy := credentials
+			authorization = tokenProbeAuthorization{
+				Value:         assertion,
+				AccountID:     strings.TrimSpace(credentials.AccountID),
+				FedRAMP:       credentials.FedRAMP,
+				AgentIdentity: &credentialsCopy,
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return officialModelsCacheEntry{}, fmt.Errorf("official models status %d", resp.StatusCode)
+		}
+		fastModels, modelCount, err := officialFastModels(body)
+		if err != nil {
+			return officialModelsCacheEntry{}, fmt.Errorf("decode official models response: %w", err)
+		}
+		if modelCount == 0 {
+			return officialModelsCacheEntry{}, errors.New("official models response contains no models")
+		}
+
+		now := time.Now().UTC()
+		cacheTTL := a.modelCatalog.cacheTTL
+		if cacheTTL <= 0 {
+			cacheTTL = officialModelsCacheTTL
+		}
+		staleTTL := a.modelCatalog.staleTTL
+		if staleTTL < cacheTTL {
+			staleTTL = officialModelsStaleTTL
+		}
+		plan := ""
+		if token.PlanType != nil {
+			plan = strings.TrimSpace(*token.PlanType)
+		}
+		return officialModelsCacheEntry{
+			body:        append([]byte(nil), body...),
+			contentType: resp.Header.Get("Content-Type"),
+			etag:        resp.Header.Get("ETag"),
+			plan:        plan,
+			fastModels:  fastModels,
+			modelCount:  modelCount,
+			storedAt:    now,
+			expiresAt:   now.Add(cacheTTL),
+			staleUntil:  now.Add(staleTTL),
+		}, nil
 	}
-	staleTTL := a.modelCatalog.staleTTL
-	if staleTTL < cacheTTL {
-		staleTTL = officialModelsStaleTTL
-	}
-	plan := ""
-	if claim.Token != nil && claim.Token.Token.PlanType != nil {
-		plan = strings.TrimSpace(*claim.Token.Token.PlanType)
-	}
-	return officialModelsCacheEntry{
-		body:        append([]byte(nil), body...),
-		contentType: resp.Header.Get("Content-Type"),
-		etag:        resp.Header.Get("ETag"),
-		plan:        plan,
-		fastModels:  fastModels,
-		modelCount:  modelCount,
-		storedAt:    now,
-		expiresAt:   now.Add(cacheTTL),
-		staleUntil:  now.Add(staleTTL),
-	}, nil
 }
 
 func officialModelsCacheKey(ownerUserID int64, plan, clientVersion string) string {

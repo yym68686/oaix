@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/yym68686/oaix/internal/agentidentity"
+	"github.com/yym68686/oaix/internal/agentidentitytask"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -74,6 +74,30 @@ func (a *App) agentIdentityProbeCredentialStore() agentIdentityProbeCredentialSt
 		return a.store
 	}
 	return nil
+}
+
+func (a *App) agentIdentityTaskCoordinator() *agentidentitytask.Coordinator {
+	if a == nil {
+		return nil
+	}
+	a.agentIdentityTaskMu.Lock()
+	defer a.agentIdentityTaskMu.Unlock()
+	if a.agentIdentityTasks != nil {
+		return a.agentIdentityTasks
+	}
+	credentialStore, _ := a.agentIdentityProbeCredentialStore().(agentidentitytask.CredentialStore)
+	var refresher agentidentitytask.SnapshotRefresher
+	if a.tokens != nil {
+		refresher = a.tokens
+	}
+	a.agentIdentityTasks = agentidentitytask.New(
+		credentialStore,
+		a.tokenProbeRequestDoer(),
+		a.cfg.Upstream.AgentIdentityAuthAPIURL,
+		refresher,
+		a.logger,
+	)
+	return a.agentIdentityTasks
 }
 
 func (a *App) prepareTokenProbeAuthorization(parent context.Context, token store.Token) (tokenProbeAuthorization, tokenProbeAttempt, bool) {
@@ -166,64 +190,15 @@ func (a *App) loadAgentIdentityProbeCredentials(parent context.Context, token st
 }
 
 func (a *App) recoverAgentIdentityProbeTask(parent context.Context, token store.Token, expectedTaskID string) (agentidentity.Credentials, error) {
-	credentialStore := a.agentIdentityProbeCredentialStore()
-	if credentialStore == nil {
-		return agentidentity.Credentials{}, errors.New("agent identity credential store is unavailable")
+	coordinator := a.agentIdentityTaskCoordinator()
+	if coordinator == nil {
+		return agentidentity.Credentials{}, errors.New("agent identity task coordinator is unavailable")
 	}
-	key := "manual-probe-agent-task:" + strconv.FormatInt(token.ID, 10)
-	value, err, _ := a.probeIdentityRefresh.Do(key, func() (any, error) {
-		ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-		defer cancel()
-		credentials, loadErr := credentialStore.GetAgentIdentityCredentials(ctx, token.ID)
-		if loadErr != nil {
-			return agentidentity.Credentials{}, fmt.Errorf("load agent identity credentials: %w", loadErr)
-		}
-		if validateErr := credentials.Validate(); validateErr != nil {
-			return agentidentity.Credentials{}, validateErr
-		}
-		currentTaskID := strings.TrimSpace(credentials.TaskID)
-		expectedTaskID = strings.TrimSpace(expectedTaskID)
-		if currentTaskID != "" && (expectedTaskID == "" || currentTaskID != expectedTaskID) {
-			return credentials, nil
-		}
-		newTaskID, registerErr := agentidentity.RegisterTask(
-			ctx,
-			a.tokenProbeRequestDoer(),
-			a.cfg.Upstream.AgentIdentityAuthAPIURL,
-			credentials,
-		)
-		if registerErr != nil {
-			return agentidentity.Credentials{}, registerErr
-		}
-		if updateErr := credentialStore.UpdateAgentIdentityTask(ctx, token.ID, currentTaskID, newTaskID); updateErr != nil {
-			if !errors.Is(updateErr, store.ErrAgentIdentityTaskChanged) {
-				return agentidentity.Credentials{}, fmt.Errorf("persist agent identity task: %w", updateErr)
-			}
-			credentials, loadErr = credentialStore.GetAgentIdentityCredentials(ctx, token.ID)
-			if loadErr != nil {
-				return agentidentity.Credentials{}, fmt.Errorf("reload agent identity credentials: %w", loadErr)
-			}
-		} else {
-			credentials.TaskID = newTaskID
-		}
-		if a.tokens != nil {
-			if refreshErr := a.tokens.Refresh(ctx); refreshErr != nil && a.logger != nil {
-				a.logger.Warn("token snapshot refresh after manual probe agent identity task registration failed", "token_id", token.ID, "error", refreshErr)
-			}
-		}
-		if a.logger != nil {
-			a.logger.Info("manual token probe agent identity task registered", "token_id", token.ID, "owner_user_id", token.OwnerUserID)
-		}
-		return credentials, nil
-	})
+	result, err := coordinator.Recover(parent, token.ID, token.OwnerUserID, expectedTaskID)
 	if err != nil {
 		return agentidentity.Credentials{}, err
 	}
-	credentials, ok := value.(agentidentity.Credentials)
-	if !ok {
-		return agentidentity.Credentials{}, errors.New("agent identity task recovery returned an invalid result")
-	}
-	return credentials, nil
+	return result.Credentials, nil
 }
 
 func redactAgentIdentityProbeAttempt(attempt tokenProbeAttempt, credentials *agentidentity.Credentials) tokenProbeAttempt {

@@ -14,12 +14,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/yym68686/oaix/internal/agentidentity"
+	"github.com/yym68686/oaix/internal/agentidentitytask"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/oauth"
@@ -42,12 +44,13 @@ type App struct {
 	modelCatalog           *officialModelsCatalog
 	probeDoer              agentidentity.RequestDoer
 	probeIdentityStore     agentIdentityProbeCredentialStore
+	agentIdentityTaskMu    sync.Mutex
+	agentIdentityTasks     *agentidentitytask.Coordinator
 	webDir                 string
 	started                time.Time
 	authKeys               []string
 	httpRoutes             *httpRouteMetrics
 	capabilityQuotaRefresh singleflight.Group
-	probeIdentityRefresh   singleflight.Group
 }
 
 type adminImportItem struct {
@@ -94,6 +97,9 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		started:            time.Now().UTC(),
 		authKeys:           cfg.Auth.ServiceAPIKeys,
 		httpRoutes:         newHTTPRouteMetrics(),
+	}
+	if pipeline != nil {
+		app.agentIdentityTasks = pipeline.AgentIdentityTaskCoordinator()
 	}
 	if app.quota != nil {
 		app.quota.app = app
@@ -842,6 +848,10 @@ func (a *App) getTokenRefreshToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	if token.IsAgentIdentity() {
+		writeError(w, http.StatusBadRequest, errors.New("refresh_token is not available for agent identity credentials"))
 		return
 	}
 	refreshToken := strings.TrimSpace(token.RefreshToken)

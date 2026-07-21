@@ -77,13 +77,13 @@ func TestQuotaSnapshotHasCapacityUsesRawRemainingPercentAcrossAllWindows(t *test
 	}
 }
 
-func TestQuotaEligibilityAllowsAgentIdentityQueriesButNotCreditActions(t *testing.T) {
+func TestQuotaEligibilityAllowsAgentIdentityQueriesAndCreditActions(t *testing.T) {
 	token := store.Token{RefreshToken: agentidentity.SyntheticRefreshPrefix + "runtime", IsActive: true}
 	if !quotaEligible(token) {
 		t.Fatal("agent identity token should be eligible for assertion-authenticated quota queries")
 	}
-	if quotaActionEligible(token) {
-		t.Fatal("agent identity token should not consume OAuth-only quota reset credits")
+	if !quotaActionEligible(token) {
+		t.Fatal("agent identity token should be eligible for assertion-authenticated quota reset credits")
 	}
 }
 

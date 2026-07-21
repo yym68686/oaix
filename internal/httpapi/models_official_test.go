@@ -64,6 +64,94 @@ func TestModelsReturnsAndCachesOfficialCatalog(t *testing.T) {
 	}
 }
 
+func TestOfficialModelsAgentIdentityUsesAssertionAndWorkspaceHeaders(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-models")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := decodeProbeAgentAssertionTask(t, r.Header.Get("Authorization")); got != credentials.TaskID {
+			t.Errorf("assertion task = %q", got)
+		}
+		if got := r.Header.Get("ChatGPT-Account-ID"); got != credentials.AccountID {
+			t.Errorf("ChatGPT-Account-ID = %q", got)
+		}
+		if got := r.Header.Get("X-OpenAI-FedRAMP"); got != "true" {
+			t.Errorf("X-OpenAI-FedRAMP = %q", got)
+		}
+		if got := r.Header.Get("Version"); got != "0.144.0" {
+			t.Errorf("Version = %q", got)
+		}
+		_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.6-sol"}]}`)
+	}))
+	defer server.Close()
+
+	ownerUserID := int64(421)
+	plan := "k12"
+	app := modelsCatalogTestApp(t, ownerUserID, []store.Token{{
+		ID:            91,
+		OwnerUserID:   ownerUserID,
+		RefreshToken:  credentials.IdentityToken(),
+		AgentIdentity: &credentials,
+		PlanType:      &plan,
+		IsActive:      true,
+	}})
+	app.probeIdentityStore = &fakeAgentIdentityProbeStore{credentials: credentials}
+	app.modelCatalog.upstreamURL = server.URL
+
+	response := serveModelsForOwner(app, ownerUserID)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestOfficialModelsAgentIdentityRecoversInvalidTaskExactlyOnce(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-models-old")
+	credentialStore := &fakeAgentIdentityProbeStore{credentials: credentials}
+	var registrationCalls atomic.Int32
+	registration := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		registrationCalls.Add(1)
+		_, _ = io.WriteString(w, `{"task_id":"task-models-new"}`)
+	}))
+	defer registration.Close()
+
+	var upstreamCalls atomic.Int32
+	var tasks []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		tasks = append(tasks, decodeProbeAgentAssertionTask(t, r.Header.Get("Authorization")))
+		if upstreamCalls.Load() == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"code":"invalid_task_id"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.6-sol"}]}`)
+	}))
+	defer server.Close()
+
+	ownerUserID := int64(422)
+	plan := "k12"
+	app := modelsCatalogTestApp(t, ownerUserID, []store.Token{{
+		ID:            92,
+		OwnerUserID:   ownerUserID,
+		RefreshToken:  credentials.IdentityToken(),
+		AgentIdentity: &credentials,
+		PlanType:      &plan,
+		IsActive:      true,
+	}})
+	app.cfg.Upstream.AgentIdentityAuthAPIURL = registration.URL
+	app.probeIdentityStore = credentialStore
+	app.modelCatalog.upstreamURL = server.URL
+
+	response := serveModelsForOwner(app, ownerUserID)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	if upstreamCalls.Load() != 2 || registrationCalls.Load() != 1 || credentialStore.updateCalls != 1 {
+		t.Fatalf("calls upstream=%d registration=%d updates=%d", upstreamCalls.Load(), registrationCalls.Load(), credentialStore.updateCalls)
+	}
+	if len(tasks) != 2 || tasks[0] != "task-models-old" || tasks[1] != "task-models-new" {
+		t.Fatalf("assertion tasks = %v", tasks)
+	}
+}
+
 func TestOfficialModelsRetriesAnotherAvailableAccount(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
