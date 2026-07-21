@@ -891,16 +891,12 @@ func (a *App) listImportJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": summaries, "pagination": pagination(opts.Limit, opts.Offset, len(summaries), total)})
 }
 
-func importSummariesForJobs(ctx context.Context, st *store.Store, jobs []store.ImportJob, includeObservedCost bool) ([]store.ImportBatchSummary, error) {
-	summaries := make([]store.ImportBatchSummary, 0, len(jobs))
-	for _, job := range jobs {
-		summary, err := st.GetImportJobSummary(ctx, job.ID, includeObservedCost)
-		if err != nil {
-			return nil, err
-		}
-		summaries = append(summaries, *summary)
-	}
-	return summaries, nil
+type importJobSummarizer interface {
+	ImportJobSummaries(context.Context, []store.ImportJob, bool) ([]store.ImportBatchSummary, error)
+}
+
+func importSummariesForJobs(ctx context.Context, st importJobSummarizer, jobs []store.ImportJob, includeObservedCost bool) ([]store.ImportBatchSummary, error) {
+	return st.ImportJobSummaries(ctx, jobs, includeObservedCost)
 }
 
 func (a *App) getImportJobV2(w http.ResponseWriter, r *http.Request) {

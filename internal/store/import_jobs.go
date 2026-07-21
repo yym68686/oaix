@@ -456,6 +456,13 @@ func (s *Store) ListImportJobSummariesScoped(ctx context.Context, scope Resource
 	return s.importJobSummaries(ctx, jobs, includeObservedCost)
 }
 
+// ImportJobSummaries summarizes an already authorized and paginated job set in
+// bulk. Callers remain responsible for applying the appropriate resource scope
+// when loading jobs.
+func (s *Store) ImportJobSummaries(ctx context.Context, jobs []ImportJob, includeObservedCost bool) ([]ImportBatchSummary, error) {
+	return s.importJobSummaries(ctx, jobs, includeObservedCost)
+}
+
 func (s *Store) GetImportJobSummary(ctx context.Context, id int64, includeObservedCost bool) (*ImportBatchSummary, error) {
 	return s.GetImportJobSummaryScoped(ctx, AllResources(), id, includeObservedCost)
 }
@@ -595,15 +602,23 @@ func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includ
 	}
 
 	allTokenIDs := make([]int64, 0)
+	seenTokenIDs := make(map[int64]struct{})
 	for index := range summaries {
 		tokenIDs := tokenIDsByJob[summaries[index].ID]
 		summaries[index].TokenIDs = append([]int64(nil), tokenIDs...)
 		for _, tokenID := range tokenIDs {
-			allTokenIDs = appendUniqueInt64(allTokenIDs, tokenID)
+			if tokenID <= 0 {
+				continue
+			}
+			if _, exists := seenTokenIDs[tokenID]; exists {
+				continue
+			}
+			seenTokenIDs[tokenID] = struct{}{}
+			allTokenIDs = append(allTokenIDs, tokenID)
 		}
 	}
 
-	tokens, err := s.ListTokensByIDs(ctx, allTokenIDs)
+	tokens, err := s.listImportSummaryTokensByIDs(ctx, allTokenIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -675,6 +690,32 @@ func (s *Store) importJobSummaries(ctx context.Context, jobs []ImportJob, includ
 		}
 	}
 	return summaries, nil
+}
+
+func (s *Store) listImportSummaryTokensByIDs(ctx context.Context, tokenIDs []int64) ([]Token, error) {
+	ids := postgresIntIDs(tokenIDs)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		select id, is_active, cooldown_until, disabled_at
+		from codex_tokens
+		where id = any($1::integer[])
+		  and merged_into_token_id is null
+	`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tokens := make([]Token, 0, len(ids))
+	for rows.Next() {
+		var token Token
+		if err := rows.Scan(&token.ID, &token.IsActive, &token.CooldownUntil, &token.DisabledAt); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, rows.Err()
 }
 
 func (s *Store) importSummarySub2APIUsage(ctx context.Context, tokens []Token) (map[int64]Sub2APIUsageCost, bool) {
