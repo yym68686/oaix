@@ -40,11 +40,14 @@ type App struct {
 	quotaJobs              *quotaRefreshRegistry
 	oauth                  *openAIOAuthSessionStore
 	modelCatalog           *officialModelsCatalog
+	probeDoer              agentidentity.RequestDoer
+	probeIdentityStore     agentIdentityProbeCredentialStore
 	webDir                 string
 	started                time.Time
 	authKeys               []string
 	httpRoutes             *httpRouteMetrics
 	capabilityQuotaRefresh singleflight.Group
+	probeIdentityRefresh   singleflight.Group
 }
 
 type adminImportItem struct {
@@ -76,20 +79,21 @@ type adminImportItem struct {
 
 func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenManager *tokens.Manager, logWriter *logs.Writer, pipeline *proxy.Pipeline) *App {
 	app := &App{
-		cfg:          cfg,
-		logger:       logger,
-		store:        store,
-		tokens:       tokenManager,
-		logs:         logWriter,
-		proxy:        pipeline,
-		quota:        newAdminQuotaService(cfg, store, logger),
-		quotaJobs:    newQuotaRefreshRegistry(),
-		oauth:        newOpenAIOAuthSessionStore(),
-		modelCatalog: newOfficialModelsCatalog(),
-		webDir:       filepath.Join("oaix_gateway", "web"),
-		started:      time.Now().UTC(),
-		authKeys:     cfg.Auth.ServiceAPIKeys,
-		httpRoutes:   newHTTPRouteMetrics(),
+		cfg:                cfg,
+		logger:             logger,
+		store:              store,
+		tokens:             tokenManager,
+		logs:               logWriter,
+		proxy:              pipeline,
+		quota:              newAdminQuotaService(cfg, store, logger),
+		quotaJobs:          newQuotaRefreshRegistry(),
+		oauth:              newOpenAIOAuthSessionStore(),
+		modelCatalog:       newOfficialModelsCatalog(),
+		probeIdentityStore: store,
+		webDir:             filepath.Join("oaix_gateway", "web"),
+		started:            time.Now().UTC(),
+		authKeys:           cfg.Auth.ServiceAPIKeys,
+		httpRoutes:         newHTTPRouteMetrics(),
 	}
 	if tokenManager != nil {
 		tokenManager.SetReadyTransitionHandler(app.syncSub2APIReadyTransitions)
@@ -100,6 +104,13 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 	}
 	app.recovery = newQuotaRecoveryWorker(app)
 	return app
+}
+
+func (a *App) SetProbeRequestDoer(doer agentidentity.RequestDoer) {
+	if a == nil || doer == nil {
+		return
+	}
+	a.probeDoer = doer
 }
 
 func (a *App) Handler() http.Handler {

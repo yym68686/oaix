@@ -108,6 +108,10 @@ export type TokenProbeResponse = {
   status_code?: number | null;
   message?: string | null;
   detail?: string | null;
+  credential_mode?: "oauth" | "agent_identity" | null;
+  probe_stage?: "local_preflight" | "credential_preparation" | "upstream_transport" | "upstream_response" | "state_persistence" | null;
+  upstream_attempted?: boolean | null;
+  error_code?: string | null;
   raw_response?: string | null;
   cooldown_seconds?: number | null;
   probe_model?: string | null;

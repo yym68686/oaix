@@ -3,16 +3,23 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/store"
 )
@@ -81,6 +88,234 @@ func TestProbeTokenUsesCurrentAccessTokenAndStreamingPayload(t *testing.T) {
 	}
 	if result["response_model"] != "gpt-5.5" {
 		t.Fatalf("response model = %#v", result["response_model"])
+	}
+}
+
+func TestProbeTokenUsesAgentIdentityAssertion(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-ready")
+	credentialStore := &fakeAgentIdentityProbeStore{credentials: credentials}
+	var upstreamSeen bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if taskID := decodeProbeAgentAssertionTask(t, r.Header.Get("Authorization")); taskID != credentials.TaskID {
+			t.Fatalf("assertion task = %q, want %q", taskID, credentials.TaskID)
+		}
+		if got := r.Header.Get("ChatGPT-Account-ID"); got != credentials.AccountID {
+			t.Fatalf("account id = %q", got)
+		}
+		if got := r.Header.Get("X-OpenAI-FedRAMP"); got != "true" {
+			t.Fatalf("fedramp header = %q", got)
+		}
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Fatalf("accept = %q", got)
+		}
+		upstreamSeen = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"status":"completed","model":"gpt-5.6-sol"}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	app := &App{
+		cfg:                config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}},
+		probeIdentityStore: credentialStore,
+	}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:           14536,
+		OwnerUserID:  1,
+		RefreshToken: credentials.IdentityToken(),
+	}, "gpt-5.6-sol")
+
+	if !upstreamSeen {
+		t.Fatal("agent identity probe did not reach upstream")
+	}
+	if result["outcome"] != "reactivated" || result["status_code"] != http.StatusOK {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if result["credential_mode"] != probeCredentialModeAgentIdentity || result["upstream_attempted"] != true {
+		t.Fatalf("probe metadata = %#v", result)
+	}
+	if result["probe_stage"] != probeStageUpstreamResponse {
+		t.Fatalf("probe stage = %#v", result["probe_stage"])
+	}
+}
+
+func TestProbeTokenRecoversInvalidAgentIdentityTaskExactlyOnce(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-old")
+	credentialStore := &fakeAgentIdentityProbeStore{credentials: credentials}
+	var registrationCalls int
+	registration := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		registrationCalls++
+		_, _ = io.WriteString(w, `{"task_id":"task-new"}`)
+	}))
+	defer registration.Close()
+
+	var upstreamCalls int
+	var tasks []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		tasks = append(tasks, decodeProbeAgentAssertionTask(t, r.Header.Get("Authorization")))
+		if upstreamCalls == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"code":"invalid_task_id"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"status":"completed","model":"gpt-5.4-mini"}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	app := &App{
+		cfg: config.Config{Upstream: config.UpstreamConfig{
+			ResponsesURL:            upstream.URL,
+			AgentIdentityAuthAPIURL: registration.URL,
+		}},
+		probeIdentityStore: credentialStore,
+	}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:           72,
+		OwnerUserID:  8,
+		RefreshToken: credentials.IdentityToken(),
+	}, defaultAdminProbeModel)
+
+	if result["outcome"] != "reactivated" {
+		t.Fatalf("probe result = %#v", result)
+	}
+	if upstreamCalls != 2 || registrationCalls != 1 || credentialStore.updateCalls != 1 {
+		t.Fatalf("calls: upstream=%d registration=%d updates=%d", upstreamCalls, registrationCalls, credentialStore.updateCalls)
+	}
+	if len(tasks) != 2 || tasks[0] != "task-old" || tasks[1] != "task-new" {
+		t.Fatalf("assertion tasks = %v", tasks)
+	}
+}
+
+func TestProbeTokenAgentIdentityPreservesUpstream402AndDisables(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-ready")
+	upstreamBody := `{"error":{"code":"deactivated_workspace","message":"workspace disabled"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:            14536,
+		RefreshToken:  credentials.IdentityToken(),
+		AgentIdentity: &credentials,
+	}, defaultAdminProbeModel)
+
+	if result["outcome"] != "disabled" || result["status_code"] != http.StatusPaymentRequired {
+		t.Fatalf("probe result = %#v", result)
+	}
+	if result["error_code"] != "deactivated_workspace" || result["raw_response"] != upstreamBody {
+		t.Fatalf("upstream evidence was not preserved: %#v", result)
+	}
+	if result["credential_mode"] != probeCredentialModeAgentIdentity || result["upstream_attempted"] != true {
+		t.Fatalf("probe metadata = %#v", result)
+	}
+}
+
+func TestProbeTokenAgentIdentityAuthRejectionUsesCredentialSpecificMessage(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-ready")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"code":"forbidden"}}`)
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:            73,
+		RefreshToken:  credentials.IdentityToken(),
+		AgentIdentity: &credentials,
+	}, defaultAdminProbeModel)
+
+	if result["outcome"] != "disabled" || result["error_code"] != "agent_identity_auth_rejected" {
+		t.Fatalf("probe result = %#v", result)
+	}
+	if message := fmt.Sprint(result["message"]); !strings.Contains(message, "Agent Identity 鉴权被上游拒绝") {
+		t.Fatalf("message = %q", message)
+	}
+}
+
+func TestProbeTokenReportsLocalCredentialFailureWithoutPretendingUpstreamResponded(t *testing.T) {
+	var upstreamCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+	var logOutput bytes.Buffer
+	app := &App{
+		cfg:    config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}},
+		logger: slog.New(slog.NewJSONHandler(&logOutput, nil)),
+	}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{ID: 14536, OwnerUserID: 1}, defaultAdminProbeModel)
+
+	if upstreamCalls != 0 {
+		t.Fatalf("local credential failure made %d upstream calls", upstreamCalls)
+	}
+	if result["outcome"] != "inconclusive" || result["status_code"] != http.StatusBadRequest {
+		t.Fatalf("probe result = %#v", result)
+	}
+	if result["upstream_attempted"] != false || result["probe_stage"] != probeStageCredentialPreparation || result["error_code"] != "missing_access_token" {
+		t.Fatalf("probe metadata = %#v", result)
+	}
+	if message := fmt.Sprint(result["message"]); !strings.Contains(message, "未向上游发送请求") {
+		t.Fatalf("message = %q", message)
+	}
+	logLine := logOutput.String()
+	for _, fragment := range []string{`"token_id":14536`, `"credential_mode":"oauth"`, `"probe_stage":"credential_preparation"`, `"upstream_attempted":false`, `"error_code":"missing_access_token"`} {
+		if !strings.Contains(logLine, fragment) {
+			t.Fatalf("structured probe log missing %s: %s", fragment, logLine)
+		}
+	}
+}
+
+func TestProbeTokenRefreshesOAuthWhenOnlyRefreshTokenIsStored(t *testing.T) {
+	var refreshCalls int
+	oauthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls++
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.Form.Get("refresh_token"); got != "refresh-only" {
+			t.Fatalf("refresh token = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"access-refreshed","refresh_token":"refresh-rotated"}`)
+	}))
+	defer oauthServer.Close()
+	var upstreamCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		if got := r.Header.Get("Authorization"); got != "Bearer access-refreshed" {
+			t.Fatalf("authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"status":"completed","model":"gpt-5.4-mini"}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{
+		ResponsesURL:  upstream.URL,
+		OAuthTokenURL: oauthServer.URL,
+	}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:           100,
+		RefreshToken: "refresh-only",
+	}, defaultAdminProbeModel)
+
+	if refreshCalls != 1 || upstreamCalls != 1 {
+		t.Fatalf("calls: refresh=%d upstream=%d", refreshCalls, upstreamCalls)
+	}
+	if result["outcome"] != "reactivated" || result["upstream_attempted"] != true {
+		t.Fatalf("probe result = %#v", result)
 	}
 }
 
@@ -168,6 +403,9 @@ func TestProbeTokenDoesNotRefreshAccessTokenOnlyAfterAuthRejection(t *testing.T)
 
 	if result["outcome"] != "inconclusive" || result["status_code"] != http.StatusUnauthorized {
 		t.Fatalf("probe result = %#v", result)
+	}
+	if result["error_code"] != "oauth_refresh_unavailable" {
+		t.Fatalf("error code = %#v", result["error_code"])
 	}
 	if result["raw_response"] != upstreamBody {
 		t.Fatalf("raw response = %#v", result["raw_response"])
@@ -456,6 +694,69 @@ func TestStrictProbeStreamReadErrorCannotReactivate(t *testing.T) {
 
 type probeErrorReader struct {
 	err error
+}
+
+type fakeAgentIdentityProbeStore struct {
+	mu          sync.Mutex
+	credentials agentidentity.Credentials
+	updateCalls int
+}
+
+func (s *fakeAgentIdentityProbeStore) GetAgentIdentityCredentials(context.Context, int64) (agentidentity.Credentials, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.credentials, nil
+}
+
+func (s *fakeAgentIdentityProbeStore) UpdateAgentIdentityTask(_ context.Context, _ int64, expectedTaskID string, taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(s.credentials.TaskID) != strings.TrimSpace(expectedTaskID) {
+		return store.ErrAgentIdentityTaskChanged
+	}
+	s.credentials.TaskID = strings.TrimSpace(taskID)
+	s.updateCalls++
+	return nil
+}
+
+func probeAgentIdentityCredentials(t *testing.T, taskID string) agentidentity.Credentials {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return agentidentity.Credentials{
+		RuntimeID:   "runtime-probe",
+		PrivateKey:  base64.StdEncoding.EncodeToString(der),
+		TaskID:      taskID,
+		AccountID:   "workspace-probe",
+		UserID:      "user-probe",
+		WorkspaceID: "workspace-probe",
+		FedRAMP:     true,
+	}
+}
+
+func decodeProbeAgentAssertionTask(t *testing.T, authorization string) string {
+	t.Helper()
+	if !strings.HasPrefix(authorization, "AgentAssertion ") {
+		t.Fatalf("authorization = %q", authorization)
+	}
+	encoded := strings.TrimPrefix(authorization, "AgentAssertion ")
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(decoded, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	return envelope.TaskID
 }
 
 func (r probeErrorReader) Read([]byte) (int, error) {

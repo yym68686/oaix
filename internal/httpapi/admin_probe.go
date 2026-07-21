@@ -101,7 +101,7 @@ func (a *App) probeToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, requestedModel string) map[string]any {
+func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, requestedModel string) (result map[string]any) {
 	model := strings.TrimSpace(requestedModel)
 	if model == "" {
 		model = normalizeConfiguredTokenProbeModel(firstEnv("ADMIN_TOKEN_PROBE_MODEL", ""))
@@ -109,6 +109,10 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 	if model == "" {
 		model = defaultAdminProbeModel
 	}
+	startedAt := time.Now()
+	defer func() {
+		a.logManualTokenProbe(token, model, result, time.Since(startedAt))
+	}()
 	attempt, probedToken := a.executeTokenProbeWithAuth(parent, token, model)
 	statusCode := attempt.StatusCode
 	if statusCode == 0 {
@@ -117,9 +121,15 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 	switch attempt.Outcome {
 	case tokenProbeCompleted:
 		if err := a.markProbeSuccess(token, probedToken, statusCode, model); err != nil {
-			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试已完成，但保存恢复状态失败；当前状态未被报告为可用。", err.Error(), model)
+			failure := attempt
+			failure.RawResponse = ""
+			failure.ErrorCode = "state_persistence_failed"
+			failure.Stage = probeStageStatePersistence
+			return tokenProbeResultForAttempt(token, "inconclusive", http.StatusServiceUnavailable, "测试已完成，但保存恢复状态失败；当前状态未被报告为可用。", err.Error(), model, failure)
 		}
-		result := tokenProbeResult(token.ID, "reactivated", statusCode, "测试成功：收到完整的 response.completed，当前已标记为可用。", "", model)
+		success := attempt
+		success.RawResponse = ""
+		result := tokenProbeResultForAttempt(token, "reactivated", statusCode, "测试成功：收到完整的 response.completed，当前已标记为可用。", "", model, success)
 		if attempt.ResponseModel != "" {
 			result["response_model"] = attempt.ResponseModel
 		}
@@ -128,31 +138,53 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		now := time.Now().UTC()
 		until := manualProbeUsageLimitCooldown(token.CooldownUntil, attempt.UsageLimit.ResetAt, now, a.cfg.TokenPool.DefaultCooldown)
 		if err := a.markProbeUsageLimit(token, probedToken, attempt.Detail, until, model); err != nil {
-			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试确认仍受额度限制，但保存冷却状态失败。", err.Error(), model)
+			failure := attempt
+			failure.ErrorCode = "state_persistence_failed"
+			failure.Stage = probeStageStatePersistence
+			return tokenProbeResultForAttempt(token, "inconclusive", http.StatusServiceUnavailable, "测试确认仍受额度限制，但保存冷却状态失败。", err.Error(), model, failure)
 		}
-		result := tokenProbeResultWithRawResponse(token.ID, "cooling", statusCode, "测试结果：上游明确返回 usage_limit_reached，当前保持冷却。", attempt.Detail, model, attempt.RawResponse)
+		result := tokenProbeResultForAttempt(token, "cooling", statusCode, "测试结果：上游明确返回 usage_limit_reached，当前保持冷却。", attempt.Detail, model, attempt)
 		result["cooldown_seconds"] = cooldownSeconds(now, until)
 		return result
 	case tokenProbeDisabled:
 		clearAccess := upstreamerror.IsTokenInvalidated(statusCode, []byte(attempt.RawResponse))
 		failureMessage := "测试确认工作区已停用，但保存禁用状态失败。"
 		resultMessage := "测试失败：上游明确返回工作区已停用，当前已标记为禁用。"
+		if attempt.ErrorCode == "agent_identity_auth_rejected" {
+			failureMessage = "测试确认 Agent Identity 鉴权已被上游拒绝，但保存禁用状态失败。"
+			resultMessage = "测试失败：Agent Identity 鉴权被上游拒绝，当前已标记为禁用。"
+		}
 		if clearAccess {
 			failureMessage = "测试确认 authentication token 已失效，但保存禁用状态失败。"
 			resultMessage = "测试失败：上游明确返回 token_invalidated，当前已标记为禁用。"
 		}
 		if err := a.markProbeDisabled(token, probedToken, attempt.Detail, clearAccess, statusCode, model); err != nil {
-			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, failureMessage, err.Error(), model)
+			failure := attempt
+			failure.ErrorCode = "state_persistence_failed"
+			failure.Stage = probeStageStatePersistence
+			return tokenProbeResultForAttempt(token, "inconclusive", http.StatusServiceUnavailable, failureMessage, err.Error(), model, failure)
 		}
-		return tokenProbeResultWithRawResponse(token.ID, "disabled", statusCode, resultMessage, attempt.Detail, model, attempt.RawResponse)
+		return tokenProbeResultForAttempt(token, "disabled", statusCode, resultMessage, attempt.Detail, model, attempt)
 	case tokenProbeCanceled:
-		return tokenProbeResultWithRawResponse(token.ID, "inconclusive", statusCode, "测试在完整终止事件前被取消，当前状态未改变。", attempt.Detail, model, attempt.RawResponse)
+		return tokenProbeResultForAttempt(token, "inconclusive", statusCode, "测试在完整终止事件前被取消，当前状态未改变。", attempt.Detail, model, attempt)
 	case tokenProbeAuthRejected:
-		return tokenProbeResultWithRawResponse(token.ID, "inconclusive", statusCode, "刷新凭据后上游仍拒绝鉴权，当前状态未改变。", attempt.Detail, model, attempt.RawResponse)
+		message := "刷新凭据后上游仍拒绝鉴权，当前状态未改变。"
+		if attempt.ErrorCode == "oauth_refresh_unavailable" {
+			message = "上游拒绝鉴权，且当前账号没有可用的 OAuth 刷新凭据；账号状态未改变。"
+		}
+		return tokenProbeResultForAttempt(token, "inconclusive", statusCode, message, attempt.Detail, model, attempt)
 	case tokenProbeTransient:
-		return tokenProbeResultWithRawResponse(token.ID, "inconclusive", statusCode, "上游暂时不可用或限流，当前状态未改变。", attempt.Detail, model, attempt.RawResponse)
+		return tokenProbeResultForAttempt(token, "inconclusive", statusCode, "上游暂时不可用或限流，当前状态未改变。", attempt.Detail, model, attempt)
 	default:
-		return tokenProbeResultWithRawResponse(token.ID, "inconclusive", statusCode, "测试未收到可信的完整成功事件，当前状态未改变。", attempt.Detail, model, attempt.RawResponse)
+		message := "测试未收到可信的完整成功事件，当前状态未改变。"
+		if !attempt.UpstreamAttempted {
+			message = "测试未执行：本地预检失败，未向上游发送请求。"
+		} else if attempt.Stage == probeStageCredentialPreparation {
+			message = "测试未完成：Agent Identity 凭据恢复失败，账号状态未改变。"
+		} else if attempt.ErrorCode == "agent_identity_task_rejected_after_recovery" {
+			message = "测试未完成：上游在 task 恢复后仍拒绝 Agent Identity，账号状态未改变。"
+		}
+		return tokenProbeResultForAttempt(token, "inconclusive", statusCode, message, attempt.Detail, model, attempt)
 	}
 }
 
@@ -323,12 +355,37 @@ func tokenProbeResult(id int64, outcome string, statusCode int, message string, 
 	return result
 }
 
-func tokenProbeResultWithRawResponse(id int64, outcome string, statusCode int, message string, detail string, model string, rawResponse string) map[string]any {
-	result := tokenProbeResult(id, outcome, statusCode, message, detail, model)
-	if rawResponse != "" {
-		result["raw_response"] = rawResponse
+func tokenProbeResultForAttempt(token store.Token, outcome string, statusCode int, message string, detail string, model string, attempt tokenProbeAttempt) map[string]any {
+	result := tokenProbeResult(token.ID, outcome, statusCode, message, detail, model)
+	result["credential_mode"] = tokenProbeCredentialMode(token)
+	result["probe_stage"] = attempt.Stage
+	result["upstream_attempted"] = attempt.UpstreamAttempted
+	if attempt.ErrorCode != "" {
+		result["error_code"] = attempt.ErrorCode
+	}
+	if attempt.RawResponse != "" {
+		result["raw_response"] = attempt.RawResponse
 	}
 	return result
+}
+
+func (a *App) logManualTokenProbe(token store.Token, model string, result map[string]any, duration time.Duration) {
+	if a == nil || a.logger == nil || result == nil {
+		return
+	}
+	a.logger.Info(
+		"manual token probe completed",
+		"token_id", token.ID,
+		"owner_user_id", token.OwnerUserID,
+		"credential_mode", result["credential_mode"],
+		"probe_model", model,
+		"outcome", result["outcome"],
+		"status_code", result["status_code"],
+		"probe_stage", result["probe_stage"],
+		"upstream_attempted", result["upstream_attempted"],
+		"error_code", result["error_code"],
+		"duration_ms", duration.Milliseconds(),
+	)
 }
 
 func parseAdminTokenIDs(value string, limit int) ([]int64, error) {

@@ -302,19 +302,32 @@ export function TokenObservedCost({
 
 export function TokenProbeResult({ result }: { result: TokenProbeResponse }) {
   const text = result.message || result.detail || "测试完成";
+  const detail = String(result.detail || "").trim();
+  const showDetail = detail !== "" && detail !== text;
   const rawResponse = String(result.raw_response || "");
   const showRawResponse = rawResponse !== "" || probeResultNeedsRawInspection(result);
+  const outcomeLabel = result.upstream_attempted === false ? "未执行" : probeOutcomeLabel(result.outcome);
+  const statusLabel = result.status_code ? (result.upstream_attempted === false ? ` · 本地 ${result.status_code}` : ` ${result.status_code}`) : "";
   return (
     <div className="grid min-w-0 gap-2">
       <div className="flex min-w-0 items-start gap-2">
         <Badge size="sm" variant={probeBadgeVariant(result.outcome)}>
-          {probeOutcomeLabel(result.outcome)}
-          {result.status_code ? ` ${result.status_code}` : ""}
+          {outcomeLabel}
+          {statusLabel}
         </Badge>
         <span className="min-w-0 break-words text-muted-foreground [overflow-wrap:anywhere]" title={result.detail || text}>
           {text}
         </span>
       </div>
+      {showDetail && (
+        <div className="min-w-0 break-words rounded-md border bg-muted/32 px-3 py-2 text-muted-foreground text-xs [overflow-wrap:anywhere]">
+          <span className="font-medium text-foreground">具体原因：</span>
+          {detail}
+        </div>
+      )}
+      {result.upstream_attempted === false && (
+        <div className="text-muted-foreground text-xs">此次测试在本地预检阶段结束，没有向模型上游发送请求。</div>
+      )}
       {showRawResponse && (
         <div className="grid min-w-0 gap-1.5">
           <div className="font-medium text-foreground text-xs">上游原始响应</div>

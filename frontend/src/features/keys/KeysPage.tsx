@@ -105,8 +105,12 @@ type ProbeResultTarget = {
 
 function probeResultMessage(result: TokenProbeResponse): string {
   const message = result.message || "测试完成";
+  const detail = String(result.detail || "").trim();
   const rawResponse = String(result.raw_response || "").trim();
   if (!rawResponse) {
+    if (detail && detail !== message) {
+      return `${message} 原因：${detail}`;
+    }
     return message;
   }
   const preview = rawResponse.length > 220 ? `${rawResponse.slice(0, 220)}...` : rawResponse;

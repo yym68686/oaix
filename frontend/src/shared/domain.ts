@@ -27,6 +27,9 @@ export const SORT_OPTIONS = [
 ];
 
 export function probeResultNeedsRawInspection(result: TokenProbeResponse): boolean {
+  if (result.upstream_attempted === false) {
+    return false;
+  }
   return String(result.message || "").trim() === INCONCLUSIVE_PROBE_MESSAGE;
 }
 

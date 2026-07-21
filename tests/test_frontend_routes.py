@@ -106,6 +106,22 @@ def test_frontend_uses_react_vite_and_coss_registry() -> None:
     assert (COSS_UI_DIR / "select.tsx").exists()
 
 
+def test_frontend_probe_result_distinguishes_local_failure_from_upstream_response() -> None:
+    api_ts = FRONTEND_API.read_text()
+    domain_ts = (FRONTEND_SRC / "shared" / "domain.ts").read_text()
+    components_tsx = (FRONTEND_SRC / "shared" / "components.tsx").read_text()
+    keys_tsx = (FRONTEND_SRC / "features" / "keys" / "KeysPage.tsx").read_text()
+
+    assert "upstream_attempted?: boolean | null" in api_ts
+    assert "probe_stage?:" in api_ts
+    assert "error_code?: string | null" in api_ts
+    assert "result.upstream_attempted === false" in domain_ts
+    assert "具体原因：" in components_tsx
+    assert "没有向模型上游发送请求" in components_tsx
+    assert 'result.upstream_attempted === false ? "未执行"' in components_tsx
+    assert "原因：${detail}" in keys_tsx
+
+
 def test_livez_returns_without_token_count_query(monkeypatch) -> None:
     async def fail_get_token_counts():
         raise AssertionError("livez should not query token counts")
