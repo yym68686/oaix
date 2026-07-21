@@ -689,23 +689,44 @@ type authFailureRefreshResult struct {
 }
 
 func (p *Pipeline) refreshAccessTokenAfterAuthFailure(parent context.Context, claim *tokens.Claim, alreadyRefreshed bool) authFailureRefreshResult {
+	if p == nil || claim == nil || claim.Token == nil {
+		return authFailureRefreshResult{
+			Inconclusive: true,
+			Message:      "non-terminal upstream auth failure: token credentials unavailable",
+		}
+	}
+	token := claim.Token.Token
+	if token.IsAccessTokenOnly() {
+		return authFailureRefreshResult{
+			Inconclusive: true,
+			Message:      "non-terminal upstream auth failure: access-token-only credential cannot refresh",
+		}
+	}
 	if alreadyRefreshed {
 		return authFailureRefreshResult{
 			Inconclusive: true,
 			Message:      "non-terminal upstream auth failure after oauth access refresh",
 		}
 	}
-	if p == nil || p.oauthClient == nil || claim == nil || claim.Token == nil {
-		return authFailureRefreshResult{}
-	}
-	token := claim.Token.Token
 	refreshToken := strings.TrimSpace(token.RefreshToken)
 	if refreshToken == "" {
-		return authFailureRefreshResult{}
+		return authFailureRefreshResult{
+			Inconclusive: true,
+			Message:      "non-terminal upstream auth failure: no refresh token",
+		}
+	}
+	if p.oauthClient == nil {
+		return authFailureRefreshResult{
+			Inconclusive: true,
+			Message:      "non-terminal upstream auth failure: oauth refresh unavailable",
+		}
 	}
 	updater, ok := p.store.(tokenSecretUpdater)
 	if !ok || updater == nil {
-		return authFailureRefreshResult{}
+		return authFailureRefreshResult{
+			Inconclusive: true,
+			Message:      "non-terminal upstream auth failure: oauth refresh persistence unavailable",
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(parent, authFailureRefreshTimeout)

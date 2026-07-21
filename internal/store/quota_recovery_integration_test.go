@@ -122,6 +122,49 @@ func TestPostgresQuotaRecoveryStateFences(t *testing.T) {
 		t.Fatalf("matching disable was not atomic: active=%v disabled_at=%v token_access=%v secret_access=%v", disabledActive, disabledAt, disabledAccess, secretAccess)
 	}
 
+	probeID, _ := insertToken("probe-reactivate", "access-probe", "refresh-probe", nil, false)
+	var probeDisabledAt *time.Time
+	if err := db.pool.QueryRow(ctx, `select disabled_at from codex_tokens where id = $1`, probeID).Scan(&probeDisabledAt); err != nil {
+		t.Fatalf("read probe token state: %v", err)
+	}
+	probeFence := ManualProbeStateFence{
+		IsActive:   false,
+		DisabledAt: probeDisabledAt,
+		Credentials: QuotaRecoveryCredentialFence{
+			AccessToken:  "access-probe",
+			RefreshToken: "refresh-probe",
+			AccountID:    "acct-probe-reactivate-" + suffix,
+		},
+	}
+	if err := db.MarkManualProbeSuccess(ctx, probeID, probeFence, 200, "gpt-5.4-mini"); err != nil {
+		t.Fatalf("manual probe success: %v", err)
+	}
+	var probeActive bool
+	var probeEventType string
+	var probeModel string
+	var probeStatus int
+	var probePreviousActive bool
+	var probeNextActive bool
+	var probeSource string
+	if err := db.pool.QueryRow(ctx, `
+		select t.is_active, e.event_type, e.model, e.status_code,
+		       e.previous_is_active, e.next_is_active, e.metadata->>'source'
+		from codex_tokens t
+		join lateral (
+			select event_type, model, status_code, previous_is_active, next_is_active, metadata
+			from token_state_events
+			where token_id = t.id
+			order by id desc
+			limit 1
+		) e on true
+		where t.id = $1
+	`, probeID).Scan(&probeActive, &probeEventType, &probeModel, &probeStatus, &probePreviousActive, &probeNextActive, &probeSource); err != nil {
+		t.Fatalf("read manual probe event: %v", err)
+	}
+	if !probeActive || probeEventType != "reactivated_by_manual_probe" || probeModel != "gpt-5.4-mini" || probeStatus != 200 || probePreviousActive || !probeNextActive || probeSource != "manual_probe" {
+		t.Fatalf("unexpected manual probe audit: active=%v type=%q model=%q status=%d previous=%v next=%v source=%q", probeActive, probeEventType, probeModel, probeStatus, probePreviousActive, probeNextActive, probeSource)
+	}
+
 	delayedDisabledID, _ := insertToken("delayed-disabled", "access-delayed-disabled", "refresh-delayed-disabled", nil, false)
 	if _, err := db.pool.Exec(ctx, `
 		insert into token_runtime_state(token_id, disabled_reason, failure_streak)

@@ -53,6 +53,37 @@ func TestParseAccessTokenClaims(t *testing.T) {
 	}
 }
 
+func TestAccessTokenOnlyCredentialClassification(t *testing.T) {
+	sentinel := accessTokenOnlyRefreshToken(" access-token ")
+	if !strings.HasPrefix(sentinel, AccessTokenOnlyRefreshTokenPrefix) {
+		t.Fatalf("sentinel = %q", sentinel)
+	}
+	if len(sentinel) != len(AccessTokenOnlyRefreshTokenPrefix)+64 {
+		t.Fatalf("sentinel length = %d", len(sentinel))
+	}
+	for _, value := range []string{
+		sentinel,
+		"  " + sentinel + "  ",
+		legacyAccessTokenOnlyRefreshTokenPrefix + "account:fixture",
+	} {
+		if !IsAccessTokenOnlyRefreshToken(value) {
+			t.Fatalf("access-only sentinel was not recognized: %q", value)
+		}
+		if token := (Token{RefreshToken: value}); !token.IsAccessTokenOnly() || token.HasRefreshableOAuthToken() {
+			t.Fatalf("access-only token was classified as refreshable: %+v", token)
+		}
+	}
+	if IsAccessTokenOnlyRefreshToken("refresh-token") {
+		t.Fatal("real refresh token was classified as access-only")
+	}
+	if token := (Token{RefreshToken: "refresh-token"}); !token.HasRefreshableOAuthToken() {
+		t.Fatal("real OAuth refresh token was classified as non-refreshable")
+	}
+	if token := (Token{}); token.HasRefreshableOAuthToken() {
+		t.Fatal("empty refresh token was classified as refreshable")
+	}
+}
+
 func TestNormalizeTokenPayloadDropsImportMetadata(t *testing.T) {
 	payload := normalizeTokenPayload(map[string]any{
 		"_import_index":           7,

@@ -1203,7 +1203,7 @@ func storedRefreshTokensFromPayloads(rawPayloads []byte) []string {
 		case string:
 			if token := strings.TrimSpace(typed); token != "" {
 				if looksLikeAccessTokenText(token) {
-					out = append(out, "access:"+hashString(token))
+					out = append(out, accessTokenOnlyRefreshToken(token))
 				} else {
 					out = append(out, token)
 				}
@@ -1236,7 +1236,7 @@ func storedRefreshTokenFromPayload(payload map[string]any) string {
 		}
 	}
 	if accessToken := importAccessTokenFromPayload(payload); accessToken != "" {
-		return "access:" + hashString(accessToken)
+		return accessTokenOnlyRefreshToken(accessToken)
 	}
 	if value, ok := payload["token"].(string); ok && strings.TrimSpace(value) != "" {
 		return strings.TrimSpace(value)

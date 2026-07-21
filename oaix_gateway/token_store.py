@@ -93,6 +93,10 @@ MAX_TOKEN_ACTIVE_STREAM_CAP = 50
 DEFAULT_TOKEN_ACTIVE_STREAM_CAP = 10
 MAX_TOKEN_REMARK_LENGTH = 2000
 ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX = "__oaix_access_token_only__:"
+ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIXES = (
+    ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX,
+    "access:",
+)
 ACCESS_TOKEN_ONLY_EXPIRED_ERROR = "Access token expired and no refresh_token is available"
 
 
@@ -708,7 +712,8 @@ def _parse_epoch_datetime(value: Any) -> datetime | None:
 
 
 def is_access_token_only_refresh_token(value: Any) -> bool:
-    return str(value or "").startswith(ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX)
+    normalized = str(value or "").strip()
+    return normalized.startswith(ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIXES)
 
 
 def _access_token_only_identity_key(payload: dict[str, Any], access_token: str) -> str:

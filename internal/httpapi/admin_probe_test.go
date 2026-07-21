@@ -143,6 +143,37 @@ func TestProbeTokenIgnoresInvalidRefreshTokenWhenCurrentAccessTokenWorks(t *test
 	}
 }
 
+func TestProbeTokenDoesNotRefreshAccessTokenOnlyAfterAuthRejection(t *testing.T) {
+	oauthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("access-token-only probe must not call OAuth refresh")
+	}))
+	defer oauthServer.Close()
+	upstreamBody := `{"error":{"code":"no_matching_rule","message":"Unauthorized"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{
+		ResponsesURL:  upstream.URL,
+		OAuthTokenURL: oauthServer.URL,
+	}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:           10,
+		AccessToken:  "access-only-token",
+		RefreshToken: store.AccessTokenOnlyRefreshTokenPrefix + "fixture",
+	}, defaultAdminProbeModel)
+
+	if result["outcome"] != "inconclusive" || result["status_code"] != http.StatusUnauthorized {
+		t.Fatalf("probe result = %#v", result)
+	}
+	if result["raw_response"] != upstreamBody {
+		t.Fatalf("raw response = %#v", result["raw_response"])
+	}
+}
+
 func TestProbeTokenReturnsRawBodyForInconclusiveNonSuccess(t *testing.T) {
 	upstreamBody := `{"error":{"code":"temporary_gateway_error","message":"upstream unavailable","type":"gateway_error"}}`
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

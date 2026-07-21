@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -222,6 +223,45 @@ func TestQuotaFetchDoesNotRefreshExplicitTokenInvalidated(t *testing.T) {
 	}
 	if reason != quotaRecoveryCheckErrorAuthenticationInvalidated {
 		t.Fatalf("reason = %q, want %q", reason, quotaRecoveryCheckErrorAuthenticationInvalidated)
+	}
+}
+
+func TestQuotaFetchDoesNotRefreshAccessTokenOnlyAfterUnauthorized(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"no_matching_rule","message":"Unauthorized"}}`))
+	}))
+	defer upstream.Close()
+
+	oauthClient := &countingQuotaOAuthClient{}
+	service := &adminQuotaService{
+		client:      upstream.Client(),
+		oauthClient: oauthClient,
+		usageURL:    upstream.URL,
+		ttl:         time.Minute,
+		sem:         make(chan struct{}, 1),
+		cache:       map[int64]cachedQuotaSnapshot{},
+		pending:     map[int64]struct{}{},
+	}
+	token := store.Token{
+		ID:           72,
+		AccessToken:  "access-only-token",
+		RefreshToken: store.AccessTokenOnlyRefreshTokenPrefix + "fixture",
+	}
+	snapshot, reason := service.fetchSnapshotWithoutHistory(t.Context(), token)
+
+	if oauthClient.calls != 0 {
+		t.Fatalf("OAuth refresh calls = %d, want 0", oauthClient.calls)
+	}
+	if snapshot == nil || snapshot.Disabled {
+		t.Fatalf("ordinary access-only 401 must stay non-terminal: %+v", snapshot)
+	}
+	if reason != quotaRecoveryCheckErrorHTTPUnauthorized {
+		t.Fatalf("reason = %q, want %q", reason, quotaRecoveryCheckErrorHTTPUnauthorized)
+	}
+	if _, err := service.refreshQuotaToken(t.Context(), token); !errors.Is(err, errAccessTokenOnlyNotRefreshable) {
+		t.Fatalf("refresh error = %v", err)
 	}
 }
 

@@ -354,17 +354,18 @@ func quotaEligible(token store.Token) bool {
 	if token.IsAgentIdentity() {
 		return false
 	}
-	return token.IsActive && token.DisabledAt == nil && (strings.TrimSpace(token.AccessToken) != "" || strings.TrimSpace(token.RefreshToken) != "")
+	return token.IsActive && token.DisabledAt == nil && (strings.TrimSpace(token.AccessToken) != "" || token.HasRefreshableOAuthToken())
 }
 
 func quotaActionEligible(token store.Token) bool {
 	if token.IsAgentIdentity() {
 		return false
 	}
-	return strings.TrimSpace(token.AccessToken) != "" || strings.TrimSpace(token.RefreshToken) != ""
+	return strings.TrimSpace(token.AccessToken) != "" || token.HasRefreshableOAuthToken()
 }
 
 var errQuotaTokenUnavailable = errors.New("token has no usable access or refresh token")
+var errAccessTokenOnlyNotRefreshable = errors.New("access-token-only credential cannot be refreshed")
 
 type quotaUpstreamError struct {
 	status int
@@ -536,7 +537,7 @@ func (s *adminQuotaService) fetchSnapshotWithDiagnostic(ctx context.Context, tok
 		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, err.Error(), quotaRecoveryCheckErrorTransport), persist), quotaRecoveryCheckErrorTransport
 	}
 	var refreshFailureReason quotaRecoveryCheckErrorReason
-	if quotaStatusShouldRefresh(statusCode) && !quotaResponseShouldDisable(statusCode, body) {
+	if quotaStatusShouldRefresh(statusCode) && !quotaResponseShouldDisable(statusCode, body) && token.HasRefreshableOAuthToken() {
 		if refreshed, refreshErr := s.refreshQuotaToken(ctx, token); refreshErr == nil {
 			token = refreshed
 			statusCode, body, err = s.requestUsage(ctx, token)
@@ -623,7 +624,7 @@ func (s *adminQuotaService) resetCredit(ctx context.Context, token store.Token) 
 	if err != nil {
 		return nil, err
 	}
-	if quotaStatusShouldRefresh(statusCode) && !quotaResponseShouldDisable(statusCode, body) {
+	if quotaStatusShouldRefresh(statusCode) && !quotaResponseShouldDisable(statusCode, body) && token.HasRefreshableOAuthToken() {
 		if refreshed, refreshErr := s.refreshQuotaToken(ctx, token); refreshErr == nil {
 			token = refreshed
 			statusCode, body, result, err = s.requestResetCredit(ctx, token, redeemRequestID)
@@ -770,6 +771,9 @@ func contextError(err error) bool {
 }
 
 func (s *adminQuotaService) refreshQuotaToken(ctx context.Context, token store.Token) (store.Token, error) {
+	if token.IsAccessTokenOnly() {
+		return token, errAccessTokenOnlyNotRefreshable
+	}
 	refreshToken := strings.TrimSpace(token.RefreshToken)
 	if refreshToken == "" {
 		return token, fmt.Errorf("token has no refresh token")

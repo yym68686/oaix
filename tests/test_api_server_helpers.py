@@ -6847,7 +6847,7 @@ def test_execute_proxy_request_with_failover_disables_app_session_terminated_and
     assert finalized[0]["token_id"] == 42
 
 
-def test_execute_proxy_request_with_failover_disables_access_token_only_auth_failure(monkeypatch) -> None:
+def test_execute_proxy_request_with_failover_cools_access_token_only_auth_failure(monkeypatch) -> None:
     app = SimpleNamespace(
         state=SimpleNamespace(
             response_traffic=ResponseTrafficController(),
@@ -6981,9 +6981,9 @@ def test_execute_proxy_request_with_failover_disables_access_token_only_auth_fai
         {
             "token_id": 51,
             "message": '{"error":{"code":"invalid_token"}}',
-            "deactivate": True,
-            "cooldown_seconds": None,
-            "clear_access_token": True,
+            "deactivate": False,
+            "cooldown_seconds": 5,
+            "clear_access_token": False,
         }
     ]
     assert mark_success_calls == [52]

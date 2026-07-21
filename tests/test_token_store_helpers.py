@@ -29,6 +29,7 @@ from oaix_gateway.token_store import (
     extract_token_account_id_from_payload,
     normalize_token_payload_for_storage,
     invalidate_fill_first_token_cache,
+    is_access_token_only_refresh_token,
     list_token_rows,
     prewarm_fill_first_token_cache,
     publish_token_payload_batch,
@@ -166,6 +167,13 @@ def test_normalize_access_token_only_payload_adds_sentinel_refresh_token() -> No
     assert payload["refresh_token"] == f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}account:acct_access_only"
     assert payload["token_source"] == "access_token"
     assert payload["expired"].endswith("+00:00")
+
+
+def test_access_token_only_detection_accepts_go_and_legacy_sentinels() -> None:
+    assert is_access_token_only_refresh_token(f"{ACCESS_TOKEN_ONLY_REFRESH_TOKEN_PREFIX}account:fixture")
+    assert is_access_token_only_refresh_token("access:" + ("a" * 64))
+    assert is_access_token_only_refresh_token("  access:" + ("b" * 64) + "  ")
+    assert not is_access_token_only_refresh_token("refresh-token")
 
 
 def test_normalize_access_token_only_payload_without_account_id_uses_access_hash() -> None:

@@ -672,6 +672,66 @@ func TestProxyAlphaSearchFailsOverAcrossAccounts(t *testing.T) {
 	}
 }
 
+func TestProxyAlphaSearchDoesNotRefreshOrDeactivateAccessTokenOnlyOnUnstructured401(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, "Unauthorized")
+			return
+		}
+		_, _ = io.WriteString(w, `{"encrypted_output":null,"output":"recovered on another account"}`)
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	accountA := "account-a"
+	accountB := "account-b"
+	accessOnlyLastUsed := now
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, AccessToken: "access-only-token", RefreshToken: store.AccessTokenOnlyRefreshTokenPrefix + "fixture", AccountID: &accountA, IsActive: true, LastUsedAt: &accessOnlyLastUsed, CreatedAt: now, UpdatedAt: now},
+			{ID: 2, AccessToken: "fallback-token", RefreshToken: "refresh-token", AccountID: &accountB, IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorEvents: make(chan tokenErrorEvent, 1),
+	}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL+"/v1/responses", 2, fakes)
+	oauthClient := &countingProxyOAuthClient{}
+	pipeline.SetOAuthClient(oauthClient)
+	req := httptest.NewRequest(http.MethodPost, alphaSearchEndpoint, strings.NewReader(`{"id":"session-access-only","model":"gpt-5.6-terra","commands":{"search_query":[{"q":"news"}]}}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: alphaSearchEndpoint, Model: "gpt-5.6-terra", UpstreamAccept: "application/json"})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := oauthClient.calls.Load(); got != 0 {
+		t.Fatalf("OAuth refresh calls = %d, want 0", got)
+	}
+	select {
+	case event := <-fakes.tokenErrorEvents:
+		if event.TokenID != 1 || event.Deactivate || event.CooldownUntil == nil {
+			t.Fatalf("unexpected access-only auth failure state: %+v", event)
+		}
+		if !strings.Contains(event.Message, "access-token-only credential cannot refresh") {
+			t.Fatalf("message = %q", event.Message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for access-only cooldown commit")
+	}
+	fakes.mu.Lock()
+	defer fakes.mu.Unlock()
+	if !fakes.tokens[0].IsActive || fakes.tokens[0].DisabledAt != nil || fakes.tokens[0].AccessToken != "access-only-token" {
+		t.Fatalf("access-only token was disabled or cleared: %+v", fakes.tokens[0])
+	}
+	if len(fakes.attempts) != 2 || fakes.attempts[0].Deactivated {
+		t.Fatalf("attempts = %+v", fakes.attempts)
+	}
+}
+
 func TestProxyAlphaSearchPreservesFinalUpstreamErrorAfterFailoverExhaustion(t *testing.T) {
 	var calls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1835,7 +1895,7 @@ func TestProxyDeactivatesOAuthTokenWhenRefreshTokenIsPermanentlyInvalid(t *testi
 	}
 	select {
 	case event := <-fakes.tokenErrorEvents:
-		if event.TokenID != 1 || !event.Deactivate {
+		if event.TokenID != 1 || !event.Deactivate || event.CooldownUntil != nil {
 			t.Fatalf("token error event = %+v, want token 1 deactivated", event)
 		}
 		if !strings.Contains(event.Message, "refresh token invalid") {
@@ -1911,11 +1971,11 @@ func TestProxyTargetTokenDoesNotFallbackAcrossOwnerPool(t *testing.T) {
 	}
 	select {
 	case event := <-fakes.tokenErrorEvents:
-		if event.TokenID != 1 || !event.Deactivate {
-			t.Fatalf("token error event = %+v, want token 1 deactivated", event)
+		if event.TokenID != 1 || event.Deactivate || event.CooldownUntil == nil {
+			t.Fatalf("token error event = %+v, want token 1 kept active with a short cooldown", event)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for target token deactivate commit")
+		t.Fatal("timed out waiting for target token auth cooldown commit")
 	}
 	select {
 	case event := <-fakes.tokenErrorEvents:
@@ -4345,6 +4405,15 @@ type fakeProxyStore struct {
 type fakeOAuthClient struct {
 	result oauth.RefreshResult
 	err    error
+}
+
+type countingProxyOAuthClient struct {
+	calls atomic.Int64
+}
+
+func (c *countingProxyOAuthClient) Refresh(context.Context, string) (oauth.RefreshResult, error) {
+	c.calls.Add(1)
+	return oauth.RefreshResult{}, errors.New("OAuth refresh must not run for access-token-only credentials")
 }
 
 func (c fakeOAuthClient) Refresh(context.Context, string) (oauth.RefreshResult, error) {

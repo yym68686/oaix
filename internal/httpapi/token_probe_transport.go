@@ -275,6 +275,14 @@ func (a *App) executeTokenProbeWithAuth(parent context.Context, token store.Toke
 			}
 		}
 	}
+	if token.IsAccessTokenOnly() {
+		return tokenProbeAttempt{
+			Outcome:     tokenProbeInconclusive,
+			StatusCode:  attempt.StatusCode,
+			Detail:      "access-token-only credential was rejected; token state was preserved",
+			RawResponse: attempt.RawResponse,
+		}, token
+	}
 
 	service := a.quota
 	if service == nil {

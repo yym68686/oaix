@@ -27,6 +27,9 @@ const (
 	MaxMarketplacePriceBPS     = 250
 	MarketplacePriceStepBPS    = 10
 
+	AccessTokenOnlyRefreshTokenPrefix       = "access:"
+	legacyAccessTokenOnlyRefreshTokenPrefix = "__oaix_access_token_only__:"
+
 	transientRetryCooldownPrefix        = "retryable upstream failure:"
 	transientRetryCooldownDisplayWindow = time.Minute
 )
@@ -63,6 +66,24 @@ type Token struct {
 
 func (t Token) IsAgentIdentity() bool {
 	return t.AgentIdentity != nil || strings.HasPrefix(strings.TrimSpace(t.RefreshToken), agentidentity.SyntheticRefreshPrefix)
+}
+
+func (t Token) IsAccessTokenOnly() bool {
+	return IsAccessTokenOnlyRefreshToken(t.RefreshToken)
+}
+
+func (t Token) HasRefreshableOAuthToken() bool {
+	return !t.IsAgentIdentity() && !t.IsAccessTokenOnly() && strings.TrimSpace(t.RefreshToken) != ""
+}
+
+func IsAccessTokenOnlyRefreshToken(value string) bool {
+	value = strings.TrimSpace(value)
+	return strings.HasPrefix(value, AccessTokenOnlyRefreshTokenPrefix) ||
+		strings.HasPrefix(value, legacyAccessTokenOnlyRefreshTokenPrefix)
+}
+
+func accessTokenOnlyRefreshToken(accessToken string) string {
+	return AccessTokenOnlyRefreshTokenPrefix + hashString(strings.TrimSpace(accessToken))
 }
 
 type TokenObservedCost struct {
@@ -892,7 +913,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 			payload["auth_mode"] = agentidentity.AuthMode
 		}
 		if refreshToken == "" && accessToken != "" {
-			refreshToken = "access:" + hashString(accessToken)
+			refreshToken = accessTokenOnlyRefreshToken(accessToken)
 			payload["refresh_token"] = refreshToken
 			payload["token_source"] = "access_token"
 		}
@@ -1326,9 +1347,10 @@ type ManualProbeStateFence struct {
 	Credentials   QuotaRecoveryCredentialFence
 }
 
-func (s *Store) MarkManualProbeSuccess(ctx context.Context, tokenID int64, fence ManualProbeStateFence) error {
+func (s *Store) MarkManualProbeSuccess(ctx context.Context, tokenID int64, fence ManualProbeStateFence, statusCode int, model string) error {
 	return s.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var ownerUserID sql.NullInt64
+		err := tx.QueryRow(ctx, `
 			update codex_tokens
 			set is_active = true,
 			    cooldown_until = null,
@@ -1345,27 +1367,48 @@ func (s *Store) MarkManualProbeSuccess(ctx context.Context, tokenID int64, fence
 			  and coalesce(access_token, '') = $6
 			  and coalesce(refresh_token, '') = $7
 			  and btrim(coalesce(account_id, '')) = $8
+			returning owner_user_id
 		`, tokenID, fence.IsActive, fence.DisabledAt, fence.CooldownUntil,
-			fence.LastError, fence.Credentials.AccessToken, fence.Credentials.RefreshToken, strings.TrimSpace(fence.Credentials.AccountID))
+			fence.LastError, fence.Credentials.AccessToken, fence.Credentials.RefreshToken, strings.TrimSpace(fence.Credentials.AccountID)).Scan(&ownerUserID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrTokenStateChanged
+		}
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() != 1 {
-			return ErrTokenStateChanged
-		}
-		_, err = tx.Exec(ctx, `
+		if _, err = tx.Exec(ctx, `
 			insert into token_runtime_state(
-				token_id, active_streams, cooldown_until, disabled_reason,
+				token_id, owner_user_id, active_streams, cooldown_until, disabled_reason,
 				failure_streak, last_success_at, updated_at
 			)
-			values ($1, 0, null, null, 0, now(), now())
+			values ($1, $2, 0, null, null, 0, now(), now())
 			on conflict (token_id) do update
-			set cooldown_until = null,
+			set owner_user_id = coalesce(excluded.owner_user_id, token_runtime_state.owner_user_id),
+			    cooldown_until = null,
 			    disabled_reason = null,
 			    failure_streak = 0,
 			    last_success_at = now(),
 			    updated_at = now()
-		`, tokenID)
+		`, tokenID, nullableOwnerID(ownerUserID)); err != nil {
+			return err
+		}
+		eventType := "manual_probe_succeeded"
+		reason := "manual probe confirmed token is usable"
+		if !fence.IsActive || fence.DisabledAt != nil {
+			eventType = "reactivated_by_manual_probe"
+			reason = "manual probe reactivated token"
+		}
+		_, err = tx.Exec(ctx, `
+			insert into token_state_events(
+				token_id, owner_user_id, event_type, reason, model, status_code,
+				previous_is_active, next_is_active, metadata
+			)
+			values ($1, $2, $3, $4, nullif($5, ''), nullif($6, 0), $7, true, $8)
+		`, tokenID, nullableOwnerID(ownerUserID), eventType, reason, strings.TrimSpace(model), statusCode, fence.IsActive, jsonBytes(map[string]any{
+			"source":           "manual_probe",
+			"cleared_cooldown": fence.CooldownUntil != nil,
+			"cleared_error":    fence.LastError != nil,
+		}))
 		return err
 	})
 }

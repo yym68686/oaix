@@ -212,6 +212,7 @@ RESPONSES_STREAM_NETWORK_ERRORS = (
     httpx.PoolTimeout,
 )
 DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECONDS = 30.0
+AUTH_FAILURE_COOLDOWN_SECONDS = 5
 STREAM_KEEPALIVE_PADDING_BYTES = 2048
 STREAM_KEEPALIVE_COMMENT = b": keepalive" + (b" " * STREAM_KEEPALIVE_PADDING_BYTES) + b"\n\n"
 _SSE_SEPARATOR_TAIL_CHARS = 3
@@ -1498,13 +1499,15 @@ def _exclude_auth_failed_token_for_request(
     token_row: Any,
     *,
     app: FastAPI | None = None,
+    clear_access_token: bool = True,
 ) -> None:
     try:
         token_id = int(token_row.id)
     except (AttributeError, TypeError, ValueError):
         return
     excluded_token_ids.add(token_id)
-    _clear_token_row_access_token_for_retry(token_row)
+    if clear_access_token:
+        _clear_token_row_access_token_for_retry(token_row)
     if app is not None:
         _prompt_cache_remove_token(app, token_id)
 
@@ -8992,9 +8995,7 @@ def _gpt_image_stream_keepalive_response(
                         await mark_token_error(token_row.id, detail)
 
                     permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
-                    auth_failed_after_refresh = status_code in (401, 403) and (
-                        access_token_refreshed or is_access_token_only_refresh_token(token_row.refresh_token)
-                    )
+                    auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
 
                     if permanently_disabled or auth_failed_after_refresh:
                         oauth_manager.invalidate(token_row.id)
@@ -9018,14 +9019,25 @@ def _gpt_image_stream_keepalive_response(
                         continue
 
                     if status_code in (401, 403):
+                        access_token_only = is_access_token_only_refresh_token(token_row.refresh_token)
                         oauth_manager.invalidate(token_row.id)
-                        _exclude_auth_failed_token_for_request(excluded_token_ids, token_row)
-                        await mark_token_error(token_row.id, detail, clear_access_token=True)
+                        _exclude_auth_failed_token_for_request(
+                            excluded_token_ids,
+                            token_row,
+                            clear_access_token=not access_token_only,
+                        )
+                        await mark_token_error(
+                            token_row.id,
+                            detail,
+                            cooldown_seconds=AUTH_FAILURE_COOLDOWN_SECONDS if access_token_only else None,
+                            clear_access_token=not access_token_only,
+                        )
                         logger.warning(
-                            "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
+                            "Codex upstream auth failed; isolated token for request retry: token_id=%s account_id=%s status=%s access_token_only=%s attempt=%s/%s",
                             token_row.id,
                             token_row.account_id,
                             status_code,
+                            access_token_only,
                             attempt,
                             max_attempts,
                         )
@@ -9871,9 +9883,7 @@ async def _responses_stream_keepalive_response(
                         await mark_token_error(token_row.id, detail)
 
                     permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
-                    auth_failed_after_refresh = status_code in (401, 403) and (
-                        access_token_refreshed or is_access_token_only_refresh_token(token_row.refresh_token)
-                    )
+                    auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
 
                     if permanently_disabled or auth_failed_after_refresh:
                         oauth_manager.invalidate(token_row.id)
@@ -9892,13 +9902,20 @@ async def _responses_stream_keepalive_response(
                         continue
 
                     if status_code in (401, 403):
+                        access_token_only = is_access_token_only_refresh_token(token_row.refresh_token)
                         oauth_manager.invalidate(token_row.id)
                         _exclude_auth_failed_token_for_request(
                             excluded_token_ids,
                             token_row,
                             app=http_request.app,
+                            clear_access_token=not access_token_only,
                         )
-                        await mark_token_error(token_row.id, detail, clear_access_token=True)
+                        await mark_token_error(
+                            token_row.id,
+                            detail,
+                            cooldown_seconds=AUTH_FAILURE_COOLDOWN_SECONDS if access_token_only else None,
+                            clear_access_token=not access_token_only,
+                        )
                         last_error = exc
                         continue
 
@@ -10762,9 +10779,7 @@ async def _execute_proxy_request_with_failover(
                     await mark_token_error(token_row.id, detail)
 
                 permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
-                auth_failed_after_refresh = status_code in (401, 403) and (
-                    access_token_refreshed or is_access_token_only_refresh_token(token_row.refresh_token)
-                )
+                auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
 
                 if permanently_disabled or auth_failed_after_refresh:
                     oauth_manager.invalidate(token_row.id)
@@ -10792,18 +10807,26 @@ async def _execute_proxy_request_with_failover(
                     continue
 
                 if status_code in (401, 403):
+                    access_token_only = is_access_token_only_refresh_token(token_row.refresh_token)
                     oauth_manager.invalidate(token_row.id)
                     _exclude_auth_failed_token_for_request(
                         excluded_token_ids,
                         token_row,
                         app=http_request.app,
+                        clear_access_token=not access_token_only,
                     )
-                    await mark_token_error(token_row.id, detail, clear_access_token=True)
+                    await mark_token_error(
+                        token_row.id,
+                        detail,
+                        cooldown_seconds=AUTH_FAILURE_COOLDOWN_SECONDS if access_token_only else None,
+                        clear_access_token=not access_token_only,
+                    )
                     logger.warning(
-                        "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
+                        "Codex upstream auth failed; isolated token for request retry: token_id=%s account_id=%s status=%s access_token_only=%s attempt=%s/%s",
                         token_row.id,
                         token_row.account_id,
                         status_code,
+                        access_token_only,
                         attempt,
                         max_attempts,
                     )

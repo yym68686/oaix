@@ -116,7 +116,7 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 	}
 	switch attempt.Outcome {
 	case tokenProbeCompleted:
-		if err := a.markProbeSuccess(token, probedToken); err != nil {
+		if err := a.markProbeSuccess(token, probedToken, statusCode, model); err != nil {
 			return tokenProbeResult(token.ID, "inconclusive", http.StatusServiceUnavailable, "测试已完成，但保存恢复状态失败；当前状态未被报告为可用。", err.Error(), model)
 		}
 		result := tokenProbeResult(token.ID, "reactivated", statusCode, "测试成功：收到完整的 response.completed，当前已标记为可用。", "", model)
@@ -157,6 +157,9 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 }
 
 func (a *App) refreshProbeAccessToken(parent context.Context, token store.Token, model string) (store.Token, map[string]any) {
+	if token.IsAccessTokenOnly() {
+		return token, tokenProbeResult(token.ID, "inconclusive", http.StatusBadRequest, "当前账号仅包含 access token，无法执行 OAuth refresh；账号状态未改变。", errAccessTokenOnlyNotRefreshable.Error(), model)
+	}
 	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 	defer cancel()
 	service := a.quota
@@ -242,13 +245,13 @@ func normalizeConfiguredTokenProbeModel(value string) string {
 	return ""
 }
 
-func (a *App) markProbeSuccess(observed store.Token, probed store.Token) error {
+func (a *App) markProbeSuccess(observed store.Token, probed store.Token, statusCode int, model string) error {
 	if a.store == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := a.store.MarkManualProbeSuccess(ctx, observed.ID, manualProbeStateFence(observed, probed)); err != nil {
+	if err := a.store.MarkManualProbeSuccess(ctx, observed.ID, manualProbeStateFence(observed, probed), statusCode, model); err != nil {
 		return err
 	}
 	if a.tokens != nil {
