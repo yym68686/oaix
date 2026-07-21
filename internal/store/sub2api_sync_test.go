@@ -64,6 +64,22 @@ func TestSub2APITokenCandidateQueryCastsRawPayloadToJSONB(t *testing.T) {
 	}
 }
 
+func TestSub2APITokenCandidateCredentialFilters(t *testing.T) {
+	if !strings.Contains(sub2APIOAuthCandidateFilter, "access_token") || !strings.Contains(sub2APIOAuthCandidateFilter, "refresh_token") {
+		t.Fatalf("OAuth candidate filter = %q", sub2APIOAuthCandidateFilter)
+	}
+	if sub2APIAgentIdentityCandidateFilter != "ai.token_id is not null" {
+		t.Fatalf("Agent Identity candidate filter = %q", sub2APIAgentIdentityCandidateFilter)
+	}
+	filters, _ := sub2APITokenCandidateQueryFilters(Sub2APISyncTarget{ID: 1, OwnerUserID: 2}, Sub2APITokenCandidateOptions{}, sub2APIAgentIdentityCandidateFilter)
+	joined := strings.Join(filters, " and ")
+	for _, expected := range []string{"t.owner_user_id = $2", "ai.token_id is not null", "m.status = 'synced'"} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("candidate filters %q do not contain %q", joined, expected)
+		}
+	}
+}
+
 func TestValidateDistinctSub2APIRemoteAccounts(t *testing.T) {
 	if err := ValidateDistinctSub2APIRemoteAccounts([]Sub2APIUsageSyncMapping{
 		{TokenID: 1, RemoteAccountID: 10},

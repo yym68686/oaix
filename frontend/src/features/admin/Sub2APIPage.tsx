@@ -1,4 +1,4 @@
-import { CheckCircle2Icon, PlayIcon, PlusIcon, RefreshCwIcon, SendIcon, Trash2Icon } from "lucide-react";
+import { CheckCircle2Icon, PlayIcon, PlusIcon, RefreshCwIcon, SendIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
@@ -120,6 +120,8 @@ export function AdminSub2APIPage({
     }
     return options;
   }, [draft.proxy_id, proxies]);
+
+  const latestCompatibilityNotice = firstSub2APIRunNotice(runs);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -320,6 +322,13 @@ export function AdminSub2APIPage({
       const run = payload.run;
       if (run?.status === "failed") {
         pushToast(run.error_message || "Sub2API 同步失败", "error");
+      } else if (run) {
+        const notice = sub2APIRunNotice(run);
+        if (notice) {
+          pushToast(notice.message, "warning");
+        } else {
+          pushToast(mode === "check" ? "Sub2API 检查完成" : "Sub2API 同步完成");
+        }
       } else {
         pushToast(mode === "check" ? "Sub2API 检查完成" : "Sub2API 同步完成");
       }
@@ -552,6 +561,13 @@ export function AdminSub2APIPage({
           </CardHeader>
           <CardPanel className="grid gap-4">
             {error && <ErrorAlert title="Sub2API 载入失败" message={error} />}
+            {latestCompatibilityNotice && (
+              <Alert aria-live="polite" variant="warning">
+                <TriangleAlertIcon />
+                <AlertTitle>{latestCompatibilityNotice.title}</AlertTitle>
+                <AlertDescription>{latestCompatibilityNotice.message}</AlertDescription>
+              </Alert>
+            )}
             <div className="grid gap-3 md:grid-cols-4">
               <MiniMetric label="目标" value={targets.length} />
               <MiniMetric label="启用" value={targets.filter((item) => item.enabled).length} />
@@ -750,24 +766,71 @@ function RunTable({ items, loading }: { items: Sub2APIRun[]; loading: boolean })
           </TableRow>
         </TableHeader>
         <TableBody>
-          {items.map((run) => (
-            <TableRow key={run.id}>
-              <TableCell>{formatDate(run.finished_at || run.started_at)}</TableCell>
-              <TableCell>#{run.target_id}</TableCell>
-              <TableCell>{run.trigger}</TableCell>
-              <TableCell>
-                <Badge variant={statusVariant(run.status)}>{run.status}</Badge>
-                {run.error_message && <div className="mt-1 max-w-72 truncate text-destructive-foreground text-xs">{run.error_message}</div>}
-              </TableCell>
-              <TableCell className="text-xs">
-                远端 {formatNumber(run.remote_count)} · 阈值 {formatNumber(run.threshold)} · 选中 {formatNumber(run.selected_count)} · 成功 {formatNumber(run.synced_count)} · 失败 {formatNumber(run.failed_count)}
-              </TableCell>
-            </TableRow>
-          ))}
+          {items.map((run) => {
+            const notice = sub2APIRunNotice(run);
+            return (
+              <TableRow key={run.id}>
+                <TableCell>{formatDate(run.finished_at || run.started_at)}</TableCell>
+                <TableCell>#{run.target_id}</TableCell>
+                <TableCell>{run.trigger}</TableCell>
+                <TableCell>
+                  <Badge variant={statusVariant(run.status)}>{run.status}</Badge>
+                  {run.error_message && (
+                    <div className="mt-1 max-w-72 truncate text-destructive-foreground text-xs" title={run.error_message}>
+                      {run.error_message}
+                    </div>
+                  )}
+                  {notice && <div className="mt-1 max-w-96 text-warning-foreground text-xs">{notice.message}</div>}
+                </TableCell>
+                <TableCell className="text-xs">
+                  远端 {formatNumber(run.remote_count)} · 阈值 {formatNumber(run.threshold)} · 选中 {formatNumber(run.selected_count)} · 成功 {formatNumber(run.synced_count)} · 失败 {formatNumber(run.failed_count)}
+                </TableCell>
+              </TableRow>
+            );
+          })}
         </TableBody>
       </Table>
     </div>
   );
+}
+
+function firstSub2APIRunNotice(runs: Sub2APIRun[]): { message: string; title: string } | null {
+  const seenTargets = new Set<number>();
+  for (const run of runs) {
+    if (seenTargets.has(run.target_id)) continue;
+    seenTargets.add(run.target_id);
+    const notice = sub2APIRunNotice(run);
+    if (notice) return notice;
+  }
+  return null;
+}
+
+function sub2APIRunNotice(run: Sub2APIRun): { message: string; title: string } | null {
+  const details = run.details;
+  if (!details) return null;
+  const blockedCount = detailNumber(details.blocked_agent_identity_count);
+  if (blockedCount <= 0) return null;
+  const targetVersion = detailString(details.target_version);
+  const requiredVersion = detailString(details.required_target_version) || "0.1.150";
+  if (targetVersion) {
+    return {
+      title: "目标 Sub2API 版本过旧",
+      message: `目标运行 Sub2API ${targetVersion}；${formatNumber(blockedCount)} 个 Agent Identity 账号需要 ${requiredVersion} 或更高版本。升级目标后重新同步。`,
+    };
+  }
+  return {
+    title: "无法确认目标 Sub2API 版本",
+    message: `为避免写入不兼容凭证，${formatNumber(blockedCount)} 个 Agent Identity 账号未同步。请将目标升级到 ${requiredVersion} 或更高版本后重试。`,
+  };
+}
+
+function detailNumber(value: unknown): number {
+  const number = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function detailString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function statusVariant(status?: string | null): "success" | "secondary" | "warning" | "error" | "outline" {

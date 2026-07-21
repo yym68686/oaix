@@ -138,7 +138,7 @@ func TestClientGetsServerTimezoneAndTodayUsageBatch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/settings/public":
-			writeSub2APISuccess(t, w, map[string]any{"server_timezone": "Asia/Shanghai"})
+			writeSub2APISuccess(t, w, map[string]any{"server_timezone": "Asia/Shanghai", "version": "0.1.162"})
 		case "/api/v1/admin/accounts/today-stats/batch":
 			if r.Method != http.MethodPost {
 				t.Fatalf("method = %s, want POST", r.Method)
@@ -163,6 +163,13 @@ func TestClientGetsServerTimezoneAndTodayUsageBatch(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.Client())
+	metadata, err := client.GetServerMetadata(t.Context(), server.URL)
+	if err != nil {
+		t.Fatalf("GetServerMetadata returned error: %v", err)
+	}
+	if metadata.Version != "0.1.162" || metadata.TimezoneName != "Asia/Shanghai" {
+		t.Fatalf("metadata = %#v", metadata)
+	}
 	timezoneName, location, err := client.GetServerTimezone(t.Context(), server.URL)
 	if err != nil {
 		t.Fatalf("GetServerTimezone returned error: %v", err)
@@ -176,6 +183,51 @@ func TestClientGetsServerTimezoneAndTodayUsageBatch(t *testing.T) {
 	}
 	if len(batch.Stats) != 2 || batch.Stats[42].AccountCost != 1.25 || batch.Stats[42].TotalRequests != 3 || batch.Stats[43].AccountCost != 0 {
 		t.Fatalf("batch = %#v", batch)
+	}
+}
+
+func TestClientGetsServerVersionWithoutTimezone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/settings/public" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		writeSub2APISuccess(t, w, map[string]any{"version": "0.1.135"})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.Client())
+	metadata, err := client.GetServerMetadata(t.Context(), server.URL)
+	if err != nil {
+		t.Fatalf("GetServerMetadata returned error: %v", err)
+	}
+	if metadata.Version != "0.1.135" || metadata.TimezoneName != "" {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+	if _, _, err := client.GetServerTimezone(t.Context(), server.URL); err == nil || !strings.Contains(err.Error(), "timezone is missing") {
+		t.Fatalf("GetServerTimezone error = %v", err)
+	}
+}
+
+func TestSupportsAgentIdentity(t *testing.T) {
+	tests := []struct {
+		version string
+		want    bool
+	}{
+		{version: "0.1.135", want: false},
+		{version: "0.1.149", want: false},
+		{version: "0.1.150", want: true},
+		{version: "v0.1.150", want: true},
+		{version: "0.1.162+build.1", want: true},
+		{version: "0.1.150-rc.1", want: false},
+		{version: "", want: false},
+		{version: "latest", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.version, func(t *testing.T) {
+			if got := SupportsAgentIdentity(test.version); got != test.want {
+				t.Fatalf("SupportsAgentIdentity(%q) = %v, want %v", test.version, got, test.want)
+			}
+		})
 	}
 }
 

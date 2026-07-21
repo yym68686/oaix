@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -37,6 +38,17 @@ type mappedAccountReconcileResult struct {
 	StaleRemoteAccountIDs  []int64 `json:"stale_remote_account_ids,omitempty"`
 	RestoredTokenIDs       []int64 `json:"restored_token_ids,omitempty"`
 	RestoredRemoteAccounts []int64 `json:"restored_remote_account_ids,omitempty"`
+}
+
+type agentIdentityCompatibility struct {
+	CandidateCount int
+	TargetVersion  string
+	Supported      bool
+	CheckFailed    bool
+}
+
+func (c agentIdentityCompatibility) blocked() bool {
+	return c.CandidateCount > 0 && !c.Supported
 }
 
 func NewSyncer(st *store.Store, client *Client, logger *slog.Logger, oauthClientID string) *Syncer {
@@ -414,8 +426,14 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 		result.NeededCount = target.MinAvailable - remoteCount
 	}
 	if mode == SyncModeCheck {
+		compatibility, compatibilityErr := s.agentIdentityCompatibility(ctx, target)
+		if compatibilityErr != nil {
+			result.Status = store.Sub2APISyncStatusFailed
+			result.ErrorMessage = compatibilityErr.Error()
+			return s.finish(ctx, run, result)
+		}
 		result.Status = store.Sub2APISyncStatusCompleted
-		result.Details = map[string]any{"mode": "check", "group_ids": target.TargetGroupIDs}
+		result.Details = agentIdentityCompatibilityDetails(map[string]any{"mode": "check", "group_ids": target.TargetGroupIDs}, compatibility)
 		return s.finish(ctx, run, result)
 	}
 	reconcile := mappedAccountReconcileResult{}
@@ -457,7 +475,16 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 		}
 	}
 
-	candidates, err := s.Store.ListSub2APITokenCandidates(ctx, target, store.Sub2APITokenCandidateOptions{Limit: limit})
+	compatibility, err := s.agentIdentityCompatibility(ctx, target)
+	if err != nil {
+		result.Status = store.Sub2APISyncStatusFailed
+		result.ErrorMessage = err.Error()
+		return s.finish(ctx, run, result)
+	}
+	candidates, err := s.Store.ListSub2APITokenCandidates(ctx, target, store.Sub2APITokenCandidateOptions{
+		Limit:                limit,
+		IncludeAgentIdentity: compatibility.Supported,
+	})
 	if err != nil {
 		result.Status = store.Sub2APISyncStatusFailed
 		result.ErrorMessage = err.Error()
@@ -466,7 +493,15 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 	result.SelectedCount = len(candidates)
 	if len(candidates) == 0 {
 		result.Status = store.Sub2APISyncStatusSkipped
-		result.Details = syncDetails(map[string]any{"reason": "no_unsynced_oaix_candidates", "group_ids": target.TargetGroupIDs}, reconcile)
+		reason := "no_unsynced_oaix_candidates"
+		if compatibility.blocked() {
+			reason = "sub2api_agent_identity_version_unsupported"
+			if compatibility.CheckFailed || compatibility.TargetVersion == "" {
+				reason = "sub2api_agent_identity_version_unknown"
+			}
+		}
+		details := syncDetails(map[string]any{"reason": reason, "group_ids": target.TargetGroupIDs}, reconcile)
+		result.Details = agentIdentityCompatibilityDetails(details, compatibility)
 		return s.finish(ctx, run, result)
 	}
 
@@ -479,7 +514,8 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 		result.Status = store.Sub2APISyncStatusFailed
 		result.FailedCount = len(candidates)
 		result.ErrorMessage = err.Error()
-		result.Details = syncDetails(map[string]any{"selected_token_ids": tokenCandidateIDs(candidates)}, reconcile)
+		details := syncDetails(map[string]any{"selected_token_ids": tokenCandidateIDs(candidates)}, reconcile)
+		result.Details = agentIdentityCompatibilityDetails(details, compatibility)
 		return s.finish(ctx, run, result)
 	}
 	for index, candidate := range candidates {
@@ -510,8 +546,28 @@ func (s *Syncer) RunTarget(ctx context.Context, target store.Sub2APISyncTarget, 
 		"selected_token_ids":  tokenCandidateIDs(candidates),
 		"sub2api_batch_total": map[string]any{"success": batch.Success, "failed": batch.Failed},
 	}
-	result.Details = syncDetails(result.Details.(map[string]any), reconcile)
+	result.Details = agentIdentityCompatibilityDetails(syncDetails(result.Details.(map[string]any), reconcile), compatibility)
 	return s.finish(ctx, run, result)
+}
+
+func (s *Syncer) agentIdentityCompatibility(ctx context.Context, target store.Sub2APISyncTarget) (agentIdentityCompatibility, error) {
+	compatibility := agentIdentityCompatibility{}
+	count, err := s.Store.CountSub2APIAgentIdentityCandidates(ctx, target)
+	if err != nil {
+		return compatibility, fmt.Errorf("count sub2api agent identity candidates: %w", err)
+	}
+	compatibility.CandidateCount = count
+	if count == 0 {
+		return compatibility, nil
+	}
+	metadata, err := s.Client.GetServerMetadata(ctx, target.BaseURL)
+	if err != nil {
+		compatibility.CheckFailed = true
+		return compatibility, nil
+	}
+	compatibility.TargetVersion = metadata.Version
+	compatibility.Supported = SupportsAgentIdentity(metadata.Version)
+	return compatibility, nil
 }
 
 func (s *Syncer) reconcileMappedAccounts(ctx context.Context, target store.Sub2APISyncTarget, runID int64) (mappedAccountReconcileResult, error) {
@@ -563,8 +619,17 @@ func shouldReconcileMappedAccounts(trigger string, neededCount int) bool {
 }
 
 func (s *Syncer) syncMappedAccount(ctx context.Context, baseURL string, adminKey string, targetID int64, remoteAccountID int64, candidate store.Sub2APITokenCandidate) error {
-	if err := s.Client.ApplyOAuthCredentials(ctx, baseURL, adminKey, remoteAccountID, s.oauthCredentials(candidate), sub2APISyncMetadata(targetID, candidate)); err != nil {
-		return fmt.Errorf("update oauth credentials: %w", err)
+	if candidate.AgentIdentity != nil {
+		metadata, err := s.Client.GetServerMetadata(ctx, baseURL)
+		if err != nil {
+			return fmt.Errorf("verify agent identity target version: %w", err)
+		}
+		if !SupportsAgentIdentity(metadata.Version) {
+			return fmt.Errorf("sub2api %s does not support agent identity credentials; version %s or newer is required", displayTargetVersion(metadata.Version), MinimumAgentIdentityTargetVersion)
+		}
+	}
+	if err := s.Client.ApplyOAuthCredentials(ctx, baseURL, adminKey, remoteAccountID, s.accountCredentials(candidate), sub2APISyncMetadata(targetID, candidate)); err != nil {
+		return fmt.Errorf("update account credentials: %w", err)
 	}
 	if err := s.Client.RestoreAccountAvailability(ctx, baseURL, adminKey, remoteAccountID); err != nil {
 		return fmt.Errorf("restore availability: %w", err)
@@ -600,6 +665,33 @@ func syncDetails(base map[string]any, reconcile mappedAccountReconcileResult) ma
 	return base
 }
 
+func agentIdentityCompatibilityDetails(base map[string]any, compatibility agentIdentityCompatibility) map[string]any {
+	if base == nil {
+		base = map[string]any{}
+	}
+	if compatibility.CandidateCount <= 0 {
+		return base
+	}
+	base["agent_identity_candidate_count"] = compatibility.CandidateCount
+	if compatibility.TargetVersion != "" {
+		base["target_version"] = compatibility.TargetVersion
+	}
+	if compatibility.blocked() {
+		base["blocked_agent_identity_count"] = compatibility.CandidateCount
+		base["required_target_version"] = MinimumAgentIdentityTargetVersion
+		base["target_version_check_failed"] = compatibility.CheckFailed
+	}
+	return base
+}
+
+func displayTargetVersion(version string) string {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return "version unknown"
+	}
+	return version
+}
+
 func (s *Syncer) finish(ctx context.Context, run store.Sub2APISyncRun, result store.Sub2APISyncRunResult) (store.Sub2APISyncRun, error) {
 	finished, err := s.Store.FinishSub2APISyncRun(ctx, run.ID, result)
 	if err != nil {
@@ -609,7 +701,7 @@ func (s *Syncer) finish(ctx context.Context, run store.Sub2APISyncRun, result st
 }
 
 func (s *Syncer) createAccountRequest(target store.Sub2APISyncTarget, candidate store.Sub2APITokenCandidate) CreateAccountRequest {
-	credentials := s.oauthCredentials(candidate)
+	credentials := s.accountCredentials(candidate)
 	extra := sub2APISyncMetadata(target.ID, candidate)
 
 	name := candidate.Email
@@ -652,6 +744,37 @@ func (s *Syncer) createAccountRequest(target store.Sub2APISyncTarget, candidate 
 		AutoPauseOnExpired:      &autoPause,
 		ConfirmMixedChannelRisk: &confirmMixedChannelRisk,
 	}
+}
+
+func (s *Syncer) accountCredentials(candidate store.Sub2APITokenCandidate) map[string]any {
+	if candidate.AgentIdentity != nil {
+		return agentIdentityCredentials(*candidate.AgentIdentity)
+	}
+	return s.oauthCredentials(candidate)
+}
+
+func agentIdentityCredentials(credentials agentidentity.Credentials) map[string]any {
+	payload := map[string]any{
+		"auth_mode":                  agentidentity.AuthMode,
+		"agent_runtime_id":           credentials.RuntimeID,
+		"agent_private_key":          credentials.PrivateKey,
+		"chatgpt_account_id":         credentials.AccountID,
+		"chatgpt_user_id":            credentials.UserID,
+		"chatgpt_account_is_fedramp": credentials.FedRAMP,
+	}
+	if credentials.TaskID != "" {
+		payload["task_id"] = credentials.TaskID
+	}
+	if credentials.Email != "" {
+		payload["email"] = credentials.Email
+	}
+	if credentials.PlanType != "" {
+		payload["plan_type"] = credentials.PlanType
+	}
+	if credentials.WorkspaceID != "" {
+		payload["workspace_id"] = credentials.WorkspaceID
+	}
+	return payload
 }
 
 func (s *Syncer) oauthCredentials(candidate store.Sub2APITokenCandidate) map[string]any {

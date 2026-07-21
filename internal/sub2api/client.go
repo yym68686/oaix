@@ -14,7 +14,10 @@ import (
 	"time"
 )
 
-const apiPrefix = "/api/v1"
+const (
+	apiPrefix                         = "/api/v1"
+	MinimumAgentIdentityTargetVersion = "0.1.150"
+)
 
 var ErrAccountNotFound = errors.New("sub2api account not found")
 var ErrUsageTotalsBatchUnsupported = errors.New("sub2api account usage totals batch API is unavailable")
@@ -125,6 +128,11 @@ type AccountUsageTotalsBatch struct {
 	ComputedAt       time.Time                    `json:"computed_at"`
 }
 
+type ServerMetadata struct {
+	Version      string
+	TimezoneName string
+}
+
 type accountTodayStats struct {
 	Requests     int64   `json:"requests"`
 	Tokens       int64   `json:"tokens"`
@@ -139,6 +147,7 @@ type accountTodayStatsBatch struct {
 
 type publicSettings struct {
 	ServerTimezone string `json:"server_timezone"`
+	Version        string `json:"version"`
 }
 
 type accountUsageStats struct {
@@ -283,20 +292,67 @@ func (c *Client) GetAccountUsageTotalsBatch(ctx context.Context, baseURL string,
 	return result, nil
 }
 
-func (c *Client) GetServerTimezone(ctx context.Context, baseURL string) (string, *time.Location, error) {
+func (c *Client) GetServerMetadata(ctx context.Context, baseURL string) (ServerMetadata, error) {
 	var settings publicSettings
 	if err := c.doJSON(ctx, http.MethodGet, baseURL, "", "/settings/public", nil, &settings); err != nil {
+		return ServerMetadata{}, err
+	}
+	return ServerMetadata{
+		Version:      strings.TrimSpace(settings.Version),
+		TimezoneName: strings.TrimSpace(settings.ServerTimezone),
+	}, nil
+}
+
+func (c *Client) GetServerTimezone(ctx context.Context, baseURL string) (string, *time.Location, error) {
+	metadata, err := c.GetServerMetadata(ctx, baseURL)
+	if err != nil {
 		return "", nil, err
 	}
-	timezoneName := strings.TrimSpace(settings.ServerTimezone)
-	if timezoneName == "" {
+	if metadata.TimezoneName == "" {
 		return "", nil, errors.New("sub2api server timezone is missing")
 	}
-	location, err := time.LoadLocation(timezoneName)
+	location, err := time.LoadLocation(metadata.TimezoneName)
 	if err != nil {
-		return "", nil, fmt.Errorf("invalid sub2api server timezone %q: %w", timezoneName, err)
+		return "", nil, fmt.Errorf("invalid sub2api server timezone %q: %w", metadata.TimezoneName, err)
 	}
-	return timezoneName, location, nil
+	return metadata.TimezoneName, location, nil
+}
+
+func SupportsAgentIdentity(version string) bool {
+	current, currentOK := parseStableVersion(version)
+	minimum, minimumOK := parseStableVersion(MinimumAgentIdentityTargetVersion)
+	if !currentOK || !minimumOK {
+		return false
+	}
+	for index := range current {
+		if current[index] != minimum[index] {
+			return current[index] > minimum[index]
+		}
+	}
+	return true
+}
+
+func parseStableVersion(value string) ([3]int, bool) {
+	var parsed [3]int
+	value = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "v"))
+	if value == "" || strings.Contains(value, "-") {
+		return parsed, false
+	}
+	if plus := strings.IndexByte(value, '+'); plus >= 0 {
+		value = value[:plus]
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) != len(parsed) {
+		return parsed, false
+	}
+	for index, part := range parts {
+		number, err := strconv.Atoi(part)
+		if err != nil || number < 0 {
+			return [3]int{}, false
+		}
+		parsed[index] = number
+	}
+	return parsed, true
 }
 
 func (c *Client) GetAccountTodayUsageBatch(ctx context.Context, baseURL string, adminKey string, accountIDs []int64) (AccountUsageTotalsBatch, error) {

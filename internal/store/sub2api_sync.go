@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/yym68686/oaix/internal/agentidentity"
 )
 
 const (
@@ -108,17 +110,18 @@ type Sub2APISyncRunResult struct {
 }
 
 type Sub2APITokenCandidate struct {
-	ID           int64           `json:"id"`
-	OwnerUserID  int64           `json:"owner_user_id"`
-	Email        string          `json:"email,omitempty"`
-	AccountID    string          `json:"account_id,omitempty"`
-	IDToken      string          `json:"-"`
-	AccessToken  string          `json:"-"`
-	RefreshToken string          `json:"-"`
-	PlanType     string          `json:"plan_type,omitempty"`
-	RawPayload   json.RawMessage `json:"raw_payload,omitempty"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
+	ID            int64                      `json:"id"`
+	OwnerUserID   int64                      `json:"owner_user_id"`
+	Email         string                     `json:"email,omitempty"`
+	AccountID     string                     `json:"account_id,omitempty"`
+	IDToken       string                     `json:"-"`
+	AccessToken   string                     `json:"-"`
+	RefreshToken  string                     `json:"-"`
+	AgentIdentity *agentidentity.Credentials `json:"-"`
+	PlanType      string                     `json:"plan_type,omitempty"`
+	RawPayload    json.RawMessage            `json:"raw_payload,omitempty"`
+	CreatedAt     time.Time                  `json:"created_at"`
+	UpdatedAt     time.Time                  `json:"updated_at"`
 }
 
 type Sub2APIAvailabilityMapping struct {
@@ -150,9 +153,10 @@ func (m Sub2APISyncedTokenMapping) Token() Token {
 }
 
 type Sub2APITokenCandidateOptions struct {
-	Limit           int
-	CreatedAfter    *time.Time
-	ExcludeTokenIDs []int64
+	Limit                int
+	CreatedAfter         *time.Time
+	ExcludeTokenIDs      []int64
+	IncludeAgentIdentity bool
 }
 
 func (s *Store) ListSub2APISyncTargets(ctx context.Context) ([]Sub2APISyncTarget, error) {
@@ -415,45 +419,21 @@ func (s *Store) ListSub2APITokenCandidates(ctx context.Context, target Sub2APISy
 	if opts.Limit <= 0 || opts.Limit > 500 {
 		opts.Limit = 100
 	}
-	args := []any{target.ID, target.OwnerUserID}
-	filters := []string{
-		"t.merged_into_token_id is null",
-		"t.owner_user_id = $2",
-		"coalesce(t.access_token, '') <> ''",
-		"coalesce(t.refresh_token, '') <> ''",
-		`not exists (
-			select 1
-			from sub2api_sync_mappings m
-			where m.target_id = $1
-			  and m.token_id = t.id
-			  and m.status = 'synced'
-		)`,
+	credentialFilter := sub2APIOAuthCandidateFilter
+	if opts.IncludeAgentIdentity {
+		credentialFilter = "(" + sub2APIOAuthCandidateFilter + " or " + sub2APIAgentIdentityCandidateFilter + ")"
 	}
-	statuses := normalizeTokenStatusFilters(target.TokenStatusFilters)
-	filters = append(filters, tokenStatusFilterSQL(statuses))
-	plans := normalizePlanFilters(target.PlanFilters)
-	if len(plans) > 0 {
-		args = append(args, plans)
-		placeholder := fmt.Sprintf("$%d::text[]", len(args))
-		filters = append(filters, fmt.Sprintf(`(
-			case when t.plan_type is null or btrim(t.plan_type) = '' then 'unknown' else lower(btrim(t.plan_type)) end
-		) = any(%s)`, placeholder))
-	}
-	if opts.CreatedAfter != nil && !opts.CreatedAfter.IsZero() {
-		args = append(args, opts.CreatedAfter.UTC())
-		filters = append(filters, fmt.Sprintf("t.created_at >= $%d", len(args)))
-	}
-	if ids := postgresIntIDs(opts.ExcludeTokenIDs); len(ids) > 0 {
-		args = append(args, ids)
-		filters = append(filters, fmt.Sprintf("not (t.id = any($%d::integer[]))", len(args)))
-	}
+	filters, args := sub2APITokenCandidateQueryFilters(target, opts, credentialFilter)
 	args = append(args, opts.Limit)
 	rawPayloadExpr := sub2APIRawPayloadSelectSQL()
 	rows, err := s.pool.Query(ctx, `
 		select t.id, coalesce(t.owner_user_id, 0), t.email, t.account_id, t.id_token,
 		       t.access_token, t.refresh_token, t.plan_type, `+rawPayloadExpr+`,
+		       ai.agent_runtime_id, ai.agent_private_key, ai.task_id, ai.chatgpt_user_id,
+		       ai.workspace_id, ai.chatgpt_account_is_fedramp,
 		       t.created_at, t.updated_at
 		from codex_tokens t
+		left join token_agent_identities ai on ai.token_id = t.id
 		where `+strings.Join(filters, " and ")+`
 		order by t.created_at asc, t.id asc
 		limit $`+strconvI(len(args)), args...)
@@ -472,17 +452,30 @@ func (s *Store) ListSub2APITokenCandidates(ctx context.Context, target Sub2APISy
 	return items, rows.Err()
 }
 
+func (s *Store) CountSub2APIAgentIdentityCandidates(ctx context.Context, target Sub2APISyncTarget) (int, error) {
+	filters, args := sub2APITokenCandidateQueryFilters(target, Sub2APITokenCandidateOptions{}, sub2APIAgentIdentityCandidateFilter)
+	var count int
+	err := s.pool.QueryRow(ctx, `
+		select count(*)::int
+		from codex_tokens t
+		join token_agent_identities ai on ai.token_id = t.id
+		where `+strings.Join(filters, " and "), args...).Scan(&count)
+	return count, err
+}
+
 func (s *Store) GetSub2APITokenCandidate(ctx context.Context, tokenID int64) (Sub2APITokenCandidate, error) {
 	rawPayloadExpr := sub2APIRawPayloadSelectSQL()
 	row := s.pool.QueryRow(ctx, `
 		select t.id, coalesce(t.owner_user_id, 0), t.email, t.account_id, t.id_token,
 		       t.access_token, t.refresh_token, t.plan_type, `+rawPayloadExpr+`,
+		       ai.agent_runtime_id, ai.agent_private_key, ai.task_id, ai.chatgpt_user_id,
+		       ai.workspace_id, ai.chatgpt_account_is_fedramp,
 		       t.created_at, t.updated_at
 		from codex_tokens t
+		left join token_agent_identities ai on ai.token_id = t.id
 		where t.id = $1
 		  and t.merged_into_token_id is null
-		  and coalesce(t.access_token, '') <> ''
-		  and coalesce(t.refresh_token, '') <> ''
+		  and (`+sub2APIOAuthCandidateFilter+` or `+sub2APIAgentIdentityCandidateFilter+`)
 	`, tokenID)
 	return scanSub2APITokenCandidate(row)
 }
@@ -498,8 +491,7 @@ func (s *Store) ListSub2APISyncedTokenMappings(ctx context.Context, target Sub2A
 		"coalesce(m.remote_account_id, 0) > 0",
 		"t.merged_into_token_id is null",
 		"t.owner_user_id = $2",
-		"coalesce(t.access_token, '') <> ''",
-		"coalesce(t.refresh_token, '') <> ''",
+		"(" + sub2APIOAuthCandidateFilter + " or " + sub2APIAgentIdentityCandidateFilter + ")",
 	}
 	statuses := normalizeTokenStatusFilters(target.TokenStatusFilters)
 	filters = append(filters, tokenStatusFilterSQL(statuses))
@@ -517,6 +509,7 @@ func (s *Store) ListSub2APISyncedTokenMappings(ctx context.Context, target Sub2A
 		       coalesce(t.owner_user_id, 0), t.is_active, t.cooldown_until, t.disabled_at
 		from sub2api_sync_mappings m
 		join codex_tokens t on t.id = m.token_id
+		left join token_agent_identities ai on ai.token_id = t.id
 		where `+strings.Join(filters, " and ")+`
 		order by m.updated_at asc, m.token_id asc
 		limit $`+strconvI(len(args)), args...)
@@ -705,11 +698,17 @@ func scanSub2APISyncRun(row rowScanner) (Sub2APISyncRun, error) {
 func scanSub2APITokenCandidate(row rowScanner) (Sub2APITokenCandidate, error) {
 	var item Sub2APITokenCandidate
 	var email, accountID, idToken, accessToken, refreshToken, planType sql.NullString
+	var runtimeID, privateKey, taskID, userID, workspaceID sql.NullString
+	var fedRAMP sql.NullBool
 	err := row.Scan(
 		&item.ID, &item.OwnerUserID, &email, &accountID, &idToken,
 		&accessToken, &refreshToken, &planType, &item.RawPayload,
+		&runtimeID, &privateKey, &taskID, &userID, &workspaceID, &fedRAMP,
 		&item.CreatedAt, &item.UpdatedAt,
 	)
+	if err != nil {
+		return item, err
+	}
 	if email.Valid {
 		item.Email = email.String
 	}
@@ -731,7 +730,20 @@ func scanSub2APITokenCandidate(row rowScanner) (Sub2APITokenCandidate, error) {
 	if item.PlanType == "" {
 		item.PlanType = planUnknown
 	}
-	return item, err
+	if runtimeID.Valid && privateKey.Valid {
+		item.AgentIdentity = &agentidentity.Credentials{
+			RuntimeID:   runtimeID.String,
+			PrivateKey:  privateKey.String,
+			TaskID:      taskID.String,
+			AccountID:   item.AccountID,
+			UserID:      userID.String,
+			Email:       item.Email,
+			PlanType:    item.PlanType,
+			WorkspaceID: workspaceID.String,
+			FedRAMP:     fedRAMP.Valid && fedRAMP.Bool,
+		}
+	}
+	return item, nil
 }
 
 func (s *Store) updateSub2APITargetFromRun(ctx context.Context, run Sub2APISyncRun) error {
@@ -840,6 +852,44 @@ func tokenStatusFilterSQL(statuses []string) string {
 		return "false"
 	}
 	return "(" + strings.Join(conditions, " or ") + ")"
+}
+
+const (
+	sub2APIOAuthCandidateFilter         = "(coalesce(t.access_token, '') <> '' and coalesce(t.refresh_token, '') <> '')"
+	sub2APIAgentIdentityCandidateFilter = "ai.token_id is not null"
+)
+
+func sub2APITokenCandidateQueryFilters(target Sub2APISyncTarget, opts Sub2APITokenCandidateOptions, credentialFilter string) ([]string, []any) {
+	args := []any{target.ID, target.OwnerUserID}
+	filters := []string{
+		"t.merged_into_token_id is null",
+		"t.owner_user_id = $2",
+		credentialFilter,
+		`not exists (
+			select 1
+			from sub2api_sync_mappings m
+			where m.target_id = $1
+			  and m.token_id = t.id
+			  and m.status = 'synced'
+		)`,
+		tokenStatusFilterSQL(target.TokenStatusFilters),
+	}
+	if plans := normalizePlanFilters(target.PlanFilters); len(plans) > 0 {
+		args = append(args, plans)
+		placeholder := fmt.Sprintf("$%d::text[]", len(args))
+		filters = append(filters, fmt.Sprintf(`(
+			case when t.plan_type is null or btrim(t.plan_type) = '' then 'unknown' else lower(btrim(t.plan_type)) end
+		) = any(%s)`, placeholder))
+	}
+	if opts.CreatedAfter != nil && !opts.CreatedAfter.IsZero() {
+		args = append(args, opts.CreatedAfter.UTC())
+		filters = append(filters, fmt.Sprintf("t.created_at >= $%d", len(args)))
+	}
+	if ids := postgresIntIDs(opts.ExcludeTokenIDs); len(ids) > 0 {
+		args = append(args, ids)
+		filters = append(filters, fmt.Sprintf("not (t.id = any($%d::integer[]))", len(args)))
+	}
+	return filters, args
 }
 
 func sub2APIRawPayloadSelectSQL() string {

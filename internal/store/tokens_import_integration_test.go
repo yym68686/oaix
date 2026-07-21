@@ -139,6 +139,33 @@ func TestUpsertAgentIdentitiesKeepsSharedWorkspaceRuntimesSeparate(t *testing.T)
 	if credentials.RuntimeID != "runtime-a" || credentials.TaskID != "task-a-next" || credentials.AccountID != "shared-workspace" {
 		t.Fatalf("stored credentials = %#v", credentials)
 	}
+	target := Sub2APISyncTarget{
+		ID:                 9_000_000_000 + user.ID,
+		OwnerUserID:        user.ID,
+		PlanFilters:        []string{"pro"},
+		TokenStatusFilters: []string{Sub2APITokenStatusAvailable},
+	}
+	agentCount, err := db.CountSub2APIAgentIdentityCandidates(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agentCount != 2 {
+		t.Fatalf("Agent Identity candidate count = %d, want 2", agentCount)
+	}
+	oauthOnly, err := db.ListSub2APITokenCandidates(ctx, target, Sub2APITokenCandidateOptions{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(oauthOnly) != 0 {
+		t.Fatalf("OAuth-only candidates = %#v, want none", oauthOnly)
+	}
+	withAgentIdentity, err := db.ListSub2APITokenCandidates(ctx, target, Sub2APITokenCandidateOptions{Limit: 10, IncludeAgentIdentity: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withAgentIdentity) != 2 || withAgentIdentity[0].AgentIdentity == nil || withAgentIdentity[1].AgentIdentity == nil {
+		t.Fatalf("Agent Identity candidates = %#v", withAgentIdentity)
+	}
 }
 
 func agentIdentityImportPayload(t *testing.T, runtimeID, taskID, userID, email string) map[string]any {

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -65,6 +66,47 @@ func TestCreateAccountRequestCopiesCodexMetadata(t *testing.T) {
 	}
 	if _, ok := request.Extra["access_token"]; ok {
 		t.Fatalf("extra leaked access token: %#v", request.Extra)
+	}
+}
+
+func TestCreateAccountRequestCopiesAgentIdentityCredentials(t *testing.T) {
+	syncer := NewSyncer(nil, nil, nil, "client-fixture")
+	request := syncer.createAccountRequest(store.Sub2APISyncTarget{
+		ID:             7,
+		TargetGroupIDs: []int64{10},
+	}, store.Sub2APITokenCandidate{
+		ID:          42,
+		OwnerUserID: 9,
+		Email:       "agent@example.invalid",
+		AccountID:   "account-fixture",
+		PlanType:    "k12",
+		AgentIdentity: &agentidentity.Credentials{
+			RuntimeID:   "runtime-fixture",
+			PrivateKey:  "private-key-fixture",
+			TaskID:      "task-fixture",
+			AccountID:   "account-fixture",
+			UserID:      "user-fixture",
+			Email:       "agent@example.invalid",
+			PlanType:    "k12",
+			WorkspaceID: "workspace-fixture",
+			FedRAMP:     true,
+		},
+	})
+
+	credentials := request.Credentials
+	if credentials["auth_mode"] != agentidentity.AuthMode || credentials["agent_runtime_id"] != "runtime-fixture" || credentials["agent_private_key"] != "private-key-fixture" {
+		t.Fatalf("agent identity credentials = %#v", credentials)
+	}
+	if credentials["task_id"] != "task-fixture" || credentials["chatgpt_account_id"] != "account-fixture" || credentials["chatgpt_user_id"] != "user-fixture" {
+		t.Fatalf("agent identity metadata = %#v", credentials)
+	}
+	if credentials["workspace_id"] != "workspace-fixture" || credentials["chatgpt_account_is_fedramp"] != true {
+		t.Fatalf("agent identity workspace metadata = %#v", credentials)
+	}
+	for _, key := range []string{"access_token", "refresh_token", "client_id"} {
+		if _, ok := credentials[key]; ok {
+			t.Fatalf("agent identity credentials unexpectedly contain %s: %#v", key, credentials)
+		}
 	}
 }
 
@@ -230,6 +272,85 @@ func TestSyncMappedAccountUpdatesCredentialsBeforeRestoringAvailability(t *testi
 		t.Fatalf("syncMappedAccount returned error: %v", err)
 	}
 	want := []string{
+		"POST /api/v1/admin/accounts/42/apply-oauth-credentials",
+		"POST /api/v1/admin/accounts/42/clear-error",
+		"POST /api/v1/admin/accounts/42/schedulable",
+	}
+	if strings.Join(seen, ",") != strings.Join(want, ",") {
+		t.Fatalf("seen = %#v, want %#v", seen, want)
+	}
+}
+
+func TestSyncMappedAccountRejectsAgentIdentityForOldTargetBeforeMutation(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/v1/settings/public" {
+			t.Fatalf("unexpected mutation request %s %s", r.Method, r.URL.Path)
+		}
+		writeSub2APISuccess(t, w, map[string]any{"server_timezone": "UTC", "version": "0.1.135"})
+	}))
+	defer server.Close()
+
+	syncer := NewSyncer(nil, NewClient(server.Client()), nil, "client-fixture")
+	err := syncer.syncMappedAccount(t.Context(), server.URL, "admin-fixture", 2, 42, store.Sub2APITokenCandidate{
+		ID: 9434,
+		AgentIdentity: &agentidentity.Credentials{
+			RuntimeID:  "runtime-fixture",
+			PrivateKey: "private-key-fixture",
+			AccountID:  "account-fixture",
+			UserID:     "user-fixture",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), MinimumAgentIdentityTargetVersion) {
+		t.Fatalf("err = %v, want target version compatibility error", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want only the public version check", requests)
+	}
+}
+
+func TestSyncMappedAccountUpdatesAgentIdentityOnSupportedTarget(t *testing.T) {
+	seen := make([]string, 0, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		switch r.URL.Path {
+		case "/api/v1/settings/public":
+			writeSub2APISuccess(t, w, map[string]any{"server_timezone": "UTC", "version": MinimumAgentIdentityTargetVersion})
+		case "/api/v1/admin/accounts/42/apply-oauth-credentials":
+			var payload ApplyOAuthCredentialsRequest
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode credentials payload: %v", err)
+			}
+			if payload.Credentials["auth_mode"] != agentidentity.AuthMode || payload.Credentials["agent_runtime_id"] != "runtime-fixture" {
+				t.Fatalf("credentials = %#v", payload.Credentials)
+			}
+			if _, ok := payload.Credentials["access_token"]; ok {
+				t.Fatalf("agent identity payload leaked OAuth access token: %#v", payload.Credentials)
+			}
+		case "/api/v1/admin/accounts/42/clear-error", "/api/v1/admin/accounts/42/schedulable":
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		writeSub2APISuccess(t, w, map[string]any{"id": 42})
+	}))
+	defer server.Close()
+
+	syncer := NewSyncer(nil, NewClient(server.Client()), nil, "client-fixture")
+	err := syncer.syncMappedAccount(t.Context(), server.URL, "admin-fixture", 2, 42, store.Sub2APITokenCandidate{
+		ID: 9434,
+		AgentIdentity: &agentidentity.Credentials{
+			RuntimeID:  "runtime-fixture",
+			PrivateKey: "private-key-fixture",
+			AccountID:  "account-fixture",
+			UserID:     "user-fixture",
+		},
+	})
+	if err != nil {
+		t.Fatalf("syncMappedAccount returned error: %v", err)
+	}
+	want := []string{
+		"GET /api/v1/settings/public",
 		"POST /api/v1/admin/accounts/42/apply-oauth-credentials",
 		"POST /api/v1/admin/accounts/42/clear-error",
 		"POST /api/v1/admin/accounts/42/schedulable",
