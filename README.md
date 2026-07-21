@@ -35,6 +35,7 @@
 - `CORS_ALLOW_ORIGIN_REGEX`: 浏览器跨域允许的 Origin 正则；默认不设置
 - `CORS_ALLOW_CREDENTIALS`: 是否允许浏览器跨域携带 credentials；默认 `false`
 - `CODEX_BASE_URL`: 上游 Codex responses 地址。默认 `https://chatgpt.com/backend-api/codex/responses`
+- `CODEX_AGENT_IDENTITY_AUTH_API_URL`: Agent Identity task 注册 API 根地址。默认 `https://auth.openai.com/api/accounts`
 - `MAX_REQUEST_ACCOUNT_RETRIES`: 单次请求最多切换多少个 key，默认 `100`
 - `PROXY_MAX_ACTIVE_RESPONSES`: 网关同时处理的 `/v1/responses*` 请求上限，默认 `64`
 - `PROXY_QUEUE_TIMEOUT_SECONDS`: 达到并发上限后排队等待秒数，默认 `1`
@@ -278,12 +279,13 @@ access_token_2
 access_token_3
 ```
 
-Go 版支持 access token 和 refresh token 导入。`POST /admin/import/parse` / `POST /admin/import/upload` 负责服务端解析预览，`POST /admin/import/jobs` 创建异步导入 job；旧 `POST /admin/tokens/import` 仍保留兼容，会同步完成一次导入并创建 completed job。refresh token 会在导入预处理或 worker 校验阶段换取 access token，并写入正式 `codex_tokens` 池。
+Go 版支持 access token、refresh token，以及 sub2api 导出的 OpenAI Agent Identity 账号。`POST /admin/import/parse` / `POST /admin/import/upload` 负责服务端解析预览，`POST /admin/import/jobs` 创建异步导入 job；旧 `POST /admin/tokens/import` 仍保留兼容，会同步完成一次导入并创建 completed job。refresh token 会在导入预处理或 worker 校验阶段换取 access token；Agent Identity 会校验 PKCS#8 Ed25519 私钥并通过独立凭证表进入正式 token 池，请求时动态签发 assertion，task 失效时只自动注册并重试一次。
 
 导入去重规则：
 
 - 不再按 `account_id` 或 `email` 合并
 - 同一个工作空间下允许存在多个相同 `account_id`、但不同 `refresh_token` 的账号
+- Agent Identity 按 `agent_runtime_id` 匹配；共享同一 workspace/account 的不同 runtime 会保留为独立账号
 - 系统会为每条 key 记录保存 RT 历史链；如果后续轮转出了 `rt2`、`rt3`，再次导入这些 RT 会命中同一条记录并判为重复
 - 如果重复的是当前仍在使用的最新 RT，导入会视为“更新现有记录”
 - 如果重复的是历史旧 RT，导入会直接跳过，不会把当前最新 RT 回滚成旧值

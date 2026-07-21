@@ -52,6 +52,7 @@ type UpstreamConfig struct {
 	ResponsesURL              string
 	ChatCompletionsURL        string
 	OAuthTokenURL             string
+	AgentIdentityAuthAPIURL   string
 	OAuthClientID             string
 	OAuthScope                string
 	MaxRetries                int
@@ -167,6 +168,7 @@ func Load() (Config, error) {
 			ResponsesURL:              envString("CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex/responses"),
 			ChatCompletionsURL:        envString("CHAT_COMPLETIONS_BASE_URL", ""),
 			OAuthTokenURL:             envString("CODEX_OAUTH_TOKEN_URL", "https://auth.openai.com/oauth/token"),
+			AgentIdentityAuthAPIURL:   envString("CODEX_AGENT_IDENTITY_AUTH_API_URL", "https://auth.openai.com/api/accounts"),
 			OAuthClientID:             envString("CODEX_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann"),
 			OAuthScope:                envString("CODEX_OAUTH_SCOPE", "openid profile email"),
 			MaxRetries:                envInt("MAX_REQUEST_ACCOUNT_RETRIES", 100),
@@ -303,6 +305,9 @@ func (c Config) Validate() error {
 	if c.Upstream.MaxRetries <= 0 {
 		errs = append(errs, fmt.Errorf("MAX_REQUEST_ACCOUNT_RETRIES must be positive"))
 	}
+	if parsed, err := url.ParseRequestURI(c.Upstream.AgentIdentityAuthAPIURL); err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		errs = append(errs, fmt.Errorf("CODEX_AGENT_IDENTITY_AUTH_API_URL must be an absolute URL"))
+	}
 	if c.Upstream.ShardCount <= 0 {
 		errs = append(errs, fmt.Errorf("UPSTREAM_HTTP_SHARD_COUNT must be positive"))
 	}
@@ -356,6 +361,7 @@ func (c Config) SanitizedSummary() map[string]any {
 		"upstream": map[string]any{
 			"responses_url":           c.Upstream.ResponsesURL,
 			"chat_completions_url":    c.Upstream.ChatCompletionsURL,
+			"agent_identity_auth_url": c.Upstream.AgentIdentityAuthAPIURL,
 			"max_retries":             c.Upstream.MaxRetries,
 			"shard_count":             c.Upstream.ShardCount,
 			"max_conns_per_host":      c.Upstream.MaxConnsPerHost,

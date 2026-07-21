@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
 )
@@ -31,6 +32,7 @@ type ValidatedItem struct {
 	PlanType      string
 	OAuthClientID string
 	Action        string
+	Payload       map[string]any
 }
 
 type Worker struct {
@@ -90,16 +92,19 @@ func (w *Worker) ValidateBatch(ctx context.Context, items []store.ImportItem) []
 					continue
 				}
 				atomic.AddInt64(&w.metrics.Validated, 1)
-				validatedPayload := map[string]any{
-					"access_token":  validated.AccessToken,
-					"refresh_token": validated.RefreshToken,
-					"id_token":      validated.IDToken,
-					"account_id":    validated.AccountID,
-					"email":         validated.Email,
-					"plan_type":     validated.PlanType,
-				}
-				if validated.OAuthClientID != "" {
-					validatedPayload["client_id"] = validated.OAuthClientID
+				validatedPayload := clonePayload(validated.Payload)
+				if len(validatedPayload) == 0 {
+					validatedPayload = map[string]any{
+						"access_token":  validated.AccessToken,
+						"refresh_token": validated.RefreshToken,
+						"id_token":      validated.IDToken,
+						"account_id":    validated.AccountID,
+						"email":         validated.Email,
+						"plan_type":     validated.PlanType,
+					}
+					if validated.OAuthClientID != "" {
+						validatedPayload["client_id"] = validated.OAuthClientID
+					}
 				}
 				copyImportControlFields(item.Payload, validatedPayload)
 				updates[index] = store.ImportItemUpdate{
@@ -165,6 +170,9 @@ type TokenPayloadValidator struct {
 func (v TokenPayloadValidator) Validate(ctx context.Context, item store.ImportItem) (ValidatedItem, error) {
 	payload := flattenNestedCredentialsPayload(item.Payload)
 	item.Payload = payload
+	if _, ok := agentidentity.NormalizePayload(payload); ok {
+		return AgentIdentityValidator{}.Validate(ctx, item)
+	}
 	if hasPayloadString(payload, "access_token", "accessToken", "token") {
 		access := v.Access
 		if access == nil {
@@ -180,6 +188,24 @@ func (v TokenPayloadValidator) Validate(ctx context.Context, item store.ImportIt
 		return refresh.Validate(ctx, item)
 	}
 	return AccessTokenValidator{}.Validate(ctx, item)
+}
+
+type AgentIdentityValidator struct{}
+
+func (AgentIdentityValidator) Validate(ctx context.Context, item store.ImportItem) (ValidatedItem, error) {
+	select {
+	case <-ctx.Done():
+		return ValidatedItem{}, ctx.Err()
+	default:
+	}
+	payload, ok := agentidentity.NormalizePayload(item.Payload)
+	if !ok {
+		return ValidatedItem{}, fmt.Errorf("import item %d is not an agent identity payload", item.ID)
+	}
+	if _, _, err := agentidentity.Parse(payload); err != nil {
+		return ValidatedItem{}, fmt.Errorf("import item %d: %w", item.ID, err)
+	}
+	return ValidatedItem{Payload: payload, Action: "upsert_agent_identity"}, nil
 }
 
 func flattenNestedCredentialsPayload(payload map[string]any) map[string]any {
@@ -213,7 +239,31 @@ func flattenNestedCredentialsPayload(payload map[string]any) map[string]any {
 	copyStringPayloadField(flattened, credentials, "oauth_client_id", "oauth_client_id")
 	copyStringPayloadField(flattened, credentials, "plan_type", "plan_type")
 	copyStringPayloadField(flattened, credentials, "type", "type")
+	copyStringPayloadField(flattened, credentials, "auth_mode", "auth_mode")
+	copyStringPayloadField(flattened, credentials, "authMode", "auth_mode")
+	copyStringPayloadField(flattened, credentials, "agent_runtime_id", "agent_runtime_id")
+	copyStringPayloadField(flattened, credentials, "agentRuntimeId", "agent_runtime_id")
+	copyStringPayloadField(flattened, credentials, "agent_private_key", "agent_private_key")
+	copyStringPayloadField(flattened, credentials, "agentPrivateKey", "agent_private_key")
+	copyStringPayloadField(flattened, credentials, "task_id", "task_id")
+	copyStringPayloadField(flattened, credentials, "taskId", "task_id")
+	copyStringPayloadField(flattened, credentials, "workspace_id", "workspace_id")
+	copyStringPayloadField(flattened, credentials, "workspaceId", "workspace_id")
+	if value, ok := credentials["chatgpt_account_is_fedramp"].(bool); ok {
+		flattened["chatgpt_account_is_fedramp"] = value
+	}
 	return flattened
+}
+
+func clonePayload(payload map[string]any) map[string]any {
+	if len(payload) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(payload))
+	for key, value := range payload {
+		out[key] = value
+	}
+	return out
 }
 
 func copyStringPayloadField(dst map[string]any, src map[string]any, srcKey string, dstKey string) {

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -769,6 +770,14 @@ func (c *Claim) AccessToken() string {
 		return ""
 	}
 	return c.Token.Token.AccessToken
+}
+
+func (c *Claim) AgentIdentity() *agentidentity.Credentials {
+	if c == nil || c.Token == nil || c.Token.Token.AgentIdentity == nil {
+		return nil
+	}
+	copy := *c.Token.Token.AgentIdentity
+	return &copy
 }
 
 func (c *Claim) TokenID() int64 {

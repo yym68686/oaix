@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/oauth"
@@ -1493,6 +1494,18 @@ func sub2APIAccountImportPayload(account map[string]any) (map[string]any, bool) 
 	credentials, ok := account["credentials"].(map[string]any)
 	if !ok {
 		return nil, false
+	}
+	if payload, agent := agentidentity.NormalizePayload(map[string]any{"credentials": credentials}); agent {
+		copyStringField(payload, account, "platform", "platform")
+		copyStringField(payload, account, "type", "account_type")
+		copyStringField(payload, account, "name", "name")
+		if payload["email"] == nil {
+			copyStringField(payload, account, "name", "email")
+		}
+		if disabled, ok := boolFromAny(credentials["disabled"]); ok && disabled {
+			payload["is_active"] = false
+		}
+		return payload, true
 	}
 	refreshToken := strings.TrimSpace(stringFromAny(credentials["refresh_token"]))
 	accessToken := strings.TrimSpace(stringFromAny(credentials["access_token"]))

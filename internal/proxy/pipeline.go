@@ -14,10 +14,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/yym68686/oaix/internal/affinity"
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/cooldown"
 	"github.com/yym68686/oaix/internal/logs"
@@ -49,6 +51,8 @@ type Pipeline struct {
 	affinity                   affinity.Store
 	oauthClient                oauth.Client
 	modelCapabilityLossHandler TokenModelCapabilityLossHandler
+	agentIdentityTaskLocks     sync.Map
+	agentIdentityCredentials   sync.Map
 	commitFailures             atomic.Int64
 }
 
@@ -76,6 +80,16 @@ type tokenSecretUpdater interface {
 
 type tokenOAuthClientIDStore interface {
 	TokenOAuthClientID(ctx context.Context, tokenID int64) (string, error)
+}
+
+type agentIdentityCredentialStore interface {
+	GetAgentIdentityCredentials(ctx context.Context, tokenID int64) (agentidentity.Credentials, error)
+	UpdateAgentIdentityTask(ctx context.Context, tokenID int64, expectedTaskID string, taskID string) error
+}
+
+type agentIdentityCredentialCacheEntry struct {
+	Credentials    agentidentity.Credentials
+	TokenUpdatedAt time.Time
 }
 
 type RequestIntent struct {
@@ -786,6 +800,98 @@ func truncateDetail(value string, limit int) string {
 	return value[:limit] + "..."
 }
 
+func (p *Pipeline) agentIdentityForClaim(claim *tokens.Claim) (agentidentity.Credentials, bool) {
+	if p == nil || claim == nil {
+		return agentidentity.Credentials{}, false
+	}
+	claimCredentials := claim.AgentIdentity()
+	if claimCredentials == nil {
+		p.agentIdentityCredentials.Delete(claim.TokenID())
+		return agentidentity.Credentials{}, false
+	}
+	if cached, ok := p.agentIdentityCredentials.Load(claim.TokenID()); ok {
+		if entry, valid := cached.(agentIdentityCredentialCacheEntry); valid {
+			if entry.TokenUpdatedAt.Equal(claim.Token.Token.UpdatedAt) &&
+				entry.Credentials.RuntimeID == claimCredentials.RuntimeID &&
+				entry.Credentials.PrivateKey == claimCredentials.PrivateKey {
+				return entry.Credentials, true
+			}
+		}
+		p.agentIdentityCredentials.Delete(claim.TokenID())
+	}
+	return *claimCredentials, true
+}
+
+func (p *Pipeline) authorizationForClaim(ctx context.Context, claim *tokens.Claim) (string, error) {
+	credentials, ok := p.agentIdentityForClaim(claim)
+	if !ok {
+		return "Bearer " + claim.AccessToken(), nil
+	}
+	if strings.TrimSpace(credentials.TaskID) == "" {
+		var err error
+		credentials, err = p.recoverAgentIdentityTask(ctx, claim, "")
+		if err != nil {
+			return "", err
+		}
+	}
+	return credentials.BuildAssertion(time.Now())
+}
+
+func (p *Pipeline) recoverAgentIdentityTask(parent context.Context, claim *tokens.Claim, expectedTaskID string) (agentidentity.Credentials, error) {
+	if p == nil || claim == nil || claim.TokenID() <= 0 {
+		return agentidentity.Credentials{}, errors.New("agent identity claim is unavailable")
+	}
+	credentialStore, ok := p.store.(agentIdentityCredentialStore)
+	if !ok || credentialStore == nil {
+		return agentidentity.Credentials{}, errors.New("agent identity credential store is unavailable")
+	}
+	lockValue, _ := p.agentIdentityTaskLocks.LoadOrStore(claim.TokenID(), &sync.Mutex{})
+	lock, ok := lockValue.(*sync.Mutex)
+	if !ok {
+		return agentidentity.Credentials{}, errors.New("agent identity task lock is invalid")
+	}
+	lock.Lock()
+	defer lock.Unlock()
+
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	credentials, err := credentialStore.GetAgentIdentityCredentials(ctx, claim.TokenID())
+	if err != nil {
+		return agentidentity.Credentials{}, fmt.Errorf("load agent identity credentials: %w", err)
+	}
+	currentTaskID := strings.TrimSpace(credentials.TaskID)
+	expectedTaskID = strings.TrimSpace(expectedTaskID)
+	if currentTaskID != "" && (expectedTaskID == "" || currentTaskID != expectedTaskID) {
+		p.agentIdentityCredentials.Store(claim.TokenID(), agentIdentityCredentialCacheEntry{
+			Credentials: credentials, TokenUpdatedAt: claim.Token.Token.UpdatedAt,
+		})
+		return credentials, nil
+	}
+	newTaskID, err := agentidentity.RegisterTask(ctx, p.transport, p.cfg.Upstream.AgentIdentityAuthAPIURL, credentials)
+	if err != nil {
+		return agentidentity.Credentials{}, err
+	}
+	if err := credentialStore.UpdateAgentIdentityTask(ctx, claim.TokenID(), currentTaskID, newTaskID); err != nil {
+		if !errors.Is(err, store.ErrAgentIdentityTaskChanged) {
+			return agentidentity.Credentials{}, fmt.Errorf("persist agent identity task: %w", err)
+		}
+		credentials, err = credentialStore.GetAgentIdentityCredentials(ctx, claim.TokenID())
+		if err != nil {
+			return agentidentity.Credentials{}, fmt.Errorf("reload agent identity credentials: %w", err)
+		}
+	} else {
+		credentials.TaskID = newTaskID
+	}
+	p.agentIdentityCredentials.Store(claim.TokenID(), agentIdentityCredentialCacheEntry{
+		Credentials: credentials, TokenUpdatedAt: claim.Token.Token.UpdatedAt,
+	})
+	p.refreshTokenSnapshotsAfterSecretUpdate(ctx, claim.Token.Token.OwnerUserID)
+	if p.logger != nil {
+		p.logger.Info("agent identity task registered", "token_id", claim.TokenID(), "owner_user_id", claim.Token.Token.OwnerUserID)
+	}
+	return credentials, nil
+}
+
 func (p *Pipeline) recordClaimTiming(timing map[string]any, claim *tokens.Claim, err error) {
 	if timing == nil {
 		return
@@ -843,11 +949,20 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	}
 	copyProxyHeaders(req.Header, r.Header)
 	req.Header.Set("X-Request-ID", attempt.RequestID)
-	req.Header.Set("Authorization", "Bearer "+attempt.Claim.AccessToken())
+	authorization, err := p.authorizationForClaim(r.Context(), attempt.Claim)
+	if err != nil {
+		return AttemptResult{Status: http.StatusBadGateway, Retry: true}, fmt.Errorf("prepare upstream authorization: %w", err)
+	}
+	req.Header.Set("Authorization", authorization)
 	if accountID := attempt.Claim.AccountID(); accountID != nil && strings.TrimSpace(*accountID) != "" {
 		req.Header.Set("ChatGPT-Account-ID", strings.TrimSpace(*accountID))
 	} else {
 		req.Header.Del("ChatGPT-Account-ID")
+	}
+	if credentials, ok := p.agentIdentityForClaim(attempt.Claim); ok && credentials.FedRAMP {
+		req.Header.Set("X-OpenAI-FedRAMP", "true")
+	} else {
+		req.Header.Del("X-OpenAI-FedRAMP")
 	}
 	req.Header.Set("Content-Type", contentType(firstNonEmpty(attempt.Intent.UpstreamContentType, r.Header.Get("Content-Type"))))
 	if attempt.Intent.UpstreamAccept != "" {
@@ -863,6 +978,10 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		detail, raw := readUpstreamError(resp.Body)
+		if credentials, ok := p.agentIdentityForClaim(attempt.Claim); ok {
+			raw = agentidentity.RedactSensitiveBody(raw, credentials)
+			detail = decodeUpstreamErrorBytes(raw)
+		}
 		retry := resp.StatusCode == http.StatusUnauthorized ||
 			resp.StatusCode == http.StatusForbidden ||
 			resp.StatusCode == http.StatusTooManyRequests ||
@@ -1133,6 +1252,31 @@ func (p *Pipeline) decideTokenFailure(
 	decision := tokenFailureDecision{}
 	if action == OutcomeUpstream401Invalid || action == OutcomeUpstream403Invalid {
 		_, alreadyRefreshed := refreshedAuthTokens[claim.TokenID()]
+		if credentials, isAgentIdentity := p.agentIdentityForClaim(claim); isAgentIdentity {
+			if action == OutcomeUpstream401Invalid && agentidentity.IsInvalidTaskResponse(status, result.ErrorBody) {
+				if alreadyRefreshed {
+					decision.cooldownUntil = authFailureCooldownUntil()
+					decision.commitRequired = true
+					decision.commitMessage = "non-terminal upstream auth failure after agent identity task recovery"
+					return decision
+				}
+				if _, recoverErr := p.recoverAgentIdentityTask(ctx, claim, credentials.TaskID); recoverErr == nil {
+					refreshedAuthTokens[claim.TokenID()] = struct{}{}
+					decision.retrySameToken = true
+					timing["agent_identity_task_recovered"] = true
+					return decision
+				} else {
+					decision.cooldownUntil = authFailureCooldownUntil()
+					decision.commitRequired = true
+					decision.commitMessage = "non-terminal upstream auth failure: agent identity task recovery failed: " + truncateDetail(recoverErr.Error(), 240)
+					return decision
+				}
+			}
+			decision.deactivate = true
+			decision.commitRequired = true
+			decision.commitMessage = fmt.Sprintf("terminal agent identity upstream status %d", status)
+			return decision
+		}
 		refreshResult := p.refreshAccessTokenAfterAuthFailure(ctx, claim, alreadyRefreshed)
 		switch {
 		case refreshResult.Refreshed:

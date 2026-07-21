@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -136,6 +137,71 @@ func TestParseImportTextPayloadsExpandsSub2APIDataExport(t *testing.T) {
 	}
 	if second["email"] != "second@example.com" || second["is_active"] != false {
 		t.Fatalf("second fallback metadata = %#v", second)
+	}
+}
+
+func TestParseImportTextPayloadsExpandsSub2APIAgentIdentityExportByRuntime(t *testing.T) {
+	accounts := make([]any, 0, 50)
+	for index := 0; index < 50; index++ {
+		accounts = append(accounts, map[string]any{
+			"name":     fmt.Sprintf("agent-%d@example.invalid", index),
+			"platform": "openai",
+			"type":     "oauth",
+			"credentials": map[string]any{
+				"auth_mode":          "agentIdentity",
+				"agent_runtime_id":   fmt.Sprintf("runtime-%d", index),
+				"agent_private_key":  fmt.Sprintf("private-key-%d", index),
+				"task_id":            fmt.Sprintf("task-%d", index),
+				"account_id":         "shared-workspace",
+				"chatgpt_account_id": "shared-workspace",
+				"chatgpt_user_id":    fmt.Sprintf("user-%d", index),
+				"email":              fmt.Sprintf("agent-%d@example.invalid", index),
+				"plan_type":          "pro",
+			},
+		})
+	}
+	data, err := json.MarshalIndent(map[string]any{
+		"type":     "sub2api-data",
+		"version":  1,
+		"proxies":  []any{},
+		"accounts": accounts,
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, err := parseImportTextPayloads(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads = dedupeImportPayloads(payloads)
+	if len(payloads) != 50 {
+		t.Fatalf("payload count = %d, want 50", len(payloads))
+	}
+	for index, payload := range payloads {
+		if payload["auth_mode"] != "agentIdentity" || payload["agent_runtime_id"] != fmt.Sprintf("runtime-%d", index) {
+			t.Fatalf("payload %d = %#v", index, payload)
+		}
+		if payload["chatgpt_account_id"] != "shared-workspace" || payload["chatgpt_user_id"] != fmt.Sprintf("user-%d", index) {
+			t.Fatalf("payload %d identity = %#v", index, payload)
+		}
+		if payload["access_token"] != nil || payload["refresh_token"] != nil {
+			t.Fatalf("payload %d unexpectedly became OAuth credentials: %#v", index, payload)
+		}
+	}
+}
+
+func TestParseImportTextPayloadsDoesNotTreatEmptyJSONExportAsLineTokens(t *testing.T) {
+	payloads, err := parseImportTextPayloads(`{
+		"type": "sub2api-data",
+		"version": 1,
+		"proxies": [],
+		"accounts": []
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payloads) != 0 {
+		t.Fatalf("empty JSON export parsed as line tokens: %#v", payloads)
 	}
 }
 

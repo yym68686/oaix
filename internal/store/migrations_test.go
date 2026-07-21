@@ -96,8 +96,8 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 }
 
 func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
-	if SchemaVersion != 21 {
-		t.Fatalf("unexpected schema version: got %d want 21", SchemaVersion)
+	if SchemaVersion != 22 {
+		t.Fatalf("unexpected schema version: got %d want 22", SchemaVersion)
 	}
 
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
@@ -109,6 +109,21 @@ func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
 	} {
 		if !strings.Contains(joined, fragment) {
 			t.Fatalf("missing stream delivery migration fragment %q", fragment)
+		}
+	}
+}
+
+func TestMigrationAddsAgentIdentityCredentialStore(t *testing.T) {
+	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	for _, fragment := range []string{
+		"create table if not exists token_agent_identities",
+		"agent_runtime_id text not null",
+		"agent_private_key text not null",
+		"chatgpt_user_id text not null",
+		"ux_token_agent_identities_owner_runtime",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("missing agent identity migration fragment %q", fragment)
 		}
 	}
 }

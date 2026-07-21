@@ -59,6 +59,21 @@ const createSub2APIUsageDailySnapshots = `create table if not exists sub2api_usa
 const createSub2APIUsageDailyTokenIndex = `create index if not exists ix_sub2api_usage_daily_token on sub2api_usage_daily_snapshots(token_id, usage_date)`
 const createSub2APIUsageDailySyncIndex = `create index if not exists ix_sub2api_usage_daily_sync on sub2api_usage_daily_snapshots(target_id, usage_date, synced_at)`
 
+const createTokenAgentIdentitiesTable = `create table if not exists token_agent_identities (
+	token_id integer primary key references codex_tokens(id) on delete cascade,
+	owner_user_id bigint references platform_users(id) on delete cascade,
+	agent_runtime_id text not null,
+	agent_private_key text not null,
+	task_id text,
+	chatgpt_user_id text not null,
+	workspace_id text,
+	chatgpt_account_is_fedramp boolean not null default false,
+	created_at timestamptz not null default now(),
+	updated_at timestamptz not null default now()
+)`
+
+const createTokenAgentIdentitiesOwnerRuntimeIndex = `create unique index if not exists ux_token_agent_identities_owner_runtime on token_agent_identities(owner_user_id, agent_runtime_id)`
+
 type startupMigration struct {
 	statements []string
 }
@@ -75,6 +90,10 @@ var startupMigrations = map[int]startupMigration{
 		createSub2APIUsageDailySnapshots,
 		createSub2APIUsageDailyTokenIndex,
 		createSub2APIUsageDailySyncIndex,
+	}},
+	22: {statements: []string{
+		createTokenAgentIdentitiesTable,
+		createTokenAgentIdentitiesOwnerRuntimeIndex,
 	}},
 }
 
@@ -171,6 +190,8 @@ var migrationStatements = []string{
 		id_token text,
 		updated_at timestamptz not null default now()
 	)`,
+	createTokenAgentIdentitiesTable,
+	createTokenAgentIdentitiesOwnerRuntimeIndex,
 	`create table if not exists token_scopes (
 		id serial primary key,
 		token_id integer not null references codex_tokens(id) on delete cascade,
@@ -764,6 +785,7 @@ var onlineMigrationStatements = []string{
 
 var downMigrationStatements = []string{
 	`drop table if exists gateway_idempotency_records`,
+	`drop table if exists token_agent_identities`,
 	`drop table if exists sub2api_usage_daily_snapshots`,
 	`drop table if exists sub2api_usage_snapshots`,
 	`drop table if exists sub2api_sync_mappings`,

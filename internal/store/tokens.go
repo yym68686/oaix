@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/yym68686/oaix/internal/agentidentity"
 )
 
 const (
@@ -32,30 +34,35 @@ const (
 var primaryPlanOrder = []string{planFree, planPlus, planTeam, planPro}
 
 type Token struct {
-	ID                        int64      `json:"id"`
-	OwnerUserID               int64      `json:"owner_user_id"`
-	Email                     *string    `json:"email,omitempty"`
-	AccountID                 *string    `json:"account_id,omitempty"`
-	AccessToken               string     `json:"-"`
-	RefreshToken              string     `json:"-"`
-	PlanType                  *string    `json:"plan_type,omitempty"`
-	Remark                    *string    `json:"remark,omitempty"`
-	SourceFile                *string    `json:"source_file,omitempty"`
-	IsActive                  bool       `json:"is_active"`
-	CooldownUntil             *time.Time `json:"cooldown_until,omitempty"`
-	DisabledAt                *time.Time `json:"disabled_at,omitempty"`
-	ShareEnabled              bool       `json:"share_enabled"`
-	ShareStatus               string     `json:"share_status,omitempty"`
-	ShareReason               *string    `json:"share_disabled_reason,omitempty"`
-	ShareEnabledAt            *time.Time `json:"share_enabled_at,omitempty"`
-	ShareDisabledAt           *time.Time `json:"share_disabled_at,omitempty"`
-	MarketplacePriceBPS       *int       `json:"marketplace_price_bps,omitempty"`
-	MarketplacePriceUpdatedAt *time.Time `json:"marketplace_price_updated_at,omitempty"`
-	MarketplacePriceSource    string     `json:"marketplace_price_source,omitempty"`
-	LastUsedAt                *time.Time `json:"last_used_at,omitempty"`
-	LastError                 *string    `json:"last_error,omitempty"`
-	CreatedAt                 time.Time  `json:"created_at"`
-	UpdatedAt                 time.Time  `json:"updated_at"`
+	ID                        int64                      `json:"id"`
+	OwnerUserID               int64                      `json:"owner_user_id"`
+	Email                     *string                    `json:"email,omitempty"`
+	AccountID                 *string                    `json:"account_id,omitempty"`
+	AccessToken               string                     `json:"-"`
+	RefreshToken              string                     `json:"-"`
+	AgentIdentity             *agentidentity.Credentials `json:"-"`
+	PlanType                  *string                    `json:"plan_type,omitempty"`
+	Remark                    *string                    `json:"remark,omitempty"`
+	SourceFile                *string                    `json:"source_file,omitempty"`
+	IsActive                  bool                       `json:"is_active"`
+	CooldownUntil             *time.Time                 `json:"cooldown_until,omitempty"`
+	DisabledAt                *time.Time                 `json:"disabled_at,omitempty"`
+	ShareEnabled              bool                       `json:"share_enabled"`
+	ShareStatus               string                     `json:"share_status,omitempty"`
+	ShareReason               *string                    `json:"share_disabled_reason,omitempty"`
+	ShareEnabledAt            *time.Time                 `json:"share_enabled_at,omitempty"`
+	ShareDisabledAt           *time.Time                 `json:"share_disabled_at,omitempty"`
+	MarketplacePriceBPS       *int                       `json:"marketplace_price_bps,omitempty"`
+	MarketplacePriceUpdatedAt *time.Time                 `json:"marketplace_price_updated_at,omitempty"`
+	MarketplacePriceSource    string                     `json:"marketplace_price_source,omitempty"`
+	LastUsedAt                *time.Time                 `json:"last_used_at,omitempty"`
+	LastError                 *string                    `json:"last_error,omitempty"`
+	CreatedAt                 time.Time                  `json:"created_at"`
+	UpdatedAt                 time.Time                  `json:"updated_at"`
+}
+
+func (t Token) IsAgentIdentity() bool {
+	return t.AgentIdentity != nil || strings.HasPrefix(strings.TrimSpace(t.RefreshToken), agentidentity.SyntheticRefreshPrefix)
 }
 
 type TokenObservedCost struct {
@@ -191,6 +198,7 @@ type TokenSecretUpdate struct {
 
 var ErrTokenCredentialsChanged = errors.New("token credentials changed concurrently")
 var ErrTokenStateChanged = errors.New("token state changed concurrently")
+var ErrAgentIdentityTaskChanged = errors.New("agent identity task changed concurrently")
 
 func (s *Store) ListAvailableTokens(ctx context.Context) ([]Token, error) {
 	return s.ListAvailableTokensScoped(ctx, AllResources())
@@ -198,28 +206,30 @@ func (s *Store) ListAvailableTokens(ctx context.Context) ([]Token, error) {
 
 func (s *Store) ListAvailableTokensScoped(ctx context.Context, scope ResourceScope) ([]Token, error) {
 	args := []any{}
-	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	ownerWhere := scope.ownerFilter("t.owner_user_id", &args)
 	rows, err := s.pool.Query(ctx, `
-		select id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		       is_active, cooldown_until, disabled_at,
-		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
-		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		       last_used_at, last_error, created_at, updated_at
-		from codex_tokens
-		where is_active = true
-		  and merged_into_token_id is null
+		select t.id, coalesce(t.owner_user_id, 0), t.email, t.account_id, t.access_token, t.refresh_token, t.plan_type, t.remark, t.source_file,
+		       t.is_active, t.cooldown_until, t.disabled_at,
+		       t.share_enabled, t.share_status, t.share_disabled_reason, t.share_enabled_at, t.share_disabled_at,
+		       t.marketplace_price_bps, t.marketplace_price_updated_at, t.marketplace_price_source,
+		       t.last_used_at, t.last_error, t.created_at, t.updated_at,
+		       ai.agent_runtime_id, ai.agent_private_key, ai.task_id, ai.chatgpt_user_id,
+		       ai.workspace_id, ai.chatgpt_account_is_fedramp
+		from codex_tokens t
+		left join token_agent_identities ai on ai.token_id = t.id
+		where t.is_active = true
+		  and t.merged_into_token_id is null
 		  and `+ownerWhere+`
-		  and access_token is not null
-		  and access_token <> ''
-		  and (cooldown_until is null or cooldown_until <= now())
-		  and disabled_at is null
-		order by coalesce(last_used_at, 'epoch'::timestamptz) asc, id asc
+		  and (coalesce(t.access_token, '') <> '' or ai.token_id is not null)
+		  and (t.cooldown_until is null or t.cooldown_until <= now())
+		  and t.disabled_at is null
+		order by coalesce(t.last_used_at, 'epoch'::timestamptz) asc, t.id asc
 	`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanAvailableTokens(rows)
+	return scanRuntimeTokens(rows)
 }
 
 func (s *Store) ListTokens(ctx context.Context, opts TokenListOptions) ([]Token, int, error) {
@@ -320,6 +330,10 @@ func tokenDisplayAvailableWhere(asOf string) string {
 
 func tokenDisplayCoolingWhere(asOf string) string {
 	return fmt.Sprintf("(cooldown_until > %s and not %s)", asOf, tokenTransientRetryBackoffWhere(asOf))
+}
+
+func tokenCredentialReadyWhere() string {
+	return "(coalesce(access_token, '') <> '' or exists (select 1 from token_agent_identities where token_id = codex_tokens.id))"
 }
 
 func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope ResourceScope) (string, []any) {
@@ -459,8 +473,7 @@ func (s *Store) TokenCountsScopedAt(ctx context.Context, scope ResourceScope, as
 			count(*) filter (
 				where is_active = true
 				  and disabled_at is null
-				  and access_token is not null
-				  and access_token <> ''
+				  and `+tokenCredentialReadyWhere()+`
 				  and `+tokenDisplayAvailableWhere("$1")+`
 			)::int as available,
 			count(*) filter (where is_active = true and disabled_at is null and `+tokenDisplayCoolingWhere("$1")+`)::int as cooling,
@@ -517,8 +530,7 @@ func (s *Store) TokenPoolSummariesByOwner(ctx context.Context, ownerIDs []int64,
 			count(*) filter (
 				where is_active = true
 				  and disabled_at is null
-				  and access_token is not null
-				  and access_token <> ''
+				  and `+tokenCredentialReadyWhere()+`
 				  and `+tokenDisplayAvailableWhere("$1")+`
 			)::int as available,
 			count(*) filter (where is_active = true and disabled_at is null and `+tokenDisplayCoolingWhere("$1")+`)::int as cooling,
@@ -645,8 +657,7 @@ func (s *Store) tokenMarketplaceAvailablePriceFloor(ctx context.Context, exclude
 			  and share_status = 'active'
 			  and is_active = true
 			  and disabled_at is null
-			  and access_token is not null
-			  and access_token <> ''
+			  and `+tokenCredentialReadyWhere()+`
 			  and (cooldown_until is null or cooldown_until <= now())
 			  and `+ownerWhere+`
 		),
@@ -860,9 +871,26 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 		resultIndex := importPayloadIndex(rawPayload, index)
 		previousRefreshToken := stringFromPayload(rawPayload, "_previous_refresh_token")
 		payload := normalizeTokenPayload(rawPayload)
+		agentCredentials, isAgentIdentity, agentErr := agentidentity.Parse(payload)
+		if agentErr != nil {
+			result.Failed++
+			result.Items = append(result.Items, ImportResultItem{
+				Index:        resultIndex,
+				Action:       "failed",
+				ErrorMessage: agentErr.Error(),
+				Status:       "failed",
+			})
+			continue
+		}
 		accessToken := stringFromPayload(payload, "access_token", "accessToken")
 		refreshToken := stringFromPayload(payload, "refresh_token", "refreshToken")
 		lastRefresh := timeFromPayload(payload, "last_refresh")
+		if isAgentIdentity {
+			accessToken = ""
+			refreshToken = agentCredentials.IdentityToken()
+			previousRefreshToken = ""
+			payload["auth_mode"] = agentidentity.AuthMode
+		}
 		if refreshToken == "" && accessToken != "" {
 			refreshToken = "access:" + hashString(accessToken)
 			payload["refresh_token"] = refreshToken
@@ -888,9 +916,14 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 		if value := stringFromPayload(payload, "plan_type", "planType", "chatgpt_plan_type"); value != "" {
 			planType = &value
 		}
+		if isAgentIdentity {
+			accountID = nullableString(agentCredentials.AccountID)
+			email = nullableString(agentCredentials.Email)
+			planType = nullableString(agentCredentials.PlanType)
+		}
 		idToken := nullableString(stringFromPayload(payload, "id_token", "idToken"))
 		tokenType := stringFromPayload(payload, "type")
-		if tokenType == "" {
+		if tokenType == "" || isAgentIdentity {
 			tokenType = "codex"
 		}
 		isActive := payloadBool(payload["is_active"], true)
@@ -905,8 +938,12 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 			payload["source"] = "access_token_import"
 		}
 		shareEnabled, shareStatus, shareExplicit := importSharingFromPayload(payload)
+		storedPayload := payload
+		if isAgentIdentity {
+			storedPayload = agentidentity.SanitizedPayload(payload)
+		}
 
-		existingID, err := findExistingTokenForImport(ctx, tx, ownerUserID, refreshToken, previousRefreshToken, accountID, email)
+		existingID, err := findExistingTokenForImport(ctx, tx, ownerUserID, refreshToken, previousRefreshToken, accountID, email, !isAgentIdentity)
 		if err != nil {
 			return result, err
 		}
@@ -923,7 +960,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 			}
 			row := tx.QueryRow(ctx, `
 				update codex_tokens
-				set access_token = coalesce(nullif($2, ''), access_token),
+				set access_token = case when $17 then null else coalesce(nullif($2, ''), access_token) end,
 				    account_id = coalesce($3, account_id),
 					    email = coalesce($4, email),
 					    plan_type = coalesce($5, plan_type),
@@ -948,13 +985,22 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 					          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 					          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 					          last_used_at, last_error, created_at, updated_at
-				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(payload), isActive, lastError, refreshToken, lastRefresh, shareExplicit, shareEnabled, shareStatus)
+				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(storedPayload), isActive, lastError, refreshToken, lastRefresh, shareExplicit, shareEnabled, shareStatus, isAgentIdentity)
 			token, scanErr := scanTokenWithSharing(row)
 			if scanErr != nil {
 				return result, scanErr
 			}
-			if err := recordTokenSecretAndRefreshHistory(ctx, tx, ownerUserID, token.ID, accessToken, refreshToken, idToken); err != nil {
-				return result, err
+			if isAgentIdentity {
+				if err := recordAgentIdentity(ctx, tx, ownerUserID, token.ID, agentCredentials, idToken); err != nil {
+					return result, err
+				}
+			} else {
+				if err := recordTokenSecretAndRefreshHistory(ctx, tx, ownerUserID, token.ID, accessToken, refreshToken, idToken); err != nil {
+					return result, err
+				}
+				if _, err := tx.Exec(ctx, `delete from token_agent_identities where token_id = $1`, token.ID); err != nil {
+					return result, err
+				}
 			}
 			action := "updated"
 			result.Updated++
@@ -1002,13 +1048,19 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 				          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 				          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 				          last_used_at, last_error, created_at, updated_at
-			`, ownerUserID, email, accountID, idToken, accessToken, refreshToken, jsonBytes(payload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh, shareEnabled, shareStatus, shareExplicit)
+			`, ownerUserID, email, accountID, idToken, accessToken, refreshToken, jsonBytes(storedPayload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh, shareEnabled, shareStatus, shareExplicit)
 		token, scanErr := scanTokenWithSharing(row)
 		if scanErr != nil {
 			return result, scanErr
 		}
-		if err := recordTokenSecretAndRefreshHistory(ctx, tx, ownerUserID, token.ID, accessToken, refreshToken, idToken); err != nil {
-			return result, err
+		if isAgentIdentity {
+			if err := recordAgentIdentity(ctx, tx, ownerUserID, token.ID, agentCredentials, idToken); err != nil {
+				return result, err
+			}
+		} else {
+			if err := recordTokenSecretAndRefreshHistory(ctx, tx, ownerUserID, token.ID, accessToken, refreshToken, idToken); err != nil {
+				return result, err
+			}
 		}
 		result.Created++
 		result.Tokens = append(result.Tokens, token)
@@ -1028,7 +1080,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 	return result, nil
 }
 
-func findExistingTokenForImport(ctx context.Context, tx pgx.Tx, ownerUserID int64, refreshToken string, previousRefreshToken string, accountID *string, email *string) (int64, error) {
+func findExistingTokenForImport(ctx context.Context, tx pgx.Tx, ownerUserID int64, refreshToken string, previousRefreshToken string, accountID *string, email *string, allowEmailFallback bool) (int64, error) {
 	var existingID int64
 	err := tx.QueryRow(ctx, `
 		select id
@@ -1044,6 +1096,9 @@ func findExistingTokenForImport(ctx context.Context, tx pgx.Tx, ownerUserID int6
 	}
 	if err != pgx.ErrNoRows {
 		return 0, err
+	}
+	if !allowEmailFallback {
+		return 0, nil
 	}
 
 	emailKey := normalizedImportEmail(email)
@@ -1071,6 +1126,98 @@ func findExistingTokenForImport(ctx context.Context, tx pgx.Tx, ownerUserID int6
 		return 0, err
 	}
 	return existingID, nil
+}
+
+func recordAgentIdentity(ctx context.Context, tx pgx.Tx, ownerUserID int64, tokenID int64, credentials agentidentity.Credentials, idToken *string) error {
+	if err := credentials.Validate(); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		insert into token_agent_identities(
+			token_id, owner_user_id, agent_runtime_id, agent_private_key, task_id,
+			chatgpt_user_id, workspace_id, chatgpt_account_is_fedramp, created_at, updated_at
+		)
+		values ($1, $2, $3, $4, nullif($5, ''), $6, nullif($7, ''), $8, now(), now())
+		on conflict (token_id) do update
+		set owner_user_id = excluded.owner_user_id,
+		    agent_runtime_id = excluded.agent_runtime_id,
+		    agent_private_key = excluded.agent_private_key,
+		    task_id = excluded.task_id,
+		    chatgpt_user_id = excluded.chatgpt_user_id,
+		    workspace_id = excluded.workspace_id,
+		    chatgpt_account_is_fedramp = excluded.chatgpt_account_is_fedramp,
+		    updated_at = now()
+	`, tokenID, ownerUserID, credentials.RuntimeID, credentials.PrivateKey, credentials.TaskID, credentials.UserID, credentials.WorkspaceID, credentials.FedRAMP); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `
+		insert into token_secrets(token_id, owner_user_id, access_token, refresh_token, id_token, updated_at)
+		values ($1, $2, null, null, $3, now())
+		on conflict (token_id) do update
+		set owner_user_id = coalesce(excluded.owner_user_id, token_secrets.owner_user_id),
+		    access_token = null,
+		    refresh_token = null,
+		    id_token = coalesce(excluded.id_token, token_secrets.id_token),
+		    updated_at = now()
+	`, tokenID, ownerUserID, idToken)
+	return err
+}
+
+func (s *Store) GetAgentIdentityCredentials(ctx context.Context, tokenID int64) (agentidentity.Credentials, error) {
+	var credentials agentidentity.Credentials
+	var taskID sql.NullString
+	var workspaceID sql.NullString
+	var accountID sql.NullString
+	var email sql.NullString
+	var planType sql.NullString
+	err := s.pool.QueryRow(ctx, `
+		select ai.agent_runtime_id, ai.agent_private_key, ai.task_id, ai.chatgpt_user_id,
+		       ai.workspace_id, ai.chatgpt_account_is_fedramp,
+		       t.account_id, t.email, t.plan_type
+		from token_agent_identities ai
+		join codex_tokens t on t.id = ai.token_id
+		where ai.token_id = $1
+		  and t.merged_into_token_id is null
+	`, tokenID).Scan(
+		&credentials.RuntimeID,
+		&credentials.PrivateKey,
+		&taskID,
+		&credentials.UserID,
+		&workspaceID,
+		&credentials.FedRAMP,
+		&accountID,
+		&email,
+		&planType,
+	)
+	if err != nil {
+		return agentidentity.Credentials{}, err
+	}
+	credentials.TaskID = taskID.String
+	credentials.WorkspaceID = workspaceID.String
+	credentials.AccountID = accountID.String
+	credentials.Email = email.String
+	credentials.PlanType = planType.String
+	return credentials, nil
+}
+
+func (s *Store) UpdateAgentIdentityTask(ctx context.Context, tokenID int64, expectedTaskID string, taskID string) error {
+	taskID = strings.TrimSpace(taskID)
+	if tokenID <= 0 || taskID == "" {
+		return fmt.Errorf("token id and agent identity task id are required")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		update token_agent_identities
+		set task_id = $3, updated_at = now()
+		where token_id = $1
+		  and coalesce(task_id, '') = $2
+	`, tokenID, strings.TrimSpace(expectedTaskID), taskID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrAgentIdentityTaskChanged
+	}
+	return nil
 }
 
 func normalizedImportEmail(value *string) string {
@@ -1890,6 +2037,97 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 		}
 		if marketplacePriceSource.Valid {
 			token.MarketplacePriceSource = marketplacePriceSource.String
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, rows.Err()
+}
+
+func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
+	var tokens []Token
+	for rows.Next() {
+		var token Token
+		var accessToken sql.NullString
+		var refreshToken sql.NullString
+		var shareStatus sql.NullString
+		var marketplacePriceBPS sql.NullInt64
+		var marketplacePriceSource sql.NullString
+		var runtimeID sql.NullString
+		var privateKey sql.NullString
+		var taskID sql.NullString
+		var userID sql.NullString
+		var workspaceID sql.NullString
+		var fedRAMP sql.NullBool
+		err := rows.Scan(
+			&token.ID,
+			&token.OwnerUserID,
+			&token.Email,
+			&token.AccountID,
+			&accessToken,
+			&refreshToken,
+			&token.PlanType,
+			&token.Remark,
+			&token.SourceFile,
+			&token.IsActive,
+			&token.CooldownUntil,
+			&token.DisabledAt,
+			&token.ShareEnabled,
+			&shareStatus,
+			&token.ShareReason,
+			&token.ShareEnabledAt,
+			&token.ShareDisabledAt,
+			&marketplacePriceBPS,
+			&token.MarketplacePriceUpdatedAt,
+			&marketplacePriceSource,
+			&token.LastUsedAt,
+			&token.LastError,
+			&token.CreatedAt,
+			&token.UpdatedAt,
+			&runtimeID,
+			&privateKey,
+			&taskID,
+			&userID,
+			&workspaceID,
+			&fedRAMP,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if accessToken.Valid {
+			token.AccessToken = accessToken.String
+		}
+		if refreshToken.Valid {
+			token.RefreshToken = refreshToken.String
+		}
+		if shareStatus.Valid {
+			token.ShareStatus = shareStatus.String
+		}
+		if marketplacePriceBPS.Valid {
+			value := int(marketplacePriceBPS.Int64)
+			token.MarketplacePriceBPS = &value
+		}
+		if marketplacePriceSource.Valid {
+			token.MarketplacePriceSource = marketplacePriceSource.String
+		}
+		if runtimeID.Valid && privateKey.Valid {
+			credentials := agentidentity.Credentials{
+				RuntimeID:   runtimeID.String,
+				PrivateKey:  privateKey.String,
+				TaskID:      taskID.String,
+				UserID:      userID.String,
+				WorkspaceID: workspaceID.String,
+				FedRAMP:     fedRAMP.Valid && fedRAMP.Bool,
+			}
+			if token.AccountID != nil {
+				credentials.AccountID = *token.AccountID
+			}
+			if token.Email != nil {
+				credentials.Email = *token.Email
+			}
+			if token.PlanType != nil {
+				credentials.PlanType = *token.PlanType
+			}
+			token.AgentIdentity = &credentials
 		}
 		tokens = append(tokens, token)
 	}

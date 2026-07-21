@@ -281,7 +281,7 @@ function ImportForm({
             className="block w-full min-w-0 max-w-full overflow-hidden"
             id="token-json"
             onChange={(event) => setTokenInput(event.currentTarget.value)}
-            placeholder="支持普通 JSON / sub2api 导出 JSON；也支持每行 access_token / refresh_token，或 account_id,refresh_token。"
+            placeholder="支持普通 JSON / sub2api 导出 JSON（含 Agent Identity）；也支持每行 access_token / refresh_token，或 account_id,refresh_token。"
             rows={10}
             spellCheck={false}
             value={tokenInput}
@@ -392,7 +392,7 @@ export function ImportNewDialog({
             <UploadIcon className="size-5" />
             导入 Key
           </DialogTitle>
-          <DialogDescription>导入 access token / refresh token 数据，或使用 ChatGPT OAuth 授权。</DialogDescription>
+          <DialogDescription>导入 access token、refresh token 或 sub2api Agent Identity 数据，也可使用 ChatGPT OAuth 授权。</DialogDescription>
         </DialogHeader>
         <DialogPanel>
           <ImportForm onImported={onImported} pushToast={pushToast} />

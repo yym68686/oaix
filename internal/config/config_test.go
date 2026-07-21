@@ -36,6 +36,9 @@ func TestLoadUsesTypedDefaultsAndEnvOverrides(t *testing.T) {
 	if cfg.Upstream.OAuthTokenURL != "https://auth.openai.com/oauth/token" {
 		t.Fatalf("OAuthTokenURL = %q", cfg.Upstream.OAuthTokenURL)
 	}
+	if cfg.Upstream.AgentIdentityAuthAPIURL != "https://auth.openai.com/api/accounts" {
+		t.Fatalf("AgentIdentityAuthAPIURL = %q", cfg.Upstream.AgentIdentityAuthAPIURL)
+	}
 	if cfg.Upstream.OAuthClientID == "" || cfg.Upstream.OAuthScope != "openid profile email" {
 		t.Fatalf("OAuth config = %#v", cfg.Upstream)
 	}
@@ -56,6 +59,13 @@ func TestLoadUsesTypedDefaultsAndEnvOverrides(t *testing.T) {
 	}
 	if cfg.QuotaRecovery.BatchSize != 24 || cfg.QuotaRecovery.Concurrency != 4 {
 		t.Fatalf("QuotaRecovery limits = %#v", cfg.QuotaRecovery)
+	}
+}
+
+func TestLoadRejectsInvalidAgentIdentityAuthAPIURL(t *testing.T) {
+	t.Setenv("CODEX_AGENT_IDENTITY_AUTH_API_URL", "://not-a-url")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "CODEX_AGENT_IDENTITY_AUTH_API_URL") {
+		t.Fatalf("expected agent identity auth URL validation error, got %v", err)
 	}
 }
 

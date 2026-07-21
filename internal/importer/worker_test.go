@@ -2,6 +2,10 @@ package importer
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
 	"testing"
 
 	"github.com/yym68686/oaix/internal/oauth"
@@ -18,6 +22,41 @@ func (fakeRefreshClient) Refresh(ctx context.Context, refreshToken string) (oaut
 		Email:        "user@example.com",
 		PlanType:     "pro",
 	}, nil
+}
+
+func TestWorkerValidateBatchAgentIdentityWithoutOAuthRefresh(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := &Worker{Validator: TokenPayloadValidator{}}
+	updates := worker.ValidateBatch(context.Background(), []store.ImportItem{{
+		ID: 9,
+		Payload: map[string]any{
+			"credentials": map[string]any{
+				"auth_mode":         "agentIdentity",
+				"agent_runtime_id":  "runtime-9",
+				"agent_private_key": base64.StdEncoding.EncodeToString(der),
+				"task_id":           "task-9",
+				"account_id":        "workspace-1",
+				"chatgpt_user_id":   "user-9",
+				"email":             "agent-9@example.invalid",
+			},
+		},
+	}})
+	if len(updates) != 1 || updates[0].Status != string(ItemValidated) || updates[0].Action != "upsert_agent_identity" {
+		t.Fatalf("agent identity update = %+v", updates)
+	}
+	if updates[0].ValidatedPayload["agent_runtime_id"] != "runtime-9" || updates[0].ValidatedPayload["agent_private_key"] == "" {
+		t.Fatalf("agent identity payload = %#v", updates[0].ValidatedPayload)
+	}
+	if updates[0].ValidatedPayload["access_token"] != nil || updates[0].ValidatedPayload["refresh_token"] != nil {
+		t.Fatalf("agent identity unexpectedly became OAuth credentials: %#v", updates[0].ValidatedPayload)
+	}
 }
 
 type fakeRefreshClientWithClientID struct {

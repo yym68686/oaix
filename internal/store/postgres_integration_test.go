@@ -124,6 +124,9 @@ func TestPostgresStartupMigrationFromVersion19DoesNotReplayHistoricalRepairs(t *
 	if _, err := db.pool.Exec(ctx, `drop table if exists gateway_idempotency_records`); err != nil {
 		t.Fatalf("drop version 20 table: %v", err)
 	}
+	if _, err := db.pool.Exec(ctx, `drop table if exists token_agent_identities`); err != nil {
+		t.Fatalf("drop version 22 table: %v", err)
+	}
 	if _, err := db.pool.Exec(ctx, `update schema_migrations set version = 19 where name = 'oaix_go'`); err != nil {
 		t.Fatalf("set schema version 19: %v", err)
 	}
@@ -143,15 +146,18 @@ func TestPostgresStartupMigrationFromVersion19DoesNotReplayHistoricalRepairs(t *
 		t.Fatalf("incremental startup migration touched a historical repair table: %v", err)
 	}
 	var version int
-	var tableName *string
+	var idempotencyTable *string
+	var agentIdentityTable *string
 	if err := db.pool.QueryRow(ctx, `
 		select (select version from schema_migrations where name = 'oaix_go'),
-		       to_regclass('public.gateway_idempotency_records')::text
-	`).Scan(&version, &tableName); err != nil {
+		       to_regclass('public.gateway_idempotency_records')::text,
+		       to_regclass('public.token_agent_identities')::text
+	`).Scan(&version, &idempotencyTable, &agentIdentityTable); err != nil {
 		t.Fatalf("inspect incremental migration result: %v", err)
 	}
-	if version != SchemaVersion || tableName == nil || *tableName != "gateway_idempotency_records" {
-		t.Fatalf("unexpected incremental migration result: version=%d table=%v", version, tableName)
+	if version != SchemaVersion || idempotencyTable == nil || *idempotencyTable != "gateway_idempotency_records" ||
+		agentIdentityTable == nil || *agentIdentityTable != "token_agent_identities" {
+		t.Fatalf("unexpected incremental migration result: version=%d idempotency_table=%v agent_identity_table=%v", version, idempotencyTable, agentIdentityTable)
 	}
 }
 

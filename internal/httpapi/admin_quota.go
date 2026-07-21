@@ -351,10 +351,16 @@ func (s *adminQuotaService) collect(ctx context.Context, tokens []store.Token) (
 }
 
 func quotaEligible(token store.Token) bool {
+	if token.IsAgentIdentity() {
+		return false
+	}
 	return token.IsActive && token.DisabledAt == nil && (strings.TrimSpace(token.AccessToken) != "" || strings.TrimSpace(token.RefreshToken) != "")
 }
 
 func quotaActionEligible(token store.Token) bool {
+	if token.IsAgentIdentity() {
+		return false
+	}
 	return strings.TrimSpace(token.AccessToken) != "" || strings.TrimSpace(token.RefreshToken) != ""
 }
 
@@ -499,6 +505,9 @@ func (s *adminQuotaService) fetchSnapshotWithoutHistory(ctx context.Context, tok
 }
 
 func (s *adminQuotaService) fetchSnapshotWithDiagnostic(ctx context.Context, token store.Token, persist bool) (*codexQuotaSnapshot, quotaRecoveryCheckErrorReason) {
+	if token.IsAgentIdentity() {
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(time.Now().UTC(), "Agent Identity quota probing is not supported"), persist), quotaRecoveryCheckErrorOther
+	}
 	now := time.Now().UTC()
 	select {
 	case s.sem <- struct{}{}:

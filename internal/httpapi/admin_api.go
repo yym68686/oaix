@@ -18,6 +18,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -1654,7 +1655,7 @@ func parseImportTextPayloads(raw string) ([]map[string]any, error) {
 	var decoded any
 	if err := json.Unmarshal([]byte(text), &decoded); err == nil {
 		payloads, _, err := parseImportPayload(decoded)
-		if err == nil && len(payloads) > 0 {
+		if err == nil {
 			return payloads, nil
 		}
 	}
@@ -1694,6 +1695,11 @@ func dedupeImportPayloads(payloads []map[string]any) []map[string]any {
 	out := make([]map[string]any, 0, len(payloads))
 	for _, payload := range payloads {
 		key := stringFromImportPayload(payload, "refresh_token", "refreshToken", "access_token", "accessToken", "token")
+		if normalized, ok := agentidentity.NormalizePayload(payload); ok {
+			if runtimeID := stringFromImportPayload(normalized, "agent_runtime_id"); runtimeID != "" {
+				key = agentidentity.SyntheticRefreshPrefix + runtimeID
+			}
+		}
 		if key == "" {
 			data, _ := json.Marshal(payload)
 			key = string(data)

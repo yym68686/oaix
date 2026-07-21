@@ -3,7 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +23,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/yym68686/oaix/internal/affinity"
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/oauth"
@@ -2589,6 +2594,138 @@ func newProxyPipelineTestHarness(t *testing.T, upstreamURL string, maxRetries in
 	return New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
 }
 
+func TestProxyAgentIdentityUsesAssertionAndWorkspaceHeaders(t *testing.T) {
+	credentials := proxyAgentIdentityCredentials(t, "task-ready")
+	accountID := credentials.AccountID
+	var authorization string
+	var chatGPTAccountID string
+	var fedRAMP string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		chatGPTAccountID = r.Header.Get("ChatGPT-Account-ID")
+		fedRAMP = r.Header.Get("X-OpenAI-FedRAMP")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-agent\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{tokens: []store.Token{{
+		ID: 71, OwnerUserID: 8, AccountID: &accountID, AgentIdentity: &credentials,
+		IsActive: true, CreatedAt: now, UpdatedAt: now,
+	}}}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL, 2, fakes)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.4","input":[],"stream":false}`))
+	recorder := httptest.NewRecorder()
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses"})
+	if recorder.Code != http.StatusOK {
+		for _, attempt := range fakes.attempts {
+			if attempt.ErrorMessageExcerpt != nil {
+				t.Logf("attempt status=%d outcome=%s error=%s", valueOrZero(attempt.StatusCode), attempt.Outcome, *attempt.ErrorMessageExcerpt)
+			}
+		}
+		t.Fatalf("status = %d body=%s attempts=%+v tokens=%+v", recorder.Code, recorder.Body.String(), fakes.attempts, fakes.tokens)
+	}
+	if !strings.HasPrefix(authorization, "AgentAssertion ") {
+		t.Fatalf("authorization = %q", authorization)
+	}
+	if task := decodeProxyAgentAssertionTask(t, authorization); task != "task-ready" {
+		t.Fatalf("assertion task = %q", task)
+	}
+	if chatGPTAccountID != credentials.AccountID || fedRAMP != "true" {
+		t.Fatalf("workspace headers: account=%q fedramp=%q", chatGPTAccountID, fedRAMP)
+	}
+}
+
+func TestProxyAgentIdentityRecoversInvalidTaskExactlyOnce(t *testing.T) {
+	credentials := proxyAgentIdentityCredentials(t, "task-old")
+	accountID := credentials.AccountID
+	var registrationCalls atomic.Int64
+	registration := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		registrationCalls.Add(1)
+		_, _ = io.WriteString(w, `{"task_id":"task-new"}`)
+	}))
+	defer registration.Close()
+	var upstreamCalls atomic.Int64
+	var tasks []string
+	var tasksMu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tasksMu.Lock()
+		tasks = append(tasks, decodeProxyAgentAssertionTask(t, r.Header.Get("Authorization")))
+		tasksMu.Unlock()
+		if upstreamCalls.Add(1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"code":"invalid_task_id"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-agent\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{tokens: []store.Token{{
+		ID: 72, OwnerUserID: 8, AccountID: &accountID, AgentIdentity: &credentials,
+		IsActive: true, CreatedAt: now, UpdatedAt: now,
+	}}}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL, 3, fakes)
+	pipeline.cfg.Upstream.AgentIdentityAuthAPIURL = registration.URL
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.4","input":[],"stream":false}`))
+	recorder := httptest.NewRecorder()
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses"})
+	if recorder.Code != http.StatusOK {
+		for _, attempt := range fakes.attempts {
+			if attempt.ErrorMessageExcerpt != nil {
+				t.Logf("attempt status=%d outcome=%s error=%s", valueOrZero(attempt.StatusCode), attempt.Outcome, *attempt.ErrorMessageExcerpt)
+			}
+		}
+		t.Fatalf("status = %d body=%s attempts=%+v tokens=%+v", recorder.Code, recorder.Body.String(), fakes.attempts, fakes.tokens)
+	}
+	if upstreamCalls.Load() != 2 || registrationCalls.Load() != 1 || fakes.agentTaskUpdates != 1 {
+		t.Fatalf("calls: upstream=%d registration=%d updates=%d", upstreamCalls.Load(), registrationCalls.Load(), fakes.agentTaskUpdates)
+	}
+	if len(tasks) != 2 || tasks[0] != "task-old" || tasks[1] != "task-new" {
+		t.Fatalf("assertion tasks = %v", tasks)
+	}
+}
+
+func proxyAgentIdentityCredentials(t *testing.T, taskID string) agentidentity.Credentials {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return agentidentity.Credentials{
+		RuntimeID: "runtime-proxy", PrivateKey: base64.StdEncoding.EncodeToString(der), TaskID: taskID,
+		AccountID: "workspace-proxy", UserID: "user-proxy", FedRAMP: true,
+	}
+}
+
+func decodeProxyAgentAssertionTask(t *testing.T, authorization string) string {
+	t.Helper()
+	encoded := strings.TrimPrefix(authorization, "AgentAssertion ")
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(decoded, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	return envelope.TaskID
+}
+
+func valueOrZero(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
 func TestProxyGpt56SolExcludesFreeTokensBeforeSelection(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -4202,6 +4339,7 @@ type fakeProxyStore struct {
 	tokenErrorCh     chan *time.Time
 	tokenErrorEvents chan tokenErrorEvent
 	attempts         []store.GatewayRequestAttempt
+	agentTaskUpdates int
 }
 
 type fakeOAuthClient struct {
@@ -4334,6 +4472,37 @@ func (s *fakeProxyStore) UpdateTokenSecret(_ context.Context, update store.Token
 		return nil
 	}
 	return fmt.Errorf("token %d not found", update.TokenID)
+}
+
+func (s *fakeProxyStore) GetAgentIdentityCredentials(_ context.Context, tokenID int64) (agentidentity.Credentials, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.tokens {
+		if s.tokens[i].ID == tokenID && s.tokens[i].AgentIdentity != nil {
+			return *s.tokens[i].AgentIdentity, nil
+		}
+	}
+	return agentidentity.Credentials{}, fmt.Errorf("agent identity token %d not found", tokenID)
+}
+
+func (s *fakeProxyStore) UpdateAgentIdentityTask(_ context.Context, tokenID int64, expectedTaskID string, taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.tokens {
+		credentials := s.tokens[i].AgentIdentity
+		if s.tokens[i].ID != tokenID || credentials == nil {
+			continue
+		}
+		if credentials.TaskID != expectedTaskID {
+			return store.ErrAgentIdentityTaskChanged
+		}
+		copy := *credentials
+		copy.TaskID = taskID
+		s.tokens[i].AgentIdentity = &copy
+		s.agentTaskUpdates++
+		return nil
+	}
+	return fmt.Errorf("agent identity token %d not found", tokenID)
 }
 
 func (s *fakeProxyStore) InsertGatewayRequestAttempt(_ context.Context, item store.GatewayRequestAttempt) (int64, error) {

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
@@ -73,6 +74,13 @@ func TestQuotaSnapshotHasCapacityUsesRawRemainingPercentAcrossAllWindows(t *test
 				t.Fatalf("quotaSnapshotHasCapacity = %v, want %v: %+v", got, test.expected, snapshot)
 			}
 		})
+	}
+}
+
+func TestQuotaEligibilitySkipsAgentIdentityTokens(t *testing.T) {
+	token := store.Token{RefreshToken: agentidentity.SyntheticRefreshPrefix + "runtime", IsActive: true}
+	if quotaEligible(token) || quotaActionEligible(token) {
+		t.Fatal("agent identity token should not be sent to OAuth-only quota endpoints")
 	}
 }
 
