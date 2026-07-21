@@ -61,6 +61,47 @@ func TestFrontendKeysPageUsesSelfScope(t *testing.T) {
 	}
 }
 
+func TestFrontendQuotaStateDistinguishesPendingFromUnavailable(t *testing.T) {
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+	components := readFrontendFile(t, "src", "shared", "components.tsx")
+	keysPage := readFrontendFile(t, "src", "features", "keys", "KeysPage.tsx")
+	importsPage := readFrontendFile(t, "src", "features", "imports", "ImportsPage.tsx")
+
+	for _, required := range []string{
+		`"pending"`,
+		"quota_fetch_state?: TokenQuotaFetchState",
+	} {
+		if !strings.Contains(apiFile, required) {
+			t.Fatalf("frontend quota API contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		`state === "pending"`,
+		"额度更新中",
+		"额度不可用",
+	} {
+		if !strings.Contains(components, required) {
+			t.Fatalf("frontend quota rendering contract missing %q", required)
+		}
+	}
+	if !strings.Contains(keysPage, "state={item.quota_fetch_state}") || !strings.Contains(keysPage, "state={token.quota_fetch_state}") {
+		t.Fatal("keys page must pass quota fetch state to every quota strip")
+	}
+	if !strings.Contains(importsPage, "state={token.quota_fetch_state}") {
+		t.Fatal("imports page must pass quota fetch state to its quota strip")
+	}
+	for _, required := range []string{
+		"quotaRefreshPending",
+		"quotaRefreshPolls.current >= 12",
+		"item.quota_fetch_state === \"pending\"",
+		"10_000",
+	} {
+		if !strings.Contains(keysPage, required) {
+			t.Fatalf("keys page quota polling contract missing %q", required)
+		}
+	}
+}
+
 func TestFrontendUserAreaUsesUserPrincipalScope(t *testing.T) {
 	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
 	for _, required := range []string{

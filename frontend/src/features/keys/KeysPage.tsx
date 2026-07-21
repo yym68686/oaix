@@ -221,7 +221,9 @@ export function KeyListPage({
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [quotaRefreshPending, setQuotaRefreshPending] = useState(false);
   const requestSeq = useRef(0);
+  const quotaRefreshPolls = useRef(0);
 
   const totalPages = Math.max(1, Math.ceil(tokenTotal / PAGE_SIZE));
   const statusOptions = useMemo(() => statusOptionsWithCounts(counts), [counts]);
@@ -243,9 +245,11 @@ export function KeyListPage({
 
   const beginQueryLoading = useCallback(() => {
     requestSeq.current += 1;
+    quotaRefreshPolls.current = 0;
     setLoading(true);
     setError("");
     setLoadedQueryKey("");
+    setQuotaRefreshPending(false);
     setSelectedIds(new Set());
   }, []);
 
@@ -276,6 +280,7 @@ export function KeyListPage({
     const requestID = requestSeq.current + 1;
     requestSeq.current = requestID;
     setLoading(true);
+    setQuotaRefreshPending(false);
     setError("");
     try {
       const params = new URLSearchParams({
@@ -306,6 +311,11 @@ export function KeyListPage({
       const items = payload.items || [];
       const nextCounts = payload.counts || {};
       setTokens(items);
+      const hasPendingQuota = items.some((item) => item.quota_fetch_state === "pending");
+      setQuotaRefreshPending(hasPendingQuota);
+      if (!hasPendingQuota) {
+        quotaRefreshPolls.current = 0;
+      }
       setTokenTotal(payload.pagination?.total ?? items.length);
       setCounts(nextCounts);
       setPlanCounts(payload.plan_counts || []);
@@ -318,6 +328,7 @@ export function KeyListPage({
       }
       setError(errorMessage(caught));
       setTokens([]);
+      setQuotaRefreshPending(false);
     } finally {
       if (requestID === requestSeq.current) {
         setLoading(false);
@@ -332,9 +343,24 @@ export function KeyListPage({
   }, [beginQueryLoading, loadedQueryKey, queryKey]);
 
   useEffect(() => {
+    quotaRefreshPolls.current = 0;
+  }, [queryKey, refreshNonce]);
+
+  useEffect(() => {
     const timer = window.setTimeout(() => void loadTokens(), search.trim() ? 260 : 0);
     return () => window.clearTimeout(timer);
   }, [loadTokens, refreshNonce, search]);
+
+  useEffect(() => {
+    if (!quotaRefreshPending || quotaRefreshPolls.current >= 12) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      quotaRefreshPolls.current += 1;
+      void loadTokens();
+    }, 10_000);
+    return () => window.clearTimeout(timer);
+  }, [loadTokens, quotaRefreshPending]);
 
   async function updateActivation(id: number, active: boolean) {
     await api.updateActivation(id, { active, clear_cooldown: true }, apiScope);
@@ -718,7 +744,7 @@ function TokenRow({
       </TableCell>
       <TableCell className="px-1.5">
         <div className="flex max-h-11 min-w-0 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
-          <TokenQuotaStrip quota={item.quota} />
+          <TokenQuotaStrip quota={item.quota} state={item.quota_fetch_state} />
         </div>
       </TableCell>
       <TableCell className="px-1.5">
@@ -1065,7 +1091,7 @@ export function KeyDetailPage({
             <div className="rounded-lg border bg-muted/32 p-3">
               <div className="text-muted-foreground text-xs">额度</div>
               <div className="mt-2 flex flex-wrap gap-1 text-[11px]">
-                <TokenQuotaStrip quota={token.quota} />
+                <TokenQuotaStrip quota={token.quota} state={token.quota_fetch_state} />
               </div>
             </div>
             <div className="rounded-lg border bg-muted/32 p-3">

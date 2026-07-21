@@ -981,7 +981,7 @@ function ImportBatchTokenRow({ token }: { token: TokenItem }) {
       </TableCell>
       <TableCell className="py-2 align-middle">
         <div className="flex max-h-11 flex-wrap items-center gap-1 overflow-hidden text-[11px]">
-          <TokenQuotaStrip quota={token.quota} />
+          <TokenQuotaStrip quota={token.quota} state={token.quota_fetch_state} />
         </div>
       </TableCell>
       <TableCell className="py-2 align-middle">

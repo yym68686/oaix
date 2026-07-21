@@ -43,6 +43,8 @@ export type TokenQuotaSnapshot = {
   rate_limit_reset_credits?: TokenQuotaResetCredits | null;
 };
 
+export type TokenQuotaFetchState = "ready" | "error" | "pending" | "unavailable";
+
 export type TokenQuotaResetCreditsResponse = {
   quota?: TokenQuotaSnapshot | null;
   rate_limit_reset_credits?: TokenQuotaResetCredits | null;
@@ -90,6 +92,7 @@ export type TokenItem = {
   sub2api_usage_synced_at?: string | null;
   sub2api_usage_stale?: boolean;
   quota?: TokenQuotaSnapshot | null;
+  quota_fetch_state?: TokenQuotaFetchState | null;
 };
 
 export type TokenObservedCostItem = {

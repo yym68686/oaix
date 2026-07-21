@@ -205,9 +205,18 @@ export function ToastStack({ items }: { items: ToastMessage[] }) {
   );
 }
 
-export function TokenQuotaStrip({ quota }: { quota?: TokenItem["quota"] | null }) {
+export function TokenQuotaStrip({
+  quota,
+  state,
+}: {
+  quota?: TokenItem["quota"] | null;
+  state?: TokenItem["quota_fetch_state"] | null;
+}) {
   if (!quota) {
-    return <div className="rounded-md bg-muted/64 px-2 py-0.5 text-muted-foreground">额度更新中</div>;
+    if (state === "pending") {
+      return <div className="rounded-md bg-muted/64 px-2 py-0.5 text-muted-foreground">额度更新中</div>;
+    }
+    return <div className="rounded-md bg-muted/64 px-2 py-0.5 text-muted-foreground">额度不可用</div>;
   }
   if (quota.disabled || String(quota.error || "").toLowerCase().includes("deactivated_workspace")) {
     return <div className="rounded-md bg-destructive/10 px-2 py-0.5 text-destructive-foreground">工作区停用，已禁用</div>;

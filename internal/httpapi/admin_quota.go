@@ -20,6 +20,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
@@ -27,19 +28,23 @@ import (
 )
 
 const (
-	defaultWHAMUsageURL      = "https://chatgpt.com/backend-api/wham/usage"
-	defaultWHAMResetURL      = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
-	defaultWHAMUserAgent     = codexUserAgent
-	defaultWHAMOriginator    = "Codex Desktop"
-	defaultWHAMLanguage      = "zh-CN"
-	quotaWindow5HSeconds     = 5 * 60 * 60
-	quotaWindow7DSeconds     = 7 * 24 * 60 * 60
-	defaultQuotaTTLSeconds   = 60
-	defaultQuotaConcurrency  = 4
-	defaultQuotaSyncLimit    = 4
-	defaultQuotaAsyncLimit   = 32
-	defaultQuotaHTTPTimeout  = 8 * time.Second
-	defaultQuotaBodyMaxBytes = 2 * 1024 * 1024
+	defaultWHAMUsageURL        = "https://chatgpt.com/backend-api/wham/usage"
+	defaultWHAMResetURL        = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+	defaultWHAMUserAgent       = codexUserAgent
+	defaultWHAMOriginator      = "Codex Desktop"
+	defaultWHAMLanguage        = "zh-CN"
+	quotaWindow5HSeconds       = 5 * 60 * 60
+	quotaWindow7DSeconds       = 7 * 24 * 60 * 60
+	defaultQuotaTTLSeconds     = 60
+	defaultQuotaConcurrency    = 4
+	defaultQuotaSyncLimit      = 4
+	defaultQuotaAsyncLimit     = 32
+	defaultQuotaHTTPTimeout    = 8 * time.Second
+	defaultQuotaBodyMaxBytes   = 2 * 1024 * 1024
+	quotaFetchStateReady       = "ready"
+	quotaFetchStateError       = "error"
+	quotaFetchStatePending     = "pending"
+	quotaFetchStateUnavailable = "unavailable"
 )
 
 type adminTokenItem struct {
@@ -55,6 +60,7 @@ type adminTokenItem struct {
 	Sub2APIUsageStale       bool                `json:"sub2api_usage_stale"`
 	ResetAt                 *time.Time          `json:"reset_at,omitempty"`
 	Quota                   *codexQuotaSnapshot `json:"quota,omitempty"`
+	QuotaFetchState         string              `json:"quota_fetch_state,omitempty"`
 }
 
 type codexQuotaWindow struct {
@@ -105,6 +111,7 @@ type cachedQuotaSnapshot struct {
 }
 
 type adminQuotaService struct {
+	app               *App
 	client            *http.Client
 	oauthClient       oauth.Client
 	store             *store.Store
@@ -204,6 +211,10 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 
 	activeByID := a.activeStreamsByTokenID(tokens)
 	cap := a.tokens.ActiveStreamCap()
+	pendingByID := make(map[int64]struct{}, len(pendingIDs))
+	for _, id := range pendingIDs {
+		pendingByID[id] = struct{}{}
+	}
 	items := make([]adminTokenItem, 0, len(tokens))
 	disabledFromQuota := false
 	for _, token := range tokens {
@@ -228,6 +239,11 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 			}
 			token.IsActive = false
 		}
+		quotaFetchState := ""
+		if includeQuota {
+			_, pending := pendingByID[token.ID]
+			quotaFetchState = quotaFetchStateForToken(token, quota, pending)
+		}
 		items = append(items, adminTokenItem{
 			Token:                   token,
 			Status:                  adminTokenStatus(token, now),
@@ -241,6 +257,7 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 			Sub2APIUsageStale:       !sub2APIUsageLoaded || remoteUsage.Stale,
 			ResetAt:                 quotaNextResetAt(quota, now),
 			Quota:                   quota,
+			QuotaFetchState:         quotaFetchState,
 		})
 	}
 	if disabledFromQuota && a.tokens != nil {
@@ -251,6 +268,21 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		}
 	}
 	return items, pendingIDs
+}
+
+func quotaFetchStateForToken(token store.Token, snapshot *codexQuotaSnapshot, pending bool) string {
+	switch {
+	case snapshot != nil && snapshot.Error != nil:
+		return quotaFetchStateError
+	case snapshot != nil:
+		return quotaFetchStateReady
+	case pending:
+		return quotaFetchStatePending
+	case quotaEligible(token):
+		return quotaFetchStatePending
+	default:
+		return quotaFetchStateUnavailable
+	}
 }
 
 func combinedObservedCost(local *float64, remote float64) *float64 {
@@ -351,10 +383,10 @@ func (s *adminQuotaService) collect(ctx context.Context, tokens []store.Token) (
 }
 
 func quotaEligible(token store.Token) bool {
-	if token.IsAgentIdentity() {
+	if !token.IsActive || token.DisabledAt != nil {
 		return false
 	}
-	return token.IsActive && token.DisabledAt == nil && (strings.TrimSpace(token.AccessToken) != "" || token.HasRefreshableOAuthToken())
+	return token.IsAgentIdentity() || strings.TrimSpace(token.AccessToken) != "" || token.HasRefreshableOAuthToken()
 }
 
 func quotaActionEligible(token store.Token) bool {
@@ -506,9 +538,6 @@ func (s *adminQuotaService) fetchSnapshotWithoutHistory(ctx context.Context, tok
 }
 
 func (s *adminQuotaService) fetchSnapshotWithDiagnostic(ctx context.Context, token store.Token, persist bool) (*codexQuotaSnapshot, quotaRecoveryCheckErrorReason) {
-	if token.IsAgentIdentity() {
-		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(time.Now().UTC(), "Agent Identity quota probing is not supported"), persist), quotaRecoveryCheckErrorOther
-	}
 	now := time.Now().UTC()
 	select {
 	case s.sem <- struct{}{}:
@@ -517,7 +546,7 @@ func (s *adminQuotaService) fetchSnapshotWithDiagnostic(ctx context.Context, tok
 		return nil, quotaRecoveryContextErrorReason(ctx.Err())
 	}
 
-	if strings.TrimSpace(token.AccessToken) == "" {
+	if !token.IsAgentIdentity() && strings.TrimSpace(token.AccessToken) == "" {
 		refreshed, err := s.refreshQuotaToken(ctx, token)
 		if err != nil {
 			if contextError(err) {
@@ -647,6 +676,9 @@ func (s *adminQuotaService) resetCredit(ctx context.Context, token store.Token) 
 }
 
 func (s *adminQuotaService) requestUsage(ctx context.Context, token store.Token) (int, []byte, error) {
+	if token.IsAgentIdentity() {
+		return s.requestAgentIdentityUsage(ctx, token)
+	}
 	accessToken := strings.TrimSpace(token.AccessToken)
 	if accessToken == "" {
 		return 0, nil, fmt.Errorf("token has no access token")
@@ -656,6 +688,77 @@ func (s *adminQuotaService) requestUsage(ctx context.Context, token store.Token)
 		return 0, nil, err
 	}
 	s.setWHAMHeaders(req, token, true)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, err := readQuotaResponseBody(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, body, nil
+}
+
+func (s *adminQuotaService) requestAgentIdentityUsage(ctx context.Context, token store.Token) (int, []byte, error) {
+	if s.app == nil {
+		return 0, nil, errors.New("agent identity quota authentication is unavailable")
+	}
+	authorization, failure, ok := s.app.prepareTokenProbeAuthorization(ctx, token)
+	if !ok {
+		detail := strings.TrimSpace(failure.Detail)
+		if detail == "" {
+			detail = "agent identity quota authentication failed"
+		}
+		return 0, nil, errors.New(detail)
+	}
+	for recovered := false; ; {
+		statusCode, body, err := s.requestUsageWithAuthorization(ctx, token, authorization)
+		if err != nil {
+			return statusCode, body, err
+		}
+		redactedBody := body
+		if authorization.AgentIdentity != nil {
+			redactedBody = agentidentity.RedactSensitiveBody(body, *authorization.AgentIdentity)
+		}
+		if authorization.AgentIdentity == nil || recovered || !agentidentity.IsInvalidTaskResponse(statusCode, body) {
+			return statusCode, redactedBody, nil
+		}
+
+		recovered = true
+		credentials, err := s.app.recoverAgentIdentityProbeTask(ctx, token, authorization.AgentIdentity.TaskID)
+		if err != nil {
+			return 0, nil, errors.New("agent identity quota task recovery failed")
+		}
+		assertion, err := credentials.BuildAssertion(time.Now())
+		if err != nil {
+			return 0, nil, errors.New("agent identity quota assertion could not be created")
+		}
+		credentialsCopy := credentials
+		authorization = tokenProbeAuthorization{
+			Value:         assertion,
+			AccountID:     strings.TrimSpace(credentials.AccountID),
+			FedRAMP:       credentials.FedRAMP,
+			AgentIdentity: &credentialsCopy,
+		}
+	}
+}
+
+func (s *adminQuotaService) requestUsageWithAuthorization(ctx context.Context, token store.Token, authorization tokenProbeAuthorization) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.usageURL, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	s.setWHAMHeaders(req, token, true)
+	req.Header.Set("Authorization", authorization.Value)
+	req.Header.Set("OpenAI-Beta", "codex-1")
+	if authorization.AccountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", authorization.AccountID)
+	}
+	if authorization.FedRAMP {
+		req.Header.Set("X-OpenAI-FedRAMP", "true")
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/yym68686/oaix/internal/agentidentity"
+	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/tokens"
@@ -328,6 +331,156 @@ func TestQuotaErrorSnapshotMarksDeactivatedWorkspace(t *testing.T) {
 	snapshot := quotaErrorSnapshot(time.Now().UTC(), "HTTP 402: deactivated_workspace")
 	if !snapshot.Disabled {
 		t.Fatal("expected snapshot to be disabled")
+	}
+}
+
+func TestQuotaFetchStateDistinguishesPendingFromUnavailable(t *testing.T) {
+	errorMessage := "quota failed"
+	tests := []struct {
+		name     string
+		token    store.Token
+		snapshot *codexQuotaSnapshot
+		pending  bool
+		want     string
+	}{
+		{name: "ready", snapshot: &codexQuotaSnapshot{}, want: quotaFetchStateReady},
+		{name: "error", snapshot: &codexQuotaSnapshot{Error: &errorMessage}, want: quotaFetchStateError},
+		{name: "pending", token: store.Token{IsActive: true, AccessToken: "access"}, pending: true, want: quotaFetchStatePending},
+		{name: "agent identity awaiting quota", token: store.Token{IsActive: true, AgentIdentity: &agentidentity.Credentials{}}, want: quotaFetchStatePending},
+		{name: "unavailable", token: store.Token{}, want: quotaFetchStateUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := quotaFetchStateForToken(test.token, test.snapshot, test.pending); got != test.want {
+				t.Fatalf("quotaFetchStateForToken = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestQuotaFetchAgentIdentityUsesAssertionWithoutOAuthToken(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-quota")
+	var authorization string
+	var accountID string
+	var fedRAMP string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		accountID = r.Header.Get("Chatgpt-Account-Id")
+		fedRAMP = r.Header.Get("X-OpenAI-FedRAMP")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"chatgpt_k12","rate_limit":{"allowed":true,"primary_window":{"limit_window_seconds":18000,"used_percent":25}}}`))
+	}))
+	defer upstream.Close()
+
+	app := &App{}
+	service := agentIdentityQuotaTestService(app, upstream.Client(), upstream.URL)
+	snapshot, reason := service.fetchSnapshotWithoutHistory(t.Context(), store.Token{
+		ID:            14536,
+		OwnerUserID:   1,
+		RefreshToken:  credentials.IdentityToken(),
+		AgentIdentity: &credentials,
+		IsActive:      true,
+	})
+
+	if snapshot == nil || snapshot.Error != nil || len(snapshot.Windows) != 1 {
+		t.Fatalf("quota snapshot = %#v, reason = %q", snapshot, reason)
+	}
+	if snapshot.PlanType == nil || *snapshot.PlanType != "k12" {
+		t.Fatalf("quota plan = %#v", snapshot.PlanType)
+	}
+	if got := decodeProbeAgentAssertionTask(t, authorization); got != credentials.TaskID {
+		t.Fatalf("assertion task = %q, want %q", got, credentials.TaskID)
+	}
+	if accountID != credentials.AccountID || fedRAMP != "true" {
+		t.Fatalf("quota headers account=%q fedramp=%q", accountID, fedRAMP)
+	}
+}
+
+func TestQuotaFetchAgentIdentityRecoversInvalidTaskExactlyOnce(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-quota-old")
+	credentialStore := &fakeAgentIdentityProbeStore{credentials: credentials}
+	registrationCalls := 0
+	registration := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		registrationCalls++
+		_, _ = w.Write([]byte(`{"task_id":"task-quota-new"}`))
+	}))
+	defer registration.Close()
+
+	upstreamCalls := 0
+	var tasks []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		tasks = append(tasks, decodeProbeAgentAssertionTask(t, r.Header.Get("Authorization")))
+		w.Header().Set("Content-Type", "application/json")
+		if upstreamCalls == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"invalid_task_id"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"plan_type":"chatgpt_k12","rate_limit":{"allowed":true}}`))
+	}))
+	defer upstream.Close()
+
+	app := &App{
+		cfg:                config.Config{Upstream: config.UpstreamConfig{AgentIdentityAuthAPIURL: registration.URL}},
+		probeIdentityStore: credentialStore,
+	}
+	service := agentIdentityQuotaTestService(app, upstream.Client(), upstream.URL)
+	snapshot, reason := service.fetchSnapshotWithoutHistory(t.Context(), store.Token{
+		ID:           14537,
+		OwnerUserID:  1,
+		RefreshToken: credentials.IdentityToken(),
+		IsActive:     true,
+	})
+
+	if snapshot == nil || snapshot.Error != nil {
+		t.Fatalf("quota snapshot = %#v, reason = %q", snapshot, reason)
+	}
+	if upstreamCalls != 2 || registrationCalls != 1 || credentialStore.updateCalls != 1 {
+		t.Fatalf("calls upstream=%d registration=%d updates=%d", upstreamCalls, registrationCalls, credentialStore.updateCalls)
+	}
+	if len(tasks) != 2 || tasks[0] != "task-quota-old" || tasks[1] != "task-quota-new" {
+		t.Fatalf("assertion tasks = %v", tasks)
+	}
+}
+
+func TestQuotaFetchAgentIdentityRedactsSensitiveUpstreamErrors(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-redaction")
+	var authorization string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"` + credentials.RuntimeID + ` ` + credentials.TaskID + ` ` + credentials.PrivateKey + ` ` + authorization + `"}`))
+	}))
+	defer upstream.Close()
+
+	service := agentIdentityQuotaTestService(&App{}, upstream.Client(), upstream.URL)
+	snapshot, _ := service.fetchSnapshotWithoutHistory(t.Context(), store.Token{
+		ID:            14538,
+		RefreshToken:  credentials.IdentityToken(),
+		AgentIdentity: &credentials,
+		IsActive:      true,
+	})
+	if snapshot == nil || snapshot.Error == nil {
+		t.Fatalf("expected redacted quota error snapshot, got %#v", snapshot)
+	}
+	for _, secret := range []string{credentials.RuntimeID, credentials.TaskID, credentials.PrivateKey, authorization} {
+		if secret != "" && strings.Contains(*snapshot.Error, secret) {
+			t.Fatalf("quota error leaked sensitive value: %q", *snapshot.Error)
+		}
+	}
+}
+
+func agentIdentityQuotaTestService(app *App, client *http.Client, usageURL string) *adminQuotaService {
+	return &adminQuotaService{
+		app:      app,
+		client:   client,
+		usageURL: usageURL,
+		ttl:      time.Minute,
+		sem:      make(chan struct{}, 1),
+		cache:    map[int64]cachedQuotaSnapshot{},
+		pending:  map[int64]struct{}{},
 	}
 }
 

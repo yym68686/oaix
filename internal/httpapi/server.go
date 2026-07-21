@@ -95,6 +95,9 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		authKeys:           cfg.Auth.ServiceAPIKeys,
 		httpRoutes:         newHTTPRouteMetrics(),
 	}
+	if app.quota != nil {
+		app.quota.app = app
+	}
 	if tokenManager != nil {
 		tokenManager.SetReadyTransitionHandler(app.syncSub2APIReadyTransitions)
 		tokenManager.SetFastCapabilityResolver(func(ctx context.Context, ownerUserID int64) error {
