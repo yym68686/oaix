@@ -172,7 +172,9 @@ func (a *App) observeHTTP(next http.Handler) http.Handler {
 		if requestID == "" {
 			requestID = observability.NewRequestID()
 		}
-		r = r.WithContext(observability.ContextWithRequestID(r.Context(), requestID))
+		ctx := observability.ContextWithRequestID(r.Context(), requestID)
+		ctx, dbQueryStats := store.ContextWithDBQueryStats(ctx)
+		r = r.WithContext(ctx)
 		w.Header().Set("X-Request-ID", requestID)
 		before := a.poolStats()
 		observed := &observedResponseWriter{ResponseWriter: w, started: started}
@@ -190,6 +192,7 @@ func (a *App) observeHTTP(next http.Handler) http.Handler {
 			return
 		}
 		after := a.poolStats()
+		requestDB := dbQueryStats.Snapshot(5)
 		message := "http request slow"
 		if status >= http.StatusInternalServerError {
 			message = "http request failed"
@@ -202,6 +205,11 @@ func (a *App) observeHTTP(next http.Handler) http.Handler {
 			"duration_ms", duration.Milliseconds(),
 			"first_byte_ms", observed.firstByteDuration().Milliseconds(),
 			"response_bytes", observed.bytes,
+			"db_query_count", requestDB.Count,
+			"db_query_duration_ms", requestDB.DurationMS,
+			"db_query_max_duration_ms", requestDB.MaxMS,
+			"db_query_error_count", requestDB.Errors,
+			"db_query_top", requestDB.Top,
 			"db_acquire_count_delta", after.AcquireCount-before.AcquireCount,
 			"db_acquire_duration_ms_delta", after.AcquireDurationMs-before.AcquireDurationMs,
 			"db_empty_acquire_count_delta", after.EmptyAcquireCount-before.EmptyAcquireCount,

@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,6 +15,113 @@ import (
 )
 
 type slowQueryTraceKey struct{}
+
+type dbQueryStatsKey struct{}
+
+type DBQueryFingerprintStats struct {
+	Fingerprint string `json:"fingerprint"`
+	Operation   string `json:"operation"`
+	Shape       string `json:"shape"`
+	Count       int64  `json:"count"`
+	DurationMS  int64  `json:"duration_ms"`
+	MaxMS       int64  `json:"max_ms"`
+	Errors      int64  `json:"errors"`
+}
+
+type DBQueryStatsSnapshot struct {
+	Count      int64                     `json:"count"`
+	DurationMS int64                     `json:"duration_ms"`
+	MaxMS      int64                     `json:"max_ms"`
+	Errors     int64                     `json:"errors"`
+	Top        []DBQueryFingerprintStats `json:"top"`
+}
+
+type DBQueryStats struct {
+	mu          sync.Mutex
+	count       int64
+	duration    time.Duration
+	maxDuration time.Duration
+	errors      int64
+	byQuery     map[string]*dbQueryFingerprintAccumulator
+}
+
+type dbQueryFingerprintAccumulator struct {
+	DBQueryFingerprintStats
+	duration    time.Duration
+	maxDuration time.Duration
+}
+
+func ContextWithDBQueryStats(ctx context.Context) (context.Context, *DBQueryStats) {
+	stats := &DBQueryStats{byQuery: make(map[string]*dbQueryFingerprintAccumulator)}
+	return context.WithValue(ctx, dbQueryStatsKey{}, stats), stats
+}
+
+func (s *DBQueryStats) record(trace slowQueryTrace, duration time.Duration, err error) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.count++
+	s.duration += duration
+	if duration > s.maxDuration {
+		s.maxDuration = duration
+	}
+	if err != nil {
+		s.errors++
+	}
+	item := s.byQuery[trace.fingerprint]
+	if item == nil {
+		item = &dbQueryFingerprintAccumulator{DBQueryFingerprintStats: DBQueryFingerprintStats{
+			Fingerprint: trace.fingerprint,
+			Operation:   trace.operation,
+			Shape:       trace.shape,
+		}}
+		s.byQuery[trace.fingerprint] = item
+	}
+	item.Count++
+	item.duration += duration
+	if duration > item.maxDuration {
+		item.maxDuration = duration
+	}
+	if err != nil {
+		item.Errors++
+	}
+}
+
+func (s *DBQueryStats) Snapshot(limit int) DBQueryStatsSnapshot {
+	if s == nil {
+		return DBQueryStatsSnapshot{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = 5
+	}
+	items := make([]DBQueryFingerprintStats, 0, len(s.byQuery))
+	for _, accumulated := range s.byQuery {
+		item := accumulated.DBQueryFingerprintStats
+		item.DurationMS = accumulated.duration.Milliseconds()
+		item.MaxMS = accumulated.maxDuration.Milliseconds()
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].DurationMS == items[j].DurationMS {
+			return items[i].Fingerprint < items[j].Fingerprint
+		}
+		return items[i].DurationMS > items[j].DurationMS
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return DBQueryStatsSnapshot{
+		Count:      s.count,
+		DurationMS: s.duration.Milliseconds(),
+		MaxMS:      s.maxDuration.Milliseconds(),
+		Errors:     s.errors,
+		Top:        items,
+	}
+}
 
 type slowQueryTrace struct {
 	started     time.Time
@@ -44,7 +153,7 @@ func (t *slowQueryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data
 }
 
 func (t *slowQueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
-	if t == nil || t.logger == nil {
+	if t == nil {
 		return
 	}
 	trace, _ := ctx.Value(slowQueryTraceKey{}).(slowQueryTrace)
@@ -52,6 +161,12 @@ func (t *slowQueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data p
 		return
 	}
 	duration := time.Since(trace.started)
+	if stats, _ := ctx.Value(dbQueryStatsKey{}).(*DBQueryStats); stats != nil {
+		stats.record(trace, duration, data.Err)
+	}
+	if t.logger == nil {
+		return
+	}
 	if data.Err == nil && duration < t.threshold {
 		return
 	}
