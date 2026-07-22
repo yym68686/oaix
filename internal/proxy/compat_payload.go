@@ -1777,6 +1777,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 	var trace *store.StreamDeliveryTrace
 	if isResponsesStreamEndpoint(attempt.Intent.Endpoint) {
 		trace = store.NewStreamDeliveryTrace(attempt.DownstreamConnectionID)
+		w.Header().Set(oaixTerminalFlushMarkerHeader, oaixTerminalFlushMarkerContract)
 	}
 	var buffered []bufferedStreamEvent
 	committed := false

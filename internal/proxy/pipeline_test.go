@@ -3810,6 +3810,15 @@ func TestStreamResponsesDeliveryTraceRecordsTerminalFrame(t *testing.T) {
 	if downstream.WriteAttemptedAt.IsZero() || downstream.WriteCompletedAt.IsZero() || downstream.FlushAttemptedAt == nil || downstream.FlushCompletedAt == nil {
 		t.Fatalf("missing downstream timestamps: %+v", downstream)
 	}
+	if recorder.Header().Get(oaixTerminalFlushMarkerHeader) != oaixTerminalFlushMarkerContract {
+		t.Fatalf("terminal flush marker contract header missing: %#v", recorder.Header())
+	}
+	if downstream.FlushMarkerContract != oaixTerminalFlushMarkerContract || downstream.MarkerWriteResult != "succeeded" || downstream.MarkerFlushResult != "succeeded" {
+		t.Fatalf("terminal flush marker delivery missing: %+v", downstream)
+	}
+	if downstream.MarkerWriteAttemptedAt == nil || downstream.MarkerWriteCompletedAt == nil || downstream.MarkerFlushAttemptedAt == nil || downstream.MarkerFlushCompletedAt == nil {
+		t.Fatalf("terminal flush marker timestamps missing: %+v", downstream)
+	}
 	if trace.Downstream.FinalBodyProducedAt == nil || trace.End.At.IsZero() || trace.End.Reason != "upstream_eof_after_terminal" {
 		t.Fatalf("unexpected stream end: downstream=%+v end=%+v", trace.Downstream, trace.End)
 	}
@@ -3818,6 +3827,28 @@ func TestStreamResponsesDeliveryTraceRecordsTerminalFrame(t *testing.T) {
 	}
 	if !bytes.Contains(recorder.Body.Bytes(), expectedWire) {
 		t.Fatalf("alias-rewritten terminal frame missing from output: %q", recorder.Body.Bytes())
+	}
+	markerStart := strings.Index(recorder.Body.String(), oaixTerminalFlushMarkerPrefix)
+	if markerStart < 0 {
+		t.Fatalf("terminal flush marker missing from output: %q", recorder.Body.Bytes())
+	}
+	markerJSON := recorder.Body.String()[markerStart+len(oaixTerminalFlushMarkerPrefix):]
+	markerJSON, _, _ = strings.Cut(markerJSON, "\n")
+	var marker struct {
+		SchemaVersion          int    `json:"schema_version"`
+		ConnectionID           string `json:"connection_id"`
+		TerminalWireSHA256     string `json:"terminal_wire_sha256"`
+		FlushAttemptedUnixNano int64  `json:"flush_attempted_unix_nano"`
+		FlushCompletedUnixNano int64  `json:"flush_completed_unix_nano"`
+	}
+	if err := json.Unmarshal([]byte(markerJSON), &marker); err != nil {
+		t.Fatalf("decode terminal flush marker: %v; payload=%q", err, markerJSON)
+	}
+	if marker.SchemaVersion != 1 || marker.ConnectionID != "oaixc-test-1" || marker.TerminalWireSHA256 != downstream.WireSHA256 {
+		t.Fatalf("unexpected terminal flush marker identity: %+v", marker)
+	}
+	if marker.FlushAttemptedUnixNano != downstream.FlushAttemptedAt.UnixNano() || marker.FlushCompletedUnixNano != downstream.FlushCompletedAt.UnixNano() {
+		t.Fatalf("terminal flush marker timestamps do not match trace: marker=%+v downstream=%+v", marker, downstream)
 	}
 }
 
@@ -3851,6 +3882,44 @@ func TestStreamResponsesDeliveryTraceBubblesFlushError(t *testing.T) {
 	}
 	if result.StreamDeliveryTrace.Downstream.FinalBodyProducedAt != nil {
 		t.Fatalf("failed flush must not claim final body completion: %+v", result.StreamDeliveryTrace.Downstream)
+	}
+}
+
+func TestStreamResponsesTerminalMarkerFailureIsObservabilityOnly(t *testing.T) {
+	pipeline := &Pipeline{cfg: config.Config{Upstream: config.UpstreamConfig{NonStreamMaxResponseBytes: 1 << 20}}}
+	completedData := []byte(`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_marker_flush","status":"completed"}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(sse.Encode("response.completed", completedData))),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	markerFlushErr := errors.New("forced marker flush failure")
+	writer := &failNthFlushResponseWriter{
+		header:   make(http.Header),
+		failAt:   2,
+		flushErr: markerFlushErr,
+	}
+	result, err := pipeline.streamResponsesWithPreflight(writer, resp, Attempt{
+		Intent:                 RequestIntent{Endpoint: "/v1/responses", Stream: true},
+		DownstreamConnectionID: "oaixc-marker-fail",
+	})
+
+	if err != nil {
+		t.Fatalf("diagnostic marker failure changed business result: %v", err)
+	}
+	if !result.Committed || result.Status != http.StatusOK || result.StreamDeliveryTrace == nil {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	terminal := result.StreamDeliveryTrace.Downstream.FirstResponseCompleted
+	if terminal == nil || terminal.FlushResult != "succeeded" || terminal.MarkerWriteResult != "succeeded" || terminal.MarkerFlushResult != "failed" {
+		t.Fatalf("unexpected marker failure trace: %+v", terminal)
+	}
+	if terminal.MarkerFlushError != markerFlushErr.Error() {
+		t.Fatalf("marker flush error = %q", terminal.MarkerFlushError)
+	}
+	if result.StreamDeliveryTrace.State() != "terminal_flushed" {
+		t.Fatalf("marker failure must not rewrite terminal state: %q", result.StreamDeliveryTrace.State())
 	}
 }
 

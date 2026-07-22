@@ -2,7 +2,7 @@ package store
 
 import "time"
 
-const StreamDeliveryTraceSchemaVersion = 2
+const StreamDeliveryTraceSchemaVersion = 3
 
 // StreamDeliveryTrace records only what the OAIX process observed locally.
 // Successful writes and flush calls do not assert that the downstream
@@ -46,19 +46,28 @@ type StreamDeliveryDownstreamTrace struct {
 }
 
 type StreamDeliveryCompletedDownstream struct {
-	EventOrdinal          int        `json:"event_ordinal"`
-	PayloadSequenceNumber *int64     `json:"payload_sequence_number,omitempty"`
-	WireBytes             int        `json:"wire_bytes"`
-	WireSHA256            string     `json:"wire_sha256"`
-	WriteAttemptedAt      time.Time  `json:"write_attempted_at"`
-	WrittenBytes          int        `json:"written_bytes"`
-	WriteResult           string     `json:"write_result"`
-	WriteError            string     `json:"write_error,omitempty"`
-	WriteCompletedAt      time.Time  `json:"write_completed_at"`
-	FlushAttemptedAt      *time.Time `json:"flush_attempted_at,omitempty"`
-	FlushResult           string     `json:"flush_result"`
-	FlushError            string     `json:"flush_error,omitempty"`
-	FlushCompletedAt      *time.Time `json:"flush_completed_at,omitempty"`
+	EventOrdinal           int        `json:"event_ordinal"`
+	PayloadSequenceNumber  *int64     `json:"payload_sequence_number,omitempty"`
+	WireBytes              int        `json:"wire_bytes"`
+	WireSHA256             string     `json:"wire_sha256"`
+	WriteAttemptedAt       time.Time  `json:"write_attempted_at"`
+	WrittenBytes           int        `json:"written_bytes"`
+	WriteResult            string     `json:"write_result"`
+	WriteError             string     `json:"write_error,omitempty"`
+	WriteCompletedAt       time.Time  `json:"write_completed_at"`
+	FlushAttemptedAt       *time.Time `json:"flush_attempted_at,omitempty"`
+	FlushResult            string     `json:"flush_result"`
+	FlushError             string     `json:"flush_error,omitempty"`
+	FlushCompletedAt       *time.Time `json:"flush_completed_at,omitempty"`
+	FlushMarkerContract    string     `json:"flush_marker_contract,omitempty"`
+	MarkerWriteAttemptedAt *time.Time `json:"marker_write_attempted_at,omitempty"`
+	MarkerWriteCompletedAt *time.Time `json:"marker_write_completed_at,omitempty"`
+	MarkerWriteResult      string     `json:"marker_write_result,omitempty"`
+	MarkerWriteError       string     `json:"marker_write_error,omitempty"`
+	MarkerFlushAttemptedAt *time.Time `json:"marker_flush_attempted_at,omitempty"`
+	MarkerFlushCompletedAt *time.Time `json:"marker_flush_completed_at,omitempty"`
+	MarkerFlushResult      string     `json:"marker_flush_result,omitempty"`
+	MarkerFlushError       string     `json:"marker_flush_error,omitempty"`
 }
 
 type StreamDeliveryEndTrace struct {

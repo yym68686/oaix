@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"math"
@@ -15,6 +16,12 @@ import (
 )
 
 const maxStreamDeliveryErrorLength = 512
+
+const (
+	oaixTerminalFlushMarkerHeader   = "X-OAIX-Terminal-Flush-Marker"
+	oaixTerminalFlushMarkerContract = "sse-comment-v1"
+	oaixTerminalFlushMarkerPrefix   = ": oaix-terminal-flush-v1 "
+)
 
 type bufferedStreamEvent struct {
 	raw                   []byte
@@ -134,6 +141,7 @@ func writeDownstreamStreamEvent(w http.ResponseWriter, trace *store.StreamDelive
 	if flushErr == nil {
 		if terminal != nil {
 			terminal.FlushResult = "succeeded"
+			writeTerminalFlushMarker(w, trace, terminal)
 		}
 		return nil
 	}
@@ -157,6 +165,72 @@ func writeDownstreamStreamEvent(w http.ResponseWriter, trace *store.StreamDelive
 		reason = "downstream_terminal_flush_error"
 	}
 	return streamDeliveryOperationError{reason: reason, err: flushErr}
+}
+
+// writeTerminalFlushMarker publishes the exact local terminal flush times in
+// a valid SSE comment. It is deliberately fail-open: the business terminal
+// was already written and flushed, so diagnostic delivery must never rewrite
+// its outcome. Ember validates both the connection ID and terminal wire hash
+// and consumes this comment without forwarding it to callers.
+func writeTerminalFlushMarker(w http.ResponseWriter, trace *store.StreamDeliveryTrace, terminal *store.StreamDeliveryCompletedDownstream) {
+	if trace == nil || terminal == nil || terminal.FlushAttemptedAt == nil || terminal.FlushCompletedAt == nil || terminal.FlushResult != "succeeded" {
+		return
+	}
+	terminal.FlushMarkerContract = oaixTerminalFlushMarkerContract
+	payload, err := json.Marshal(struct {
+		SchemaVersion          int    `json:"schema_version"`
+		ConnectionID           string `json:"connection_id,omitempty"`
+		TerminalWireSHA256     string `json:"terminal_wire_sha256"`
+		FlushAttemptedUnixNano int64  `json:"flush_attempted_unix_nano"`
+		FlushCompletedUnixNano int64  `json:"flush_completed_unix_nano"`
+	}{
+		SchemaVersion:          1,
+		ConnectionID:           trace.Downstream.ConnectionID,
+		TerminalWireSHA256:     terminal.WireSHA256,
+		FlushAttemptedUnixNano: terminal.FlushAttemptedAt.UnixNano(),
+		FlushCompletedUnixNano: terminal.FlushCompletedAt.UnixNano(),
+	})
+	if err != nil {
+		terminal.MarkerWriteResult = "encode_failed"
+		terminal.MarkerWriteError = streamDeliveryError(err)
+		return
+	}
+	marker := make([]byte, 0, len(oaixTerminalFlushMarkerPrefix)+len(payload)+2)
+	marker = append(marker, oaixTerminalFlushMarkerPrefix...)
+	marker = append(marker, payload...)
+	marker = append(marker, '\n', '\n')
+
+	writeAttemptedAt := time.Now().UTC()
+	terminal.MarkerWriteAttemptedAt = &writeAttemptedAt
+	trace.Downstream.BytesWriteAttempted += int64(len(marker))
+	n, writeErr := w.Write(marker)
+	writeCompletedAt := time.Now().UTC()
+	terminal.MarkerWriteCompletedAt = &writeCompletedAt
+	trace.Downstream.BytesWritten += int64(n)
+	if writeErr == nil && n != len(marker) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr != nil {
+		terminal.MarkerWriteResult = "failed"
+		terminal.MarkerWriteError = streamDeliveryError(writeErr)
+		return
+	}
+	terminal.MarkerWriteResult = "succeeded"
+	flushAttemptedAt := time.Now().UTC()
+	terminal.MarkerFlushAttemptedAt = &flushAttemptedAt
+	flushErr := http.NewResponseController(w).Flush()
+	flushCompletedAt := time.Now().UTC()
+	terminal.MarkerFlushCompletedAt = &flushCompletedAt
+	if flushErr == nil {
+		terminal.MarkerFlushResult = "succeeded"
+		return
+	}
+	if errors.Is(flushErr, http.ErrNotSupported) {
+		terminal.MarkerFlushResult = "not_supported"
+	} else {
+		terminal.MarkerFlushResult = "failed"
+	}
+	terminal.MarkerFlushError = streamDeliveryError(flushErr)
 }
 
 func finishStreamDeliveryTrace(trace *store.StreamDeliveryTrace, parseErr error) {
