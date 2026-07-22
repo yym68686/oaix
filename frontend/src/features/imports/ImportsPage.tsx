@@ -3,8 +3,11 @@ import {
   CopyIcon,
   ExternalLinkIcon,
   EyeIcon,
+  FileJsonIcon,
+  FolderOpenIcon,
   Trash2Icon,
   UploadIcon,
+  XIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
@@ -92,6 +95,19 @@ function parseOAuthCallbackInput(value: string): { code: string; state: string }
   return { code: trimmed, state: "" };
 }
 
+const directoryPickerAttributes = {
+  directory: "",
+  webkitdirectory: "",
+};
+
+function isJSONFile(file: File): boolean {
+  return file.name.toLowerCase().endsWith(".json") || file.type === "application/json";
+}
+
+function importFileName(file: File): string {
+  return file.webkitRelativePath || file.name;
+}
+
 export function ImportsPage({
   pushToast,
   refreshNonce,
@@ -116,6 +132,9 @@ function ImportForm({
   const [queuePosition, setQueuePosition] = useState<"front" | "back">("front");
   const [importFeedback, setImportFeedback] = useState("等待导入。");
   const [importBusy, setImportBusy] = useState(false);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [fileSelectionSource, setFileSelectionSource] = useState<"files" | "folder" | null>(null);
+  const [ignoredFileCount, setIgnoredFileCount] = useState(0);
   const [oauthSession, setOAuthSession] = useState<{
     authUrl: string;
     redirectUri?: string;
@@ -125,11 +144,48 @@ function ImportForm({
   const [oauthCallbackInput, setOAuthCallbackInput] = useState("");
   const [oauthCopied, setOAuthCopied] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
 
   function changeImportSource(value: unknown) {
     if (value === "paste" || value === "file" || value === "oauth") {
       setImportSource(value);
     }
+  }
+
+  function clearFileSelection({ preserveFeedback = false }: { preserveFeedback?: boolean } = {}) {
+    setSelectedFiles([]);
+    setFileSelectionSource(null);
+    setIgnoredFileCount(0);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    if (folderInputRef.current) {
+      folderInputRef.current.value = "";
+    }
+    if (!preserveFeedback) {
+      setImportFeedback("已清空所选 JSON 文件。");
+    }
+  }
+
+  function selectImportFiles(source: "files" | "folder", fileList: FileList | null) {
+    const candidates = Array.from(fileList || []);
+    const jsonFiles = candidates
+      .filter(isJSONFile)
+      .sort((left, right) => importFileName(left).localeCompare(importFileName(right)));
+    const ignored = candidates.length - jsonFiles.length;
+
+    setSelectedFiles(jsonFiles);
+    setFileSelectionSource(source);
+    setIgnoredFileCount(ignored);
+    if (!jsonFiles.length) {
+      setImportFeedback(source === "folder" ? "所选文件夹中没有 JSON 文件。" : "请选择至少一个 JSON 文件。");
+      return;
+    }
+    setImportFeedback(
+      source === "folder"
+        ? `已从文件夹选择 ${formatNumber(jsonFiles.length)} 个 JSON 文件${ignored ? `，已忽略 ${formatNumber(ignored)} 个非 JSON 文件` : ""}。`
+        : `已选择 ${formatNumber(jsonFiles.length)} 个 JSON 文件${ignored ? `，已忽略 ${formatNumber(ignored)} 个非 JSON 文件` : ""}。`,
+    );
   }
 
   async function startOAuthImport() {
@@ -222,8 +278,13 @@ function ImportForm({
       setImportFeedback("正在解析导入内容...");
       let parsed;
       if (importSource === "file") {
+        if (!selectedFiles.length) {
+          setImportFeedback("请先多选 JSON 文件或选择一个文件夹。");
+          return;
+        }
+        setImportFeedback(`正在解析 ${formatNumber(selectedFiles.length)} 个 JSON 文件...`);
         const form = new FormData();
-        for (const file of Array.from(fileInputRef.current?.files || [])) {
+        for (const file of selectedFiles) {
           form.append("files", file, file.name);
         }
         parsed = await api.uploadImport(form);
@@ -248,9 +309,7 @@ function ImportForm({
           : `导入完成：新建 ${formatNumber(summary.created)}，更新 ${formatNumber(summary.updated)}，跳过 ${formatNumber(summary.skipped)}，失败 ${formatNumber(summary.failed)}。`,
       );
       setTokenInput("");
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
+      clearFileSelection({ preserveFeedback: true });
       pushToast("导入任务已提交");
       await onImported?.();
     } catch (caught) {
@@ -269,7 +328,7 @@ function ImportForm({
             粘贴 Key 数据
           </TabsTab>
           <TabsTab className="flex-1 sm:flex-none" value="file">
-            选择文件
+            文件 / 文件夹
           </TabsTab>
           <TabsTab className="flex-1 sm:flex-none" value="oauth">
             ChatGPT OAuth
@@ -289,15 +348,71 @@ function ImportForm({
           />
         </TabsPanel>
         <TabsPanel className="grid min-w-0 gap-2" keepMounted value="file">
-          <Label htmlFor="token-files">选择文件</Label>
-          <Input
-            accept=".json,.txt,.csv,application/json,text/plain"
+          <Label>选择 JSON 文件或文件夹</Label>
+          <input
+            aria-label="多选 JSON 文件"
+            accept=".json,application/json"
+            hidden
             id="token-files"
             multiple
-            nativeInput
+            onChange={(event) => {
+              selectImportFiles("files", event.currentTarget.files);
+              event.currentTarget.value = "";
+            }}
             ref={fileInputRef}
             type="file"
           />
+          <input
+            {...directoryPickerAttributes}
+            aria-label="选择包含 JSON 的文件夹"
+            hidden
+            id="token-folder"
+            multiple
+            onChange={(event) => {
+              selectImportFiles("folder", event.currentTarget.files);
+              event.currentTarget.value = "";
+            }}
+            ref={folderInputRef}
+            type="file"
+          />
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Button onClick={() => fileInputRef.current?.click()} variant="outline">
+              <FileJsonIcon />
+              多选 JSON 文件
+            </Button>
+            <Button onClick={() => folderInputRef.current?.click()} variant="outline">
+              <FolderOpenIcon />
+              选择文件夹
+            </Button>
+          </div>
+          <p className="text-muted-foreground text-xs">
+            选择文件夹会递归读取其中的全部 JSON 文件；其他类型文件会被自动忽略。
+          </p>
+          {selectedFiles.length > 0 && (
+            <div className="grid min-w-0 gap-2 rounded-lg border bg-muted/30 p-3">
+              <div className="flex min-w-0 items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="font-medium text-sm">
+                    {fileSelectionSource === "folder" ? "文件夹" : "多选文件"} · {formatNumber(selectedFiles.length)} 个 JSON
+                  </p>
+                  {ignoredFileCount > 0 && (
+                    <p className="text-muted-foreground text-xs">已忽略 {formatNumber(ignoredFileCount)} 个非 JSON 文件</p>
+                  )}
+                </div>
+                <Button aria-label="清空已选文件" onClick={() => clearFileSelection()} size="icon-sm" title="清空已选文件" variant="ghost">
+                  <XIcon />
+                </Button>
+              </div>
+              <div className="max-h-28 overflow-y-auto rounded-md border bg-background px-3 py-2 text-muted-foreground text-xs oaix-scrollbar">
+                {selectedFiles.slice(0, 20).map((file, index) => (
+                  <div className="truncate" key={`${importFileName(file)}-${file.size}-${file.lastModified}-${index}`} title={importFileName(file)}>
+                    {importFileName(file)}
+                  </div>
+                ))}
+                {selectedFiles.length > 20 && <div className="pt-1">另有 {formatNumber(selectedFiles.length - 20)} 个文件</div>}
+              </div>
+            </div>
+          )}
         </TabsPanel>
         <TabsPanel className="grid min-w-0 gap-3" keepMounted value="oauth">
           {oauthSession ? (
@@ -360,7 +475,16 @@ function ImportForm({
           </Button>
         </div>
       </div>
-      <Button disabled={importBusy || (importSource === "oauth" && Boolean(oauthSession) && !oauthCallbackInput.trim())} loading={importBusy} onClick={() => void importTokens()}>
+      <Button
+        disabled={
+          importBusy ||
+          (importSource === "paste" && !tokenInput.trim()) ||
+          (importSource === "file" && !selectedFiles.length) ||
+          (importSource === "oauth" && Boolean(oauthSession) && !oauthCallbackInput.trim())
+        }
+        loading={importBusy}
+        onClick={() => void importTokens()}
+      >
         {importSource === "oauth" && <ExternalLinkIcon />}
         {importSource === "oauth" ? (oauthSession ? "完成 OAuth 导入" : "生成并打开授权链接") : "开始导入"}
       </Button>

@@ -232,6 +232,13 @@ def test_frontend_import_panel_supports_queue_position_and_token_formats() -> No
     assert "tokens: entries" in app_tsx
     assert "api.uploadImport(form)" in app_tsx
     assert "api.parseImport({ text: tokenInput })" in app_tsx
+    assert "webkitdirectory" in app_tsx
+    assert "selectImportFiles(\"folder\"" in app_tsx
+    assert "selectImportFiles(\"files\"" in app_tsx
+    assert 'file.name.toLowerCase().endsWith(".json")' in app_tsx
+    assert "for (const file of selectedFiles)" in app_tsx
+    assert app_tsx.count("hidden") >= 2
+    assert "选择文件夹会递归读取其中的全部 JSON 文件" in app_tsx
     assert '"access_token"' in app_tsx
     assert '"refresh_token"' in app_tsx
     assert '"refreshToken"' in app_tsx
