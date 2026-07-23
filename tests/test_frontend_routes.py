@@ -236,9 +236,15 @@ def test_frontend_import_panel_supports_queue_position_and_token_formats() -> No
     assert "selectImportFiles(\"folder\"" in app_tsx
     assert "selectImportFiles(\"files\"" in app_tsx
     assert 'file.name.toLowerCase().endsWith(".json")' in app_tsx
-    assert "for (const file of selectedFiles)" in app_tsx
+    assert "for (const candidate of selectedFiles)" in app_tsx
     assert app_tsx.count("hidden") >= 2
     assert "选择文件夹会递归读取其中的全部 JSON 文件" in app_tsx
+    assert "collectDroppedImportFiles" in app_tsx
+    assert "webkitGetAsEntry" in app_tsx
+    assert "handleFileDrop" in app_tsx
+    assert 'event.dataTransfer.dropEffect = fileSelectionBusy ? "none" : "copy"' in app_tsx
+    assert "拖放 JSON 文件或文件夹到这里" in app_tsx
+    assert "松开鼠标后预览文件，确认无误再开始导入" in app_tsx
     assert '"access_token"' in app_tsx
     assert '"refresh_token"' in app_tsx
     assert '"refreshToken"' in app_tsx

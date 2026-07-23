@@ -9,7 +9,7 @@ import {
   UploadIcon,
   XIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
@@ -20,6 +20,7 @@ import { Label } from "@/registry/default/ui/label";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/registry/default/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { Textarea } from "@/registry/default/ui/textarea";
+import { cn } from "@/registry/default/lib/utils";
 import {
   api,
   isAuthContextPending,
@@ -108,6 +109,99 @@ function importFileName(file: File): string {
   return file.webkitRelativePath || file.name;
 }
 
+type ImportFileCandidate = {
+  file: File;
+  path: string;
+};
+
+function importFileCandidate(file: File, path = importFileName(file)): ImportFileCandidate {
+  return { file, path };
+}
+
+function importFileCandidateKey(candidate: ImportFileCandidate): string {
+  return `${candidate.path}\u0000${candidate.file.size}\u0000${candidate.file.lastModified}`;
+}
+
+function readDroppedFileEntry(entry: FileSystemFileEntry, path: string): Promise<ImportFileCandidate> {
+  return new Promise((resolve, reject) => {
+    entry.file((file) => resolve(importFileCandidate(file, path)), reject);
+  });
+}
+
+function readDroppedDirectoryEntries(entry: FileSystemDirectoryEntry): Promise<FileSystemEntry[]> {
+  const reader = entry.createReader();
+  const entries: FileSystemEntry[] = [];
+  return new Promise((resolve, reject) => {
+    function readNextBatch() {
+      reader.readEntries((batch) => {
+        if (!batch.length) {
+          resolve(entries);
+          return;
+        }
+        entries.push(...batch);
+        readNextBatch();
+      }, reject);
+    }
+    readNextBatch();
+  });
+}
+
+async function collectDroppedEntry(entry: FileSystemEntry, parentPath = ""): Promise<ImportFileCandidate[]> {
+  const path = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+  if (entry.isFile) {
+    return [await readDroppedFileEntry(entry as FileSystemFileEntry, path)];
+  }
+  if (!entry.isDirectory) {
+    return [];
+  }
+  const children = await readDroppedDirectoryEntries(entry as FileSystemDirectoryEntry);
+  children.sort((left, right) => left.name.localeCompare(right.name));
+  const files: ImportFileCandidate[] = [];
+  for (const child of children) {
+    files.push(...(await collectDroppedEntry(child, path)));
+  }
+  return files;
+}
+
+async function collectDroppedImportFiles(dataTransfer: DataTransfer): Promise<ImportFileCandidate[]> {
+  const items = Array.from(dataTransfer.items).filter((item) => item.kind === "file");
+  if (!items.length) {
+    return Array.from(dataTransfer.files).map((file) => importFileCandidate(file));
+  }
+  const captured: Array<{ candidate: ImportFileCandidate } | { entry: FileSystemEntry }> = [];
+  for (const item of items) {
+    const entry = typeof item.webkitGetAsEntry === "function" ? item.webkitGetAsEntry() : null;
+    if (entry) {
+      captured.push({ entry });
+      continue;
+    }
+    const file = item.getAsFile();
+    if (file) {
+      captured.push({ candidate: importFileCandidate(file) });
+    }
+  }
+  if (!captured.length) {
+    return Array.from(dataTransfer.files).map((file) => importFileCandidate(file));
+  }
+  const files: ImportFileCandidate[] = [];
+  for (const item of captured) {
+    if ("candidate" in item) {
+      files.push(item.candidate);
+    } else {
+      files.push(...(await collectDroppedEntry(item.entry)));
+    }
+  }
+  return files;
+}
+
+function dataTransferHasFiles(dataTransfer: DataTransfer): boolean {
+  return (
+    Array.from(dataTransfer.types).includes("Files") ||
+    Array.from(dataTransfer.items).some((item) => item.kind === "file") ||
+    dataTransfer.files.length > 0
+  );
+}
+
 export function ImportsPage({
   pushToast,
   refreshNonce,
@@ -132,9 +226,12 @@ function ImportForm({
   const [queuePosition, setQueuePosition] = useState<"front" | "back">("front");
   const [importFeedback, setImportFeedback] = useState("等待导入。");
   const [importBusy, setImportBusy] = useState(false);
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-  const [fileSelectionSource, setFileSelectionSource] = useState<"files" | "folder" | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<ImportFileCandidate[]>([]);
+  const [fileSelectionSource, setFileSelectionSource] = useState<"files" | "folder" | "drop" | null>(null);
   const [ignoredFileCount, setIgnoredFileCount] = useState(0);
+  const [duplicateFileCount, setDuplicateFileCount] = useState(0);
+  const [dropBusy, setDropBusy] = useState(false);
+  const [fileDragActive, setFileDragActive] = useState(false);
   const [oauthSession, setOAuthSession] = useState<{
     authUrl: string;
     redirectUri?: string;
@@ -145,6 +242,8 @@ function ImportForm({
   const [oauthCopied, setOAuthCopied] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const fileDragDepthRef = useRef(0);
+  const fileSelectionBusy = importBusy || dropBusy;
 
   function changeImportSource(value: unknown) {
     if (value === "paste" || value === "file" || value === "oauth") {
@@ -156,6 +255,7 @@ function ImportForm({
     setSelectedFiles([]);
     setFileSelectionSource(null);
     setIgnoredFileCount(0);
+    setDuplicateFileCount(0);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -167,25 +267,98 @@ function ImportForm({
     }
   }
 
-  function selectImportFiles(source: "files" | "folder", fileList: FileList | null) {
-    const candidates = Array.from(fileList || []);
-    const jsonFiles = candidates
-      .filter(isJSONFile)
-      .sort((left, right) => importFileName(left).localeCompare(importFileName(right)));
-    const ignored = candidates.length - jsonFiles.length;
+  function selectImportFileCandidates(source: "files" | "folder" | "drop", candidates: ImportFileCandidate[]) {
+    const jsonCandidates = candidates
+      .filter((candidate) => isJSONFile(candidate.file))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    const ignored = candidates.length - jsonCandidates.length;
+    const seen = new Set<string>();
+    const jsonFiles = jsonCandidates.filter((candidate) => {
+      const key = importFileCandidateKey(candidate);
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+    const duplicates = jsonCandidates.length - jsonFiles.length;
 
     setSelectedFiles(jsonFiles);
     setFileSelectionSource(source);
     setIgnoredFileCount(ignored);
+    setDuplicateFileCount(duplicates);
     if (!jsonFiles.length) {
-      setImportFeedback(source === "folder" ? "所选文件夹中没有 JSON 文件。" : "请选择至少一个 JSON 文件。");
+      setImportFeedback(source === "drop" ? "拖入内容中没有 JSON 文件。" : source === "folder" ? "所选文件夹中没有 JSON 文件。" : "请选择至少一个 JSON 文件。");
       return;
     }
+    const details = `${ignored ? `，已忽略 ${formatNumber(ignored)} 个非 JSON 文件` : ""}${duplicates ? `，已去重 ${formatNumber(duplicates)} 个重复文件` : ""}`;
     setImportFeedback(
       source === "folder"
-        ? `已从文件夹选择 ${formatNumber(jsonFiles.length)} 个 JSON 文件${ignored ? `，已忽略 ${formatNumber(ignored)} 个非 JSON 文件` : ""}。`
-        : `已选择 ${formatNumber(jsonFiles.length)} 个 JSON 文件${ignored ? `，已忽略 ${formatNumber(ignored)} 个非 JSON 文件` : ""}。`,
+        ? `已从文件夹选择 ${formatNumber(jsonFiles.length)} 个 JSON 文件${details}。`
+        : source === "drop"
+          ? `已拖入 ${formatNumber(jsonFiles.length)} 个 JSON 文件${details}。`
+          : `已选择 ${formatNumber(jsonFiles.length)} 个 JSON 文件${details}。`,
     );
+  }
+
+  function selectImportFiles(source: "files" | "folder", fileList: FileList | null) {
+    selectImportFileCandidates(source, Array.from(fileList || []).map((file) => importFileCandidate(file)));
+  }
+
+  function handleFileDragEnter(event: DragEvent<HTMLDivElement>) {
+    if (!dataTransferHasFiles(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    fileDragDepthRef.current += 1;
+    if (!fileSelectionBusy) {
+      setImportSource("file");
+      setFileDragActive(true);
+    }
+  }
+
+  function handleFileDragOver(event: DragEvent<HTMLDivElement>) {
+    if (!dataTransferHasFiles(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = fileSelectionBusy ? "none" : "copy";
+  }
+
+  function handleFileDragLeave(event: DragEvent<HTMLDivElement>) {
+    if (fileDragDepthRef.current === 0) {
+      return;
+    }
+    event.preventDefault();
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) {
+      setFileDragActive(false);
+    }
+  }
+
+  async function handleFileDrop(event: DragEvent<HTMLDivElement>) {
+    if (!dataTransferHasFiles(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    fileDragDepthRef.current = 0;
+    setFileDragActive(false);
+    if (fileSelectionBusy) {
+      return;
+    }
+    setImportSource("file");
+    setDropBusy(true);
+    setImportFeedback("正在读取拖入的文件...");
+    try {
+      const files = await collectDroppedImportFiles(event.dataTransfer);
+      selectImportFileCandidates("drop", files);
+    } catch (caught) {
+      const message = `读取拖入文件失败：${errorMessage(caught)}`;
+      setImportFeedback(message);
+      pushToast(message, "error");
+    } finally {
+      setDropBusy(false);
+    }
   }
 
   async function startOAuthImport() {
@@ -284,8 +457,8 @@ function ImportForm({
         }
         setImportFeedback(`正在解析 ${formatNumber(selectedFiles.length)} 个 JSON 文件...`);
         const form = new FormData();
-        for (const file of selectedFiles) {
-          form.append("files", file, file.name);
+        for (const candidate of selectedFiles) {
+          form.append("files", candidate.file, candidate.file.name);
         }
         parsed = await api.uploadImport(form);
       } else {
@@ -321,7 +494,13 @@ function ImportForm({
   }
 
   return (
-    <div className="grid min-w-0 gap-4">
+    <div
+      className="grid min-w-0 gap-4"
+      onDragEnter={handleFileDragEnter}
+      onDragLeave={handleFileDragLeave}
+      onDragOver={handleFileDragOver}
+      onDrop={(event) => void handleFileDrop(event)}
+    >
       <Tabs className="min-w-0" onValueChange={changeImportSource} value={importSource}>
         <TabsList className="w-full sm:w-fit">
           <TabsTab className="flex-1 sm:flex-none" value="paste">
@@ -355,6 +534,7 @@ function ImportForm({
             hidden
             id="token-files"
             multiple
+            disabled={fileSelectionBusy}
             onChange={(event) => {
               selectImportFiles("files", event.currentTarget.files);
               event.currentTarget.value = "";
@@ -368,6 +548,7 @@ function ImportForm({
             hidden
             id="token-folder"
             multiple
+            disabled={fileSelectionBusy}
             onChange={(event) => {
               selectImportFiles("folder", event.currentTarget.files);
               event.currentTarget.value = "";
@@ -375,12 +556,40 @@ function ImportForm({
             ref={folderInputRef}
             type="file"
           />
+          <div
+            aria-busy={dropBusy || undefined}
+            aria-disabled={fileSelectionBusy || undefined}
+            className={cn(
+              "grid min-h-28 cursor-pointer place-items-center gap-2 rounded-lg border border-dashed border-input bg-muted/20 p-4 text-center outline-none transition-colors hover:bg-muted/40 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/24",
+              fileDragActive && "border-ring bg-accent ring-2 ring-ring/24",
+              fileSelectionBusy && "cursor-not-allowed opacity-64",
+            )}
+            onClick={() => {
+              if (!fileSelectionBusy) {
+                fileInputRef.current?.click();
+              }
+            }}
+            onKeyDown={(event) => {
+              if (!fileSelectionBusy && (event.key === "Enter" || event.key === " ")) {
+                event.preventDefault();
+                fileInputRef.current?.click();
+              }
+            }}
+            role="button"
+            tabIndex={0}
+          >
+            <UploadIcon className="size-6 text-muted-foreground" />
+            <div className="grid gap-1">
+              <p className="font-medium text-sm">拖放 JSON 文件或文件夹到这里</p>
+              <p className="text-muted-foreground text-xs">松开鼠标后预览文件，确认无误再开始导入；点击此区域也可多选文件。</p>
+            </div>
+          </div>
           <div className="grid gap-2 sm:grid-cols-2">
-            <Button onClick={() => fileInputRef.current?.click()} variant="outline">
+            <Button disabled={fileSelectionBusy} onClick={() => fileInputRef.current?.click()} variant="outline">
               <FileJsonIcon />
               多选 JSON 文件
             </Button>
-            <Button onClick={() => folderInputRef.current?.click()} variant="outline">
+            <Button disabled={fileSelectionBusy} onClick={() => folderInputRef.current?.click()} variant="outline">
               <FolderOpenIcon />
               选择文件夹
             </Button>
@@ -393,10 +602,13 @@ function ImportForm({
               <div className="flex min-w-0 items-center justify-between gap-3">
                 <div className="min-w-0">
                   <p className="font-medium text-sm">
-                    {fileSelectionSource === "folder" ? "文件夹" : "多选文件"} · {formatNumber(selectedFiles.length)} 个 JSON
+                    {fileSelectionSource === "folder" ? "文件夹" : fileSelectionSource === "drop" ? "拖入文件" : "多选文件"} · {formatNumber(selectedFiles.length)} 个 JSON
                   </p>
                   {ignoredFileCount > 0 && (
                     <p className="text-muted-foreground text-xs">已忽略 {formatNumber(ignoredFileCount)} 个非 JSON 文件</p>
+                  )}
+                  {duplicateFileCount > 0 && (
+                    <p className="text-muted-foreground text-xs">已去重 {formatNumber(duplicateFileCount)} 个重复文件</p>
                   )}
                 </div>
                 <Button aria-label="清空已选文件" onClick={() => clearFileSelection()} size="icon-sm" title="清空已选文件" variant="ghost">
@@ -404,9 +616,9 @@ function ImportForm({
                 </Button>
               </div>
               <div className="max-h-28 overflow-y-auto rounded-md border bg-background px-3 py-2 text-muted-foreground text-xs oaix-scrollbar">
-                {selectedFiles.slice(0, 20).map((file, index) => (
-                  <div className="truncate" key={`${importFileName(file)}-${file.size}-${file.lastModified}-${index}`} title={importFileName(file)}>
-                    {importFileName(file)}
+                {selectedFiles.slice(0, 20).map((candidate, index) => (
+                  <div className="truncate" key={`${importFileCandidateKey(candidate)}-${index}`} title={candidate.path}>
+                    {candidate.path}
                   </div>
                 ))}
                 {selectedFiles.length > 20 && <div className="pt-1">另有 {formatNumber(selectedFiles.length - 20)} 个文件</div>}
@@ -478,6 +690,7 @@ function ImportForm({
       <Button
         disabled={
           importBusy ||
+          dropBusy ||
           (importSource === "paste" && !tokenInput.trim()) ||
           (importSource === "file" && !selectedFiles.length) ||
           (importSource === "oauth" && Boolean(oauthSession) && !oauthCallbackInput.trim())
