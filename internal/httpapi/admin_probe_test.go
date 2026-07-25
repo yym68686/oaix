@@ -260,6 +260,32 @@ func TestProbeTokenDisablesInactiveSelectedWorkspaceMember(t *testing.T) {
 	}
 }
 
+func TestProbeTokenDisablesExpiredAuthenticationToken(t *testing.T) {
+	upstreamBody := `{"error":{"message":"Provided authentication token is expired. Please try signing in again.","type":null,"code":"token_expired","param":null},"status":401}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:          14539,
+		AccessToken: "expired-authentication-token",
+	}, defaultAdminProbeModel)
+
+	if result["outcome"] != "disabled" || result["status_code"] != http.StatusUnauthorized {
+		t.Fatalf("probe result = %#v", result)
+	}
+	if result["error_code"] != "token_expired" || result["raw_response"] != upstreamBody {
+		t.Fatalf("upstream evidence was not preserved: %#v", result)
+	}
+	if message := fmt.Sprint(result["message"]); !strings.Contains(message, "token_expired") {
+		t.Fatalf("message = %q", message)
+	}
+}
+
 func TestProbeTokenAgentIdentityAuthRejectionUsesCredentialSpecificMessage(t *testing.T) {
 	credentials := probeAgentIdentityCredentials(t, "task-ready")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

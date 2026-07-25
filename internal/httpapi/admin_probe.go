@@ -147,10 +147,17 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		result["cooldown_seconds"] = cooldownSeconds(now, until)
 		return result
 	case tokenProbeDisabled:
-		clearAccess := upstreamerror.IsTokenInvalidated(statusCode, []byte(attempt.RawResponse))
+		rawResponse := []byte(attempt.RawResponse)
+		tokenInvalidated := upstreamerror.IsTokenInvalidated(statusCode, rawResponse)
+		tokenExpired := upstreamerror.IsTokenExpired(statusCode, rawResponse)
+		clearAccess := tokenInvalidated || tokenExpired
 		failureMessage := "测试确认工作区已停用，但保存禁用状态失败。"
 		resultMessage := "测试失败：上游明确返回工作区已停用，当前已标记为禁用。"
-		if upstreamerror.IsInactiveWorkspaceMember(statusCode, []byte(attempt.RawResponse)) {
+		if tokenExpired {
+			failureMessage = "测试确认 authentication token 已过期，但保存禁用状态失败。"
+			resultMessage = "测试失败：上游明确返回 token_expired，当前已标记为禁用。"
+		}
+		if upstreamerror.IsInactiveWorkspaceMember(statusCode, rawResponse) {
 			failureMessage = "测试确认 Personal access token 所有者已不在所选工作区中，但保存禁用状态失败。"
 			resultMessage = "测试失败：Personal access token 所有者已不在所选工作区中，当前已标记为禁用。"
 		}
@@ -158,7 +165,7 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 			failureMessage = "测试确认 Agent Identity 鉴权已被上游拒绝，但保存禁用状态失败。"
 			resultMessage = "测试失败：Agent Identity 鉴权被上游拒绝，当前已标记为禁用。"
 		}
-		if clearAccess {
+		if tokenInvalidated {
 			failureMessage = "测试确认 authentication token 已失效，但保存禁用状态失败。"
 			resultMessage = "测试失败：上游明确返回 token_invalidated，当前已标记为禁用。"
 		}

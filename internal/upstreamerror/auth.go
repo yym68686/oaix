@@ -7,9 +7,11 @@ import (
 )
 
 const (
-	inactiveWorkspaceMemberCode     = "biscuit_baker_service_auth_credential_error_status"
-	inactiveWorkspaceMemberMessage  = "Personal access token owner is not an active member of the selected workspace."
-	inactiveAccessTokenOwnerMessage = "Personal access token owner is inactive."
+	inactiveWorkspaceMemberCode       = "biscuit_baker_service_auth_credential_error_status"
+	inactiveWorkspaceMemberMessage    = "Personal access token owner is not an active member of the selected workspace."
+	inactiveAccessTokenOwnerMessage   = "Personal access token owner is inactive."
+	expiredAuthenticationTokenCode    = "token_expired"
+	expiredAuthenticationTokenMessage = "Provided authentication token is expired. Please try signing in again."
 )
 
 // IsTokenInvalidated reports whether an upstream HTTP response contains the
@@ -29,6 +31,27 @@ func IsTokenInvalidated(status int, body []byte) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(payload.Error.Code), "token_invalidated")
+}
+
+// IsTokenExpired reports whether an upstream HTTP response contains the
+// explicit token_expired protocol signal and its permanent authentication
+// message. Both fields are required so an unrelated 401 cannot disable a
+// refreshable token.
+func IsTokenExpired(status int, body []byte) bool {
+	if status != http.StatusUnauthorized || len(body) == 0 {
+		return false
+	}
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(payload.Error.Code), expiredAuthenticationTokenCode) &&
+		strings.EqualFold(strings.TrimSpace(payload.Error.Message), expiredAuthenticationTokenMessage)
 }
 
 // IsInactiveWorkspaceMember reports whether an upstream HTTP response

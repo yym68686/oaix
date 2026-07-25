@@ -59,6 +59,43 @@ func TestIsTokenInvalidated(t *testing.T) {
 	}
 }
 
+func TestIsTokenExpired(t *testing.T) {
+	const exact = `{"error":{"message":"Provided authentication token is expired. Please try signing in again.","type":null,"code":"token_expired","param":null},"status":401}`
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "exact expired authentication token", status: http.StatusUnauthorized, body: exact, want: true},
+		{
+			name:   "structured fields are case insensitive and trimmed",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"code":" TOKEN_EXPIRED ","message":" provided AUTHENTICATION token is EXPIRED. please TRY signing in AGAIN. "}}`,
+			want:   true,
+		},
+		{name: "same payload under another status", status: http.StatusForbidden, body: exact},
+		{
+			name:   "code without exact message",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"code":"token_expired","message":"Session expired."}}`,
+		},
+		{
+			name:   "message without protocol code",
+			status: http.StatusUnauthorized,
+			body:   `{"error":{"message":"Provided authentication token is expired. Please try signing in again."}}`,
+		},
+		{name: "malformed response", status: http.StatusUnauthorized, body: `{"error":`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsTokenExpired(test.status, []byte(test.body)); got != test.want {
+				t.Fatalf("IsTokenExpired() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestIsInactiveWorkspaceMember(t *testing.T) {
 	const exact = `{"error":{"message":"Personal access token owner is not an active member of the selected workspace.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`
 	tests := []struct {

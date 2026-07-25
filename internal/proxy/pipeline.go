@@ -156,6 +156,7 @@ const (
 	OutcomeUpstream429Cooldown            Outcome = "upstream_429_cooldown"
 	OutcomeUpstream401Invalid             Outcome = "upstream_401_invalid"
 	OutcomeUpstream401Invalidated         Outcome = "upstream_401_token_invalidated"
+	OutcomeUpstream401Expired             Outcome = "upstream_401_token_expired"
 	OutcomeAlphaSearch401Failover         Outcome = "alpha_search_401_account_failover"
 	OutcomeUpstream400ModelCapabilityLoss Outcome = "upstream_400_model_capability_loss"
 	OutcomeUpstream402Deactivated         Outcome = "upstream_402_deactivated_workspace"
@@ -607,6 +608,18 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream401Invalidated, retry, true, nil)
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Invalidated, attemptID))
+			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+			excluded[claim.TokenID()] = struct{}{}
+			if attempt < p.cfg.Upstream.MaxRetries {
+				continue
+			}
+			break
+		}
+		if upstreamerror.IsTokenExpired(status, result.ErrorBody) {
+			message := "terminal upstream status 401: token_expired"
+			lastErr = errors.New(message)
+			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream401Expired, retry, true, nil)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Expired, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < p.cfg.Upstream.MaxRetries {
