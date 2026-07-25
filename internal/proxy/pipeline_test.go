@@ -4952,6 +4952,10 @@ func (s *fakeProxyStore) MarkTokenErrorWithContext(_ context.Context, tokenID in
 	s.mu.Lock()
 	for i := range s.tokens {
 		if s.tokens[i].ID == tokenID {
+			if !deactivate && !s.tokens[i].IsActive {
+				s.mu.Unlock()
+				return nil
+			}
 			msg := message
 			now := time.Now().UTC()
 			s.tokens[i].LastError = &msg
@@ -4959,6 +4963,7 @@ func (s *fakeProxyStore) MarkTokenErrorWithContext(_ context.Context, tokenID in
 			if deactivate {
 				s.tokens[i].IsActive = false
 				s.tokens[i].DisabledAt = &now
+				s.tokens[i].CooldownUntil = nil
 			}
 			s.tokens[i].UpdatedAt = now
 			break

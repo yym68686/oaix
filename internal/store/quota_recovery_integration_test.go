@@ -110,16 +110,17 @@ func TestPostgresQuotaRecoveryStateFences(t *testing.T) {
 	}
 	var disabledActive bool
 	var disabledAt *time.Time
+	var disabledCooldownAfter *time.Time
 	var disabledAccess *string
 	var secretAccess *string
-	if err := db.pool.QueryRow(ctx, `select is_active, disabled_at, access_token from codex_tokens where id = $1`, disabledID).Scan(&disabledActive, &disabledAt, &disabledAccess); err != nil {
+	if err := db.pool.QueryRow(ctx, `select is_active, disabled_at, cooldown_until, access_token from codex_tokens where id = $1`, disabledID).Scan(&disabledActive, &disabledAt, &disabledCooldownAfter, &disabledAccess); err != nil {
 		t.Fatalf("read disabled token: %v", err)
 	}
 	if err := db.pool.QueryRow(ctx, `select access_token from token_secrets where token_id = $1`, disabledID).Scan(&secretAccess); err != nil {
 		t.Fatalf("read disabled secret: %v", err)
 	}
-	if disabledActive || disabledAt == nil || disabledAccess != nil || secretAccess != nil {
-		t.Fatalf("matching disable was not atomic: active=%v disabled_at=%v token_access=%v secret_access=%v", disabledActive, disabledAt, disabledAccess, secretAccess)
+	if disabledActive || disabledAt == nil || disabledCooldownAfter != nil || disabledAccess != nil || secretAccess != nil {
+		t.Fatalf("matching disable was not atomic: active=%v disabled_at=%v cooldown=%v token_access=%v secret_access=%v", disabledActive, disabledAt, disabledCooldownAfter, disabledAccess, secretAccess)
 	}
 
 	probeID, _ := insertToken("probe-reactivate", "access-probe", "refresh-probe", nil, false)
@@ -186,6 +187,33 @@ func TestPostgresQuotaRecoveryStateFences(t *testing.T) {
 	}
 	if !stillDisabled || disabledReason == nil || *disabledReason != "manual disable" {
 		t.Fatalf("delayed success undid manual disable: disabled=%v reason=%v", stillDisabled, disabledReason)
+	}
+
+	delayedFailureID, _ := insertToken("delayed-failure-after-disable", "access-delayed-failure", "refresh-delayed-failure", &future, true)
+	permanentReason := "terminal upstream status 403: inactive selected workspace member"
+	if err := db.MarkTokenError(ctx, delayedFailureID, permanentReason, true, nil); err != nil {
+		t.Fatalf("permanently disable token: %v", err)
+	}
+	staleCooldown := time.Now().UTC().Add(5 * time.Second)
+	if err := db.MarkTokenError(ctx, delayedFailureID, "stale non-terminal auth failure", false, &staleCooldown); err != nil {
+		t.Fatalf("record delayed token failure: %v", err)
+	}
+	var delayedFailureActive bool
+	var delayedFailureDisabledAt *time.Time
+	var delayedFailureCooldown *time.Time
+	var delayedFailureReason string
+	var delayedRuntimeCooldown *time.Time
+	var delayedRuntimeReason string
+	if err := db.pool.QueryRow(ctx, `
+		select t.is_active, t.disabled_at, t.cooldown_until, t.last_error, r.cooldown_until, r.disabled_reason
+		from codex_tokens t join token_runtime_state r on r.token_id = t.id
+		where t.id = $1
+	`, delayedFailureID).Scan(&delayedFailureActive, &delayedFailureDisabledAt, &delayedFailureCooldown, &delayedFailureReason, &delayedRuntimeCooldown, &delayedRuntimeReason); err != nil {
+		t.Fatalf("read delayed-failure token state: %v", err)
+	}
+	if delayedFailureActive || delayedFailureDisabledAt == nil || delayedFailureCooldown != nil || delayedRuntimeCooldown != nil || delayedFailureReason != permanentReason || delayedRuntimeReason != permanentReason {
+		t.Fatalf("delayed failure overwrote permanent disable: active=%v disabled_at=%v token_cooldown=%v runtime_cooldown=%v reason=%q runtime_reason=%q",
+			delayedFailureActive, delayedFailureDisabledAt, delayedFailureCooldown, delayedRuntimeCooldown, delayedFailureReason, delayedRuntimeReason)
 	}
 
 	newCooldown := time.Now().UTC().Add(2 * time.Hour)

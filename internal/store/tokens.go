@@ -1491,12 +1491,12 @@ func (s *Store) MarkManualProbeDisabled(ctx context.Context, tokenID int64, fenc
 	}
 	return s.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		var ownerUserID sql.NullInt64
-		var cooldownUntil sql.NullTime
 		err := tx.QueryRow(ctx, `
 			update codex_tokens
 			set last_error = $9,
 			    is_active = false,
 			    disabled_at = now(),
+			    cooldown_until = null,
 			    access_token = case when $10 then null else access_token end,
 			    updated_at = now()
 			where id = $1
@@ -1508,19 +1508,15 @@ func (s *Store) MarkManualProbeDisabled(ctx context.Context, tokenID int64, fenc
 			  and coalesce(access_token, '') = $6
 			  and coalesce(refresh_token, '') = $7
 			  and btrim(coalesce(account_id, '')) = $8
-			returning owner_user_id, cooldown_until
+			returning owner_user_id
 		`, tokenID, fence.IsActive, fence.DisabledAt, fence.CooldownUntil,
 			fence.LastError, fence.Credentials.AccessToken, fence.Credentials.RefreshToken, strings.TrimSpace(fence.Credentials.AccountID),
-			message, clearAccess).Scan(&ownerUserID, &cooldownUntil)
+			message, clearAccess).Scan(&ownerUserID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrTokenStateChanged
 		}
 		if err != nil {
 			return err
-		}
-		var cooldownValue any
-		if cooldownUntil.Valid {
-			cooldownValue = cooldownUntil.Time.UTC()
 		}
 		if clearAccess {
 			if _, err := tx.Exec(ctx, `
@@ -1536,7 +1532,7 @@ func (s *Store) MarkManualProbeDisabled(ctx context.Context, tokenID int64, fenc
 				token_id, owner_user_id, cooldown_until, disabled_reason,
 				failure_streak, last_failure_at, updated_at
 			)
-			values ($1, $2, $3, $4, 1, now(), now())
+			values ($1, $2, null, $3, 1, now(), now())
 			on conflict (token_id) do update
 			set owner_user_id = coalesce(excluded.owner_user_id, token_runtime_state.owner_user_id),
 			    cooldown_until = excluded.cooldown_until,
@@ -1544,7 +1540,7 @@ func (s *Store) MarkManualProbeDisabled(ctx context.Context, tokenID int64, fenc
 			    failure_streak = token_runtime_state.failure_streak + 1,
 			    last_failure_at = now(),
 			    updated_at = now()
-		`, tokenID, nullableOwnerID(ownerUserID), cooldownValue, message); err != nil {
+		`, tokenID, nullableOwnerID(ownerUserID), message); err != nil {
 			return err
 		}
 		metadata := map[string]any{
@@ -1556,8 +1552,8 @@ func (s *Store) MarkManualProbeDisabled(ctx context.Context, tokenID int64, fenc
 				token_id, owner_user_id, event_type, reason, cooldown_until,
 				model, status_code, previous_is_active, next_is_active, metadata
 			)
-			values ($1, $2, 'disabled', $3, $4, nullif($5, ''), nullif($6, 0), $7, false, $8)
-		`, tokenID, nullableOwnerID(ownerUserID), message, cooldownValue, strings.TrimSpace(model), statusCode, fence.IsActive, jsonBytes(metadata))
+			values ($1, $2, 'disabled', $3, null, nullif($4, ''), nullif($5, 0), $6, false, $7)
+		`, tokenID, nullableOwnerID(ownerUserID), message, strings.TrimSpace(model), statusCode, fence.IsActive, jsonBytes(metadata))
 		return err
 	})
 }
@@ -1582,12 +1578,16 @@ func (s *Store) MarkTokenErrorWithContext(ctx context.Context, tokenID int64, me
 	`, tokenID).Scan(&ownerUserID, &previousActive); err != nil {
 		return err
 	}
-	disabledAtExpr := "disabled_at"
-	isActiveExpr := "is_active"
+	// A non-terminal failure may finish after another in-flight request has
+	// permanently disabled this token. Preserve the terminal state and reason;
+	// the gateway attempt log already records the stale failure itself.
+	if !deactivate && !previousActive {
+		return tx.Commit(ctx)
+	}
+	stateCooldownUntil := cooldownUntil
 	nextActive := previousActive
 	if deactivate {
-		disabledAtExpr = "now()"
-		isActiveExpr = "false"
+		stateCooldownUntil = nil
 		nextActive = false
 	}
 	if eventCtx.PreviousIsActive == nil {
@@ -1596,15 +1596,15 @@ func (s *Store) MarkTokenErrorWithContext(ctx context.Context, tokenID int64, me
 	if eventCtx.NextIsActive == nil {
 		eventCtx.NextIsActive = &nextActive
 	}
-	_, err = tx.Exec(ctx, fmt.Sprintf(`
+	_, err = tx.Exec(ctx, `
 		update codex_tokens
 		set last_error = $2,
-		    is_active = %s,
-		    disabled_at = %s,
-		    cooldown_until = coalesce($3, cooldown_until),
+		    is_active = case when $4 then false else is_active end,
+		    disabled_at = case when $4 then now() else disabled_at end,
+		    cooldown_until = case when $4 then null else coalesce($3, cooldown_until) end,
 		    updated_at = now()
 		where id = $1
-	`, isActiveExpr, disabledAtExpr), tokenID, truncate(message, 4000), cooldownUntil)
+	`, tokenID, truncate(message, 4000), cooldownUntil, deactivate)
 	if err != nil {
 		return err
 	}
@@ -1612,12 +1612,12 @@ func (s *Store) MarkTokenErrorWithContext(ctx context.Context, tokenID int64, me
 		insert into token_runtime_state(token_id, cooldown_until, disabled_reason, failure_streak, last_failure_at, updated_at)
 		values ($1, $2, $3, 1, now(), now())
 		on conflict (token_id) do update
-		set cooldown_until = coalesce(excluded.cooldown_until, token_runtime_state.cooldown_until),
+		set cooldown_until = case when $4 then null else coalesce(excluded.cooldown_until, token_runtime_state.cooldown_until) end,
 		    disabled_reason = coalesce(excluded.disabled_reason, token_runtime_state.disabled_reason),
 		    failure_streak = token_runtime_state.failure_streak + 1,
 		    last_failure_at = now(),
 		    updated_at = now()
-	`, tokenID, cooldownUntil, truncate(message, 4000))
+	`, tokenID, stateCooldownUntil, truncate(message, 4000), deactivate)
 	if err != nil {
 		return err
 	}
@@ -1632,7 +1632,7 @@ func (s *Store) MarkTokenErrorWithContext(ctx context.Context, tokenID int64, me
 			selection_mode, caller_owner_user_id, previous_is_active, next_is_active, metadata
 		)
 		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-	`, tokenID, ownerParam, map[bool]string{true: "disabled", false: "error"}[deactivate], truncate(message, 4000), cooldownUntil,
+	`, tokenID, ownerParam, map[bool]string{true: "disabled", false: "error"}[deactivate], truncate(message, 4000), stateCooldownUntil,
 		nullableString(eventCtx.RequestID), eventCtx.GatewayRequestLogID, eventCtx.GatewayRequestAttemptID,
 		nullableString(eventCtx.Endpoint), nullableString(eventCtx.Model), eventCtx.StatusCode,
 		nullableString(eventCtx.SelectionMode), eventCtx.CallerOwnerUserID,
