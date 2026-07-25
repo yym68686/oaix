@@ -1339,6 +1339,9 @@ func quotaResponseShouldDisable(status int, body []byte) bool {
 	if upstreamerror.IsTokenInvalidated(status, body) {
 		return true
 	}
+	if upstreamerror.IsInactiveWorkspaceMember(status, body) {
+		return true
+	}
 	if status != http.StatusPaymentRequired {
 		return false
 	}
