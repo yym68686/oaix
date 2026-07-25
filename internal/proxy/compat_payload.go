@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,11 @@ const (
 	maxResponsesFailurePayloadBytes  = 64 * 1024
 	maxResponsesFailureMessageBytes  = 16 * 1024
 	maxResponsesFailureMetadataBytes = 1024
+)
+
+const (
+	maxToolSearchArgumentPropertyNameRunes = 256
+	toolSearchArgumentCollisionHashRunes   = 16
 )
 
 var (
@@ -243,6 +249,7 @@ func prepareResponsesPayload(body []byte, intent *RequestIntent) ([]byte, error)
 	} else {
 		preservePreviousResponseID = false
 	}
+	intent.ToolSearchKeyFixes += shortenToolSearchArgumentPropertyNames(payload["input"])
 	sanitizeCodexPayload(payload, intent.Compact, preservePreviousResponseID)
 	if !intent.Compact && !intent.Stream {
 		payload["stream"] = true
@@ -269,6 +276,96 @@ func normalizeResponsesStringInput(payload map[string]any) {
 			"content": input,
 		},
 	}
+}
+
+// shortenToolSearchArgumentPropertyNames keeps malformed historical
+// tool_search_call items compatible with the upstream Responses validator.
+// The upstream limits JSON property names inside arguments to 256 Unicode
+// code points. Limit this rewrite to tool-search arguments so ordinary tool
+// schemas, function-call arguments, and message content retain their original
+// semantics.
+func shortenToolSearchArgumentPropertyNames(input any) int {
+	switch typed := input.(type) {
+	case []any:
+		shortened := 0
+		for _, item := range typed {
+			shortened += shortenToolSearchArgumentPropertyNames(item)
+		}
+		return shortened
+	case map[string]any:
+		if text(typed["type"]) != "tool_search_call" {
+			return 0
+		}
+		return shortenOversizedJSONPropertyNames(typed["arguments"])
+	default:
+		return 0
+	}
+}
+
+func shortenOversizedJSONPropertyNames(value any) int {
+	switch typed := value.(type) {
+	case []any:
+		shortened := 0
+		for _, nested := range typed {
+			shortened += shortenOversizedJSONPropertyNames(nested)
+		}
+		return shortened
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		used := make(map[string]struct{}, len(keys))
+		oversized := make([]string, 0)
+		for _, key := range keys {
+			if utf8.RuneCountInString(key) <= maxToolSearchArgumentPropertyNameRunes {
+				used[key] = struct{}{}
+				continue
+			}
+			oversized = append(oversized, key)
+		}
+
+		shortened := 0
+		for _, key := range oversized {
+			candidate := runePrefix(key, maxToolSearchArgumentPropertyNameRunes)
+			if _, exists := used[candidate]; exists {
+				for collision := 0; collision <= len(used); collision++ {
+					suffix := "~" + shortHash(key, toolSearchArgumentCollisionHashRunes)
+					if collision > 0 {
+						suffix += "-" + strconv.Itoa(collision)
+					}
+					candidate = runePrefix(key, maxToolSearchArgumentPropertyNameRunes-utf8.RuneCountInString(suffix)) + suffix
+					if _, exists := used[candidate]; !exists {
+						break
+					}
+				}
+			}
+			item := typed[key]
+			delete(typed, key)
+			typed[candidate] = item
+			used[candidate] = struct{}{}
+			shortened++
+		}
+
+		for _, nested := range typed {
+			shortened += shortenOversizedJSONPropertyNames(nested)
+		}
+		return shortened
+	default:
+		return 0
+	}
+}
+
+func runePrefix(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(value) <= limit {
+		return value
+	}
+	return string([]rune(value)[:limit])
 }
 
 func translateResponsesImageCompatPayload(payload map[string]any, compact bool) (map[string]any, error) {

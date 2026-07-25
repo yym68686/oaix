@@ -3197,6 +3197,161 @@ func TestPrepareResponsesPayloadNormalizesStringInput(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesPayloadShortensOversizedToolSearchArgumentPropertyName(t *testing.T) {
+	longKey := strings.Repeat("界", 300)
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-5.5",
+		"input": []any{
+			map[string]any{
+				"type":      "tool_search_call",
+				"status":    "completed",
+				"arguments": map[string]any{longKey: "preserved-value"},
+			},
+		},
+		"stream": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := RequestIntent{Endpoint: "/v1/responses", Stream: true}
+	upstream, err := prepareResponsesPayload(body, &intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.ToolSearchKeyFixes != 1 {
+		t.Fatalf("shortened property names = %d, want 1", intent.ToolSearchKeyFixes)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(upstream, &payload); err != nil {
+		t.Fatal(err)
+	}
+	item := payload["input"].([]any)[0].(map[string]any)
+	arguments := item["arguments"].(map[string]any)
+	if len(arguments) != 1 {
+		t.Fatalf("arguments = %v", arguments)
+	}
+	wantKey := string([]rune(longKey)[:maxToolSearchArgumentPropertyNameRunes])
+	if arguments[wantKey] != "preserved-value" {
+		t.Fatalf("shortened key or value changed unexpectedly: %v", arguments)
+	}
+}
+
+func TestPrepareResponsesPayloadShortensNestedToolSearchKeysWithoutCollisions(t *testing.T) {
+	prefix := strings.Repeat("p", maxToolSearchArgumentPropertyNameRunes)
+	collidingLongKey := prefix + "-oversized"
+	nestedLongKey := strings.Repeat("界", maxToolSearchArgumentPropertyNameRunes+1)
+	functionLongKey := strings.Repeat("f", maxToolSearchArgumentPropertyNameRunes+20)
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-5.5",
+		"input": []any{
+			map[string]any{
+				"type": "tool_search_call",
+				"arguments": map[string]any{
+					prefix: "keep-existing",
+					collidingLongKey: map[string]any{
+						nestedLongKey: "nested-value",
+					},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"arguments": map[string]any{functionLongKey: "untouched"},
+			},
+			map[string]any{
+				"type":      "tool_search_call",
+				"arguments": strings.Repeat("argument-text", 100),
+			},
+		},
+		"stream": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prepare := func() ([]byte, RequestIntent) {
+		intent := RequestIntent{Endpoint: "/v1/responses", Stream: true}
+		upstream, err := prepareResponsesPayload(body, &intent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return upstream, intent
+	}
+	first, firstIntent := prepare()
+	second, secondIntent := prepare()
+	if !bytes.Equal(first, second) {
+		t.Fatal("collision-safe shortening must be deterministic")
+	}
+	if firstIntent.ToolSearchKeyFixes != 2 || secondIntent.ToolSearchKeyFixes != 2 {
+		t.Fatalf("shortened property names = %d/%d, want 2", firstIntent.ToolSearchKeyFixes, secondIntent.ToolSearchKeyFixes)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(first, &payload); err != nil {
+		t.Fatal(err)
+	}
+	input := payload["input"].([]any)
+	toolSearchArguments := input[0].(map[string]any)["arguments"].(map[string]any)
+	if len(toolSearchArguments) != 2 || toolSearchArguments[prefix] != "keep-existing" {
+		t.Fatalf("existing key was overwritten: %v", toolSearchArguments)
+	}
+	var nested map[string]any
+	for key, value := range toolSearchArguments {
+		if key == prefix {
+			continue
+		}
+		if len([]rune(key)) > maxToolSearchArgumentPropertyNameRunes {
+			t.Fatalf("collision-safe key still exceeds limit: %d", len([]rune(key)))
+		}
+		nested = value.(map[string]any)
+	}
+	if len(nested) != 1 {
+		t.Fatalf("nested arguments = %v", nested)
+	}
+	for key, value := range nested {
+		if len([]rune(key)) != maxToolSearchArgumentPropertyNameRunes || value != "nested-value" {
+			t.Fatalf("nested key or value changed unexpectedly: %d %v", len([]rune(key)), value)
+		}
+	}
+	functionArguments := input[1].(map[string]any)["arguments"].(map[string]any)
+	if functionArguments[functionLongKey] != "untouched" {
+		t.Fatalf("function-call arguments were rewritten: %v", functionArguments)
+	}
+	if input[2].(map[string]any)["arguments"] != strings.Repeat("argument-text", 100) {
+		t.Fatalf("string tool-search arguments were rewritten: %v", input[2])
+	}
+}
+
+func TestShortenOversizedJSONPropertyNamesAvoidsReservedFallbackKeys(t *testing.T) {
+	prefix := strings.Repeat("x", maxToolSearchArgumentPropertyNameRunes)
+	longKey := prefix + "-oversized"
+	hashSuffix := "~" + shortHash(longKey, toolSearchArgumentCollisionHashRunes)
+	hashCandidate := runePrefix(longKey, maxToolSearchArgumentPropertyNameRunes-len([]rune(hashSuffix))) + hashSuffix
+	arguments := map[string]any{
+		prefix:        "reserved-prefix",
+		hashCandidate: "reserved-hash",
+		longKey:       "must-survive",
+	}
+	if shortened := shortenOversizedJSONPropertyNames(arguments); shortened != 1 {
+		t.Fatalf("shortened property names = %d, want 1", shortened)
+	}
+	if len(arguments) != 3 || arguments[prefix] != "reserved-prefix" || arguments[hashCandidate] != "reserved-hash" {
+		t.Fatalf("reserved keys were overwritten: %v", arguments)
+	}
+	found := false
+	for key, value := range arguments {
+		if value != "must-survive" {
+			continue
+		}
+		found = true
+		if key == prefix || key == hashCandidate || len([]rune(key)) > maxToolSearchArgumentPropertyNameRunes {
+			t.Fatalf("invalid collision fallback key: %q", key)
+		}
+	}
+	if !found {
+		t.Fatalf("oversized key value was lost: %v", arguments)
+	}
+}
+
 func TestPrepareResponsesPayloadTranslatesGPTImage2(t *testing.T) {
 	body := []byte(`{
 		"model": "gpt-image-2",

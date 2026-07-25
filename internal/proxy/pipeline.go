@@ -110,6 +110,7 @@ type RequestIntent struct {
 	ResponseModelAlias  string
 	ImageResponseFormat string
 	ImageStreamPrefix   string
+	ToolSearchKeyFixes  int
 }
 
 type Attempt struct {
@@ -279,6 +280,10 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}()
 	}
 	timing := map[string]any{"request_body_bytes": len(bodyBytes)}
+	if intent.ToolSearchKeyFixes > 0 {
+		timing["tool_search_argument_property_names_shortened"] = intent.ToolSearchKeyFixes
+		timing["tool_search_argument_property_name_limit"] = maxToolSearchArgumentPropertyNameRunes
+	}
 	if idempotencyExecution != nil {
 		timing["idempotency_mode"] = "routing_attempt"
 		timing["routing_attempt_id_hash"] = idempotencyExecution.keyHash
