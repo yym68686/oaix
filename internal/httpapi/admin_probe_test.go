@@ -219,28 +219,44 @@ func TestProbeTokenAgentIdentityPreservesUpstream402AndDisables(t *testing.T) {
 }
 
 func TestProbeTokenDisablesInactiveSelectedWorkspaceMember(t *testing.T) {
-	upstreamBody := `{"error":{"message":"Personal access token owner is not an active member of the selected workspace.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, upstreamBody)
-	}))
-	defer upstream.Close()
-
-	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
-	result := app.probeTokenWithAccess(t.Context(), store.Token{
-		ID:          14537,
-		AccessToken: "inactive-workspace-member-token",
-	}, defaultAdminProbeModel)
-
-	if result["outcome"] != "disabled" || result["status_code"] != http.StatusForbidden {
-		t.Fatalf("probe result = %#v", result)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "not active in selected workspace",
+			body: `{"error":{"message":"Personal access token owner is not an active member of the selected workspace.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`,
+		},
+		{
+			name: "personal access token owner inactive",
+			body: `{"error":{"message":"Personal access token owner is inactive.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`,
+		},
 	}
-	if result["error_code"] != "biscuit_baker_service_auth_credential_error_status" || result["raw_response"] != upstreamBody {
-		t.Fatalf("upstream evidence was not preserved: %#v", result)
-	}
-	if message := fmt.Sprint(result["message"]); !strings.Contains(message, "已不在所选工作区中") {
-		t.Fatalf("message = %q", message)
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer upstream.Close()
+
+			app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+			result := app.probeTokenWithAccess(t.Context(), store.Token{
+				ID:          int64(14537 + index),
+				AccessToken: "inactive-workspace-member-token",
+			}, defaultAdminProbeModel)
+
+			if result["outcome"] != "disabled" || result["status_code"] != http.StatusForbidden {
+				t.Fatalf("probe result = %#v", result)
+			}
+			if result["error_code"] != "biscuit_baker_service_auth_credential_error_status" || result["raw_response"] != test.body {
+				t.Fatalf("upstream evidence was not preserved: %#v", result)
+			}
+			if message := fmt.Sprint(result["message"]); !strings.Contains(message, "已不在所选工作区中") {
+				t.Fatalf("message = %q", message)
+			}
+		})
 	}
 }
 

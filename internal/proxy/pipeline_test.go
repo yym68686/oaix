@@ -1731,7 +1731,7 @@ func TestProxyDeactivatesAndRetriesAfterInactiveWorkspaceMember403(t *testing.T)
 		case "Bearer inactive-member-token":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = io.WriteString(w, `{"error":{"message":"Personal access token owner is not an active member of the selected workspace.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`)
+			_, _ = io.WriteString(w, `{"error":{"message":"Personal access token owner is inactive.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`)
 		case "Bearer good-token":
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, strings.Join([]string{

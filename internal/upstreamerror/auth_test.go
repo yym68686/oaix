@@ -69,6 +69,12 @@ func TestIsInactiveWorkspaceMember(t *testing.T) {
 	}{
 		{name: "exact permanent membership failure", status: http.StatusForbidden, body: exact, want: true},
 		{
+			name:   "inactive personal access token owner",
+			status: http.StatusForbidden,
+			body:   `{"error":{"code":"biscuit_baker_service_auth_credential_error_status","message":"Personal access token owner is inactive."},"status":403}`,
+			want:   true,
+		},
+		{
 			name:   "structured fields are case insensitive and trimmed",
 			status: http.StatusForbidden,
 			body:   `{"error":{"code":" BISCUIT_BAKER_SERVICE_AUTH_CREDENTIAL_ERROR_STATUS ","message":" personal ACCESS token OWNER is not an ACTIVE member of the selected WORKSPACE. "}}`,

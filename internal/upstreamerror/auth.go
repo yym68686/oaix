@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	inactiveWorkspaceMemberCode    = "biscuit_baker_service_auth_credential_error_status"
-	inactiveWorkspaceMemberMessage = "Personal access token owner is not an active member of the selected workspace."
+	inactiveWorkspaceMemberCode     = "biscuit_baker_service_auth_credential_error_status"
+	inactiveWorkspaceMemberMessage  = "Personal access token owner is not an active member of the selected workspace."
+	inactiveAccessTokenOwnerMessage = "Personal access token owner is inactive."
 )
 
 // IsTokenInvalidated reports whether an upstream HTTP response contains the
@@ -47,6 +48,10 @@ func IsInactiveWorkspaceMember(status int, body []byte) bool {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(payload.Error.Code), inactiveWorkspaceMemberCode) &&
-		strings.EqualFold(strings.TrimSpace(payload.Error.Message), inactiveWorkspaceMemberMessage)
+	if !strings.EqualFold(strings.TrimSpace(payload.Error.Code), inactiveWorkspaceMemberCode) {
+		return false
+	}
+	message := strings.TrimSpace(payload.Error.Message)
+	return strings.EqualFold(message, inactiveWorkspaceMemberMessage) ||
+		strings.EqualFold(message, inactiveAccessTokenOwnerMessage)
 }

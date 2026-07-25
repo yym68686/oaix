@@ -222,6 +222,9 @@ func TestQuotaResponseShouldDisableOnlyForPermanentSignals(t *testing.T) {
 	if !quotaResponseShouldDisable(http.StatusForbidden, inactiveMember) {
 		t.Fatal("inactive selected workspace membership should disable token")
 	}
+	if !quotaResponseShouldDisable(http.StatusForbidden, []byte(`{"error":{"code":"biscuit_baker_service_auth_credential_error_status","message":"Personal access token owner is inactive."},"status":403}`)) {
+		t.Fatal("inactive personal access token owner should disable token")
+	}
 	if quotaResponseShouldDisable(http.StatusForbidden, []byte(`{"error":{"code":"biscuit_baker_service_auth_credential_error_status","message":"Credential rejected."}}`)) {
 		t.Fatal("other biscuit baker credential failures should not disable token")
 	}
