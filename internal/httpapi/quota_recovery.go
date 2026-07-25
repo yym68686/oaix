@@ -12,6 +12,7 @@ import (
 
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/store"
+	"github.com/yym68686/oaix/internal/upstreamerror"
 )
 
 type quotaRecoveryStore interface {
@@ -21,6 +22,7 @@ type quotaRecoveryStore interface {
 	GetToken(context.Context, int64) (*store.Token, error)
 	CompleteQuotaRecovery(context.Context, store.QuotaRecoveryClaim, store.QuotaRecoveryCredentialFence, map[string]any) (bool, error)
 	ApplyQuotaRecoveryUsageLimit(context.Context, store.QuotaRecoveryClaim, store.QuotaRecoveryCredentialFence, *time.Time, time.Duration, string, map[string]any) (bool, *time.Time, error)
+	DisableQuotaRecovery(context.Context, store.QuotaRecoveryClaim, store.QuotaRecoveryCredentialFence, string, bool, int, map[string]any) (bool, error)
 	RecordQuotaRecoveryResult(context.Context, store.QuotaRecoveryClaim, store.QuotaRecoveryResult) error
 }
 
@@ -87,10 +89,12 @@ type quotaRecoveryStats struct {
 	FreshQuotaErrorSkips         int64            `json:"fresh_quota_error_skips"`
 	FreshQuotaErrorSkipsByReason map[string]int64 `json:"fresh_quota_error_skips_by_reason"`
 	CapacityPositive             int64            `json:"capacity_positive"`
+	QuotaErrorProbes             int64            `json:"quota_error_probes"`
 	ProbesStarted                int64            `json:"probes_started"`
 	ProbeCompleted               int64            `json:"probe_completed"`
 	Reactivated                  int64            `json:"reactivated"`
 	UsageLimited                 int64            `json:"usage_limited"`
+	Disabled                     int64            `json:"disabled"`
 	Inconclusive                 int64            `json:"inconclusive"`
 	StateConflicts               int64            `json:"state_conflicts"`
 	PersistenceErrors            int64            `json:"persistence_errors"`
@@ -117,10 +121,12 @@ type quotaRecoveryWorker struct {
 	quotaCheckErrors     atomic.Int64
 	freshQuotaErrorSkips atomic.Int64
 	capacityPositive     atomic.Int64
+	quotaErrorProbes     atomic.Int64
 	probesStarted        atomic.Int64
 	probeCompleted       atomic.Int64
 	reactivated          atomic.Int64
 	usageLimited         atomic.Int64
+	disabled             atomic.Int64
 	inconclusive         atomic.Int64
 	stateConflicts       atomic.Int64
 	persistenceErrors    atomic.Int64
@@ -239,9 +245,12 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 	now := time.Now().UTC()
 	selected := make([]store.QuotaRecoveryCandidate, 0, w.cfg.BatchSize)
 	selectedIDs := make(map[int64]struct{}, w.cfg.BatchSize)
-	// A fresh positive UI snapshot already gives us the signal the user cares
-	// about. Scan the whole candidate set for those first so stale/zero entries
-	// near the front cannot consume the batch and delay a real recovery.
+	// A fresh positive UI snapshot or a fresh quota error already gives us an
+	// actionable signal. Scan the whole candidate set for those first so
+	// stale/zero entries near the front cannot consume the batch and delay a
+	// strict model probe. Quota errors must be probed instead of waiting for the
+	// snapshot to become stale: the UI refresh loop can keep an error snapshot
+	// fresh indefinitely.
 	for _, candidate := range candidates {
 		if len(selected) >= w.cfg.BatchSize {
 			break
@@ -252,7 +261,7 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 		if !candidate.CooldownUntil.After(now.Add(quotaRecoveryMinimumLeadTime)) {
 			continue
 		}
-		if snapshot, fresh := w.snapshotForCandidate(candidate, now); fresh && quotaSnapshotHasCapacity(snapshot) {
+		if snapshot, fresh := w.snapshotForCandidate(candidate, now); fresh && quotaSnapshotNeedsProbe(snapshot) {
 			selected = append(selected, candidate)
 			selectedIDs[candidate.TokenID] = struct{}{}
 		}
@@ -273,14 +282,7 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 		if !candidate.CooldownUntil.After(now.Add(quotaRecoveryMinimumLeadTime)) {
 			continue
 		}
-		if snapshot, fresh := w.snapshotForCandidate(candidate, now); fresh {
-			if snapshot != nil && snapshot.Error != nil {
-				reason := snapshot.recoveryErrorReason
-				if reason == "" {
-					reason = quotaRecoveryCheckErrorFreshSnapshotUnknown
-				}
-				w.recordFreshQuotaErrorSkip(reason)
-			}
+		if _, fresh := w.snapshotForCandidate(candidate, now); fresh {
 			continue
 		}
 		if next, ok := w.nextCheck[candidate.TokenID]; ok && next.After(now) {
@@ -315,6 +317,7 @@ func (w *quotaRecoveryWorker) scan(parent context.Context) {
 func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate store.QuotaRecoveryCandidate) {
 	now := time.Now().UTC()
 	snapshot, fresh := w.snapshotForCandidate(candidate, now)
+	quotaErrorProbe := snapshot != nil && snapshot.Error != nil
 	var checkLease *store.QuotaRecoveryCheckLease
 	releaseCheckLease := func() {
 		if checkLease == nil {
@@ -351,13 +354,17 @@ func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate st
 		}
 		if snapshot.Error != nil {
 			w.recordQuotaCheckError(failureReason)
-			return
+			quotaErrorProbe = true
 		}
 	}
-	if !quotaSnapshotHasCapacity(snapshot) {
+	if !quotaErrorProbe && !quotaSnapshotHasCapacity(snapshot) {
 		return
 	}
-	w.capacityPositive.Add(1)
+	if quotaErrorProbe {
+		w.quotaErrorProbes.Add(1)
+	} else {
+		w.capacityPositive.Add(1)
+	}
 	claim, nextEligibleAt, err := w.store.BeginQuotaRecoveryProbe(ctx, candidate, w.cfg.ProbeRetryInterval, quotaRecoveryMinimumLeadTime)
 	// The durable probe claim now prevents duplicate model probes. Release the
 	// session advisory lock before the potentially long upstream model request.
@@ -432,6 +439,32 @@ func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate st
 				"owner_user_id", claim.OwnerUserID,
 				"cooldown_until", appliedUntil,
 				"explicit_reset", attempt.UsageLimit.ExplicitReset,
+			)
+		}
+	case tokenProbeDisabled:
+		clearAccess := upstreamerror.IsTokenInvalidated(attempt.StatusCode, []byte(attempt.RawResponse)) ||
+			upstreamerror.IsTokenExpired(attempt.StatusCode, []byte(attempt.RawResponse))
+		applied, err := w.store.DisableQuotaRecovery(ctx, *claim, fence, attempt.Detail, clearAccess, attempt.StatusCode, metadata)
+		if err != nil {
+			w.persistenceErrors.Add(1)
+			if w.logger != nil && ctx.Err() == nil {
+				w.logger.Warn("automatic quota recovery disable failed", "token_id", claim.TokenID, "error", err)
+			}
+			return
+		}
+		if !applied {
+			w.stateConflicts.Add(1)
+			return
+		}
+		w.disabled.Add(1)
+		w.refreshRecoveredToken(ctx, *claim)
+		if w.logger != nil {
+			w.logger.Info("automatic quota recovery disabled token",
+				"token_id", claim.TokenID,
+				"owner_user_id", claim.OwnerUserID,
+				"status_code", attempt.StatusCode,
+				"error_code", attempt.ErrorCode,
+				"credential_access_cleared", clearAccess,
 			)
 		}
 	default:
@@ -524,10 +557,12 @@ func (w *quotaRecoveryWorker) Stats() quotaRecoveryStats {
 		FreshQuotaErrorSkips:         freshQuotaErrorSkips,
 		FreshQuotaErrorSkipsByReason: freshQuotaErrorSkipsByReason,
 		CapacityPositive:             w.capacityPositive.Load(),
+		QuotaErrorProbes:             w.quotaErrorProbes.Load(),
 		ProbesStarted:                w.probesStarted.Load(),
 		ProbeCompleted:               w.probeCompleted.Load(),
 		Reactivated:                  w.reactivated.Load(),
 		UsageLimited:                 w.usageLimited.Load(),
+		Disabled:                     w.disabled.Load(),
 		Inconclusive:                 w.inconclusive.Load(),
 		StateConflicts:               w.stateConflicts.Load(),
 		PersistenceErrors:            w.persistenceErrors.Load(),
@@ -623,6 +658,10 @@ func quotaSnapshotHasCapacity(snapshot *codexQuotaSnapshot) bool {
 		}
 	}
 	return true
+}
+
+func quotaSnapshotNeedsProbe(snapshot *codexQuotaSnapshot) bool {
+	return snapshot != nil && (snapshot.Error != nil || quotaSnapshotHasCapacity(snapshot))
 }
 
 func quotaRecoveryProbeMetadata(snapshot *codexQuotaSnapshot, attempt tokenProbeAttempt) map[string]any {

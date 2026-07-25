@@ -18,6 +18,7 @@ const (
 	QuotaRecoveryProbeStartedEvent = "quota_recovery_probe_started"
 	QuotaRecoveryReactivatedEvent  = "quota_recovery_reactivated"
 	QuotaRecoveryUsageLimitedEvent = "quota_recovery_usage_limited"
+	QuotaRecoveryDisabledEvent     = "quota_recovery_disabled"
 	QuotaRecoveryInconclusiveEvent = "quota_recovery_inconclusive"
 	TokenUsageLimitConfirmedEvent  = "usage_limit_confirmed"
 	QuotaRecoveryModel             = "gpt-5.4-mini"
@@ -415,6 +416,81 @@ func (s *Store) ApplyQuotaRecoveryUsageLimit(ctx context.Context, claim QuotaRec
 		return nil
 	})
 	return applied, appliedCooldown, err
+}
+
+func (s *Store) DisableQuotaRecovery(ctx context.Context, claim QuotaRecoveryClaim, fence QuotaRecoveryCredentialFence, reason string, clearAccess bool, statusCode int, metadata map[string]any) (bool, error) {
+	applied := false
+	reason = truncate(strings.TrimSpace(reason), 4000)
+	if reason == "" {
+		reason = "automatic quota recovery probe confirmed token is disabled"
+	}
+	err := s.WithTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		ownerUserID, matches, err := quotaRecoveryClaimMatches(ctx, tx, claim, fence)
+		if err != nil || !matches {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			update codex_tokens
+			set last_error = $3,
+			    is_active = false,
+			    disabled_at = now(),
+			    cooldown_until = null,
+			    access_token = case when $4 then null else access_token end,
+			    updated_at = now()
+			where id = $1
+			  and is_active = true
+			  and disabled_at is null
+			  and merged_into_token_id is null
+			  and cooldown_until = $2
+		`, claim.TokenID, claim.CooldownUntil, reason, clearAccess)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return nil
+		}
+		if clearAccess {
+			if _, err := tx.Exec(ctx, `
+				update token_secrets
+				set access_token = null, updated_at = now()
+				where token_id = $1
+			`, claim.TokenID); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			insert into token_runtime_state(
+				token_id, owner_user_id, cooldown_until, disabled_reason,
+				failure_streak, last_failure_at, updated_at
+			)
+			values ($1, $2, null, $3, 1, now(), now())
+			on conflict (token_id) do update
+			set owner_user_id = coalesce(excluded.owner_user_id, token_runtime_state.owner_user_id),
+			    cooldown_until = null,
+			    disabled_reason = excluded.disabled_reason,
+			    failure_streak = token_runtime_state.failure_streak + 1,
+			    last_failure_at = now(),
+			    updated_at = now()
+		`, claim.TokenID, nullableOwnerID(ownerUserID), reason); err != nil {
+			return err
+		}
+		metadata = quotaRecoveryMetadata(claim, metadata)
+		metadata["source"] = "automatic_quota_recovery"
+		metadata["credential_access_cleared"] = clearAccess
+		if _, err := tx.Exec(ctx, `
+			insert into token_state_events(
+				token_id, owner_user_id, event_type, reason, model, status_code,
+				previous_is_active, next_is_active, metadata
+			)
+			values ($1, $2, $3, $4, $5, nullif($6, 0), true, false, $7)
+		`, claim.TokenID, nullableOwnerID(ownerUserID), QuotaRecoveryDisabledEvent,
+			reason, QuotaRecoveryModel, statusCode, jsonBytes(metadata)); err != nil {
+			return err
+		}
+		applied = true
+		return nil
+	})
+	return applied, err
 }
 
 func (s *Store) RecordQuotaRecoveryResult(ctx context.Context, claim QuotaRecoveryClaim, result QuotaRecoveryResult) error {

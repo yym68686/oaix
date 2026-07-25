@@ -66,7 +66,7 @@
 - `IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS`: `gpt-image-2` 撞到上游 `input-images` 短速率限制且未返回明确重试时间时的 scoped 冷却秒数，默认 `5`
 - `IMAGE_RATE_LIMIT_MIN_COOLDOWN_SECONDS`: 解析到 `Please try again in ...` 时的最小 scoped 冷却秒数，默认 `1`
 - `DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS`: 429 且没有明确重置时间时的默认冷却秒数，默认 `300`
-- `OAIX_AUTO_QUOTA_RECOVERY_ENABLED`: 是否后台检查仍处于 usage-limit 冷却、但原始额度窗口均已大于 `0` 的账号，并用固定 `gpt-5.4-mini` 完整请求验证后提前恢复，默认 `true`
+- `OAIX_AUTO_QUOTA_RECOVERY_ENABLED`: 是否后台检查仍处于 usage-limit 冷却、但原始额度窗口均已大于 `0` 或额度查询报错的账号，并用固定 `gpt-5.4-mini` 完整请求验证；成功时提前恢复，明确永久凭据错误时自动禁用，默认 `true`
 - `OAIX_AUTO_QUOTA_RECOVERY_STARTUP_DELAY_SECONDS`: 自动额度恢复首次扫描前等待秒数，默认 `30`
 - `OAIX_AUTO_QUOTA_RECOVERY_SCAN_INTERVAL_SECONDS`: 自动额度恢复候选扫描间隔秒数，默认 `30`
 - `OAIX_AUTO_QUOTA_RECOVERY_RECHECK_INTERVAL_SECONDS`: 同一冷却账号主动重查额度的最小间隔秒数，默认 `900`

@@ -123,6 +123,67 @@ func TestPostgresQuotaRecoveryStateFences(t *testing.T) {
 		t.Fatalf("matching disable was not atomic: active=%v disabled_at=%v cooldown=%v token_access=%v secret_access=%v", disabledActive, disabledAt, disabledCooldownAfter, disabledAccess, secretAccess)
 	}
 
+	automaticID, automaticCooldown := insertToken("automatic-disabled", "access-automatic", "refresh-automatic", &future, true)
+	var sourceEventID int64
+	if err := db.pool.QueryRow(ctx, `
+		insert into token_state_events(
+			token_id, event_type, reason, cooldown_until, status_code,
+			previous_is_active, next_is_active
+		)
+		values ($1, 'error', 'upstream usage limit cooldown', $2, 429, true, true)
+		returning id
+	`, automaticID, automaticCooldown).Scan(&sourceEventID); err != nil {
+		t.Fatalf("insert automatic recovery source event: %v", err)
+	}
+	claim, _, err := db.BeginQuotaRecoveryProbe(ctx, QuotaRecoveryCandidate{
+		TokenID: automaticID, CooldownUntil: *automaticCooldown, SourceEventID: sourceEventID,
+	}, time.Minute, 0)
+	if err != nil || claim == nil {
+		t.Fatalf("begin automatic disable probe: claim=%+v err=%v", claim, err)
+	}
+	applied, err := db.DisableQuotaRecovery(ctx, *claim, QuotaRecoveryCredentialFence{
+		AccessToken: "access-automatic", RefreshToken: "refresh-automatic", AccountID: "acct-automatic-disabled-" + suffix,
+	}, "HTTP 401: token_expired", true, 401, map[string]any{"probe_outcome": "disabled"})
+	if err != nil || !applied {
+		t.Fatalf("apply automatic recovery disable: applied=%v err=%v", applied, err)
+	}
+	var automaticActive bool
+	var automaticDisabledAt *time.Time
+	var automaticCooldownAfter *time.Time
+	var automaticAccess *string
+	var automaticSecretAccess *string
+	var automaticEventType string
+	var automaticEventSource string
+	var automaticPreviousActive bool
+	var automaticNextActive bool
+	if err := db.pool.QueryRow(ctx, `
+		select t.is_active, t.disabled_at, t.cooldown_until, t.access_token,
+		       s.access_token, e.event_type, e.metadata->>'source',
+		       e.previous_is_active, e.next_is_active
+		from codex_tokens t
+		join token_secrets s on s.token_id = t.id
+		join lateral (
+			select event_type, metadata, previous_is_active, next_is_active
+			from token_state_events
+			where token_id = t.id
+			order by id desc
+			limit 1
+		) e on true
+		where t.id = $1
+	`, automaticID).Scan(
+		&automaticActive, &automaticDisabledAt, &automaticCooldownAfter, &automaticAccess,
+		&automaticSecretAccess, &automaticEventType, &automaticEventSource,
+		&automaticPreviousActive, &automaticNextActive,
+	); err != nil {
+		t.Fatalf("read automatic recovery disable: %v", err)
+	}
+	if automaticActive || automaticDisabledAt == nil || automaticCooldownAfter != nil || automaticAccess != nil || automaticSecretAccess != nil ||
+		automaticEventType != QuotaRecoveryDisabledEvent || automaticEventSource != "automatic_quota_recovery" || !automaticPreviousActive || automaticNextActive {
+		t.Fatalf("automatic recovery disable was not atomic or auditable: active=%v disabled_at=%v cooldown=%v token_access=%v secret_access=%v event=%q source=%q previous=%v next=%v",
+			automaticActive, automaticDisabledAt, automaticCooldownAfter, automaticAccess, automaticSecretAccess,
+			automaticEventType, automaticEventSource, automaticPreviousActive, automaticNextActive)
+	}
+
 	probeID, _ := insertToken("probe-reactivate", "access-probe", "refresh-probe", nil, false)
 	var probeDisabledAt *time.Time
 	if err := db.pool.QueryRow(ctx, `select disabled_at from codex_tokens where id = $1`, probeID).Scan(&probeDisabledAt); err != nil {

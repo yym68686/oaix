@@ -319,9 +319,9 @@ func TestQuotaRecoveryFetchDiagnosticClassifiesHTTPClientDeadline(t *testing.T) 
 	}
 }
 
-func TestQuotaRecoveryFreshPersistedErrorSkipIsObservable(t *testing.T) {
+func TestQuotaRecoveryFreshPersistedErrorStartsProbeAndDisablesToken(t *testing.T) {
 	now := time.Now().UTC()
-	errorText := "HTTP 401: authentication_token_invalidated"
+	errorText := "HTTP 401: token_expired"
 	snapshot := codexQuotaSnapshot{FetchedAt: now, Error: &errorText, Windows: []codexQuotaWindow{}}
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
@@ -332,15 +332,89 @@ func TestQuotaRecoveryFreshPersistedErrorSkipIsObservable(t *testing.T) {
 		TokenID: 8, OwnerUserID: 9, CooldownUntil: now.Add(time.Hour), SourceEventID: 10,
 		QuotaSnapshot: raw, QuotaFetchedAt: &fetchedAt,
 	}
-	fake := &fakeQuotaRecoveryStore{candidates: []store.QuotaRecoveryCandidate{candidate}}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"Provided authentication token is expired. Please try signing in again.","type":null,"code":"token_expired","param":null},"status":401}`))
+	}))
+	defer upstream.Close()
+	fake := &fakeQuotaRecoveryStore{
+		candidates: []store.QuotaRecoveryCandidate{candidate},
+		token: store.Token{
+			ID: candidate.TokenID, OwnerUserID: candidate.OwnerUserID, AccessToken: "expired-access",
+			IsActive: true, CooldownUntil: &candidate.CooldownUntil,
+		},
+	}
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
 	worker := &quotaRecoveryWorker{
-		cfg:   config.QuotaRecoveryConfig{BatchSize: 1, Concurrency: 1, QuotaMaxAge: time.Minute},
+		app: app,
+		cfg: config.QuotaRecoveryConfig{
+			BatchSize: 1, Concurrency: 1, QuotaMaxAge: time.Minute,
+			RecheckInterval: time.Minute, ProbeRetryInterval: time.Minute,
+		},
 		store: fake, quota: &adminQuotaService{}, nextCheck: map[int64]time.Time{}, nextProbe: map[int64]time.Time{},
 	}
+	app.recovery = worker
 	worker.scan(t.Context())
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.claimCalls != 1 || fake.disableCalls != 1 || fake.completeCalls != 0 || fake.recordCalls != 0 {
+		t.Fatalf("fresh quota error did not run the strict disable probe: claims=%d disables=%d completes=%d records=%d", fake.claimCalls, fake.disableCalls, fake.completeCalls, fake.recordCalls)
+	}
+	if !fake.disabledClearAccess || fake.disabledStatus != http.StatusUnauthorized || fake.disabledFence.AccessToken != "expired-access" {
+		t.Fatalf("unexpected disable persistence: clear_access=%v status=%d fence=%+v", fake.disabledClearAccess, fake.disabledStatus, fake.disabledFence)
+	}
 	stats := worker.Stats()
-	if stats.FreshQuotaErrorSkips != 1 || stats.FreshQuotaErrorSkipsByReason[string(quotaRecoveryCheckErrorFreshSnapshotUnknown)] != 1 {
-		t.Fatalf("fresh error skip stats = %+v", stats)
+	if stats.FreshQuotaErrorSkips != 0 || stats.QuotaErrorProbes != 1 || stats.ProbesStarted != 1 || stats.Disabled != 1 {
+		t.Fatalf("fresh error probe stats = %+v", stats)
+	}
+}
+
+func TestQuotaRecoveryNewQuotaFetchErrorStillStartsStrictProbe(t *testing.T) {
+	now := time.Now().UTC()
+	quotaUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":{"message":"temporary quota endpoint failure"}}`))
+	}))
+	defer quotaUpstream.Close()
+	probeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"status":"completed","model":"gpt-5.4-mini"}}` + "\n\n"))
+	}))
+	defer probeUpstream.Close()
+
+	candidate := recoveryTestCandidate(t, now, 30, 20)
+	candidate.QuotaSnapshot = nil
+	candidate.QuotaFetchedAt = nil
+	fake := &fakeQuotaRecoveryStore{
+		candidates: []store.QuotaRecoveryCandidate{candidate},
+		token: store.Token{
+			ID: candidate.TokenID, OwnerUserID: candidate.OwnerUserID, AccessToken: "access",
+			IsActive: true, CooldownUntil: &candidate.CooldownUntil,
+		},
+	}
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: probeUpstream.URL}}}
+	worker := &quotaRecoveryWorker{
+		app: app,
+		cfg: config.QuotaRecoveryConfig{
+			BatchSize: 1, Concurrency: 1, QuotaMaxAge: time.Minute,
+			RecheckInterval: time.Minute, ProbeRetryInterval: time.Minute,
+		},
+		store: fake, quota: quotaRecoveryTestQuotaService(quotaUpstream.URL, &quotaRecoveryOAuthStub{}),
+		nextCheck: map[int64]time.Time{}, nextProbe: map[int64]time.Time{},
+	}
+	app.recovery = worker
+	worker.scan(t.Context())
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.claimCalls != 1 || fake.completeCalls != 1 || fake.disableCalls != 0 || fake.recordCalls != 0 {
+		t.Fatalf("new quota error did not run the strict recovery probe: claims=%d completes=%d disables=%d records=%d", fake.claimCalls, fake.completeCalls, fake.disableCalls, fake.recordCalls)
+	}
+	stats := worker.Stats()
+	if stats.QuotaChecks != 1 || stats.QuotaCheckErrors != 1 || stats.QuotaErrorProbes != 1 || stats.Reactivated != 1 {
+		t.Fatalf("new quota error probe stats = %+v", stats)
 	}
 }
 
@@ -685,20 +759,25 @@ func float64Pointer(value float64) *float64 {
 }
 
 type fakeQuotaRecoveryStore struct {
-	mu             sync.Mutex
-	candidates     []store.QuotaRecoveryCandidate
-	token          store.Token
-	rejectClaims   bool
-	nextEligibleAt *time.Time
-	claimCalls     int
-	completeCalls  int
-	usageCalls     int
-	recordCalls    int
-	completedFence store.QuotaRecoveryCredentialFence
-	leaseErr       error
-	leaseContended bool
-	nilToken       bool
-	getTokenErr    error
+	mu                  sync.Mutex
+	candidates          []store.QuotaRecoveryCandidate
+	token               store.Token
+	rejectClaims        bool
+	nextEligibleAt      *time.Time
+	claimCalls          int
+	completeCalls       int
+	usageCalls          int
+	disableCalls        int
+	recordCalls         int
+	completedFence      store.QuotaRecoveryCredentialFence
+	disabledFence       store.QuotaRecoveryCredentialFence
+	disabledReason      string
+	disabledClearAccess bool
+	disabledStatus      int
+	leaseErr            error
+	leaseContended      bool
+	nilToken            bool
+	getTokenErr         error
 }
 
 func (s *fakeQuotaRecoveryStore) ListQuotaRecoveryCandidates(context.Context) ([]store.QuotaRecoveryCandidate, error) {
@@ -760,6 +839,17 @@ func (s *fakeQuotaRecoveryStore) ApplyQuotaRecoveryUsageLimit(context.Context, s
 	defer s.mu.Unlock()
 	s.usageCalls++
 	return true, nil, nil
+}
+
+func (s *fakeQuotaRecoveryStore) DisableQuotaRecovery(_ context.Context, _ store.QuotaRecoveryClaim, fence store.QuotaRecoveryCredentialFence, reason string, clearAccess bool, statusCode int, _ map[string]any) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.disableCalls++
+	s.disabledFence = fence
+	s.disabledReason = reason
+	s.disabledClearAccess = clearAccess
+	s.disabledStatus = statusCode
+	return true, nil
 }
 
 func (s *fakeQuotaRecoveryStore) RecordQuotaRecoveryResult(context.Context, store.QuotaRecoveryClaim, store.QuotaRecoveryResult) error {

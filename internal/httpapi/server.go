@@ -344,6 +344,7 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"checked\"} %d\n", recoveryStats.QuotaChecks)
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"error\"} %d\n", recoveryStats.QuotaCheckErrors)
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"capacity_positive\"} %d\n", recoveryStats.CapacityPositive)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_quota_checks_total{outcome=\"quota_error_probe\"} %d\n", recoveryStats.QuotaErrorProbes)
 	_, _ = fmt.Fprintf(w, "# HELP oaix_quota_recovery_check_errors_total Automatic quota recovery check failures by fixed reason.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_quota_recovery_check_errors_total counter\n")
 	for _, reason := range quotaRecoveryCheckErrorReasons {
@@ -360,6 +361,7 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"completed\"} %d\n", recoveryStats.ProbeCompleted)
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"reactivated\"} %d\n", recoveryStats.Reactivated)
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"usage_limited\"} %d\n", recoveryStats.UsageLimited)
+	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"disabled\"} %d\n", recoveryStats.Disabled)
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"inconclusive\"} %d\n", recoveryStats.Inconclusive)
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"state_conflict\"} %d\n", recoveryStats.StateConflicts)
 	_, _ = fmt.Fprintf(w, "oaix_quota_recovery_probes_total{outcome=\"persistence_error\"} %d\n", recoveryStats.PersistenceErrors)
