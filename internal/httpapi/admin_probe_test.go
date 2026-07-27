@@ -286,6 +286,37 @@ func TestProbeTokenDisablesExpiredAuthenticationToken(t *testing.T) {
 	}
 }
 
+func TestProbeTokenDisablesDeletedAgentRuntime(t *testing.T) {
+	credentials := probeAgentIdentityCredentials(t, "task-deleted")
+	upstreamBody := `{"error":{"message":"Agent runtime has been deleted.","type":null,"code":"biscuit_baker_service_agent_error_status","param":null},"status":403}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:            14540,
+		RefreshToken:  credentials.IdentityToken(),
+		AgentIdentity: &credentials,
+	}, defaultAdminProbeModel)
+
+	if result["outcome"] != "disabled" || result["status_code"] != http.StatusForbidden {
+		t.Fatalf("probe result = %#v", result)
+	}
+	if result["error_code"] != "biscuit_baker_service_agent_error_status" || result["raw_response"] != upstreamBody {
+		t.Fatalf("upstream evidence was not preserved: %#v", result)
+	}
+	if result["credential_mode"] != probeCredentialModeAgentIdentity {
+		t.Fatalf("credential mode = %#v", result["credential_mode"])
+	}
+	if message := fmt.Sprint(result["message"]); !strings.Contains(message, "Agent runtime 已被删除") {
+		t.Fatalf("message = %q", message)
+	}
+}
+
 func TestProbeTokenAgentIdentityAuthRejectionUsesCredentialSpecificMessage(t *testing.T) {
 	credentials := probeAgentIdentityCredentials(t, "task-ready")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -161,6 +161,7 @@ const (
 	OutcomeUpstream400ModelCapabilityLoss Outcome = "upstream_400_model_capability_loss"
 	OutcomeUpstream402Deactivated         Outcome = "upstream_402_deactivated_workspace"
 	OutcomeUpstream403InactiveMember      Outcome = "upstream_403_inactive_workspace_member"
+	OutcomeUpstream403AgentRuntimeDeleted Outcome = "upstream_403_agent_runtime_deleted"
 	OutcomeUpstream403Invalid             Outcome = "upstream_403_invalid"
 	OutcomeUpstream4xx                    Outcome = "upstream_4xx"
 	OutcomeUpstream5xx                    Outcome = "upstream_5xx"
@@ -644,6 +645,18 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream403InactiveMember, retry, true, nil)
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403InactiveMember, attemptID))
+			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+			excluded[claim.TokenID()] = struct{}{}
+			if attempt < p.cfg.Upstream.MaxRetries {
+				continue
+			}
+			break
+		}
+		if upstreamerror.IsAgentRuntimeDeleted(status, result.ErrorBody) {
+			message := "terminal upstream status 403: biscuit_baker_service_agent_error_status (agent runtime deleted)"
+			lastErr = errors.New(message)
+			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream403AgentRuntimeDeleted, retry, true, nil)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403AgentRuntimeDeleted, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < p.cfg.Upstream.MaxRetries {

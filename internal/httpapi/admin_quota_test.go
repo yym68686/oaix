@@ -235,6 +235,13 @@ func TestQuotaResponseShouldDisableOnlyForPermanentSignals(t *testing.T) {
 	if quotaResponseShouldDisable(http.StatusForbidden, []byte(`{"error":{"code":"biscuit_baker_service_auth_credential_error_status","message":"Credential rejected."}}`)) {
 		t.Fatal("other biscuit baker credential failures should not disable token")
 	}
+	deletedAgentRuntime := []byte(`{"error":{"message":"Agent runtime has been deleted.","type":null,"code":"biscuit_baker_service_agent_error_status","param":null},"status":403}`)
+	if !quotaResponseShouldDisable(http.StatusForbidden, deletedAgentRuntime) {
+		t.Fatal("deleted agent runtime should disable token")
+	}
+	if quotaResponseShouldDisable(http.StatusForbidden, []byte(`{"error":{"code":"biscuit_baker_service_agent_error_status","message":"Agent runtime is temporarily unavailable."}}`)) {
+		t.Fatal("other biscuit baker agent failures should not disable token")
+	}
 }
 
 func TestQuotaFetchDoesNotRefreshExplicitTokenInvalidated(t *testing.T) {

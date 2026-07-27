@@ -370,6 +370,61 @@ func TestQuotaRecoveryFreshPersistedErrorStartsProbeAndDisablesToken(t *testing.
 	}
 }
 
+func TestQuotaRecoveryFreshDeletedAgentRuntimeErrorDisablesToken(t *testing.T) {
+	now := time.Now().UTC()
+	errorText := "HTTP 403: Agent runtime has been deleted."
+	snapshot := codexQuotaSnapshot{FetchedAt: now, Error: &errorText, Windows: []codexQuotaWindow{}}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetchedAt := now
+	candidate := store.QuotaRecoveryCandidate{
+		TokenID: 11, OwnerUserID: 12, CooldownUntil: now.Add(time.Hour), SourceEventID: 13,
+		QuotaSnapshot: raw, QuotaFetchedAt: &fetchedAt,
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"Agent runtime has been deleted.","type":null,"code":"biscuit_baker_service_agent_error_status","param":null},"status":403}`))
+	}))
+	defer upstream.Close()
+	fake := &fakeQuotaRecoveryStore{
+		candidates: []store.QuotaRecoveryCandidate{candidate},
+		token: store.Token{
+			ID: candidate.TokenID, OwnerUserID: candidate.OwnerUserID, AccessToken: "deleted-runtime-access",
+			IsActive: true, CooldownUntil: &candidate.CooldownUntil,
+		},
+	}
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	worker := &quotaRecoveryWorker{
+		app: app,
+		cfg: config.QuotaRecoveryConfig{
+			BatchSize: 1, Concurrency: 1, QuotaMaxAge: time.Minute,
+			RecheckInterval: time.Minute, ProbeRetryInterval: time.Minute,
+		},
+		store: fake, quota: &adminQuotaService{}, nextCheck: map[int64]time.Time{}, nextProbe: map[int64]time.Time{},
+	}
+	app.recovery = worker
+	worker.scan(t.Context())
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.claimCalls != 1 || fake.disableCalls != 1 || fake.completeCalls != 0 || fake.recordCalls != 0 {
+		t.Fatalf("deleted Agent runtime did not run the strict disable probe: claims=%d disables=%d completes=%d records=%d", fake.claimCalls, fake.disableCalls, fake.completeCalls, fake.recordCalls)
+	}
+	if fake.disabledClearAccess || fake.disabledStatus != http.StatusForbidden || fake.disabledFence.AccessToken != "deleted-runtime-access" {
+		t.Fatalf("unexpected disable persistence: clear_access=%v status=%d fence=%+v", fake.disabledClearAccess, fake.disabledStatus, fake.disabledFence)
+	}
+	if !strings.Contains(fake.disabledReason, "Agent runtime has been deleted") {
+		t.Fatalf("disable reason = %q", fake.disabledReason)
+	}
+	stats := worker.Stats()
+	if stats.QuotaErrorProbes != 1 || stats.ProbesStarted != 1 || stats.Disabled != 1 || stats.PersistenceErrors != 0 {
+		t.Fatalf("deleted Agent runtime probe stats = %+v", stats)
+	}
+}
+
 func TestQuotaRecoveryNewQuotaFetchErrorStillStartsStrictProbe(t *testing.T) {
 	now := time.Now().UTC()
 	quotaUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
