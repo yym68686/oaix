@@ -1224,6 +1224,9 @@ func quotaErrorSnapshotForRecovery(fetchedAt time.Time, message string, reason q
 }
 
 func quotaRecoveryHTTPErrorReason(status int, body []byte, detail string) quotaRecoveryCheckErrorReason {
+	if upstreamerror.IsInactivePersonalAccessToken(status, body) {
+		return quotaRecoveryCheckErrorAccessTokenInactive
+	}
 	if status >= 400 && status < 500 {
 		signals := quotaRecoveryStructuredErrorSignals(body)
 		signals = append(signals, strings.ToLower(detail))
@@ -1340,6 +1343,9 @@ func quotaResponseShouldDisable(status int, body []byte) bool {
 		return true
 	}
 	if upstreamerror.IsTokenExpired(status, body) {
+		return true
+	}
+	if upstreamerror.IsInactivePersonalAccessToken(status, body) {
 		return true
 	}
 	if upstreamerror.IsInactiveWorkspaceMember(status, body) {

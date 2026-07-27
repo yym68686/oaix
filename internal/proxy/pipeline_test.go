@@ -1822,6 +1822,100 @@ func TestProxyDeactivatesAndRetriesAfterInactiveWorkspaceMember403(t *testing.T)
 	}
 }
 
+func TestProxyDeactivatesAndRetriesAfterInactivePersonalAccessToken403(t *testing.T) {
+	var mu sync.Mutex
+	var authHeaders []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		authHeaders = append(authHeaders, auth)
+		mu.Unlock()
+		switch auth {
+		case "Bearer inactive-personal-access-token":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":{"message":"Personal access token is inactive.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`)
+		case "Bearer good-token":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, strings.Join([]string{
+				`event: response.completed`,
+				`data: {"type":"response.completed","response":{"id":"resp_retry","object":"response","model":"gpt-5.5","status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+				``,
+			}, "\n"))
+		default:
+			t.Fatalf("unexpected authorization header %q", auth)
+		}
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, OwnerUserID: 10, AccessToken: "good-token", IsActive: true, CreatedAt: now, UpdatedAt: now},
+			{ID: 2, OwnerUserID: 20, AccessToken: "inactive-personal-access-token", RefreshToken: "refresh-token", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorEvents: make(chan tokenErrorEvent, 1),
+	}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL, 2, fakes)
+	affinityStore := affinity.NewMemoryStore()
+	affinityStore.Put("prompt", affinity.Lane{PrimaryTokenID: 2}, time.Hour)
+	pipeline.affinity = affinityStore
+	oauthClient := &countingProxyOAuthClient{}
+	pipeline.SetOAuthClient(oauthClient)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", Stream: true})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	mu.Lock()
+	gotAuthHeaders := append([]string(nil), authHeaders...)
+	mu.Unlock()
+	if len(gotAuthHeaders) != 2 || gotAuthHeaders[0] != "Bearer inactive-personal-access-token" || gotAuthHeaders[1] != "Bearer good-token" {
+		t.Fatalf("auth headers = %v, want inactive personal access token followed by good token", gotAuthHeaders)
+	}
+	if calls := oauthClient.calls.Load(); calls != 0 {
+		t.Fatalf("OAuth refresh calls = %d, want 0 for inactive personal access token", calls)
+	}
+	select {
+	case event := <-fakes.tokenErrorEvents:
+		if event.TokenID != 2 || !event.Deactivate || event.CooldownUntil != nil {
+			t.Fatalf("unexpected token error event: %+v", event)
+		}
+		if !strings.Contains(event.Message, "personal access token inactive") {
+			t.Fatalf("message = %q", event.Message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for inactive personal access token deactivate commit")
+	}
+	deadline := time.Now().Add(time.Second)
+	for pipeline.tokens.Snapshot().ByID[2] != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("inactive personal access token remained in refreshed snapshot")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok := affinityStore.Get("prompt"); ok {
+		t.Fatal("prompt affinity still contains inactive personal access token")
+	}
+	fakes.mu.Lock()
+	attempts := append([]store.GatewayRequestAttempt(nil), fakes.attempts...)
+	fakes.mu.Unlock()
+	if len(attempts) != 2 {
+		t.Fatalf("recorded attempts = %d, want 2", len(attempts))
+	}
+	first := attempts[0]
+	if first.Outcome != string(OutcomeUpstream403TokenInactive) || !first.Deactivated || first.CooldownUntil != nil {
+		t.Fatalf("first attempt = %+v", first)
+	}
+	if first.StatusCode == nil || *first.StatusCode != http.StatusForbidden || first.ErrorCode == nil || *first.ErrorCode != "biscuit_baker_service_auth_credential_error_status" {
+		t.Fatalf("first attempt evidence = %+v", first)
+	}
+}
+
 func TestProxyDeactivatesAndRetriesAfterDeletedAgentRuntime403(t *testing.T) {
 	credentials := proxyAgentIdentityCredentials(t, "task-deleted")
 	accountID := credentials.AccountID

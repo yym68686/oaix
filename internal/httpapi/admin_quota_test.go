@@ -232,6 +232,9 @@ func TestQuotaResponseShouldDisableOnlyForPermanentSignals(t *testing.T) {
 	if !quotaResponseShouldDisable(http.StatusForbidden, []byte(`{"error":{"code":"biscuit_baker_service_auth_credential_error_status","message":"Personal access token owner is inactive."},"status":403}`)) {
 		t.Fatal("inactive personal access token owner should disable token")
 	}
+	if !quotaResponseShouldDisable(http.StatusForbidden, []byte(`{"error":{"message":"Personal access token is inactive.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`)) {
+		t.Fatal("inactive personal access token should disable token")
+	}
 	if quotaResponseShouldDisable(http.StatusForbidden, []byte(`{"error":{"code":"biscuit_baker_service_auth_credential_error_status","message":"Credential rejected."}}`)) {
 		t.Fatal("other biscuit baker credential failures should not disable token")
 	}
@@ -277,6 +280,42 @@ func TestQuotaFetchDoesNotRefreshExplicitTokenInvalidated(t *testing.T) {
 	}
 	if reason != quotaRecoveryCheckErrorAuthenticationInvalidated {
 		t.Fatalf("reason = %q, want %q", reason, quotaRecoveryCheckErrorAuthenticationInvalidated)
+	}
+}
+
+func TestQuotaFetchDoesNotRefreshInactivePersonalAccessToken(t *testing.T) {
+	upstreamBody := `{"error":{"message":"Personal access token is inactive.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	oauthClient := &countingQuotaOAuthClient{}
+	service := &adminQuotaService{
+		client:      upstream.Client(),
+		oauthClient: oauthClient,
+		usageURL:    upstream.URL,
+		ttl:         time.Minute,
+		sem:         make(chan struct{}, 1),
+		cache:       map[int64]cachedQuotaSnapshot{},
+		pending:     map[int64]struct{}{},
+	}
+	snapshot, reason := service.fetchSnapshotWithoutHistory(t.Context(), store.Token{
+		ID:           73,
+		AccessToken:  "inactive-personal-access-token",
+		RefreshToken: "refresh-token",
+	})
+
+	if oauthClient.calls != 0 {
+		t.Fatalf("OAuth refresh calls = %d, want 0", oauthClient.calls)
+	}
+	if snapshot == nil || !snapshot.Disabled {
+		t.Fatalf("snapshot should report disabled: %+v", snapshot)
+	}
+	if reason != quotaRecoveryCheckErrorAccessTokenInactive {
+		t.Fatalf("reason = %q, want %q", reason, quotaRecoveryCheckErrorAccessTokenInactive)
 	}
 }
 

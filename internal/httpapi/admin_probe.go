@@ -150,6 +150,7 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		rawResponse := []byte(attempt.RawResponse)
 		tokenInvalidated := upstreamerror.IsTokenInvalidated(statusCode, rawResponse)
 		tokenExpired := upstreamerror.IsTokenExpired(statusCode, rawResponse)
+		inactivePersonalAccessToken := upstreamerror.IsInactivePersonalAccessToken(statusCode, rawResponse)
 		agentRuntimeDeleted := upstreamerror.IsAgentRuntimeDeleted(statusCode, rawResponse)
 		clearAccess := tokenInvalidated || tokenExpired
 		failureMessage := "测试确认工作区已停用，但保存禁用状态失败。"
@@ -161,6 +162,10 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		if upstreamerror.IsInactiveWorkspaceMember(statusCode, rawResponse) {
 			failureMessage = "测试确认 Personal access token 所有者已不在所选工作区中，但保存禁用状态失败。"
 			resultMessage = "测试失败：Personal access token 所有者已不在所选工作区中，当前已标记为禁用。"
+		}
+		if inactivePersonalAccessToken {
+			failureMessage = "测试确认 Personal access token 已停用，但保存禁用状态失败。"
+			resultMessage = "测试失败：上游明确返回 Personal access token 已停用，当前已标记为禁用。"
 		}
 		if agentRuntimeDeleted {
 			failureMessage = "测试确认 Agent runtime 已被删除，但保存禁用状态失败。"

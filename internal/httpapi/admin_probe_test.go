@@ -260,6 +260,32 @@ func TestProbeTokenDisablesInactiveSelectedWorkspaceMember(t *testing.T) {
 	}
 }
 
+func TestProbeTokenDisablesInactivePersonalAccessToken(t *testing.T) {
+	upstreamBody := `{"error":{"message":"Personal access token is inactive.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	result := app.probeTokenWithAccess(t.Context(), store.Token{
+		ID:          14541,
+		AccessToken: "inactive-personal-access-token",
+	}, defaultAdminProbeModel)
+
+	if result["outcome"] != "disabled" || result["status_code"] != http.StatusForbidden {
+		t.Fatalf("probe result = %#v", result)
+	}
+	if result["error_code"] != "biscuit_baker_service_auth_credential_error_status" || result["raw_response"] != upstreamBody {
+		t.Fatalf("upstream evidence was not preserved: %#v", result)
+	}
+	if message := fmt.Sprint(result["message"]); !strings.Contains(message, "Personal access token 已停用") {
+		t.Fatalf("message = %q", message)
+	}
+}
+
 func TestProbeTokenDisablesExpiredAuthenticationToken(t *testing.T) {
 	upstreamBody := `{"error":{"message":"Provided authentication token is expired. Please try signing in again.","type":null,"code":"token_expired","param":null},"status":401}`
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

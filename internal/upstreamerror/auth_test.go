@@ -139,6 +139,43 @@ func TestIsInactiveWorkspaceMember(t *testing.T) {
 	}
 }
 
+func TestIsInactivePersonalAccessToken(t *testing.T) {
+	const exact = `{"error":{"message":"Personal access token is inactive.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "exact inactive personal access token", status: http.StatusForbidden, body: exact, want: true},
+		{
+			name:   "structured fields are case insensitive and trimmed",
+			status: http.StatusForbidden,
+			body:   `{"error":{"code":" BISCUIT_BAKER_SERVICE_AUTH_CREDENTIAL_ERROR_STATUS ","message":" personal ACCESS token is INACTIVE. "}}`,
+			want:   true,
+		},
+		{name: "same payload under another status", status: http.StatusUnauthorized, body: exact},
+		{
+			name:   "code without exact inactive token message",
+			status: http.StatusForbidden,
+			body:   `{"error":{"code":"biscuit_baker_service_auth_credential_error_status","message":"Personal access token owner is inactive."}}`,
+		},
+		{
+			name:   "message without protocol code",
+			status: http.StatusForbidden,
+			body:   `{"error":{"message":"Personal access token is inactive."}}`,
+		},
+		{name: "malformed response", status: http.StatusForbidden, body: `{"error":`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsInactivePersonalAccessToken(test.status, []byte(test.body)); got != test.want {
+				t.Fatalf("IsInactivePersonalAccessToken() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestIsAgentRuntimeDeleted(t *testing.T) {
 	const exact = `{"error":{"message":"Agent runtime has been deleted.","type":null,"code":"biscuit_baker_service_agent_error_status","param":null},"status":403}`
 	tests := []struct {

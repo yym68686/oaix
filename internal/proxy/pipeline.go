@@ -161,6 +161,7 @@ const (
 	OutcomeUpstream400ModelCapabilityLoss Outcome = "upstream_400_model_capability_loss"
 	OutcomeUpstream402Deactivated         Outcome = "upstream_402_deactivated_workspace"
 	OutcomeUpstream403InactiveMember      Outcome = "upstream_403_inactive_workspace_member"
+	OutcomeUpstream403TokenInactive       Outcome = "upstream_403_inactive_personal_access_token"
 	OutcomeUpstream403AgentRuntimeDeleted Outcome = "upstream_403_agent_runtime_deleted"
 	OutcomeUpstream403Invalid             Outcome = "upstream_403_invalid"
 	OutcomeUpstream4xx                    Outcome = "upstream_4xx"
@@ -633,6 +634,18 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream402Deactivated, retry, true, nil)
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream402Deactivated, attemptID))
+			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+			excluded[claim.TokenID()] = struct{}{}
+			if attempt < p.cfg.Upstream.MaxRetries {
+				continue
+			}
+			break
+		}
+		if upstreamerror.IsInactivePersonalAccessToken(status, result.ErrorBody) {
+			message := "terminal upstream status 403: biscuit_baker_service_auth_credential_error_status (personal access token inactive)"
+			lastErr = errors.New(message)
+			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream403TokenInactive, retry, true, nil)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403TokenInactive, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < p.cfg.Upstream.MaxRetries {

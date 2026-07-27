@@ -124,6 +124,12 @@ func TestQuotaRecoveryHTTPErrorReasonUsesFixedCredentialAndStatusClasses(t *test
 			want:   quotaRecoveryCheckErrorAccessTokenInactive,
 		},
 		{
+			name:   "structured inactive personal access token",
+			status: http.StatusForbidden,
+			body:   `{"error":{"message":"Personal access token is inactive.","code":"biscuit_baker_service_auth_credential_error_status"},"status":403}`,
+			want:   quotaRecoveryCheckErrorAccessTokenInactive,
+		},
+		{
 			name:   "invalidated authentication token",
 			status: http.StatusUnauthorized,
 			body:   `{"error":{"message":"The authentication token has been invalidated"}}`,
@@ -422,6 +428,61 @@ func TestQuotaRecoveryFreshDeletedAgentRuntimeErrorDisablesToken(t *testing.T) {
 	stats := worker.Stats()
 	if stats.QuotaErrorProbes != 1 || stats.ProbesStarted != 1 || stats.Disabled != 1 || stats.PersistenceErrors != 0 {
 		t.Fatalf("deleted Agent runtime probe stats = %+v", stats)
+	}
+}
+
+func TestQuotaRecoveryFreshInactivePersonalAccessTokenErrorDisablesToken(t *testing.T) {
+	now := time.Now().UTC()
+	errorText := "HTTP 403: Personal access token is inactive."
+	snapshot := codexQuotaSnapshot{FetchedAt: now, Error: &errorText, Windows: []codexQuotaWindow{}}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetchedAt := now
+	candidate := store.QuotaRecoveryCandidate{
+		TokenID: 14, OwnerUserID: 15, CooldownUntil: now.Add(time.Hour), SourceEventID: 16,
+		QuotaSnapshot: raw, QuotaFetchedAt: &fetchedAt,
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"Personal access token is inactive.","type":null,"code":"biscuit_baker_service_auth_credential_error_status","param":null},"status":403}`))
+	}))
+	defer upstream.Close()
+	fake := &fakeQuotaRecoveryStore{
+		candidates: []store.QuotaRecoveryCandidate{candidate},
+		token: store.Token{
+			ID: candidate.TokenID, OwnerUserID: candidate.OwnerUserID, AccessToken: "inactive-personal-access-token",
+			IsActive: true, CooldownUntil: &candidate.CooldownUntil,
+		},
+	}
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	worker := &quotaRecoveryWorker{
+		app: app,
+		cfg: config.QuotaRecoveryConfig{
+			BatchSize: 1, Concurrency: 1, QuotaMaxAge: time.Minute,
+			RecheckInterval: time.Minute, ProbeRetryInterval: time.Minute,
+		},
+		store: fake, quota: &adminQuotaService{}, nextCheck: map[int64]time.Time{}, nextProbe: map[int64]time.Time{},
+	}
+	app.recovery = worker
+	worker.scan(t.Context())
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.claimCalls != 1 || fake.disableCalls != 1 || fake.completeCalls != 0 || fake.recordCalls != 0 {
+		t.Fatalf("inactive personal access token did not run the strict disable probe: claims=%d disables=%d completes=%d records=%d", fake.claimCalls, fake.disableCalls, fake.completeCalls, fake.recordCalls)
+	}
+	if fake.disabledClearAccess || fake.disabledStatus != http.StatusForbidden || fake.disabledFence.AccessToken != "inactive-personal-access-token" {
+		t.Fatalf("unexpected disable persistence: clear_access=%v status=%d fence=%+v", fake.disabledClearAccess, fake.disabledStatus, fake.disabledFence)
+	}
+	if !strings.Contains(fake.disabledReason, "Personal access token is inactive") {
+		t.Fatalf("disable reason = %q", fake.disabledReason)
+	}
+	stats := worker.Stats()
+	if stats.QuotaErrorProbes != 1 || stats.ProbesStarted != 1 || stats.Disabled != 1 || stats.PersistenceErrors != 0 {
+		t.Fatalf("inactive personal access token probe stats = %+v", stats)
 	}
 }
 
