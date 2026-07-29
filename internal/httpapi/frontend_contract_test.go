@@ -58,7 +58,7 @@ func TestFrontendSub2APIUserSelectorLoadsEveryActiveUserPage(t *testing.T) {
 		"if (!pagination?.has_next) break",
 		"pagination.offset + pagination.returned",
 		`Number(right.role === "admin") - Number(left.role === "admin")`,
-		`{ label: "请选择 OAIX 用户", value: "0" }`,
+		`{ label: "请选择 OAIX 用户（管理员优先）", value: "0" }`,
 	} {
 		if !strings.Contains(sub2APIPage, required) {
 			t.Fatalf("Sub2API owner selector must load the complete active-user catalog: missing %q", required)

@@ -131,7 +131,7 @@ export function AdminSub2APIPage({
     if (draft.owner_user_id && !options.some((item) => item.value === String(draft.owner_user_id))) {
       options.unshift({ label: `User #${draft.owner_user_id}`, value: String(draft.owner_user_id) });
     }
-    return options.length ? [{ label: "请选择 OAIX 用户", value: "0" }, ...options] : [{ label: "暂无用户", value: "0" }];
+    return options.length ? [{ label: "请选择 OAIX 用户（管理员优先）", value: "0" }, ...options] : [{ label: "暂无用户", value: "0" }];
   }, [draft.owner_user_id, users]);
 
   const selectedGroupNames = useMemo(() => {
