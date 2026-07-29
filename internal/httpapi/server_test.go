@@ -93,7 +93,7 @@ func TestAssetsUseRevalidationCachePolicy(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d", response.Code)
 	}
-	if got := response.Header().Get("Cache-Control"); got != "no-cache" {
+	if got := response.Header().Get("Cache-Control"); got != "private, no-cache" {
 		t.Fatalf("Cache-Control = %q", got)
 	}
 }

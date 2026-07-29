@@ -125,7 +125,9 @@ export function AdminSub2APIPage({
   const [proxyError, setProxyError] = useState("");
 
   const userOptions = useMemo(() => {
-    const options = users.map((user) => ({ label: `${user.email || `User #${user.id}`} · ${user.id}`, value: String(user.id) }));
+    const options = [...users]
+      .sort((left, right) => Number(right.role === "admin") - Number(left.role === "admin"))
+      .map((user) => ({ label: `${user.email || `User #${user.id}`} · ${user.id}`, value: String(user.id) }));
     if (draft.owner_user_id && !options.some((item) => item.value === String(draft.owner_user_id))) {
       options.unshift({ label: `User #${draft.owner_user_id}`, value: String(draft.owner_user_id) });
     }

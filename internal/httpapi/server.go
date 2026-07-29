@@ -175,7 +175,10 @@ func (a *App) Handler() http.Handler {
 func (a *App) assets() http.Handler {
 	files := http.StripPrefix("/assets/", http.FileServer(http.Dir(a.webDir)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
+		// Fixed asset paths can be served by old and new pods during a rolling
+		// deployment. Shared caches must not bind a new query-version key to the
+		// previous pod's bytes; browsers may store the response and revalidate it.
+		w.Header().Set("Cache-Control", "private, no-cache")
 		files.ServeHTTP(w, r)
 	})
 }

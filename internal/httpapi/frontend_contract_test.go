@@ -57,6 +57,7 @@ func TestFrontendSub2APIUserSelectorLoadsEveryActiveUserPage(t *testing.T) {
 		`include_usage: "false"`,
 		"if (!pagination?.has_next) break",
 		"pagination.offset + pagination.returned",
+		`Number(right.role === "admin") - Number(left.role === "admin")`,
 		`{ label: "请选择 OAIX 用户", value: "0" }`,
 	} {
 		if !strings.Contains(sub2APIPage, required) {
