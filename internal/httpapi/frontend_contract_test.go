@@ -49,6 +49,25 @@ func TestFrontendAdminPagesContract(t *testing.T) {
 	}
 }
 
+func TestFrontendSub2APIUserSelectorLoadsEveryActiveUserPage(t *testing.T) {
+	sub2APIPage := readFrontendFile(t, "src", "features", "admin", "Sub2APIPage.tsx")
+	for _, required := range []string{
+		"loadActiveUserPlanCatalog()",
+		"SUB2API_USER_PAGE_LIMIT = 500",
+		`include_usage: "false"`,
+		"if (!pagination?.has_next) break",
+		"pagination.offset + pagination.returned",
+		`{ label: "请选择 OAIX 用户", value: "0" }`,
+	} {
+		if !strings.Contains(sub2APIPage, required) {
+			t.Fatalf("Sub2API owner selector must load the complete active-user catalog: missing %q", required)
+		}
+	}
+	if strings.Contains(sub2APIPage, `new URLSearchParams({ limit: "200", status: "active" })`) {
+		t.Fatal("Sub2API owner selector must not truncate active users to its first 200 results")
+	}
+}
+
 func TestFrontendKeysPageUsesSelfScope(t *testing.T) {
 	keysPage := readFrontendFile(t, "src", "features", "keys", "KeysPage.tsx")
 	for _, required := range []string{

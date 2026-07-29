@@ -36,6 +36,7 @@ type Draft = {
 };
 
 const DEFAULT_TOKEN_STATUS_FILTERS = ["available", "cooling"];
+const SUB2API_USER_PAGE_LIMIT = 500;
 
 const TOKEN_STATUS_OPTIONS = [
   { label: "可用", value: "available" },
@@ -63,6 +64,40 @@ const EMPTY_DRAFT: Draft = {
   proxy_id: 0,
   auto_sync_new: false,
 };
+
+async function loadActiveUserPlanCatalog(): Promise<{
+  users: PlatformUser[];
+  planCountsByUser: Record<number, TokenPlanCount[]>;
+}> {
+  const usersByID = new Map<number, PlatformUser>();
+  const planCountsByUser: Record<number, TokenPlanCount[]> = {};
+  let offset = 0;
+
+  while (true) {
+    const params = new URLSearchParams({
+      include_usage: "false",
+      limit: String(SUB2API_USER_PAGE_LIMIT),
+      offset: String(offset),
+      status: "active",
+    });
+    const payload = await api.adminPoolSummaryByUser(params);
+    for (const item of payload.items || []) {
+      if (!item.user?.id) continue;
+      usersByID.set(item.user.id, item.user);
+      planCountsByUser[item.user.id] = item.plan_counts || [];
+    }
+
+    const pagination = payload.pagination;
+    if (!pagination?.has_next) break;
+    const nextOffset = pagination.offset + pagination.returned;
+    if (pagination.returned <= 0 || nextOffset <= offset) {
+      throw new Error("OAIX 用户分页未能继续");
+    }
+    offset = nextOffset;
+  }
+
+  return { users: Array.from(usersByID.values()), planCountsByUser };
+}
 
 export function AdminSub2APIPage({
   pushToast,
@@ -94,7 +129,7 @@ export function AdminSub2APIPage({
     if (draft.owner_user_id && !options.some((item) => item.value === String(draft.owner_user_id))) {
       options.unshift({ label: `User #${draft.owner_user_id}`, value: String(draft.owner_user_id) });
     }
-    return options.length ? options : [{ label: "暂无用户", value: "0" }];
+    return options.length ? [{ label: "请选择 OAIX 用户", value: "0" }, ...options] : [{ label: "暂无用户", value: "0" }];
   }, [draft.owner_user_id, users]);
 
   const selectedGroupNames = useMemo(() => {
@@ -127,25 +162,17 @@ export function AdminSub2APIPage({
     setLoading(true);
     setError("");
     try {
-      const userParams = new URLSearchParams({ limit: "200", status: "active" });
-      const [targetPayload, runPayload, userPayload, poolPayload, poolByUserPayload] = await Promise.all([
+      const [targetPayload, runPayload, userCatalog, poolPayload] = await Promise.all([
         api.sub2APITargets(),
         api.sub2APIRuns(undefined, 80),
-        api.adminUsers(userParams),
+        loadActiveUserPlanCatalog(),
         api.adminPoolSummary(),
-        api.adminPoolSummaryByUser(userParams),
       ]);
       setTargets(targetPayload.items || []);
       setRuns(runPayload.items || []);
-      setUsers(userPayload.items || []);
+      setUsers(userCatalog.users);
       setGlobalPlanCounts(poolPayload.plan_counts || []);
-      const nextPlanCountsByUser: Record<number, TokenPlanCount[]> = {};
-      for (const item of poolByUserPayload.items || []) {
-        if (item.user?.id) {
-          nextPlanCountsByUser[item.user.id] = item.plan_counts || [];
-        }
-      }
-      setPlanCountsByUser(nextPlanCountsByUser);
+      setPlanCountsByUser(userCatalog.planCountsByUser);
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
