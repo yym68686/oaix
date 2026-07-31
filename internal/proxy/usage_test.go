@@ -127,66 +127,6 @@ func TestFastUsageCostMultipliersUseNormalizedIntent(t *testing.T) {
 	}
 }
 
-func TestUsageBillingUsesEffectiveResponseServiceTier(t *testing.T) {
-	usagePayload := map[string]any{
-		"input_tokens": 100,
-		"input_tokens_details": map[string]any{
-			"cache_write_tokens": 20,
-			"cached_tokens":      30,
-		},
-		"output_tokens": 10,
-	}
-	tests := []struct {
-		name          string
-		payload       map[string]any
-		requestedFast bool
-		wantFast      bool
-		wantTier      string
-		wantCost      float64
-	}{
-		{
-			name:          "requested Fast downgraded to default",
-			payload:       map[string]any{"service_tier": "default", "usage": usagePayload},
-			requestedFast: true,
-			wantCost:      0.00069,
-		},
-		{
-			name:     "project default returned priority",
-			payload:  map[string]any{"response": map[string]any{"service_tier": "priority", "usage": usagePayload}},
-			wantFast: true,
-			wantTier: "priority",
-			wantCost: 0.00138,
-		},
-		{
-			name:     "future response returned fast",
-			payload:  map[string]any{"service_tier": "fast", "usage": usagePayload},
-			wantFast: true,
-			wantTier: "fast",
-			wantCost: 0.00138,
-		},
-		{
-			name:          "missing response tier falls back to request",
-			payload:       map[string]any{"usage": usagePayload},
-			requestedFast: true,
-			wantFast:      true,
-			wantTier:      "priority",
-			wantCost:      0.00138,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			usage := extractUsageMetricsForIntent(test.payload, "gpt-5.6-sol", test.requestedFast)
-			if usage == nil {
-				t.Fatal("usage is nil")
-			}
-			if usage.FastMode != test.wantFast || usage.ServiceTier != test.wantTier {
-				t.Fatalf("effective tier = fast:%v tier:%q, want fast:%v tier:%q", usage.FastMode, usage.ServiceTier, test.wantFast, test.wantTier)
-			}
-			assertCost(t, usage.EstimatedCostUSD, test.wantCost)
-		})
-	}
-}
-
 func TestDatedGPT54VariantsKeepSpecificBasePricing(t *testing.T) {
 	tests := []struct {
 		model   string

@@ -227,11 +227,10 @@ func extractUsageMetricsForIntent(payload any, modelName string, requireFast boo
 	}
 	if pricing, ok := pricingForModel(modelName); ok {
 		multiplier := 1.0
-		fastMode, serviceTier := effectiveFastServiceTier(payload, requireFast)
-		if fastMode {
+		if requireFast {
 			multiplier = fastCostMultiplierForPricingModel(pricing.name)
 			metrics.FastMode = true
-			metrics.ServiceTier = serviceTier
+			metrics.ServiceTier = "priority"
 		}
 		applyUsagePricing(metrics, pricing, multiplier)
 		if pricing.billingMode == usageBillingModeOpenAIPromptCache && !cacheWrite.Present {
@@ -246,39 +245,6 @@ func extractUsageMetricsForIntent(payload any, modelName string, requireFast boo
 		metrics.Anomalies = append(metrics.Anomalies, "cache_components_exceed_input_tokens")
 	}
 	return metrics
-}
-
-func effectiveFastServiceTier(payload any, requested bool) (bool, string) {
-	if tier, ok := responseServiceTier(payload); ok {
-		switch strings.ToLower(strings.TrimSpace(tier)) {
-		case "priority":
-			return true, "priority"
-		case "fast":
-			return true, "fast"
-		case "default", "standard":
-			return false, ""
-		}
-	}
-	if requested {
-		return true, "priority"
-	}
-	return false, ""
-}
-
-func responseServiceTier(payload any) (string, bool) {
-	mapping, ok := payload.(map[string]any)
-	if !ok {
-		return "", false
-	}
-	if response, ok := mapping["response"].(map[string]any); ok {
-		if tier, ok := response["service_tier"].(string); ok {
-			return tier, true
-		}
-	}
-	if tier, ok := mapping["service_tier"].(string); ok {
-		return tier, true
-	}
-	return "", false
 }
 
 func resolveUsageField(mapping map[string]any, prefix string, paths ...[]string) usageField {
