@@ -4740,7 +4740,7 @@ func TestDoAttemptCapturesFastUsageForNonStreamResponseModes(t *testing.T) {
 			name:      "responses compact JSON",
 			intent:    RequestIntent{Endpoint: "/v1/responses/compact", Model: "gpt-5.6-luna", Compact: true, RequireFast: true},
 			baseCost:  0.0000276,
-			finalCost: 0.0000552,
+			finalCost: 0.000069,
 		},
 	}
 	for _, test := range tests {
@@ -4841,7 +4841,7 @@ func TestStreamResponsesCapturesFastUsageForChatAndResponses(t *testing.T) {
 				``,
 			}, "\n"),
 			baseCost:  0.0000276,
-			finalCost: 0.0000552,
+			finalCost: 0.000069,
 		},
 	}
 	for _, test := range tests {

@@ -95,9 +95,9 @@ func TestFastUsageCostMultipliersUseNormalizedIntent(t *testing.T) {
 		baseCost   float64
 		finalCost  float64
 	}{
-		{model: "gpt-5.6-sol", multiplier: 2, baseCost: 0.00069, finalCost: 0.00138},
-		{model: "gpt-5.6-terra-preview", multiplier: 2, baseCost: 0.000276, finalCost: 0.000552},
-		{model: "gpt-5.6-luna-2026-07-10", multiplier: 2, baseCost: 0.0000276, finalCost: 0.0000552},
+		{model: "gpt-5.6-sol", multiplier: 2.5, baseCost: 0.00069, finalCost: 0.001725},
+		{model: "gpt-5.6-terra-preview", multiplier: 2.5, baseCost: 0.000276, finalCost: 0.00069},
+		{model: "gpt-5.6-luna-2026-07-10", multiplier: 2.5, baseCost: 0.0000276, finalCost: 0.000069},
 		{model: "gpt-5.5-2026-05-01", multiplier: 2.5, baseCost: 0.000665, finalCost: 0.0016625},
 		{model: "gpt-5.4", multiplier: 2, baseCost: 0.0003325, finalCost: 0.000665},
 	}

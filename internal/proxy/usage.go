@@ -416,7 +416,9 @@ func applyUsagePricing(metrics *UsageMetrics, pricing modelPricing, multiplier f
 func fastCostMultiplierForPricingModel(pricingModel string) float64 {
 	switch {
 	case strings.HasPrefix(pricingModel, "gpt-5.6-"):
-		return 2
+		// OAIX serves Codex subscription accounts, where GPT-5.6 Fast consumes
+		// 2.5x credits. The public API's 2x token price is a separate contract.
+		return 2.5
 	case pricingModel == "gpt-5.5":
 		return 2.5
 	case strings.HasPrefix(pricingModel, "gpt-5.4"):
