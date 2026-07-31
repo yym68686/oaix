@@ -1959,12 +1959,12 @@ func normalizeIntent(intent RequestIntent, body []byte) RequestIntent {
 		// Read service_tier through the same map decoder used to prepare the
 		// upstream payload. In particular, duplicate JSON keys must resolve the
 		// same way here and upstream; otherwise an earlier value with the wrong
-		// type can make struct decoding fail while a later "priority" value is
-		// still forwarded, bypassing the Fast token allow-list.
+		// type can make struct decoding fail while a later Fast tier is still
+		// forwarded, bypassing the Fast token allow-list.
 		if payload, err := decodeJSONObject(body); err == nil {
 			serviceTier, _ := payload["service_tier"].(string)
 			intent.ServiceTier = serviceTier
-			intent.RequireFast = serviceTier == "priority"
+			intent.RequireFast = serviceTier == "priority" || serviceTier == "fast"
 		}
 	}
 	switch intent.Endpoint {

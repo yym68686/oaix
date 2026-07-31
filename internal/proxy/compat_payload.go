@@ -118,9 +118,6 @@ func newImageStreamTrace(streamPrefix string) *imageStreamTrace {
 }
 
 func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) ([]byte, RequestIntent, int, error) {
-	if intent.ServiceTier == "fast" {
-		return body, intent, http.StatusBadRequest, errors.New(`service_tier "fast" is unsupported; use "priority" for Fast mode`)
-	}
 	switch intent.Endpoint {
 	case alphaSearchEndpoint:
 		next, err := prepareAlphaSearchPayload(body)
@@ -231,8 +228,8 @@ func prepareResponsesPayload(body []byte, intent *RequestIntent) ([]byte, error)
 	}
 	normalizeResponsesStringInput(payload)
 	if intent.RequireFast {
-		// The official wire value is "priority". Accept legacy/user-facing Fast
-		// aliases at the edge, but never forward a non-canonical tier upstream.
+		// Existing models still report "priority" in responses and usage records.
+		// Normalize both accepted request values to that stable upstream value.
 		payload["service_tier"] = "priority"
 		intent.ServiceTier = "priority"
 	}

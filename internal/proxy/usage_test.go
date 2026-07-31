@@ -36,11 +36,11 @@ func TestExtractUsageMetricsGPT56PromptCacheBilling(t *testing.T) {
 	if usage.CachedInputTokensSource != "response.usage.input_tokens_details.cached_tokens" {
 		t.Fatalf("cached source = %q", usage.CachedInputTokensSource)
 	}
-	if usage.InputPricePerMillionUSD != 1 || usage.OutputPricePerMillionUSD != 6 || usage.CacheWritePricePerMillionUSD == nil || *usage.CacheWritePricePerMillionUSD != 1.25 {
+	if usage.InputPricePerMillionUSD != 0.2 || usage.OutputPricePerMillionUSD != 1.2 || usage.CacheWritePricePerMillionUSD == nil || *usage.CacheWritePricePerMillionUSD != 0.25 {
 		t.Fatalf("unexpected official pricing metadata: %+v", usage)
 	}
-	assertCost(t, usage.BaseCostUSD, 0.000138)
-	assertCost(t, usage.EstimatedCostUSD, 0.000138)
+	assertCost(t, usage.BaseCostUSD, 0.0000276)
+	assertCost(t, usage.EstimatedCostUSD, 0.0000276)
 	if usage.BillingMultiplier != 1 || usage.FastMode {
 		t.Fatalf("standard request was multiplied: %+v", usage)
 	}
@@ -56,8 +56,8 @@ func TestGPT56PricingFamilies(t *testing.T) {
 		output     float64
 	}{
 		{model: "gpt-5.6-sol", pricing: "gpt-5.6-sol", input: 5, cacheWrite: 6.25, cached: 0.5, output: 30},
-		{model: "gpt-5.6-terra-2026-07-01", pricing: "gpt-5.6-terra", input: 2.5, cacheWrite: 3.125, cached: 0.25, output: 15},
-		{model: "gpt-5.6-luna", pricing: "gpt-5.6-luna", input: 1, cacheWrite: 1.25, cached: 0.1, output: 6},
+		{model: "gpt-5.6-terra-2026-07-01", pricing: "gpt-5.6-terra", input: 2, cacheWrite: 2.5, cached: 0.2, output: 12},
+		{model: "gpt-5.6-luna", pricing: "gpt-5.6-luna", input: 0.2, cacheWrite: 0.25, cached: 0.02, output: 1.2},
 	}
 	for _, test := range tests {
 		t.Run(test.model, func(t *testing.T) {
@@ -95,9 +95,9 @@ func TestFastUsageCostMultipliersUseNormalizedIntent(t *testing.T) {
 		baseCost   float64
 		finalCost  float64
 	}{
-		{model: "gpt-5.6-sol", multiplier: 2.5, baseCost: 0.00069, finalCost: 0.001725},
-		{model: "gpt-5.6-terra-preview", multiplier: 2.5, baseCost: 0.000345, finalCost: 0.0008625},
-		{model: "gpt-5.6-luna-2026-07-10", multiplier: 2.5, baseCost: 0.000138, finalCost: 0.000345},
+		{model: "gpt-5.6-sol", multiplier: 2, baseCost: 0.00069, finalCost: 0.00138},
+		{model: "gpt-5.6-terra-preview", multiplier: 2, baseCost: 0.000276, finalCost: 0.000552},
+		{model: "gpt-5.6-luna-2026-07-10", multiplier: 2, baseCost: 0.0000276, finalCost: 0.0000552},
 		{model: "gpt-5.5-2026-05-01", multiplier: 2.5, baseCost: 0.000665, finalCost: 0.0016625},
 		{model: "gpt-5.4", multiplier: 2, baseCost: 0.0003325, finalCost: 0.000665},
 	}
@@ -123,6 +123,66 @@ func TestFastUsageCostMultipliersUseNormalizedIntent(t *testing.T) {
 			if billing["base_cost_usd"] != test.baseCost || billing["multiplier"] != test.multiplier || billing["final_cost_usd"] != test.finalCost {
 				t.Fatalf("ambiguous Fast billing trace: %#v", billing)
 			}
+		})
+	}
+}
+
+func TestUsageBillingUsesEffectiveResponseServiceTier(t *testing.T) {
+	usagePayload := map[string]any{
+		"input_tokens": 100,
+		"input_tokens_details": map[string]any{
+			"cache_write_tokens": 20,
+			"cached_tokens":      30,
+		},
+		"output_tokens": 10,
+	}
+	tests := []struct {
+		name          string
+		payload       map[string]any
+		requestedFast bool
+		wantFast      bool
+		wantTier      string
+		wantCost      float64
+	}{
+		{
+			name:          "requested Fast downgraded to default",
+			payload:       map[string]any{"service_tier": "default", "usage": usagePayload},
+			requestedFast: true,
+			wantCost:      0.00069,
+		},
+		{
+			name:     "project default returned priority",
+			payload:  map[string]any{"response": map[string]any{"service_tier": "priority", "usage": usagePayload}},
+			wantFast: true,
+			wantTier: "priority",
+			wantCost: 0.00138,
+		},
+		{
+			name:     "future response returned fast",
+			payload:  map[string]any{"service_tier": "fast", "usage": usagePayload},
+			wantFast: true,
+			wantTier: "fast",
+			wantCost: 0.00138,
+		},
+		{
+			name:          "missing response tier falls back to request",
+			payload:       map[string]any{"usage": usagePayload},
+			requestedFast: true,
+			wantFast:      true,
+			wantTier:      "priority",
+			wantCost:      0.00138,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			usage := extractUsageMetricsForIntent(test.payload, "gpt-5.6-sol", test.requestedFast)
+			if usage == nil {
+				t.Fatal("usage is nil")
+			}
+			if usage.FastMode != test.wantFast || usage.ServiceTier != test.wantTier {
+				t.Fatalf("effective tier = fast:%v tier:%q, want fast:%v tier:%q", usage.FastMode, usage.ServiceTier, test.wantFast, test.wantTier)
+			}
+			assertCost(t, usage.EstimatedCostUSD, test.wantCost)
 		})
 	}
 }

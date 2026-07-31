@@ -227,10 +227,11 @@ func extractUsageMetricsForIntent(payload any, modelName string, requireFast boo
 	}
 	if pricing, ok := pricingForModel(modelName); ok {
 		multiplier := 1.0
-		if requireFast {
+		fastMode, serviceTier := effectiveFastServiceTier(payload, requireFast)
+		if fastMode {
 			multiplier = fastCostMultiplierForPricingModel(pricing.name)
 			metrics.FastMode = true
-			metrics.ServiceTier = "priority"
+			metrics.ServiceTier = serviceTier
 		}
 		applyUsagePricing(metrics, pricing, multiplier)
 		if pricing.billingMode == usageBillingModeOpenAIPromptCache && !cacheWrite.Present {
@@ -245,6 +246,39 @@ func extractUsageMetricsForIntent(payload any, modelName string, requireFast boo
 		metrics.Anomalies = append(metrics.Anomalies, "cache_components_exceed_input_tokens")
 	}
 	return metrics
+}
+
+func effectiveFastServiceTier(payload any, requested bool) (bool, string) {
+	if tier, ok := responseServiceTier(payload); ok {
+		switch strings.ToLower(strings.TrimSpace(tier)) {
+		case "priority":
+			return true, "priority"
+		case "fast":
+			return true, "fast"
+		case "default", "standard":
+			return false, ""
+		}
+	}
+	if requested {
+		return true, "priority"
+	}
+	return false, ""
+}
+
+func responseServiceTier(payload any) (string, bool) {
+	mapping, ok := payload.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	if response, ok := mapping["response"].(map[string]any); ok {
+		if tier, ok := response["service_tier"].(string); ok {
+			return tier, true
+		}
+	}
+	if tier, ok := mapping["service_tier"].(string); ok {
+		return tier, true
+	}
+	return "", false
 }
 
 func resolveUsageField(mapping map[string]any, prefix string, paths ...[]string) usageField {
@@ -416,7 +450,7 @@ func applyUsagePricing(metrics *UsageMetrics, pricing modelPricing, multiplier f
 func fastCostMultiplierForPricingModel(pricingModel string) float64 {
 	switch {
 	case strings.HasPrefix(pricingModel, "gpt-5.6-"):
-		return 2.5
+		return 2
 	case pricingModel == "gpt-5.5":
 		return 2.5
 	case strings.HasPrefix(pricingModel, "gpt-5.4"):
@@ -445,11 +479,11 @@ func pricingForModel(modelName string) (modelPricing, bool) {
 		},
 		"gpt-5.6-terra": {
 			name: "gpt-5.6-terra", billingMode: usageBillingModeOpenAIPromptCache,
-			input: 2.5, cacheWrite: price(3.125), cached: price(0.25), output: 15.0,
+			input: 2.0, cacheWrite: price(2.5), cached: price(0.2), output: 12.0,
 		},
 		"gpt-5.6-luna": {
 			name: "gpt-5.6-luna", billingMode: usageBillingModeOpenAIPromptCache,
-			input: 1.0, cacheWrite: price(1.25), cached: price(0.1), output: 6.0,
+			input: 0.2, cacheWrite: price(0.25), cached: price(0.02), output: 1.2,
 		},
 		"gpt-5.5": {
 			name: "gpt-5.5", billingMode: usageBillingModeOpenAICachedInput,

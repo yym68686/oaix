@@ -1206,6 +1206,8 @@ func TestProxyRoutesFastRequestOnlyToFastCapablePlan(t *testing.T) {
 	for _, body := range []string{
 		`{"model":"gpt-5.5","input":"hello","service_tier":"priority"}`,
 		`{"model":"gpt-5.5","input":"hello","service_tier":{},"service_tier":"priority"}`,
+		`{"model":"gpt-5.5","input":"hello","service_tier":"fast"}`,
+		`{"model":"gpt-5.5","input":"hello","service_tier":{},"service_tier":"fast"}`,
 	} {
 		upstreamAuthorization = ""
 		upstreamServiceTier = ""
@@ -1226,24 +1228,28 @@ func TestProxyRoutesFastRequestOnlyToFastCapablePlan(t *testing.T) {
 	}
 }
 
-func TestNormalizeIntentRecognizesOnlyExactPriorityServiceTier(t *testing.T) {
-	intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(`{"model":"gpt-5.5","service_tier":"priority"}`))
-	if !intent.RequireFast || intent.ServiceTier != "priority" {
-		t.Fatalf("service_tier priority did not require Fast: %#v", intent)
+func TestNormalizeIntentRecognizesExactFastServiceTiers(t *testing.T) {
+	for _, tier := range []string{"priority", "fast"} {
+		intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(fmt.Sprintf(`{"model":"gpt-5.5","service_tier":%q}`, tier)))
+		if !intent.RequireFast || intent.ServiceTier != tier {
+			t.Fatalf("service_tier %q did not require Fast: %#v", tier, intent)
+		}
 	}
-	for _, tier := range []string{"", "default", "auto", "fast", "PRIORITY", " priority "} {
+	for _, tier := range []string{"", "default", "auto", "FAST", "PRIORITY", " fast ", " priority "} {
 		intent := normalizeIntent(RequestIntent{Endpoint: "/v1/responses"}, []byte(fmt.Sprintf(`{"model":"gpt-5.5","service_tier":%q}`, tier)))
 		if intent.RequireFast {
 			t.Fatalf("service_tier %q unexpectedly required Fast", tier)
 		}
 	}
 	for _, endpoint := range []string{"/v1/responses", "/v1/responses/compact", "/v1/chat/completions"} {
-		duplicate := normalizeIntent(
-			RequestIntent{Endpoint: endpoint},
-			[]byte(`{"model":"gpt-5.5","service_tier":{},"service_tier":"priority"}`),
-		)
-		if !duplicate.RequireFast || duplicate.ServiceTier != "priority" {
-			t.Fatalf("endpoint %s duplicate service_tier intent = %#v, want priority Fast", endpoint, duplicate)
+		for _, tier := range []string{"priority", "fast"} {
+			duplicate := normalizeIntent(
+				RequestIntent{Endpoint: endpoint},
+				[]byte(fmt.Sprintf(`{"model":"gpt-5.5","service_tier":{},"service_tier":%q}`, tier)),
+			)
+			if !duplicate.RequireFast || duplicate.ServiceTier != tier {
+				t.Fatalf("endpoint %s duplicate service_tier intent = %#v, want %s Fast", endpoint, duplicate, tier)
+			}
 		}
 	}
 	for _, test := range []struct {
@@ -1260,13 +1266,17 @@ func TestNormalizeIntentRecognizesOnlyExactPriorityServiceTier(t *testing.T) {
 	}
 }
 
-func TestPrepareUpstreamPayloadPreservesPriorityServiceTier(t *testing.T) {
+func TestPrepareUpstreamPayloadCanonicalizesFastServiceTiers(t *testing.T) {
 	for _, test := range []struct {
 		endpoint string
 		tier     string
 	}{
 		{endpoint: "/v1/responses", tier: "priority"},
+		{endpoint: "/v1/responses", tier: "fast"},
+		{endpoint: "/v1/responses/compact", tier: "priority"},
+		{endpoint: "/v1/responses/compact", tier: "fast"},
 		{endpoint: "/v1/chat/completions", tier: "priority"},
+		{endpoint: "/v1/chat/completions", tier: "fast"},
 	} {
 		body := []byte(fmt.Sprintf(`{"model":"gpt-5.5","input":"hello","service_tier":%q}`, test.tier))
 		intent := normalizeIntent(RequestIntent{Endpoint: test.endpoint}, body)
@@ -1287,27 +1297,6 @@ func TestPrepareUpstreamPayloadPreservesPriorityServiceTier(t *testing.T) {
 		}
 		if preparedIntent.ServiceTier != "priority" || !preparedIntent.RequireFast {
 			t.Fatalf("tier %q intent = %#v", test.tier, preparedIntent)
-		}
-	}
-}
-
-func TestPrepareUpstreamPayloadRejectsFastAlias(t *testing.T) {
-	for _, endpoint := range []string{"/v1/responses", "/v1/responses/compact", "/v1/chat/completions"} {
-		body := []byte(`{"model":"gpt-5.5","service_tier":"fast"}`)
-		intent := normalizeIntent(RequestIntent{Endpoint: endpoint}, body)
-		prepared, preparedIntent, status, err := prepareUpstreamPayload(
-			httptest.NewRequest(http.MethodPost, endpoint, nil),
-			body,
-			intent,
-		)
-		if err == nil || status != http.StatusBadRequest {
-			t.Fatalf("endpoint %s: status=%d err=%v", endpoint, status, err)
-		}
-		if preparedIntent.RequireFast || preparedIntent.ServiceTier != "fast" {
-			t.Fatalf("endpoint %s alias was upgraded: %#v", endpoint, preparedIntent)
-		}
-		if string(prepared) != string(body) {
-			t.Fatalf("endpoint %s alias payload was rewritten: %s", endpoint, prepared)
 		}
 	}
 }
@@ -4750,8 +4739,8 @@ func TestDoAttemptCapturesFastUsageForNonStreamResponseModes(t *testing.T) {
 		{
 			name:      "responses compact JSON",
 			intent:    RequestIntent{Endpoint: "/v1/responses/compact", Model: "gpt-5.6-luna", Compact: true, RequireFast: true},
-			baseCost:  0.000138,
-			finalCost: 0.000345,
+			baseCost:  0.0000276,
+			finalCost: 0.0000552,
 		},
 	}
 	for _, test := range tests {
@@ -4851,8 +4840,8 @@ func TestStreamResponsesCapturesFastUsageForChatAndResponses(t *testing.T) {
 				`data: {"type":"response.completed","response":{"id":"resp_fast","status":"completed","usage":{"input_tokens":100,"input_tokens_details":{"cache_write_tokens":20,"cached_tokens":30},"output_tokens":10,"total_tokens":110}}}`,
 				``,
 			}, "\n"),
-			baseCost:  0.000138,
-			finalCost: 0.000345,
+			baseCost:  0.0000276,
+			finalCost: 0.0000552,
 		},
 	}
 	for _, test := range tests {
