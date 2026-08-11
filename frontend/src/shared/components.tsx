@@ -28,14 +28,19 @@ import {
 import type { ToastMessage } from "./types";
 
 /**
- * 筛选行：能排一行就排一行，只有每列压到比 select 触发器自身的最小宽度
- * （`min-w-36`，即 144px）还窄时才换行。用 auto-fit 而不是断点，避免在
- * 断点之间出现「明明放得下却塌成多行」。
+ * 筛选行：能排一行就排一行，只有窄到筛选项自己的文案要被截断时才换行。
+ * 用 auto-fit 而不是断点，避免在断点之间出现「明明放得下却塌成多行」。
+ *
+ * 128px 是量出来的，不是猜的：`SelectField` 给触发器加了 `min-w-0`，所以
+ * 触发器自身的 `min-w-36` 在这里不生效，真正的下限只取决于文案何时被截断。
+ * 实测最长的值（Key 页「全部计划 6」）在 112px 以下才开始截断，标签即使
+ * 96px 也不会折行，因此 128px 留了一档余量。这个值同时保证 5 个筛选项的
+ * 用户状态页在 1024px 视口（内容区 706px：5×128+4×12=688）仍是一行。
  */
 export function FilterBar({
   children,
   className,
-  minColumn = "144px",
+  minColumn = "128px",
 }: {
   children: React.ReactNode;
   className?: string;
