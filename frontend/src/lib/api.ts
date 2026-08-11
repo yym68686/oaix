@@ -676,7 +676,7 @@ export const api = {
       return requestJSON<{ items?: RequestItem[]; summary?: RequestSummary }>(`/admin/requests?limit=${limit}`);
     }
     const [requestPayload, usagePayload] = await Promise.all([
-      requestJSON<{ items?: RequestItem[]; pagination?: Pagination }>(`/api/requests?limit=${limit}&include_total=true`),
+      requestJSON<{ items?: RequestItem[]; pagination?: Pagination }>(`/api/requests?limit=${limit}`),
       api.myUsage(24),
     ]);
     const usage = usagePayload.usage || {};
@@ -714,7 +714,7 @@ export const api = {
     requestJSON<TokenListResponse>(`/api/admin/users/${id}/tokens?${params.toString()}`),
   adminUserImportJobs: (id: number, params = new URLSearchParams({ limit: "50" })) =>
     requestJSON<{ items?: ImportBatch[]; pagination?: Pagination }>(`/api/admin/users/${id}/import/jobs?${params.toString()}`),
-  adminUserRequests: (id: number, params = new URLSearchParams({ limit: "80", include_total: "true" })) =>
+  adminUserRequests: (id: number, params = new URLSearchParams({ limit: "80" })) =>
     requestJSON<{ items?: RequestItem[]; pagination?: Pagination }>(`/api/admin/users/${id}/requests?${params.toString()}`),
   adminUserUsage: (id: number, hours = 24) =>
     requestJSON<{ pool?: TokenCounts; usage?: OwnerUsageSummary }>(`/api/admin/users/${id}/usage?hours=${hours}`),
@@ -737,7 +737,6 @@ export const api = {
     if (!params.has("limit")) {
       params.set("limit", "120");
     }
-    params.set("include_total", "true");
     return requestJSON<{ items?: RequestItem[]; pagination?: Pagination }>(`/api/admin/requests?${params.toString()}`);
   },
   adminRequestsExportURL: (params = new URLSearchParams()) => `/api/admin/requests/export?${params.toString()}`,

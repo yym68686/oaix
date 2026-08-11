@@ -204,7 +204,7 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
         api.adminUserAPIKeys(userID),
         api.adminUserTokens(userID, new URLSearchParams({ limit: "50", include_quota: "true" })),
         api.adminUserImportJobs(userID, new URLSearchParams({ limit: "50" })),
-        api.adminUserRequests(userID, new URLSearchParams({ limit: "80", include_total: "true" })),
+        api.adminUserRequests(userID, new URLSearchParams({ limit: "80" })),
         api.adminUserUsage(userID, 24),
         api.adminAuditLogs(200),
       ]);
