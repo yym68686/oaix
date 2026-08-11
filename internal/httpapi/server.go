@@ -153,7 +153,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/tokens/{token_id}/remark", a.requireAuth(a.updateTokenRemark))
 	mux.HandleFunc("POST /admin/tokens/{token_id}/probe", a.requireAuth(a.probeToken))
 	mux.HandleFunc("DELETE /admin/tokens/{token_id}", a.requireAuth(a.deleteToken))
-	mux.HandleFunc("GET /admin/requests", a.requireAuth(a.listRequests))
+	mux.HandleFunc("GET /admin/requests", a.serveSPAOnNavigation(a.requireAuth(a.listRequests)))
 	mux.HandleFunc("GET /admin/analytics", a.requireAuth(a.analytics))
 	mux.HandleFunc("GET /admin/runtime", a.requireAuth(a.runtime))
 	mux.HandleFunc("GET /admin/settings", a.requireAuth(a.listSettings))
@@ -200,6 +200,29 @@ func (a *App) index(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 	_, _ = io.WriteString(w, html)
+}
+
+// serveSPAOnNavigation lets a path serve both the single-page app and a JSON
+// API. "/admin/requests" is one of the app's own routes, so a browser landing
+// there directly (refresh, bookmark, shared link) must get the app shell rather
+// than the API's auth error. Only document navigations take that branch; API
+// clients never ask for HTML.
+func (a *App) serveSPAOnNavigation(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if isDocumentNavigation(r) {
+			a.index(w, r)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func isDocumentNavigation(r *http.Request) bool {
+	if r.Header.Get("Sec-Fetch-Dest") == "document" {
+		return true
+	}
+	// Browsers that omit Sec-Fetch-* still ask for HTML; JSON clients never do.
+	return strings.Contains(r.Header.Get("Accept"), "text/html")
 }
 
 func (a *App) webAssetVersion(rel string) string {

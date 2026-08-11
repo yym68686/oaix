@@ -16,6 +16,9 @@ export default defineConfig(({ command }) => ({
   server: {
     proxy: {
       "/admin": "https://oaix.fugue.pro",
+      // Normal-user routes (/api/me, /api/tokens, /api/auth/login, ...) live
+      // under /api; without this the dev server answers them with index.html.
+      "/api": "https://oaix.fugue.pro",
       "/healthz": "https://oaix.fugue.pro",
     },
   },

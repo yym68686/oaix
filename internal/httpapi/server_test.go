@@ -80,6 +80,43 @@ func TestIndexInjectsVersionedAssets(t *testing.T) {
 	}
 }
 
+func TestAdminRequestsServesAppShellOnNavigation(t *testing.T) {
+	webDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("<!doctype html><title>oaix</title>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app := NewApp(config.Config{Auth: config.AuthConfig{ServiceAPIKeys: []string{"service-key"}}}, nil, nil, nil, nil, nil)
+	app.webDir = webDir
+	handler := app.Handler()
+
+	for _, navigation := range []map[string]string{
+		{"Sec-Fetch-Dest": "document"},
+		{"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
+	} {
+		request := httptest.NewRequest(http.MethodGet, "/admin/requests", nil)
+		for name, value := range navigation {
+			request.Header.Set(name, value)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("navigation %v status = %d body=%s", navigation, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), "<!doctype html>") {
+			t.Fatalf("navigation %v did not receive the app shell: %s", navigation, response.Body.String())
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/admin/requests", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated API call status = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestAssetsUseRevalidationCachePolicy(t *testing.T) {
 	webDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(webDir, "styles.css"), []byte("body{}"), 0o644); err != nil {
