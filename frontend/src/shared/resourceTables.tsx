@@ -46,29 +46,6 @@ export function PoolSummaryCards({ summary }: { summary: PoolSummaryResponse }) 
   );
 }
 
-export function TokenFilters({
-  onPlanChange,
-  onStatusChange,
-  plan,
-  planOptions,
-  status,
-  statusOptions,
-}: {
-  onPlanChange: (value: string) => void;
-  onStatusChange: (value: string) => void;
-  plan: string;
-  planOptions: Array<{ label: string; value: string }>;
-  status: string;
-  statusOptions: Array<{ label: string; value: string }>;
-}) {
-  return (
-    <div className="grid gap-3 md:grid-cols-2">
-      <SelectField label="状态" onChange={onStatusChange} options={statusOptions} value={status} />
-      <SelectField label="计划" onChange={onPlanChange} options={planOptions} value={plan} />
-    </div>
-  );
-}
-
 export function UserSelector({
   apiKeyID,
   model,

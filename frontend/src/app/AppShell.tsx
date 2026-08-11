@@ -3,12 +3,17 @@ import {
   DatabaseIcon,
   KeyRoundIcon,
   ListFilterIcon,
+  LogInIcon,
+  LogOutIcon,
+  PanelLeftCloseIcon,
+  PanelLeftOpenIcon,
   RefreshCwIcon,
   SaveIcon,
   SendIcon,
   Settings2Icon,
   ShieldCheckIcon,
   UploadIcon,
+  UserRoundIcon,
   UsersRoundIcon,
 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -19,10 +24,11 @@ import { Button } from "@/registry/default/ui/button";
 import { Dialog, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
+import { Menu, MenuGroupLabel, MenuItem, MenuPopup, MenuRadioGroup, MenuRadioItem, MenuSeparator, MenuTrigger } from "@/registry/default/ui/menu";
 import { cn } from "@/registry/default/lib/utils";
 import { api, getServiceKey, isAdminPrincipal, isServicePrincipal, setServiceKey, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
 import { formatNumber } from "@/lib/format";
-import { ThemeButton } from "@/shared/components";
+import { readSidebarCollapsed, writeSidebarCollapsed } from "@/shared/domain";
 import type { RouteKey, ThemePreference } from "@/shared/types";
 import { navigateTo } from "./router";
 
@@ -89,6 +95,7 @@ export function AppShell({
   webVersion?: { hash: string; time: string };
 }) {
   const available = counts.available ?? counts.active ?? 0;
+  const [collapsed, setCollapsed] = useState(() => readSidebarCollapsed());
   const [credentialDialogOpen, setCredentialDialogOpen] = useState(false);
   const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
   const [serviceKeyError, setServiceKeyError] = useState("");
@@ -101,7 +108,6 @@ export function AppShell({
   const credentialOpen = credentialRequired || credentialDialogOpen;
   const admin = isAdminPrincipal(me);
   const serviceOnly = Boolean(me && isServicePrincipal(me) && !me.user?.id);
-  const principalSubtitle = me?.user?.email || (serviceOnly ? "Service API Key" : protectedMode ? "API Key required" : "local");
 
   useEffect(() => {
     if (credentialRequired) {
@@ -111,6 +117,26 @@ export function AppShell({
       setCredentialDialogOpen(true);
     }
   }, [credentialRequired]);
+
+  function toggleSidebar() {
+    const next = !collapsed;
+    setCollapsed(next);
+    writeSidebarCollapsed(next);
+  }
+
+  function openLogin() {
+    setServiceKeyDraft(getServiceKey());
+    setServiceKeyError("");
+    setAuthMode("login");
+    setCredentialDialogOpen(true);
+  }
+
+  // 服务端没有登出接口，这里只能清掉本地保存的 API Key；
+  // 该 Key 在服务端依然有效，需要作废请到设置页轮换。
+  function logout() {
+    setServiceKey("");
+    onRefresh();
+  }
 
   function changeCredentialDialogOpen(open: boolean) {
     if (credentialRequired) {
@@ -159,16 +185,27 @@ export function AppShell({
 
   return (
     <div className="min-h-screen text-foreground">
-      <div className="mx-auto grid min-h-screen w-full max-w-[1600px] grid-cols-1 gap-0 px-3 py-3 lg:grid-cols-[220px_minmax(0,1fr)] lg:px-4">
+      <div
+        className="mx-auto grid min-h-screen w-full max-w-[1600px] grid-cols-1 gap-0 px-3 py-3 transition-[grid-template-columns] duration-200 ease-out lg:grid-cols-[var(--oaix-sidebar-width)_minmax(0,1fr)] lg:px-4"
+        style={{ "--oaix-sidebar-width": collapsed ? "68px" : "220px" } as React.CSSProperties}
+      >
         <aside className="sticky top-3 z-20 mb-3 h-fit rounded-lg border bg-card/90 p-3 shadow-xs/5 backdrop-blur lg:mb-0 lg:min-h-[calc(100vh-1.5rem)]">
-          <div className="flex items-center gap-2 px-2 py-2">
-            <div className="flex size-9 items-center justify-center rounded-md border bg-muted">
+          <div className={cn("flex items-center gap-2 px-2 py-2", collapsed && "lg:flex-col lg:gap-3 lg:px-0")}>
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-md border bg-muted">
               <DatabaseIcon className="size-4" />
             </div>
-            <div className="min-w-0">
-              <div className="font-heading text-lg font-semibold leading-none">oaix</div>
-              <div className="mt-1 truncate text-muted-foreground text-xs">{principalSubtitle}</div>
-            </div>
+            <div className={cn("min-w-0 flex-1 font-heading text-lg font-semibold leading-none", collapsed && "lg:hidden")}>oaix</div>
+            <Button
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
+              className="hidden lg:inline-flex"
+              onClick={toggleSidebar}
+              size="icon-sm"
+              title={collapsed ? "展开侧边栏" : "折叠侧边栏"}
+              variant="ghost"
+            >
+              {collapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
+            </Button>
           </div>
           <nav className="mt-4 grid gap-4">
             {NAV_GROUPS.map((group) => {
@@ -178,8 +215,9 @@ export function AppShell({
               }
               return (
                 <div className="grid gap-1" key={group.label}>
-                  <div className="px-2 text-muted-foreground text-xs">{group.label}</div>
-                  <div className="flex gap-1 overflow-x-auto lg:grid lg:overflow-visible">
+                  <div className={cn("px-2 text-muted-foreground text-xs", collapsed && "lg:hidden")}>{group.label}</div>
+                  {collapsed && <div className="mx-auto mb-1 hidden h-px w-6 bg-border lg:block" />}
+                  <div className={cn("flex gap-1 overflow-x-auto lg:grid lg:overflow-visible", collapsed && "lg:justify-items-center")}>
                     {items.map((item) => {
                       const active =
                         routeKey === item.key ||
@@ -189,14 +227,15 @@ export function AppShell({
                         (routeKey === "admin_user_detail" && item.key === "admin_users");
                       return (
                         <Button
-                          className={cn("justify-start", active && "bg-secondary")}
+                          className={cn("justify-start", active && "bg-secondary", collapsed && "lg:size-9 lg:justify-center lg:px-0")}
                           key={item.href}
                           onClick={() => navigateTo(item.href)}
                           size="sm"
+                          title={collapsed ? item.label : undefined}
                           variant={active ? "secondary" : "ghost"}
                         >
                           {item.icon}
-                          {item.label}
+                          <span className={cn(collapsed && "lg:hidden")}>{item.label}</span>
                         </Button>
                       );
                     })}
@@ -205,19 +244,21 @@ export function AppShell({
               );
             })}
           </nav>
-          <div className="mt-4 hidden gap-2 border-t pt-4 text-xs text-muted-foreground lg:grid">
-            <div className="flex items-center justify-between">
-              <span>有效</span>
-              <span className="oaix-tabular">{formatNumber(available)}</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>冷却</span>
-              <span className="oaix-tabular">{formatNumber(counts.cooling)}</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>禁用</span>
-              <span className="oaix-tabular">{formatNumber(counts.disabled)}</span>
-            </div>
+          <div className={cn("mt-4 hidden gap-2 border-t pt-4 text-xs text-muted-foreground lg:grid", collapsed && "lg:gap-2.5")}>
+            {[
+              { label: "有效", value: available },
+              { label: "冷却", value: counts.cooling },
+              { label: "禁用", value: counts.disabled },
+            ].map((row) => (
+              <div
+                className={cn("flex items-center justify-between", collapsed && "lg:flex-col lg:justify-center lg:gap-0.5 lg:text-[11px]")}
+                key={row.label}
+                title={collapsed ? `${row.label} ${formatNumber(row.value)}` : undefined}
+              >
+                <span>{row.label}</span>
+                <span className="oaix-tabular">{formatNumber(row.value)}</span>
+              </div>
+            ))}
           </div>
         </aside>
 
@@ -226,37 +267,25 @@ export function AppShell({
             <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
               <div className="min-w-0">
                 <div className="mb-2 flex flex-wrap items-center gap-2">
-                  <Badge variant={protectedMode ? "success" : "warning"}>
-                    {protectedMode ? "API Key 已启用" : "未启用服务侧凭证"}
-                  </Badge>
+                  {!protectedMode && <Badge variant="warning">未启用服务侧凭证</Badge>}
                   <Badge variant={health?.ok === false ? "warning" : "secondary"}>{syncText}</Badge>
                   <Badge variant="outline">总量 {formatNumber(counts.total)}</Badge>
                 </div>
                 <h1 className="font-heading text-2xl font-semibold tracking-normal">Key 池控制台</h1>
               </div>
               <div className="flex flex-wrap items-center gap-2 md:justify-end">
-                {protectedMode && (
-                  <Button
-                    onClick={() => {
-                      setServiceKeyDraft(getServiceKey());
-                      setServiceKeyError("");
-                      setAuthMode("api_key");
-                      setCredentialDialogOpen(true);
-                    }}
-                    size="sm"
-                    variant="outline"
-                  >
-                    <ShieldCheckIcon />
-                    API Key
-                  </Button>
-                )}
-                <ThemeButton value="auto" current={theme} onSelect={onThemeChange} />
-                <ThemeButton value="light" current={theme} onSelect={onThemeChange} />
-                <ThemeButton value="dark" current={theme} onSelect={onThemeChange} />
                 <Button onClick={onRefresh} variant="outline">
                   <RefreshCwIcon className={cn(loading && "animate-spin")} />
                   刷新
                 </Button>
+                <AccountMenu
+                  me={me}
+                  onLogin={openLogin}
+                  onLogout={logout}
+                  onThemeChange={onThemeChange}
+                  serviceOnly={serviceOnly}
+                  theme={theme}
+                />
               </div>
             </div>
           </header>
@@ -381,5 +410,88 @@ export function AppShell({
         </DialogPopup>
       </Dialog>
     </div>
+  );
+}
+
+function principalRoleLabel(me: MeResponse | null, serviceOnly: boolean): string {
+  const role = String(me?.role || me?.user?.role || "").toLowerCase();
+  if (role === "admin") {
+    return "管理员";
+  }
+  if (role === "readonly_admin") {
+    return "只读管理员";
+  }
+  if (role === "service" || serviceOnly) {
+    return "服务凭证";
+  }
+  if (role === "user") {
+    return "普通用户";
+  }
+  return "已登录";
+}
+
+/**
+ * 头像菜单：身份、主题、登录/退出登录都收在这里，避免头部平铺一排按钮。
+ * 未登录时依然渲染（否则主题切换会没有入口），此时展示登录项。
+ */
+function AccountMenu({
+  me,
+  onLogin,
+  onLogout,
+  onThemeChange,
+  serviceOnly,
+  theme,
+}: {
+  me: MeResponse | null;
+  onLogin: () => void;
+  onLogout: () => void;
+  onThemeChange: (theme: ThemePreference) => void;
+  serviceOnly: boolean;
+  theme: ThemePreference;
+}) {
+  const email = me?.user?.email?.trim() || "";
+  const name = email || (serviceOnly ? "Service API Key" : "当前会话");
+  const initial = email.slice(0, 1).toUpperCase();
+  return (
+    <Menu>
+      <MenuTrigger
+        aria-label={me ? `账户菜单：${name}` : "账户菜单"}
+        render={<Button className="rounded-full before:rounded-full" size="icon" variant="outline" />}
+        title={me ? name : "未登录"}
+      >
+        {me && initial ? <span className="font-medium text-sm">{initial}</span> : me ? <ShieldCheckIcon /> : <UserRoundIcon />}
+      </MenuTrigger>
+      <MenuPopup>
+        {me && (
+          <>
+            <div className="grid gap-0.5 px-2 py-1.5">
+              <div className="truncate font-medium text-sm" title={name}>
+                {name}
+              </div>
+              <div className="text-muted-foreground text-xs">{principalRoleLabel(me, serviceOnly)}</div>
+            </div>
+            <MenuSeparator />
+          </>
+        )}
+        <MenuRadioGroup onValueChange={(value) => onThemeChange(value as ThemePreference)} value={theme}>
+          <MenuGroupLabel>主题</MenuGroupLabel>
+          <MenuRadioItem value="auto">自动</MenuRadioItem>
+          <MenuRadioItem value="light">亮色</MenuRadioItem>
+          <MenuRadioItem value="dark">暗色</MenuRadioItem>
+        </MenuRadioGroup>
+        <MenuSeparator />
+        {me ? (
+          <MenuItem className="text-destructive-foreground" onClick={onLogout}>
+            <LogOutIcon />
+            退出登录
+          </MenuItem>
+        ) : (
+          <MenuItem onClick={onLogin}>
+            <LogInIcon />
+            登录
+          </MenuItem>
+        )}
+      </MenuPopup>
+    </Menu>
   );
 }

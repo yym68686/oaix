@@ -4,8 +4,6 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   DatabaseIcon,
-  MoonIcon,
-  SunIcon,
 } from "lucide-react";
 import type * as React from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
@@ -27,21 +25,47 @@ import {
   quotaWindowFor,
   tokenStatusLabel,
 } from "./domain";
-import type { ThemePreference, ToastMessage } from "./types";
+import type { ToastMessage } from "./types";
+
+/**
+ * 筛选行：能排一行就排一行，只有每列压到比 select 触发器自身的最小宽度
+ * （`min-w-36`，即 144px）还窄时才换行。用 auto-fit 而不是断点，避免在
+ * 断点之间出现「明明放得下却塌成多行」。
+ */
+export function FilterBar({
+  children,
+  className,
+  minColumn = "144px",
+}: {
+  children: React.ReactNode;
+  className?: string;
+  minColumn?: string;
+}) {
+  return (
+    <div
+      className={cn("grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(var(--oaix-filter-min),1fr))]", className)}
+      style={{ "--oaix-filter-min": minColumn } as React.CSSProperties}
+    >
+      {children}
+    </div>
+  );
+}
 
 export function SelectField({
+  className,
   label,
   onChange,
   options,
   value,
 }: {
+  className?: string;
   label: string;
   onChange: (value: string) => void;
   options: Array<{ label: string; value: string }>;
   value: string;
 }) {
   return (
-    <div className="grid min-w-0 gap-2">
+    <div className={cn("grid min-w-0 gap-2", className)}>
       <Label>{label}</Label>
       <Select aria-label={label} items={options} onValueChange={(next) => onChange(String(next))} value={value}>
         <SelectTrigger className="min-w-0">
@@ -106,27 +130,6 @@ export function MiniMetric({ label, value }: { label: string; value: React.React
         {typeof value === "number" ? formatNumber(value) : value || "-"}
       </div>
     </div>
-  );
-}
-
-export function ThemeButton({
-  current,
-  icon,
-  onSelect,
-  value,
-}: {
-  current: ThemePreference;
-  icon?: React.ReactNode;
-  onSelect: (value: ThemePreference) => void;
-  value: ThemePreference;
-}) {
-  const label = value === "auto" ? "自动" : value === "light" ? "亮色" : "暗色";
-  const fallbackIcon = value === "light" ? <SunIcon /> : value === "dark" ? <MoonIcon /> : undefined;
-  return (
-    <Button onClick={() => onSelect(value)} size="sm" variant={current === value ? "secondary" : "ghost"}>
-      {icon || fallbackIcon}
-      {label}
-    </Button>
   );
 }
 

@@ -10,7 +10,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { KeyListPage } from "@/features/keys/KeysPage";
 import { api, type APIKeyItem, type CreatedAPIKey, type ImportBatch, type OwnerUsageSummary, type PlatformUser, type PoolSummaryResponse, type RequestItem, type TokenCounts, type TokenItem } from "@/lib/api";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/format";
-import { EmptyState, ErrorAlert, LoadingState, MiniMetric, SelectField } from "@/shared/components";
+import { EmptyState, ErrorAlert, FilterBar, LoadingState, MiniMetric, SelectField } from "@/shared/components";
 import { errorMessage, tokenResetAtLabel } from "@/shared/domain";
 import { ApiKeyTable, ImportJobsTable, RequestLogsTable, RequestModelCell, TokenTable, UserSelector } from "@/shared/resourceTables";
 import type { ToastMessage } from "@/shared/types";
@@ -90,8 +90,8 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
       </CardHeader>
       <CardPanel className="grid gap-4">
         {error && <ErrorAlert title="用户数据载入失败" message={error} />}
-        <div className="grid gap-3 xl:grid-cols-[minmax(260px,1fr)_150px_150px_150px_170px]">
-          <div className="grid gap-2">
+        <FilterBar>
+          <div className="grid min-w-0 gap-2">
             <Label htmlFor="admin-user-search">搜索用户</Label>
             <div className="relative">
               <SearchIcon className="-translate-y-1/2 pointer-events-none absolute left-3 top-1/2 size-4 text-muted-foreground" />
@@ -102,7 +102,7 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
           <SelectField label="角色" value={role} onChange={setRole} options={[{ label: "全部", value: "all" }, { label: "user", value: "user" }, { label: "admin", value: "admin" }, { label: "readonly_admin", value: "readonly_admin" }, { label: "service", value: "service" }]} />
           <SelectField label="计划" value={plan} onChange={setPlan} options={[{ label: "全部", value: "all" }, { label: "Free", value: "free" }, { label: "Plus", value: "plus" }, { label: "Team", value: "team" }, { label: "Pro", value: "pro" }, { label: "Unknown", value: "unknown" }]} />
           <SelectField label="活跃度" value={activity} onChange={setActivity} options={[{ label: "全部", value: "all" }, { label: "24h 活跃", value: "24h" }, { label: "7d 活跃", value: "7d" }, { label: "7d 未活跃", value: "inactive7d" }]} />
-        </div>
+        </FilterBar>
         <div className="grid gap-3 rounded-lg border bg-muted/30 p-3 md:grid-cols-[minmax(180px,1fr)_minmax(160px,1fr)_auto]">
           <Input nativeInput onChange={(event) => setNewEmail(event.currentTarget.value)} placeholder="新用户邮箱" type="email" value={newEmail} />
           <Input nativeInput onChange={(event) => setNewPassword(event.currentTarget.value)} placeholder="初始密码" type="password" value={newPassword} />

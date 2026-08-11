@@ -253,6 +253,14 @@ export function readThemePreference(): ThemePreference {
   return raw === "light" || raw === "dark" || raw === "auto" ? raw : "auto";
 }
 
+export function readSidebarCollapsed(): boolean {
+  return localStorage.getItem("oaix.sidebarCollapsed") === "1";
+}
+
+export function writeSidebarCollapsed(collapsed: boolean): void {
+  localStorage.setItem("oaix.sidebarCollapsed", collapsed ? "1" : "0");
+}
+
 export function applyTheme(preference: ThemePreference): void {
   localStorage.setItem("oaix.themePreference", preference);
   const resolved =

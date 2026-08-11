@@ -67,6 +67,7 @@ import {
 import {
   EmptyState,
   ErrorAlert,
+  FilterBar,
   LoadingRows,
   Pagination,
   SelectField,
@@ -77,7 +78,6 @@ import {
   TokenStatusPlan,
   statusBadge,
 } from "@/shared/components";
-import { TokenFilters } from "@/shared/resourceTables";
 import type { DeleteTarget, RemarkTarget, ToastMessage, TokenStatus } from "@/shared/types";
 import { navigateTo, type RouteState, useRouteSearch } from "@/app/router";
 
@@ -461,7 +461,7 @@ export function KeyListPage({
           )}
         </CardHeader>
         <CardPanel className="grid gap-4">
-          <div className={cn("grid gap-3", config.ownerFilterOptions ? "xl:grid-cols-[minmax(220px,1fr)_210px_190px_190px_190px]" : "xl:grid-cols-[minmax(260px,1fr)_190px_190px_190px]")}>
+          <FilterBar>
             <div className="grid min-w-0 gap-2">
               <Label htmlFor={searchId}>搜索 Key</Label>
               <div className="relative min-w-0">
@@ -485,18 +485,10 @@ export function KeyListPage({
                 value={ownerUserID}
               />
             )}
-            <div className="xl:col-span-2">
-              <TokenFilters
-                onPlanChange={(value) => updateQuery({ page: 1, plan: value })}
-                onStatusChange={(value) => updateQuery({ page: 1, status: value })}
-                plan={plan}
-                planOptions={planOptions}
-                status={status}
-                statusOptions={statusOptions}
-              />
-            </div>
+            <SelectField label="状态" onChange={(value) => updateQuery({ page: 1, status: value })} options={statusOptions} value={status} />
+            <SelectField label="计划" onChange={(value) => updateQuery({ page: 1, plan: value })} options={planOptions} value={plan} />
             <SelectField label="排序" onChange={(value) => updateQuery({ page: 1, sort: value })} options={SORT_OPTIONS} value={sort} />
-          </div>
+          </FilterBar>
 
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-muted/40 p-3">
             <div className="flex flex-wrap items-center gap-2">
