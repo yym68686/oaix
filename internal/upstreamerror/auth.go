@@ -17,6 +17,23 @@ const (
 	expiredAuthenticationTokenMessage = "Provided authentication token is expired. Please try signing in again."
 )
 
+// IsUnauthorizedDetail reports the exact structured 401 response returned by
+// the upstream gateway for credentials that cannot authenticate. Only the
+// top-level detail field is accepted so a nested OAuth error or a free-form
+// Unauthorized message remains eligible for the existing refresh path.
+func IsUnauthorizedDetail(status int, body []byte) bool {
+	if status != http.StatusUnauthorized || len(body) == 0 {
+		return false
+	}
+	var payload struct {
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	return payload.Detail == "Unauthorized"
+}
+
 // IsTokenInvalidated reports whether an upstream HTTP response contains the
 // explicit, permanent token_invalidated protocol signal. Free-form messages
 // are intentionally ignored so localized or unrelated 401 errors cannot

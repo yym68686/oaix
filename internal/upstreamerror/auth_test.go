@@ -5,6 +5,31 @@ import (
 	"testing"
 )
 
+func TestIsUnauthorizedDetail(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "exact top-level detail", status: http.StatusUnauthorized, body: `{"detail":"Unauthorized"}`, want: true},
+		{name: "extra top-level fields", status: http.StatusUnauthorized, body: `{"detail":"Unauthorized","status":401}`, want: true},
+		{name: "nested OAuth error remains non-terminal", status: http.StatusUnauthorized, body: `{"error":{"code":"no_matching_rule","message":"Unauthorized"}}`},
+		{name: "plain text remains non-terminal", status: http.StatusUnauthorized, body: `Unauthorized`},
+		{name: "different detail remains non-terminal", status: http.StatusUnauthorized, body: `{"detail":"Invalid credentials"}`},
+		{name: "same body under another status", status: http.StatusForbidden, body: `{"detail":"Unauthorized"}`},
+		{name: "non-string detail remains non-terminal", status: http.StatusUnauthorized, body: `{"detail":true}`},
+		{name: "malformed response", status: http.StatusUnauthorized, body: `{"detail":`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsUnauthorizedDetail(test.status, []byte(test.body)); got != test.want {
+				t.Fatalf("IsUnauthorizedDetail() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestIsTokenInvalidated(t *testing.T) {
 	tests := []struct {
 		name   string

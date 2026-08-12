@@ -155,6 +155,7 @@ const (
 	OutcomeClientCanceled                 Outcome = "client_canceled"
 	OutcomeUpstream429Cooldown            Outcome = "upstream_429_cooldown"
 	OutcomeUpstream401Invalid             Outcome = "upstream_401_invalid"
+	OutcomeUpstream401UnauthorizedDetail  Outcome = "upstream_401_unauthorized_detail"
 	OutcomeUpstream401Invalidated         Outcome = "upstream_401_token_invalidated"
 	OutcomeUpstream401Expired             Outcome = "upstream_401_token_expired"
 	OutcomeAlphaSearch401Failover         Outcome = "alpha_search_401_account_failover"
@@ -570,6 +571,18 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			timing["alpha_search_401_failover"] = true
 			timing["alpha_search_401_failover_count"] = alphaSearch401Failovers
 			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, true, false, nil)
+			if attempt < p.cfg.Upstream.MaxRetries {
+				continue
+			}
+			break
+		}
+		if upstreamerror.IsUnauthorizedDetail(status, result.ErrorBody) {
+			message := `terminal upstream status 401: detail "Unauthorized"`
+			lastErr = errors.New(message)
+			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream401UnauthorizedDetail, retry, true, nil)
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401UnauthorizedDetail, attemptID))
+			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
+			excluded[claim.TokenID()] = struct{}{}
 			if attempt < p.cfg.Upstream.MaxRetries {
 				continue
 			}
