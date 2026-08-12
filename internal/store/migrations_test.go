@@ -143,6 +143,17 @@ func TestMigrationAddsGatewayIdempotencyRecords(t *testing.T) {
 	}
 }
 
+func TestMigrationIndexesResponseOwnerBindingTokenCleanup(t *testing.T) {
+	joinedMigration := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	if !strings.Contains(joinedMigration, "ix_response_owner_bindings_token_id") {
+		t.Fatal("full migrations must index response owner binding token cleanup")
+	}
+	joinedOnline := strings.ToLower(strings.Join(onlineMigrationStatements, "\n"))
+	if !strings.Contains(joinedOnline, "create index concurrently if not exists ix_response_owner_bindings_token_id") {
+		t.Fatal("online migrations must build response owner binding token cleanup index concurrently")
+	}
+}
+
 func TestStartupMigrationsCoverEveryVersionAfterBaseline(t *testing.T) {
 	for version := startupMigrationBaseVersion + 1; version <= SchemaVersion; version++ {
 		migration, ok := startupMigrations[version]
