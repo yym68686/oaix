@@ -58,27 +58,6 @@ func TestClassifyUpstreamFailures(t *testing.T) {
 	}
 }
 
-func TestRequiresNonFreeTokenPlan(t *testing.T) {
-	tests := []struct {
-		model string
-		want  bool
-	}{
-		{model: "gpt-5.6-sol", want: true},
-		{model: " GPT-5.6-SOL ", want: true},
-		{model: "gpt-5.6-sol-2026-07-01", want: true},
-		{model: "gpt-5.6-terra", want: false},
-		{model: "gpt-5.5", want: false},
-		{model: "gpt-5.6-solar", want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.model, func(t *testing.T) {
-			if got := requiresNonFreeTokenPlan(tt.model); got != tt.want {
-				t.Fatalf("requiresNonFreeTokenPlan(%q) = %v, want %v", tt.model, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestIsDeactivatedWorkspaceFailure(t *testing.T) {
 	if !isDeactivatedWorkspaceFailure(http.StatusPaymentRequired, []byte(`{"error":{"code":"deactivated_workspace"}}`), nil) {
 		t.Fatal("expected deactivated workspace body to be terminal")
@@ -3349,14 +3328,16 @@ func valueOrZero(value *int) int {
 	return *value
 }
 
-func TestProxyGpt56SolExcludesFreeTokensBeforeSelection(t *testing.T) {
+func TestProxyGpt56SolAllowsFreeTokensAcrossSelectionModes(t *testing.T) {
 	tests := []struct {
 		name          string
+		model         string
 		selectionMode string
 		ownerUserID   int64
 	}{
-		{name: "default"},
-		{name: "marketplace priced", selectionMode: "marketplace-priced", ownerUserID: 10},
+		{name: "default", model: "gpt-5.6-sol"},
+		{name: "versioned alias", model: "gpt-5.6-sol-2026-07-01"},
+		{name: "marketplace priced", model: "gpt-5.6-sol", selectionMode: "marketplace-priced", ownerUserID: 10},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3427,7 +3408,7 @@ func TestProxyGpt56SolExcludesFreeTokensBeforeSelection(t *testing.T) {
 			writer := logs.NewWriter(fakes, logger, cfg.RequestLog)
 			pipeline := New(cfg, logger, manager, client, writer, fakes, affinity.NewMemoryStore())
 
-			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(fmt.Sprintf(`{"model":%q,"input":"hello"}`, tt.model)))
 			req.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
 			pipeline.Proxy(recorder, req, RequestIntent{
@@ -3439,8 +3420,8 @@ func TestProxyGpt56SolExcludesFreeTokensBeforeSelection(t *testing.T) {
 			if recorder.Code != http.StatusOK {
 				t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
 			}
-			if upstreamAuthorization != "Bearer pro-token" {
-				t.Fatalf("upstream authorization = %q, want pro token", upstreamAuthorization)
+			if upstreamAuthorization != "Bearer free-token" {
+				t.Fatalf("upstream authorization = %q, want free token", upstreamAuthorization)
 			}
 		})
 	}
