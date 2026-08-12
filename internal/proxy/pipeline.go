@@ -124,6 +124,7 @@ type Attempt struct {
 	UpstreamURL            string
 	Method                 string
 	PromptCache            *PromptCacheContext
+	CodexFingerprint       *CodexFingerprintContext
 	StreamState            StreamAttemptState
 	DownstreamConnectionID string
 }
@@ -263,6 +264,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		writeErrorResponse(w, intent.Stream, status, err.Error())
 		return
 	}
+	codexFingerprintContext := buildCodexFingerprintContext(r.Header, intent)
 	promptCacheContext, upstreamBody := buildPromptCacheContext(r.Header, intent, bodyBytes, p.cfg.PromptCache)
 	bodyBytes = upstreamBody
 	searchSessionContext := buildSearchSessionContext(intent, bodyBytes)
@@ -285,6 +287,14 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}()
 	}
 	timing := map[string]any{"request_body_bytes": len(bodyBytes)}
+	initialSessionIDHash := promptString(promptCacheContext, func(c *PromptCacheContext) string { return shortHash(c.SessionID, 64) })
+	initialSessionIDSource := promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.SessionIDSource })
+	if codexFingerprintContext != nil {
+		timing["codex_fingerprint_mode"] = "session"
+		timing["codex_client_session_present"] = codexFingerprintContext.ClientSessionID != ""
+		initialSessionIDHash = nil
+		initialSessionIDSource = nil
+	}
 	if intent.ToolSearchKeyFixes > 0 {
 		timing["tool_search_argument_property_names_shortened"] = intent.ToolSearchKeyFixes
 		timing["tool_search_argument_property_name_limit"] = maxToolSearchArgumentPropertyNameRunes
@@ -343,8 +353,8 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		PromptCacheKeyHash:            promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheKeyHash }),
 		PromptCacheRetentionRequested: promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheRetentionRequested }),
 		PromptCacheRetentionSent:      promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheRetentionSent }),
-		SessionIDHash:                 promptString(promptCacheContext, func(c *PromptCacheContext) string { return shortHash(c.SessionID, 64) }),
-		SessionIDSource:               promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.SessionIDSource }),
+		SessionIDHash:                 initialSessionIDHash,
+		SessionIDSource:               initialSessionIDSource,
 		PreviousResponseIDHash:        promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PreviousResponseIDHash }),
 		PromptCacheTrace:              promptTrace(promptCacheContext),
 	}, false)
@@ -355,6 +365,8 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	var selectedTokenID *int64
 	var selectedTokenOwnerID *int64
 	var accountID *string
+	var upstreamSessionIDHash *string
+	var upstreamSessionIDSource *string
 	var lastAffinityResult tokens.PromptAffinityResult
 	var lastUsage *UsageMetrics
 	var lastResponseID string
@@ -435,6 +447,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			}
 		}
 		accountID = claim.AccountID()
+		upstreamSessionIDHash, upstreamSessionIDSource = codexFingerprintLogFields(claim, codexFingerprintContext)
 		attemptStarted := time.Now()
 		attemptSpec := Attempt{
 			Index:                  attempt,
@@ -445,6 +458,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			StartedAt:              attemptStarted.UTC(),
 			RetryCause:             classify(finalStatus, lastErr),
 			PromptCache:            promptCacheContext,
+			CodexFingerprint:       codexFingerprintContext,
 			StreamState:            streamState,
 			DownstreamConnectionID: downstreamConnectionID,
 		}
@@ -535,7 +549,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				msg = &text
 			}
 			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, selectedTokenOwnerID, accountID, msg, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, success, attempt, selectedTokenID, selectedTokenOwnerID, accountID, msg, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			if success {
 				p.commitSuccess(claim.TokenID())
 				p.recordPromptCacheSuccess(promptCacheContext, claim, lastResponseID)
@@ -547,7 +561,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitSuccess(claim.TokenID())
 			p.recordPromptCacheSuccess(promptCacheContext, claim, lastResponseID)
 			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, selectedTokenOwnerID, accountID, nil, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, true, attempt, selectedTokenID, selectedTokenOwnerID, accountID, nil, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
 		lastErr = err
@@ -559,7 +573,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				message = err.Error()
 			}
 			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+			p.finalLog(context.Background(), requestID, intent, started, 499, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
 		if isAlphaSearchEndpoint(intent) && status == http.StatusUnauthorized {
@@ -713,7 +727,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				message = err.Error()
 			}
 			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-			p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+			p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, attempt, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
 		if decision.retrySameToken {
@@ -739,7 +753,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				message = fmt.Sprintf("%s; downstream failure delivery failed: %v", message, deliveryErr)
 			}
 			observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-			p.finalLog(r.Context(), requestID, intent, started, status, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+			p.finalLog(r.Context(), requestID, intent, started, status, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 			return
 		}
 		message := "no available token"
@@ -749,7 +763,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 		writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, http.StatusServiceUnavailable, message)
 		observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 		return
 	}
 	message := "upstream request failed"
@@ -762,7 +776,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		w.Header().Set("X-OAIX-Request-ID", requestID)
 		writeFinalErrorResponse(w, false, false, http.StatusServiceUnavailable, message)
 		observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+		p.finalLog(r.Context(), requestID, intent, started, http.StatusServiceUnavailable, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 		return
 	}
 	if isAlphaSearchEndpoint(intent) && lastUpstreamErrorHeaders != nil {
@@ -778,12 +792,12 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		w.WriteHeader(finalStatus)
 		_, _ = w.Write(lastUpstreamErrorBody)
 		observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-		p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+		p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 		return
 	}
 	writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, finalStatus, message)
 	observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
-	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
 }
 
 func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {
@@ -1051,7 +1065,12 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		method = http.MethodPost
 	}
 	attempt.Method = method
-	req, err := http.NewRequestWithContext(r.Context(), method, upstreamURL, bytes.NewReader(attempt.Body))
+	fingerprintIDs := resolveCodexFingerprintIDs(attempt.Claim, attempt.CodexFingerprint)
+	upstreamBody, err := applyCodexFingerprintBody(attempt.Body, fingerprintIDs)
+	if err != nil {
+		return AttemptResult{Status: http.StatusBadGateway}, err
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, upstreamURL, bytes.NewReader(upstreamBody))
 	if err != nil {
 		return AttemptResult{Status: http.StatusBadGateway}, err
 	}
@@ -1079,6 +1098,7 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	if attempt.PromptCache != nil && attempt.PromptCache.SessionID != "" {
 		req.Header.Set("Session_id", attempt.PromptCache.SessionID)
 	}
+	applyCodexFingerprintHeaders(req.Header, fingerprintIDs)
 	resp, err := p.transport.Do(r.Context(), req)
 	if err != nil {
 		return AttemptResult{Status: http.StatusBadGateway, Retry: true}, err
@@ -1738,7 +1758,7 @@ func (p *Pipeline) withCommitRetry(ctx context.Context, fn func(context.Context)
 	return lastErr
 }
 
-func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent RequestIntent, started time.Time, status int, success bool, attempts int, tokenID *int64, tokenOwnerUserID *int64, accountID *string, errMsg *string, timing map[string]any, promptCacheContext *PromptCacheContext, affinityResult tokens.PromptAffinityResult, usage *UsageMetrics, upstreamResponseID string, firstTokenAt *time.Time, downstreamConnectionID string, streamDeliveryTrace *store.StreamDeliveryTrace) {
+func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent RequestIntent, started time.Time, status int, success bool, attempts int, tokenID *int64, tokenOwnerUserID *int64, accountID *string, errMsg *string, timing map[string]any, promptCacheContext *PromptCacheContext, upstreamSessionIDHash *string, upstreamSessionIDSource *string, affinityResult tokens.PromptAffinityResult, usage *UsageMetrics, upstreamResponseID string, firstTokenAt *time.Time, downstreamConnectionID string, streamDeliveryTrace *store.StreamDeliveryTrace) {
 	finished := time.Now().UTC()
 	duration := int(finished.Sub(started).Milliseconds())
 	if timing == nil {
@@ -1786,8 +1806,8 @@ func (p *Pipeline) finalLog(ctx context.Context, requestID string, intent Reques
 		PromptCacheKeyHash:            promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheKeyHash }),
 		PromptCacheRetentionRequested: promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheRetentionRequested }),
 		PromptCacheRetentionSent:      promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PromptCacheRetentionSent }),
-		SessionIDHash:                 promptString(promptCacheContext, func(c *PromptCacheContext) string { return shortHash(c.SessionID, 64) }),
-		SessionIDSource:               promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.SessionIDSource }),
+		SessionIDHash:                 firstNonNilString(upstreamSessionIDHash, promptString(promptCacheContext, func(c *PromptCacheContext) string { return shortHash(c.SessionID, 64) })),
+		SessionIDSource:               firstNonNilString(upstreamSessionIDSource, promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.SessionIDSource })),
 		PreviousResponseIDHash:        promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.PreviousResponseIDHash }),
 		UpstreamResponseID:            nullable(upstreamResponseID),
 		CacheHitRatio:                 usageFloatValue(usage, func(u *UsageMetrics) *float64 { return u.CacheHitRatio }),
@@ -2051,6 +2071,15 @@ func nullable(value string) *string {
 		return nil
 	}
 	return &value
+}
+
+func firstNonNilString(values ...*string) *string {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 func ptrInt(value int) *int {

@@ -324,6 +324,7 @@ Go 版支持 access token、refresh token，以及 sub2api 导出的 OpenAI Agen
 ## 网关行为
 
 - 只会选择 `is_active=true` 且 `cooldown_until` 不在未来的 key
+- Codex `/v1/responses` 及内部转到 Responses 的图片请求默认使用账号级 `session` 指纹收敛：`installation_id` 和 `session_id` 对同一上游账号恒定，`thread_id` 按账号与客户端原始 `session-id` 确定性派生，`turn_id` 每个入站请求新生成；相关请求头、`x-codex-turn-metadata` 和请求体 `client_metadata` 会保持一致。`/v1/responses/compact` 保持原有协议，不注入该元数据
 - `/v1/responses/compact` 会透传到上游 `/responses/compact`；上游不支持 `store` 参数，网关会先移除该字段，非流式调用时也不会自动补 `stream`
 - 下游如果把 `/v1/responses` 当非流式调用，网关会自动把上游改成 `stream=true`，先在网关内收完整个 SSE，再拼成一个普通 JSON 响应返回
 - `/v1/images/generations` 和 `/v1/images/edits` 默认把 `model` 当作图片工具模型处理；未指定时默认 `gpt-image-2`，内部主模型固定走 `gpt-5.5`
