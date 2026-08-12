@@ -313,13 +313,20 @@ export function parseTokenText(raw: string): ImportEntry[] {
     if (value.includes(",")) {
       const parts = value.split(",").map((part) => part.trim()).filter(Boolean);
       if (parts.length >= 2) {
-        values.push({ account_id: parts[0], refresh_token: parts[parts.length - 1] });
+        const token = parts[parts.length - 1];
+        if (!isRedactedCredential(token)) {
+          values.push({ account_id: parts[0], refresh_token: token });
+        }
       } else if (parts.length) {
-        values.push(parts[0]);
+        if (!isRedactedCredential(parts[0])) {
+          values.push(parts[0]);
+        }
       }
       continue;
     }
-    values.push(value);
+    if (!isRedactedCredential(value)) {
+      values.push(value);
+    }
   }
   return values;
 }
@@ -334,7 +341,7 @@ function collectFromJSON(value: unknown, output: ImportEntry[]): void {
   }
   if (typeof value === "string") {
     const text = value.trim();
-    if (text) {
+    if (text && !isRedactedCredential(text)) {
       output.push(text);
     }
     return;
@@ -378,8 +385,8 @@ function importPayloadFromSub2APIAccount(account: Record<string, unknown>): Reco
     return null;
   }
   const credentials = account.credentials;
-  const refreshToken = stringField(credentials, "refresh_token");
-  const accessToken = stringField(credentials, "access_token");
+  const refreshToken = credentialField(credentials, "refresh_token");
+  const accessToken = credentialField(credentials, "access_token");
   if (!refreshToken && !accessToken) {
     return null;
   }
@@ -425,7 +432,8 @@ function importPayloadFromRecord(record: Record<string, unknown>): Record<string
     "is_active",
   ]) {
     const value = record[key];
-    if (typeof value === "string" && value.trim()) {
+    if (typeof value === "string" && value.trim() &&
+      (!isCredentialKey(key) || !isRedactedCredential(value))) {
       payload[key] = value.trim();
     } else if (typeof value === "boolean") {
       payload[key] = value;
@@ -448,13 +456,37 @@ function stringField(record: Record<string, unknown>, key: string): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function credentialField(record: Record<string, unknown>, key: string): string {
+  const value = stringField(record, key);
+  return isRedactedCredential(value) ? "" : value;
+}
+
+function isCredentialKey(key: string): boolean {
+  return ["access_token", "accessToken", "refresh_token", "refreshToken", "token"].includes(key);
+}
+
+function isRedactedCredential(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (["…", "[redacted]", "<redacted>", "(redacted)", "redacted", "***redacted***"].includes(normalized)) {
+    return true;
+  }
+  return Boolean(normalized) && normalized.replace(/[.*•]/g, "") === "";
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function importEntryKey(value: ImportEntry): string {
   if (typeof value === "string") {
-    return value.trim();
+    const token = value.trim();
+    return isRedactedCredential(token) ? "" : token;
+  }
+  for (const key of ["refresh_token", "refreshToken", "access_token", "accessToken", "token"]) {
+    const token = credentialField(value, key);
+    if (token) {
+      return token;
+    }
   }
   const sorted = Object.keys(value)
     .sort()

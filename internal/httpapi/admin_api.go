@@ -19,12 +19,91 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/yym68686/oaix/internal/agentidentity"
+	"github.com/yym68686/oaix/internal/importpayload"
 	"github.com/yym68686/oaix/internal/store"
 )
 
 type quotaRefreshRegistry struct {
 	mu   sync.Mutex
 	jobs map[string]*quotaRefreshJob
+}
+
+type importParseSummary struct {
+	InputCount               int  `json:"input_count"`
+	Total                    int  `json:"total"`
+	Deduplicated             bool `json:"deduplicated"`
+	DeduplicatedCount        int  `json:"deduplicated_count"`
+	RedactedCredentialCount  int  `json:"redacted_credential_count"`
+	RejectedCount            int  `json:"rejected_count"`
+	AccessTokenFallbackCount int  `json:"access_token_fallback_count"`
+}
+
+func finalizeImportParse(payloads []map[string]any, inputCount int) ([]map[string]any, importParseSummary) {
+	summary := importParseSummary{InputCount: inputCount, Deduplicated: true}
+	usableCount := 0
+	for _, payload := range payloads {
+		redacted := importPayloadInt(payload, importRedactedCredentialCountKey)
+		summary.RedactedCredentialCount += redacted
+		if redacted > 0 && importpayload.String(payload, "access_token", "accessToken") != "" {
+			summary.AccessTokenFallbackCount++
+		}
+		if importPayloadIdentityKey(payload) != "" {
+			usableCount++
+		}
+	}
+	payloads = dedupeImportPayloads(payloads)
+	summary.Total = len(payloads)
+	summary.DeduplicatedCount = max(0, usableCount-len(payloads))
+	summary.RejectedCount = max(0, inputCount-usableCount)
+	for _, payload := range payloads {
+		delete(payload, importRedactedCredentialCountKey)
+	}
+	return payloads, summary
+}
+
+func importPayloadInt(payload map[string]any, key string) int {
+	switch value := payload[key].(type) {
+	case int:
+		return value
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+func importInputCount(body any, payloads []map[string]any) int {
+	switch typed := body.(type) {
+	case []any:
+		return len(typed)
+	case map[string]any:
+		if accounts, ok := typed["accounts"].([]any); ok {
+			return len(accounts)
+		}
+		if tokens, ok := typed["tokens"].([]any); ok {
+			return len(tokens)
+		}
+	}
+	return len(payloads)
+}
+
+func importTextInputCount(raw string, payloads []map[string]any) int {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return 0
+	}
+	var decoded any
+	if json.Unmarshal([]byte(text), &decoded) == nil {
+		return importInputCount(decoded, payloads)
+	}
+	count := 0
+	for _, line := range strings.Split(text, "\n") {
+		value := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if value != "" && !strings.HasPrefix(value, "#") {
+			count++
+		}
+	}
+	return count
 }
 
 type quotaRefreshJob struct {
@@ -761,20 +840,24 @@ func (a *App) parseImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payloads []map[string]any
+	inputCount := 0
 	var err error
 	if strings.TrimSpace(payload.Text) != "" {
 		payloads, err = parseImportTextPayloads(payload.Text)
+		inputCount = importTextInputCount(payload.Text, payloads)
 	} else if payload.Tokens != nil {
-		payloads, _, err = parseImportPayload(map[string]any{"tokens": payload.Tokens})
+		body := map[string]any{"tokens": payload.Tokens}
+		payloads, _, err = parseImportPayload(body)
+		inputCount = importInputCount(body, payloads)
 	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	payloads = dedupeImportPayloads(payloads)
+	payloads, summary := finalizeImportParse(payloads, inputCount)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items":   payloads,
-		"summary": map[string]any{"total": len(payloads), "deduplicated": true},
+		"summary": summary,
 	})
 }
 
@@ -784,6 +867,7 @@ func (a *App) uploadImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var all []map[string]any
+	inputCount := 0
 	for _, headers := range r.MultipartForm.File {
 		for _, header := range headers {
 			file, err := header.Open()
@@ -802,14 +886,15 @@ func (a *App) uploadImport(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
+			inputCount += importTextInputCount(string(data), payloads)
 			for _, payload := range payloads {
 				payload["source_file"] = header.Filename
 				all = append(all, payload)
 			}
 		}
 	}
-	all = dedupeImportPayloads(all)
-	writeJSON(w, http.StatusOK, map[string]any{"items": all, "summary": map[string]any{"total": len(all)}})
+	all, summary := finalizeImportParse(all, inputCount)
+	writeJSON(w, http.StatusOK, map[string]any{"items": all, "summary": summary})
 }
 
 func (a *App) createImportJob(w http.ResponseWriter, r *http.Request) {
@@ -1669,6 +1754,9 @@ func parseImportTextPayloads(raw string) ([]map[string]any, error) {
 			parts := splitClean(value, "----")
 			if len(parts) > 0 {
 				payload := importPayloadFromString(parts[len(parts)-1])
+				if payload == nil {
+					continue
+				}
 				if strings.Contains(strings.ToLower(parts[0]), "@") {
 					payload["email"] = parts[0]
 				}
@@ -1680,12 +1768,17 @@ func parseImportTextPayloads(raw string) ([]map[string]any, error) {
 			parts := splitClean(value, ",")
 			if len(parts) >= 2 {
 				payload := importPayloadFromString(parts[len(parts)-1])
+				if payload == nil {
+					continue
+				}
 				payload["account_id"] = parts[0]
 				out = append(out, payload)
 				continue
 			}
 		}
-		out = append(out, importPayloadFromString(value))
+		if payload := importPayloadFromString(value); payload != nil {
+			out = append(out, payload)
+		}
 	}
 	return out, nil
 }
@@ -1694,16 +1787,7 @@ func dedupeImportPayloads(payloads []map[string]any) []map[string]any {
 	seen := map[string]struct{}{}
 	out := make([]map[string]any, 0, len(payloads))
 	for _, payload := range payloads {
-		key := stringFromImportPayload(payload, "refresh_token", "refreshToken", "access_token", "accessToken", "token")
-		if normalized, ok := agentidentity.NormalizePayload(payload); ok {
-			if runtimeID := stringFromImportPayload(normalized, "agent_runtime_id"); runtimeID != "" {
-				key = agentidentity.SyntheticRefreshPrefix + runtimeID
-			}
-		}
-		if key == "" {
-			data, _ := json.Marshal(payload)
-			key = string(data)
-		}
+		key := importPayloadIdentityKey(payload)
 		if key == "" {
 			continue
 		}
@@ -1711,9 +1795,24 @@ func dedupeImportPayloads(payloads []map[string]any) []map[string]any {
 			continue
 		}
 		seen[key] = struct{}{}
+		delete(payload, importRedactedCredentialCountKey)
 		out = append(out, payload)
 	}
 	return out
+}
+
+func importPayloadIdentityKey(payload map[string]any) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	if normalized, ok := agentidentity.NormalizePayload(payload); ok {
+		if runtimeID := stringFromImportPayload(normalized, "agent_runtime_id"); runtimeID != "" {
+			return agentidentity.SyntheticRefreshPrefix + runtimeID
+		}
+		data, _ := json.Marshal(normalized)
+		return string(data)
+	}
+	return importpayload.String(payload, "refresh_token", "refreshToken", "access_token", "accessToken", "token")
 }
 
 func requestLogOptionsFromRequest(r *http.Request) store.RequestLogListOptions {

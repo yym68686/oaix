@@ -14,6 +14,11 @@ def test_normalize_refresh_token_trims_empty_values():
     assert normalize_refresh_token(None) is None
 
 
+def test_normalize_refresh_token_rejects_redacted_markers():
+    for marker in (".", "...", "***", "…", "[REDACTED]", "<redacted>"):
+        assert normalize_refresh_token(marker) is None
+
+
 def test_merge_refresh_token_aliases_preserves_order_and_uniqueness():
     aliases = merge_refresh_token_aliases(["rt_1", "rt_2", "rt_1"], "rt_3", "rt_2", "", None)
     assert aliases == ["rt_1", "rt_2", "rt_3"]

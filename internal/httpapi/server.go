@@ -23,6 +23,7 @@ import (
 	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/agentidentitytask"
 	"github.com/yym68686/oaix/internal/config"
+	"github.com/yym68686/oaix/internal/importpayload"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/proxy"
@@ -52,6 +53,8 @@ type App struct {
 	httpRoutes             *httpRouteMetrics
 	capabilityQuotaRefresh singleflight.Group
 }
+
+const importRedactedCredentialCountKey = "_redacted_credential_count"
 
 type adminImportItem struct {
 	ID                         int64      `json:"id"`
@@ -680,6 +683,11 @@ func (a *App) importTokens(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	payloads = dedupeImportPayloads(payloads)
+	if len(payloads) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("tokens must contain at least one usable import credential"))
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	job, result, err := a.completeTokenImport(ctx, payloads, queuePosition, "admin_api", "api")
@@ -737,11 +745,11 @@ func (a *App) prepareImportPayloads(ctx context.Context, payloads []map[string]a
 	client.ClientID = a.cfg.Upstream.OAuthClientID
 	client.Scope = a.cfg.Upstream.OAuthScope
 	for index, payload := range payloads {
-		normalized := clonePayload(payload)
-		refreshToken := stringFromImportPayload(normalized, "refresh_token", "refreshToken")
-		accessToken := stringFromImportPayload(normalized, "access_token", "accessToken")
+		normalized, _ := importpayload.CleanCredentials(clonePayload(payload))
+		refreshToken := importpayload.String(normalized, "refresh_token", "refreshToken")
+		accessToken := importpayload.String(normalized, "access_token", "accessToken")
 		if accessToken == "" {
-			if token := stringFromImportPayload(normalized, "token"); looksLikeAccessTokenText(token) {
+			if token := importpayload.String(normalized, "token"); looksLikeAccessTokenText(token) {
 				accessToken = token
 			}
 		}
@@ -1511,7 +1519,9 @@ func parseImportPayload(body any) ([]map[string]any, string, error) {
 		case string:
 			text := strings.TrimSpace(item)
 			if text != "" {
-				payloads = append(payloads, importPayloadFromString(text))
+				if payload := importPayloadFromString(text); payload != nil {
+					payloads = append(payloads, payload)
+				}
 			}
 		case map[string]any:
 			payloads = append(payloads, normalizeImportPayloadMap(item))
@@ -1559,12 +1569,30 @@ func sub2APIAccountImportPayload(account map[string]any) (map[string]any, bool) 
 		}
 		return payload, true
 	}
-	refreshToken := strings.TrimSpace(stringFromAny(credentials["refresh_token"]))
-	accessToken := strings.TrimSpace(stringFromAny(credentials["access_token"]))
+	refreshToken := importpayload.NormalizeCredential(credentials["refresh_token"])
+	accessToken := importpayload.NormalizeCredential(credentials["access_token"])
+	redactedCredentialCount := 0
+	for _, key := range []string{"refresh_token", "access_token"} {
+		if value, ok := credentials[key].(string); ok && importpayload.IsRedactedCredential(value) {
+			redactedCredentialCount++
+		}
+	}
 	if refreshToken == "" && accessToken == "" {
-		return nil, false
+		if redactedCredentialCount == 0 {
+			return nil, false
+		}
+		payload := map[string]any{importRedactedCredentialCountKey: redactedCredentialCount}
+		copyStringField(payload, credentials, "account_id", "account_id")
+		copyStringField(payload, credentials, "email", "email")
+		if payload["email"] == nil {
+			copyStringField(payload, account, "name", "email")
+		}
+		return payload, true
 	}
 	payload := map[string]any{}
+	if redactedCredentialCount > 0 {
+		payload[importRedactedCredentialCountKey] = redactedCredentialCount
+	}
 	if refreshToken != "" {
 		payload["refresh_token"] = refreshToken
 	} else {
@@ -1605,6 +1633,9 @@ func boolFromAny(value any) (bool, bool) {
 
 func importPayloadFromString(value string) map[string]any {
 	value = strings.TrimSpace(value)
+	if importpayload.IsRedactedCredential(value) {
+		return map[string]any{importRedactedCredentialCountKey: 1}
+	}
 	if looksLikeAccessTokenText(value) {
 		return map[string]any{"access_token": value}
 	}
@@ -1616,24 +1647,24 @@ func normalizeImportPayloadMap(payload map[string]any) map[string]any {
 		preserveImportPayloadControlFields(normalized, payload)
 		return normalized
 	}
-	out := make(map[string]any, len(payload)+1)
-	for key, value := range payload {
-		out[key] = value
+	out, redactedCredentialCount := importpayload.CleanCredentials(payload)
+	if redactedCredentialCount > 0 {
+		out[importRedactedCredentialCountKey] = redactedCredentialCount
 	}
 	if _, hasAccess := out["access_token"]; !hasAccess {
-		if value, ok := out["accessToken"].(string); ok && strings.TrimSpace(value) != "" {
-			out["access_token"] = strings.TrimSpace(value)
+		if value := importpayload.String(out, "accessToken"); value != "" {
+			out["access_token"] = value
 		}
 	}
 	if _, hasRefresh := out["refresh_token"]; !hasRefresh {
-		if value, ok := out["refreshToken"].(string); ok && strings.TrimSpace(value) != "" {
-			out["refresh_token"] = strings.TrimSpace(value)
+		if value := importpayload.String(out, "refreshToken"); value != "" {
+			out["refresh_token"] = value
 		}
 	}
 	if _, hasAccess := out["access_token"]; !hasAccess {
 		if _, hasRefresh := out["refresh_token"]; !hasRefresh {
-			if value, ok := out["token"].(string); ok && strings.TrimSpace(value) != "" {
-				text := strings.TrimSpace(value)
+			if value := importpayload.String(out, "token"); value != "" {
+				text := value
 				if looksLikeAccessTokenText(text) {
 					out["access_token"] = text
 				} else {
@@ -1651,7 +1682,7 @@ func preserveImportPayloadControlFields(dst map[string]any, src map[string]any) 
 	}
 	for _, key := range []string{
 		"_share_enabled", "_share_status", "share_enabled", "shareEnabled", "share_status", "shareStatus",
-		"source_file", "_import_index", "_previous_refresh_token",
+		"source_file", "_import_index", "_previous_refresh_token", importRedactedCredentialCountKey,
 	} {
 		if value, ok := src[key]; ok {
 			dst[key] = value

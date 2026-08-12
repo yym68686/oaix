@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/yym68686/oaix/internal/importpayload"
 )
 
 type ImportJob struct {
@@ -1201,7 +1202,7 @@ func storedRefreshTokensFromPayloads(rawPayloads []byte) []string {
 	for _, value := range values {
 		switch typed := value.(type) {
 		case string:
-			if token := strings.TrimSpace(typed); token != "" {
+			if token := importpayload.NormalizeCredential(typed); token != "" {
 				if looksLikeAccessTokenText(token) {
 					out = append(out, accessTokenOnlyRefreshToken(token))
 				} else {
@@ -1218,39 +1219,30 @@ func storedRefreshTokensFromPayloads(rawPayloads []byte) []string {
 }
 
 func importAccessTokenFromPayload(payload map[string]any) string {
-	for _, key := range []string{"access_token", "accessToken"} {
-		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
+	if value := importpayload.String(payload, "access_token", "accessToken"); value != "" {
+		return value
 	}
-	if value, ok := payload["token"].(string); ok && looksLikeAccessTokenText(value) {
-		return strings.TrimSpace(value)
+	if value := importpayload.String(payload, "token"); looksLikeAccessTokenText(value) {
+		return value
 	}
 	return ""
 }
 
 func storedRefreshTokenFromPayload(payload map[string]any) string {
-	for _, key := range []string{"refresh_token", "refreshToken"} {
-		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
+	if value := importpayload.String(payload, "refresh_token", "refreshToken"); value != "" {
+		return value
 	}
 	if accessToken := importAccessTokenFromPayload(payload); accessToken != "" {
 		return accessTokenOnlyRefreshToken(accessToken)
 	}
-	if value, ok := payload["token"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value)
+	if value := importpayload.String(payload, "token"); value != "" {
+		return value
 	}
 	return ""
 }
 
 func tokenIdentityFromPayload(payload map[string]any) string {
-	for _, key := range []string{"refresh_token", "refreshToken", "access_token", "accessToken", "token"} {
-		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
+	return importpayload.String(payload, "refresh_token", "refreshToken", "access_token", "accessToken", "token")
 }
 
 func looksLikeAccessTokenText(value string) bool {

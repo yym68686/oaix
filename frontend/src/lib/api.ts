@@ -198,8 +198,13 @@ export type ImportBatchDetail = {
 export type ImportParseResponse = {
   items?: Array<string | Record<string, unknown>>;
   summary?: {
+    input_count?: number;
     total?: number;
     deduplicated?: boolean;
+    deduplicated_count?: number;
+    redacted_credential_count?: number;
+    rejected_count?: number;
+    access_token_fallback_count?: number;
   };
 };
 

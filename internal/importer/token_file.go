@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+
+	"github.com/yym68686/oaix/internal/importpayload"
 )
 
 func ReadAccessTokenFile(path string) ([]string, error) {
@@ -24,16 +26,15 @@ func ReadAccessTokenFile(path string) ([]string, error) {
 		if strings.HasPrefix(line, "{") {
 			var payload map[string]any
 			if err := json.Unmarshal([]byte(line), &payload); err == nil {
-				for _, key := range []string{"access_token", "accessToken", "token"} {
-					if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-						tokens = append(tokens, strings.TrimSpace(value))
-						break
-					}
+				if token := importpayload.String(payload, "access_token", "accessToken", "token"); token != "" {
+					tokens = append(tokens, token)
 				}
 			}
 			continue
 		}
-		tokens = append(tokens, line)
+		if !importpayload.IsRedactedCredential(line) {
+			tokens = append(tokens, line)
+		}
 	}
 	return tokens, scanner.Err()
 }

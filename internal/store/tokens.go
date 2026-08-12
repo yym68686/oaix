@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/yym68686/oaix/internal/agentidentity"
+	"github.com/yym68686/oaix/internal/importpayload"
 )
 
 const (
@@ -2373,12 +2374,12 @@ func timeFromPayload(payload map[string]any, keys ...string) *time.Time {
 }
 
 func normalizeTokenPayload(payload map[string]any) map[string]any {
-	out := make(map[string]any, len(payload)+2)
-	for key, value := range payload {
+	out, _ := importpayload.CleanCredentials(payload)
+	for key := range payload {
 		if key == "_import_index" || key == "_previous_refresh_token" {
+			delete(out, key)
 			continue
 		}
-		out[key] = value
 	}
 	if out["access_token"] == nil {
 		if value := stringFromPayload(out, "accessToken"); value != "" {

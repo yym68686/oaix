@@ -29,3 +29,33 @@ func TestImportItemSelectColumnsMatchesScanner(t *testing.T) {
 		}
 	}
 }
+
+func TestImportCredentialIdentityIgnoresRedactedRefreshToken(t *testing.T) {
+	payload := map[string]any{
+		"refresh_token": "...",
+		"access_token":  "eyJ.access.signature",
+	}
+	if got := tokenIdentityFromPayload(payload); got != "eyJ.access.signature" {
+		t.Fatalf("token identity = %q", got)
+	}
+	if got := storedRefreshTokenFromPayload(payload); got != accessTokenOnlyRefreshToken("eyJ.access.signature") {
+		t.Fatalf("stored refresh token = %q", got)
+	}
+	if hash := refreshHashFromPayload(map[string]any{"refresh_token": "."}); hash != nil {
+		t.Fatalf("redacted-only payload received a hash: %q", *hash)
+	}
+}
+
+func TestNormalizeTokenPayloadFallsBackFromRedactedRefreshToken(t *testing.T) {
+	payload := normalizeTokenPayload(map[string]any{
+		"refresh_token": "...",
+		"access_token":  "eyJ.access.signature",
+		"account_id":    "acct-1",
+	})
+	if _, exists := payload["refresh_token"]; exists {
+		t.Fatalf("redacted refresh token leaked: %#v", payload)
+	}
+	if payload["access_token"] != "eyJ.access.signature" || payload["account_id"] != "acct-1" {
+		t.Fatalf("payload = %#v", payload)
+	}
+}

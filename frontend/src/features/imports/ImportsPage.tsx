@@ -466,10 +466,21 @@ function ImportForm({
       }
       const entries = parsed.items || [];
       if (!entries.length) {
-        setImportFeedback("没有可导入的 token。");
+        const rejected = Number(parsed.summary?.rejected_count || 0);
+        setImportFeedback(
+          rejected > 0 ? `没有可导入的 token；${formatNumber(rejected)} 条缺少可用凭据。` : "没有可导入的 token。",
+        );
         return;
       }
-      setImportFeedback(`正在提交 ${formatNumber(entries.length)} 条 token...`);
+      const fallbackCount = Number(parsed.summary?.access_token_fallback_count || 0);
+      const rejectedCount = Number(parsed.summary?.rejected_count || 0);
+      const parseNotes = [
+        fallbackCount > 0 ? `${formatNumber(fallbackCount)} 条脱敏 refresh 已改用 access token` : "",
+        rejectedCount > 0 ? `${formatNumber(rejectedCount)} 条缺少可用凭据` : "",
+      ].filter(Boolean);
+      setImportFeedback(
+        `正在提交 ${formatNumber(entries.length)} 条 token${parseNotes.length ? `（${parseNotes.join("，")}）` : ""}...`,
+      );
       const result = await api.createImportJob({
         import_queue_position: queuePosition,
         tokens: entries,
@@ -478,7 +489,7 @@ function ImportForm({
       const summary = (result as any).result || {};
       setImportFeedback(
         job.id
-          ? `已提交批次 #${job.id}：共 ${formatNumber(job.total_count || entries.length)} 条。`
+          ? `已提交批次 #${job.id}：共 ${formatNumber(job.total_count || entries.length)} 条${parseNotes.length ? `；${parseNotes.join("，")}` : ""}。`
           : `导入完成：新建 ${formatNumber(summary.created)}，更新 ${formatNumber(summary.updated)}，跳过 ${formatNumber(summary.skipped)}，失败 ${formatNumber(summary.failed)}。`,
       );
       setTokenInput("");

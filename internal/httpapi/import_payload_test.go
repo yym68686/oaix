@@ -140,6 +140,68 @@ func TestParseImportTextPayloadsExpandsSub2APIDataExport(t *testing.T) {
 	}
 }
 
+func TestSub2APIImportFallsBackFromRedactedRefreshTokensWithoutCollapsingAccounts(t *testing.T) {
+	accounts := make([]any, 0, 20)
+	for index := 0; index < 20; index++ {
+		refreshToken := fmt.Sprintf("rt-real-%d", index)
+		if index < 17 {
+			refreshToken = "..."
+		} else if index == 17 {
+			refreshToken = "."
+		}
+		accounts = append(accounts, map[string]any{
+			"name": fmt.Sprintf("account-%d@example.com", index),
+			"credentials": map[string]any{
+				"access_token":  fmt.Sprintf("eyJ.account-%d.signature", index),
+				"refresh_token": refreshToken,
+				"account_id":    fmt.Sprintf("acct-%d", index),
+				"email":         fmt.Sprintf("account-%d@example.com", index),
+			},
+		})
+	}
+	data, err := json.Marshal(map[string]any{"type": "sub2api-data", "accounts": accounts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, err := parseImportTextPayloads(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, summary := finalizeImportParse(payloads, importTextInputCount(string(data), payloads))
+	if len(payloads) != 20 || summary.InputCount != 20 || summary.Total != 20 {
+		t.Fatalf("payloads=%d summary=%+v", len(payloads), summary)
+	}
+	if summary.RedactedCredentialCount != 18 || summary.AccessTokenFallbackCount != 18 || summary.DeduplicatedCount != 0 || summary.RejectedCount != 0 {
+		t.Fatalf("summary=%+v", summary)
+	}
+	for index, payload := range payloads {
+		if _, leaked := payload[importRedactedCredentialCountKey]; leaked {
+			t.Fatalf("payload %d leaked parser metadata: %#v", index, payload)
+		}
+		if index < 18 {
+			if payload["access_token"] != fmt.Sprintf("eyJ.account-%d.signature", index) || payload["refresh_token"] != nil {
+				t.Fatalf("payload %d did not use access fallback: %#v", index, payload)
+			}
+		} else if payload["refresh_token"] != fmt.Sprintf("rt-real-%d", index) || payload["access_token"] != nil {
+			t.Fatalf("payload %d did not preserve real refresh preference: %#v", index, payload)
+		}
+	}
+}
+
+func TestImportParseSummaryRejectsRedactedOnlyCredentials(t *testing.T) {
+	payloads, err := parseImportTextPayloads(`{
+		"type": "sub2api-data",
+		"accounts": [{"name":"redacted@example.com","credentials":{"refresh_token":"..."}}]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, summary := finalizeImportParse(payloads, 1)
+	if len(payloads) != 0 || summary.Total != 0 || summary.RejectedCount != 1 || summary.RedactedCredentialCount != 1 {
+		t.Fatalf("payloads=%#v summary=%+v", payloads, summary)
+	}
+}
+
 func TestParseImportTextPayloadsExpandsSub2APIAgentIdentityExportByRuntime(t *testing.T) {
 	accounts := make([]any, 0, 50)
 	for index := 0; index < 50; index++ {

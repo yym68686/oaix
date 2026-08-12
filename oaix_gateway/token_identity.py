@@ -8,7 +8,16 @@ T = TypeVar("T")
 
 def normalize_refresh_token(value: Any) -> str | None:
     token = str(value or "").strip()
+    if _is_redacted_credential(token):
+        return None
     return token or None
+
+
+def _is_redacted_credential(value: str) -> bool:
+    token = value.strip().lower()
+    if token in {"…", "[redacted]", "<redacted>", "(redacted)", "redacted", "***redacted***"}:
+        return True
+    return bool(token) and not token.strip(".*•")
 
 
 def merge_refresh_token_aliases(existing: Any, *refresh_tokens: Any) -> list[str]:

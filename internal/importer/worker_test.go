@@ -169,6 +169,30 @@ func TestWorkerValidateBatchPersonalAccessTokenPreservesNestedMetadata(t *testin
 	}
 }
 
+func TestWorkerValidateBatchFallsBackFromRedactedNestedRefreshToken(t *testing.T) {
+	worker := &Worker{Validator: TokenPayloadValidator{}}
+	updates := worker.ValidateBatch(context.Background(), []store.ImportItem{{
+		ID: 1,
+		Payload: map[string]any{
+			"credentials": map[string]any{
+				"access_token":  "at-redacted-refresh-fallback",
+				"refresh_token": "...",
+				"account_id":    "acct-fallback",
+			},
+		},
+	}})
+	if len(updates) != 1 || updates[0].Status != string(ItemValidated) || updates[0].Action != "upsert_access_token" {
+		t.Fatalf("unexpected update: %+v", updates)
+	}
+	payload := updates[0].ValidatedPayload
+	if payload["access_token"] != "at-redacted-refresh-fallback" || payload["account_id"] != "acct-fallback" {
+		t.Fatalf("fallback payload = %#v", payload)
+	}
+	if _, exists := payload["refresh_token"]; exists {
+		t.Fatalf("redacted refresh token leaked into validated payload: %#v", payload)
+	}
+}
+
 func TestWorkerValidateBatchNestedCredentialsRefreshTokens(t *testing.T) {
 	refreshClient := &fakeRefreshClientWithClientID{}
 	worker := &Worker{

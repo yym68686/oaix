@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yym68686/oaix/internal/agentidentity"
+	"github.com/yym68686/oaix/internal/importpayload"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
 )
@@ -153,17 +154,14 @@ func (AccessTokenValidator) Validate(ctx context.Context, item store.ImportItem)
 		return ValidatedItem{}, ctx.Err()
 	default:
 	}
-	payload := clonePayload(flattenNestedCredentialsPayload(item.Payload))
-	for _, key := range []string{"access_token", "accessToken", "token"} {
-		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			accessToken := strings.TrimSpace(value)
-			payload["access_token"] = accessToken
-			if store.IsCodexPersonalAccessToken(accessToken) {
-				payload["auth_mode"] = store.CodexPersonalAccessTokenAuthMode
-				payload["openai_auth_mode"] = store.CodexPersonalAccessTokenLegacyAuthMode
-			}
-			return ValidatedItem{AccessToken: accessToken, Action: "upsert_access_token", Payload: payload}, nil
+	payload, _ := importpayload.CleanCredentials(flattenNestedCredentialsPayload(item.Payload))
+	if accessToken := importpayload.String(payload, "access_token", "accessToken", "token"); accessToken != "" {
+		payload["access_token"] = accessToken
+		if store.IsCodexPersonalAccessToken(accessToken) {
+			payload["auth_mode"] = store.CodexPersonalAccessTokenAuthMode
+			payload["openai_auth_mode"] = store.CodexPersonalAccessTokenLegacyAuthMode
 		}
+		return ValidatedItem{AccessToken: accessToken, Action: "upsert_access_token", Payload: payload}, nil
 	}
 	return ValidatedItem{}, fmt.Errorf("import item %d does not contain an access token", item.ID)
 }
@@ -174,7 +172,7 @@ type TokenPayloadValidator struct {
 }
 
 func (v TokenPayloadValidator) Validate(ctx context.Context, item store.ImportItem) (ValidatedItem, error) {
-	payload := flattenNestedCredentialsPayload(item.Payload)
+	payload, _ := importpayload.CleanCredentials(flattenNestedCredentialsPayload(item.Payload))
 	item.Payload = payload
 	if _, ok := agentidentity.NormalizePayload(payload); ok {
 		return AgentIdentityValidator{}.Validate(ctx, item)
@@ -218,6 +216,7 @@ func flattenNestedCredentialsPayload(payload map[string]any) map[string]any {
 	if len(payload) == 0 {
 		return payload
 	}
+	payload, _ = importpayload.CleanCredentials(payload)
 	credentials, ok := payload["credentials"].(map[string]any)
 	if !ok || len(credentials) == 0 {
 		return payload
@@ -228,11 +227,11 @@ func flattenNestedCredentialsPayload(payload map[string]any) map[string]any {
 			flattened[key] = value
 		}
 	}
-	copyStringPayloadField(flattened, credentials, "refresh_token", "refresh_token")
-	copyStringPayloadField(flattened, credentials, "refreshToken", "refresh_token")
-	if _, hasRefresh := flattened["refresh_token"]; !hasRefresh {
-		copyStringPayloadField(flattened, credentials, "access_token", "access_token")
-		copyStringPayloadField(flattened, credentials, "accessToken", "access_token")
+	copyCredentialPayloadField(flattened, credentials, "refresh_token", "refresh_token")
+	copyCredentialPayloadField(flattened, credentials, "refreshToken", "refresh_token")
+	if importpayload.String(flattened, "refresh_token") == "" {
+		copyCredentialPayloadField(flattened, credentials, "access_token", "access_token")
+		copyCredentialPayloadField(flattened, credentials, "accessToken", "access_token")
 	}
 	copyStringPayloadField(flattened, credentials, "account_id", "account_id")
 	copyStringPayloadField(flattened, credentials, "chatgpt_account_id", "chatgpt_account_id")
@@ -283,6 +282,15 @@ func copyStringPayloadField(dst map[string]any, src map[string]any, srcKey strin
 	}
 }
 
+func copyCredentialPayloadField(dst map[string]any, src map[string]any, srcKey string, dstKey string) {
+	if importpayload.String(dst, dstKey) != "" {
+		return
+	}
+	if value := importpayload.NormalizeCredential(src[srcKey]); value != "" {
+		dst[dstKey] = value
+	}
+}
+
 type OAuthRefreshValidator struct {
 	Client oauth.Client
 }
@@ -291,13 +299,7 @@ func (v OAuthRefreshValidator) Validate(ctx context.Context, item store.ImportIt
 	if v.Client == nil {
 		return ValidatedItem{}, fmt.Errorf("oauth client is not configured")
 	}
-	refreshToken := ""
-	for _, key := range []string{"refresh_token", "refreshToken"} {
-		if value, ok := item.Payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			refreshToken = strings.TrimSpace(value)
-			break
-		}
-	}
+	refreshToken := importpayload.String(item.Payload, "refresh_token", "refreshToken")
 	if refreshToken == "" {
 		return ValidatedItem{}, fmt.Errorf("import item %d does not contain a refresh token", item.ID)
 	}
@@ -318,12 +320,7 @@ func (v OAuthRefreshValidator) Validate(ctx context.Context, item store.ImportIt
 }
 
 func hasPayloadString(payload map[string]any, keys ...string) bool {
-	for _, key := range keys {
-		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			return true
-		}
-	}
-	return false
+	return importpayload.String(payload, keys...) != ""
 }
 
 func copyImportControlFields(src map[string]any, dst map[string]any) {
