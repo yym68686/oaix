@@ -103,6 +103,18 @@ type ProbeResultTarget = {
   title: string;
 };
 
+type TokenSelection =
+  | { mode: "explicit"; ids: Set<number> }
+  | { mode: "filtered"; excludedIds: Set<number> };
+
+function emptyTokenSelection(): TokenSelection {
+  return { mode: "explicit", ids: new Set() };
+}
+
+function tokenIsSelected(selection: TokenSelection, id: number): boolean {
+  return selection.mode === "filtered" ? !selection.excludedIds.has(id) : selection.ids.has(id);
+}
+
 function probeResultMessage(result: TokenProbeResponse): string {
   const message = result.message || "测试完成";
   const detail = String(result.detail || "").trim();
@@ -215,7 +227,7 @@ export function KeyListPage({
   const [planCounts, setPlanCounts] = useState<TokenPlanCount[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
+  const [selection, setSelection] = useState<TokenSelection>(emptyTokenSelection);
   const [probeBusyIds, setProbeBusyIds] = useState<Set<number>>(() => new Set());
   const [probeResultTarget, setProbeResultTarget] = useState<ProbeResultTarget | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
@@ -228,11 +240,13 @@ export function KeyListPage({
   const totalPages = Math.max(1, Math.ceil(tokenTotal / PAGE_SIZE));
   const statusOptions = useMemo(() => statusOptionsWithCounts(counts), [counts]);
   const planOptions = useMemo(() => planOptionsWithCounts(planCounts), [planCounts]);
+  const filterKey = useMemo(() => JSON.stringify({ ownerUserID, plan, search: search.trim(), status }), [ownerUserID, plan, search, status]);
   const queryKey = useMemo(() => JSON.stringify({ ownerUserID, page, plan, search, sort, status }), [ownerUserID, page, plan, search, sort, status]);
   const [loadedQueryKey, setLoadedQueryKey] = useState("");
   const tableLoading = loading && (!tokens.length || loadedQueryKey !== queryKey);
-  const pageIds = tokens.map((item) => item.id);
-  const allSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.has(id));
+  const selectedCount = selection.mode === "filtered" ? Math.max(0, tokenTotal - selection.excludedIds.size) : selection.ids.size;
+  const allFilteredSelected = tokenTotal > 0 && selection.mode === "filtered" && selection.excludedIds.size === 0;
+  const selectionIndeterminate = selectedCount > 0 && !allFilteredSelected;
   const canMutate = String(getAuthContext()?.role || getAuthContext()?.user?.role || "").toLowerCase() !== "readonly_admin";
   const apiScope = config.apiScope || "auto";
   const probeModel = useTokenProbeModel(apiScope);
@@ -250,8 +264,16 @@ export function KeyListPage({
     setError("");
     setLoadedQueryKey("");
     setQuotaRefreshPending(false);
-    setSelectedIds(new Set());
   }, []);
+
+  const tokenFilterParams = useCallback(() => {
+    const params = new URLSearchParams();
+    if (search.trim()) params.set("q", search.trim());
+    if (status !== "all") params.set("status", status);
+    if (plan !== "all") params.set("plan", plan);
+    if (ownerUserID !== "all") params.set("owner_user_id", ownerUserID);
+    return params;
+  }, [ownerUserID, plan, search, status]);
 
   const updateQuery = useCallback(
     (patch: Record<string, string | number | null>, replace = true) => {
@@ -319,7 +341,6 @@ export function KeyListPage({
       setTokenTotal(payload.pagination?.total ?? items.length);
       setCounts(nextCounts);
       setPlanCounts(payload.plan_counts || []);
-      setSelectedIds(new Set());
       setLoadedQueryKey(queryKey);
       onCountsChange?.(nextCounts);
     } catch (caught) {
@@ -347,6 +368,14 @@ export function KeyListPage({
   }, [queryKey, refreshNonce]);
 
   useEffect(() => {
+    setSelection(emptyTokenSelection());
+  }, [filterKey]);
+
+  useEffect(() => {
+    setSelection(emptyTokenSelection());
+  }, [refreshNonce]);
+
+  useEffect(() => {
     const timer = window.setTimeout(() => void loadTokens(), search.trim() ? 260 : 0);
     return () => window.clearTimeout(timer);
   }, [loadTokens, refreshNonce, search]);
@@ -365,6 +394,7 @@ export function KeyListPage({
   async function updateActivation(id: number, active: boolean) {
     await api.updateActivation(id, { active, clear_cooldown: true }, apiScope);
     pushToast(active ? "Key 已启用" : "Key 已禁用");
+    setSelection(emptyTokenSelection());
     await loadTokens();
   }
 
@@ -377,6 +407,7 @@ export function KeyListPage({
         const item = tokens.find((token) => token.id === id);
         setProbeResultTarget({ result, title: item ? tokenTitle(item) : `Token #${id}` });
       }
+      setSelection(emptyTokenSelection());
       await loadTokens();
     } catch (caught) {
       pushToast(errorMessage(caught), "error");
@@ -390,16 +421,27 @@ export function KeyListPage({
   }
 
   async function runBatchActivation(active: boolean) {
-    if (!selectedIds.size) {
+    if (!selectedCount) {
       return;
     }
-    await api.batchTokens({
+    const payload: Record<string, unknown> = {
       action: active ? "enable" : "disable",
       clear_cooldown: active,
-      token_ids: [...selectedIds],
-    }, apiScope);
-    pushToast(active ? "已批量启用" : "已批量禁用");
-    await loadTokens();
+    };
+    if (selection.mode === "filtered") {
+      payload.all_filtered = true;
+      payload.excluded_token_ids = [...selection.excludedIds];
+    } else {
+      payload.token_ids = [...selection.ids];
+    }
+    try {
+      await api.batchTokens(payload, apiScope, tokenFilterParams());
+      pushToast(`${active ? "已启用" : "已禁用"} ${formatNumber(selectedCount)} 把 Key`);
+      setSelection(emptyTokenSelection());
+      await loadTokens();
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    }
   }
 
   async function confirmDelete() {
@@ -407,13 +449,19 @@ export function KeyListPage({
       return;
     }
     try {
-      if (deleteTarget.ids.length === 1) {
+      if (deleteTarget.ids.length === 1 && !deleteTarget.allFiltered) {
         await api.deleteToken(deleteTarget.ids[0], apiScope);
       } else {
-        await api.batchTokens({ action: "delete", token_ids: deleteTarget.ids }, apiScope);
+        await api.batchTokens({
+          action: "delete",
+          all_filtered: Boolean(deleteTarget.allFiltered),
+          excluded_token_ids: deleteTarget.excludedIds || [],
+          token_ids: deleteTarget.allFiltered ? [] : deleteTarget.ids,
+        }, apiScope, tokenFilterParams());
       }
       pushToast("Key 已删除");
       setDeleteTarget(null);
+      setSelection(emptyTokenSelection());
       await loadTokens();
     } catch (caught) {
       pushToast(errorMessage(caught), "error");
@@ -427,11 +475,13 @@ export function KeyListPage({
     await api.updateRemark(remarkTarget.id, remarkTarget.remark, apiScope);
     pushToast("备注已保存");
     setRemarkTarget(null);
+    setSelection(emptyTokenSelection());
     await loadTokens();
   }
 
   async function handleImported() {
     setImportDialogOpen(false);
+    setSelection(emptyTokenSelection());
     await loadTokens();
   }
 
@@ -494,33 +544,36 @@ export function KeyListPage({
             <div className="flex flex-wrap items-center gap-2">
               <Label className="rounded-lg border bg-background px-3 py-2">
                 <Checkbox
-                  disabled={!canMutate}
-                  checked={allSelected}
+                  disabled={!canMutate || tokenTotal === 0}
+                  checked={allFilteredSelected}
+                  indeterminate={selectionIndeterminate}
                   onCheckedChange={(checked) => {
-                    const next = new Set(selectedIds);
                     if (checked) {
-                      pageIds.forEach((id) => next.add(id));
+                      setSelection({ mode: "filtered", excludedIds: new Set() });
                     } else {
-                      pageIds.forEach((id) => next.delete(id));
+                      setSelection(emptyTokenSelection());
                     }
-                    setSelectedIds(next);
                   }}
                 />
-                全选本页
+                全选
               </Label>
-              <Button disabled={!canMutate || !selectedIds.size} onClick={() => void runBatchActivation(true)} variant="outline">
+              <Button disabled={!canMutate || !selectedCount} onClick={() => void runBatchActivation(true)} variant="outline">
                 启用
               </Button>
-              <Button disabled={!canMutate || !selectedIds.size} onClick={() => void runBatchActivation(false)} variant="outline">
+              <Button disabled={!canMutate || !selectedCount} onClick={() => void runBatchActivation(false)} variant="outline">
                 禁用
               </Button>
               <Button
-                disabled={!canMutate || !selectedIds.size}
+                disabled={!canMutate || !selectedCount}
                 onClick={() =>
                   setDeleteTarget({
-                    description: "批量删除后会从调度池和最近列表移除。此操作不可撤销。",
-                    ids: [...selectedIds],
-                    title: `删除 ${selectedIds.size} 把 Key？`,
+                    allFiltered: selection.mode === "filtered",
+                    description: selection.mode === "filtered"
+                      ? "将删除当前筛选下选中的全部 Key，包括未显示在本页的结果。此操作不可撤销。"
+                      : "批量删除后会从调度池和最近列表移除。此操作不可撤销。",
+                    excludedIds: selection.mode === "filtered" ? [...selection.excludedIds] : [],
+                    ids: selection.mode === "explicit" ? [...selection.ids] : [],
+                    title: `删除 ${formatNumber(selectedCount)} 把 Key？`,
                   })
                 }
                 variant="destructive"
@@ -529,7 +582,7 @@ export function KeyListPage({
                 删除
               </Button>
             </div>
-            <Badge variant="secondary">{selectedIds.size ? `已选择 ${selectedIds.size} 个` : "未选择"}</Badge>
+            <Badge variant="secondary">{selectedCount ? `已选择 ${formatNumber(selectedCount)} 个` : "未选择"}</Badge>
           </div>
 
           <TokenTable
@@ -542,10 +595,10 @@ export function KeyListPage({
             onDelete={setDeleteTarget}
             onProbe={(id) => void runTokenProbe(id)}
             onRemark={setRemarkTarget}
-            onSelectedChange={setSelectedIds}
+            onSelectionChange={setSelection}
             onToggleActivation={(id, active) => void updateActivation(id, active)}
             probeBusyIds={probeBusyIds}
-            selectedIds={selectedIds}
+            selection={selection}
             tokens={tokens}
           />
           <Pagination page={page} totalPages={totalPages} onPageChange={(next) => updateQuery({ page: clamp(next, 1, totalPages) }, false)} total={tokenTotal} />
@@ -581,10 +634,10 @@ function TokenTable({
   onDelete,
   onProbe,
   onRemark,
-  onSelectedChange,
+  onSelectionChange,
   onToggleActivation,
   probeBusyIds,
-  selectedIds,
+  selection,
   tokens,
 }: {
   activeStreamCap: number;
@@ -596,10 +649,10 @@ function TokenTable({
   onDelete: (target: DeleteTarget) => void;
   onProbe: (id: number) => void;
   onRemark: (target: RemarkTarget) => void;
-  onSelectedChange: (selected: Set<number>) => void;
+  onSelectionChange: React.Dispatch<React.SetStateAction<TokenSelection>>;
   onToggleActivation: (id: number, active: boolean) => void;
   probeBusyIds: Set<number>;
-  selectedIds: Set<number>;
+  selection: TokenSelection;
   tokens: TokenItem[];
 }) {
   if (error) {
@@ -654,10 +707,10 @@ function TokenTable({
               onDelete={onDelete}
               onProbe={onProbe}
               onRemark={onRemark}
-              onSelectedChange={onSelectedChange}
+              onSelectionChange={onSelectionChange}
               onToggleActivation={onToggleActivation}
               probeBusy={probeBusyIds.has(item.id)}
-              selectedIds={selectedIds}
+              selection={selection}
             />
           ))}
         </TableBody>
@@ -674,10 +727,10 @@ function TokenRow({
   onDelete,
   onProbe,
   onRemark,
-  onSelectedChange,
+  onSelectionChange,
   onToggleActivation,
   probeBusy,
-  selectedIds,
+  selection,
 }: {
   activeStreamCap: number;
   detailBasePath: string;
@@ -686,15 +739,15 @@ function TokenRow({
   onDelete: (target: DeleteTarget) => void;
   onProbe: (id: number) => void;
   onRemark: (target: RemarkTarget) => void;
-  onSelectedChange: (selected: Set<number>) => void;
+  onSelectionChange: React.Dispatch<React.SetStateAction<TokenSelection>>;
   onToggleActivation: (id: number, active: boolean) => void;
   probeBusy: boolean;
-  selectedIds: Set<number>;
+  selection: TokenSelection;
 }) {
   const status = tokenStatusOf(item);
   const title = tokenTitle(item);
   const planType = tokenPlanType(item);
-  const checked = selectedIds.has(item.id);
+  const checked = tokenIsSelected(selection, item.id);
   const secondaryText = item.remark || item.source_file || "-";
   return (
     <TableRow data-state={checked ? "selected" : undefined}>
@@ -702,13 +755,18 @@ function TokenRow({
         <Checkbox
           checked={checked}
           onCheckedChange={(value) => {
-            const next = new Set(selectedIds);
-            if (value) {
-              next.add(item.id);
-            } else {
-              next.delete(item.id);
-            }
-            onSelectedChange(next);
+            onSelectionChange((current) => {
+              if (current.mode === "filtered") {
+                const excludedIds = new Set(current.excludedIds);
+                if (value) excludedIds.delete(item.id);
+                else excludedIds.add(item.id);
+                return { mode: "filtered", excludedIds };
+              }
+              const ids = new Set(current.ids);
+              if (value) ids.add(item.id);
+              else ids.delete(item.id);
+              return { mode: "explicit", ids };
+            });
           }}
         />
       </TableCell>

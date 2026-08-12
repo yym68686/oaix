@@ -254,6 +254,40 @@ func TestTokenListWhereScopedAddsOwnerFilter(t *testing.T) {
 	}
 }
 
+func TestTokenBulkWhereScopedPreservesFiltersAndExclusions(t *testing.T) {
+	ownerID := int64(42)
+	asOf := time.Date(2026, 8, 13, 1, 2, 3, 0, time.UTC)
+	where, args := tokenBulkWhereScoped(TokenListOptions{
+		OwnerUserID: 77,
+		Query:       "acct",
+		Status:      "cooling",
+		Plan:        "pro",
+		StatusAsOf:  &asOf,
+	}, OwnerResources(ownerID), []int64{9, 9, 10})
+	if len(args) != 6 {
+		t.Fatalf("args = %#v", args)
+	}
+	if args[0] != ownerID || args[1] != int64(77) || args[2] != "%acct%" || args[3] != asOf || args[4] != "pro" {
+		t.Fatalf("filter args changed: %#v", args)
+	}
+	excluded, ok := args[5].([]int32)
+	if !ok || len(excluded) != 2 || excluded[0] != 9 || excluded[1] != 10 {
+		t.Fatalf("excluded ids = %#v", args[5])
+	}
+	for _, fragment := range []string{
+		"owner_user_id = $1",
+		"owner_user_id = $2",
+		"email ilike $3",
+		"cooldown_until > $4",
+		"lower(btrim(plan_type)) = $5",
+		"id <> all($6::integer[])",
+	} {
+		if !strings.Contains(where, fragment) {
+			t.Fatalf("bulk filter missing %q: %s", fragment, where)
+		}
+	}
+}
+
 func TestTokenHasTransientRetryBackoff(t *testing.T) {
 	now := time.Date(2026, 6, 25, 1, 25, 0, 0, time.UTC)
 	shortUntil := now.Add(5 * time.Second)

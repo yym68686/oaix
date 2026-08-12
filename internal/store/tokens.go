@@ -457,6 +457,16 @@ func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope Resourc
 	return where, args
 }
 
+func tokenBulkWhereScoped(opts TokenListOptions, scope ResourceScope, excludedTokenIDs []int64) (string, []any) {
+	where, args := tokenListWhereScoped(opts, true, scope)
+	excluded := postgresIntIDs(excludedTokenIDs)
+	if len(excluded) > 0 {
+		args = append(args, excluded)
+		where += fmt.Sprintf(" and id <> all($%d::integer[])", len(args))
+	}
+	return where, args
+}
+
 func (s *Store) ListTokensByIDs(ctx context.Context, tokenIDs []int64) ([]Token, error) {
 	return s.ListTokensByIDsScoped(ctx, AllResources(), tokenIDs)
 }
@@ -1672,6 +1682,47 @@ func (s *Store) SetTokenActiveScoped(ctx context.Context, scope ResourceScope, t
 	return &token, nil
 }
 
+func (s *Store) SetTokensActiveFilteredScoped(ctx context.Context, scope ResourceScope, opts TokenListOptions, excludedTokenIDs []int64, active bool, clearCooldown bool) (int64, error) {
+	where, args := tokenBulkWhereScoped(opts, scope, excludedTokenIDs)
+	args = append(args, active, clearCooldown || !active)
+	activeArg := len(args) - 1
+	clearCooldownArg := len(args)
+	tag, err := s.pool.Exec(ctx, fmt.Sprintf(`
+		update codex_tokens
+		set is_active = $%d,
+		    disabled_at = case when $%d then null else now() end,
+		    cooldown_until = case when $%d then null else cooldown_until end,
+		    updated_at = now()
+		where %s
+	`, activeArg, activeArg, clearCooldownArg, where), args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (s *Store) SetTokensActiveByIDsScoped(ctx context.Context, scope ResourceScope, tokenIDs []int64, active bool, clearCooldown bool) (int64, error) {
+	ids := postgresIntIDs(tokenIDs)
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	args := []any{ids, active, clearCooldown || !active}
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	tag, err := s.pool.Exec(ctx, `
+		update codex_tokens
+		set is_active = $2,
+		    disabled_at = case when $2 then null else now() end,
+		    cooldown_until = case when $3 then null else cooldown_until end,
+		    updated_at = now()
+		where id = any($1::integer[])
+		  and merged_into_token_id is null
+		  and `+ownerWhere, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *Store) GetToken(ctx context.Context, tokenID int64) (*Token, error) {
 	return s.GetTokenScoped(ctx, AllResources(), tokenID)
 }
@@ -1878,6 +1929,49 @@ func (s *Store) DeleteTokenScoped(ctx context.Context, scope ResourceScope, toke
 		return pgx.ErrNoRows
 	}
 	return nil
+}
+
+func (s *Store) DeleteTokensFilteredScoped(ctx context.Context, scope ResourceScope, opts TokenListOptions, excludedTokenIDs []int64) (int64, error) {
+	rootWhere, args := tokenBulkWhereScoped(opts, scope, excludedTokenIDs)
+	childOwnerWhere := scope.ownerFilter("owner_user_id", &args)
+	tag, err := s.pool.Exec(ctx, `
+		with roots as (
+			select id
+			from codex_tokens
+			where `+rootWhere+`
+		)
+		delete from codex_tokens
+		where (id in (select id from roots) or merged_into_token_id in (select id from roots))
+		  and `+childOwnerWhere, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (s *Store) DeleteTokensByIDsScoped(ctx context.Context, scope ResourceScope, tokenIDs []int64) (int64, error) {
+	ids := postgresIntIDs(tokenIDs)
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	args := []any{ids}
+	rootOwnerWhere := scope.ownerFilter("owner_user_id", &args)
+	childOwnerWhere := scope.ownerFilter("owner_user_id", &args)
+	tag, err := s.pool.Exec(ctx, `
+		with roots as (
+			select id
+			from codex_tokens
+			where id = any($1::integer[])
+			  and merged_into_token_id is null
+			  and `+rootOwnerWhere+`
+		)
+		delete from codex_tokens
+		where (id in (select id from roots) or merged_into_token_id in (select id from roots))
+		  and `+childOwnerWhere, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (s *Store) DeleteDisabledTokensScoped(ctx context.Context, scope ResourceScope) ([]int64, error) {

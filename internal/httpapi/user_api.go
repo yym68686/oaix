@@ -31,6 +31,7 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tokens", a.requireAuth(a.listMyTokens))
 	mux.HandleFunc("GET /api/tokens/quota", a.requireAuth(a.listMyTokenQuota))
 	mux.HandleFunc("POST /api/tokens/quota-refresh", a.requireAuth(a.createMyQuotaRefreshJob))
+	mux.HandleFunc("POST /api/tokens/batch", a.requireAuth(a.batchMyTokens))
 	mux.HandleFunc("PATCH /api/tokens/sharing", a.requireAuth(a.patchMyTokensSharing))
 	mux.HandleFunc("PATCH /api/tokens/marketplace-price", a.requireAuth(a.patchMyTokensMarketplacePrice))
 	mux.HandleFunc("GET /api/tokens/{token_id}", a.requireAuth(a.getMyToken))
@@ -54,6 +55,29 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/oauth/openai/sessions/{session_id}", a.requireAuth(a.getOpenAIOAuthSession))
 	mux.HandleFunc("POST /api/oauth/openai/sessions/{session_id}/exchange", a.requireAuth(a.exchangeOpenAIOAuthSession))
 	mux.HandleFunc("GET /api/requests", a.requireAuth(a.listMyRequests))
+}
+
+func (a *App) batchMyTokens(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	scope, ok := a.tokenSelfScope(r.Context(), w, auth)
+	if !ok {
+		return
+	}
+	var payload tokenBatchPayload
+	if err := decodeJSON(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	action := strings.TrimSpace(strings.ToLower(payload.Action))
+	switch action {
+	case "activate", "enable", "deactivate", "disable", "set_active", "delete":
+	default:
+		writeError(w, http.StatusBadRequest, errors.New("action must be enable, disable, set_active, or delete"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	a.batchTokenSetMutation(w, r, ctx, scope, payload, action, "self")
 }
 
 func (a *App) registerUser(w http.ResponseWriter, r *http.Request) {

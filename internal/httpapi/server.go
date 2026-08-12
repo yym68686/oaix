@@ -83,6 +83,18 @@ type adminImportItem struct {
 	UpdatedAt                  time.Time  `json:"updated_at"`
 }
 
+type tokenBatchPayload struct {
+	Action           string  `json:"action"`
+	TokenIDs         []int64 `json:"token_ids"`
+	AllFiltered      bool    `json:"all_filtered"`
+	ExcludedTokenIDs []int64 `json:"excluded_token_ids"`
+	Active           *bool   `json:"active"`
+	ClearCooldown    bool    `json:"clear_cooldown"`
+	PlanType         string  `json:"plan_type"`
+	Remark           string  `json:"remark"`
+	Model            string  `json:"model"`
+}
+
 func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenManager *tokens.Manager, logWriter *logs.Writer, pipeline *proxy.Pipeline) *App {
 	app := &App{
 		cfg:                cfg,
@@ -1084,26 +1096,21 @@ func sanitizeImportItems(items []store.ImportItem) []adminImportItem {
 }
 
 func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
-	var payload struct {
-		Action        string  `json:"action"`
-		TokenIDs      []int64 `json:"token_ids"`
-		Active        *bool   `json:"active"`
-		ClearCooldown bool    `json:"clear_cooldown"`
-		PlanType      string  `json:"plan_type"`
-		Remark        string  `json:"remark"`
-		Model         string  `json:"model"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	var payload tokenBatchPayload
+	if err := decodeJSON(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if len(payload.TokenIDs) == 0 || len(payload.TokenIDs) > 500 {
-		writeError(w, http.StatusBadRequest, errors.New("token_ids must contain 1..500 ids"))
 		return
 	}
 	action := strings.TrimSpace(strings.ToLower(payload.Action))
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
+	if handled := a.batchTokenSetMutation(w, r, ctx, store.AllResources(), payload, action, "api"); handled {
+		return
+	}
+	if len(payload.TokenIDs) == 0 || len(payload.TokenIDs) > 500 || payload.AllFiltered {
+		writeError(w, http.StatusBadRequest, errors.New("token_ids must contain 1..500 ids"))
+		return
+	}
 	var updated, deleted, failed int
 	var results []any
 	var availabilityTokens []store.Token
@@ -1200,6 +1207,85 @@ func (a *App) batchTokens(w http.ResponseWriter, r *http.Request) {
 		"failed":  failed,
 		"results": results,
 	})
+}
+
+func (a *App) batchTokenSetMutation(w http.ResponseWriter, r *http.Request, ctx context.Context, scope store.ResourceScope, payload tokenBatchPayload, action string, auditActor string) bool {
+	active := false
+	clearCooldown := payload.ClearCooldown
+	switch action {
+	case "activate", "enable":
+		active = true
+		clearCooldown = true
+	case "deactivate", "disable":
+		active = false
+		clearCooldown = true
+	case "set_active":
+		if payload.Active == nil {
+			writeError(w, http.StatusBadRequest, errors.New("active is required for set_active"))
+			return true
+		}
+		active = *payload.Active
+	case "delete":
+		// handled below
+	default:
+		return false
+	}
+	if payload.AllFiltered {
+		if len(payload.TokenIDs) > 0 {
+			writeError(w, http.StatusBadRequest, errors.New("token_ids and all_filtered cannot be combined"))
+			return true
+		}
+	} else if len(payload.TokenIDs) == 0 || len(payload.TokenIDs) > 500 {
+		writeError(w, http.StatusBadRequest, errors.New("token_ids must contain 1..500 ids"))
+		return true
+	}
+
+	var affected int64
+	var err error
+	filters := tokenListOptionsFromRequest(r, store.TokenListOptions{})
+	if action == "delete" {
+		if payload.AllFiltered {
+			affected, err = a.store.DeleteTokensFilteredScoped(ctx, scope, filters, payload.ExcludedTokenIDs)
+		} else {
+			affected, err = a.store.DeleteTokensByIDsScoped(ctx, scope, payload.TokenIDs)
+		}
+	} else if payload.AllFiltered {
+		affected, err = a.store.SetTokensActiveFilteredScoped(ctx, scope, filters, payload.ExcludedTokenIDs, active, clearCooldown)
+	} else {
+		affected, err = a.store.SetTokensActiveByIDsScoped(ctx, scope, payload.TokenIDs, active, clearCooldown)
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return true
+	}
+	if a.tokens != nil {
+		_ = a.tokens.Refresh(ctx)
+	}
+	auditDetails := map[string]any{
+		"action":             action,
+		"affected":           affected,
+		"all_filtered":       payload.AllFiltered,
+		"token_ids_count":    len(payload.TokenIDs),
+		"excluded_ids_count": len(payload.ExcludedTokenIDs),
+		"filters": map[string]any{
+			"q": filters.Query, "status": filters.Status, "plan": filters.Plan,
+			"owner_user_id": filters.OwnerUserID, "source": filters.Source, "source_file": filters.SourceFile,
+		},
+	}
+	_ = a.store.WriteAuditLog(ctx, "token_batch_"+action, auditActor, "token", "filtered", auditDetails)
+	updated := int64(0)
+	deleted := int64(0)
+	if action == "delete" {
+		deleted = affected
+	} else {
+		updated = affected
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated": updated,
+		"deleted": deleted,
+		"failed":  0,
+	})
+	return true
 }
 
 func (a *App) updateTokenActivation(w http.ResponseWriter, r *http.Request) {

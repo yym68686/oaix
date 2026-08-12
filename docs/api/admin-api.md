@@ -24,7 +24,7 @@ oaix 管理面以 `/admin/*` 为稳定 API 前缀，前端只是这些 API 的�
 - 我的账号：`GET /api/me`、`GET /api/me/usage`、`GET /api/me/pool-summary`。
 - 我的 API Key：`GET /api/me/api-keys`、`POST /api/me/api-keys`、`DELETE /api/me/api-keys/{key_id}`。
 - 我的设置：`GET /api/me/settings`、`GET /api/me/settings/{key}`、`POST /api/me/settings/{key}`、`DELETE /api/me/settings/{key}`。这些设置写入 `user_settings`，不会污染全局 `gateway_settings`。
-- 我的 Key：`GET /api/tokens`、`GET /api/tokens/{token_id}`、`PATCH /api/tokens/{token_id}`、`DELETE /api/tokens/{token_id}`、`POST /api/tokens/{token_id}/probe`。
+- 我的 Key：`GET /api/tokens`、`POST /api/tokens/batch`、`GET /api/tokens/{token_id}`、`PATCH /api/tokens/{token_id}`、`DELETE /api/tokens/{token_id}`、`POST /api/tokens/{token_id}/probe`。批量接口支持用 `all_filtered=true` 配合列表筛选参数选中完整结果集，并用 `excluded_token_ids` 排除个别 Key。
 - 我的导入：`POST /api/import/parse`、`POST /api/import/upload`、`POST /api/import/jobs`、`GET /api/import/jobs`、`GET /api/import/jobs/{job_id}`、`POST /api/import/jobs/{job_id}/cancel`、`DELETE /api/import/jobs/{job_id}`、`GET /api/import/jobs/{job_id}/items`、`GET /api/import/jobs/{job_id}/tokens`。
 - 我的请求：`GET /api/requests`。
 
@@ -39,7 +39,7 @@ oaix 管理面以 `/admin/*` 为稳定 API 前缀，前端只是这些 API 的�
 
 ## 主要资源
 
-- Key：`GET /admin/tokens`、`PATCH /admin/tokens/{id}`、`POST /admin/tokens/{id}/cooldown`、`DELETE /admin/token-cooldown/{id}`、`DELETE /admin/token-last-error/{id}`、`POST /admin/tokens/{id}/secrets`、`POST /admin/tokens/{id}/refresh`、`GET /admin/token-refresh-history/{id}`、`POST /admin/tokens/{id}/merge`、`POST /admin/tokens/{id}/unmerge`、`GET /admin/tokens/export`。
+- Key：`GET /admin/tokens`、`POST /admin/tokens/batch`、`PATCH /admin/tokens/{id}`、`POST /admin/tokens/{id}/cooldown`、`DELETE /admin/token-cooldown/{id}`、`DELETE /admin/token-last-error/{id}`、`POST /admin/tokens/{id}/secrets`、`POST /admin/tokens/{id}/refresh`、`GET /admin/token-refresh-history/{id}`、`POST /admin/tokens/{id}/merge`、`POST /admin/tokens/{id}/unmerge`、`GET /admin/tokens/export`。
 - Quota/成本：`GET /admin/tokens/quota?force_refresh=true`、`POST /admin/tokens/quota-refresh`、`GET /admin/tokens/quota-refresh/{job_id}`、`GET /admin/token-quota-history/{id}`、`GET /admin/costs/by-token`、`GET /admin/costs/by-account`。
 - 导入：`POST /admin/import/parse`、`POST /admin/import/upload`、`POST /admin/import/jobs`、`GET /admin/import/jobs`、`GET /admin/import/jobs/{id}`、`GET /admin/import/jobs/{id}/items`、`GET /admin/import/jobs/{id}/tokens`、`GET /admin/import/jobs/{id}/failed-items`、`POST /admin/import/jobs/{id}/retry`、`POST /admin/import/items/{id}/retry`、`POST /admin/import/items/{id}/skip`、`GET /admin/import/jobs/{id}/events`。
 - OAuth：`POST /admin/oauth/openai/sessions`、`GET /admin/oauth/openai/sessions/{id}`、`DELETE /admin/oauth/openai/sessions/{id}`、`POST /admin/oauth/openai/sessions/{id}/exchange`。旧 `start/exchange` 路由保留。

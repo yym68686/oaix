@@ -16,6 +16,7 @@ func TestAdminOpenAPISpecContainsAPIizedResources(t *testing.T) {
 	}
 	required := []string{
 		"/admin/import/parse",
+		"/admin/tokens/batch",
 		"/admin/import/jobs",
 		"/admin/oauth/openai/sessions/{session_id}",
 		"/admin/analytics/cache",
@@ -25,6 +26,7 @@ func TestAdminOpenAPISpecContainsAPIizedResources(t *testing.T) {
 		"/api/auth/register",
 		"/api/me/settings/{key}",
 		"/api/tokens/{token_id}",
+		"/api/tokens/batch",
 		"/api/import/jobs/{job_id}/tokens",
 		"/api/admin/users/{user_id}/tokens",
 		"/api/admin/pool-summary/by-user",

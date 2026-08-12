@@ -590,6 +590,44 @@ func TestBulkTokenSharingScopeWithDatabase(t *testing.T) {
 	}
 }
 
+func TestFilteredBulkTokenActivationScopeWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	userA, keyA := h.createUser(t, "filtered-batch-a")
+	userB, _ := h.createUser(t, "filtered-batch-b")
+	matchingA1 := h.createToken(t, userA.ID, "filtered-batch-match-a-1")
+	matchingA2 := h.createToken(t, userA.ID, "filtered-batch-match-a-2")
+	nonMatchingA := h.createToken(t, userA.ID, "filtered-batch-other-a")
+	matchingB := h.createToken(t, userB.ID, "filtered-batch-match-b")
+
+	for _, token := range []store.Token{matchingA1, matchingA2, nonMatchingA, matchingB} {
+		ownerID := token.OwnerUserID
+		if _, err := h.db.SetTokenActiveScoped(context.Background(), store.OwnerResources(ownerID), token.ID, false, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body := fmt.Sprintf(`{"action":"enable","all_filtered":true,"excluded_token_ids":[%d]}`, matchingA2.ID)
+	expectStatus(t, h.request(t, http.MethodPost, "/api/tokens/batch?status=disabled&q=filtered-batch-match", keyA.PlaintextKey, body), http.StatusOK)
+
+	for _, test := range []struct {
+		token store.Token
+		want  bool
+	}{
+		{matchingA1, true},
+		{matchingA2, false},
+		{nonMatchingA, false},
+		{matchingB, false},
+	} {
+		reloaded, err := h.db.GetToken(context.Background(), test.token.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reloaded.IsActive != test.want {
+			t.Fatalf("token %d active = %v, want %v", test.token.ID, reloaded.IsActive, test.want)
+		}
+	}
+}
+
 func TestDeleteDisabledTokensScopeWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userA, keyA := h.createUser(t, "disabled-delete-a")

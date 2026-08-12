@@ -81,6 +81,36 @@ func TestFrontendKeysPageUsesSelfScope(t *testing.T) {
 	}
 }
 
+func TestFrontendSelectAllTargetsCompleteFilteredTokenSet(t *testing.T) {
+	keysPage := readFrontendFile(t, "src", "features", "keys", "KeysPage.tsx")
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+	for _, required := range []string{
+		`type TokenSelection =`,
+		`{ mode: "filtered"; excludedIds: Set<number> }`,
+		`setSelection({ mode: "filtered", excludedIds: new Set() })`,
+		`payload.all_filtered = true`,
+		`payload.excluded_token_ids = [...selection.excludedIds]`,
+		`all_filtered: Boolean(deleteTarget.allFiltered)`,
+		`}, [filterKey]);`,
+		`全选`,
+	} {
+		if !strings.Contains(keysPage, required) {
+			t.Fatalf("keys page complete filtered selection contract missing %q", required)
+		}
+	}
+	if strings.Contains(keysPage, "全选本页") {
+		t.Fatal("keys page still exposes page-only select-all copy")
+	}
+	for _, required := range []string{
+		`tokenScopedPath("/api/tokens/batch", "/admin/tokens/batch", scope)`,
+		"postJSON<Record<string, unknown>>(`${base}${query ? `?${query}` : \"\"}`, payload)",
+	} {
+		if !strings.Contains(apiFile, required) {
+			t.Fatalf("frontend filtered batch API contract missing %q", required)
+		}
+	}
+}
+
 func TestFrontendQuotaStateDistinguishesPendingFromUnavailable(t *testing.T) {
 	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
 	components := readFrontendFile(t, "src", "shared", "components.tsx")

@@ -221,7 +221,8 @@ def test_frontend_token_explorer_keeps_core_admin_actions() -> None:
     assert "api.deleteToken" in keys_tsx
     assert "api.importJobs(80)" in imports_tsx
     assert 'listTokens: (params: URLSearchParams, scope: TokenAPIScope = "auto")' in api_ts
-    assert 'batchTokens: async (payload: Record<string, unknown>, scope: TokenAPIScope = "auto")' in api_ts
+    assert 'batchTokens: (payload: Record<string, unknown>, scope: TokenAPIScope = "auto", filters?: URLSearchParams)' in api_ts
+    assert 'tokenScopedPath("/api/tokens/batch", "/admin/tokens/batch", scope)' in api_ts
 
 
 def test_frontend_import_panel_supports_queue_position_and_token_formats() -> None:
@@ -399,7 +400,8 @@ def test_frontend_delete_and_remark_dialogs_use_coss_dialogs() -> None:
     assert "<DialogPopup" in app_tsx
     assert "<DialogFooter>" in app_tsx
     assert "api.updateRemark(remarkTarget.id, remarkTarget.remark, apiScope)" in app_tsx
-    assert 'api.batchTokens({ action: "delete", token_ids: deleteTarget.ids }, apiScope)' in app_tsx
+    assert 'all_filtered: Boolean(deleteTarget.allFiltered)' in app_tsx
+    assert 'excluded_token_ids: deleteTarget.excludedIds || []' in app_tsx
 
 
 def test_frontend_fetch_errors_preserve_backend_detail_messages() -> None:

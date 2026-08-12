@@ -623,18 +623,10 @@ export const api = {
     postJSON<TokenProbeResponse>(tokenScopedPath(`/api/tokens/${id}/probe`, `/admin/tokens/${id}/probe`, scope), payload),
   deleteToken: (id: number, scope: TokenAPIScope = "auto") =>
     deleteJSON<Record<string, unknown>>(tokenScopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`, scope)),
-  batchTokens: async (payload: Record<string, unknown>, scope: TokenAPIScope = "auto") => {
-    if (tokenScopedPath("/api", "/admin", scope) === "/admin") {
-      return postJSON<Record<string, unknown>>("/admin/tokens/batch", payload);
-    }
-    const ids = Array.isArray(payload.token_ids) ? payload.token_ids.map(Number).filter(Boolean) : [];
-    const action = String(payload.action || "");
-    if (action === "delete") {
-      await Promise.all(ids.map((id) => api.deleteToken(id, "self")));
-    } else if (action === "enable" || action === "disable") {
-      await Promise.all(ids.map((id) => api.updateActivation(id, { active: action === "enable" }, "self")));
-    }
-    return { ok: true, count: ids.length };
+  batchTokens: (payload: Record<string, unknown>, scope: TokenAPIScope = "auto", filters?: URLSearchParams) => {
+    const base = tokenScopedPath("/api/tokens/batch", "/admin/tokens/batch", scope);
+    const query = filters?.toString();
+    return postJSON<Record<string, unknown>>(`${base}${query ? `?${query}` : ""}`, payload);
   },
   parseImport: (payload: Record<string, unknown>) =>
     postJSON<ImportParseResponse>(scopedPath("/api/import/parse", "/admin/import/parse"), payload),

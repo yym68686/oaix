@@ -30,6 +30,8 @@ export type DeleteTarget = {
   ids: number[];
   title: string;
   description: string;
+  allFiltered?: boolean;
+  excludedIds?: number[];
 };
 
 export type RemarkTarget = {
