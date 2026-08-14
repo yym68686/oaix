@@ -66,6 +66,58 @@ func TestFrontendUserAPIKeyPageContract(t *testing.T) {
 	}
 }
 
+func TestFrontendProfileSupportsSavedAccountSwitching(t *testing.T) {
+	appShell := readFrontendFile(t, "src", "app", "AppShell.tsx")
+	router := readFrontendFile(t, "src", "app", "router.ts")
+	app := readFrontendFile(t, "src", "App.tsx")
+	profile := readFrontendFile(t, "src", "features", "account", "ProfilePage.tsx")
+	accounts := readFrontendFile(t, "src", "lib", "accounts.ts")
+	for _, required := range []string{
+		`{ key: "account_profile", href: "/account/profile"`,
+		`accounts.length > 1`,
+		`<MenuGroupLabel>切换账号</MenuGroupLabel>`,
+		`onSwitchAccount={switchAccount}`,
+		`authBlocked && protectedMode && savedAccounts.length === 0`,
+		`退出当前账号`,
+	} {
+		if !strings.Contains(appShell, required) {
+			t.Fatalf("account menu switching contract missing %q", required)
+		}
+	}
+	if !strings.Contains(router, `return { key: "account_profile"`) {
+		t.Fatal("router must expose /account/profile")
+	}
+	if !strings.Contains(router, `navigateTo("/account/profile", { replace: true })`) {
+		t.Fatal("legacy /account route must redirect to the personal profile page")
+	}
+	if !strings.Contains(app, `route.key === "account_profile"`) || !strings.Contains(app, `<ProfilePage`) {
+		t.Fatal("App must render the personal profile page")
+	}
+	for _, required := range []string{
+		`添加账号`,
+		`api.login`,
+		`rememberPasswordAuthAccount`,
+		`activateSavedAccount`,
+		`removeSavedAccount`,
+		`不会保存密码`,
+	} {
+		if !strings.Contains(profile, required) {
+			t.Fatalf("profile account management contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		`oaix.savedAccounts.v1`,
+		`export function rememberSavedAccount`,
+		`export function activateSavedAccount`,
+		`export function removeSavedAccount`,
+		`export function restoreSavedAccount`,
+	} {
+		if !strings.Contains(accounts, required) {
+			t.Fatalf("saved account storage contract missing %q", required)
+		}
+	}
+}
+
 func TestFrontendAdminPagesContract(t *testing.T) {
 	adminPages := readFrontendFile(t, "src", "features", "admin", "AdminPages.tsx")
 	for _, required := range []string{

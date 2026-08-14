@@ -367,7 +367,7 @@ type MeResponse = {
 
 `App` 启动时不再只看 `service_key_protected`，而是：
 
-1. 读取本地 API Key。
+1. 读取本浏览器保存的账号列表和当前活动 API Key；兼容旧的单 API Key 存储。
 2. 调用 `/api/me`。
 3. 根据 `role/capabilities` 决定导航项和默认首页。
 4. 普通用户默认进入 `/keys?status=available`，只能看到自己的数据。
@@ -375,14 +375,14 @@ type MeResponse = {
 
 ### 普通用户页面
 
-#### 我的账号 `/account`
+#### 个人资料 `/account/profile`
 
 显示：
 
 - 当前用户 email/display name/role/status。
-- 用户自己的用量：请求数、成功率、缓存率、成本。
-- 用户自己的号池摘要：总账号、有效、冷却、禁用、计划分布。
-- 最近 24h 活跃状态。
+- 添加另一个已有 OAIX 账号；浏览器只保存登录返回的 API Key，不保存密码。
+- 管理本浏览器保存的账号，可切换或移除本地登录信息。
+- 保存两个或更多账号时，右上角个人资料菜单直接显示账号切换项。
 
 #### 我的 API Key `/account/api-keys`
 
@@ -658,15 +658,15 @@ type ResourceScope = {
 - [x] 普通用户隐藏管理员分组。
 - [x] Admin/Service 显示管理员分组。
 - [x] 直接访问无权限 route 显示 403 页面。
-- [x] `RouteKey` 增加 `account`、`account_api_keys`、`admin_users`、`admin_user_detail`、`admin_pools`、`admin_requests`、`admin_audit`。
+- [x] `RouteKey` 增加 `account_profile`、`account_api_keys`、`admin_users`、`admin_user_detail`、`admin_pools`、`admin_requests`、`admin_audit`。
 - [x] `router.ts` 增加上述路由解析。
 
 ### 8. 前端普通用户页面
 
-- [x] 新增 `/account` 我的账号页面。
+- [x] 新增 `/account/profile` 个人资料页面。
 - [x] 展示用户身份、状态、角色。
-- [x] 展示自己的 24h 请求量、成功率、缓存率、成本。
-- [x] 展示自己的号池摘要和计划分布。
+- [x] 支持在个人资料页添加已有账号，并在本浏览器保存多个账号会话。
+- [x] 保存两个或更多账号时，右上角个人资料菜单支持直接切换。
 - [x] 新增 `/account/api-keys` 页面。
 - [x] 用户可创建自己的 API Key。
 - [x] 用户可撤销自己的 API Key。

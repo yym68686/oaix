@@ -26,6 +26,15 @@ import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Menu, MenuGroupLabel, MenuItem, MenuPopup, MenuRadioGroup, MenuRadioItem, MenuSeparator, MenuTrigger } from "@/registry/default/ui/menu";
 import { cn } from "@/registry/default/lib/utils";
+import {
+  activateSavedAccount,
+  getActiveSavedAccount,
+  rememberPasswordAuthAccount,
+  removeSavedAccount,
+  savedAccountLabel,
+  useSavedAccounts,
+  type SavedAccount,
+} from "@/lib/accounts";
 import { api, getServiceKey, isAdminPrincipal, isServicePrincipal, setServiceKey, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
 import { formatNumber } from "@/lib/format";
 import { readSidebarCollapsed, writeSidebarCollapsed } from "@/shared/domain";
@@ -45,6 +54,7 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
     label: "用户",
     items: [
       { key: "keys", href: "/keys?status=available", icon: <KeyRoundIcon />, label: "Key" },
+      { key: "account_profile", href: "/account/profile", icon: <UserRoundIcon />, label: "个人资料" },
       { key: "account_api_keys", href: "/account/api-keys", icon: <ShieldCheckIcon />, label: "API Key" },
       { key: "imports", href: "/imports", icon: <UploadIcon />, label: "导入" },
       { key: "requests", href: "/requests", icon: <ListFilterIcon />, label: "请求" },
@@ -105,7 +115,11 @@ export function AppShell({
   const [passwordDraft, setPasswordDraft] = useState("");
   const [displayNameDraft, setDisplayNameDraft] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
-  const credentialRequired = authBlocked && protectedMode;
+  const savedAccounts = useSavedAccounts();
+  const activeSavedAccount = getActiveSavedAccount(savedAccounts);
+  // If a saved credential expires, keep the shell usable so the user can switch
+  // to another saved account or open the profile page to replace it.
+  const credentialRequired = authBlocked && protectedMode && savedAccounts.length === 0;
   const credentialOpen = credentialRequired || credentialDialogOpen;
   const admin = isAdminPrincipal(me);
   const serviceOnly = Boolean(me && isServicePrincipal(me) && !me.user?.id);
@@ -132,10 +146,21 @@ export function AppShell({
     setCredentialDialogOpen(true);
   }
 
-  // 服务端没有登出接口，这里只能清掉本地保存的 API Key；
-  // 该 Key 在服务端依然有效，需要作废请到设置页轮换。
+  // 服务端没有登出接口，这里只移除当前账号在本浏览器保存的 API Key；
+  // 该 Key 在服务端依然有效，需要作废请到 API Key 页面删除。
   function logout() {
-    setServiceKey("");
+    if (activeSavedAccount) {
+      removeSavedAccount(activeSavedAccount.id);
+    } else {
+      setServiceKey("");
+    }
+    onRefresh();
+  }
+
+  function switchAccount(id: string) {
+    if (id === activeSavedAccount?.id || !activateSavedAccount(id)) {
+      return;
+    }
     onRefresh();
   }
 
@@ -174,7 +199,8 @@ export function AppShell({
       if (!key) {
         throw new Error("服务端没有返回一次性 API Key");
       }
-      setServiceKey(key);
+      rememberPasswordAuthAccount(key, result.user, result.api_key?.id);
+      setPasswordDraft("");
       setCredentialDialogOpen(false);
       onRefresh();
     } catch (caught) {
@@ -280,9 +306,12 @@ export function AppShell({
                   刷新
                 </Button>
                 <AccountMenu
+                  accounts={savedAccounts}
+                  activeAccount={activeSavedAccount}
                   me={me}
                   onLogin={openLogin}
                   onLogout={logout}
+                  onSwitchAccount={switchAccount}
                   onThemeChange={onThemeChange}
                   serviceOnly={serviceOnly}
                   theme={theme}
@@ -414,8 +443,8 @@ export function AppShell({
   );
 }
 
-function principalRoleLabel(me: MeResponse | null, serviceOnly: boolean): string {
-  const role = String(me?.role || me?.user?.role || "").toLowerCase();
+function principalRoleLabel(me: MeResponse | null, serviceOnly: boolean, activeAccount?: SavedAccount | null): string {
+  const role = String(activeAccount?.role || activeAccount?.user?.role || me?.role || me?.user?.role || "").toLowerCase();
   if (role === "admin") {
     return "管理员";
   }
@@ -436,44 +465,78 @@ function principalRoleLabel(me: MeResponse | null, serviceOnly: boolean): string
  * 未登录时依然渲染（否则主题切换会没有入口），此时展示登录项。
  */
 function AccountMenu({
+  accounts,
+  activeAccount,
   me,
   onLogin,
   onLogout,
+  onSwitchAccount,
   onThemeChange,
   serviceOnly,
   theme,
 }: {
+  accounts: SavedAccount[];
+  activeAccount: SavedAccount | null;
   me: MeResponse | null;
   onLogin: () => void;
   onLogout: () => void;
+  onSwitchAccount: (id: string) => void;
   onThemeChange: (theme: ThemePreference) => void;
   serviceOnly: boolean;
   theme: ThemePreference;
 }) {
-  const email = me?.user?.email?.trim() || "";
-  const name = email || (serviceOnly ? "Service API Key" : "当前会话");
-  const initial = email.slice(0, 1).toUpperCase();
+  const email = activeAccount?.user?.email?.trim() || me?.user?.email?.trim() || "";
+  const name =
+    activeAccount?.user?.display_name?.trim() ||
+    me?.user?.display_name?.trim() ||
+    email ||
+    (activeAccount ? savedAccountLabel(activeAccount) : serviceOnly ? "Service API Key" : "当前会话");
+  const initial = name.slice(0, 1).toUpperCase();
+  const signedIn = Boolean(me || activeAccount);
   return (
     <Menu>
       <MenuTrigger
-        aria-label={me ? `账户菜单：${name}` : "账户菜单"}
+        aria-label={signedIn ? `账户菜单：${name}` : "账户菜单"}
         render={<Button className="rounded-full before:rounded-full" size="icon" variant="outline" />}
-        title={me ? name : "未登录"}
+        title={signedIn ? name : "未登录"}
       >
-        {me && initial ? <span className="font-medium text-sm">{initial}</span> : me ? <ShieldCheckIcon /> : <UserRoundIcon />}
+        {signedIn && initial ? <span className="font-medium text-sm">{initial}</span> : signedIn ? <ShieldCheckIcon /> : <UserRoundIcon />}
       </MenuTrigger>
       <MenuPopup>
-        {me && (
+        {signedIn && (
           <>
             <div className="grid gap-0.5 px-2 py-1.5">
               <div className="truncate font-medium text-sm" title={name}>
                 {name}
               </div>
-              <div className="text-muted-foreground text-xs">{principalRoleLabel(me, serviceOnly)}</div>
+              <div className="text-muted-foreground text-xs">{principalRoleLabel(me, serviceOnly, activeAccount)}</div>
             </div>
             <MenuSeparator />
           </>
         )}
+        {accounts.length > 1 && (
+          <>
+            <MenuRadioGroup onValueChange={onSwitchAccount} value={activeAccount?.id || ""}>
+              <MenuGroupLabel>切换账号</MenuGroupLabel>
+              {accounts.map((account) => (
+                <MenuRadioItem key={account.id} value={account.id}>
+                  <span className="grid max-w-56" title={account.user?.email || savedAccountLabel(account)}>
+                    <span className="truncate">{savedAccountLabel(account)}</span>
+                    {account.user?.email && account.user.email !== savedAccountLabel(account) && (
+                      <span className="truncate text-muted-foreground text-xs">{account.user.email}</span>
+                    )}
+                  </span>
+                </MenuRadioItem>
+              ))}
+            </MenuRadioGroup>
+            <MenuSeparator />
+          </>
+        )}
+        <MenuItem onClick={() => navigateTo("/account/profile")}>
+          <UserRoundIcon />
+          个人资料
+        </MenuItem>
+        <MenuSeparator />
         <MenuRadioGroup onValueChange={(value) => onThemeChange(value as ThemePreference)} value={theme}>
           <MenuGroupLabel>主题</MenuGroupLabel>
           <MenuRadioItem value="auto">自动</MenuRadioItem>
@@ -481,10 +544,10 @@ function AccountMenu({
           <MenuRadioItem value="dark">暗色</MenuRadioItem>
         </MenuRadioGroup>
         <MenuSeparator />
-        {me ? (
+        {signedIn ? (
           <MenuItem className="text-destructive-foreground" onClick={onLogout}>
             <LogOutIcon />
-            退出登录
+            退出当前账号
           </MenuItem>
         ) : (
           <MenuItem onClick={onLogin}>

@@ -5,6 +5,7 @@ export type TokenStatus = "all" | "available" | "cooling" | "disabled";
 export type RouteKey =
   | "keys"
   | "key_detail"
+  | "account_profile"
   | "account_api_keys"
   | "imports"
   | "import_new"

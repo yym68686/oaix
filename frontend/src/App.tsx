@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { AppShell } from "@/app/AppShell";
 import { useRouteState } from "@/app/router";
 import { AccountAPIKeysPage } from "@/features/account/APIKeysPage";
+import { ProfilePage } from "@/features/account/ProfilePage";
 import { ImportsPage } from "@/features/imports/ImportsPage";
 import { KeyDetailPage, KeysPage } from "@/features/keys/KeysPage";
 import { RequestsPage } from "@/features/requests/RequestsPage";
@@ -9,7 +10,8 @@ import { RuntimePage } from "@/features/runtime/RuntimePage";
 import { SettingsPage, UserSettingsPage } from "@/features/settings/SettingsPage";
 import { AdminAuditPage, AdminImportsPage, AdminPoolsPage, AdminRequestsPage, AdminUserDetailPage, AdminUsersPage } from "@/features/admin/AdminPages";
 import { AdminSub2APIPage } from "@/features/admin/Sub2APIPage";
-import { api, hasServiceKey, isAdminPrincipal, isSelfUserMode, setAuthContext, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
+import { rememberSavedAccount, restoreSavedAccount } from "@/lib/accounts";
+import { api, getServiceKey, hasServiceKey, isAdminPrincipal, isSelfUserMode, setAuthContext, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
 import { applyTheme, errorMessage, readThemePreference } from "@/shared/domain";
 import { EmptyState, ToastStack } from "@/shared/components";
 import type { ThemePreference, ToastMessage } from "@/shared/types";
@@ -63,6 +65,7 @@ export function App(): React.ReactElement {
       let mePayload: MeResponse | null = null;
       if (hasServiceKey()) {
         mePayload = await api.me();
+        rememberSavedAccount(getServiceKey(), mePayload, false);
         setAuthContext(mePayload);
         setMe(mePayload);
       } else {
@@ -104,6 +107,7 @@ export function App(): React.ReactElement {
   }, [theme]);
 
   useEffect(() => {
+    restoreSavedAccount();
     void refreshAll();
     const timer = window.setInterval(() => void refreshAll(), 30_000);
     return () => window.clearInterval(timer);
@@ -142,6 +146,8 @@ export function App(): React.ReactElement {
     page = <AdminSub2APIPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "account_api_keys") {
     page = <AccountAPIKeysPage pushToast={pushToast} refreshNonce={refreshNonce} />;
+  } else if (route.key === "account_profile") {
+    page = <ProfilePage me={me} onRefresh={() => void refreshAll()} pushToast={pushToast} />;
   } else if (route.key === "imports" || route.key === "import_new") {
     page = <ImportsPage pushToast={pushToast} refreshNonce={refreshNonce} route={route} />;
   } else if (route.key === "requests") {
