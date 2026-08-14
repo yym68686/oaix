@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AppShell } from "@/app/AppShell";
 import { useRouteState } from "@/app/router";
 import { AccountAPIKeysPage } from "@/features/account/APIKeysPage";
@@ -11,7 +11,7 @@ import { SettingsPage, UserSettingsPage } from "@/features/settings/SettingsPage
 import { AdminAuditPage, AdminImportsPage, AdminPoolsPage, AdminRequestsPage, AdminUserDetailPage, AdminUsersPage } from "@/features/admin/AdminPages";
 import { AdminSub2APIPage } from "@/features/admin/Sub2APIPage";
 import { rememberSavedAccount, restoreSavedAccount } from "@/lib/accounts";
-import { api, getServiceKey, hasServiceKey, isAdminPrincipal, isSelfUserMode, setAuthContext, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
+import { api, getServiceKey, isAdminPrincipal, setAuthContext, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
 import { applyTheme, errorMessage, readThemePreference } from "@/shared/domain";
 import { EmptyState, ToastStack } from "@/shared/components";
 import type { ThemePreference, ToastMessage } from "@/shared/types";
@@ -38,6 +38,8 @@ export function App(): React.ReactElement {
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [streamCap, setStreamCap] = useState(10);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const refreshIDRef = useRef(0);
+  const validatedCredentialRef = useRef("");
   const webVersion = window.__OAIX_WEB_VERSION__;
 
   const pushToast = useCallback((title: string, variant: ToastMessage["variant"] = "success") => {
@@ -49,56 +51,104 @@ export function App(): React.ReactElement {
   }, []);
 
   const refreshAll = useCallback(async () => {
+    const refreshID = ++refreshIDRef.current;
+    const credential = getServiceKey().trim();
+    const isCurrentRefresh = () => refreshID === refreshIDRef.current && getServiceKey().trim() === credential;
+
     setLoading(true);
+    if (validatedCredentialRef.current !== credential) {
+      validatedCredentialRef.current = "";
+      setAuthContext(null);
+      setMe(null);
+      setCounts({});
+      setAuthBlocked(false);
+      setSyncText(credential ? "正在验证身份" : "等待登录");
+    }
     try {
       const healthPayload = await api.health();
+      if (!isCurrentRefresh()) {
+        return;
+      }
       setHealth(healthPayload);
-      setCounts(healthPayload.counts || {});
       setProtectedMode(Boolean(healthPayload.service_key_protected));
-      if (healthPayload.service_key_protected && !hasServiceKey()) {
+      if (healthPayload.service_key_protected && !credential) {
+        validatedCredentialRef.current = "";
         setAuthContext(null);
         setMe(null);
+        setCounts(healthPayload.counts || {});
         setAuthBlocked(true);
         setSyncText(`需要凭证 · ${new Date().toLocaleTimeString("zh-CN")}`);
         return;
       }
       let mePayload: MeResponse | null = null;
-      if (hasServiceKey()) {
-        mePayload = await api.me();
-        rememberSavedAccount(getServiceKey(), mePayload, false);
+      if (credential) {
+        mePayload = await api.me(credential);
+        if (!isCurrentRefresh()) {
+          return;
+        }
+        rememberSavedAccount(credential, mePayload, false);
+        validatedCredentialRef.current = credential;
         setAuthContext(mePayload);
         setMe(mePayload);
       } else {
+        validatedCredentialRef.current = "";
         setAuthContext(null);
         setMe(null);
       }
       setAuthBlocked(false);
-      if (mePayload && !isAdminPrincipal(mePayload) && isSelfUserMode()) {
+      let nextCounts = healthPayload.counts || {};
+      if (mePayload && !isAdminPrincipal(mePayload) && mePayload.user?.id) {
+        nextCounts = {};
         try {
-          const pool = await api.myPoolSummary();
-          setCounts(pool.counts || {});
-        } catch {}
+          const pool = await api.myPoolSummary(credential);
+          if (!isCurrentRefresh()) {
+            return;
+          }
+          nextCounts = pool.counts || {};
+        } catch {
+          if (!isCurrentRefresh()) {
+            return;
+          }
+        }
       }
       if (!mePayload || isAdminPrincipal(mePayload)) {
         try {
-          const selection = await api.tokenSelection();
+          const selection = await api.tokenSelection(credential);
+          if (!isCurrentRefresh()) {
+            return;
+          }
           const cap = Number(selection.active_stream_cap || 10);
           setStreamCap(Number.isFinite(cap) ? Math.max(1, Math.min(50, cap)) : 10);
-        } catch {}
+        } catch {
+          if (!isCurrentRefresh()) {
+            return;
+          }
+        }
       }
+      if (!isCurrentRefresh()) {
+        return;
+      }
+      setCounts(nextCounts);
       setRefreshNonce((value) => value + 1);
       setSyncText(`已同步 ${new Date().toLocaleTimeString("zh-CN")}`);
     } catch (caught) {
+      if (!isCurrentRefresh()) {
+        return;
+      }
+      validatedCredentialRef.current = "";
       setHealth(null);
       setAuthContext(null);
       setMe(null);
-      if (hasServiceKey()) {
+      setCounts({});
+      if (credential) {
         setAuthBlocked(true);
       }
       pushToast(errorMessage(caught), "error");
       setSyncText(`同步失败 ${new Date().toLocaleTimeString("zh-CN")}`);
     } finally {
-      setLoading(false);
+      if (isCurrentRefresh()) {
+        setLoading(false);
+      }
     }
   }, [pushToast]);
 
@@ -116,8 +166,12 @@ export function App(): React.ReactElement {
   let page: React.ReactElement;
   const adminRoute = route.key.startsWith("admin_") || route.key === "settings" || route.key === "runtime";
   const admin = isAdminPrincipal(me);
-  if (adminRoute && !admin && !loading) {
-    page = <EmptyState title="无权限" description="当前 API Key 没有管理员权限。" />;
+  if (adminRoute && !admin) {
+    page = loading ? (
+      <EmptyState title="正在验证身份" description="正在确认当前账号的管理员权限。" />
+    ) : (
+      <EmptyState title="无权限" description="当前 API Key 没有管理员权限。" />
+    );
   } else if (route.key === "admin_users") {
     page = <AdminUsersPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_user_detail") {

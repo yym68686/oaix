@@ -118,6 +118,41 @@ func TestFrontendProfileSupportsSavedAccountSwitching(t *testing.T) {
 	}
 }
 
+func TestFrontendAccountSwitchInvalidatesStaleAuthorization(t *testing.T) {
+	app := readFrontendFile(t, "src", "App.tsx")
+	appShell := readFrontendFile(t, "src", "app", "AppShell.tsx")
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+
+	for _, required := range []string{
+		`const refreshIDRef = useRef(0)`,
+		`const validatedCredentialRef = useRef("")`,
+		`const credential = getServiceKey().trim()`,
+		`refreshID === refreshIDRef.current && getServiceKey().trim() === credential`,
+		`validatedCredentialRef.current !== credential`,
+		`setAuthContext(null)`,
+		`setMe(null)`,
+		`setCounts({})`,
+		`api.me(credential)`,
+		`rememberSavedAccount(credential, mePayload, false)`,
+		`api.myPoolSummary(credential)`,
+		`api.tokenSelection(credential)`,
+		`if (adminRoute && !admin)`,
+	} {
+		if !strings.Contains(app, required) {
+			t.Fatalf("account switch authorization contract missing %q", required)
+		}
+	}
+	if strings.Contains(app, `if (adminRoute && !admin && !loading)`) {
+		t.Fatal("admin routes must not render while the current credential is still unverified")
+	}
+	if !strings.Contains(appShell, `const activeSavedAccount = getActiveSavedAccount()`) {
+		t.Fatal("account menu must resolve the active account from the current credential on every parent render")
+	}
+	if !strings.Contains(apiFile, `authKey === undefined ? getServiceKey() : authKey.trim()`) {
+		t.Fatal("identity refresh requests must be bound to the credential captured at refresh start")
+	}
+}
+
 func TestFrontendAdminPagesContract(t *testing.T) {
 	adminPages := readFrontendFile(t, "src", "features", "admin", "AdminPages.tsx")
 	for _, required := range []string{

@@ -116,7 +116,7 @@ export function AppShell({
   const [displayNameDraft, setDisplayNameDraft] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const savedAccounts = useSavedAccounts();
-  const activeSavedAccount = getActiveSavedAccount(savedAccounts);
+  const activeSavedAccount = getActiveSavedAccount();
   // If a saved credential expires, keep the shell usable so the user can switch
   // to another saved account or open the profile page to replace it.
   const credentialRequired = authBlocked && protectedMode && savedAccounts.length === 0;

@@ -488,9 +488,9 @@ export function isAuthContextPending(): boolean {
   return hasServiceKey() && currentAuth == null;
 }
 
-async function requestJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function requestJSON<T>(path: string, init: RequestInit = {}, authKey?: string): Promise<T> {
   const headers = new Headers(init.headers || {});
-  const key = getServiceKey();
+  const key = authKey === undefined ? getServiceKey() : authKey.trim();
   if (key) {
     headers.set("Authorization", `Bearer ${key}`);
   }
@@ -573,7 +573,7 @@ export type ImportAPIScope = "self" | "admin";
 
 export const api = {
   health: () => requestJSON<HealthResponse>("/healthz"),
-  me: () => requestJSON<MeResponse>("/api/me"),
+  me: (authKey?: string) => requestJSON<MeResponse>("/api/me", {}, authKey),
   register: (payload: Record<string, unknown>) =>
     postJSON<{ user?: PlatformUser; api_key?: CreatedAPIKey }>("/api/auth/register", payload),
   login: (payload: Record<string, unknown>) =>
@@ -584,12 +584,12 @@ export const api = {
   revealMyAPIKey: (id: number) => requestJSON<{ plaintext_key?: string }>(`/api/me/api-keys/${id}/value`),
   revokeMyAPIKey: (id: number) => deleteJSON<{ ok?: boolean; current_key_deleted?: boolean }>(`/api/me/api-keys/${id}`),
   myUsage: (hours = 24) => requestJSON<{ usage?: UsageSummary }>(`/api/me/usage?hours=${hours}`),
-  myPoolSummary: () => requestJSON<PoolSummaryResponse>("/api/me/pool-summary"),
+  myPoolSummary: (authKey?: string) => requestJSON<PoolSummaryResponse>("/api/me/pool-summary", {}, authKey),
   mySettings: () => requestJSON<{ items?: SettingItem[] }>("/api/me/settings"),
   updateMySetting: (key: string, value: unknown) =>
     postJSON<SettingItem>(`/api/me/settings/${encodeURIComponent(key)}`, value),
   runtime: () => requestJSON<Record<string, unknown>>("/admin/runtime"),
-  tokenSelection: () => requestJSON<Record<string, unknown>>("/admin/token-selection"),
+  tokenSelection: (authKey?: string) => requestJSON<Record<string, unknown>>("/admin/token-selection", {}, authKey),
   updateTokenSelection: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/token-selection", payload),
   listTokens: (params: URLSearchParams, scope: TokenAPIScope = "auto") =>
