@@ -20,7 +20,7 @@ import (
 	"github.com/yym68686/oaix/internal/config"
 )
 
-const SchemaVersion = 22
+const SchemaVersion = 23
 
 type Workload string
 
@@ -34,6 +34,7 @@ const (
 type Store struct {
 	pool          *pgxpool.Pool
 	workloadPools map[Workload]*pgxpool.Pool
+	apiKeyCipher  *apiKeyCipher
 }
 
 type ResourceScope struct {
@@ -106,7 +107,8 @@ func ConnectObserved(ctx context.Context, cfg config.DatabaseConfig, logger *slo
 		return nil, err
 	}
 	return &Store{
-		pool: pool,
+		pool:         pool,
+		apiKeyCipher: newAPIKeyCipher(cfg.APIKeyEncryptionSecret, cfg.URL),
 		workloadPools: map[Workload]*pgxpool.Pool{
 			WorkloadHotPath:   pool,
 			WorkloadAdmin:     pool,

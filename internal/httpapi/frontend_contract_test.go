@@ -29,6 +29,43 @@ func TestFrontendAdminNavigationContract(t *testing.T) {
 	}
 }
 
+func TestFrontendUserAPIKeyPageContract(t *testing.T) {
+	appShell := readFrontendFile(t, "src", "app", "AppShell.tsx")
+	router := readFrontendFile(t, "src", "app", "router.ts")
+	app := readFrontendFile(t, "src", "App.tsx")
+	page := readFrontendFile(t, "src", "features", "account", "APIKeysPage.tsx")
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+	for _, required := range []string{
+		`{ key: "account_api_keys", href: "/account/api-keys"`,
+		`label: "API Key"`,
+	} {
+		if !strings.Contains(appShell, required) {
+			t.Fatalf("API Key navigation contract missing %q", required)
+		}
+	}
+	if !strings.Contains(router, `return { key: "account_api_keys"`) {
+		t.Fatal("router must preserve /account/api-keys instead of redirecting it")
+	}
+	if !strings.Contains(app, `route.key === "account_api_keys"`) || !strings.Contains(app, "<AccountAPIKeysPage") {
+		t.Fatal("App must render the user API Key page")
+	}
+	for _, required := range []string{
+		"api.createMyAPIKey",
+		"api.revealMyAPIKey",
+		"api.revokeMyAPIKey",
+		"只能调用你自己添加的",
+		"复制",
+		"删除",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("API Key page contract missing %q", required)
+		}
+	}
+	if !strings.Contains(apiFile, "/api/me/api-keys/${id}/value") {
+		t.Fatal("frontend API client must expose recoverable API key value endpoint")
+	}
+}
+
 func TestFrontendAdminPagesContract(t *testing.T) {
 	adminPages := readFrontendFile(t, "src", "features", "admin", "AdminPages.tsx")
 	for _, required := range []string{

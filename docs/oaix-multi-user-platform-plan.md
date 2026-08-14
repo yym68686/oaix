@@ -311,7 +311,7 @@ type ResourceScope struct {
 - 普通用户永远不能通过参数传 `owner_user_id` 越权。
 - Admin 查询跨用户数据时必须走 `/api/admin/*`。
 - 任何 secret 字段只允许写入，不允许明文读取；管理员也只能看到 prefix/hash/更新时间。
-- API Key 明文只在创建时返回一次。
+- API Key 明文创建时返回，并使用服务端加密密文保存；用户之后可在自己的 API Key 页面按需解密复制。数据库不保存裸明文，旧的仅哈希 Key 仍不可恢复。
 - Service API Key 的全局能力必须写入审计，尤其是 act-as。
 - 所有 mutating API 支持 `Idempotency-Key`，避免用户重复提交导入任务。
 - 所有列表默认分页，禁止默认全表 count；精确 count 需要显式 `include_total=true` 或异步统计。
@@ -389,9 +389,9 @@ type MeResponse = {
 显示：
 
 - API Key 列表：name、prefix、scopes、created_at、last_used_at、expires_at、revoked_at。
-- 创建 API Key 弹窗。
+- 创建 API Key 表单；创建成功后自动复制，之后也可随时复制。
 - 撤销 API Key 确认框。
-- 新 key 明文只显示一次，前端提示用户保存。
+- 新 key 创建后会自动复制；完整明文只通过 owner-scoped、`no-store` 的按需解密接口返回，不出现在列表响应中。
 
 ### 管理员页面
 
@@ -670,7 +670,7 @@ type ResourceScope = {
 - [x] 新增 `/account/api-keys` 页面。
 - [x] 用户可创建自己的 API Key。
 - [x] 用户可撤销自己的 API Key。
-- [x] API Key 明文只显示一次并提供复制按钮。
+- [x] API Key 明文使用服务端加密密文保存，用户可随时复制；旧的仅哈希 Key 明确提示不可恢复。
 - [x] 用户 Key/导入/请求页面切到 `/api/*` 自助 API。
 
 ### 9. 前端管理员页面

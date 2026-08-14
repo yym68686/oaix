@@ -51,18 +51,19 @@ type PlatformUserPatch struct {
 }
 
 type APIKey struct {
-	ID         int64      `json:"id"`
-	UserID     *int64     `json:"user_id,omitempty"`
-	Kind       string     `json:"kind"`
-	Name       string     `json:"name"`
-	Role       string     `json:"role"`
-	KeyPrefix  string     `json:"key_prefix"`
-	Scopes     []string   `json:"scopes,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	ID            int64      `json:"id"`
+	UserID        *int64     `json:"user_id,omitempty"`
+	Kind          string     `json:"kind"`
+	Name          string     `json:"name"`
+	Role          string     `json:"role"`
+	KeyPrefix     string     `json:"key_prefix"`
+	Scopes        []string   `json:"scopes,omitempty"`
+	CopyAvailable bool       `json:"copy_available"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	LastUsedAt    *time.Time `json:"last_used_at,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	RevokedAt     *time.Time `json:"revoked_at,omitempty"`
 }
 
 type CreatedAPIKey struct {
@@ -269,14 +270,18 @@ func (s *Store) CreateAPIKey(ctx context.Context, userID *int64, kind string, na
 	if err != nil {
 		return CreatedAPIKey{}, err
 	}
+	ciphertext, err := s.apiKeyCipher.Encrypt(plain)
+	if err != nil {
+		return CreatedAPIKey{}, err
+	}
 	hash := hashString(plain)
 	var item APIKey
 	err = s.pool.QueryRow(ctx, `
-		insert into api_keys(user_id, kind, name, role, key_prefix, key_hash, created_by_user_id)
-		values ($1, $2, $3, $4, $5, $6, $7)
-		returning id, user_id, kind, name, role, key_prefix, scopes, created_at, updated_at, last_used_at, expires_at, revoked_at
-	`, userID, kind, truncate(name, 128), role, prefix, hash, createdByUserID).Scan(
-		&item.ID, &item.UserID, &item.Kind, &item.Name, &item.Role, &item.KeyPrefix, scanJSONStringSlice(&item.Scopes),
+		insert into api_keys(user_id, kind, name, role, key_prefix, key_hash, key_ciphertext, created_by_user_id)
+		values ($1, $2, $3, $4, $5, $6, $7, $8)
+		returning id, user_id, kind, name, role, key_prefix, scopes, key_ciphertext is not null, created_at, updated_at, last_used_at, expires_at, revoked_at
+	`, userID, kind, truncate(name, 128), role, prefix, hash, ciphertext, createdByUserID).Scan(
+		&item.ID, &item.UserID, &item.Kind, &item.Name, &item.Role, &item.KeyPrefix, scanJSONStringSlice(&item.Scopes), &item.CopyAvailable,
 		&item.CreatedAt, &item.UpdatedAt, &item.LastUsedAt, &item.ExpiresAt, &item.RevokedAt,
 	)
 	if err != nil {
@@ -295,7 +300,7 @@ func (s *Store) ListAPIKeys(ctx context.Context, scope ResourceScope, userID *in
 		filters = append(filters, scope.ownerFilter("user_id", &args))
 	}
 	rows, err := s.pool.Query(ctx, `
-		select id, user_id, kind, name, role, key_prefix, scopes, created_at, updated_at, last_used_at, expires_at, revoked_at
+		select id, user_id, kind, name, role, key_prefix, scopes, key_ciphertext is not null, created_at, updated_at, last_used_at, expires_at, revoked_at
 		from api_keys
 		where `+strings.Join(filters, " and ")+`
 		order by id desc
@@ -307,7 +312,7 @@ func (s *Store) ListAPIKeys(ctx context.Context, scope ResourceScope, userID *in
 	items := []APIKey{}
 	for rows.Next() {
 		var item APIKey
-		if err := rows.Scan(&item.ID, &item.UserID, &item.Kind, &item.Name, &item.Role, &item.KeyPrefix, scanJSONStringSlice(&item.Scopes), &item.CreatedAt, &item.UpdatedAt, &item.LastUsedAt, &item.ExpiresAt, &item.RevokedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.UserID, &item.Kind, &item.Name, &item.Role, &item.KeyPrefix, scanJSONStringSlice(&item.Scopes), &item.CopyAvailable, &item.CreatedAt, &item.UpdatedAt, &item.LastUsedAt, &item.ExpiresAt, &item.RevokedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -321,7 +326,7 @@ func (s *Store) RevokeAPIKey(ctx context.Context, scope ResourceScope, id int64)
 	if !scope.AllowAll {
 		where += " and " + scope.ownerFilter("user_id", &args)
 	}
-	tag, err := s.pool.Exec(ctx, `update api_keys set revoked_at = now(), updated_at = now() where `+where, args...)
+	tag, err := s.pool.Exec(ctx, `update api_keys set revoked_at = now(), key_ciphertext = null, updated_at = now() where `+where, args...)
 	if err != nil {
 		return err
 	}
@@ -329,6 +334,22 @@ func (s *Store) RevokeAPIKey(ctx context.Context, scope ResourceScope, id int64)
 		return pgx.ErrNoRows
 	}
 	return nil
+}
+
+func (s *Store) RevealAPIKey(ctx context.Context, scope ResourceScope, id int64) (string, error) {
+	args := []any{id}
+	where := "id = $1 and revoked_at is null and (expires_at is null or expires_at > now())"
+	if !scope.AllowAll {
+		where += " and " + scope.ownerFilter("user_id", &args)
+	}
+	var ciphertext *string
+	if err := s.pool.QueryRow(ctx, `select key_ciphertext from api_keys where `+where, args...).Scan(&ciphertext); err != nil {
+		return "", err
+	}
+	if ciphertext == nil || strings.TrimSpace(*ciphertext) == "" {
+		return "", ErrAPIKeyNotRecoverable
+	}
+	return s.apiKeyCipher.Decrypt(*ciphertext)
 }
 
 func (s *Store) ValidateAPIKey(ctx context.Context, plaintext string) (ValidatedAPIKey, bool, error) {
@@ -340,7 +361,7 @@ func (s *Store) ValidateAPIKey(ctx context.Context, plaintext string) (Validated
 	var out ValidatedAPIKey
 	err := s.pool.QueryRow(ctx, `
 		select
-		  k.id, k.user_id, k.kind, k.name, k.role, k.key_prefix, k.scopes,
+		  k.id, k.user_id, k.kind, k.name, k.role, k.key_prefix, k.scopes, k.key_ciphertext is not null,
 		  k.created_at, k.updated_at, k.last_used_at, k.expires_at, k.revoked_at,
 		  u.id, u.email, u.display_name, u.role, u.status, u.plan, u.notes,
 		  u.created_at, u.updated_at, u.last_seen_at, u.disabled_at
@@ -350,7 +371,7 @@ func (s *Store) ValidateAPIKey(ctx context.Context, plaintext string) (Validated
 		  and k.revoked_at is null
 		  and (k.expires_at is null or k.expires_at > now())
 	`, hash).Scan(
-		&out.ID, &out.UserID, &out.Kind, &out.Name, &out.Role, &out.KeyPrefix, scanJSONStringSlice(&out.Scopes),
+		&out.ID, &out.UserID, &out.Kind, &out.Name, &out.Role, &out.KeyPrefix, scanJSONStringSlice(&out.Scopes), &out.CopyAvailable,
 		&out.CreatedAt, &out.UpdatedAt, &out.LastUsedAt, &out.ExpiresAt, &out.RevokedAt,
 		&out.User.ID, &out.User.Email, &out.User.DisplayName, &out.User.Role, &out.User.Status, &out.User.Plan, &out.User.Notes,
 		&out.User.CreatedAt, &out.User.UpdatedAt, &out.User.LastSeenAt, &out.User.DisabledAt,
@@ -401,13 +422,17 @@ func (s *Store) CreateRegisteredUser(ctx context.Context, email string, password
 		if err != nil {
 			return err
 		}
+		ciphertext, err := s.apiKeyCipher.Encrypt(plain)
+		if err != nil {
+			return err
+		}
 		key.PlaintextKey = plain
 		if err := tx.QueryRow(ctx, `
-			insert into api_keys(user_id, kind, name, role, key_prefix, key_hash, created_by_user_id)
-			values ($1, 'user', 'default', 'user', $2, $3, $1)
-			returning id, user_id, kind, name, role, key_prefix, scopes, created_at, updated_at, last_used_at, expires_at, revoked_at
-		`, user.ID, prefix, hashString(plain)).Scan(
-			&key.ID, &key.UserID, &key.Kind, &key.Name, &key.Role, &key.KeyPrefix, scanJSONStringSlice(&key.Scopes),
+				insert into api_keys(user_id, kind, name, role, key_prefix, key_hash, key_ciphertext, created_by_user_id)
+				values ($1, 'user', 'default', 'user', $2, $3, $4, $1)
+				returning id, user_id, kind, name, role, key_prefix, scopes, key_ciphertext is not null, created_at, updated_at, last_used_at, expires_at, revoked_at
+			`, user.ID, prefix, hashString(plain), ciphertext).Scan(
+			&key.ID, &key.UserID, &key.Kind, &key.Name, &key.Role, &key.KeyPrefix, scanJSONStringSlice(&key.Scopes), &key.CopyAvailable,
 			&key.CreatedAt, &key.UpdatedAt, &key.LastUsedAt, &key.ExpiresAt, &key.RevokedAt,
 		); err != nil {
 			return err

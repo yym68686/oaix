@@ -277,6 +277,7 @@ export type APIKeyItem = {
   kind?: string | null;
   role?: string | null;
   scopes?: string[];
+  copy_available?: boolean;
   created_at?: string | null;
   last_used_at?: string | null;
   expires_at?: string | null;
@@ -291,6 +292,7 @@ export type CreatedAPIKey = APIKeyItem & {
 export type MeResponse = {
   principal_type?: string;
   user?: PlatformUser | null;
+  api_key_id?: number | null;
   role?: string;
   scopes?: string[];
   capabilities?: string[];
@@ -579,7 +581,8 @@ export const api = {
   myAPIKeys: () => requestJSON<{ items?: APIKeyItem[] }>("/api/me/api-keys"),
   createMyAPIKey: (payload: Record<string, unknown>) =>
     postJSON<{ api_key?: CreatedAPIKey }>("/api/me/api-keys", payload),
-  revokeMyAPIKey: (id: number) => deleteJSON<Record<string, unknown>>(`/api/me/api-keys/${id}`),
+  revealMyAPIKey: (id: number) => requestJSON<{ plaintext_key?: string }>(`/api/me/api-keys/${id}/value`),
+  revokeMyAPIKey: (id: number) => deleteJSON<{ ok?: boolean; current_key_deleted?: boolean }>(`/api/me/api-keys/${id}`),
   myUsage: (hours = 24) => requestJSON<{ usage?: UsageSummary }>(`/api/me/usage?hours=${hours}`),
   myPoolSummary: () => requestJSON<PoolSummaryResponse>("/api/me/pool-summary"),
   mySettings: () => requestJSON<{ items?: SettingItem[] }>("/api/me/settings"),

@@ -74,6 +74,8 @@ const createTokenAgentIdentitiesTable = `create table if not exists token_agent_
 
 const createTokenAgentIdentitiesOwnerRuntimeIndex = `create unique index if not exists ux_token_agent_identities_owner_runtime on token_agent_identities(owner_user_id, agent_runtime_id)`
 
+const addAPIKeyCiphertext = `alter table api_keys add column if not exists key_ciphertext text`
+
 type startupMigration struct {
 	statements []string
 }
@@ -94,6 +96,9 @@ var startupMigrations = map[int]startupMigration{
 	22: {statements: []string{
 		createTokenAgentIdentitiesTable,
 		createTokenAgentIdentitiesOwnerRuntimeIndex,
+	}},
+	23: {statements: []string{
+		addAPIKeyCiphertext,
 	}},
 }
 
@@ -133,6 +138,7 @@ var migrationStatements = []string{
 		role varchar(32) not null default 'user',
 		key_prefix varchar(32) not null,
 		key_hash varchar(128) not null unique,
+		key_ciphertext text,
 		scopes jsonb,
 		last_used_at timestamptz,
 		expires_at timestamptz,
@@ -143,6 +149,7 @@ var migrationStatements = []string{
 	)`,
 	`create index if not exists ix_api_keys_user_active on api_keys(user_id, revoked_at, expires_at)`,
 	`create index if not exists ix_api_keys_kind_role on api_keys(kind, role)`,
+	addAPIKeyCiphertext,
 	`create table if not exists codex_tokens (
 		id serial primary key,
 		email varchar(320),

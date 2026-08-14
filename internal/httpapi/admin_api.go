@@ -312,7 +312,7 @@ func adminOpenAPISpec() map[string]any {
 		"GET /admin/api-keys", "POST /admin/api-keys", "POST /admin/api-keys/{key_id}/rotate",
 		"DELETE /admin/api-keys/{key_id}",
 		"POST /api/auth/register", "POST /api/auth/login", "GET /api/me", "GET /api/me/api-keys",
-		"POST /api/me/api-keys", "DELETE /api/me/api-keys/{key_id}", "GET /api/me/usage",
+		"POST /api/me/api-keys", "GET /api/me/api-keys/{key_id}/value", "DELETE /api/me/api-keys/{key_id}", "GET /api/me/usage",
 		"GET /api/me/pool-summary", "GET /api/me/settings", "GET /api/me/settings/{key}",
 		"POST /api/me/settings/{key}", "DELETE /api/me/settings/{key}",
 		"GET /api/tokens", "POST /api/tokens/batch", "GET /api/tokens/{token_id}", "GET /api/tokens/{token_id}/refresh-token",

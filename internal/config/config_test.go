@@ -120,6 +120,7 @@ func TestLoadRejectsInvalidPort(t *testing.T) {
 func TestSanitizedSummaryDoesNotExposeSecrets(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgresql://user:secret@localhost:5432/db")
 	t.Setenv("SERVICE_API_KEYS", "secret-key")
+	t.Setenv("API_KEY_ENCRYPTION_SECRET", "api-key-encryption-secret")
 	t.Setenv("UPSTREAM_MAX_REQUEST_BODY_BYTES", "")
 	cfg, err := Load()
 	if err != nil {
@@ -127,7 +128,7 @@ func TestSanitizedSummaryDoesNotExposeSecrets(t *testing.T) {
 	}
 	summary := cfg.SanitizedSummary()
 	text := toString(summary)
-	if contains(text, "secret-key") || contains(text, "secret@") {
+	if contains(text, "secret-key") || contains(text, "secret@") || contains(text, "api-key-encryption-secret") {
 		t.Fatalf("sanitized summary leaked secret: %s", text)
 	}
 }

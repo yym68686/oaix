@@ -884,6 +884,52 @@ func TestMultiUserAPIKeyRevocationAndDisabledUserWithDatabase(t *testing.T) {
 	expectStatus(t, h.request(t, http.MethodPost, "/v1/responses", keyB.PlaintextKey, `{"model":"gpt-5.5","input":"hello"}`), http.StatusForbidden)
 }
 
+func TestUserCanCopyOnlyOwnRecoverableAPIKeysWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	userA, keyA := h.createUser(t, "copy-a")
+	userB, keyB := h.createUser(t, "copy-b")
+	tokenA := h.createToken(t, userA.ID, "copy-a")
+	tokenB := h.createToken(t, userB.ID, "copy-b")
+
+	createdPayload := expectStatus(t, h.request(t, http.MethodPost, "/api/me/api-keys", keyA.PlaintextKey, `{"name":"automation"}`), http.StatusCreated)
+	created, _ := createdPayload["api_key"].(map[string]any)
+	if created == nil {
+		t.Fatalf("created api key payload = %#v", createdPayload)
+	}
+	createdID := int64(created["id"].(float64))
+	plaintext, _ := created["plaintext_key"].(string)
+	if plaintext == "" || created["copy_available"] != true {
+		t.Fatalf("created api key is not recoverable: %#v", created)
+	}
+
+	valuePayload := expectStatus(t, h.request(t, http.MethodGet, "/api/me/api-keys/"+strconv.FormatInt(createdID, 10)+"/value", keyA.PlaintextKey, ""), http.StatusOK)
+	if valuePayload["plaintext_key"] != plaintext {
+		t.Fatalf("revealed plaintext = %v, want created plaintext", valuePayload["plaintext_key"])
+	}
+	expectStatus(t, h.request(t, http.MethodGet, "/api/me/api-keys/"+strconv.FormatInt(createdID, 10)+"/value", keyB.PlaintextKey, ""), http.StatusNotFound)
+	expectStatus(t, h.request(t, http.MethodPost, "/v1/responses", plaintext, `{"model":"gpt-5.5","input":"hello"}`), http.StatusOK)
+	auths := h.upstream.Auths()
+	if len(auths) != 1 || auths[0] != "Bearer "+tokenA.AccessToken {
+		t.Fatalf("new API key used wrong owner pool: auths=%v want owner A token; owner B token=%q", auths, tokenB.AccessToken)
+	}
+	otherTokenHeaders := map[string]string{"X-OAIX-Target-Token-ID": strconv.FormatInt(tokenB.ID, 10)}
+	expectStatus(t, h.requestWithHeaders(t, http.MethodPost, "/v1/responses", plaintext, `{"model":"gpt-5.5","input":"hello"}`, otherTokenHeaders), http.StatusServiceUnavailable)
+	if got := len(h.upstream.Auths()); got != 1 {
+		t.Fatalf("targeting another owner's token reached upstream: calls=%d", got)
+	}
+
+	if _, err := h.db.Pool().Exec(context.Background(), `update api_keys set key_ciphertext = null where id = $1 and user_id = $2`, keyA.ID, userA.ID); err != nil {
+		t.Fatal(err)
+	}
+	expectStatus(t, h.request(t, http.MethodGet, "/api/me/api-keys/"+strconv.FormatInt(keyA.ID, 10)+"/value", keyA.PlaintextKey, ""), http.StatusConflict)
+
+	deletePayload := expectStatus(t, h.request(t, http.MethodDelete, "/api/me/api-keys/"+strconv.FormatInt(createdID, 10), keyA.PlaintextKey, ""), http.StatusOK)
+	if deletePayload["current_key_deleted"] != false {
+		t.Fatalf("deleting secondary key reported current credential deletion: %#v", deletePayload)
+	}
+	expectStatus(t, h.request(t, http.MethodGet, "/api/me/api-keys/"+strconv.FormatInt(createdID, 10)+"/value", keyA.PlaintextKey, ""), http.StatusNotFound)
+}
+
 func TestProxyUsesOwnerTokenPoolWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userA, keyA := h.createUser(t, "proxy-a")

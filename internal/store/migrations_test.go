@@ -96,8 +96,8 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 }
 
 func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
-	if SchemaVersion != 22 {
-		t.Fatalf("unexpected schema version: got %d want 22", SchemaVersion)
+	if SchemaVersion != 23 {
+		t.Fatalf("unexpected schema version: got %d want 23", SchemaVersion)
 	}
 
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
@@ -110,6 +110,17 @@ func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
 		if !strings.Contains(joined, fragment) {
 			t.Fatalf("missing stream delivery migration fragment %q", fragment)
 		}
+	}
+}
+
+func TestMigrationAddsRecoverableAPIKeyCiphertext(t *testing.T) {
+	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	if !strings.Contains(joined, "alter table api_keys add column if not exists key_ciphertext text") {
+		t.Fatal("full migration must add encrypted API key ciphertext storage")
+	}
+	migration, ok := startupMigrations[23]
+	if !ok || len(migration.statements) != 1 || migration.statements[0] != addAPIKeyCiphertext {
+		t.Fatalf("startup migration 23 = %#v, want additive API key ciphertext migration", migration)
 	}
 }
 

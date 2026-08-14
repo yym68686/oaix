@@ -21,6 +21,7 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/me", a.requireAuth(a.me))
 	mux.HandleFunc("GET /api/me/api-keys", a.requireAuth(a.listMyAPIKeys))
 	mux.HandleFunc("POST /api/me/api-keys", a.requireAuth(a.createMyAPIKey))
+	mux.HandleFunc("GET /api/me/api-keys/{key_id}/value", a.requireAuth(a.revealMyAPIKey))
 	mux.HandleFunc("DELETE /api/me/api-keys/{key_id}", a.requireAuth(a.revokeMyAPIKey))
 	mux.HandleFunc("GET /api/me/usage", a.requireAuth(a.myUsage))
 	mux.HandleFunc("GET /api/me/pool-summary", a.requireAuth(a.myPoolSummary))
@@ -148,6 +149,7 @@ func (a *App) me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"principal_type": auth.PrincipalType,
 		"user":           auth.User,
+		"api_key_id":     auth.APIKeyID,
 		"role":           auth.Role,
 		"scopes":         auth.Scopes,
 		"capabilities":   capabilities,
@@ -232,6 +234,37 @@ func (a *App) createMyAPIKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"api_key": key})
 }
 
+func (a *App) revealMyAPIKey(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	id, ok := pathInt64(w, r, "key_id")
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	scope, ok := apiKeyManagementScope(ctx, a.store, w, auth)
+	if !ok {
+		return
+	}
+	plaintext, err := a.store.RevealAPIKey(ctx, scope, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "API key not found"})
+		return
+	}
+	if errors.Is(err, store.ErrAPIKeyNotRecoverable) {
+		writeJSON(w, http.StatusConflict, map[string]any{"detail": "This API key predates encrypted key storage and cannot be copied; create a replacement key"})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	_ = a.store.WriteAuditLog(ctx, "user_api_key_reveal", firstNonEmpty(auth.Role, "self"), "api_key", strconv.FormatInt(id, 10), map[string]any{"user_id": scope.OwnerUserID})
+	writeJSON(w, http.StatusOK, map[string]any{"plaintext_key": plaintext})
+}
+
 func (a *App) revokeMyAPIKey(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
 	id, ok := pathInt64(w, r, "key_id")
@@ -252,7 +285,8 @@ func (a *App) revokeMyAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = a.store.WriteAuditLog(ctx, "user_api_key_revoke", firstNonEmpty(auth.Role, "self"), "api_key", strconv.FormatInt(id, 10), map[string]any{"user_id": scope.OwnerUserID})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	currentKeyDeleted := auth.APIKeyID != nil && *auth.APIKeyID == id
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "current_key_deleted": currentKeyDeleted})
 }
 
 func (a *App) myUsage(w http.ResponseWriter, r *http.Request) {

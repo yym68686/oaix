@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { AppShell } from "@/app/AppShell";
 import { useRouteState } from "@/app/router";
+import { AccountAPIKeysPage } from "@/features/account/APIKeysPage";
 import { ImportsPage } from "@/features/imports/ImportsPage";
 import { KeyDetailPage, KeysPage } from "@/features/keys/KeysPage";
 import { RequestsPage } from "@/features/requests/RequestsPage";
@@ -139,6 +140,8 @@ export function App(): React.ReactElement {
     page = <AdminAuditPage refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_sub2api") {
     page = <AdminSub2APIPage pushToast={pushToast} refreshNonce={refreshNonce} />;
+  } else if (route.key === "account_api_keys") {
+    page = <AccountAPIKeysPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "imports" || route.key === "import_new") {
     page = <ImportsPage pushToast={pushToast} refreshNonce={refreshNonce} route={route} />;
   } else if (route.key === "requests") {

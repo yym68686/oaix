@@ -35,13 +35,14 @@ type ServerConfig struct {
 }
 
 type DatabaseConfig struct {
-	URL              string
-	MaxConns         int32
-	MinConns         int32
-	ConnectTimeout   time.Duration
-	AcquireTimeout   time.Duration
-	RuntimeMustMatch bool
-	AutoMigrate      bool
+	URL                    string
+	APIKeyEncryptionSecret string
+	MaxConns               int32
+	MinConns               int32
+	ConnectTimeout         time.Duration
+	AcquireTimeout         time.Duration
+	RuntimeMustMatch       bool
+	AutoMigrate            bool
 }
 
 type AuthConfig struct {
@@ -153,13 +154,14 @@ func Load() (Config, error) {
 			ShutdownTimeout: envDurationSeconds("SERVER_SHUTDOWN_TIMEOUT_SECONDS", 15*time.Second),
 		},
 		Database: DatabaseConfig{
-			URL:              normalizeDatabaseURL(envString("DATABASE_URL", "postgresql://oaix:oaix_password@127.0.0.1:5432/oaix_gateway")),
-			MaxConns:         int32(envInt("DATABASE_POOL_SIZE", 32)),
-			MinConns:         int32(envInt("DATABASE_MIN_POOL_SIZE", 2)),
-			ConnectTimeout:   envDurationSeconds("DATABASE_CONNECT_TIMEOUT_SECONDS", 5*time.Second),
-			AcquireTimeout:   envDurationSeconds("DATABASE_POOL_TIMEOUT_SECONDS", 5*time.Second),
-			RuntimeMustMatch: envBool("OAIX_RUNTIME_SCHEMA_MUST_MATCH", true),
-			AutoMigrate:      envBool("OAIX_AUTO_MIGRATE_ON_STARTUP", false),
+			URL:                    normalizeDatabaseURL(envString("DATABASE_URL", "postgresql://oaix:oaix_password@127.0.0.1:5432/oaix_gateway")),
+			APIKeyEncryptionSecret: envString("API_KEY_ENCRYPTION_SECRET", envString("TOKEN_IMPORT_PAYLOAD_SECRET", "")),
+			MaxConns:               int32(envInt("DATABASE_POOL_SIZE", 32)),
+			MinConns:               int32(envInt("DATABASE_MIN_POOL_SIZE", 2)),
+			ConnectTimeout:         envDurationSeconds("DATABASE_CONNECT_TIMEOUT_SECONDS", 5*time.Second),
+			AcquireTimeout:         envDurationSeconds("DATABASE_POOL_TIMEOUT_SECONDS", 5*time.Second),
+			RuntimeMustMatch:       envBool("OAIX_RUNTIME_SCHEMA_MUST_MATCH", true),
+			AutoMigrate:            envBool("OAIX_AUTO_MIGRATE_ON_STARTUP", false),
 		},
 		Auth: AuthConfig{
 			ServiceAPIKeys: envCSV("SERVICE_API_KEYS"),
