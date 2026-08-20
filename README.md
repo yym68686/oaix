@@ -100,7 +100,6 @@
 - `FUGUE_OBSERVABILITY_REQUEST_SUMMARY_ENABLED` / `FUGUE_OBSERVABILITY_STAGE_SPANS_ENABLED` / `FUGUE_OBSERVABILITY_METRICS_ENABLED`: 分别控制 request summary、阶段 span、低基数 metric 诊断副本，默认均开启
 - `IMPORT_RESPONSE_IDLE_GRACE_SECONDS`: 导入 key 遇到活跃 `/v1/responses*` 流量时，等流量清空后再额外静默多久继续补号，默认 `0.25`
 - `IMPORT_WAIT_TIMEOUT_SECONDS`: 导入 key 在为活跃 `/v1/responses*` 流量让路时，最多等待多久；超时后不再整批返回 `503`，而是记一次超时并继续低优先级导入，默认 `30`
-- `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS`: `/v1/responses/compact` 遇到上游 5xx / 传输错误时的冷却秒数，默认 `60`；设为 `0` 可关闭
 - `HOST`: 内置启动命令监听地址，默认 `0.0.0.0`
 - `PORT`: 内置启动命令端口，默认 `8000`
 
@@ -228,7 +227,6 @@ export IMAGE_UPLOAD_MAX_BYTES='26214400'
 export UPSTREAM_MAX_REQUEST_BODY_BYTES='0'
 export UPSTREAM_NON_STREAM_MAX_RESPONSE_BYTES='67108864'
 export STREAM_CAPTURE_MAX_BYTES='8388608'
-export COMPACT_SERVER_ERROR_COOLDOWN_SECONDS='60'
 ```
 
 启动后打开：
@@ -332,7 +330,7 @@ Go 版支持 access token、refresh token，以及 sub2api 导出的 OpenAI Agen
 - 图片接口内部统一走上游 `/responses` 的 `image_generation` tool；非流式会在网关内收完整个 SSE 后再拼成 OpenAI Images API 形状，流式会把上游 responses 事件改写成 `image_generation.*` / `image_edit.*`
 - 图片编辑或 `gpt-image-2` responses 请求的输入图片数超过 `IMAGE_INPUT_MAX_PER_REQUEST` 时，网关直接返回 `400`
 - `gpt-image-2` 上游返回 `429 rate_limit_exceeded` 且命中 `input-images` 速率桶时，只会对当前 key 的图片桶做短冷却并自动重试下一个 key，不影响该 key 处理其他模型
-- `/v1/responses/compact` 在上游 5xx 或传输错误时，会默认把当前 key 冷却 `60` 秒后切换下一把 key；可用 `COMPACT_SERVER_ERROR_COOLDOWN_SECONDS=0` 关闭
+- 普通上游 5xx 或传输错误只会在当前请求内排除该 key 并切换下一把 key，不会持久冷却账号；只有明确的 `429` 额度/速率限制、认证失败或账号失效才会更新 key 健康状态
 - 流式 `/v1/responses*` 会先预读开头的 SSE 状态事件；如果前缀已经是 `response.failed` / `type=error` / 不完整流 / 预读阶段网络错误，就不会先把坏流交给客户端，而是留在网关里切下一把 key
 - 新 `/admin/import/jobs` 路由会创建异步 staging job，由 worker 校验 refresh token 并发布到正式 key 池；旧 `/admin/tokens/import` 保持同步兼容，会预处理 refresh token 后直接 upsert 并创建 completed job
 - 未验证或验证失败的 refresh token 不会进入正式池；正常请求最多只会感知到“新 key 稍后可用”，不会替导入任务试错

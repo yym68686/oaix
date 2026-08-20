@@ -296,6 +296,83 @@ func TestManagerStatsIncludesOwnerSnapshotActiveStreams(t *testing.T) {
 	}
 }
 
+func TestManagerSharesActiveCapAcrossGlobalAndOwnerSnapshots(t *testing.T) {
+	rows := makeTokens(1)
+	rows[0].OwnerUserID = 10
+	rows[0].ShareEnabled = true
+	rows[0].ShareStatus = "active"
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, nil, time.Second, time.Second, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("global Refresh returned error: %v", err)
+	}
+
+	ownerClaim, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10})
+	if err != nil {
+		t.Fatalf("owner Claim returned error: %v", err)
+	}
+	defer ownerClaim.Release()
+
+	globalToken := manager.Snapshot().ByID[1]
+	ownerToken := manager.SnapshotForOwner(10).ByID[1]
+	if globalToken == nil || ownerToken == nil {
+		t.Fatalf("token missing from snapshots: global=%v owner=%v", globalToken, ownerToken)
+	}
+	if globalToken.Active != ownerToken.Active {
+		t.Fatalf("active counters differ across snapshots: global=%p owner=%p", globalToken.Active, ownerToken.Active)
+	}
+	if got := manager.ActiveStreams(); got != 1 {
+		t.Fatalf("ActiveStreams = %d, want one unique active claim", got)
+	}
+
+	claim, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10, SelectionMode: "marketplace"})
+	if claim != nil {
+		claim.Release()
+	}
+	if !errors.Is(err, ErrNoToken) {
+		t.Fatalf("global claim bypassed shared cap: claim=%v err=%v", claim, err)
+	}
+}
+
+func TestManagerRetainsActiveCounterWhileTokenIsAbsentFromSnapshots(t *testing.T) {
+	source := &fakeSource{tokens: makeTokens(1)}
+	manager := NewManager(source, nil, time.Second, time.Second, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh returned error: %v", err)
+	}
+
+	claim, err := manager.Claim(context.Background(), Intent{})
+	if err != nil {
+		t.Fatalf("Claim returned error: %v", err)
+	}
+	source.tokens = nil
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("removal Refresh returned error: %v", err)
+	}
+	if got := manager.ActiveStreamsForToken(1, 0); got != 1 {
+		t.Fatalf("active count while absent = %d, want 1", got)
+	}
+
+	source.tokens = makeTokens(1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatalf("restore Refresh returned error: %v", err)
+	}
+	blocked, err := manager.Claim(context.Background(), Intent{})
+	if blocked != nil {
+		blocked.Release()
+	}
+	if !errors.Is(err, ErrNoToken) {
+		t.Fatalf("restored token bypassed in-flight cap: claim=%v err=%v", blocked, err)
+	}
+
+	claim.Release()
+	recovered, err := manager.Claim(context.Background(), Intent{})
+	if err != nil {
+		t.Fatalf("Claim after release returned error: %v", err)
+	}
+	recovered.Release()
+}
+
 func TestManagerClaimLoadsOwnerSnapshotLazily(t *testing.T) {
 	rows := makeTokens(4)
 	rows[0].OwnerUserID = 10

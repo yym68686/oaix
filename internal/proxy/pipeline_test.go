@@ -58,6 +58,50 @@ func TestClassifyUpstreamFailures(t *testing.T) {
 	}
 }
 
+func TestDecideTokenFailureKeepsGenericFailuresRequestLocal(t *testing.T) {
+	pipeline := &Pipeline{}
+	claim := &tokens.Claim{Token: &tokens.RuntimeToken{Token: store.Token{ID: 42}}}
+	tests := []struct {
+		name   string
+		status int
+		result AttemptResult
+		err    error
+		action Outcome
+	}{
+		{
+			name:   "generic upstream 500",
+			status: http.StatusInternalServerError,
+			result: AttemptResult{Retry: true},
+			err:    errors.New("Our servers are currently overloaded. Please try again later."),
+			action: OutcomeUpstream5xx,
+		},
+		{
+			name:   "transport failure",
+			status: http.StatusBadGateway,
+			result: AttemptResult{Retry: true},
+			err:    errors.New("upstream connection reset"),
+			action: OutcomeTransportError,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decision := pipeline.decideTokenFailure(
+				context.Background(),
+				claim,
+				test.status,
+				test.result,
+				test.err,
+				test.action,
+				map[int64]struct{}{},
+				map[string]any{},
+			)
+			if decision.commitRequired || decision.cooldownUntil != nil || decision.deactivate || decision.retrySameToken {
+				t.Fatalf("generic failure changed token health: %+v", decision)
+			}
+		})
+	}
+}
+
 func TestIsDeactivatedWorkspaceFailure(t *testing.T) {
 	if !isDeactivatedWorkspaceFailure(http.StatusPaymentRequired, []byte(`{"error":{"code":"deactivated_workspace"}}`), nil) {
 		t.Fatal("expected deactivated workspace body to be terminal")
@@ -3151,6 +3195,65 @@ func TestProxyDiscardsRetriedFailureWhenLaterAttemptSucceeds(t *testing.T) {
 	}
 	if !strings.Contains(body, "response.completed") || !strings.Contains(body, "resp_ok") {
 		t.Fatalf("successful retry terminal missing: %q", body)
+	}
+}
+
+func TestProxyRetriesGeneric500OnAnotherTokenWithoutCoolingAccount(t *testing.T) {
+	var callsMu sync.Mutex
+	var authorizations []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		call := len(authorizations)
+		callsMu.Unlock()
+		if call == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"Our servers are currently overloaded. Please try again later."}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(sse.Encode("response.completed", []byte(`{"type":"response.completed","sequence_number":0,"response":{"id":"resp_ok","object":"response","model":"gpt-5.5","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)))
+	}))
+	defer upstream.Close()
+
+	now := time.Now().UTC()
+	fakes := &fakeProxyStore{
+		tokens: []store.Token{
+			{ID: 1, AccessToken: "upstream-token-1", IsActive: true, CreatedAt: now, UpdatedAt: now},
+			{ID: 2, AccessToken: "upstream-token-2", IsActive: true, CreatedAt: now, UpdatedAt: now},
+		},
+		tokenErrorCh: make(chan *time.Time, 1),
+	}
+	pipeline := newProxyPipelineTestHarness(t, upstream.URL, 2, fakes)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello","stream":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	pipeline.Proxy(recorder, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5"})
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"id":"resp_ok"`) {
+		t.Fatalf("retry did not succeed: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	callsMu.Lock()
+	gotAuthorizations := append([]string(nil), authorizations...)
+	callsMu.Unlock()
+	if len(gotAuthorizations) != 2 || gotAuthorizations[0] == gotAuthorizations[1] {
+		t.Fatalf("request-local exclusion did not switch tokens: %v", gotAuthorizations)
+	}
+	select {
+	case until := <-fakes.tokenErrorCh:
+		t.Fatalf("generic 500 changed token health: cooldown=%v", until)
+	case <-time.After(100 * time.Millisecond):
+	}
+	fakes.mu.Lock()
+	attempts := append([]store.GatewayRequestAttempt(nil), fakes.attempts...)
+	fakes.mu.Unlock()
+	if len(attempts) != 2 {
+		t.Fatalf("gateway attempts = %d, want 2", len(attempts))
+	}
+	first := attempts[0]
+	if first.Outcome != string(OutcomeUpstream5xx) || first.Retry == nil || !*first.Retry || first.CooldownUntil != nil || first.Deactivated {
+		t.Fatalf("unexpected first attempt: %+v", first)
 	}
 }
 

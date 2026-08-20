@@ -81,12 +81,11 @@ type IdempotencyConfig struct {
 }
 
 type TokenPoolConfig struct {
-	SnapshotMaxAge       time.Duration
-	RefreshInterval      time.Duration
-	ActiveStreamCap      int64
-	DefaultCooldown      time.Duration
-	CompactErrorCooldown time.Duration
-	AccessTokenFile      string
+	SnapshotMaxAge  time.Duration
+	RefreshInterval time.Duration
+	ActiveStreamCap int64
+	DefaultCooldown time.Duration
+	AccessTokenFile string
 }
 
 type QuotaRecoveryConfig struct {
@@ -196,12 +195,11 @@ func Load() (Config, error) {
 			MaxResponseBytes:  int64(envInt("OAIX_IDEMPOTENCY_MAX_RESPONSE_BYTES", 16*1024*1024)),
 		},
 		TokenPool: TokenPoolConfig{
-			SnapshotMaxAge:       envDurationSeconds("TOKEN_POOL_SNAPSHOT_MAX_AGE_SECONDS", 10*time.Second),
-			RefreshInterval:      envDurationSeconds("TOKEN_POOL_REFRESH_INTERVAL_SECONDS", 2*time.Second),
-			ActiveStreamCap:      int64(envInt("TOKEN_ACTIVE_STREAM_CAP", envInt("TOKEN_SELECTION_ACTIVE_STREAM_CAP", 10))),
-			DefaultCooldown:      envDurationSeconds("DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS", 300*time.Second),
-			CompactErrorCooldown: envDurationSeconds("COMPACT_SERVER_ERROR_COOLDOWN_SECONDS", 60*time.Second),
-			AccessTokenFile:      envString("OAIX_ACCESS_TOKEN_FILE", envString("ACCESS_TOKEN_FILE", "")),
+			SnapshotMaxAge:  envDurationSeconds("TOKEN_POOL_SNAPSHOT_MAX_AGE_SECONDS", 10*time.Second),
+			RefreshInterval: envDurationSeconds("TOKEN_POOL_REFRESH_INTERVAL_SECONDS", 2*time.Second),
+			ActiveStreamCap: int64(envInt("TOKEN_ACTIVE_STREAM_CAP", envInt("TOKEN_SELECTION_ACTIVE_STREAM_CAP", 10))),
+			DefaultCooldown: envDurationSeconds("DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS", 300*time.Second),
+			AccessTokenFile: envString("OAIX_ACCESS_TOKEN_FILE", envString("ACCESS_TOKEN_FILE", "")),
 		},
 		QuotaRecovery: QuotaRecoveryConfig{
 			Enabled:            envBool("OAIX_AUTO_QUOTA_RECOVERY_ENABLED", true),

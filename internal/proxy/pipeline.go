@@ -1445,12 +1445,12 @@ func (p *Pipeline) decideTokenFailure(
 		decision.commitRequired = true
 		return decision
 	}
-	if (result.Retry || result.ResponsesFailure != nil) && (action == OutcomeUpstream5xx || action == OutcomeTransportError) {
-		until := time.Now().UTC().Add(5 * time.Second)
-		decision.cooldownUntil = &until
-		decision.commitMessage = fmt.Sprintf("retryable upstream failure: %v", err)
-		decision.commitRequired = true
-	}
+	// Generic upstream 5xx and transport failures are request-scoped signals, not
+	// evidence that the selected account is unhealthy. The retry loop excludes the
+	// token from the current request before selecting another one, while leaving it
+	// available to unrelated requests. Persisting a token cooldown here lets a
+	// provider-wide overload skew the pool toward whichever token happened not to
+	// fail first.
 	return decision
 }
 

@@ -38,6 +38,11 @@ type RuntimeToken struct {
 	RecentTTFTMs *atomic.Int64
 }
 
+type runtimeTokenState struct {
+	active       *atomic.Int64
+	recentTTFTMs *atomic.Int64
+}
+
 type ReadyTransitionHandler func(ctx context.Context, tokens []store.Token)
 
 type Manager struct {
@@ -56,6 +61,7 @@ type Manager struct {
 	version          atomic.Int64
 	snapshot         atomic.Value
 	ownerSnapshots   sync.Map
+	runtimeStates    sync.Map
 	cursor           atomic.Uint64
 	stopOnce         sync.Once
 	stopCh           chan struct{}
@@ -277,7 +283,7 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	}
 	version := m.version.Add(1)
 	current := m.Snapshot()
-	next := buildSnapshot(rows, current, version)
+	next := m.buildSnapshot(rows, version)
 	readyTransitions := newlyReadyTokens(current, next)
 	m.snapshot.Store(next)
 	m.refreshMu.Unlock()
@@ -303,7 +309,7 @@ func (m *Manager) RefreshOwner(ctx context.Context, ownerUserID int64) error {
 		m.logger.Warn("owner token model capability loss refresh failed", "owner_user_id", ownerUserID, "error", err)
 	}
 	version := m.version.Add(1)
-	next := buildSnapshot(rows, state.snapshotValue(), version)
+	next := m.buildSnapshot(rows, version)
 	state.snapshot.Store(next)
 	if m.logger != nil {
 		m.logger.Debug("owner token snapshot refreshed", "owner_user_id", ownerUserID, "version", version, "ready_tokens", len(next.Ready))
@@ -411,32 +417,30 @@ func (m *Manager) ActiveStreams() int64 {
 	if m == nil {
 		return 0
 	}
-	active := snapshotActiveStreams(m.Snapshot())
-	m.ownerSnapshots.Range(func(_, value any) bool {
-		state, ok := value.(*ownerSnapshotState)
-		if !ok || state == nil {
-			return true
+	var active int64
+	m.runtimeStates.Range(func(_, value any) bool {
+		state, ok := value.(*runtimeTokenState)
+		if ok && state != nil && state.active != nil {
+			active += max(state.active.Load(), 0)
 		}
-		active += snapshotActiveStreams(state.snapshotValue())
 		return true
 	})
 	return active
 }
 
-func (m *Manager) ActiveStreamsForToken(tokenID int64, ownerUserID int64) int64 {
+func (m *Manager) ActiveStreamsForToken(tokenID int64, _ int64) int64 {
 	if m == nil || tokenID == 0 {
 		return 0
 	}
-	var active int64
-	active += snapshotTokenActive(m.Snapshot(), tokenID)
-	if ownerUserID > 0 {
-		if value, ok := m.ownerSnapshots.Load(ownerUserID); ok {
-			if state, ok := value.(*ownerSnapshotState); ok && state != nil {
-				active += snapshotTokenActive(state.snapshotValue(), tokenID)
-			}
-		}
+	value, ok := m.runtimeStates.Load(tokenID)
+	if !ok {
+		return 0
 	}
-	return active
+	state, ok := value.(*runtimeTokenState)
+	if !ok || state == nil || state.active == nil {
+		return 0
+	}
+	return max(state.active.Load(), 0)
 }
 
 func (m *Manager) SnapshotDiagnostics(limit int) []SnapshotDiagnostics {
@@ -896,7 +900,42 @@ func (m *Manager) listAvailableTokens(ctx context.Context, scope store.ResourceS
 	return filtered, nil
 }
 
+func (m *Manager) buildSnapshot(rows []store.Token, version int64) *Snapshot {
+	return buildSnapshotWithState(rows, version, func(tokenID int64) (*atomic.Int64, *atomic.Int64) {
+		state := &runtimeTokenState{
+			active:       new(atomic.Int64),
+			recentTTFTMs: new(atomic.Int64),
+		}
+		actual, _ := m.runtimeStates.LoadOrStore(tokenID, state)
+		shared, ok := actual.(*runtimeTokenState)
+		if !ok || shared == nil {
+			m.runtimeStates.Store(tokenID, state)
+			shared = state
+		}
+		return shared.active, shared.recentTTFTMs
+	})
+}
+
 func buildSnapshot(rows []store.Token, current *Snapshot, version int64) *Snapshot {
+	if current == nil {
+		current = emptySnapshot()
+	}
+	return buildSnapshotWithState(rows, version, func(tokenID int64) (*atomic.Int64, *atomic.Int64) {
+		active := new(atomic.Int64)
+		recentTTFTMs := new(atomic.Int64)
+		if currentToken := current.ByID[tokenID]; currentToken != nil {
+			if currentToken.Active != nil {
+				active = currentToken.Active
+			}
+			if currentToken.RecentTTFTMs != nil {
+				recentTTFTMs = currentToken.RecentTTFTMs
+			}
+		}
+		return active, recentTTFTMs
+	})
+}
+
+func buildSnapshotWithState(rows []store.Token, version int64, stateFor func(int64) (*atomic.Int64, *atomic.Int64)) *Snapshot {
 	sort.SliceStable(rows, func(i, j int) bool {
 		left := rows[i].LastUsedAt
 		right := rows[j].LastUsedAt
@@ -911,9 +950,6 @@ func buildSnapshot(rows []store.Token, current *Snapshot, version int64) *Snapsh
 		}
 		return rows[i].ID < rows[j].ID
 	})
-	if current == nil {
-		current = emptySnapshot()
-	}
 	nextByID := make(map[int64]*RuntimeToken, len(rows))
 	nextByScope := make(map[string][]*RuntimeToken)
 	nextByModel := make(map[string][]*RuntimeToken)
@@ -921,16 +957,7 @@ func buildSnapshot(rows []store.Token, current *Snapshot, version int64) *Snapsh
 	nextCooling := make(map[int64]time.Time)
 	ready := make([]*RuntimeToken, 0, len(rows))
 	for _, token := range rows {
-		active := new(atomic.Int64)
-		recentTTFTMs := new(atomic.Int64)
-		if currentToken := current.ByID[token.ID]; currentToken != nil {
-			if currentToken.Active != nil {
-				active = currentToken.Active
-			}
-			if currentToken.RecentTTFTMs != nil {
-				recentTTFTMs = currentToken.RecentTTFTMs
-			}
-		}
+		active, recentTTFTMs := stateFor(token.ID)
 		runtimeToken := &RuntimeToken{
 			Token:        token,
 			Active:       active,
