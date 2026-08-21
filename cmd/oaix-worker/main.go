@@ -32,6 +32,12 @@ func main() {
 	defer db.Close()
 	ticker := time.NewTicker(cfg.RequestLog.AggregationWindow)
 	defer ticker.Stop()
+	cleanupInterval := cfg.RequestLog.CleanupInterval
+	if cleanupInterval <= 0 {
+		cleanupInterval = time.Hour
+	}
+	cleanupTicker := time.NewTicker(cleanupInterval)
+	defer cleanupTicker.Stop()
 	importWorker := newImportWorker(cfg)
 	logger.Info("oaix worker started")
 	for {
@@ -78,6 +84,25 @@ func main() {
 				logger.Warn("request log retention cleanup failed", "error", err)
 			} else if deleted > 0 {
 				logger.Info("request log retention cleanup deleted rows", "count", deleted)
+			}
+		case <-cleanupTicker.C:
+			if err := db.EnsureRequestAttemptRetentionIndex(ctx); err != nil {
+				logger.Warn("request attempt retention index ensure failed", "error", err)
+			}
+			cacheRetention, err := db.DeleteExpiredAffinityRows(ctx, cfg.PromptCache.RetentionBatchSize, cfg.PromptCache.RetentionMaxBatches)
+			if err != nil {
+				logger.Warn("prompt cache retention cleanup failed", "error", err)
+			} else if cacheRetention.PromptAffinityLanes > 0 || cacheRetention.ResponseOwnerBindings > 0 {
+				logger.Info("prompt cache retention cleanup deleted rows",
+					"prompt_affinity_lanes", cacheRetention.PromptAffinityLanes,
+					"response_owner_bindings", cacheRetention.ResponseOwnerBindings,
+				)
+			}
+			attemptsDeleted, err := db.DeleteOldRequestAttempts(ctx, cfg.RequestLog.AttemptRetentionDays, cfg.PromptCache.RetentionBatchSize, cfg.PromptCache.RetentionMaxBatches)
+			if err != nil {
+				logger.Warn("request attempt retention cleanup failed", "error", err)
+			} else if attemptsDeleted > 0 {
+				logger.Info("request attempt retention cleanup deleted rows", "count", attemptsDeleted)
 			}
 		}
 	}

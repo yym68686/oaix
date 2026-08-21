@@ -1159,6 +1159,9 @@ func (s *Store) DeleteOldRequestLogs(ctx context.Context, retentionDays int) (in
 		where id in (
 			select id from gateway_request_logs
 			where started_at < now() - make_interval(days => $1)
+			  and finished_at is not null
+			  and analytics_recorded_at is not null
+			  and analytics_recorded_at >= finished_at
 			order by id
 			limit 5000
 		)

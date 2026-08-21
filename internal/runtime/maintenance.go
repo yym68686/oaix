@@ -249,10 +249,28 @@ func runFastRequestCostRepricing(ctx context.Context, logger *slog.Logger, db fa
 }
 
 func runRequestLogCleanup(ctx context.Context, cfg config.Config, logger *slog.Logger, db *store.Store) {
+	runStep(ctx, logger, "request attempt retention index ensure", 30*time.Second, db.EnsureRequestAttemptRetentionIndex)
 	runStep(ctx, logger, "request log retention cleanup", 30*time.Second, func(stepCtx context.Context) error {
 		deleted, err := db.DeleteOldRequestLogs(stepCtx, cfg.RequestLog.RetentionDays)
 		if err == nil && deleted > 0 && logger != nil {
 			logger.Info("request log retention cleanup deleted rows", "count", deleted)
+		}
+		return err
+	})
+	runStep(ctx, logger, "prompt cache retention cleanup", 30*time.Second, func(stepCtx context.Context) error {
+		result, err := db.DeleteExpiredAffinityRows(stepCtx, cfg.PromptCache.RetentionBatchSize, cfg.PromptCache.RetentionMaxBatches)
+		if err == nil && logger != nil && (result.PromptAffinityLanes > 0 || result.ResponseOwnerBindings > 0) {
+			logger.Info("prompt cache retention cleanup deleted rows",
+				"prompt_affinity_lanes", result.PromptAffinityLanes,
+				"response_owner_bindings", result.ResponseOwnerBindings,
+			)
+		}
+		return err
+	})
+	runStep(ctx, logger, "request attempt retention cleanup", 30*time.Second, func(stepCtx context.Context) error {
+		deleted, err := db.DeleteOldRequestAttempts(stepCtx, cfg.RequestLog.AttemptRetentionDays, cfg.PromptCache.RetentionBatchSize, cfg.PromptCache.RetentionMaxBatches)
+		if err == nil && deleted > 0 && logger != nil {
+			logger.Info("request attempt retention cleanup deleted rows", "count", deleted)
 		}
 		return err
 	})

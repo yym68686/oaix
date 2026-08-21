@@ -111,18 +111,21 @@ type PromptCacheConfig struct {
 	SessionPreferHeader   bool
 	LaneTTL               time.Duration
 	ResponseTTL           time.Duration
+	RetentionBatchSize    int
+	RetentionMaxBatches   int
 }
 
 type RequestLogConfig struct {
-	Concurrency       int
-	BatchSize         int
-	QueueMaxSize      int
-	FlushInterval     time.Duration
-	RetentionDays     int
-	CleanupInterval   time.Duration
-	FinalSyncOnFull   bool
-	OutboxDrainBatch  int
-	AggregationWindow time.Duration
+	Concurrency          int
+	BatchSize            int
+	QueueMaxSize         int
+	FlushInterval        time.Duration
+	RetentionDays        int
+	AttemptRetentionDays int
+	CleanupInterval      time.Duration
+	FinalSyncOnFull      bool
+	OutboxDrainBatch     int
+	AggregationWindow    time.Duration
 }
 
 type ImportConfig struct {
@@ -223,17 +226,20 @@ func Load() (Config, error) {
 			SessionPreferHeader:   promptCacheSessionPreferHeader(),
 			LaneTTL:               envDurationSeconds("PROMPT_CACHE_LANE_TTL_SECONDS", time.Hour),
 			ResponseTTL:           envDurationSeconds("PROMPT_CACHE_RESPONSE_TTL_SECONDS", 24*time.Hour),
+			RetentionBatchSize:    envInt("PROMPT_CACHE_RETENTION_BATCH_SIZE", 1000),
+			RetentionMaxBatches:   envInt("PROMPT_CACHE_RETENTION_MAX_BATCHES", 10),
 		},
 		RequestLog: RequestLogConfig{
-			Concurrency:       envInt("REQUEST_LOG_WRITE_CONCURRENCY", 1),
-			BatchSize:         envInt("REQUEST_LOG_WRITE_BATCH_SIZE", 250),
-			QueueMaxSize:      envInt("REQUEST_LOG_WRITE_QUEUE_MAX_SIZE", 20000),
-			FlushInterval:     envDurationSeconds("REQUEST_LOG_WRITE_FLUSH_INTERVAL_SECONDS", time.Second),
-			RetentionDays:     envInt("REQUEST_LOG_RETENTION_DAYS", 30),
-			CleanupInterval:   envDurationSeconds("REQUEST_LOG_CLEANUP_INTERVAL_SECONDS", time.Hour),
-			FinalSyncOnFull:   envBool("REQUEST_LOG_FINAL_SYNC_ON_FULL", true),
-			OutboxDrainBatch:  envInt("REQUEST_LOG_OUTBOX_DRAIN_BATCH_SIZE", 500),
-			AggregationWindow: envDurationSeconds("REQUEST_LOG_AGGREGATION_INTERVAL_SECONDS", 60*time.Second),
+			Concurrency:          envInt("REQUEST_LOG_WRITE_CONCURRENCY", 1),
+			BatchSize:            envInt("REQUEST_LOG_WRITE_BATCH_SIZE", 250),
+			QueueMaxSize:         envInt("REQUEST_LOG_WRITE_QUEUE_MAX_SIZE", 20000),
+			FlushInterval:        envDurationSeconds("REQUEST_LOG_WRITE_FLUSH_INTERVAL_SECONDS", time.Second),
+			RetentionDays:        envInt("REQUEST_LOG_RETENTION_DAYS", 30),
+			AttemptRetentionDays: envInt("REQUEST_ATTEMPT_RETENTION_DAYS", 7),
+			CleanupInterval:      envDurationSeconds("REQUEST_LOG_CLEANUP_INTERVAL_SECONDS", time.Hour),
+			FinalSyncOnFull:      envBool("REQUEST_LOG_FINAL_SYNC_ON_FULL", true),
+			OutboxDrainBatch:     envInt("REQUEST_LOG_OUTBOX_DRAIN_BATCH_SIZE", 500),
+			AggregationWindow:    envDurationSeconds("REQUEST_LOG_AGGREGATION_INTERVAL_SECONDS", 60*time.Second),
 		},
 		Import: ImportConfig{
 			MaxConcurrency:     envInt("IMPORT_JOB_MAX_CONCURRENCY", 16),
@@ -295,6 +301,15 @@ func (c Config) Validate() error {
 	}
 	if c.PromptCache.MaxLanesPerKey <= 0 {
 		errs = append(errs, fmt.Errorf("PROMPT_CACHE_MAX_LANES_PER_KEY must be positive"))
+	}
+	if c.PromptCache.RetentionBatchSize <= 0 || c.PromptCache.RetentionBatchSize > 5000 {
+		errs = append(errs, fmt.Errorf("PROMPT_CACHE_RETENTION_BATCH_SIZE must be in [1,5000]"))
+	}
+	if c.PromptCache.RetentionMaxBatches <= 0 || c.PromptCache.RetentionMaxBatches > 100 {
+		errs = append(errs, fmt.Errorf("PROMPT_CACHE_RETENTION_MAX_BATCHES must be in [1,100]"))
+	}
+	if c.RequestLog.AttemptRetentionDays <= 0 || c.RequestLog.AttemptRetentionDays > 365 {
+		errs = append(errs, fmt.Errorf("REQUEST_ATTEMPT_RETENTION_DAYS must be in [1,365]"))
 	}
 	if c.RequestLog.BatchSize <= 0 {
 		errs = append(errs, fmt.Errorf("REQUEST_LOG_WRITE_BATCH_SIZE must be positive"))
@@ -398,14 +413,17 @@ func (c Config) SanitizedSummary() map[string]any {
 			"max_lanes_per_key":       c.PromptCache.MaxLanesPerKey,
 			"global_fallback_enabled": c.PromptCache.GlobalFallbackEnabled,
 			"session_prefer_header":   c.PromptCache.SessionPreferHeader,
+			"retention_batch_size":    c.PromptCache.RetentionBatchSize,
+			"retention_max_batches":   c.PromptCache.RetentionMaxBatches,
 		},
 		"request_log": map[string]any{
-			"concurrency":  c.RequestLog.Concurrency,
-			"batch_size":   c.RequestLog.BatchSize,
-			"queue_size":   c.RequestLog.QueueMaxSize,
-			"retention":    c.RequestLog.RetentionDays,
-			"final_sync":   c.RequestLog.FinalSyncOnFull,
-			"outbox_batch": c.RequestLog.OutboxDrainBatch,
+			"concurrency":       c.RequestLog.Concurrency,
+			"batch_size":        c.RequestLog.BatchSize,
+			"queue_size":        c.RequestLog.QueueMaxSize,
+			"retention":         c.RequestLog.RetentionDays,
+			"attempt_retention": c.RequestLog.AttemptRetentionDays,
+			"final_sync":        c.RequestLog.FinalSyncOnFull,
+			"outbox_batch":      c.RequestLog.OutboxDrainBatch,
 		},
 		"worker": map[string]any{
 			"embedded": c.Worker.Embedded,

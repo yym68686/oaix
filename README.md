@@ -51,6 +51,7 @@
 - `PROMPT_CACHE_PREVIOUS_REPLAY_FALLBACK_ENABLED`: owner 忙时是否允许 `previous_response_id` 请求 fallback 到 prompt cache lanes，仅在调用方已保证 stateless replay 时开启，默认 `false`
 - `PROMPT_CACHE_REBIND_PRIMARY`: spillover 是否覆盖 primary lane，默认 `false`
 - `PROMPT_CACHE_LANE_TTL_SECONDS`: cache key lane 状态空闲保留秒数，默认 `3600`
+- `PROMPT_CACHE_RETENTION_BATCH_SIZE` / `PROMPT_CACHE_RETENTION_MAX_BATCHES`: 过期 lane 与 response owner 绑定的单轮清理批大小和最大批数，默认 `1000` / `10`
 - `IMAGE_REQUEST_MAX_ACCOUNT_RETRIES`: 图片接口单次请求最多切换多少个 key，默认 `8`
 - `IMAGE_INPUT_MAX_PER_REQUEST`: 单次图片请求最多允许多少张输入图片，默认 `249`；达到上游 `input-images per min` 桶大小前直接拒绝超大请求
 - `IMAGE_UPLOAD_MAX_BYTES`: multipart 图片上传单文件最大字节数，默认 `26214400`（25 MiB）
@@ -76,7 +77,8 @@
 - `REQUEST_LOG_WRITE_CONCURRENCY`: 请求日志异步写入并发数，默认 `2`
 - `REQUEST_LOG_WRITE_BATCH_SIZE`: 请求日志异步写入批大小，默认 `50`
 - `REQUEST_LOG_WRITE_QUEUE_MAX_SIZE`: 请求日志写入队列最大长度，默认 `2000`；满队列时会丢弃日志而不阻塞请求
-- `REQUEST_LOG_RETENTION_DAYS`: 请求日志保留天数，默认 `30`；设为 `0` 关闭清理
+- `REQUEST_LOG_RETENTION_DAYS`: 请求日志保留天数，默认 `30`；只删除已结束且 analytics 聚合完成、且最终完成时间不晚于聚合时间的行；设为 `0` 关闭清理
+- `REQUEST_ATTEMPT_RETENTION_DAYS`: 已完成请求尝试诊断记录保留天数，默认 `7`；只清理已完成 attempt，不影响路由或计费
 - `REQUEST_LOG_CLEANUP_INTERVAL_SECONDS`: 请求日志清理后台任务间隔秒数，默认 `3600`
 - `ADMIN_REQUESTS_CACHE_TTL_SECONDS`: `/admin/requests` 汇总与图表缓存 TTL，默认 `5`
 - `ADMIN_TOKEN_COUNTS_CACHE_TTL_SECONDS`: `/admin/tokens` 统计计数缓存 TTL，默认 `2`
