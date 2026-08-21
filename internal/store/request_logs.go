@@ -96,6 +96,7 @@ const (
 	requestAnalyticsQueueBatchSize       = 500
 	requestAnalyticsMaxBatchesPerRun     = 4
 	requestAnalyticsStatementTimeout     = 10 * time.Second
+	requestLogRetentionBatchSize         = 500
 )
 
 const aggregateRequestTokenCostsSQL = `
@@ -1162,10 +1163,10 @@ func (s *Store) DeleteOldRequestLogs(ctx context.Context, retentionDays int) (in
 			  and finished_at is not null
 			  and analytics_recorded_at is not null
 			  and analytics_recorded_at >= finished_at
-			order by id
-			limit 5000
+			order by started_at, id
+			limit $2
 		)
-	`, retentionDays)
+	`, retentionDays, requestLogRetentionBatchSize)
 	if err != nil {
 		return 0, err
 	}

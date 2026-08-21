@@ -26,4 +26,7 @@ func TestRequestLogRetentionRequiresFinalAnalyticsState(t *testing.T) {
 			t.Fatalf("request log retention missing final-state guard %q: %s", fragment, body)
 		}
 	}
+	if !strings.Contains(body, "order by started_at, id") || !strings.Contains(body, "limit $2") {
+		t.Fatalf("request log retention should use the bounded time-ordered batch: %s", body)
+	}
 }
