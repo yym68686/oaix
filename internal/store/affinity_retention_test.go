@@ -35,7 +35,7 @@ func TestRequestAttemptRetentionRequiresCompletedRowsAndUsesTTL(t *testing.T) {
 		"gateway_request_attempts",
 		"started_at < now() - ($1::int * interval '1 day')",
 		"finished_at is not null",
-		"order by started_at asc, id asc",
+		"limit $2",
 		"for update skip locked",
 	} {
 		if !strings.Contains(text, fragment) {

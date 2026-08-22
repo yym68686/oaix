@@ -185,7 +185,6 @@ func (s *Store) DeleteOldRequestAttempts(ctx context.Context, retentionDays, bat
 				from gateway_request_attempts
 				where started_at < now() - ($1::int * interval '1 day')
 				  and finished_at is not null
-				order by started_at asc, id asc
 				limit $2
 				for update skip locked
 			)
