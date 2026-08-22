@@ -21,11 +21,12 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 		return func(context.Context) {}
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
+	maintenanceDone := make(chan struct{})
+	indexDone := make(chan struct{})
 	importWorker := newImportWorker(cfg)
 	sub2apiSyncer := sub2api.NewSyncer(db, nil, logger, cfg.Upstream.OAuthClientID)
 	go func() {
-		defer close(done)
+		defer close(maintenanceDone)
 		runMaintenanceOnce(workerCtx, cfg, logger, db, tokenManager, importWorker, sub2apiSyncer, true)
 		aggregationInterval := cfg.RequestLog.AggregationWindow
 		if aggregationInterval <= 0 {
@@ -50,14 +51,44 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 			}
 		}
 	}()
+	go func() {
+		defer close(indexDone)
+		runRequestAttemptRetentionIndexWorker(workerCtx, logger, db)
+	}()
 	if logger != nil {
 		logger.Info("embedded worker started")
 	}
 	return func(shutdownCtx context.Context) {
 		cancel()
 		select {
-		case <-done:
+		case <-maintenanceDone:
 		case <-shutdownCtx.Done():
+			return
+		}
+		select {
+		case <-indexDone:
+		case <-shutdownCtx.Done():
+		}
+	}
+}
+
+func runRequestAttemptRetentionIndexWorker(ctx context.Context, logger *slog.Logger, db *store.Store) {
+	for {
+		stepCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		err := db.EnsureRequestAttemptRetentionIndex(stepCtx)
+		cancel()
+		if err == nil {
+			return
+		}
+		if logger != nil && ctx.Err() == nil {
+			logger.Warn("request attempt retention index ensure failed", "error", err)
+		}
+		timer := time.NewTimer(time.Hour)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 	}
 }
@@ -249,7 +280,6 @@ func runFastRequestCostRepricing(ctx context.Context, logger *slog.Logger, db fa
 }
 
 func runRequestLogCleanup(ctx context.Context, cfg config.Config, logger *slog.Logger, db *store.Store) {
-	runStep(ctx, logger, "request attempt retention index ensure", 30*time.Second, db.EnsureRequestAttemptRetentionIndex)
 	runStep(ctx, logger, "request log retention cleanup", 30*time.Second, func(stepCtx context.Context) error {
 		deleted, err := db.DeleteOldRequestLogs(stepCtx, cfg.RequestLog.RetentionDays)
 		if err == nil && deleted > 0 && logger != nil {

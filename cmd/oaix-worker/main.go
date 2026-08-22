@@ -39,6 +39,7 @@ func main() {
 	cleanupTicker := time.NewTicker(cleanupInterval)
 	defer cleanupTicker.Stop()
 	importWorker := newImportWorker(cfg)
+	go ensureRequestAttemptRetentionIndex(ctx, db, logger)
 	logger.Info("oaix worker started")
 	for {
 		select {
@@ -86,9 +87,6 @@ func main() {
 				logger.Info("request log retention cleanup deleted rows", "count", deleted)
 			}
 		case <-cleanupTicker.C:
-			if err := db.EnsureRequestAttemptRetentionIndex(ctx); err != nil {
-				logger.Warn("request attempt retention index ensure failed", "error", err)
-			}
 			cacheRetention, err := db.DeleteExpiredAffinityRows(ctx, cfg.PromptCache.RetentionBatchSize, cfg.PromptCache.RetentionMaxBatches)
 			if err != nil {
 				logger.Warn("prompt cache retention cleanup failed", "error", err)
@@ -104,6 +102,27 @@ func main() {
 			} else if attemptsDeleted > 0 {
 				logger.Info("request attempt retention cleanup deleted rows", "count", attemptsDeleted)
 			}
+		}
+	}
+}
+
+func ensureRequestAttemptRetentionIndex(ctx context.Context, db *store.Store, logger *slog.Logger) {
+	for {
+		stepCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		err := db.EnsureRequestAttemptRetentionIndex(stepCtx)
+		cancel()
+		if err == nil {
+			return
+		}
+		if ctx.Err() == nil {
+			logger.Warn("request attempt retention index ensure failed", "error", err)
+		}
+		timer := time.NewTimer(time.Hour)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 	}
 }
