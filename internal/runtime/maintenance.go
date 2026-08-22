@@ -78,6 +78,9 @@ func runRequestAttemptRetentionIndexWorker(ctx context.Context, logger *slog.Log
 		err := db.EnsureRequestAttemptRetentionIndex(stepCtx)
 		cancel()
 		if err == nil {
+			if logger != nil {
+				logger.Info("request attempt retention index ready")
+			}
 			return
 		}
 		if logger != nil && ctx.Err() == nil {

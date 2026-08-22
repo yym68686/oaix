@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"errors"
 )
 
 const gatewayRequestAttemptsRetentionIndexName = "ix_gateway_request_attempts_retention"
+
+var errRequestAttemptRetentionIndexBuildInProgress = errors.New("request attempt retention index build is already in progress")
 
 // EnsureRequestAttemptRetentionIndex builds the age index asynchronously from
 // the worker path. It is concurrent and advisory-lock guarded, so a gateway
@@ -21,7 +24,7 @@ func (s *Store) EnsureRequestAttemptRetentionIndex(ctx context.Context) error {
 		return err
 	}
 	if !locked {
-		return nil
+		return errRequestAttemptRetentionIndexBuildInProgress
 	}
 	defer func() {
 		_, _ = conn.Exec(context.Background(), "select pg_advisory_unlock(hashtext($1))", gatewayRequestAttemptsRetentionIndexName)

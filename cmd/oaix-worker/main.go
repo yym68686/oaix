@@ -112,6 +112,7 @@ func ensureRequestAttemptRetentionIndex(ctx context.Context, db *store.Store, lo
 		err := db.EnsureRequestAttemptRetentionIndex(stepCtx)
 		cancel()
 		if err == nil {
+			logger.Info("request attempt retention index ready")
 			return
 		}
 		if ctx.Err() == nil {
