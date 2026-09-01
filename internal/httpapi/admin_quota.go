@@ -211,7 +211,17 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 	}
 
 	activeByID := a.activeStreamsByTokenID(tokens)
-	cap := a.tokens.ActiveStreamCap()
+	ownerIDs := make([]int64, 0, len(tokens))
+	for _, token := range tokens {
+		ownerIDs = append(ownerIDs, token.OwnerUserID)
+	}
+	concurrencyByOwner, concurrencyErr := a.store.UserTokenConcurrencyByOwner(parent, ownerIDs)
+	if concurrencyErr != nil {
+		concurrencyByOwner = map[int64]store.TokenConcurrencySettings{}
+		if a.logger != nil {
+			a.logger.Warn("token concurrency settings load failed", "error", concurrencyErr)
+		}
+	}
 	pendingByID := make(map[int64]struct{}, len(pendingIDs))
 	for _, id := range pendingIDs {
 		pendingByID[id] = struct{}{}
@@ -234,6 +244,12 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		if quota != nil && quota.PlanType != nil {
 			token.PlanType = quota.PlanType
 		}
+		if userSettings, ok := concurrencyByOwner[token.OwnerUserID]; ok {
+			if cap, overridden := userSettings.ActiveStreamCapForPlan(token.PlanType); overridden {
+				value := cap
+				token.UserActiveStreamCap = &value
+			}
+		}
 		if quotaSnapshotDisablesToken(quota) {
 			if token.IsActive {
 				disabledFromQuota = true
@@ -250,7 +266,7 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 			CredentialMode:          tokenProbeCredentialMode(token),
 			Status:                  adminTokenStatus(token, now),
 			ActiveStreams:           activeByID[token.ID],
-			ActiveStreamCap:         cap,
+			ActiveStreamCap:         a.tokens.ActiveStreamCapForToken(token),
 			ObservedCostUSD:         localCost,
 			LocalObservedCostUSD:    localCost,
 			Sub2APIObservedCostUSD:  remoteCostPointer,

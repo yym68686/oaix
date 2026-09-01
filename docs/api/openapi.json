@@ -64,6 +64,7 @@
     "/api/me/pool-summary": {"get": {"responses": {"200": {"description": "My pool summary"}}}},
     "/api/me/settings": {"get": {"responses": {"200": {"description": "My user settings"}}}},
     "/api/me/settings/{key}": {"get": {"responses": {"200": {"description": "My setting"}}}, "post": {"responses": {"200": {"description": "Update my setting"}}}, "delete": {"responses": {"200": {"description": "Delete my setting"}}}},
+    "/api/me/token-concurrency": {"get": {"responses": {"200": {"description": "My effective plan concurrency settings"}}}, "post": {"responses": {"200": {"description": "Update my plan concurrency overrides"}}}, "delete": {"responses": {"200": {"description": "Reset my plan concurrency overrides"}}}},
     "/api/tokens": {"get": {"responses": {"200": {"description": "My tokens"}}}},
     "/api/tokens/batch": {"post": {"responses": {"200": {"description": "Update or delete selected tokens in my scope"}}}},
     "/api/tokens/{token_id}": {"get": {"responses": {"200": {"description": "My token"}}}, "patch": {"responses": {"200": {"description": "Update my token"}}}, "delete": {"responses": {"200": {"description": "Delete my token"}}}},

@@ -224,7 +224,7 @@ func (m *Manager) claimSpecific(ctx context.Context, snapshot *Snapshot, intent 
 	if candidate == nil || !tokenMatchesIntent(candidate, intent) {
 		return nil
 	}
-	activeCap := m.ActiveStreamCap()
+	activeCap := activeStreamCapFor(candidate, m.ActiveStreamCap())
 	deadline := time.Now().Add(wait)
 	for {
 		select {

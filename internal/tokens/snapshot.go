@@ -220,6 +220,14 @@ func (m *Manager) ActiveStreamCap() int64 {
 	return value
 }
 
+func (m *Manager) ActiveStreamCapForToken(token store.Token) int64 {
+	fallback := m.ActiveStreamCap()
+	if token.UserActiveStreamCap != nil && *token.UserActiveStreamCap > 0 {
+		return *token.UserActiveStreamCap
+	}
+	return fallback
+}
+
 func (m *Manager) SetActiveStreamCap(value int64) int64 {
 	if m == nil {
 		return 0
@@ -541,7 +549,7 @@ func tokenActivities(scope string, snapshot *Snapshot, activeCap int64, limit in
 			AccountID:       token.AccountID,
 			PlanType:        token.PlanType,
 			ActiveStreams:   active,
-			ActiveCap:       activeCap,
+			ActiveCap:       activeStreamCapFor(runtimeToken, activeCap),
 			IsActive:        token.IsActive,
 			ShareEnabled:    token.ShareEnabled,
 			ShareStatus:     token.ShareStatus,
@@ -659,14 +667,15 @@ func (m *Manager) Claim(ctx context.Context, intent Intent) (*Claim, error) {
 			break
 		}
 		activeBefore := candidate.Active.Load()
+		candidateCap := activeStreamCapFor(candidate, activeCap)
 		next := candidate.Active.Add(1)
-		if next > activeCap {
+		if next > candidateCap {
 			candidate.Active.Add(-1)
 			m.recordOverCapDenial()
 			continue
 		}
 		now := time.Now().UTC()
-		return m.newClaim(claimSnapshot, intent, candidate, reason, activeBefore, next, activeCap, int(total), now), nil
+		return m.newClaim(claimSnapshot, intent, candidate, reason, activeBefore, next, candidateCap, int(total), now), nil
 	}
 	m.selectorMisses.Add(1)
 	if snapshotHasCapBlockedToken(claimSnapshot, intent, activeCap) {
@@ -763,7 +772,7 @@ func snapshotHasCapBlockedToken(snapshot *Snapshot, intent Intent, activeCap int
 		if _, excluded := intent.ExcludeTokenIDs[token.Token.ID]; excluded {
 			continue
 		}
-		if tokenMatchesIntent(token, intent) && token.Active.Load() >= activeCap {
+		if tokenMatchesIntent(token, intent) && token.Active.Load() >= activeStreamCapFor(token, activeCap) {
 			return true
 		}
 	}

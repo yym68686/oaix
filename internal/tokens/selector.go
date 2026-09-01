@@ -32,7 +32,7 @@ func (RoundRobinSelector) Select(ctx context.Context, snapshot *Snapshot, intent
 		if !tokenMatchesIntent(candidate, intent) {
 			continue
 		}
-		if candidate.Active.Load() >= activeCap {
+		if candidate.Active.Load() >= activeStreamCapFor(candidate, activeCap) {
 			continue
 		}
 		return candidate, "snapshot_round_robin"
@@ -58,7 +58,7 @@ func (FillFirstSelector) Select(ctx context.Context, snapshot *Snapshot, intent 
 		if _, excluded := intent.ExcludeTokenIDs[candidate.Token.ID]; excluded {
 			continue
 		}
-		if !tokenMatchesIntent(candidate, intent) || candidate.Active.Load() >= activeCap {
+		if !tokenMatchesIntent(candidate, intent) || candidate.Active.Load() >= activeStreamCapFor(candidate, activeCap) {
 			continue
 		}
 		return candidate, "snapshot_fill_first"
@@ -106,7 +106,7 @@ func (LatencyAwareSelector) Select(ctx context.Context, snapshot *Snapshot, inte
 		if !tokenMatchesIntent(candidate, intent) {
 			continue
 		}
-		if candidate.Active.Load() >= activeCap {
+		if candidate.Active.Load() >= activeStreamCapFor(candidate, activeCap) {
 			continue
 		}
 		latency := candidate.RecentTTFTMs.Load()
@@ -146,7 +146,7 @@ func (s MarketplacePriceSelector) Select(ctx context.Context, snapshot *Snapshot
 		if _, excluded := intent.ExcludeTokenIDs[candidate.Token.ID]; excluded {
 			continue
 		}
-		if !tokenMatchesIntent(candidate, intent) || candidate.Active.Load() >= activeCap {
+		if !tokenMatchesIntent(candidate, intent) || candidate.Active.Load() >= activeStreamCapFor(candidate, activeCap) {
 			continue
 		}
 		bucket := marketplacePriceBucket(candidate)
@@ -192,7 +192,7 @@ type PromptAffinitySelector struct {
 func (s PromptAffinitySelector) Select(ctx context.Context, snapshot *Snapshot, intent Intent, activeCap int64, cursor *uint64) (*RuntimeToken, string) {
 	if snapshot != nil && s.PreferredTokenID > 0 {
 		_, excluded := intent.ExcludeTokenIDs[s.PreferredTokenID]
-		if candidate := snapshot.ByID[s.PreferredTokenID]; !excluded && candidate != nil && candidate.Active.Load() < activeCap {
+		if candidate := snapshot.ByID[s.PreferredTokenID]; !excluded && candidate != nil && candidate.Active.Load() < activeStreamCapFor(candidate, activeCap) {
 			if !tokenMatchesIntent(candidate, intent) {
 				goto fallback
 			}
@@ -209,4 +209,14 @@ fallback:
 		return nil, ""
 	}
 	return token, "prompt_affinity_" + reason
+}
+
+func activeStreamCapFor(candidate *RuntimeToken, fallback int64) int64 {
+	if candidate != nil && candidate.Token.UserActiveStreamCap != nil && *candidate.Token.UserActiveStreamCap > 0 {
+		return *candidate.Token.UserActiveStreamCap
+	}
+	if fallback <= 0 {
+		return 1
+	}
+	return fallback
 }

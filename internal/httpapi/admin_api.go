@@ -315,6 +315,7 @@ func adminOpenAPISpec() map[string]any {
 		"POST /api/me/api-keys", "GET /api/me/api-keys/{key_id}/value", "DELETE /api/me/api-keys/{key_id}", "GET /api/me/usage",
 		"GET /api/me/pool-summary", "GET /api/me/settings", "GET /api/me/settings/{key}",
 		"POST /api/me/settings/{key}", "DELETE /api/me/settings/{key}",
+		"GET /api/me/token-concurrency", "POST /api/me/token-concurrency", "DELETE /api/me/token-concurrency",
 		"GET /api/tokens", "POST /api/tokens/batch", "GET /api/tokens/{token_id}", "GET /api/tokens/{token_id}/refresh-token",
 		"GET /api/tokens/{token_id}/quota-reset-credits", "POST /api/tokens/{token_id}/quota-reset", "PATCH /api/tokens/{token_id}",
 		"DELETE /api/tokens/disabled", "DELETE /api/tokens/{token_id}", "POST /api/tokens/{token_id}/probe",

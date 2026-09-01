@@ -57,3 +57,50 @@ func TestParseTokenActiveStreamCapRange(t *testing.T) {
 		t.Fatalf("ParseTokenActiveStreamCap(50) = %d, %v; want 50, nil", got, err)
 	}
 }
+
+func TestParseTokenConcurrencyPayloadNormalizesPlans(t *testing.T) {
+	settings, err := ParseTokenConcurrencyPayload([]byte(`{
+		"plan_concurrency": {
+			"chatgpt_pro": 8,
+			" PLUS ": 4,
+			"k12": 2
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settings) != 3 || settings["pro"] != 8 || settings["plus"] != 4 || settings["k12"] != 2 {
+		t.Fatalf("settings = %#v", settings)
+	}
+}
+
+func TestParseTokenConcurrencyPayloadRejectsInvalidValues(t *testing.T) {
+	tests := []string{
+		`{"plan_concurrency":{"pro":0}}`,
+		`{"plan_concurrency":{"pro":51}}`,
+		`{"plan_concurrency":{"pro":1.5}}`,
+		`{"plan_concurrency":{"all":5}}`,
+		`{"plan_concurrency":{"pro":2,"chatgpt_pro":3}}`,
+		`{"plan_concurrency":{"":5}}`,
+		`{"plan_concurrency":{},"unknown":true}`,
+		`{"plan_concurrency":{}} {"plan_concurrency":{}}`,
+	}
+	for _, raw := range tests {
+		if _, err := ParseTokenConcurrencyPayload([]byte(raw)); err == nil {
+			t.Fatalf("ParseTokenConcurrencyPayload(%s) returned nil error", raw)
+		}
+	}
+}
+
+func TestBuildUserTokenConcurrencySettingsIgnoresCorruptEntries(t *testing.T) {
+	settings := buildUserTokenConcurrencySettings(json.RawMessage(`{
+		"plan_concurrency": {"pro": 8, "plus": 0, "team": 51, "free": "bad"}
+	}`))
+	if len(settings.PlanConcurrency) != 1 || settings.PlanConcurrency["pro"] != 8 {
+		t.Fatalf("settings = %#v", settings.PlanConcurrency)
+	}
+	pro := "chatgpt_pro"
+	if cap, ok := settings.ActiveStreamCapForPlan(&pro); !ok || cap != 8 {
+		t.Fatalf("pro cap = %d, %v", cap, ok)
+	}
+}

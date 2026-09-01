@@ -334,6 +334,72 @@ func TestManagerSharesActiveCapAcrossGlobalAndOwnerSnapshots(t *testing.T) {
 	}
 }
 
+func TestManagerUsesUserPlanCapBeforeGlobalCap(t *testing.T) {
+	pro := "pro"
+	userCap := int64(2)
+	rows := makeTokens(1)
+	rows[0].OwnerUserID = 10
+	rows[0].PlanType = &pro
+	rows[0].UserActiveStreamCap = &userCap
+	rows[0].ShareEnabled = true
+	rows[0].ShareStatus = "active"
+	manager := NewManager(&fakeSource{tokens: rows}, nil, time.Minute, time.Minute, 7)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	second, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if first.Telemetry.ActiveCap != userCap || second.Telemetry.ActiveCap != userCap {
+		t.Fatalf("telemetry caps = %d, %d; want %d", first.Telemetry.ActiveCap, second.Telemetry.ActiveCap, userCap)
+	}
+	blocked, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10})
+	if blocked != nil {
+		blocked.Release()
+	}
+	if !errors.Is(err, ErrNoToken) {
+		t.Fatalf("third owner claim = %v, %v; want cap denial", blocked, err)
+	}
+
+	marketplace, err := manager.Claim(context.Background(), Intent{OwnerUserID: 20, SelectionMode: "marketplace"})
+	if marketplace != nil {
+		marketplace.Release()
+	}
+	if !errors.Is(err, ErrNoToken) {
+		t.Fatalf("marketplace claim bypassed token-owner cap: claim=%v err=%v", marketplace, err)
+	}
+}
+
+func TestManagerFallsBackToGlobalCapWithoutUserPlanOverride(t *testing.T) {
+	pro := "pro"
+	rows := makeTokens(1)
+	rows[0].OwnerUserID = 10
+	rows[0].PlanType = &pro
+	manager := NewManager(&fakeSource{tokens: rows}, nil, time.Minute, time.Minute, 2)
+
+	first, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	second, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if first.Telemetry.ActiveCap != 2 || second.Telemetry.ActiveCap != 2 {
+		t.Fatalf("global fallback caps = %d, %d; want 2", first.Telemetry.ActiveCap, second.Telemetry.ActiveCap)
+	}
+}
+
 func TestManagerRetainsActiveCounterWhileTokenIsAbsentFromSnapshots(t *testing.T) {
 	source := &fakeSource{tokens: makeTokens(1)}
 	manager := NewManager(source, nil, time.Second, time.Second, 1)

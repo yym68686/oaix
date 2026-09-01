@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 const (
 	TokenSelectionSettingKey        = "token_selection"
+	TokenConcurrencySettingKey      = "token_concurrency"
 	DefaultTokenSelectionStrategy   = "least_recently_used"
 	TokenSelectionStrategyFillFirst = "fill_first"
 	MinTokenActiveStreamCap         = int64(1)
@@ -39,6 +41,35 @@ type TokenSelectionSettings struct {
 	PlanOrder        []string   `json:"plan_order"`
 	ActiveStreamCap  int64      `json:"active_stream_cap"`
 	UpdatedAt        *time.Time `json:"updated_at,omitempty"`
+}
+
+// TokenConcurrencySettings contains only the user-owned per-plan overrides.
+// An absent plan is intentionally different from a value of zero: absent means
+// inherit the administrator's global active stream cap, while every stored
+// value is validated to the same range as the admin setting.
+type TokenConcurrencySettings struct {
+	PlanConcurrency map[string]int64 `json:"plan_concurrency"`
+	UpdatedAt       *time.Time       `json:"updated_at,omitempty"`
+}
+
+func (s TokenConcurrencySettings) ActiveStreamCapForPlan(planType *string) (int64, bool) {
+	plan := CanonicalTokenPlan("")
+	if planType != nil {
+		plan = CanonicalTokenPlan(*planType)
+	}
+	cap, ok := s.PlanConcurrency[plan]
+	return cap, ok
+}
+
+func CanonicalTokenPlan(value string) string {
+	if normalized := normalizePlanType(value); normalized != "" {
+		return normalized
+	}
+	return "unknown"
+}
+
+type tokenConcurrencyPayload struct {
+	PlanConcurrency map[string]int64 `json:"plan_concurrency"`
 }
 
 func (s *Store) ListSettings(ctx context.Context) ([]Setting, error) {
@@ -114,6 +145,161 @@ func (s *Store) GetUserSetting(ctx context.Context, ownerUserID int64, key strin
 		where owner_user_id = $1 and key = $2
 	`, ownerUserID, key).Scan(&item.Key, &item.Value, &item.UpdatedAt)
 	return item, err
+}
+
+func (s *Store) GetUserTokenConcurrency(ctx context.Context, ownerUserID int64) (TokenConcurrencySettings, error) {
+	if ownerUserID <= 0 {
+		return TokenConcurrencySettings{PlanConcurrency: map[string]int64{}}, nil
+	}
+	setting, err := s.GetUserSetting(ctx, ownerUserID, TokenConcurrencySettingKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TokenConcurrencySettings{PlanConcurrency: map[string]int64{}}, nil
+	}
+	if err != nil {
+		return TokenConcurrencySettings{}, err
+	}
+	settings := buildUserTokenConcurrencySettings(setting.Value)
+	updatedAt := setting.UpdatedAt.UTC()
+	settings.UpdatedAt = &updatedAt
+	return settings, nil
+}
+
+func (s *Store) UserTokenConcurrencyByOwner(ctx context.Context, ownerUserIDs []int64) (map[int64]TokenConcurrencySettings, error) {
+	unique := make([]int64, 0, len(ownerUserIDs))
+	seen := make(map[int64]struct{}, len(ownerUserIDs))
+	for _, ownerUserID := range ownerUserIDs {
+		if ownerUserID <= 0 {
+			continue
+		}
+		if _, exists := seen[ownerUserID]; exists {
+			continue
+		}
+		seen[ownerUserID] = struct{}{}
+		unique = append(unique, ownerUserID)
+	}
+	result := make(map[int64]TokenConcurrencySettings, len(unique))
+	if len(unique) == 0 {
+		return result, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		select owner_user_id, coalesce(value::jsonb, '{}'::jsonb), updated_at
+		from user_settings
+		where owner_user_id = any($1::bigint[])
+		  and key = $2
+	`, unique, TokenConcurrencySettingKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ownerUserID int64
+		var raw json.RawMessage
+		var updatedAt time.Time
+		if err := rows.Scan(&ownerUserID, &raw, &updatedAt); err != nil {
+			return nil, err
+		}
+		settings := buildUserTokenConcurrencySettings(raw)
+		value := updatedAt.UTC()
+		settings.UpdatedAt = &value
+		result[ownerUserID] = settings
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) UpsertUserTokenConcurrency(ctx context.Context, ownerUserID int64, planConcurrency map[string]int64) (TokenConcurrencySettings, error) {
+	if ownerUserID <= 0 {
+		return TokenConcurrencySettings{}, errors.New("owner user id is required")
+	}
+	normalized, err := NormalizeTokenPlanConcurrency(planConcurrency)
+	if err != nil {
+		return TokenConcurrencySettings{}, err
+	}
+	payload, err := json.Marshal(map[string]any{"plan_concurrency": normalized})
+	if err != nil {
+		return TokenConcurrencySettings{}, err
+	}
+	setting, err := s.UpsertUserSetting(ctx, ownerUserID, TokenConcurrencySettingKey, payload)
+	if err != nil {
+		return TokenConcurrencySettings{}, err
+	}
+	settings := buildUserTokenConcurrencySettings(setting.Value)
+	updatedAt := setting.UpdatedAt.UTC()
+	settings.UpdatedAt = &updatedAt
+	return settings, nil
+}
+
+func (s *Store) DeleteUserTokenConcurrency(ctx context.Context, ownerUserID int64) error {
+	if ownerUserID <= 0 {
+		return errors.New("owner user id is required")
+	}
+	return s.DeleteUserSetting(ctx, ownerUserID, TokenConcurrencySettingKey)
+}
+
+func buildUserTokenConcurrencySettings(raw json.RawMessage) TokenConcurrencySettings {
+	settings := TokenConcurrencySettings{PlanConcurrency: map[string]int64{}}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return settings
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil || payload == nil {
+		return settings
+	}
+	value, ok := payload["plan_concurrency"].(map[string]any)
+	if !ok {
+		return settings
+	}
+	for plan, rawCap := range value {
+		parsed, ok := parseInt64Value(rawCap)
+		if !ok {
+			continue
+		}
+		canonical := normalizePlanType(plan)
+		if canonical == "" {
+			continue
+		}
+		if cap, err := ParseTokenActiveStreamCap(parsed); err == nil {
+			settings.PlanConcurrency[canonical] = cap
+		}
+	}
+	return settings
+}
+
+func NormalizeTokenPlanConcurrency(values map[string]int64) (map[string]int64, error) {
+	normalized := make(map[string]int64, len(values))
+	for plan, rawCap := range values {
+		canonical := normalizePlanType(plan)
+		if canonical == "" || canonical == "all" {
+			return nil, fmt.Errorf("invalid token concurrency plan %q", plan)
+		}
+		if len(canonical) > 64 {
+			return nil, fmt.Errorf("token concurrency plan %q is too long", plan)
+		}
+		cap, err := ParseTokenActiveStreamCap(rawCap)
+		if err != nil {
+			return nil, fmt.Errorf("token concurrency plan %q: %w", canonical, err)
+		}
+		if _, exists := normalized[canonical]; exists {
+			return nil, fmt.Errorf("duplicate token concurrency plan %q", canonical)
+		}
+		normalized[canonical] = cap
+	}
+	return normalized, nil
+}
+
+func ParseTokenConcurrencyPayload(raw []byte) (map[string]int64, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var payload tokenConcurrencyPayload
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, fmt.Errorf("invalid token concurrency setting: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid token concurrency setting: multiple JSON values")
+	}
+	if payload.PlanConcurrency == nil {
+		payload.PlanConcurrency = map[string]int64{}
+	}
+	return NormalizeTokenPlanConcurrency(payload.PlanConcurrency)
 }
 
 func (s *Store) UpsertUserSetting(ctx context.Context, ownerUserID int64, key string, value json.RawMessage) (Setting, error) {

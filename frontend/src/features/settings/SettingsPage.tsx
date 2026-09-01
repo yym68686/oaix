@@ -1,13 +1,14 @@
-import { DatabaseIcon, RefreshCwIcon, SaveIcon, Settings2Icon, ShieldCheckIcon } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { DatabaseIcon, RefreshCwIcon, RotateCcwIcon, SaveIcon, Settings2Icon, ShieldCheckIcon } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Button } from "@/registry/default/ui/button";
 import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { Checkbox } from "@/registry/default/ui/checkbox";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Textarea } from "@/registry/default/ui/textarea";
 import { cn } from "@/registry/default/lib/utils";
-import { api, getServiceKey, setServiceKey, type SettingItem } from "@/lib/api";
+import { api, getServiceKey, setServiceKey, type SettingItem, type TokenConcurrencyPlan } from "@/lib/api";
 import { clamp } from "@/lib/format";
 import {
   ADMIN_TOKEN_PROBE_MODEL_SETTING_KEY,
@@ -30,16 +31,32 @@ export function UserSettingsPage({
   refreshNonce: number;
 }) {
   const [probeModel, setProbeModel] = useState<TestModel>(DEFAULT_TEST_MODEL);
+  const [concurrencyPlans, setConcurrencyPlans] = useState<TokenConcurrencyPlan[]>([]);
+  const [concurrencyOverrides, setConcurrencyOverrides] = useState<Record<string, number>>({});
+  const [globalConcurrency, setGlobalConcurrency] = useState(10);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [savingConcurrency, setSavingConcurrency] = useState(false);
   const [error, setError] = useState("");
+  const concurrencyDirtyRef = useRef(false);
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      const payload = await api.mySettings();
+      const [payload, concurrency] = await Promise.all([api.mySettings(), api.myTokenConcurrency()]);
       setProbeModel(testModelFromSettings(payload.items || [], USER_TOKEN_PROBE_MODEL_SETTING_KEY));
+      if (!concurrencyDirtyRef.current) {
+        setConcurrencyPlans(concurrency.plans || []);
+        setGlobalConcurrency(clamp(Number(concurrency.global_active_stream_cap || 10), 1, 50));
+        setConcurrencyOverrides(
+          Object.fromEntries(
+            (concurrency.plans || [])
+              .filter((plan) => plan.overridden)
+              .map((plan) => [plan.plan, clamp(Number(plan.active_stream_cap || 1), 1, 50)]),
+          ),
+        );
+      }
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -64,8 +81,121 @@ export function UserSettingsPage({
     }
   }
 
+  async function saveConcurrency() {
+    setSavingConcurrency(true);
+    try {
+      await api.updateMyTokenConcurrency(concurrencyOverrides);
+      pushToast("计划并发设置已保存");
+      concurrencyDirtyRef.current = false;
+      await loadSettings();
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setSavingConcurrency(false);
+    }
+  }
+
+  async function resetConcurrency() {
+    setSavingConcurrency(true);
+    try {
+      await api.resetMyTokenConcurrency();
+      pushToast("已恢复管理员默认并发", "info");
+      concurrencyDirtyRef.current = false;
+      await loadSettings();
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setSavingConcurrency(false);
+    }
+  }
+
+  function toggleConcurrencyOverride(plan: TokenConcurrencyPlan, enabled: boolean) {
+    concurrencyDirtyRef.current = true;
+    setConcurrencyOverrides((current) => {
+      const next = { ...current };
+      if (enabled) {
+        next[plan.plan] = clamp(Number(plan.active_stream_cap || globalConcurrency), 1, 50);
+      } else {
+        delete next[plan.plan];
+      }
+      return next;
+    });
+  }
+
   return (
-    <div className="grid gap-4 xl:grid-cols-[minmax(320px,.65fr)_minmax(0,1fr)]">
+    <div className="grid gap-4 xl:grid-cols-2">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Settings2Icon className="size-5" />
+            计划并发
+          </CardTitle>
+          <CardDescription>按账号计划设置每个 Key 的并发上限。你的设置优先于管理员默认值。</CardDescription>
+        </CardHeader>
+        <CardPanel className="grid gap-4">
+          {error && <ErrorAlert title="设置载入失败" message={error} />}
+          {loading && !error ? (
+            <LoadingState compact label="正在载入并发设置" />
+          ) : (
+            <>
+              <Alert variant="info">
+                <DatabaseIcon />
+                <AlertTitle>管理员默认：每 Key {globalConcurrency} 并发</AlertTitle>
+                <AlertDescription>关闭某个计划的“自定义”后，该计划会自动继承管理员默认值。</AlertDescription>
+              </Alert>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {concurrencyPlans.map((plan) => {
+                  const overridden = Object.hasOwn(concurrencyOverrides, plan.plan);
+                  const cap = overridden ? concurrencyOverrides[plan.plan] : globalConcurrency;
+                  return (
+                    <div className="grid gap-3 rounded-lg border bg-muted/30 p-3" key={plan.plan}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="font-medium">{plan.label || plan.plan}</div>
+                          <div className="text-muted-foreground text-xs">{plan.token_count} 个 Key</div>
+                        </div>
+                        <Label className="flex items-center gap-2 text-xs">
+                          <Checkbox checked={overridden} onCheckedChange={(value) => toggleConcurrencyOverride(plan, Boolean(value))} />
+                          自定义
+                        </Label>
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor={`plan-concurrency-${plan.plan}`}>每 Key 并发</Label>
+                        <Input
+                          disabled={!overridden}
+                          id={`plan-concurrency-${plan.plan}`}
+                          max={50}
+                          min={1}
+                          nativeInput
+                          onChange={(event) => {
+                            concurrencyDirtyRef.current = true;
+                            setConcurrencyOverrides((current) => ({
+                              ...current,
+                              [plan.plan]: clamp(Number(event.currentTarget.value || 1), 1, 50),
+                            }));
+                          }}
+                          type="number"
+                          value={cap}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button disabled={savingConcurrency} loading={savingConcurrency} onClick={() => void saveConcurrency()}>
+                  <SaveIcon />
+                  保存并发设置
+                </Button>
+                <Button disabled={savingConcurrency} onClick={() => void resetConcurrency()} variant="outline">
+                  <RotateCcwIcon />
+                  全部恢复默认
+                </Button>
+              </div>
+            </>
+          )}
+        </CardPanel>
+      </Card>
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -75,7 +205,6 @@ export function UserSettingsPage({
           <CardDescription>设置用户页面 Key 测试按钮默认使用的模型。</CardDescription>
         </CardHeader>
         <CardPanel className="grid gap-4">
-          {error && <ErrorAlert title="设置载入失败" message={error} />}
           {loading && !error ? (
             <LoadingState compact label="正在载入设置" />
           ) : (

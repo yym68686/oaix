@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -928,6 +929,59 @@ func TestUserCanCopyOnlyOwnRecoverableAPIKeysWithDatabase(t *testing.T) {
 		t.Fatalf("deleting secondary key reported current credential deletion: %#v", deletePayload)
 	}
 	expectStatus(t, h.request(t, http.MethodGet, "/api/me/api-keys/"+strconv.FormatInt(createdID, 10)+"/value", keyA.PlaintextKey, ""), http.StatusNotFound)
+}
+
+func TestUserPlanConcurrencyOverridesAdminDefaultWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	user, key := h.createUser(t, "plan-concurrency")
+	token := h.createToken(t, user.ID, "plan-concurrency-pro")
+	h.app.tokens.SetActiveStreamCap(9)
+
+	payload := expectStatus(t, h.request(t, http.MethodPost, "/api/me/token-concurrency", key.PlaintextKey, `{
+		"plan_concurrency": {"pro": 2, "k12": 1}
+	}`), http.StatusOK)
+	if payload["global_active_stream_cap"] != float64(9) {
+		t.Fatalf("global cap = %v, want 9 payload=%v", payload["global_active_stream_cap"], payload)
+	}
+	settings, _ := payload["plan_concurrency"].(map[string]any)
+	if settings["pro"] != float64(2) || settings["k12"] != float64(1) {
+		t.Fatalf("plan concurrency = %#v", settings)
+	}
+
+	ownerToken := h.app.tokens.SnapshotForOwner(user.ID).ByID[token.ID]
+	globalToken := h.app.tokens.Snapshot().ByID[token.ID]
+	for scope, runtimeToken := range map[string]*tokens.RuntimeToken{"owner": ownerToken, "global": globalToken} {
+		if runtimeToken == nil || runtimeToken.Token.UserActiveStreamCap == nil || *runtimeToken.Token.UserActiveStreamCap != 2 {
+			t.Fatalf("%s runtime cap = %#v, want 2", scope, runtimeToken)
+		}
+	}
+
+	first, err := h.app.tokens.Claim(context.Background(), tokens.Intent{OwnerUserID: user.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	second, err := h.app.tokens.Claim(context.Background(), tokens.Intent{OwnerUserID: user.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if first.Telemetry.ActiveCap != 2 || second.Telemetry.ActiveCap != 2 {
+		t.Fatalf("claim caps = %d/%d, want 2", first.Telemetry.ActiveCap, second.Telemetry.ActiveCap)
+	}
+	if claim, err := h.app.tokens.Claim(context.Background(), tokens.Intent{OwnerUserID: user.ID}); !errors.Is(err, tokens.ErrNoToken) {
+		if claim != nil {
+			claim.Release()
+		}
+		t.Fatalf("third claim = %v, %v; want user cap denial", claim, err)
+	}
+
+	expectStatus(t, h.request(t, http.MethodPost, "/api/me/settings/token_concurrency", key.PlaintextKey, `{"plan_concurrency":{"pro":8}}`), http.StatusBadRequest)
+	expectStatus(t, h.request(t, http.MethodDelete, "/api/me/token-concurrency", key.PlaintextKey, ""), http.StatusOK)
+	stored, err := h.db.GetUserTokenConcurrency(context.Background(), user.ID)
+	if err != nil || len(stored.PlanConcurrency) != 0 {
+		t.Fatalf("reset settings = %#v err=%v", stored, err)
+	}
 }
 
 func TestProxyUsesOwnerTokenPoolWithDatabase(t *testing.T) {

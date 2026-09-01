@@ -351,6 +351,21 @@ export type SettingItem = {
   updated_at?: string | null;
 };
 
+export type TokenConcurrencyPlan = {
+  plan: string;
+  label: string;
+  token_count: number;
+  active_stream_cap: number;
+  overridden: boolean;
+};
+
+export type TokenConcurrencySettings = {
+  global_active_stream_cap: number;
+  plan_concurrency: Record<string, number>;
+  plans: TokenConcurrencyPlan[];
+  updated_at?: string | null;
+};
+
 export type Sub2APITarget = {
   id: number;
   name: string;
@@ -588,6 +603,10 @@ export const api = {
   mySettings: () => requestJSON<{ items?: SettingItem[] }>("/api/me/settings"),
   updateMySetting: (key: string, value: unknown) =>
     postJSON<SettingItem>(`/api/me/settings/${encodeURIComponent(key)}`, value),
+  myTokenConcurrency: () => requestJSON<TokenConcurrencySettings>("/api/me/token-concurrency"),
+  updateMyTokenConcurrency: (planConcurrency: Record<string, number>) =>
+    postJSON<TokenConcurrencySettings>("/api/me/token-concurrency", { plan_concurrency: planConcurrency }),
+  resetMyTokenConcurrency: () => deleteJSON<TokenConcurrencySettings>("/api/me/token-concurrency"),
   runtime: () => requestJSON<Record<string, unknown>>("/admin/runtime"),
   tokenSelection: (authKey?: string) => requestJSON<Record<string, unknown>>("/admin/token-selection", {}, authKey),
   updateTokenSelection: (payload: Record<string, unknown>) =>

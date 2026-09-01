@@ -24,6 +24,7 @@ oaix 管理面以 `/admin/*` 为稳定 API 前缀，前端只是这些 API 的�
 - 我的账号：`GET /api/me`、`GET /api/me/usage`、`GET /api/me/pool-summary`。
 - 我的 API Key：`GET /api/me/api-keys`、`POST /api/me/api-keys`、`DELETE /api/me/api-keys/{key_id}`。
 - 我的设置：`GET /api/me/settings`、`GET /api/me/settings/{key}`、`POST /api/me/settings/{key}`、`DELETE /api/me/settings/{key}`。这些设置写入 `user_settings`，不会污染全局 `gateway_settings`。
+- 我的计划并发：`GET /api/me/token-concurrency` 查看管理员默认值、各计划有效值和用户覆盖；`POST /api/me/token-concurrency` 以 `{"plan_concurrency":{"free":1,"plus":4,"pro":8}}` 保存按计划覆盖；`DELETE /api/me/token-concurrency` 删除全部覆盖并恢复继承管理员默认值。用户覆盖优先于管理员全局值，并按 token 所有者应用到自用和 marketplace 流量。
 - 我的 Key：`GET /api/tokens`、`POST /api/tokens/batch`、`GET /api/tokens/{token_id}`、`PATCH /api/tokens/{token_id}`、`DELETE /api/tokens/{token_id}`、`POST /api/tokens/{token_id}/probe`。批量接口支持用 `all_filtered=true` 配合列表筛选参数选中完整结果集，并用 `excluded_token_ids` 排除个别 Key。
 - 我的导入：`POST /api/import/parse`、`POST /api/import/upload`、`POST /api/import/jobs`、`GET /api/import/jobs`、`GET /api/import/jobs/{job_id}`、`POST /api/import/jobs/{job_id}/cancel`、`DELETE /api/import/jobs/{job_id}`、`GET /api/import/jobs/{job_id}/items`、`GET /api/import/jobs/{job_id}/tokens`。
 - 我的请求：`GET /api/requests`。

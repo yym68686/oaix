@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,9 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/me/settings/{key}", a.requireAuth(a.getMySetting))
 	mux.HandleFunc("POST /api/me/settings/{key}", a.requireAuth(a.updateMySetting))
 	mux.HandleFunc("DELETE /api/me/settings/{key}", a.requireAuth(a.deleteMySetting))
+	mux.HandleFunc("GET /api/me/token-concurrency", a.requireAuth(a.getMyTokenConcurrency))
+	mux.HandleFunc("POST /api/me/token-concurrency", a.requireAuth(a.updateMyTokenConcurrency))
+	mux.HandleFunc("DELETE /api/me/token-concurrency", a.requireAuth(a.deleteMyTokenConcurrency))
 	mux.HandleFunc("GET /api/tokens", a.requireAuth(a.listMyTokens))
 	mux.HandleFunc("GET /api/tokens/quota", a.requireAuth(a.listMyTokenQuota))
 	mux.HandleFunc("POST /api/tokens/quota-refresh", a.requireAuth(a.createMyQuotaRefreshJob))
@@ -399,6 +403,10 @@ func (a *App) updateMySetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
 		return
 	}
+	if key == store.TokenConcurrencySettingKey {
+		writeError(w, http.StatusBadRequest, errors.New("token_concurrency must be updated through /api/me/token-concurrency"))
+		return
+	}
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1024*1024))
 	if err != nil {
@@ -431,6 +439,10 @@ func (a *App) deleteMySetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
 		return
 	}
+	if key == store.TokenConcurrencySettingKey {
+		writeError(w, http.StatusBadRequest, errors.New("token_concurrency must be reset through /api/me/token-concurrency"))
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	if err := a.store.DeleteUserSetting(ctx, *scope.OwnerUserID, key); errors.Is(err, pgx.ErrNoRows) {
@@ -442,6 +454,162 @@ func (a *App) deleteMySetting(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.store.WriteAuditLog(ctx, "user_setting_delete", "self", "user_setting", key, map[string]any{"user_id": *scope.OwnerUserID})
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "key": key})
+}
+
+type userTokenConcurrencyPlan struct {
+	Plan            string `json:"plan"`
+	Label           string `json:"label"`
+	TokenCount      int    `json:"token_count"`
+	ActiveStreamCap int64  `json:"active_stream_cap"`
+	Overridden      bool   `json:"overridden"`
+}
+
+func (a *App) getMyTokenConcurrency(w http.ResponseWriter, r *http.Request) {
+	a.writeMyTokenConcurrency(w, r, nil)
+}
+
+func (a *App) updateMyTokenConcurrency(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	scope, ok := userScope(w, auth)
+	if !ok || scope.OwnerUserID == nil {
+		return
+	}
+	defer r.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	planConcurrency, err := store.ParseTokenConcurrencyPayload(body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	settings, err := a.store.UpsertUserTokenConcurrency(ctx, *scope.OwnerUserID, planConcurrency)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	_ = a.store.WriteAuditLog(ctx, "user_token_concurrency_update", "self", "user_setting", store.TokenConcurrencySettingKey, map[string]any{
+		"user_id":          *scope.OwnerUserID,
+		"plan_concurrency": settings.PlanConcurrency,
+	})
+	a.refreshTokenConcurrency(ctx, *scope.OwnerUserID)
+	a.writeMyTokenConcurrencyForScope(w, ctx, scope, settings)
+}
+
+func (a *App) deleteMyTokenConcurrency(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	scope, ok := userScope(w, auth)
+	if !ok || scope.OwnerUserID == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	err := a.store.DeleteUserTokenConcurrency(ctx, *scope.OwnerUserID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	_ = a.store.WriteAuditLog(ctx, "user_token_concurrency_reset", "self", "user_setting", store.TokenConcurrencySettingKey, map[string]any{
+		"user_id": *scope.OwnerUserID,
+	})
+	a.refreshTokenConcurrency(ctx, *scope.OwnerUserID)
+	a.writeMyTokenConcurrencyForScope(w, ctx, scope, store.TokenConcurrencySettings{PlanConcurrency: map[string]int64{}})
+}
+
+func (a *App) writeMyTokenConcurrency(w http.ResponseWriter, r *http.Request, known *store.TokenConcurrencySettings) {
+	auth := authFromContext(r.Context())
+	scope, ok := userScope(w, auth)
+	if !ok || scope.OwnerUserID == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	settings := store.TokenConcurrencySettings{PlanConcurrency: map[string]int64{}}
+	var err error
+	if known != nil {
+		settings = *known
+	} else {
+		settings, err = a.store.GetUserTokenConcurrency(ctx, *scope.OwnerUserID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+	}
+	a.writeMyTokenConcurrencyForScope(w, ctx, scope, settings)
+}
+
+func (a *App) writeMyTokenConcurrencyForScope(w http.ResponseWriter, ctx context.Context, scope store.ResourceScope, settings store.TokenConcurrencySettings) {
+	counts, err := a.store.TokenPlanCountsScoped(ctx, scope, store.TokenListOptions{})
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	globalCap := store.NormalizeTokenActiveStreamCap(a.cfg.TokenPool.ActiveStreamCap)
+	if a.tokens != nil {
+		globalCap = a.tokens.ActiveStreamCap()
+	}
+	canonicalCounts := make(map[string]store.TokenPlanCount, len(counts))
+	planOrder := make([]string, 0, len(counts))
+	for _, item := range counts {
+		plan := store.CanonicalTokenPlan(item.Plan)
+		current, exists := canonicalCounts[plan]
+		if !exists {
+			current = store.TokenPlanCount{Plan: plan, Label: item.Label}
+			planOrder = append(planOrder, plan)
+		}
+		current.Count += item.Count
+		canonicalCounts[plan] = current
+	}
+	missingPlans := make([]string, 0)
+	for plan := range settings.PlanConcurrency {
+		if _, exists := canonicalCounts[plan]; !exists {
+			missingPlans = append(missingPlans, plan)
+		}
+	}
+	sort.Strings(missingPlans)
+	for _, plan := range missingPlans {
+		canonicalCounts[plan] = store.TokenPlanCount{Plan: plan, Label: plan}
+		planOrder = append(planOrder, plan)
+	}
+	plans := make([]userTokenConcurrencyPlan, 0, len(planOrder))
+	for _, plan := range planOrder {
+		item := canonicalCounts[plan]
+		cap := globalCap
+		overridden := false
+		if value, ok := settings.PlanConcurrency[plan]; ok {
+			cap = value
+			overridden = true
+		}
+		plans = append(plans, userTokenConcurrencyPlan{
+			Plan:            plan,
+			Label:           item.Label,
+			TokenCount:      item.Count,
+			ActiveStreamCap: cap,
+			Overridden:      overridden,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"global_active_stream_cap": globalCap,
+		"plan_concurrency":         settings.PlanConcurrency,
+		"plans":                    plans,
+		"updated_at":               settings.UpdatedAt,
+	})
+}
+
+func (a *App) refreshTokenConcurrency(ctx context.Context, ownerUserID int64) {
+	if a.tokens == nil {
+		return
+	}
+	if err := a.tokens.Refresh(ctx); err != nil && a.logger != nil {
+		a.logger.Warn("global token pool refresh after user concurrency update failed", "owner_user_id", ownerUserID, "error", err)
+	}
+	if err := a.tokens.RefreshOwner(ctx, ownerUserID); err != nil && a.logger != nil {
+		a.logger.Warn("owner token pool refresh after user concurrency update failed", "owner_user_id", ownerUserID, "error", err)
+	}
 }
 
 func (a *App) listMyTokens(w http.ResponseWriter, r *http.Request) {

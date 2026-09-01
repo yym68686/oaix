@@ -143,6 +143,8 @@ oaix 现在区分三类 API Key：
 
 资源归属以 `owner_user_id` 为边界。用户导入的 key、OAuth 会话、导入批次、请求日志、成本聚合和 prompt-cache 亲和状态都会写入 owner 维度。管理员读取全局资源时使用 `/api/admin/*` 或旧 `/admin/*`；普通用户自助管理使用 `/api/*`。
 
+普通用户可以通过前端“设置”页或 `GET` / `POST` / `DELETE /api/me/token-concurrency` 按 token 计划设置每个 Key 的并发上限。用户对某个计划设置的上限优先于管理员的全局 `active_stream_cap`；未覆盖的计划继续继承管理员默认值。该限制按 token 所有者生效，因此用户共享到 marketplace 的 Key 也遵守所有者配置。
+
 ## 路由尝试级幂等
 
 受信任的路由层可在 `/v1/*` 请求上发送 `X-OAIX-Routing-Attempt-ID`。同一 owner、同一尝试 ID、同一请求指纹的并发请求只执行一次；已完成的 `<500` 响应会原样重放，并通过 `X-OAIX-Idempotency-Status` 返回 `executed` 或 `replayed`。同一尝试 ID 搭配不同请求会返回 `409`，协调存储不可用时会在调用上游前返回 `503`。

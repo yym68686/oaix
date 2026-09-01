@@ -49,6 +49,7 @@ type Token struct {
 	RefreshToken              string                     `json:"-"`
 	AgentIdentity             *agentidentity.Credentials `json:"-"`
 	PlanType                  *string                    `json:"plan_type,omitempty"`
+	UserActiveStreamCap       *int64                     `json:"user_active_stream_cap,omitempty"`
 	Remark                    *string                    `json:"remark,omitempty"`
 	SourceFile                *string                    `json:"source_file,omitempty"`
 	IsActive                  bool                       `json:"is_active"`
@@ -247,9 +248,16 @@ func (s *Store) ListAvailableTokensScoped(ctx context.Context, scope ResourceSco
 		       t.marketplace_price_bps, t.marketplace_price_updated_at, t.marketplace_price_source,
 		       t.last_used_at, t.last_error, t.created_at, t.updated_at,
 		       ai.agent_runtime_id, ai.agent_private_key, ai.task_id, ai.chatgpt_user_id,
-		       ai.workspace_id, ai.chatgpt_account_is_fedramp
+		       ai.workspace_id, ai.chatgpt_account_is_fedramp,
+		       concurrency.value->'plan_concurrency'->>coalesce(
+		         nullif(regexp_replace(lower(btrim(t.plan_type)), '^chatgpt_', ''), ''),
+		         'unknown'
+		       )
 		from codex_tokens t
 		left join token_agent_identities ai on ai.token_id = t.id
+		left join user_settings concurrency
+		  on concurrency.owner_user_id = t.owner_user_id
+		 and concurrency.key = 'token_concurrency'
 		where t.is_active = true
 		  and t.merged_into_token_id is null
 		  and `+ownerWhere+`
@@ -2207,6 +2215,7 @@ func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
 		var userID sql.NullString
 		var workspaceID sql.NullString
 		var fedRAMP sql.NullBool
+		var userActiveStreamCap sql.NullString
 		err := rows.Scan(
 			&token.ID,
 			&token.OwnerUserID,
@@ -2238,6 +2247,7 @@ func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
 			&userID,
 			&workspaceID,
 			&fedRAMP,
+			&userActiveStreamCap,
 		)
 		if err != nil {
 			return nil, err
@@ -2257,6 +2267,14 @@ func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
 		}
 		if marketplacePriceSource.Valid {
 			token.MarketplacePriceSource = marketplacePriceSource.String
+		}
+		if userActiveStreamCap.Valid {
+			if parsed, ok := parseInt64Value(userActiveStreamCap.String); ok {
+				if cap, err := ParseTokenActiveStreamCap(parsed); err == nil {
+					value := cap
+					token.UserActiveStreamCap = &value
+				}
+			}
 		}
 		if runtimeID.Valid && privateKey.Valid {
 			credentials := agentidentity.Credentials{

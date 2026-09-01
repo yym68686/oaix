@@ -66,6 +66,34 @@ func TestFrontendUserAPIKeyPageContract(t *testing.T) {
 	}
 }
 
+func TestFrontendUserSettingsExposePlanConcurrencyOverrides(t *testing.T) {
+	page := readFrontendFile(t, "src", "features", "settings", "SettingsPage.tsx")
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+	for _, required := range []string{
+		"计划并发",
+		"你的设置优先于管理员默认值",
+		"api.myTokenConcurrency()",
+		"api.updateMyTokenConcurrency(concurrencyOverrides)",
+		"api.resetMyTokenConcurrency()",
+		"const concurrencyDirtyRef = useRef(false)",
+		"if (!concurrencyDirtyRef.current)",
+		"全部恢复默认",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("user settings concurrency contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		`myTokenConcurrency: () => requestJSON<TokenConcurrencySettings>("/api/me/token-concurrency")`,
+		`postJSON<TokenConcurrencySettings>("/api/me/token-concurrency"`,
+		`deleteJSON<TokenConcurrencySettings>("/api/me/token-concurrency")`,
+	} {
+		if !strings.Contains(apiFile, required) {
+			t.Fatalf("frontend concurrency API contract missing %q", required)
+		}
+	}
+}
+
 func TestFrontendProfileSupportsSavedAccountSwitching(t *testing.T) {
 	appShell := readFrontendFile(t, "src", "app", "AppShell.tsx")
 	router := readFrontendFile(t, "src", "app", "router.ts")
