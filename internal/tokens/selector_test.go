@@ -351,6 +351,37 @@ func TestModelCapabilityCatalogFiltersOnlyKnownPlanModels(t *testing.T) {
 	}
 }
 
+func TestMarketplaceModelEligibilityDoesNotProbeBuyerCatalog(t *testing.T) {
+	pro := "pro"
+	rows := makeTokens(1)
+	rows[0].OwnerUserID = 10
+	rows[0].PlanType = &pro
+	rows[0].ShareEnabled = true
+	rows[0].ShareStatus = "active"
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	resolverCalls := 0
+	manager.SetFastCapabilityResolver(func(_ context.Context, _ int64) error {
+		resolverCalls++
+		return nil
+	})
+	eligible, err := manager.ModelEligibleTokenIDs(context.Background(), Intent{
+		OwnerUserID:   20,
+		SelectionMode: "marketplace",
+	}, "gpt-5.6-sol", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolverCalls != 0 {
+		t.Fatalf("buyer capability resolver calls = %d, want 0", resolverCalls)
+	}
+	if _, ok := eligible[1]; !ok || len(eligible) != 1 {
+		t.Fatalf("eligible tokens = %#v, want shared seller token 1", eligible)
+	}
+}
+
 func TestLatencyAwareSelectorPrefersLowestTTFT(t *testing.T) {
 	manager := NewManager(&fakeSource{tokens: makeTokens(2)}, nil, testMaxAge, testRefreshInterval, 1)
 	if err := manager.Refresh(context.Background()); err != nil {

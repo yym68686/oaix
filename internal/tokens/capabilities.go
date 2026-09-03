@@ -115,7 +115,7 @@ func (m *Manager) ModelEligibleTokenIDs(ctx context.Context, intent Intent, mode
 	resolver := m.fastResolver
 	m.capabilityMu.RUnlock()
 	var resolveErr error
-	if !known && resolver != nil && intent.OwnerUserID > 0 {
+	if !known && resolver != nil && intent.OwnerUserID > 0 && !isMarketplaceSelection(intent.SelectionMode) {
 		resolveErr = resolver(ctx, intent.OwnerUserID)
 	}
 	m.capabilityMu.RLock()
