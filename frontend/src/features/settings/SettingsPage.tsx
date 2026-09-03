@@ -123,8 +123,8 @@ export function UserSettingsPage({
   }
 
   return (
-    <div className="grid gap-4 xl:grid-cols-2">
-      <Card>
+    <div className="grid min-w-0 gap-4">
+      <Card className="min-w-0">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Settings2Icon className="size-5" />
@@ -143,18 +143,18 @@ export function UserSettingsPage({
                 <AlertTitle>管理员默认：每 Key {globalConcurrency} 并发</AlertTitle>
                 <AlertDescription>关闭某个计划的“自定义”后，该计划会自动继承管理员默认值。</AlertDescription>
               </Alert>
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid min-w-0 gap-3 md:grid-cols-2">
                 {concurrencyPlans.map((plan) => {
                   const overridden = Object.hasOwn(concurrencyOverrides, plan.plan);
                   const cap = overridden ? concurrencyOverrides[plan.plan] : globalConcurrency;
                   return (
-                    <div className="grid gap-3 rounded-lg border bg-muted/30 p-3" key={plan.plan}>
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <div className="font-medium">{plan.label || plan.plan}</div>
+                    <div className="grid min-w-0 gap-3 rounded-lg border bg-muted/30 p-3" key={plan.plan}>
+                      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+                        <div className="min-w-0">
+                          <div className="font-medium [overflow-wrap:anywhere]">{plan.label || plan.plan}</div>
                           <div className="text-muted-foreground text-xs">{plan.token_count} 个 Key</div>
                         </div>
-                        <Label className="flex items-center gap-2 text-xs">
+                        <Label className="flex min-h-7 shrink-0 items-center gap-2 text-xs">
                           <Checkbox checked={overridden} onCheckedChange={(value) => toggleConcurrencyOverride(plan, Boolean(value))} />
                           自定义
                         </Label>
@@ -181,13 +181,14 @@ export function UserSettingsPage({
                     </div>
                   );
                 })}
+                {!concurrencyPlans.length && <EmptyState compact title="暂无计划" description="当前账号还没有可配置并发的 Key 计划。" />}
               </div>
-              <div className="flex flex-wrap gap-2">
-                <Button disabled={savingConcurrency} loading={savingConcurrency} onClick={() => void saveConcurrency()}>
+              <div className="grid gap-2 sm:flex sm:flex-wrap">
+                <Button className="w-full sm:w-auto" disabled={savingConcurrency} loading={savingConcurrency} onClick={() => void saveConcurrency()}>
                   <SaveIcon />
                   保存并发设置
                 </Button>
-                <Button disabled={savingConcurrency} onClick={() => void resetConcurrency()} variant="outline">
+                <Button className="w-full sm:w-auto" disabled={savingConcurrency} onClick={() => void resetConcurrency()} variant="outline">
                   <RotateCcwIcon />
                   全部恢复默认
                 </Button>
@@ -196,7 +197,7 @@ export function UserSettingsPage({
           )}
         </CardPanel>
       </Card>
-      <Card>
+      <Card className="min-w-0">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Settings2Icon className="size-5" />
