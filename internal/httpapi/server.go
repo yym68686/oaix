@@ -1623,6 +1623,40 @@ func sub2APIImportPayloads(record map[string]any) ([]map[string]any, bool) {
 	if !ok {
 		return nil, false
 	}
+
+	// A valid refresh token is the preferred identity for a normal sub2api
+	// export. If one refresh token is repeated for multiple distinct account
+	// identities in the same export, treating it as the identity would collapse
+	// otherwise distinct accounts and the worker would try to refresh the shared
+	// placeholder. Preserve each access-token account only in that narrow,
+	// internally inconsistent case; access-only normalization will add an
+	// oaix-owned sentinel refresh token later.
+	refreshIdentityVariants := make(map[string]map[string]struct{})
+	for _, item := range accounts {
+		account, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		credentials, ok := account["credentials"].(map[string]any)
+		if !ok {
+			continue
+		}
+		refreshToken := importpayload.NormalizeCredential(credentials["refresh_token"])
+		if refreshToken == "" {
+			continue
+		}
+		identity := sub2APIAccountIdentity(account, credentials)
+		if identity == "" {
+			continue
+		}
+		variants := refreshIdentityVariants[refreshToken]
+		if variants == nil {
+			variants = make(map[string]struct{})
+			refreshIdentityVariants[refreshToken] = variants
+		}
+		variants[identity] = struct{}{}
+	}
+
 	payloads := make([]map[string]any, 0, len(accounts))
 	for _, item := range accounts {
 		account, ok := item.(map[string]any)
@@ -1631,11 +1665,30 @@ func sub2APIImportPayloads(record map[string]any) ([]map[string]any, bool) {
 		}
 		payload, ok := sub2APIAccountImportPayload(account)
 		if ok {
+			credentials, _ := account["credentials"].(map[string]any)
+			refreshToken := importpayload.NormalizeCredential(credentials["refresh_token"])
+			accessToken := importpayload.NormalizeCredential(credentials["access_token"])
+			if refreshToken != "" && accessToken != "" && len(refreshIdentityVariants[refreshToken]) > 1 {
+				delete(payload, "refresh_token")
+				payload["access_token"] = accessToken
+			}
 			preserveImportPayloadControlFields(payload, record)
 			payloads = append(payloads, payload)
 		}
 	}
 	return payloads, true
+}
+
+func sub2APIAccountIdentity(account, credentials map[string]any) string {
+	for _, key := range []string{"chatgpt_account_id", "account_id", "email"} {
+		if value := strings.TrimSpace(stringFromAny(credentials[key])); value != "" {
+			return key + ":" + strings.ToLower(value)
+		}
+	}
+	if value := strings.TrimSpace(stringFromAny(account["name"])); value != "" {
+		return "name:" + strings.ToLower(value)
+	}
+	return ""
 }
 
 func sub2APIAccountImportPayload(account map[string]any) (map[string]any, bool) {

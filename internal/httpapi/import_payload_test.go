@@ -188,6 +188,81 @@ func TestSub2APIImportFallsBackFromRedactedRefreshTokensWithoutCollapsingAccount
 	}
 }
 
+func TestSub2APIImportFallsBackWhenRefreshTokenCollidesAcrossDistinctAccessTokens(t *testing.T) {
+	accounts := make([]any, 0, 10)
+	for index := 0; index < 10; index++ {
+		accounts = append(accounts, map[string]any{
+			"name":     fmt.Sprintf("account-%d@example.com", index),
+			"platform": "openai",
+			"type":     "oauth",
+			"credentials": map[string]any{
+				// The incident input carried the same non-empty value here while
+				// each account still had a distinct usable access token.
+				"refresh_token": "111",
+				"access_token":  fmt.Sprintf("eyJ.account-%d.signature", index),
+				"account_id":    fmt.Sprintf("acct-%d", index),
+				"email":         fmt.Sprintf("account-%d@example.com", index),
+			},
+		})
+	}
+	data, err := json.Marshal(map[string]any{"type": "sub2api-data", "accounts": accounts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, err := parseImportTextPayloads(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, summary := finalizeImportParse(payloads, 10)
+	if len(payloads) != 10 || summary.Total != 10 || summary.DeduplicatedCount != 0 {
+		t.Fatalf("payloads=%d summary=%+v", len(payloads), summary)
+	}
+	for index, payload := range payloads {
+		if payload["access_token"] != fmt.Sprintf("eyJ.account-%d.signature", index) {
+			t.Fatalf("payload %d access token = %#v", index, payload["access_token"])
+		}
+		if _, ok := payload["refresh_token"]; ok {
+			t.Fatalf("payload %d retained colliding refresh token: %#v", index, payload)
+		}
+	}
+}
+
+func TestSub2APIImportKeepsRefreshIdentityForSameAccountVariants(t *testing.T) {
+	accounts := []any{
+		map[string]any{
+			"name": "account@example.com",
+			"credentials": map[string]any{
+				"refresh_token": "rt-shared",
+				"access_token":  "eyJ.account-one.signature",
+				"account_id":    "acct-same",
+			},
+		},
+		map[string]any{
+			"name": "account@example.com",
+			"credentials": map[string]any{
+				"refresh_token": "rt-shared",
+				"access_token":  "eyJ.account-two.signature",
+				"account_id":    "acct-same",
+			},
+		},
+	}
+	data, err := json.Marshal(map[string]any{"type": "sub2api-data", "accounts": accounts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, err := parseImportTextPayloads(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, summary := finalizeImportParse(payloads, 2)
+	if len(payloads) != 1 || summary.DeduplicatedCount != 1 {
+		t.Fatalf("payloads=%d summary=%+v", len(payloads), summary)
+	}
+	if payloads[0]["refresh_token"] != "rt-shared" {
+		t.Fatalf("same-account refresh identity changed: %#v", payloads[0])
+	}
+}
+
 func TestImportParseSummaryRejectsRedactedOnlyCredentials(t *testing.T) {
 	payloads, err := parseImportTextPayloads(`{
 		"type": "sub2api-data",
