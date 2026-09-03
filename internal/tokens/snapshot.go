@@ -158,19 +158,21 @@ type TokenActivity struct {
 }
 
 type Intent struct {
-	Endpoint           string
-	Model              string
-	OwnerUserID        int64
-	SelectionMode      string
-	ExcludeOwnerUserID int64
-	TargetTokenID      int64
-	PromptCacheKeyHash string
-	ExcludeTokenIDs    map[int64]struct{}
-	RequireNonFree     bool
-	RequiredPlan       string
-	RequireFast        bool
-	FastEligibleTokens map[int64]struct{}
-	RequireAlphaSearch bool
+	Endpoint               string
+	Model                  string
+	OwnerUserID            int64
+	SelectionMode          string
+	ExcludeOwnerUserID     int64
+	TargetTokenID          int64
+	PromptCacheKeyHash     string
+	ExcludeTokenIDs        map[int64]struct{}
+	RequireNonFree         bool
+	RequiredPlan           string
+	RequireFast            bool
+	FastEligibleTokens     map[int64]struct{}
+	RequireModelCapability bool
+	ModelEligibleTokens    map[int64]struct{}
+	RequireAlphaSearch     bool
 }
 
 type Claim struct {

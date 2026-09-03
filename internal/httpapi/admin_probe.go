@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/yym68686/oaix/internal/modelaccess"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/upstreamerror"
@@ -26,14 +27,7 @@ const (
 	userProbeModelSettingKey   = "token_probe_model"
 )
 
-var supportedTokenProbeModels = []string{
-	"gpt-5.4-mini",
-	"gpt-5.4",
-	"gpt-5.5",
-	"gpt-5.6-sol",
-	"gpt-5.6-terra",
-	"gpt-5.6-luna",
-}
+var supportedTokenProbeModels = modelaccess.TextModelIDs()
 
 func (a *App) listTokenQuota(w http.ResponseWriter, r *http.Request) {
 	ids, err := parseAdminTokenIDs(r.URL.Query().Get("ids"), 100)

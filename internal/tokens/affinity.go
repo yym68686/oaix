@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yym68686/oaix/internal/modelaccess"
+
 	"golang.org/x/crypto/blake2b"
 
 	"github.com/yym68686/oaix/internal/affinity"
@@ -287,6 +289,24 @@ func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 	}
 	if intent.RequireAlphaSearch && candidate.Token.IsCodexPersonalAccessToken() {
 		return false
+	}
+	if strings.TrimSpace(intent.Model) != "" {
+		plan := unknownPlanKey
+		if candidate.Token.PlanType != nil {
+			plan = *candidate.Token.PlanType
+		}
+		if candidate.Token.ModelAccessConfigured {
+			if !modelaccess.Matches(candidate.Token.AllowedModels, intent.Model) {
+				return false
+			}
+		} else if !modelaccess.DefaultAllows(plan, intent.Model) {
+			return false
+		}
+		if intent.RequireModelCapability {
+			if _, ok := intent.ModelEligibleTokens[candidate.Token.ID]; !ok {
+				return false
+			}
+		}
 	}
 	if isMarketplaceSelection(intent.SelectionMode) {
 		if intent.ExcludeOwnerUserID > 0 && candidate.Token.OwnerUserID == intent.ExcludeOwnerUserID {

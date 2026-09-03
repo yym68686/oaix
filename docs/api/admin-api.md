@@ -25,6 +25,7 @@ oaix 管理面以 `/admin/*` 为稳定 API 前缀，前端只是这些 API 的�
 - 我的 API Key：`GET /api/me/api-keys`、`POST /api/me/api-keys`、`DELETE /api/me/api-keys/{key_id}`。
 - 我的设置：`GET /api/me/settings`、`GET /api/me/settings/{key}`、`POST /api/me/settings/{key}`、`DELETE /api/me/settings/{key}`。这些设置写入 `user_settings`，不会污染全局 `gateway_settings`。
 - 我的计划并发：`GET /api/me/token-concurrency` 查看管理员默认值、各计划有效值和用户覆盖；`POST /api/me/token-concurrency` 以 `{"plan_concurrency":{"free":1,"plus":4,"pro":8}}` 保存按计划覆盖；`DELETE /api/me/token-concurrency` 删除全部覆盖并恢复继承管理员默认值。用户覆盖优先于管理员全局值，并按 token 所有者应用到自用和 marketplace 流量。
+- 我的计划模型：`GET /api/me/token-models` 返回模型目录、每个计划的有效/继承/覆盖值及官方能力探测状态；`POST /api/me/token-models` 以 `{"plan_models":{"free":["gpt-5.4-mini"],"pro":["gpt-5.5"]}}` 保存覆盖；`DELETE /api/me/token-models` 删除用户覆盖。计划键存在且值为空数组表示禁用该计划的全部模型，省略计划表示继承。用户设置优先于管理员默认，但官方每计划目录仍是不可越过的能力边界。
 - 我的 Key：`GET /api/tokens`、`POST /api/tokens/batch`、`GET /api/tokens/{token_id}`、`PATCH /api/tokens/{token_id}`、`DELETE /api/tokens/{token_id}`、`POST /api/tokens/{token_id}/probe`。批量接口支持用 `all_filtered=true` 配合列表筛选参数选中完整结果集，并用 `excluded_token_ids` 排除个别 Key。
 - 我的导入：`POST /api/import/parse`、`POST /api/import/upload`、`POST /api/import/jobs`、`GET /api/import/jobs`、`GET /api/import/jobs/{job_id}`、`POST /api/import/jobs/{job_id}/cancel`、`DELETE /api/import/jobs/{job_id}`、`GET /api/import/jobs/{job_id}/items`、`GET /api/import/jobs/{job_id}/tokens`。
 - 我的请求：`GET /api/requests`。
@@ -50,6 +51,7 @@ oaix 管理面以 `/admin/*` 为稳定 API 前缀，前端只是这些 API 的�
 - 运维：`GET /admin/workers`、`GET /admin/request-log-outbox`、`POST /admin/request-log-outbox/drain`、`POST /admin/maintenance/hourly-stats`、`POST /admin/maintenance/cleanup-request-logs`、`POST /admin/token-pool/refresh`、`GET /admin/token-pool/snapshot`、`POST /admin/transport/reset-idle`。
 - Prompt cache：`GET /admin/prompt-cache/lanes`、`GET /admin/prompt-cache/lanes/{hash}`、`DELETE /admin/prompt-cache/lanes/{hash}`、`GET /admin/response-owners`、`DELETE /admin/response-owners/{hash}`、`DELETE /admin/token-response-owners/{id}`、`GET /admin/prompt-cache/stats`。
 - Settings/Audit/Auth：`GET /admin/settings/{key}`、`DELETE /admin/settings/{key}`、`POST /admin/settings/{key}/validate`、`GET /admin/settings/schema`、`GET /admin/audit-logs`、`GET /admin/audit-logs/{id}`、`GET /admin/api-keys`、`POST /admin/api-keys`、`POST /admin/api-keys/{id}/rotate`、`DELETE /admin/api-keys/{id}`。
+- 计划模型默认值：`GET /admin/token-models`、`POST /admin/token-models`、`DELETE /admin/token-models`。请求体同用户接口；管理员设置只作为默认值，用户的显式计划覆盖优先。
 
 ## 兼容路由
 

@@ -26,6 +26,8 @@ func TestAdminOpenAPISpecContainsAPIizedResources(t *testing.T) {
 		"/api/auth/register",
 		"/api/me/settings/{key}",
 		"/api/me/token-concurrency",
+		"/api/me/token-models",
+		"/admin/token-models",
 		"/api/tokens/{token_id}",
 		"/api/tokens/batch",
 		"/api/import/jobs/{job_id}/tokens",

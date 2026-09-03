@@ -430,6 +430,23 @@ func TestOfficialFastModelsPrefersServiceTiersOverLegacyField(t *testing.T) {
 	}
 }
 
+func TestOfficialModelCapabilitiesReturnsAllModelSlugsAndFastSubset(t *testing.T) {
+	models, fastModels, count, err := officialModelCapabilities([]byte(`{"models":[
+		{"slug":"gpt-5.4","additional_speed_tiers":["fast"],"service_tiers":[]},
+		{"slug":"gpt-5.5","service_tiers":[{"id":"priority","name":"Fast"}]},
+		{"slug":"gpt-5.6-sol","service_tiers":[]}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 || !equalStrings(models, []string{"gpt-5.4", "gpt-5.5", "gpt-5.6-sol"}) {
+		t.Fatalf("models=%#v count=%d", models, count)
+	}
+	if !equalStrings(fastModels, []string{"gpt-5.5"}) {
+		t.Fatalf("fast models=%#v", fastModels)
+	}
+}
+
 func modelsCatalogTestApp(t *testing.T, ownerUserID int64, rows []store.Token) *App {
 	t.Helper()
 	source := &modelsCatalogTokenSource{tokens: rows}

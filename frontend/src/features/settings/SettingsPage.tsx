@@ -8,7 +8,15 @@ import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Textarea } from "@/registry/default/ui/textarea";
 import { cn } from "@/registry/default/lib/utils";
-import { api, getServiceKey, setServiceKey, type SettingItem, type TokenConcurrencyPlan } from "@/lib/api";
+import {
+  api,
+  getServiceKey,
+  setServiceKey,
+  type SettingItem,
+  type TokenConcurrencyPlan,
+  type TokenModelAccessPlan,
+  type TokenModelAccessSettings,
+} from "@/lib/api";
 import { clamp } from "@/lib/format";
 import {
   ADMIN_TOKEN_PROBE_MODEL_SETTING_KEY,
@@ -39,13 +47,21 @@ export function UserSettingsPage({
   const [savingConcurrency, setSavingConcurrency] = useState(false);
   const [error, setError] = useState("");
   const concurrencyDirtyRef = useRef(false);
+  const [modelSettings, setModelSettings] = useState<TokenModelAccessSettings | null>(null);
+  const [modelOverrides, setModelOverrides] = useState<Record<string, string[]>>({});
+  const [savingModels, setSavingModels] = useState(false);
+  const modelDirtyRef = useRef(false);
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      const [payload, concurrency] = await Promise.all([api.mySettings(), api.myTokenConcurrency()]);
+      const [payload, concurrency, models] = await Promise.all([api.mySettings(), api.myTokenConcurrency(), api.myTokenModels()]);
       setProbeModel(testModelFromSettings(payload.items || [], USER_TOKEN_PROBE_MODEL_SETTING_KEY));
+      setModelSettings(models);
+      if (!modelDirtyRef.current) {
+        setModelOverrides(Object.fromEntries((models.plans || []).filter((plan) => plan.overridden).map((plan) => [plan.plan, plan.models || []])));
+      }
       if (!concurrencyDirtyRef.current) {
         setConcurrencyPlans(concurrency.plans || []);
         setGlobalConcurrency(clamp(Number(concurrency.global_active_stream_cap || 10), 1, 50));
@@ -107,6 +123,57 @@ export function UserSettingsPage({
     } finally {
       setSavingConcurrency(false);
     }
+  }
+
+  async function saveModels() {
+    setSavingModels(true);
+    try {
+      await api.updateMyTokenModels(modelOverrides);
+      pushToast("计划模型设置已保存");
+      modelDirtyRef.current = false;
+      await loadSettings();
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setSavingModels(false);
+    }
+  }
+
+  async function resetModels() {
+    setSavingModels(true);
+    try {
+      await api.resetMyTokenModels();
+      pushToast("已恢复管理员默认模型", "info");
+      modelDirtyRef.current = false;
+      await loadSettings();
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setSavingModels(false);
+    }
+  }
+
+  function toggleModelOverride(plan: TokenModelAccessPlan, enabled: boolean) {
+    modelDirtyRef.current = true;
+    setModelOverrides((current) => {
+      const next = { ...current };
+      if (enabled) {
+        next[plan.plan] = [...(plan.models || [])];
+      } else {
+        delete next[plan.plan];
+      }
+      return next;
+    });
+  }
+
+  function toggleModel(plan: TokenModelAccessPlan, model: string, checked: boolean) {
+    modelDirtyRef.current = true;
+    setModelOverrides((current) => {
+      const selected = new Set(current[plan.plan] || plan.models || []);
+      if (checked) selected.add(model);
+      else selected.delete(model);
+      return { ...current, [plan.plan]: [...selected].sort() };
+    });
   }
 
   function toggleConcurrencyOverride(plan: TokenConcurrencyPlan, enabled: boolean) {
@@ -197,6 +264,18 @@ export function UserSettingsPage({
           )}
         </CardPanel>
       </Card>
+      <TokenModelAccessPanel
+        modelOverrides={modelOverrides}
+        onReset={() => void resetModels()}
+        onSave={() => void saveModels()}
+        onToggleModel={toggleModel}
+        onToggleOverride={toggleModelOverride}
+        error={error}
+        loading={loading}
+        saving={savingModels}
+        settings={modelSettings}
+        userMode
+      />
       <Card className="min-w-0">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -228,6 +307,105 @@ export function UserSettingsPage({
   );
 }
 
+function TokenModelAccessPanel({
+  modelOverrides,
+  error,
+  loading,
+  onReset,
+  onSave,
+  onToggleModel,
+  onToggleOverride,
+  saving,
+  settings,
+  userMode = false,
+}: {
+  modelOverrides: Record<string, string[]>;
+  error: string;
+  loading: boolean;
+  onReset: () => void;
+  onSave: () => void;
+  onToggleModel: (plan: TokenModelAccessPlan, model: string, checked: boolean) => void;
+  onToggleOverride: (plan: TokenModelAccessPlan, enabled: boolean) => void;
+  saving: boolean;
+  settings: TokenModelAccessSettings | null;
+  userMode?: boolean;
+}) {
+  return (
+    <Card className="min-w-0">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Settings2Icon className="size-5" />
+          计划模型
+        </CardTitle>
+        <CardDescription>{userMode ? "按计划选择用户可使用的模型。用户设置优先于管理员默认值。" : "按计划选择默认可用模型，用户可以在自己的设置中覆盖。"}</CardDescription>
+      </CardHeader>
+      <CardPanel className="grid min-w-0 gap-4">
+        {!settings ? (
+          loading ? <LoadingState compact label="正在载入模型设置" /> : <ErrorAlert title="模型设置载入失败" message={error || "未返回模型设置"} />
+        ) : (
+          <>
+            <Alert variant="info">
+              <DatabaseIcon />
+              <AlertTitle>{userMode ? "用户模型覆盖" : "管理员模型默认"}</AlertTitle>
+              <AlertDescription>{userMode ? "关闭自定义会继承管理员设置；灰色模型表示当前计划目录没有返回该模型。" : "未勾选的模型不会被该计划的 token 调度。"}</AlertDescription>
+            </Alert>
+            <div className="grid min-w-0 gap-3 md:grid-cols-2">
+              {(settings.plans || []).map((plan) => {
+                const overridden = Object.hasOwn(modelOverrides, plan.plan);
+                const selected = new Set(overridden ? modelOverrides[plan.plan] : plan.models || []);
+                const modelIDs = [
+                  ...new Set([
+                    ...(settings.models || []).map((model) => model.id),
+                    ...(plan.available_models || []),
+                    ...(plan.models || []),
+                    ...(plan.inherited_models || []),
+                  ]),
+                ].sort();
+                return (
+                  <div className="grid min-w-0 gap-3 rounded-lg border bg-muted/30 p-3" key={plan.plan}>
+                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+                      <div className="min-w-0">
+                        <div className="font-medium [overflow-wrap:anywhere]">{plan.label || plan.plan}</div>
+                        <div className="text-muted-foreground text-xs">{plan.token_count} 个 Key</div>
+                      </div>
+                      <Label className="flex min-h-11 shrink-0 items-center gap-2 text-xs sm:min-h-7">
+                        <Checkbox checked={overridden} onCheckedChange={(value) => onToggleOverride(plan, Boolean(value))} />
+                        自定义
+                      </Label>
+                    </div>
+                    <div className="grid min-w-0 gap-1">
+                      {modelIDs.map((model) => {
+                        const available = (plan.available_models || []).includes(model);
+                        return (
+                          <Label className="flex min-h-11 min-w-0 items-start gap-2 rounded-md px-2 py-2 text-xs hover:bg-muted/60 sm:min-h-8 sm:py-1.5" key={model}>
+                            <Checkbox checked={selected.has(model)} disabled={!overridden || (!available && !selected.has(model))} onCheckedChange={(value) => onToggleModel(plan, model, Boolean(value))} />
+                            <span className="min-w-0 [overflow-wrap:anywhere]">{model}</span>
+                          </Label>
+                        );
+                      })}
+                      {!modelIDs.length && <div className="text-muted-foreground text-xs">暂无已知模型</div>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="grid gap-2 sm:flex sm:flex-wrap">
+              <Button className="w-full sm:w-auto" disabled={saving} loading={saving} onClick={onSave}>
+                <SaveIcon />
+                保存计划模型
+              </Button>
+              <Button className="w-full sm:w-auto" disabled={saving} onClick={onReset} variant="outline">
+                <RotateCcwIcon />
+                全部恢复默认
+              </Button>
+            </div>
+          </>
+        )}
+      </CardPanel>
+    </Card>
+  );
+}
+
 export function SettingsPage({
   onStreamCapChange,
   pushToast,
@@ -248,6 +426,10 @@ export function SettingsPage({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [adminProbeModelSaving, setAdminProbeModelSaving] = useState(false);
+  const [adminModelSettings, setAdminModelSettings] = useState<TokenModelAccessSettings | null>(null);
+  const [adminModelOverrides, setAdminModelOverrides] = useState<Record<string, string[]>>({});
+  const [adminModelsSaving, setAdminModelsSaving] = useState(false);
+  const adminModelsDirtyRef = useRef(false);
 
   const loadTokenSelection = useCallback(async () => {
     const payload = await api.tokenSelection();
@@ -260,10 +442,14 @@ export function SettingsPage({
     setLoading(true);
     setError("");
     try {
-      const [settingsPayload] = await Promise.all([api.settings(), loadTokenSelection()]);
+      const [settingsPayload, , models] = await Promise.all([api.settings(), loadTokenSelection(), api.adminTokenModels()]);
       const nextItems = settingsPayload.items || [];
       setItems(nextItems);
       setAdminProbeModel(testModelFromSettings(nextItems, ADMIN_TOKEN_PROBE_MODEL_SETTING_KEY));
+      setAdminModelSettings(models);
+      if (!adminModelsDirtyRef.current) {
+        setAdminModelOverrides(Object.fromEntries((models.plans || []).filter((plan) => plan.overridden).map((plan) => [plan.plan, plan.models || []])));
+      }
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -311,6 +497,54 @@ export function SettingsPage({
     }
   }
 
+  async function saveAdminModels() {
+    setAdminModelsSaving(true);
+    try {
+      await api.updateAdminTokenModels(adminModelOverrides);
+      pushToast("管理员计划模型已保存");
+      adminModelsDirtyRef.current = false;
+      await loadSettings();
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setAdminModelsSaving(false);
+    }
+  }
+
+  async function resetAdminModels() {
+    setAdminModelsSaving(true);
+    try {
+      await api.resetAdminTokenModels();
+      pushToast("已恢复内置模型默认值", "info");
+      adminModelsDirtyRef.current = false;
+      await loadSettings();
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setAdminModelsSaving(false);
+    }
+  }
+
+  function toggleAdminModelOverride(plan: TokenModelAccessPlan, enabled: boolean) {
+    adminModelsDirtyRef.current = true;
+    setAdminModelOverrides((current) => {
+      const next = { ...current };
+      if (enabled) next[plan.plan] = [...(plan.models || [])];
+      else delete next[plan.plan];
+      return next;
+    });
+  }
+
+  function toggleAdminModel(plan: TokenModelAccessPlan, model: string, checked: boolean) {
+    adminModelsDirtyRef.current = true;
+    setAdminModelOverrides((current) => {
+      const selected = new Set(current[plan.plan] || plan.models || []);
+      if (checked) selected.add(model);
+      else selected.delete(model);
+      return { ...current, [plan.plan]: [...selected].sort() };
+    });
+  }
+
   function saveServiceKey() {
     setServiceKey(serviceKeyDraft);
     pushToast("Service API Key 已保存");
@@ -323,7 +557,20 @@ export function SettingsPage({
   }
 
   return (
-    <div className="grid gap-4 xl:grid-cols-[minmax(320px,.7fr)_minmax(0,1fr)]">
+    <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(320px,.7fr)_minmax(0,1fr)]">
+      <div className="min-w-0 xl:col-span-2">
+        <TokenModelAccessPanel
+          modelOverrides={adminModelOverrides}
+          onReset={() => void resetAdminModels()}
+          onSave={() => void saveAdminModels()}
+          onToggleModel={toggleAdminModel}
+          onToggleOverride={toggleAdminModelOverride}
+          error={error}
+          loading={loading}
+          saving={adminModelsSaving}
+          settings={adminModelSettings}
+        />
+      </div>
       <div className="grid gap-4">
         <Card>
           <CardHeader>

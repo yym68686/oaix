@@ -94,6 +94,35 @@ func TestFrontendUserSettingsExposePlanConcurrencyOverrides(t *testing.T) {
 	}
 }
 
+func TestFrontendSettingsExposePlanModelOverrides(t *testing.T) {
+	page := readFrontendFile(t, "src", "features", "settings", "SettingsPage.tsx")
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+	for _, required := range []string{
+		"计划模型",
+		"用户设置优先于管理员默认值",
+		"api.myTokenModels()",
+		"api.updateMyTokenModels(modelOverrides)",
+		"api.resetMyTokenModels()",
+		"api.adminTokenModels()",
+		"api.updateAdminTokenModels(adminModelOverrides)",
+		"关闭自定义会继承管理员设置",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("user settings model access contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		`myTokenModels: () => requestJSON<TokenModelAccessSettings>("/api/me/token-models")`,
+		`postJSON<TokenModelAccessSettings>("/api/me/token-models"`,
+		`deleteJSON<TokenModelAccessSettings>("/api/me/token-models")`,
+		`adminTokenModels: () => requestJSON<TokenModelAccessSettings>("/admin/token-models")`,
+	} {
+		if !strings.Contains(apiFile, required) {
+			t.Fatalf("frontend model access API contract missing %q", required)
+		}
+	}
+}
+
 func TestFrontendProfileSupportsSavedAccountSwitching(t *testing.T) {
 	appShell := readFrontendFile(t, "src", "app", "AppShell.tsx")
 	router := readFrontendFile(t, "src", "app", "router.ts")

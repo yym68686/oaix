@@ -984,6 +984,47 @@ func TestUserPlanConcurrencyOverridesAdminDefaultWithDatabase(t *testing.T) {
 	}
 }
 
+func TestUserPlanModelAccessOverridesAdministratorDefaultWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	h.app.modelCatalog = nil
+	user, key := h.createUser(t, "plan-model-access")
+	token := h.createToken(t, user.ID, "plan-model-access-pro")
+	cleanup := func() {
+		_, _ = h.db.Pool().Exec(context.Background(), `delete from user_settings where owner_user_id = $1 and key = $2`, user.ID, store.TokenModelAccessSettingKey)
+		_, _ = h.db.Pool().Exec(context.Background(), `delete from gateway_settings where key = $1`, store.TokenModelAccessSettingKey)
+	}
+	defer cleanup()
+
+	expectStatus(t, h.request(t, http.MethodPost, "/admin/token-models", "service-test-key", `{"plan_models":{"pro":["gpt-5.5"]}}`), http.StatusOK)
+	userPayload := expectStatus(t, h.request(t, http.MethodPost, "/api/me/token-models", key.PlaintextKey, `{"plan_models":{"pro":["gpt-5.4-mini"]}}`), http.StatusOK)
+	planItems, _ := userPayload["plans"].([]any)
+	if len(planItems) == 0 {
+		t.Fatalf("user model plans missing: %#v", userPayload)
+	}
+	runtimeToken := h.app.tokens.SnapshotForOwner(user.ID).ByID[token.ID]
+	if runtimeToken == nil || !runtimeToken.Token.ModelAccessConfigured || len(runtimeToken.Token.AllowedModels) != 1 || runtimeToken.Token.AllowedModels[0] != "gpt-5.4-mini" {
+		t.Fatalf("runtime model access = %#v", runtimeToken)
+	}
+	claim, err := h.app.tokens.Claim(context.Background(), tokens.Intent{OwnerUserID: user.ID, Model: "gpt-5.4-mini"})
+	if err != nil || claim == nil {
+		t.Fatalf("user override allowed model claim=%v err=%v", claim, err)
+	}
+	claim.Release()
+	if claim, err := h.app.tokens.Claim(context.Background(), tokens.Intent{OwnerUserID: user.ID, Model: "gpt-5.5"}); claim != nil || err == nil {
+		if claim != nil {
+			claim.Release()
+		}
+		t.Fatalf("user override denied model claim=%v err=%v", claim, err)
+	}
+
+	expectStatus(t, h.request(t, http.MethodDelete, "/api/me/token-models", key.PlaintextKey, ""), http.StatusOK)
+	claim, err = h.app.tokens.Claim(context.Background(), tokens.Intent{OwnerUserID: user.ID, Model: "gpt-5.5"})
+	if err != nil || claim == nil {
+		t.Fatalf("administrator fallback model claim=%v err=%v", claim, err)
+	}
+	claim.Release()
+}
+
 func TestProxyUsesOwnerTokenPoolWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userA, keyA := h.createUser(t, "proxy-a")

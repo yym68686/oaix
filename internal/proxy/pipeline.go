@@ -400,6 +400,15 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			timing["fast_eligibility_error"] = eligibilityErr.Error()
 		}
 	}
+	if intent.Model != "" && !strings.EqualFold(strings.TrimSpace(intent.Model), "gpt-image-2") && intent.Endpoint != "/v1/images/generations" && intent.Endpoint != "/v1/images/edits" {
+		eligible, eligibilityErr := p.tokens.ModelEligibleTokenIDs(r.Context(), baseTokenIntent, intent.Model, time.Now().UTC())
+		baseTokenIntent.RequireModelCapability = true
+		baseTokenIntent.ModelEligibleTokens = eligible
+		timing["model_eligible_tokens"] = len(eligible)
+		if eligibilityErr != nil {
+			timing["model_eligibility_error"] = eligibilityErr.Error()
+		}
+	}
 	for attempt := 1; attempt <= p.cfg.Upstream.MaxRetries; attempt++ {
 		selectStarted := time.Now()
 		tokenIntent := baseTokenIntent

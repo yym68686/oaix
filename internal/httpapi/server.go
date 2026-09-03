@@ -149,6 +149,9 @@ func (a *App) Handler() http.Handler {
 	a.registerPlatformAdminAPIRoutes(mux)
 	mux.HandleFunc("GET /admin/token-selection", a.requireAuth(a.tokenSelection))
 	mux.HandleFunc("POST /admin/token-selection", a.requireAuth(a.updateTokenSelection))
+	mux.HandleFunc("GET /admin/token-models", a.requireAuth(a.getAdminTokenModelAccess))
+	mux.HandleFunc("POST /admin/token-models", a.requireAuth(a.updateAdminTokenModelAccess))
+	mux.HandleFunc("DELETE /admin/token-models", a.requireAuth(a.deleteAdminTokenModelAccess))
 	mux.HandleFunc("GET /admin/tokens", a.requireAuth(a.listTokens))
 	mux.HandleFunc("POST /admin/tokens/batch", a.requireAuth(a.batchTokens))
 	mux.HandleFunc("GET /admin/tokens/costs", a.requireAuth(a.listTokenCosts))
@@ -1436,6 +1439,10 @@ func (a *App) updateSetting(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimSpace(r.PathValue("key"))
 	if key == "" {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
+		return
+	}
+	if key == store.TokenModelAccessSettingKey {
+		writeError(w, http.StatusBadRequest, errors.New("token_model_access must be updated through /admin/token-models"))
 		return
 	}
 	defer r.Body.Close()

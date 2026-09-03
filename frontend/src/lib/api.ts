@@ -366,6 +366,31 @@ export type TokenConcurrencySettings = {
   updated_at?: string | null;
 };
 
+export type TokenModelOption = {
+  id: string;
+  label: string;
+};
+
+export type TokenModelAccessPlan = {
+  plan: string;
+  label: string;
+  token_count: number;
+  models: string[];
+  available_models: string[];
+  capability_known: boolean;
+  inherited_models: string[];
+  override_models?: string[];
+  overridden: boolean;
+};
+
+export type TokenModelAccessSettings = {
+  models: TokenModelOption[];
+  plans: TokenModelAccessPlan[];
+  plan_models: Record<string, string[]>;
+  administrator_plan_models: Record<string, string[]>;
+  updated_at?: string | null;
+};
+
 export type Sub2APITarget = {
   id: number;
   name: string;
@@ -607,10 +632,18 @@ export const api = {
   updateMyTokenConcurrency: (planConcurrency: Record<string, number>) =>
     postJSON<TokenConcurrencySettings>("/api/me/token-concurrency", { plan_concurrency: planConcurrency }),
   resetMyTokenConcurrency: () => deleteJSON<TokenConcurrencySettings>("/api/me/token-concurrency"),
+  myTokenModels: () => requestJSON<TokenModelAccessSettings>("/api/me/token-models"),
+  updateMyTokenModels: (planModels: Record<string, string[]>) =>
+    postJSON<TokenModelAccessSettings>("/api/me/token-models", { plan_models: planModels }),
+  resetMyTokenModels: () => deleteJSON<TokenModelAccessSettings>("/api/me/token-models"),
   runtime: () => requestJSON<Record<string, unknown>>("/admin/runtime"),
   tokenSelection: (authKey?: string) => requestJSON<Record<string, unknown>>("/admin/token-selection", {}, authKey),
   updateTokenSelection: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/token-selection", payload),
+  adminTokenModels: () => requestJSON<TokenModelAccessSettings>("/admin/token-models"),
+  updateAdminTokenModels: (planModels: Record<string, string[]>) =>
+    postJSON<TokenModelAccessSettings>("/admin/token-models", { plan_models: planModels }),
+  resetAdminTokenModels: () => deleteJSON<TokenModelAccessSettings>("/admin/token-models"),
   listTokens: (params: URLSearchParams, scope: TokenAPIScope = "auto") =>
     requestJSON<TokenListResponse>(`${tokenScopedPath("/api/tokens", "/admin/tokens", scope)}?${params.toString()}`),
   getToken: (id: number, includeQuota = false, scope: TokenAPIScope = "auto") => {

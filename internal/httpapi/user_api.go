@@ -33,6 +33,9 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/me/token-concurrency", a.requireAuth(a.getMyTokenConcurrency))
 	mux.HandleFunc("POST /api/me/token-concurrency", a.requireAuth(a.updateMyTokenConcurrency))
 	mux.HandleFunc("DELETE /api/me/token-concurrency", a.requireAuth(a.deleteMyTokenConcurrency))
+	mux.HandleFunc("GET /api/me/token-models", a.requireAuth(a.getMyTokenModelAccess))
+	mux.HandleFunc("POST /api/me/token-models", a.requireAuth(a.updateMyTokenModelAccess))
+	mux.HandleFunc("DELETE /api/me/token-models", a.requireAuth(a.deleteMyTokenModelAccess))
 	mux.HandleFunc("GET /api/tokens", a.requireAuth(a.listMyTokens))
 	mux.HandleFunc("GET /api/tokens/quota", a.requireAuth(a.listMyTokenQuota))
 	mux.HandleFunc("POST /api/tokens/quota-refresh", a.requireAuth(a.createMyQuotaRefreshJob))
@@ -403,8 +406,8 @@ func (a *App) updateMySetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
 		return
 	}
-	if key == store.TokenConcurrencySettingKey {
-		writeError(w, http.StatusBadRequest, errors.New("token_concurrency must be updated through /api/me/token-concurrency"))
+	if key == store.TokenConcurrencySettingKey || key == store.TokenModelAccessSettingKey {
+		writeError(w, http.StatusBadRequest, errors.New("this setting must be updated through its dedicated /api/me endpoint"))
 		return
 	}
 	defer r.Body.Close()
@@ -439,8 +442,8 @@ func (a *App) deleteMySetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
 		return
 	}
-	if key == store.TokenConcurrencySettingKey {
-		writeError(w, http.StatusBadRequest, errors.New("token_concurrency must be reset through /api/me/token-concurrency"))
+	if key == store.TokenConcurrencySettingKey || key == store.TokenModelAccessSettingKey {
+		writeError(w, http.StatusBadRequest, errors.New("this setting must be reset through its dedicated /api/me endpoint"))
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -496,7 +499,7 @@ func (a *App) updateMyTokenConcurrency(w http.ResponseWriter, r *http.Request) {
 		"user_id":          *scope.OwnerUserID,
 		"plan_concurrency": settings.PlanConcurrency,
 	})
-	a.refreshTokenConcurrency(ctx, *scope.OwnerUserID)
+	a.refreshTokenPoolSettings(ctx, *scope.OwnerUserID)
 	a.writeMyTokenConcurrencyForScope(w, ctx, scope, settings)
 }
 
@@ -516,7 +519,7 @@ func (a *App) deleteMyTokenConcurrency(w http.ResponseWriter, r *http.Request) {
 	_ = a.store.WriteAuditLog(ctx, "user_token_concurrency_reset", "self", "user_setting", store.TokenConcurrencySettingKey, map[string]any{
 		"user_id": *scope.OwnerUserID,
 	})
-	a.refreshTokenConcurrency(ctx, *scope.OwnerUserID)
+	a.refreshTokenPoolSettings(ctx, *scope.OwnerUserID)
 	a.writeMyTokenConcurrencyForScope(w, ctx, scope, store.TokenConcurrencySettings{PlanConcurrency: map[string]int64{}})
 }
 
@@ -600,15 +603,15 @@ func (a *App) writeMyTokenConcurrencyForScope(w http.ResponseWriter, ctx context
 	})
 }
 
-func (a *App) refreshTokenConcurrency(ctx context.Context, ownerUserID int64) {
+func (a *App) refreshTokenPoolSettings(ctx context.Context, ownerUserID int64) {
 	if a.tokens == nil {
 		return
 	}
 	if err := a.tokens.Refresh(ctx); err != nil && a.logger != nil {
-		a.logger.Warn("global token pool refresh after user concurrency update failed", "owner_user_id", ownerUserID, "error", err)
+		a.logger.Warn("global token pool refresh after user setting update failed", "owner_user_id", ownerUserID, "error", err)
 	}
 	if err := a.tokens.RefreshOwner(ctx, ownerUserID); err != nil && a.logger != nil {
-		a.logger.Warn("owner token pool refresh after user concurrency update failed", "owner_user_id", ownerUserID, "error", err)
+		a.logger.Warn("owner token pool refresh after user setting update failed", "owner_user_id", ownerUserID, "error", err)
 	}
 }
 

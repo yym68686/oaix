@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/yym68686/oaix/internal/modelaccess"
 )
 
 const (
@@ -146,9 +148,7 @@ func (a *App) models(w http.ResponseWriter, r *http.Request) {
 }
 
 func advertisedModelIDs() []string {
-	modelIDs := make([]string, 0, len(supportedTokenProbeModels)+1)
-	modelIDs = append(modelIDs, supportedTokenProbeModels...)
-	return append(modelIDs, "gpt-image-2")
+	return modelaccess.ModelIDs()
 }
 
 func (a *App) cachedFastModelsForRequest(r *http.Request, clientVersion string) map[string]struct{} {

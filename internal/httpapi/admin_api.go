@@ -281,6 +281,7 @@ func (a *App) openapiSpec(w http.ResponseWriter, r *http.Request) {
 func adminOpenAPISpec() map[string]any {
 	routes := []string{
 		"GET /admin/openapi.json", "GET /admin/options",
+		"GET /admin/token-models", "POST /admin/token-models", "DELETE /admin/token-models",
 		"GET /admin/tokens", "POST /admin/tokens/batch", "GET /admin/token-refresh-tokens/{token_id}", "PATCH /admin/tokens/{token_id}", "GET /admin/tokens/export",
 		"GET /admin/token-quota-reset-credits/{token_id}", "POST /admin/token-quota-reset/{token_id}",
 		"POST /admin/tokens/{token_id}/cooldown", "DELETE /admin/token-cooldown/{token_id}",
@@ -316,6 +317,7 @@ func adminOpenAPISpec() map[string]any {
 		"GET /api/me/pool-summary", "GET /api/me/settings", "GET /api/me/settings/{key}",
 		"POST /api/me/settings/{key}", "DELETE /api/me/settings/{key}",
 		"GET /api/me/token-concurrency", "POST /api/me/token-concurrency", "DELETE /api/me/token-concurrency",
+		"GET /api/me/token-models", "POST /api/me/token-models", "DELETE /api/me/token-models",
 		"GET /api/tokens", "POST /api/tokens/batch", "GET /api/tokens/{token_id}", "GET /api/tokens/{token_id}/refresh-token",
 		"GET /api/tokens/{token_id}/quota-reset-credits", "POST /api/tokens/{token_id}/quota-reset", "PATCH /api/tokens/{token_id}",
 		"DELETE /api/tokens/disabled", "DELETE /api/tokens/{token_id}", "POST /api/tokens/{token_id}/probe",
@@ -1519,6 +1521,10 @@ func (a *App) getSetting(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) deleteSetting(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimSpace(r.PathValue("key"))
+	if key == store.TokenModelAccessSettingKey {
+		writeError(w, http.StatusBadRequest, errors.New("token_model_access must be reset through /admin/token-models"))
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	tag, err := a.store.Pool().Exec(ctx, `delete from gateway_settings where key = $1`, key)
@@ -1558,6 +1564,12 @@ func (a *App) settingsSchema(w http.ResponseWriter, r *http.Request) {
 			"type":       "object",
 			"properties": map[string]any{"model": map[string]any{"type": "string", "enum": supportedTokenProbeModels}},
 			"default":    map[string]any{"model": defaultAdminProbeModel},
+		},
+		"token_model_access": map[string]any{
+			"type": "object",
+			"properties": map[string]any{"plan_models": map[string]any{
+				"type": "object", "additionalProperties": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			}},
 		},
 		"generic": map[string]any{"type": "object"},
 	})

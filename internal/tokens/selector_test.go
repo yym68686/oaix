@@ -290,6 +290,67 @@ func TestRequiredPlanFiltersCatalogProbeClaims(t *testing.T) {
 	claim.Release()
 }
 
+func TestModelAccessPolicyFiltersRuntimeTokens(t *testing.T) {
+	free := "free"
+	pro := "pro"
+	rows := makeTokens(2)
+	rows[0].PlanType = &free
+	rows[0].ModelAccessConfigured = true
+	rows[0].AllowedModels = []string{"gpt-5.4-mini"}
+	rows[1].PlanType = &pro
+	rows[1].ModelAccessConfigured = true
+	rows[1].AllowedModels = []string{}
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.Claim(context.Background(), Intent{Model: "gpt-5.4-mini"})
+	if err != nil || claim == nil || claim.TokenID() != 1 {
+		t.Fatalf("allowed claim=%v err=%v", claim, err)
+	}
+	claim.Release()
+	if claim, err := manager.Claim(context.Background(), Intent{Model: "gpt-5.5"}); claim != nil || err == nil {
+		if claim != nil {
+			claim.Release()
+		}
+		t.Fatalf("denied claim=%v err=%v", claim, err)
+	}
+}
+
+func TestModelCapabilityCatalogFiltersOnlyKnownPlanModels(t *testing.T) {
+	pro := "chatgpt_pro"
+	k12 := "k12"
+	rows := makeTokens(2)
+	for index := range rows {
+		rows[index].OwnerUserID = 10
+	}
+	rows[0].PlanType = &pro
+	rows[1].PlanType = &k12
+	manager := NewManager(&fakeSource{tokens: rows}, nil, testMaxAge, testRefreshInterval, 1)
+	if err := manager.RefreshOwner(context.Background(), 10); err != nil {
+		t.Fatal(err)
+	}
+	validUntil := time.Now().UTC().Add(time.Hour)
+	manager.SetPlanModelCatalog(10, "pro", "0.144.0", []string{"gpt-5.5"}, nil, validUntil)
+	manager.SetPlanModelCatalog(10, k12, "0.144.0", []string{"gpt-5.4-mini"}, nil, validUntil)
+
+	for _, test := range []struct {
+		model string
+		want  int64
+	}{
+		{model: "gpt-5.5", want: 1},
+		{model: "gpt-5.4-mini", want: 2},
+	} {
+		eligible, err := manager.ModelEligibleTokenIDs(context.Background(), Intent{OwnerUserID: 10}, test.model, time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := eligible[test.want]; !ok || len(eligible) != 1 {
+			t.Fatalf("model %s eligible=%#v, want token %d", test.model, eligible, test.want)
+		}
+	}
+}
+
 func TestLatencyAwareSelectorPrefersLowestTTFT(t *testing.T) {
 	manager := NewManager(&fakeSource{tokens: makeTokens(2)}, nil, testMaxAge, testRefreshInterval, 1)
 	if err := manager.Refresh(context.Background()); err != nil {

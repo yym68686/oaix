@@ -40,6 +40,7 @@ type officialModelsCacheEntry struct {
 	plan        string
 	plans       string
 	fastModels  []string
+	models      []string
 	modelCount  int
 	storedAt    time.Time
 	expiresAt   time.Time
@@ -266,7 +267,7 @@ func (a *App) fetchOfficialModelsPlanCatalog(ctx context.Context, ownerUserID in
 		claim.Release()
 		if fetchErr == nil {
 			entry.plan = plan
-			a.tokens.SetPlanModelCapabilities(ownerUserID, plan, clientVersion, entry.fastModels, entry.staleUntil)
+			a.tokens.SetPlanModelCatalog(ownerUserID, plan, clientVersion, entry.models, entry.fastModels, entry.staleUntil)
 			return entry, nil
 		}
 		lastErr = fmt.Errorf("token %d: %w", tokenID, fetchErr)
@@ -361,7 +362,7 @@ func (a *App) fetchOfficialModelsWithClaim(ctx context.Context, claim *tokens.Cl
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return officialModelsCacheEntry{}, fmt.Errorf("official models status %d", resp.StatusCode)
 		}
-		fastModels, modelCount, err := officialFastModels(body)
+		models, fastModels, modelCount, err := officialModelCapabilities(body)
 		if err != nil {
 			return officialModelsCacheEntry{}, fmt.Errorf("decode official models response: %w", err)
 		}
@@ -388,6 +389,7 @@ func (a *App) fetchOfficialModelsWithClaim(ctx context.Context, claim *tokens.Cl
 			etag:        resp.Header.Get("ETag"),
 			plan:        plan,
 			fastModels:  fastModels,
+			models:      models,
 			modelCount:  modelCount,
 			storedAt:    now,
 			expiresAt:   now.Add(cacheTTL),
@@ -401,27 +403,35 @@ func officialModelsCacheKey(ownerUserID int64, plan, clientVersion string) strin
 }
 
 func officialFastModels(body []byte) ([]string, int, error) {
+	_, fastModels, count, err := officialModelCapabilities(body)
+	return fastModels, count, err
+}
+
+func officialModelCapabilities(body []byte) ([]string, []string, int, error) {
 	var payload struct {
 		Models []json.RawMessage `json:"models"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
+	models := make([]string, 0, len(payload.Models))
 	fastModels := make([]string, 0)
 	for _, rawModel := range payload.Models {
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(rawModel, &fields); err != nil {
-			return nil, 0, err
+			return nil, nil, 0, err
 		}
 		var slug string
 		if err := json.Unmarshal(fields["slug"], &slug); err != nil || strings.TrimSpace(slug) == "" {
 			continue
 		}
+		model := strings.TrimSpace(slug)
+		models = append(models, model)
 		if officialModelHasFastTier(fields) {
-			fastModels = append(fastModels, strings.TrimSpace(slug))
+			fastModels = append(fastModels, model)
 		}
 	}
-	return fastModels, len(payload.Models), nil
+	return models, fastModels, len(payload.Models), nil
 }
 
 func officialModelHasFastTier(fields map[string]json.RawMessage) bool {
@@ -470,11 +480,15 @@ func (c *officialModelsCatalog) cached(key string, now time.Time, allowStale boo
 		return officialModelsCacheEntry{}, false
 	}
 	entry.body = append([]byte(nil), entry.body...)
+	entry.models = append([]string(nil), entry.models...)
+	entry.fastModels = append([]string(nil), entry.fastModels...)
 	return entry, true
 }
 
 func (c *officialModelsCatalog) store(key string, entry officialModelsCacheEntry) {
 	entry.body = append([]byte(nil), entry.body...)
+	entry.models = append([]string(nil), entry.models...)
+	entry.fastModels = append([]string(nil), entry.fastModels...)
 	c.mu.Lock()
 	_, exists := c.entries[key]
 	if !exists && len(c.entries) >= officialModelsMaxEntries {

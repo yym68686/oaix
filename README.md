@@ -145,6 +145,8 @@ oaix 现在区分三类 API Key：
 
 普通用户可以通过前端“设置”页或 `GET` / `POST` / `DELETE /api/me/token-concurrency` 按 token 计划设置每个 Key 的并发上限。用户对某个计划设置的上限优先于管理员的全局 `active_stream_cap`；未覆盖的计划继续继承管理员默认值。该限制按 token 所有者生效，因此用户共享到 marketplace 的 Key 也遵守所有者配置。
 
+计划模型白名单通过 `GET` / `POST` / `DELETE /api/me/token-models` 管理。`POST` 请求格式为 `{"plan_models":{"free":["gpt-5.4-mini"],"pro":["gpt-5.5","gpt-5.6-sol"]}}`；出现的计划键是用户显式覆盖，空数组表示该计划禁用全部模型，省略计划则继续继承管理员设置或内置默认值。用户覆盖优先于 `/admin/token-models` 的管理员默认，但不能绕过 OAIX 从官方每计划模型目录探测到的能力边界。白名单按 token 所有者应用，自用与 marketplace 流量行为一致。
+
 ## 路由尝试级幂等
 
 受信任的路由层可在 `/v1/*` 请求上发送 `X-OAIX-Routing-Attempt-ID`。同一 owner、同一尝试 ID、同一请求指纹的并发请求只执行一次；已完成的 `<500` 响应会原样重放，并通过 `X-OAIX-Idempotency-Status` 返回 `executed` 或 `replayed`。同一尝试 ID 搭配不同请求会返回 `409`，协调存储不可用时会在调用上游前返回 `503`。

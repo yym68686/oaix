@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const unknownPlanKey = "<unknown>"
+const unknownPlanKey = "unknown"
 
 type FastCapabilityResolver func(ctx context.Context, ownerUserID int64) error
 
@@ -19,6 +19,8 @@ type planCapabilityKey struct {
 
 type planModelCapability struct {
 	clientVersion string
+	models        map[string]struct{}
+	catalogKnown  bool
 	fastModels    map[string]struct{}
 	validUntil    time.Time
 }
@@ -27,6 +29,14 @@ type planModelCapability struct {
 // plan. Capabilities stay owner-scoped so one workspace's policy cannot grant
 // Fast routing to another workspace that happens to use the same plan name.
 func (m *Manager) SetPlanModelCapabilities(ownerUserID int64, plan, clientVersion string, fastModels []string, validUntil time.Time) {
+	m.setPlanModelCatalog(ownerUserID, plan, clientVersion, nil, fastModels, validUntil, false)
+}
+
+func (m *Manager) SetPlanModelCatalog(ownerUserID int64, plan, clientVersion string, availableModels, fastModels []string, validUntil time.Time) {
+	m.setPlanModelCatalog(ownerUserID, plan, clientVersion, availableModels, fastModels, validUntil, true)
+}
+
+func (m *Manager) setPlanModelCatalog(ownerUserID int64, plan, clientVersion string, availableModels, fastModels []string, validUntil time.Time, catalogKnown bool) {
 	if m == nil || ownerUserID <= 0 {
 		return
 	}
@@ -34,10 +44,16 @@ func (m *Manager) SetPlanModelCapabilities(ownerUserID int64, plan, clientVersio
 		ownerUserID: ownerUserID,
 		plan:        normalizePlanKey(plan),
 	}
-	models := make(map[string]struct{}, len(fastModels))
-	for _, model := range fastModels {
+	models := make(map[string]struct{}, len(availableModels))
+	for _, model := range availableModels {
 		if normalized := normalizeModelKey(model); normalized != "" {
 			models[normalized] = struct{}{}
+		}
+	}
+	fast := make(map[string]struct{}, len(fastModels))
+	for _, model := range fastModels {
+		if normalized := normalizeModelKey(model); normalized != "" {
+			fast[normalized] = struct{}{}
 		}
 	}
 	m.capabilityMu.Lock()
@@ -55,10 +71,81 @@ func (m *Manager) SetPlanModelCapabilities(ownerUserID int64, plan, clientVersio
 	}
 	m.capabilities[key] = planModelCapability{
 		clientVersion: strings.TrimSpace(clientVersion),
-		fastModels:    models,
+		models:        models,
+		catalogKnown:  catalogKnown,
+		fastModels:    fast,
 		validUntil:    validUntil,
 	}
 	m.capabilityMu.Unlock()
+}
+
+func (m *Manager) ModelsForOwnerPlan(ownerUserID int64, plan, clientVersion string, now time.Time) ([]string, bool) {
+	if m == nil || ownerUserID <= 0 {
+		return nil, false
+	}
+	key := planCapabilityKey{ownerUserID: ownerUserID, plan: normalizePlanKey(plan)}
+	m.capabilityMu.RLock()
+	capability, ok := m.capabilities[key]
+	m.capabilityMu.RUnlock()
+	if !ok || !capability.catalogKnown || capabilityExpired(capability, now) || strings.TrimSpace(clientVersion) != "" && capability.clientVersion != strings.TrimSpace(clientVersion) {
+		return nil, false
+	}
+	models := make([]string, 0, len(capability.models))
+	for model := range capability.models {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	return models, true
+}
+
+// ModelEligibleTokenIDs uses a successfully fetched official per-plan catalog
+// as a hard capability boundary. Plans without a current catalog remain
+// eligible so a catalog outage cannot take otherwise healthy traffic offline.
+func (m *Manager) ModelEligibleTokenIDs(ctx context.Context, intent Intent, model string, now time.Time) (map[int64]struct{}, error) {
+	eligible := make(map[int64]struct{})
+	if m == nil || normalizeModelKey(model) == "" || normalizeModelKey(model) == "gpt-image-2" {
+		return eligible, nil
+	}
+	snapshot, _, err := m.snapshotForClaim(ctx, intent)
+	if err != nil {
+		return eligible, err
+	}
+	m.capabilityMu.RLock()
+	known := m.anyModelCapabilityKnownLocked(snapshot, now)
+	resolver := m.fastResolver
+	m.capabilityMu.RUnlock()
+	var resolveErr error
+	if !known && resolver != nil && intent.OwnerUserID > 0 {
+		resolveErr = resolver(ctx, intent.OwnerUserID)
+	}
+	m.capabilityMu.RLock()
+	defer m.capabilityMu.RUnlock()
+	for _, token := range snapshot.Ready {
+		if token == nil {
+			continue
+		}
+		capability, ok := m.capabilities[planCapabilityKey{ownerUserID: token.Token.OwnerUserID, plan: planKeyForToken(token)}]
+		if !ok || !capability.catalogKnown || capabilityExpired(capability, now) || fastModelSetMatches(capability.models, model) {
+			eligible[token.Token.ID] = struct{}{}
+		}
+	}
+	return eligible, resolveErr
+}
+
+func (m *Manager) anyModelCapabilityKnownLocked(snapshot *Snapshot, now time.Time) bool {
+	if snapshot == nil {
+		return false
+	}
+	for _, token := range snapshot.Ready {
+		if token == nil {
+			continue
+		}
+		capability, ok := m.capabilities[planCapabilityKey{ownerUserID: token.Token.OwnerUserID, plan: planKeyForToken(token)}]
+		if ok && capability.catalogKnown && !capabilityExpired(capability, now) {
+			return true
+		}
+	}
+	return false
 }
 
 // SetFastCapabilityResolver installs the on-demand catalog probe used when a
@@ -216,6 +303,7 @@ func planKeyForToken(token *RuntimeToken) string {
 
 func normalizePlanKey(plan string) string {
 	plan = strings.ToLower(strings.TrimSpace(plan))
+	plan = strings.TrimPrefix(plan, "chatgpt_")
 	if plan == "" {
 		return unknownPlanKey
 	}
