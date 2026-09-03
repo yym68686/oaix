@@ -154,7 +154,7 @@ export function UserSettingsPage({
                           <div className="font-medium [overflow-wrap:anywhere]">{plan.label || plan.plan}</div>
                           <div className="text-muted-foreground text-xs">{plan.token_count} 个 Key</div>
                         </div>
-                        <Label className="flex min-h-7 shrink-0 items-center gap-2 text-xs">
+                        <Label className="flex min-h-11 shrink-0 items-center gap-2 text-xs sm:min-h-7">
                           <Checkbox checked={overridden} onCheckedChange={(value) => toggleConcurrencyOverride(plan, Boolean(value))} />
                           自定义
                         </Label>
