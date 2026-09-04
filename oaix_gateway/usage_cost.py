@@ -11,6 +11,9 @@ class ModelPricing:
     output_per_million_usd: float
     cached_input_per_million_usd: float | None = None
     cache_write_input_per_million_usd: float | None = None
+    long_context_threshold_tokens: int | None = None
+    long_context_input_multiplier: float = 1.0
+    long_context_output_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,15 @@ class UsageMetrics:
 
 
 DEFAULT_MODEL_PRICING: dict[str, ModelPricing] = {
+    "gpt-6-astra": ModelPricing(
+        input_per_million_usd=10.0,
+        cache_write_input_per_million_usd=12.5,
+        cached_input_per_million_usd=1.0,
+        output_per_million_usd=50.0,
+        long_context_threshold_tokens=272_000,
+        long_context_input_multiplier=2.0,
+        long_context_output_multiplier=1.5,
+    ),
     "gpt-5.6-sol": ModelPricing(
         input_per_million_usd=5.0,
         cache_write_input_per_million_usd=6.25,
@@ -132,11 +144,22 @@ def _env_model_pricing() -> dict[str, ModelPricing]:
         except (TypeError, ValueError):
             cache_write_price = None
 
+        long_context_threshold = _normalize_int(value.get("long_context_threshold_tokens"))
+        try:
+            long_context_input_multiplier = max(0.0, float(value.get("long_context_input_multiplier", 1.0)))
+            long_context_output_multiplier = max(0.0, float(value.get("long_context_output_multiplier", 1.0)))
+        except (TypeError, ValueError):
+            long_context_input_multiplier = 1.0
+            long_context_output_multiplier = 1.0
+
         pricing[model_name] = ModelPricing(
             input_per_million_usd=max(0.0, input_price),
             output_per_million_usd=max(0.0, output_price),
             cached_input_per_million_usd=max(0.0, cached_price) if cached_price is not None else None,
             cache_write_input_per_million_usd=max(0.0, cache_write_price) if cache_write_price is not None else None,
+            long_context_threshold_tokens=long_context_threshold,
+            long_context_input_multiplier=long_context_input_multiplier,
+            long_context_output_multiplier=long_context_output_multiplier,
         )
     return pricing
 
@@ -151,6 +174,12 @@ def resolve_model_pricing(model_name: str | None) -> tuple[str | None, ModelPric
         return normalized, env_pricing[normalized]
     if normalized in DEFAULT_MODEL_PRICING:
         return normalized, DEFAULT_MODEL_PRICING[normalized]
+
+    if normalized.startswith("gpt-6-astra-"):
+        pricing = env_pricing.get("gpt-6-astra") or DEFAULT_MODEL_PRICING["gpt-6-astra"]
+        return "gpt-6-astra", pricing
+    if normalized.startswith("gpt-6"):
+        return None, None
 
     for family_name in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
         if normalized.startswith(f"{family_name}-"):
@@ -189,29 +218,43 @@ def estimate_usage_cost(
     output_tokens: int,
     cache_write_input_tokens: int = 0,
     cached_input_tokens: int = 0,
+    long_context_pricing_enabled: bool = False,
 ) -> tuple[float | None, str | None]:
     pricing_model, pricing = resolve_model_pricing(model_name)
     if pricing is None:
         return None, None
 
+    long_context = (
+        long_context_pricing_enabled
+        and pricing.long_context_threshold_tokens is not None
+        and input_tokens > pricing.long_context_threshold_tokens
+    )
+    input_multiplier = pricing.long_context_input_multiplier if long_context else 1.0
+    output_multiplier = pricing.long_context_output_multiplier if long_context else 1.0
+
     non_cached_input_tokens = max(0, input_tokens - cached_input_tokens)
     if pricing.cache_write_input_per_million_usd is not None:
         non_cached_input_tokens = max(0, non_cached_input_tokens - cache_write_input_tokens)
     estimated_cost_usd = (
-        (non_cached_input_tokens / 1_000_000.0) * pricing.input_per_million_usd
-        + (output_tokens / 1_000_000.0) * pricing.output_per_million_usd
+        (non_cached_input_tokens / 1_000_000.0) * pricing.input_per_million_usd * input_multiplier
+        + (output_tokens / 1_000_000.0) * pricing.output_per_million_usd * output_multiplier
     )
     if pricing.cache_write_input_per_million_usd is not None and cache_write_input_tokens > 0:
         estimated_cost_usd += (
             cache_write_input_tokens / 1_000_000.0
-        ) * pricing.cache_write_input_per_million_usd
+        ) * pricing.cache_write_input_per_million_usd * input_multiplier
     if pricing.cached_input_per_million_usd is not None and cached_input_tokens > 0:
-        estimated_cost_usd += (cached_input_tokens / 1_000_000.0) * pricing.cached_input_per_million_usd
+        estimated_cost_usd += (cached_input_tokens / 1_000_000.0) * pricing.cached_input_per_million_usd * input_multiplier
 
     return round(estimated_cost_usd, 8), pricing_model
 
 
-def extract_usage_metrics(payload: Any, *, model_name: str | None = None) -> UsageMetrics | None:
+def extract_usage_metrics(
+    payload: Any,
+    *,
+    model_name: str | None = None,
+    long_context_pricing_enabled: bool = False,
+) -> UsageMetrics | None:
     usage_obj = None
     if isinstance(payload, dict):
         if isinstance(payload.get("usage"), dict):
@@ -259,6 +302,7 @@ def extract_usage_metrics(payload: Any, *, model_name: str | None = None) -> Usa
         output_tokens=effective_output_tokens,
         cache_write_input_tokens=cache_write_input_tokens,
         cached_input_tokens=cached_input_tokens,
+        long_context_pricing_enabled=long_context_pricing_enabled,
     )
     return UsageMetrics(
         input_tokens=effective_input_tokens,

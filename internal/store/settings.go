@@ -18,6 +18,7 @@ const (
 	TokenSelectionSettingKey        = "token_selection"
 	TokenConcurrencySettingKey      = "token_concurrency"
 	Ordinary429CooldownSettingKey   = "ordinary_429_cooldown"
+	GPT6AstraLongContextSettingKey  = "gpt6_astra_long_context_pricing"
 	DefaultTokenSelectionStrategy   = "least_recently_used"
 	TokenSelectionStrategyFillFirst = "fill_first"
 	MinTokenActiveStreamCap         = int64(1)
@@ -52,6 +53,11 @@ type Ordinary429CooldownSettings struct {
 	UpdatedAt       *time.Time `json:"updated_at,omitempty"`
 }
 
+type GPT6AstraLongContextPricingSettings struct {
+	Enabled   bool       `json:"enabled"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
 // TokenConcurrencySettings contains only the user-owned per-plan overrides.
 // An absent plan is intentionally different from a value of zero: absent means
 // inherit the administrator's global active stream cap, while every stored
@@ -83,6 +89,53 @@ type tokenConcurrencyPayload struct {
 
 type ordinary429CooldownPayload struct {
 	CooldownSeconds int64 `json:"cooldown_seconds"`
+}
+
+type gpt6AstraLongContextPricingPayload struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *Store) GetGPT6AstraLongContextPricingSettings(ctx context.Context) (GPT6AstraLongContextPricingSettings, error) {
+	setting, err := s.GetSetting(ctx, GPT6AstraLongContextSettingKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return GPT6AstraLongContextPricingSettings{}, nil
+	}
+	if err != nil {
+		return GPT6AstraLongContextPricingSettings{}, err
+	}
+	settings := buildGPT6AstraLongContextPricingSettings(setting.Value)
+	updatedAt := setting.UpdatedAt.UTC()
+	settings.UpdatedAt = &updatedAt
+	return settings, nil
+}
+
+func (s *Store) UpdateGPT6AstraLongContextPricingSettings(ctx context.Context, enabled bool) (GPT6AstraLongContextPricingSettings, error) {
+	payload, err := json.Marshal(gpt6AstraLongContextPricingPayload{Enabled: enabled})
+	if err != nil {
+		return GPT6AstraLongContextPricingSettings{}, err
+	}
+	setting, err := s.UpsertSetting(ctx, GPT6AstraLongContextSettingKey, payload)
+	if err != nil {
+		return GPT6AstraLongContextPricingSettings{}, err
+	}
+	updatedAt := setting.UpdatedAt.UTC()
+	return GPT6AstraLongContextPricingSettings{Enabled: enabled, UpdatedAt: &updatedAt}, nil
+}
+
+func (s *Store) DeleteGPT6AstraLongContextPricingSettings(ctx context.Context) error {
+	return s.deleteGlobalSetting(ctx, GPT6AstraLongContextSettingKey)
+}
+
+func buildGPT6AstraLongContextPricingSettings(raw json.RawMessage) GPT6AstraLongContextPricingSettings {
+	settings := GPT6AstraLongContextPricingSettings{}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return settings
+	}
+	var payload gpt6AstraLongContextPricingPayload
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		settings.Enabled = payload.Enabled
+	}
+	return settings
 }
 
 func (s *Store) GetOrdinary429CooldownSettings(ctx context.Context, fallback time.Duration) (Ordinary429CooldownSettings, error) {

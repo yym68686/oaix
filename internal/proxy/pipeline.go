@@ -43,20 +43,21 @@ const (
 )
 
 type Pipeline struct {
-	cfg                        config.Config
-	logger                     *slog.Logger
-	tokens                     *tokens.Manager
-	transport                  *transport.Client
-	logs                       *logs.Writer
-	store                      tokenStateStore
-	affinity                   affinity.Store
-	oauthClient                oauth.Client
-	modelCapabilityLossHandler TokenModelCapabilityLossHandler
-	agentIdentityTaskMu        sync.Mutex
-	agentIdentityTasks         *agentidentitytask.Coordinator
-	agentIdentityCredentials   sync.Map
-	commitFailures             atomic.Int64
-	ordinary429CooldownNanos   atomic.Int64
+	cfg                         config.Config
+	logger                      *slog.Logger
+	tokens                      *tokens.Manager
+	transport                   *transport.Client
+	logs                        *logs.Writer
+	store                       tokenStateStore
+	affinity                    affinity.Store
+	oauthClient                 oauth.Client
+	modelCapabilityLossHandler  TokenModelCapabilityLossHandler
+	agentIdentityTaskMu         sync.Mutex
+	agentIdentityTasks          *agentidentitytask.Coordinator
+	agentIdentityCredentials    sync.Map
+	commitFailures              atomic.Int64
+	ordinary429CooldownNanos    atomic.Int64
+	gpt6AstraLongContextPricing atomic.Bool
 }
 
 type TokenModelCapabilityLoss struct {
@@ -206,6 +207,16 @@ func (p *Pipeline) Ordinary429Cooldown() time.Duration {
 		return value
 	}
 	return 5 * time.Minute
+}
+
+func (p *Pipeline) SetGPT6AstraLongContextPricing(enabled bool) {
+	if p != nil {
+		p.gpt6AstraLongContextPricing.Store(enabled)
+	}
+}
+
+func (p *Pipeline) GPT6AstraLongContextPricingEnabled() bool {
+	return p != nil && p.gpt6AstraLongContextPricing.Load()
 }
 
 func (p *Pipeline) AgentIdentityTaskCoordinator() *agentidentitytask.Coordinator {
@@ -1245,7 +1256,7 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		_, copyErr := io.Copy(w, io.TeeReader(resp.Body, capture))
 		result := AttemptResult{Status: resp.StatusCode, Committed: true}
 		if !capture.Truncated() {
-			result.Usage, result.ResponseID = extractResponseMetrics(capture.Bytes(), attempt.Intent.Model, attempt.Intent.RequireFast)
+			result.Usage, result.ResponseID = extractResponseMetrics(capture.Bytes(), attempt.Intent.Model, attempt.Intent.RequireFast, p.GPT6AstraLongContextPricingEnabled())
 		}
 		if copyErr != nil {
 			return result, copyErr

@@ -111,6 +111,12 @@ func TestFrontendSettingsExposePlanModelOverrides(t *testing.T) {
 			t.Fatalf("user settings model access contract missing %q", required)
 		}
 	}
+	if strings.Contains(page, "...(settings.models || []).map") {
+		t.Fatal("plan model choices must not be polluted by the hardcoded global model catalog")
+	}
+	if !strings.Contains(page, "...(plan.available_models || [])") || !strings.Contains(page, "官方目录自动更新") {
+		t.Fatal("plan model choices must follow each plan's fetched official catalog")
+	}
 	for _, required := range []string{
 		`myTokenModels: () => requestJSON<TokenModelAccessSettings>("/api/me/token-models")`,
 		`postJSON<TokenModelAccessSettings>("/api/me/token-models"`,
@@ -119,6 +125,32 @@ func TestFrontendSettingsExposePlanModelOverrides(t *testing.T) {
 	} {
 		if !strings.Contains(apiFile, required) {
 			t.Fatalf("frontend model access API contract missing %q", required)
+		}
+	}
+}
+
+func TestFrontendSettingsExposeGPT6AstraLongContextPricing(t *testing.T) {
+	page := readFrontendFile(t, "src", "features", "settings", "SettingsPage.tsx")
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+	for _, required := range []string{
+		"GPT-6 Astra 计费",
+		"超过 272K token 启用 API 长上下文阶梯价",
+		"默认关闭",
+		"api.gpt6AstraLongContextPricing()",
+		"api.updateGPT6AstraLongContextPricing(gpt6AstraLongContextEnabled)",
+		"api.resetGPT6AstraLongContextPricing()",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("GPT-6 Astra pricing settings contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		`requestJSON<GPT6AstraLongContextPricingSettings>("/admin/gpt6-astra-long-context-pricing")`,
+		`postJSON<GPT6AstraLongContextPricingSettings>("/admin/gpt6-astra-long-context-pricing"`,
+		`deleteJSON<GPT6AstraLongContextPricingSettings>("/admin/gpt6-astra-long-context-pricing")`,
+	} {
+		if !strings.Contains(apiFile, required) {
+			t.Fatalf("GPT-6 Astra pricing API contract missing %q", required)
 		}
 	}
 }

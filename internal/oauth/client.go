@@ -71,7 +71,7 @@ const (
 	ErrorClassTerminal  ErrorClass = "terminal"
 )
 
-const codexUserAgent = "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+const codexUserAgent = "codex_cli_rs/0.153.2 (Debian 13.0.0; x86_64) WindowsTerminal"
 
 func NewHTTPClient(tokenURL string) *HTTPClient {
 	return &HTTPClient{

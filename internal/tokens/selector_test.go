@@ -147,9 +147,9 @@ func TestFastCapabilityIsHardConstraintAcrossSelectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	validUntil := time.Now().UTC().Add(time.Hour)
-	manager.SetPlanModelCapabilities(10, free, "0.144.0", nil, validUntil)
-	manager.SetPlanModelCapabilities(10, k12, "0.144.0", nil, validUntil)
-	manager.SetPlanModelCapabilities(10, pro, "0.144.0", []string{"gpt-5.5"}, validUntil)
+	manager.SetPlanModelCapabilities(10, free, "0.153.2", nil, validUntil)
+	manager.SetPlanModelCapabilities(10, k12, "0.153.2", nil, validUntil)
+	manager.SetPlanModelCapabilities(10, pro, "0.153.2", []string{"gpt-5.5"}, validUntil)
 
 	base := Intent{OwnerUserID: 10}
 	eligible, err := manager.FastEligibleTokenIDs(context.Background(), base, "gpt-5.5", time.Now().UTC())
@@ -196,7 +196,7 @@ func TestFastCapabilityExpiresAndIsModelSpecific(t *testing.T) {
 	if err := manager.RefreshOwner(context.Background(), 10); err != nil {
 		t.Fatal(err)
 	}
-	manager.SetPlanModelCapabilities(10, pro, "0.144.0", []string{"gpt-5.5"}, time.Now().UTC().Add(time.Minute))
+	manager.SetPlanModelCapabilities(10, pro, "0.153.2", []string{"gpt-5.5"}, time.Now().UTC().Add(time.Minute))
 
 	base := Intent{OwnerUserID: 10}
 	eligible, err := manager.FastEligibleTokenIDs(context.Background(), base, "gpt-5.4", time.Now().UTC())
@@ -226,7 +226,7 @@ func TestLatestPlanCapabilityReplacesOlderClientVersion(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	manager.SetPlanModelCapabilities(10, pro, "0.143.0", []string{"gpt-5.5"}, now.Add(time.Hour))
-	manager.SetPlanModelCapabilities(10, pro, "0.144.0", nil, now.Add(time.Hour))
+	manager.SetPlanModelCapabilities(10, pro, "0.153.2", nil, now.Add(time.Hour))
 	manager.SetPlanModelCapabilities(10, pro, "0.143.9", []string{"gpt-5.5"}, now.Add(time.Hour))
 	manager.SetPlanModelCapabilities(10, pro, "not-a-version", []string{"gpt-5.5"}, now.Add(time.Hour))
 
@@ -254,7 +254,7 @@ func TestFastEligibilityResolvesColdCapabilitiesOnDemand(t *testing.T) {
 	resolverCalls := 0
 	manager.SetFastCapabilityResolver(func(_ context.Context, ownerUserID int64) error {
 		resolverCalls++
-		manager.SetPlanModelCapabilities(ownerUserID, pro, "0.144.0", []string{"gpt-5.5"}, time.Now().UTC().Add(time.Hour))
+		manager.SetPlanModelCapabilities(ownerUserID, pro, "0.153.2", []string{"gpt-5.5"}, time.Now().UTC().Add(time.Hour))
 		return nil
 	})
 
@@ -331,8 +331,8 @@ func TestModelCapabilityCatalogFiltersOnlyKnownPlanModels(t *testing.T) {
 		t.Fatal(err)
 	}
 	validUntil := time.Now().UTC().Add(time.Hour)
-	manager.SetPlanModelCatalog(10, "pro", "0.144.0", []string{"gpt-5.5"}, nil, validUntil)
-	manager.SetPlanModelCatalog(10, k12, "0.144.0", []string{"gpt-5.4-mini"}, nil, validUntil)
+	manager.SetPlanModelCatalog(10, "pro", "0.153.2", []string{"gpt-5.5"}, nil, validUntil)
+	manager.SetPlanModelCatalog(10, k12, "0.153.2", []string{"gpt-5.4-mini"}, nil, validUntil)
 
 	for _, test := range []struct {
 		model string

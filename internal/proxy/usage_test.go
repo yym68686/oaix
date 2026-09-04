@@ -78,6 +78,78 @@ func TestGPT56PricingFamilies(t *testing.T) {
 	}
 }
 
+func TestGPT6AstraUsesOfficialAPIPricing(t *testing.T) {
+	pricing, ok := pricingForModel("gpt-6-astra-2026-09-03")
+	if !ok || pricing.name != "gpt-6-astra" || pricing.billingMode != usageBillingModeOpenAIPromptCache {
+		t.Fatalf("unexpected pricing: %+v, %v", pricing, ok)
+	}
+	if pricing.cacheWrite == nil || pricing.cached == nil || pricing.input != 10 || *pricing.cacheWrite != 12.5 || *pricing.cached != 1 || pricing.output != 50 {
+		t.Fatalf("unexpected official rates: %+v", pricing)
+	}
+
+	usage := extractUsageMetricsForPricingPolicy(map[string]any{
+		"usage": map[string]any{
+			"input_tokens": 100,
+			"input_tokens_details": map[string]any{
+				"cache_write_tokens": 20,
+				"cached_tokens":      30,
+			},
+			"output_tokens": 10,
+		},
+	}, "gpt-6-astra", true, false)
+	if usage == nil {
+		t.Fatal("usage is nil")
+	}
+	assertCost(t, usage.BaseCostUSD, 0.00128)
+	assertCost(t, usage.EstimatedCostUSD, 0.00256)
+	if usage.BillingMultiplier != 2 || !usage.FastMode || usage.LongContextPricing {
+		t.Fatalf("unexpected billing metadata: %+v", usage)
+	}
+}
+
+func TestGPT6AstraLongContextPricingIsOptIn(t *testing.T) {
+	payload := map[string]any{
+		"usage": map[string]any{
+			"input_tokens": 300_000,
+			"input_tokens_details": map[string]any{
+				"cache_write_tokens": 20_000,
+				"cached_tokens":      30_000,
+			},
+			"output_tokens": 10_000,
+		},
+	}
+	standard := extractUsageMetricsForPricingPolicy(payload, "gpt-6-astra", false, false)
+	if standard == nil {
+		t.Fatal("standard usage is nil")
+	}
+	assertCost(t, standard.EstimatedCostUSD, 3.28)
+	if standard.LongContextPricing {
+		t.Fatalf("long-context pricing unexpectedly enabled: %+v", standard)
+	}
+
+	longContext := extractUsageMetricsForPricingPolicy(payload, "gpt-6-astra", false, true)
+	if longContext == nil {
+		t.Fatal("long-context usage is nil")
+	}
+	assertCost(t, longContext.EstimatedCostUSD, 6.31)
+	if !longContext.LongContextPricing || longContext.LongContextThresholdTokens != 272_000 {
+		t.Fatalf("long-context pricing metadata = %+v", longContext)
+	}
+	if longContext.InputPricePerMillionUSD != 20 || longContext.CacheWritePricePerMillionUSD == nil || *longContext.CacheWritePricePerMillionUSD != 25 || longContext.CachedInputPricePerMillionUSD == nil || *longContext.CachedInputPricePerMillionUSD != 2 || longContext.OutputPricePerMillionUSD != 75 {
+		t.Fatalf("long-context effective rates = %+v", longContext)
+	}
+	billing, _ := longContext.Trace()["billing"].(map[string]any)
+	if billing["long_context_pricing"] != true || billing["long_context_threshold_tokens"] != 272_000 {
+		t.Fatalf("long-context trace = %#v", billing)
+	}
+}
+
+func TestUnknownGPT6VariantIsNotGuessed(t *testing.T) {
+	if pricing, ok := pricingForModel("gpt-6-unknown"); ok {
+		t.Fatalf("unexpected pricing for unknown GPT-6 variant: %+v", pricing)
+	}
+}
+
 func TestFastUsageCostMultipliersUseNormalizedIntent(t *testing.T) {
 	payload := map[string]any{
 		"usage": map[string]any{

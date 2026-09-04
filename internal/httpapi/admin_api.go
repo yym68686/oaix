@@ -282,6 +282,7 @@ func adminOpenAPISpec() map[string]any {
 	routes := []string{
 		"GET /admin/openapi.json", "GET /admin/options",
 		"GET /admin/ordinary-429-cooldown", "POST /admin/ordinary-429-cooldown", "DELETE /admin/ordinary-429-cooldown",
+		"GET /admin/gpt6-astra-long-context-pricing", "POST /admin/gpt6-astra-long-context-pricing", "DELETE /admin/gpt6-astra-long-context-pricing",
 		"GET /admin/token-models", "POST /admin/token-models", "DELETE /admin/token-models",
 		"GET /admin/tokens", "POST /admin/tokens/batch", "GET /admin/token-refresh-tokens/{token_id}", "PATCH /admin/tokens/{token_id}", "GET /admin/tokens/export",
 		"GET /admin/token-quota-reset-credits/{token_id}", "POST /admin/token-quota-reset/{token_id}",
@@ -1522,7 +1523,7 @@ func (a *App) getSetting(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) deleteSetting(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimSpace(r.PathValue("key"))
-	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey {
+	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey {
 		writeError(w, http.StatusBadRequest, errors.New("this setting must be reset through its dedicated API"))
 		return
 	}
@@ -1569,6 +1570,11 @@ func (a *App) settingsSchema(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 			"default": map[string]any{"cooldown_seconds": int64(store.DefaultOrdinary429Cooldown / time.Second)},
+		},
+		"gpt6_astra_long_context_pricing": map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"enabled": map[string]any{"type": "boolean"}},
+			"default":    map[string]any{"enabled": false},
 		},
 		"admin_token_probe_model": map[string]any{
 			"type":       "object",

@@ -17,11 +17,11 @@ import (
 )
 
 func TestModelsReturnsAndCachesOfficialCatalog(t *testing.T) {
-	const officialBody = `{"models":[{"slug":"gpt-5.6-sol","supported_reasoning_levels":[{"effort":"max","description":"Maximum reasoning depth"}]}]}`
+	const officialBody = `{"models":[{"slug":"gpt-6-astra","supported_reasoning_levels":[{"effort":"max","description":"Maximum reasoning depth"}]},{"slug":"gpt-5.6-sol"}]}`
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		if got := r.URL.Query().Get("client_version"); got != "0.144.0" {
+		if got := r.URL.Query().Get("client_version"); got != "0.153.2" {
 			t.Errorf("client_version = %q", got)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer access-pro" {
@@ -62,6 +62,10 @@ func TestModelsReturnsAndCachesOfficialCatalog(t *testing.T) {
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("official requests = %d, want 1", got)
 	}
+	models, ok := app.tokens.ModelsForOwnerPlan(ownerUserID, "pro", defaultCodexClientVersion, time.Now().UTC())
+	if !ok || !equalStrings(models, []string{"gpt-5.6-sol", "gpt-6-astra"}) {
+		t.Fatalf("cached plan models = %#v, %v; want dynamic GPT-6 Astra catalog", models, ok)
+	}
 }
 
 func TestOfficialModelsAgentIdentityUsesAssertionAndWorkspaceHeaders(t *testing.T) {
@@ -76,7 +80,7 @@ func TestOfficialModelsAgentIdentityUsesAssertionAndWorkspaceHeaders(t *testing.
 		if got := r.Header.Get("X-OpenAI-FedRAMP"); got != "true" {
 			t.Errorf("X-OpenAI-FedRAMP = %q", got)
 		}
-		if got := r.Header.Get("Version"); got != "0.144.0" {
+		if got := r.Header.Get("Version"); got != "0.153.2" {
 			t.Errorf("Version = %q", got)
 		}
 		_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.6-sol"}]}`)
@@ -175,7 +179,7 @@ func TestOfficialModelsRetriesAnotherAvailableAccount(t *testing.T) {
 	app.modelCatalog.upstreamURL = server.URL
 	app.modelCatalog.maxAttempts = 2
 
-	entry, err := app.fetchOfficialModelsPlanCatalog(context.Background(), ownerUserID, "pro", "0.144.0")
+	entry, err := app.fetchOfficialModelsPlanCatalog(context.Background(), ownerUserID, "pro", "0.153.2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,15 +438,16 @@ func TestOfficialModelCapabilitiesReturnsAllModelSlugsAndFastSubset(t *testing.T
 	models, fastModels, count, err := officialModelCapabilities([]byte(`{"models":[
 		{"slug":"gpt-5.4","additional_speed_tiers":["fast"],"service_tiers":[]},
 		{"slug":"gpt-5.5","service_tiers":[{"id":"priority","name":"Fast"}]},
-		{"slug":"gpt-5.6-sol","service_tiers":[]}
+		{"slug":"gpt-5.6-sol","service_tiers":[]},
+		{"slug":"gpt-6-astra","service_tiers":[{"id":"priority","name":"Fast"}]}
 	]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 || !equalStrings(models, []string{"gpt-5.4", "gpt-5.5", "gpt-5.6-sol"}) {
+	if count != 4 || !equalStrings(models, []string{"gpt-5.4", "gpt-5.5", "gpt-5.6-sol", "gpt-6-astra"}) {
 		t.Fatalf("models=%#v count=%d", models, count)
 	}
-	if !equalStrings(fastModels, []string{"gpt-5.5"}) {
+	if !equalStrings(fastModels, []string{"gpt-5.5", "gpt-6-astra"}) {
 		t.Fatalf("fast models=%#v", fastModels)
 	}
 }
@@ -458,7 +463,7 @@ func modelsCatalogTestApp(t *testing.T, ownerUserID int64, rows []store.Token) *
 }
 
 func serveModelsForOwner(app *App, ownerUserID int64) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.144.0", nil)
+	request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.2", nil)
 	request = withAuthContext(request, &AuthContext{UserID: &ownerUserID})
 	response := httptest.NewRecorder()
 	app.models(response, request)

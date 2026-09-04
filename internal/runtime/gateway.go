@@ -66,6 +66,12 @@ func RunGateway(ctx context.Context) error {
 	} else {
 		ordinary429Cooldown = time.Duration(settings.CooldownSeconds) * time.Second
 	}
+	gpt6AstraLongContextPricing := false
+	if settings, err := db.GetGPT6AstraLongContextPricingSettings(ctx); err != nil {
+		logger.Warn("GPT-6 Astra long-context pricing settings load failed; using disabled default", "error", err)
+	} else {
+		gpt6AstraLongContextPricing = settings.Enabled
+	}
 	tokenManager := tokens.NewManager(db, logger, cfg.TokenPool.SnapshotMaxAge, cfg.TokenPool.RefreshInterval, activeStreamCap)
 	tokenManager.Start(ctx)
 	logWriter := logs.NewWriter(db, logger, cfg.RequestLog)
@@ -76,6 +82,7 @@ func RunGateway(ctx context.Context) error {
 	affinityStore := affinity.NewPostgresStore(db.Pool())
 	pipeline := proxy.New(cfg, logger, tokenManager, upstream, logWriter, db, affinityStore)
 	pipeline.SetOrdinary429Cooldown(ordinary429Cooldown)
+	pipeline.SetGPT6AstraLongContextPricing(gpt6AstraLongContextPricing)
 	oauthClient := oauth.NewHTTPClient(cfg.Upstream.OAuthTokenURL)
 	oauthClient.ClientID = cfg.Upstream.OAuthClientID
 	oauthClient.Scope = cfg.Upstream.OAuthScope

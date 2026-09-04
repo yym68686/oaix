@@ -16,6 +16,7 @@ func TestAdminOpenAPISpecContainsAPIizedResources(t *testing.T) {
 	}
 	required := []string{
 		"/admin/ordinary-429-cooldown",
+		"/admin/gpt6-astra-long-context-pricing",
 		"/admin/import/parse",
 		"/admin/tokens/batch",
 		"/admin/import/jobs",

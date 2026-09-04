@@ -152,6 +152,9 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/ordinary-429-cooldown", a.requireAuth(a.getOrdinary429Cooldown))
 	mux.HandleFunc("POST /admin/ordinary-429-cooldown", a.requireAuth(a.updateOrdinary429Cooldown))
 	mux.HandleFunc("DELETE /admin/ordinary-429-cooldown", a.requireAuth(a.resetOrdinary429Cooldown))
+	mux.HandleFunc("GET /admin/gpt6-astra-long-context-pricing", a.requireAuth(a.getGPT6AstraLongContextPricing))
+	mux.HandleFunc("POST /admin/gpt6-astra-long-context-pricing", a.requireAuth(a.updateGPT6AstraLongContextPricing))
+	mux.HandleFunc("DELETE /admin/gpt6-astra-long-context-pricing", a.requireAuth(a.resetGPT6AstraLongContextPricing))
 	mux.HandleFunc("GET /admin/token-models", a.requireAuth(a.getAdminTokenModelAccess))
 	mux.HandleFunc("POST /admin/token-models", a.requireAuth(a.updateAdminTokenModelAccess))
 	mux.HandleFunc("DELETE /admin/token-models", a.requireAuth(a.deleteAdminTokenModelAccess))
@@ -1447,7 +1450,7 @@ func (a *App) updateSetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
 		return
 	}
-	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey {
+	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey {
 		writeError(w, http.StatusBadRequest, errors.New("this setting must be updated through its dedicated API"))
 		return
 	}

@@ -122,6 +122,47 @@ def test_gpt_5_6_unknown_variant_is_not_guessed() -> None:
     assert pricing is None
 
 
+def test_gpt_6_astra_uses_official_api_pricing_with_opt_in_long_context() -> None:
+    pricing_model, pricing = resolve_model_pricing("gpt-6-astra-2026-09-03")
+
+    assert pricing_model == "gpt-6-astra"
+    assert pricing is not None
+    assert (
+        pricing.input_per_million_usd,
+        pricing.cache_write_input_per_million_usd,
+        pricing.cached_input_per_million_usd,
+        pricing.output_per_million_usd,
+    ) == (10.0, 12.5, 1.0, 50.0)
+
+    payload = {
+        "usage": {
+            "input_tokens": 300_000,
+            "input_tokens_details": {
+                "cache_write_tokens": 20_000,
+                "cached_tokens": 30_000,
+            },
+            "output_tokens": 10_000,
+        },
+    }
+    standard = extract_usage_metrics(payload, model_name="gpt-6-astra")
+    long_context = extract_usage_metrics(
+        payload,
+        model_name="gpt-6-astra",
+        long_context_pricing_enabled=True,
+    )
+    assert standard is not None
+    assert standard.estimated_cost_usd == 3.28
+    assert long_context is not None
+    assert long_context.estimated_cost_usd == 6.31
+
+
+def test_gpt_6_unknown_variant_is_not_guessed() -> None:
+    pricing_model, pricing = resolve_model_pricing("gpt-6-unknown")
+
+    assert pricing_model is None
+    assert pricing is None
+
+
 def test_cache_write_explicit_zero_has_priority_over_fallback_fields() -> None:
     usage = extract_usage_metrics(
         {

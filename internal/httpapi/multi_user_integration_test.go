@@ -1017,6 +1017,42 @@ func TestAdminOrdinary429CooldownUpdatesRuntimeWithDatabase(t *testing.T) {
 	}
 }
 
+func TestAdminGPT6AstraLongContextPricingUpdatesRuntimeWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	_, _ = h.db.Pool().Exec(context.Background(), `delete from gateway_settings where key = $1`, store.GPT6AstraLongContextSettingKey)
+	t.Cleanup(func() {
+		_, _ = h.db.Pool().Exec(context.Background(), `delete from gateway_settings where key = $1`, store.GPT6AstraLongContextSettingKey)
+	})
+
+	initial := expectStatus(t, h.request(t, http.MethodGet, "/admin/gpt6-astra-long-context-pricing", "service-test-key", ""), http.StatusOK)
+	if initial["enabled"] != false || initial["default_enabled"] != false || initial["overridden"] != false {
+		t.Fatalf("initial Astra pricing = %#v, want disabled default", initial)
+	}
+	if initial["long_context_threshold_tokens"] != float64(272_000) || initial["input_multiplier"] != float64(2) || initial["output_multiplier"] != 1.5 {
+		t.Fatalf("initial Astra pricing metadata = %#v", initial)
+	}
+
+	expectStatus(t, h.request(t, http.MethodPost, "/admin/gpt6-astra-long-context-pricing", "service-test-key", `{"enabled":true}`), http.StatusOK)
+	if !h.app.proxy.GPT6AstraLongContextPricingEnabled() {
+		t.Fatal("runtime Astra long-context pricing was not enabled")
+	}
+	stored, err := h.db.GetGPT6AstraLongContextPricingSettings(context.Background())
+	if err != nil || !stored.Enabled || stored.UpdatedAt == nil {
+		t.Fatalf("stored Astra pricing = %#v err=%v", stored, err)
+	}
+
+	expectStatus(t, h.request(t, http.MethodPost, "/admin/gpt6-astra-long-context-pricing", "service-test-key", `{}`), http.StatusBadRequest)
+	expectStatus(t, h.request(t, http.MethodPost, "/admin/settings/gpt6_astra_long_context_pricing", "service-test-key", `{"enabled":false}`), http.StatusBadRequest)
+
+	reset := expectStatus(t, h.request(t, http.MethodDelete, "/admin/gpt6-astra-long-context-pricing", "service-test-key", ""), http.StatusOK)
+	if reset["enabled"] != false || reset["overridden"] != false {
+		t.Fatalf("reset Astra pricing = %#v, want disabled default", reset)
+	}
+	if h.app.proxy.GPT6AstraLongContextPricingEnabled() {
+		t.Fatal("runtime Astra long-context pricing remained enabled after reset")
+	}
+}
+
 func TestUserPlanModelAccessOverridesAdministratorDefaultWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	h.app.modelCatalog = nil

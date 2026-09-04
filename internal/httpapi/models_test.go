@@ -52,7 +52,7 @@ func TestModelsReturnsOpenAIList(t *testing.T) {
 
 func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 	handler := modelsTestHandler()
-	request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.144.0", nil)
+	request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.2", nil)
 	request.Header.Set("Authorization", "Bearer service-key")
 	response := httptest.NewRecorder()
 

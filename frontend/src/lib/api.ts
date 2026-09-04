@@ -398,6 +398,16 @@ export type Ordinary429CooldownSettings = {
   updated_at?: string | null;
 };
 
+export type GPT6AstraLongContextPricingSettings = {
+  enabled: boolean;
+  default_enabled: boolean;
+  long_context_threshold_tokens: number;
+  input_multiplier: number;
+  output_multiplier: number;
+  overridden: boolean;
+  updated_at?: string | null;
+};
+
 export type Sub2APITarget = {
   id: number;
   name: string;
@@ -651,6 +661,12 @@ export const api = {
   updateOrdinary429Cooldown: (cooldownSeconds: number) =>
     postJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown", { cooldown_seconds: cooldownSeconds }),
   resetOrdinary429Cooldown: () => deleteJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown"),
+  gpt6AstraLongContextPricing: () =>
+    requestJSON<GPT6AstraLongContextPricingSettings>("/admin/gpt6-astra-long-context-pricing"),
+  updateGPT6AstraLongContextPricing: (enabled: boolean) =>
+    postJSON<GPT6AstraLongContextPricingSettings>("/admin/gpt6-astra-long-context-pricing", { enabled }),
+  resetGPT6AstraLongContextPricing: () =>
+    deleteJSON<GPT6AstraLongContextPricingSettings>("/admin/gpt6-astra-long-context-pricing"),
   adminTokenModels: () => requestJSON<TokenModelAccessSettings>("/admin/token-models"),
   updateAdminTokenModels: (planModels: Record<string, string[]>) =>
     postJSON<TokenModelAccessSettings>("/admin/token-models", { plan_models: planModels }),

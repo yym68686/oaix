@@ -1488,7 +1488,7 @@ func (p *Pipeline) writeResponsesJSONFromSSE(w http.ResponseWriter, resp *http.R
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	_, writeErr := w.Write(body)
-	usage, responseID := extractResponseMetrics(body, firstNonEmpty(attempt.Intent.ResponseModelAlias, attempt.Intent.Model), attempt.Intent.RequireFast)
+	usage, responseID := extractResponseMetrics(body, firstNonEmpty(attempt.Intent.ResponseModelAlias, attempt.Intent.Model), attempt.Intent.RequireFast, p.GPT6AstraLongContextPricingEnabled())
 	result.Committed = true
 	result.Usage = usage
 	result.ResponseID = responseID
@@ -1936,7 +1936,7 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 }
 
 func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *http.Response, attempt Attempt) (AttemptResult, error) {
-	observer := newUsageObserver(attempt.Intent.Model, attempt.Intent.RequireFast)
+	observer := newUsageObserver(attempt.Intent.Model, attempt.Intent.RequireFast, p.GPT6AstraLongContextPricingEnabled())
 	var trace *store.StreamDeliveryTrace
 	if isResponsesStreamEndpoint(attempt.Intent.Endpoint) {
 		trace = store.NewStreamDeliveryTrace(attempt.DownstreamConnectionID)

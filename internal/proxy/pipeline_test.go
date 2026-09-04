@@ -1218,9 +1218,9 @@ func TestProxyRoutesFastRequestOnlyToFastCapablePlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	validUntil := time.Now().UTC().Add(time.Hour)
-	manager.SetPlanModelCapabilities(42, free, "0.144.0", nil, validUntil)
-	manager.SetPlanModelCapabilities(42, k12, "0.144.0", nil, validUntil)
-	manager.SetPlanModelCapabilities(42, pro, "0.144.0", []string{"gpt-5.5"}, validUntil)
+	manager.SetPlanModelCapabilities(42, free, "0.153.2", nil, validUntil)
+	manager.SetPlanModelCapabilities(42, k12, "0.153.2", nil, validUntil)
+	manager.SetPlanModelCapabilities(42, pro, "0.153.2", []string{"gpt-5.5"}, validUntil)
 	client := transport.New(cfg.Upstream)
 	defer client.CloseIdleConnections()
 	writer := logs.NewWriter(fakes, logger, cfg.RequestLog)

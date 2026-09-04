@@ -12,6 +12,7 @@ import {
   api,
   getServiceKey,
   setServiceKey,
+  type GPT6AstraLongContextPricingSettings,
   type Ordinary429CooldownSettings,
   type SettingItem,
   type TokenConcurrencyPlan,
@@ -36,6 +37,7 @@ const DEFAULT_ORDINARY_429_COOLDOWN_SECONDS = 300;
 const MIN_ORDINARY_429_COOLDOWN_SECONDS = 1;
 const MAX_ORDINARY_429_COOLDOWN_SECONDS = 86_400;
 const ORDINARY_429_COOLDOWN_SETTING_KEY = "ordinary_429_cooldown";
+const GPT6_ASTRA_LONG_CONTEXT_SETTING_KEY = "gpt6_astra_long_context_pricing";
 const numberFormatter = new Intl.NumberFormat("zh-CN");
 
 function formatCooldownDuration(seconds: number): string {
@@ -361,7 +363,7 @@ function TokenModelAccessPanel({
             <Alert variant="info">
               <DatabaseIcon />
               <AlertTitle>{userMode ? "用户模型覆盖" : "管理员模型默认"}</AlertTitle>
-              <AlertDescription>{userMode ? "关闭自定义会继承管理员设置；灰色模型表示当前计划目录没有返回该模型。" : "未勾选的模型不会被该计划的 token 调度。"}</AlertDescription>
+              <AlertDescription>{userMode ? "模型选项会跟随当前计划获取到的官方目录自动更新；关闭自定义会继承管理员设置，灰色模型表示官方目录已不再返回该模型。" : "模型选项会跟随各计划获取到的官方目录自动更新；未勾选的模型不会被该计划的 token 调度。"}</AlertDescription>
             </Alert>
             <div className="grid min-w-0 gap-3 md:grid-cols-2">
               {(settings.plans || []).map((plan) => {
@@ -369,7 +371,6 @@ function TokenModelAccessPanel({
                 const selected = new Set(overridden ? modelOverrides[plan.plan] : plan.models || []);
                 const modelIDs = [
                   ...new Set([
-                    ...(settings.models || []).map((model) => model.id),
                     ...(plan.available_models || []),
                     ...(plan.models || []),
                     ...(plan.inherited_models || []),
@@ -451,6 +452,9 @@ export function SettingsPage({
   const [ordinary429Dirty, setOrdinary429Dirty] = useState(false);
   const ordinary429DirtyRef = useRef(false);
   const ordinary429InputRef = useRef<HTMLInputElement>(null);
+  const [gpt6AstraPricing, setGPT6AstraPricing] = useState<GPT6AstraLongContextPricingSettings | null>(null);
+  const [gpt6AstraLongContextEnabled, setGPT6AstraLongContextEnabled] = useState(false);
+  const [gpt6AstraPricingSaving, setGPT6AstraPricingSaving] = useState(false);
 
   const loadTokenSelection = useCallback(async () => {
     const payload = await api.tokenSelection();
@@ -463,11 +467,12 @@ export function SettingsPage({
     setLoading(true);
     setError("");
     try {
-      const [settingsPayload, , models, cooldown] = await Promise.all([
+      const [settingsPayload, , models, cooldown, astraPricing] = await Promise.all([
         api.settings(),
         loadTokenSelection(),
         api.adminTokenModels(),
         api.ordinary429Cooldown(),
+        api.gpt6AstraLongContextPricing(),
       ]);
       const nextItems = settingsPayload.items || [];
       setItems(nextItems);
@@ -477,6 +482,8 @@ export function SettingsPage({
         setAdminModelOverrides(Object.fromEntries((models.plans || []).filter((plan) => plan.overridden).map((plan) => [plan.plan, plan.models || []])));
       }
       setOrdinary429Settings(cooldown);
+      setGPT6AstraPricing(astraPricing);
+      setGPT6AstraLongContextEnabled(astraPricing.enabled);
       if (!ordinary429DirtyRef.current) {
         setOrdinary429Draft(String(cooldown.cooldown_seconds || DEFAULT_ORDINARY_429_COOLDOWN_SECONDS));
         setOrdinary429Error("");
@@ -562,6 +569,39 @@ export function SettingsPage({
       pushToast(message, "error");
     } finally {
       setOrdinary429Saving(false);
+    }
+  }
+
+  async function saveGPT6AstraLongContextPricing() {
+    setGPT6AstraPricingSaving(true);
+    try {
+      const saved = await api.updateGPT6AstraLongContextPricing(gpt6AstraLongContextEnabled);
+      setGPT6AstraPricing(saved);
+      setGPT6AstraLongContextEnabled(saved.enabled);
+      setItems((current) => {
+        const item = { key: GPT6_ASTRA_LONG_CONTEXT_SETTING_KEY, value: { enabled: saved.enabled }, updated_at: saved.updated_at };
+        return [...current.filter((candidate) => candidate.key !== GPT6_ASTRA_LONG_CONTEXT_SETTING_KEY), item].sort((left, right) => left.key.localeCompare(right.key));
+      });
+      pushToast(`GPT-6 Astra 长上下文阶梯价已${saved.enabled ? "开启" : "关闭"}`);
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setGPT6AstraPricingSaving(false);
+    }
+  }
+
+  async function resetGPT6AstraLongContextPricing() {
+    setGPT6AstraPricingSaving(true);
+    try {
+      const reset = await api.resetGPT6AstraLongContextPricing();
+      setGPT6AstraPricing(reset);
+      setGPT6AstraLongContextEnabled(reset.enabled);
+      setItems((current) => current.filter((item) => item.key !== GPT6_ASTRA_LONG_CONTEXT_SETTING_KEY));
+      pushToast("已恢复默认关闭", "info");
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setGPT6AstraPricingSaving(false);
     }
   }
 
@@ -700,6 +740,53 @@ export function SettingsPage({
               <SaveIcon />
               保存调度设置
             </Button>
+          </CardPanel>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Settings2Icon aria-hidden="true" className="size-5" />
+              GPT-6 Astra 计费
+            </CardTitle>
+            <CardDescription>基础费率按官方 API 每百万 token 价格；Codex 订阅默认不启用长上下文阶梯倍率。</CardDescription>
+          </CardHeader>
+          <CardPanel className="grid gap-4">
+            {!gpt6AstraPricing ? (
+              loading ? <LoadingState compact label="正在载入 Astra 计费设置" /> : <ErrorAlert title="Astra 计费设置载入失败" message={error || "未返回计费设置"} />
+            ) : (
+              <>
+                <Alert variant="info">
+                  <DatabaseIcon aria-hidden="true" />
+                  <AlertTitle>长上下文阶梯价当前{gpt6AstraPricing.enabled ? "开启" : "关闭"}</AlertTitle>
+                  <AlertDescription>
+                    {gpt6AstraPricing.overridden ? "当前使用管理员自定义值。" : "当前使用默认关闭值。"}
+                  </AlertDescription>
+                </Alert>
+                <Label className="flex min-h-11 items-start gap-3 rounded-lg border bg-muted/30 p-3">
+                  <Checkbox
+                    checked={gpt6AstraLongContextEnabled}
+                    onCheckedChange={(value) => setGPT6AstraLongContextEnabled(Boolean(value))}
+                  />
+                  <span className="grid gap-1">
+                    <span>超过 272K token 启用 API 长上下文阶梯价</span>
+                    <span className="text-muted-foreground text-xs font-normal">
+                      开启后，整次请求的输入、缓存写入和缓存读取按 2×，输出按 1.5×；默认关闭。
+                    </span>
+                  </span>
+                </Label>
+                <div className="grid gap-2 sm:flex sm:flex-wrap">
+                  <Button className="w-full sm:w-auto" disabled={gpt6AstraPricingSaving} loading={gpt6AstraPricingSaving} onClick={() => void saveGPT6AstraLongContextPricing()}>
+                    <SaveIcon aria-hidden="true" />
+                    保存 Astra 计费
+                  </Button>
+                  <Button className="w-full sm:w-auto" disabled={gpt6AstraPricingSaving} onClick={() => void resetGPT6AstraLongContextPricing()} variant="outline">
+                    <RotateCcwIcon aria-hidden="true" />
+                    恢复默认关闭
+                  </Button>
+                </div>
+              </>
+            )}
           </CardPanel>
         </Card>
 

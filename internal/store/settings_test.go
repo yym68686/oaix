@@ -40,6 +40,18 @@ func TestParseOrdinary429CooldownSecondsRange(t *testing.T) {
 	}
 }
 
+func TestBuildGPT6AstraLongContextPricingDefaultsDisabled(t *testing.T) {
+	if settings := buildGPT6AstraLongContextPricingSettings(nil); settings.Enabled {
+		t.Fatalf("default settings = %#v, want disabled", settings)
+	}
+	if settings := buildGPT6AstraLongContextPricingSettings(json.RawMessage(`{"enabled":true}`)); !settings.Enabled {
+		t.Fatalf("persisted settings = %#v, want enabled", settings)
+	}
+	if settings := buildGPT6AstraLongContextPricingSettings(json.RawMessage(`{"enabled":"invalid"}`)); settings.Enabled {
+		t.Fatalf("invalid settings = %#v, want disabled", settings)
+	}
+}
+
 func TestBuildTokenSelectionSettingsPreservesPythonPayload(t *testing.T) {
 	raw := json.RawMessage(`{
 		"strategy": "fill_first",

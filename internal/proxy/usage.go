@@ -31,6 +31,8 @@ type UsageMetrics struct {
 	BaseCostUSD                   *float64
 	BillingMultiplier             float64
 	EstimatedCostUSD              *float64
+	LongContextPricing            bool
+	LongContextThresholdTokens    int
 	FastMode                      bool
 	ServiceTier                   string
 	Anomalies                     []string
@@ -49,13 +51,14 @@ type usageField struct {
 }
 
 type usageObserver struct {
-	modelName    string
-	requireFast  bool
-	pending      []byte
-	dataLines    []string
-	usage        *UsageMetrics
-	responseID   string
-	firstTokenAt *time.Time
+	modelName          string
+	requireFast        bool
+	longContextPricing bool
+	pending            []byte
+	dataLines          []string
+	usage              *UsageMetrics
+	responseID         string
+	firstTokenAt       *time.Time
 }
 
 type usageBodyCapture struct {
@@ -98,8 +101,8 @@ func (c *usageBodyCapture) Truncated() bool {
 	return c != nil && c.truncated
 }
 
-func newUsageObserver(modelName string, requireFast bool) *usageObserver {
-	return &usageObserver{modelName: modelName, requireFast: requireFast}
+func newUsageObserver(modelName string, requireFast, longContextPricing bool) *usageObserver {
+	return &usageObserver{modelName: modelName, requireFast: requireFast, longContextPricing: longContextPricing}
 }
 
 func (o *usageObserver) Observe(chunk []byte) {
@@ -148,7 +151,7 @@ func (o *usageObserver) flushEvent() {
 		now := time.Now().UTC()
 		o.firstTokenAt = &now
 	}
-	if usage := extractUsageMetricsForIntent(payload, o.modelName, o.requireFast); usage != nil {
+	if usage := extractUsageMetricsForPricingPolicy(payload, o.modelName, o.requireFast, o.longContextPricing); usage != nil {
 		o.usage = usage
 	}
 	if responseID := extractResponseID(payload); responseID != "" {
@@ -156,12 +159,12 @@ func (o *usageObserver) flushEvent() {
 	}
 }
 
-func extractResponseMetrics(body []byte, modelName string, requireFast bool) (*UsageMetrics, string) {
+func extractResponseMetrics(body []byte, modelName string, requireFast, longContextPricing bool) (*UsageMetrics, string) {
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, ""
 	}
-	return extractUsageMetricsForIntent(payload, modelName, requireFast), extractResponseID(payload)
+	return extractUsageMetricsForPricingPolicy(payload, modelName, requireFast, longContextPricing), extractResponseID(payload)
 }
 
 func extractUsageMetrics(payload any, modelName string) *UsageMetrics {
@@ -169,6 +172,10 @@ func extractUsageMetrics(payload any, modelName string) *UsageMetrics {
 }
 
 func extractUsageMetricsForIntent(payload any, modelName string, requireFast bool) *UsageMetrics {
+	return extractUsageMetricsForPricingPolicy(payload, modelName, requireFast, false)
+}
+
+func extractUsageMetricsForPricingPolicy(payload any, modelName string, requireFast, longContextPricing bool) *UsageMetrics {
 	usageObj, usagePrefix := usageObject(payload)
 	if usageObj == nil {
 		return nil
@@ -232,9 +239,13 @@ func extractUsageMetricsForIntent(payload any, modelName string, requireFast boo
 			metrics.FastMode = true
 			metrics.ServiceTier = "priority"
 		}
-		applyUsagePricing(metrics, pricing, multiplier)
+		applyUsagePricingWithPolicy(metrics, pricing, multiplier, longContextPricing)
 		if pricing.billingMode == usageBillingModeOpenAIPromptCache && !cacheWrite.Present {
-			metrics.Anomalies = append(metrics.Anomalies, "gpt56_cache_write_tokens_missing")
+			anomaly := "prompt_cache_write_tokens_missing"
+			if strings.HasPrefix(pricing.name, "gpt-5.6-") {
+				anomaly = "gpt56_cache_write_tokens_missing"
+			}
+			metrics.Anomalies = append(metrics.Anomalies, anomaly)
 		}
 	}
 	cacheComponentTokens := metrics.CachedInputTokens
@@ -378,11 +389,19 @@ func estimateUsageCost(modelName string, inputTokens, outputTokens, cacheWriteIn
 }
 
 func applyUsagePricing(metrics *UsageMetrics, pricing modelPricing, multiplier float64) {
+	applyUsagePricingWithPolicy(metrics, pricing, multiplier, false)
+}
+
+func applyUsagePricingWithPolicy(metrics *UsageMetrics, pricing modelPricing, multiplier float64, longContextPricing bool) {
 	if metrics == nil {
 		return
 	}
 	if multiplier <= 0 {
 		multiplier = 1
+	}
+	longContext := false
+	if longContextPricing {
+		pricing, longContext = effectiveModelPricing(pricing, metrics.InputTokens)
 	}
 	nonCached := metrics.InputTokens - metrics.CachedInputTokens
 	if pricing.cacheWrite != nil {
@@ -411,10 +430,41 @@ func applyUsagePricing(metrics *UsageMetrics, pricing modelPricing, multiplier f
 	metrics.BaseCostUSD = &baseCost
 	metrics.BillingMultiplier = multiplier
 	metrics.EstimatedCostUSD = &finalCost
+	metrics.LongContextPricing = longContext
+	if longContext {
+		metrics.LongContextThresholdTokens = pricing.longContextThreshold
+	}
+}
+
+func effectiveModelPricing(pricing modelPricing, inputTokens int) (modelPricing, bool) {
+	if pricing.longContextThreshold <= 0 || inputTokens <= pricing.longContextThreshold {
+		return pricing, false
+	}
+	inputMultiplier := pricing.longContextInputMultiplier
+	if inputMultiplier <= 0 {
+		inputMultiplier = 1
+	}
+	outputMultiplier := pricing.longContextOutputMultiplier
+	if outputMultiplier <= 0 {
+		outputMultiplier = 1
+	}
+	pricing.input *= inputMultiplier
+	pricing.output *= outputMultiplier
+	if pricing.cacheWrite != nil {
+		value := *pricing.cacheWrite * inputMultiplier
+		pricing.cacheWrite = &value
+	}
+	if pricing.cached != nil {
+		value := *pricing.cached * inputMultiplier
+		pricing.cached = &value
+	}
+	return pricing, true
 }
 
 func fastCostMultiplierForPricingModel(pricingModel string) float64 {
 	switch {
+	case pricingModel == "gpt-6-astra":
+		return 2
 	case strings.HasPrefix(pricingModel, "gpt-5.6-"):
 		// OAIX serves Codex subscription accounts, where GPT-5.6 Fast consumes
 		// 2.5x credits. The public API's 2x token price is a separate contract.
@@ -429,18 +479,26 @@ func fastCostMultiplierForPricingModel(pricingModel string) float64 {
 }
 
 type modelPricing struct {
-	name        string
-	billingMode string
-	input       float64
-	output      float64
-	cached      *float64
-	cacheWrite  *float64
+	name                        string
+	billingMode                 string
+	input                       float64
+	output                      float64
+	cached                      *float64
+	cacheWrite                  *float64
+	longContextThreshold        int
+	longContextInputMultiplier  float64
+	longContextOutputMultiplier float64
 }
 
 func pricingForModel(modelName string) (modelPricing, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(modelName))
 	price := func(value float64) *float64 { return &value }
 	table := map[string]modelPricing{
+		"gpt-6-astra": {
+			name: "gpt-6-astra", billingMode: usageBillingModeOpenAIPromptCache,
+			input: 10.0, cacheWrite: price(12.5), cached: price(1.0), output: 50.0,
+			longContextThreshold: 272_000, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5,
+		},
 		"gpt-5.6-sol": {
 			name: "gpt-5.6-sol", billingMode: usageBillingModeOpenAIPromptCache,
 			input: 5.0, cacheWrite: price(6.25), cached: price(0.5), output: 30.0,
@@ -484,6 +542,12 @@ func pricingForModel(modelName string) (modelPricing, bool) {
 	}
 	if pricing, ok := table[normalized]; ok {
 		return pricing, true
+	}
+	if strings.HasPrefix(normalized, "gpt-6-astra-") {
+		return table["gpt-6-astra"], true
+	}
+	if strings.HasPrefix(normalized, "gpt-6") {
+		return modelPricing{}, false
 	}
 	for _, family := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		if strings.HasPrefix(normalized, family+"-") {
@@ -548,6 +612,10 @@ func (u *UsageMetrics) Trace() map[string]any {
 		if u.FastMode {
 			billing["fast_mode"] = true
 			billing["service_tier"] = u.ServiceTier
+		}
+		if u.LongContextPricing {
+			billing["long_context_pricing"] = true
+			billing["long_context_threshold_tokens"] = u.LongContextThresholdTokens
 		}
 		if u.CacheWritePricePerMillionUSD != nil {
 			billing["cache_write_per_million_usd"] = *u.CacheWritePricePerMillionUSD
