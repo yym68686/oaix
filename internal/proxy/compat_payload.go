@@ -118,43 +118,69 @@ func newImageStreamTrace(streamPrefix string) *imageStreamTrace {
 }
 
 func prepareUpstreamPayload(r *http.Request, body []byte, intent RequestIntent) ([]byte, RequestIntent, int, error) {
+	document := newRequestDocument(body, "")
+	nextIntent, status, err := prepareUpstreamDocument(r, document, intent)
+	if err != nil {
+		return body, nextIntent, status, err
+	}
+	next, err := document.Bytes()
+	if err != nil {
+		return body, nextIntent, http.StatusBadRequest, err
+	}
+	return next, nextIntent, status, nil
+}
+
+func prepareUpstreamDocument(r *http.Request, document *RequestDocument, intent RequestIntent) (RequestIntent, int, error) {
 	switch intent.Endpoint {
 	case alphaSearchEndpoint:
-		next, err := prepareAlphaSearchPayload(body)
+		err := prepareAlphaSearchDocument(document)
 		if err != nil {
-			return body, intent, http.StatusBadRequest, err
+			return intent, http.StatusBadRequest, err
 		}
-		return next, intent, http.StatusOK, nil
+		return intent, http.StatusOK, nil
 	case "/v1/responses", "/v1/responses/compact":
-		next, err := prepareResponsesPayload(body, &intent)
+		err := prepareResponsesDocument(document, &intent)
 		if err != nil {
-			return body, intent, http.StatusBadRequest, err
+			return intent, http.StatusBadRequest, err
 		}
-		return next, intent, http.StatusOK, nil
+		return intent, http.StatusOK, nil
 	case "/v1/chat/completions":
 		if intent.RequireFast {
-			next, err := canonicalizeFastServiceTier(body)
+			err := canonicalizeFastServiceTierDocument(document)
 			if err != nil {
-				return body, intent, http.StatusBadRequest, err
+				return intent, http.StatusBadRequest, err
 			}
 			intent.ServiceTier = "priority"
-			return next, intent, http.StatusOK, nil
 		}
-		return body, intent, http.StatusOK, nil
+		return intent, http.StatusOK, nil
 	case "/v1/images/generations":
-		next, err := prepareImageGenerationPayload(body, &intent)
+		err := prepareImageGenerationDocument(document, &intent)
 		if err != nil {
-			return body, intent, http.StatusBadRequest, err
+			return intent, http.StatusBadRequest, err
 		}
-		return next, intent, http.StatusOK, nil
+		return intent, http.StatusOK, nil
 	case "/v1/images/edits":
-		next, err := prepareImageEditPayload(r, body, &intent)
-		if err != nil {
-			return body, intent, http.StatusBadRequest, err
+		contentType := strings.TrimSpace(r.Header.Get("Content-Type"))
+		if strings.HasPrefix(strings.ToLower(contentType), "application/json") {
+			err := prepareImageEditJSONDocument(document, &intent)
+			if err != nil {
+				return intent, http.StatusBadRequest, err
+			}
+			return intent, http.StatusOK, nil
 		}
-		return next, intent, http.StatusOK, nil
+		next, err := prepareImageEditPayload(r, document.raw, &intent)
+		if err != nil {
+			return intent, http.StatusBadRequest, err
+		}
+		replacement := newRequestDocument(next, "")
+		object, objectErr := replacement.Object()
+		if objectErr != nil {
+			return intent, http.StatusBadRequest, objectErr
+		}
+		document.ReplaceObject(object)
+		return intent, http.StatusOK, nil
 	default:
-		return body, intent, http.StatusOK, nil
+		return intent, http.StatusOK, nil
 	}
 }
 
@@ -168,12 +194,20 @@ var alphaSearchUnsupportedResponsesFields = [...]string{
 // Responses prompt-cache fields to every Codex request, but alpha/search
 // rejects those top-level fields as unknown parameters.
 func prepareAlphaSearchPayload(body []byte) ([]byte, error) {
-	if err := validateAlphaSearchPayload(body); err != nil {
+	document := newRequestDocument(body, "")
+	if err := prepareAlphaSearchDocument(document); err != nil {
 		return body, err
 	}
-	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(bytes.TrimSpace(body), &payload); err != nil {
-		return body, errors.New("request body must be valid JSON")
+	return document.Bytes()
+}
+
+func prepareAlphaSearchDocument(document *RequestDocument) error {
+	payload, err := document.StrictObject()
+	if err != nil {
+		return err
+	}
+	if err := validateAlphaSearchObject(payload); err != nil {
+		return err
 	}
 	changed := false
 	for _, field := range alphaSearchUnsupportedResponsesFields {
@@ -184,23 +218,21 @@ func prepareAlphaSearchPayload(body []byte) ([]byte, error) {
 		changed = true
 	}
 	if !changed {
-		return body, nil
+		return nil
 	}
-	next, err := json.Marshal(payload)
-	if err != nil {
-		return body, errors.New("failed to sanitize alpha search request body")
-	}
-	return next, nil
+	document.MarkDirty()
+	return nil
 }
 
 func validateAlphaSearchPayload(body []byte) error {
-	var payload map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(body), &payload); err != nil {
-		return errors.New("request body must be valid JSON")
+	payload, err := newRequestDocument(body, "").Object()
+	if err != nil {
+		return err
 	}
-	if payload == nil {
-		return errors.New("request body must be a JSON object")
-	}
+	return validateAlphaSearchObject(payload)
+}
+
+func validateAlphaSearchObject(payload map[string]any) error {
 	id, idOK := payload["id"].(string)
 	if !idOK || strings.TrimSpace(id) == "" {
 		return errors.New("request body requires a non-empty string id")
@@ -213,18 +245,35 @@ func validateAlphaSearchPayload(body []byte) error {
 }
 
 func canonicalizeFastServiceTier(body []byte) ([]byte, error) {
-	payload, err := decodeJSONObject(body)
-	if err != nil {
+	document := newRequestDocument(body, "")
+	if err := canonicalizeFastServiceTierDocument(document); err != nil {
 		return body, err
 	}
+	return document.Bytes()
+}
+
+func canonicalizeFastServiceTierDocument(document *RequestDocument) error {
+	payload, err := document.Object()
+	if err != nil {
+		return err
+	}
 	payload["service_tier"] = "priority"
-	return openai.EncodeJSON(payload)
+	document.MarkDirty()
+	return nil
 }
 
 func prepareResponsesPayload(body []byte, intent *RequestIntent) ([]byte, error) {
-	payload, err := decodeJSONObject(body)
-	if err != nil {
+	document := newRequestDocument(body, "")
+	if err := prepareResponsesDocument(document, intent); err != nil {
 		return body, err
+	}
+	return document.Bytes()
+}
+
+func prepareResponsesDocument(document *RequestDocument, intent *RequestIntent) error {
+	payload, err := document.Object()
+	if err != nil {
+		return err
 	}
 	normalizeResponsesStringInput(payload)
 	if intent.RequireFast {
@@ -238,9 +287,10 @@ func prepareResponsesPayload(body []byte, intent *RequestIntent) ([]byte, error)
 	if model == defaultImagesToolModel {
 		translated, err := translateResponsesImageCompatPayload(payload, intent.Compact)
 		if err != nil {
-			return body, err
+			return err
 		}
 		payload = translated
+		document.ReplaceObject(payload)
 		intent.ResponseModelAlias = model
 		preservePreviousResponseID = true
 	} else {
@@ -259,7 +309,8 @@ func prepareResponsesPayload(body []byte, intent *RequestIntent) ([]byte, error)
 	} else {
 		intent.UpstreamAccept = "application/json"
 	}
-	return openai.EncodeJSON(payload)
+	document.MarkDirty()
+	return nil
 }
 
 func normalizeResponsesStringInput(payload map[string]any) {
@@ -388,13 +439,21 @@ func translateResponsesImageCompatPayload(payload map[string]any, compact bool) 
 }
 
 func prepareImageGenerationPayload(body []byte, intent *RequestIntent) ([]byte, error) {
-	payload, err := decodeJSONObject(body)
-	if err != nil {
+	document := newRequestDocument(body, "")
+	if err := prepareImageGenerationDocument(document, intent); err != nil {
 		return body, err
+	}
+	return document.Bytes()
+}
+
+func prepareImageGenerationDocument(document *RequestDocument, intent *RequestIntent) error {
+	payload, err := document.Object()
+	if err != nil {
+		return err
 	}
 	prompt := text(payload["prompt"])
 	if prompt == "" {
-		return nil, errors.New("prompt is required")
+		return errors.New("prompt is required")
 	}
 	imageModel := firstNonEmpty(text(payload["model"]), defaultImagesToolModel)
 	intent.Model = imageModel
@@ -413,7 +472,8 @@ func prepareImageGenerationPayload(body []byte, intent *RequestIntent) ([]byte, 
 	}
 	copyImageToolFields(payload, tool, false)
 	upstream := buildImagesResponsesPayload(prompt, nil, tool)
-	return openai.EncodeJSON(upstream)
+	document.ReplaceObject(upstream)
+	return nil
 }
 
 func prepareImageEditPayload(r *http.Request, body []byte, intent *RequestIntent) ([]byte, error) {
@@ -429,24 +489,32 @@ func prepareImageEditPayload(r *http.Request, body []byte, intent *RequestIntent
 }
 
 func prepareImageEditJSONPayload(body []byte, intent *RequestIntent) ([]byte, error) {
-	payload, err := decodeJSONObject(body)
-	if err != nil {
+	document := newRequestDocument(body, "")
+	if err := prepareImageEditJSONDocument(document, intent); err != nil {
 		return body, err
+	}
+	return document.Bytes()
+}
+
+func prepareImageEditJSONDocument(document *RequestDocument, intent *RequestIntent) error {
+	payload, err := document.Object()
+	if err != nil {
+		return err
 	}
 	prompt := text(payload["prompt"])
 	if prompt == "" {
-		return nil, errors.New("prompt is required")
+		return errors.New("prompt is required")
 	}
 	images := jsonImageReferences(payload)
 	if len(images) == 0 {
-		return nil, errors.New("images[].image_url is required")
+		return errors.New("images[].image_url is required")
 	}
 	mask, err := jsonMaskReference(payload["mask"])
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := enforceImageInputCountLimit(len(images) + boolCount(mask != "")); err != nil {
-		return nil, err
+		return err
 	}
 	imageModel := firstNonEmpty(text(payload["model"]), defaultImagesToolModel)
 	intent.Model = imageModel
@@ -468,7 +536,8 @@ func prepareImageEditJSONPayload(body []byte, intent *RequestIntent) ([]byte, er
 		tool["input_image_mask"] = map[string]any{"image_url": mask}
 	}
 	upstream := buildImagesResponsesPayload(prompt, images, tool)
-	return openai.EncodeJSON(upstream)
+	document.ReplaceObject(upstream)
+	return nil
 }
 
 func prepareImageEditMultipartPayload(contentType string, body []byte, intent *RequestIntent) ([]byte, error) {

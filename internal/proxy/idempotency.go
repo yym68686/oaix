@@ -56,6 +56,17 @@ func (p *Pipeline) beginGatewayIdempotency(
 	promptCache *PromptCacheContext,
 	requestID string,
 ) (*gatewayIdempotencyExecution, bool) {
+	return p.beginGatewayIdempotencyWithBodyDigest(w, r, intent, sha256Bytes(body), promptCache, requestID)
+}
+
+func (p *Pipeline) beginGatewayIdempotencyWithBodyDigest(
+	w http.ResponseWriter,
+	r *http.Request,
+	intent RequestIntent,
+	bodySHA256 string,
+	promptCache *PromptCacheContext,
+	requestID string,
+) (*gatewayIdempotencyExecution, bool) {
 	if p == nil || !p.cfg.Idempotency.Enabled {
 		return nil, false
 	}
@@ -82,7 +93,7 @@ func (p *Pipeline) beginGatewayIdempotency(
 	}
 
 	keyHash := hashText(routingAttemptID)
-	requestHash, err := gatewayIdempotencyRequestHash(intent, body, r.Header, promptCache)
+	requestHash, err := gatewayIdempotencyRequestHashWithBodyDigest(intent, bodySHA256, r.Header, promptCache)
 	if err != nil {
 		p.logIdempotencyError("gateway idempotency request hashing failed", requestID, keyHash, err)
 		writeGatewayIdempotencyUnavailable(w, "failed to prepare idempotent request")
@@ -393,6 +404,10 @@ func replayGatewayIdempotencyResponse(w http.ResponseWriter, record store.Gatewa
 }
 
 func gatewayIdempotencyRequestHash(intent RequestIntent, body []byte, headers http.Header, promptCache *PromptCacheContext) (string, error) {
+	return gatewayIdempotencyRequestHashWithBodyDigest(intent, sha256Bytes(body), headers, promptCache)
+}
+
+func gatewayIdempotencyRequestHashWithBodyDigest(intent RequestIntent, bodySHA256 string, headers http.Header, promptCache *PromptCacheContext) (string, error) {
 	method := strings.ToUpper(strings.TrimSpace(intent.Method))
 	if method == "" {
 		method = http.MethodPost
@@ -462,7 +477,7 @@ func gatewayIdempotencyRequestHash(intent RequestIntent, body []byte, headers ht
 	hash := sha256.New()
 	_, _ = hash.Write(metadata)
 	_, _ = hash.Write([]byte{0})
-	_, _ = hash.Write(body)
+	_, _ = hash.Write([]byte(bodySHA256))
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 

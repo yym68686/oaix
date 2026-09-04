@@ -119,6 +119,7 @@ type Attempt struct {
 	Intent                 RequestIntent
 	Claim                  *tokens.Claim
 	Body                   []byte
+	Document               *RequestDocument
 	StartedAt              time.Time
 	RetryCause             Outcome
 	UpstreamURL            string
@@ -249,29 +250,59 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	if downstreamConnectionID != "" {
 		w.Header().Set("X-OAIX-Connection-ID", downstreamConnectionID)
 	}
-	bodyBytes, bodyStatus, bodyMessage, err := readProxyRequestBody(r, p.cfg.Upstream.MaxRequestBodyBytes)
+	bodyResult, bodyStatus, bodyMessage, err := readProxyRequestBodyWithDigest(r, p.cfg.Upstream.MaxRequestBodyBytes)
 	if err != nil {
 		writeJSONError(w, bodyStatus, bodyMessage)
 		return
 	}
-	if !isAlphaSearchEndpoint(intent) {
-		bodyBytes, _ = sanitizeReasoningContentBody(bodyBytes)
+	bodyBytes := bodyResult.Bytes
+	document := newRequestDocument(bodyBytes, bodyResult.SHA256)
+	intent = normalizeIntentDocument(intent, document)
+	promptCacheContext := (*PromptCacheContext)(nil)
+	deferNonRoutingPreparation := hasExplicitPromptCacheKey(document, intent)
+	if deferNonRoutingPreparation {
+		promptCacheContext = buildExplicitPromptCacheRoutingContext(r.Header, intent, document, p.cfg.PromptCache)
 	}
-	intent = normalizeIntent(intent, bodyBytes)
-	var status int
-	bodyBytes, intent, status, err = prepareUpstreamPayload(r, bodyBytes, intent)
-	if err != nil {
-		writeErrorResponse(w, intent.Stream, status, err.Error())
-		return
+	var codexFingerprintContext *CodexFingerprintContext
+	var searchSessionContext *SearchSessionContext
+	prepared := false
+	prepareAfterClaim := func() (int, error) {
+		if prepared {
+			return http.StatusOK, nil
+		}
+		if !isAlphaSearchEndpoint(intent) && !isResponsesEndpoint(intent) {
+			sanitizeReasoningContentDocument(document)
+		}
+		var status int
+		intent, status, err = prepareUpstreamDocument(r, document, intent)
+		if err != nil {
+			return status, err
+		}
+		if promptCacheContext == nil {
+			promptCacheContext = buildPromptCacheRoutingContext(r.Header, intent, document, p.cfg.PromptCache)
+		}
+		if err := finalizePromptCacheContext(promptCacheContext, document); err != nil {
+			return http.StatusBadRequest, err
+		}
+		codexFingerprintContext = buildCodexFingerprintContext(r.Header, intent)
+		searchSessionContext = buildSearchSessionDocument(intent, document)
+		if promptCacheContext != nil && intent.Model == "" {
+			intent.Model = promptCacheContext.Model
+		}
+		prepared = true
+		return http.StatusOK, nil
 	}
-	codexFingerprintContext := buildCodexFingerprintContext(r.Header, intent)
-	promptCacheContext, upstreamBody := buildPromptCacheContext(r.Header, intent, bodyBytes, p.cfg.PromptCache)
-	bodyBytes = upstreamBody
-	searchSessionContext := buildSearchSessionContext(intent, bodyBytes)
+	if !deferNonRoutingPreparation {
+		status, prepareErr := prepareAfterClaim()
+		if prepareErr != nil {
+			writeErrorResponse(w, intent.Stream, status, prepareErr.Error())
+			return
+		}
+	}
 	if promptCacheContext != nil && intent.Model == "" {
 		intent.Model = promptCacheContext.Model
 	}
-	idempotencyExecution, handled := p.beginGatewayIdempotency(w, r, intent, bodyBytes, promptCacheContext, requestID)
+	idempotencyExecution, handled := p.beginGatewayIdempotencyWithBodyDigest(w, r, intent, document.RawSHA256(), promptCacheContext, requestID)
 	if handled {
 		return
 	}
@@ -289,9 +320,9 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	timing := map[string]any{"request_body_bytes": len(bodyBytes)}
 	initialSessionIDHash := promptString(promptCacheContext, func(c *PromptCacheContext) string { return shortHash(c.SessionID, 64) })
 	initialSessionIDSource := promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.SessionIDSource })
-	if codexFingerprintContext != nil {
+	if codexFingerprintContext != nil || deferNonRoutingPreparation && codexFingerprintEligible(intent) {
 		timing["codex_fingerprint_mode"] = "session"
-		timing["codex_client_session_present"] = codexFingerprintContext.ClientSessionID != ""
+		timing["codex_client_session_present"] = extractClientSessionID(r.Header) != ""
 		initialSessionIDHash = nil
 		initialSessionIDSource = nil
 	}
@@ -435,6 +466,27 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.recordNoTokenGatewayAttempt(requestID, intent, attempt, selectStarted.UTC(), err)
 			break
 		}
+		if !prepared {
+			status, prepareErr := prepareAfterClaim()
+			if prepareErr != nil {
+				claim.Release()
+				writeErrorResponse(w, intent.Stream, status, prepareErr.Error())
+				return
+			}
+			if codexFingerprintContext != nil {
+				timing["codex_fingerprint_mode"] = "session"
+				timing["codex_client_session_present"] = codexFingerprintContext.ClientSessionID != ""
+			}
+			if intent.ToolSearchKeyFixes > 0 {
+				timing["tool_search_argument_property_names_shortened"] = intent.ToolSearchKeyFixes
+				timing["tool_search_argument_property_name_limit"] = maxToolSearchArgumentPropertyNameRunes
+			}
+			if searchSessionContext != nil {
+				timing["search_session_id_hash"] = searchSessionContext.IDHash
+				timing["search_account_affinity"] = false
+				timing["search_routing_mode"] = "account_failover"
+			}
+		}
 		selectedTokenID = ptrInt64(claim.TokenID())
 		if claim.Token != nil {
 			selectedTokenOwnerID = ptrInt64(claim.Token.Token.OwnerUserID)
@@ -464,6 +516,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			Intent:                 intent,
 			Claim:                  claim,
 			Body:                   bodyBytes,
+			Document:               document,
 			StartedAt:              attemptStarted.UTC(),
 			RetryCause:             classify(finalStatus, lastErr),
 			PromptCache:            promptCacheContext,
@@ -473,6 +526,10 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 		attemptsMade = attempt
 		result, err := p.doAttempt(w, r, attemptSpec)
+		if currentBody, encodeErr := document.Bytes(); encodeErr == nil {
+			bodyBytes = currentBody
+			timing["request_body_bytes"] = len(bodyBytes)
+		}
 		encryptedContentRetryStarted := time.Now()
 		encryptedContentRetryCount := 0
 		for encryptedContentRetryCount < maxRejectedEncryptedContentRetries && !result.Committed && !result.StreamState.DownstreamStarted {
@@ -487,6 +544,8 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			retryStarted := time.Now()
 			retrySpec := attemptSpec
 			retrySpec.Body = sanitizedBody
+			document = newRequestDocument(sanitizedBody, "")
+			retrySpec.Document = document
 			retrySpec.RetryCause = classify(result.Status, err)
 			bodyBytes = sanitizedBody
 			encryptedContentRetryCount++
@@ -1075,10 +1134,24 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	}
 	attempt.Method = method
 	fingerprintIDs := resolveCodexFingerprintIDs(attempt.Claim, attempt.CodexFingerprint)
-	upstreamBody, err := applyCodexFingerprintBody(attempt.Body, fingerprintIDs)
-	if err != nil {
-		return AttemptResult{Status: http.StatusBadGateway}, err
+	upstreamBody := attempt.Body
+	if attempt.Document != nil {
+		if err := applyCodexFingerprintDocument(attempt.Document, fingerprintIDs); err != nil {
+			return AttemptResult{Status: http.StatusBadGateway}, err
+		}
+		var err error
+		upstreamBody, err = attempt.Document.Bytes()
+		if err != nil {
+			return AttemptResult{Status: http.StatusBadGateway}, err
+		}
+	} else {
+		var err error
+		upstreamBody, err = applyCodexFingerprintBody(attempt.Body, fingerprintIDs)
+		if err != nil {
+			return AttemptResult{Status: http.StatusBadGateway}, err
+		}
 	}
+	completePromptCacheContext(attempt.PromptCache, upstreamBody)
 	req, err := http.NewRequestWithContext(r.Context(), method, upstreamURL, bytes.NewReader(upstreamBody))
 	if err != nil {
 		return AttemptResult{Status: http.StatusBadGateway}, err
@@ -1990,6 +2063,12 @@ func requestID(r *http.Request) string {
 }
 
 func normalizeIntent(intent RequestIntent, body []byte) RequestIntent {
+	return normalizeIntentDocument(intent, newRequestDocument(body, ""))
+}
+
+func normalizeIntentDocument(intent RequestIntent, document *RequestDocument) RequestIntent {
+	payload, _ := document.Object()
+	strictPayload, _ := document.StrictObject()
 	switch intent.Endpoint {
 	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions":
 		// Read service_tier through the same map decoder used to prepare the
@@ -1997,7 +2076,7 @@ func normalizeIntent(intent RequestIntent, body []byte) RequestIntent {
 		// same way here and upstream; otherwise an earlier value with the wrong
 		// type can make struct decoding fail while a later Fast tier is still
 		// forwarded, bypassing the Fast token allow-list.
-		if payload, err := decodeJSONObject(body); err == nil {
+		if payload != nil {
 			serviceTier, _ := payload["service_tier"].(string)
 			intent.ServiceTier = serviceTier
 			intent.RequireFast = serviceTier == "priority" || serviceTier == "fast"
@@ -2005,45 +2084,43 @@ func normalizeIntent(intent RequestIntent, body []byte) RequestIntent {
 	}
 	switch intent.Endpoint {
 	case "/v1/responses":
-		if req, err := openai.DecodeResponsesRequest(body); err == nil {
+		if strictPayload != nil {
 			if intent.Model == "" {
-				intent.Model = req.Model
+				intent.Model, _ = strictPayload["model"].(string)
 			}
 			if !intent.Stream {
-				intent.Stream = req.Stream
+				intent.Stream, _ = strictPayload["stream"].(bool)
 			}
 		}
 	case "/v1/chat/completions":
-		if req, err := openai.DecodeChatCompletionRequest(body); err == nil {
+		if strictPayload != nil {
 			if intent.Model == "" {
-				intent.Model = req.Model
+				intent.Model, _ = strictPayload["model"].(string)
 			}
 			if !intent.Stream {
-				intent.Stream = req.Stream
+				intent.Stream, _ = strictPayload["stream"].(bool)
 			}
 		}
 	case "/v1/images/generations":
-		if req, err := openai.DecodeImageGenerationRequest(body); err == nil && intent.Model == "" {
-			intent.Model = req.Model
+		if strictPayload != nil && intent.Model == "" {
+			intent.Model, _ = strictPayload["model"].(string)
 		}
 	case alphaSearchEndpoint:
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err == nil && intent.Model == "" {
-			if model, ok := payload["model"].(string); ok {
+		if strictPayload != nil && intent.Model == "" {
+			if model, ok := strictPayload["model"].(string); ok {
 				intent.Model = model
 			}
 		}
 		intent.Stream = false
 	default:
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err == nil {
+		if strictPayload != nil {
 			if intent.Model == "" {
-				if model, ok := payload["model"].(string); ok {
+				if model, ok := strictPayload["model"].(string); ok {
 					intent.Model = model
 				}
 			}
 			if !intent.Stream {
-				stream, _ := payload["stream"].(bool)
+				stream, _ := strictPayload["stream"].(bool)
 				intent.Stream = stream
 			}
 		}

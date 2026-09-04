@@ -1,9 +1,6 @@
 package proxy
 
-import (
-	"encoding/json"
-	"strings"
-)
+import "strings"
 
 const alphaSearchEndpoint = "/v1/alpha/search"
 
@@ -16,11 +13,15 @@ func isAlphaSearchEndpoint(intent RequestIntent) bool {
 }
 
 func buildSearchSessionContext(intent RequestIntent, body []byte) *SearchSessionContext {
+	return buildSearchSessionDocument(intent, newRequestDocument(body, ""))
+}
+
+func buildSearchSessionDocument(intent RequestIntent, document *RequestDocument) *SearchSessionContext {
 	if !isAlphaSearchEndpoint(intent) {
 		return nil
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+	payload, err := document.StrictObject()
+	if err != nil {
 		return nil
 	}
 	id, _ := payload["id"].(string)

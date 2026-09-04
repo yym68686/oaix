@@ -32,18 +32,33 @@ type PromptCacheContext struct {
 	PromptCacheRetentionSent      string
 	PreviousResponseIDHash        string
 	PromptCacheTrace              map[string]any
+	ownerUserID                   int64
 }
 
 func buildPromptCacheContext(headers http.Header, intent RequestIntent, body []byte, cfg config.PromptCacheConfig) (*PromptCacheContext, []byte) {
-	if !cfg.AffinityEnabled {
+	document := newRequestDocument(body, "")
+	ctx := buildPromptCacheRoutingContext(headers, intent, document, cfg)
+	if err := finalizePromptCacheContext(ctx, document); err != nil {
 		return nil, body
+	}
+	upstreamBody, err := document.Bytes()
+	if err != nil {
+		return nil, body
+	}
+	completePromptCacheContext(ctx, upstreamBody)
+	return ctx, upstreamBody
+}
+
+func buildPromptCacheRoutingContext(headers http.Header, intent RequestIntent, document *RequestDocument, cfg config.PromptCacheConfig) *PromptCacheContext {
+	if !cfg.AffinityEnabled {
+		return nil
 	}
 	if intent.Endpoint != "/v1/responses" && intent.Endpoint != "/v1/responses/compact" && intent.Endpoint != "/v1/chat/completions" {
-		return nil, body
+		return nil
 	}
-	var raw map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(body), &raw); err != nil || raw == nil {
-		return nil, body
+	raw, err := document.StrictObject()
+	if err != nil {
+		return nil
 	}
 	model := intent.Model
 	if model == "" {
@@ -71,18 +86,7 @@ func buildPromptCacheContext(headers http.Header, intent RequestIntent, body []b
 		}
 	}
 	if previousResponseID == "" && promptCacheKey == "" {
-		return nil, body
-	}
-
-	upstream := cloneMap(raw)
-	retentionRequested := text(raw["prompt_cache_retention"])
-	delete(upstream, "prompt_cache_retention")
-	if promptCacheKey != "" {
-		upstream["prompt_cache_key"] = promptCacheKey
-	}
-	upstreamBody, err := encodeSeedJSON(upstream)
-	if err != nil {
-		return nil, body
+		return nil
 	}
 
 	keyHash := ""
@@ -107,30 +111,110 @@ func buildPromptCacheContext(headers http.Header, intent RequestIntent, body []b
 	if previousResponseID != "" {
 		previousHash = shortHash(previousResponseID, 64)
 	}
-	promptTemplateHash, promptDynamicHash := promptHashes(upstream)
 	ctx := &PromptCacheContext{
-		Endpoint:                      intent.Endpoint,
-		Model:                         firstNonEmpty(model, text(raw["model"])),
-		Compact:                       intent.Compact,
-		PreviousResponseID:            previousResponseID,
-		PromptCacheKey:                promptCacheKey,
-		PromptCacheKeyHash:            keyHash,
-		AffinityKey:                   affinityKey,
-		ClientScope:                   clientScope,
-		Source:                        source,
-		SessionID:                     sessionID,
-		SessionIDSource:               sessionSource,
-		RequestPayloadHash:            hashPayload(raw),
-		UpstreamPayloadHash:           hashPayload(upstream),
-		PromptTemplateHash:            promptTemplateHash,
-		PromptDynamicHash:             promptDynamicHash,
-		PromptCacheRetentionRequested: retentionRequested,
-		PromptCacheRetentionSent:      text(upstream["prompt_cache_retention"]),
-		PreviousResponseIDHash:        previousHash,
+		Endpoint:               intent.Endpoint,
+		Model:                  firstNonEmpty(model, text(raw["model"])),
+		Compact:                intent.Compact,
+		PreviousResponseID:     previousResponseID,
+		PromptCacheKey:         promptCacheKey,
+		PromptCacheKeyHash:     keyHash,
+		AffinityKey:            affinityKey,
+		ClientScope:            clientScope,
+		Source:                 source,
+		SessionID:              sessionID,
+		SessionIDSource:        sessionSource,
+		PreviousResponseIDHash: previousHash,
 	}
-	ctx.PromptCacheTrace = buildPromptCacheTrace(ctx)
 	ctx.ApplyOwnerNamespace(intent.OwnerUserID)
-	return ctx, []byte(upstreamBody)
+	return ctx
+}
+
+func hasExplicitPromptCacheKey(document *RequestDocument, intent RequestIntent) bool {
+	if intent.Endpoint != "/v1/responses" && intent.Endpoint != "/v1/responses/compact" && intent.Endpoint != "/v1/chat/completions" {
+		return false
+	}
+	payload, err := document.StrictObject()
+	return err == nil && text(payload["prompt_cache_key"]) != ""
+}
+
+func buildExplicitPromptCacheRoutingContext(headers http.Header, intent RequestIntent, document *RequestDocument, cfg config.PromptCacheConfig) *PromptCacheContext {
+	if !cfg.AffinityEnabled || !hasExplicitPromptCacheKey(document, intent) {
+		return nil
+	}
+	payload, _ := document.StrictObject()
+	model := firstNonEmpty(intent.Model, text(payload["model"]))
+	promptCacheKey := text(payload["prompt_cache_key"])
+	keyHash := shortHash(promptCacheKey, 32)
+	clientScope := clientScopeHash(headers)
+	affinityEndpoint, affinityCompact := promptCacheAffinityFamily(intent.Endpoint, intent.Compact)
+	affinityKey := shortHash(mustSeedJSON(map[string]any{
+		"endpoint": affinityEndpoint,
+		"model":    model,
+		"compact":  affinityCompact,
+		"client":   clientScope,
+		"prompt":   keyHash,
+	}), 32)
+	previousResponseID := ""
+	if intent.Endpoint == "/v1/chat/completions" || (text(payload["model"]) == defaultImagesToolModel && !intent.Compact) {
+		previousResponseID = text(payload["previous_response_id"])
+	}
+	sessionID, sessionSource := promptCacheSession(headers, clientScope, promptCacheKey, affinityKey, cfg.SessionPreferHeader)
+	ctx := &PromptCacheContext{
+		Endpoint:           intent.Endpoint,
+		Model:              model,
+		Compact:            intent.Compact,
+		PreviousResponseID: previousResponseID,
+		PromptCacheKey:     promptCacheKey,
+		PromptCacheKeyHash: keyHash,
+		AffinityKey:        affinityKey,
+		ClientScope:        clientScope,
+		Source:             "explicit",
+		SessionID:          sessionID,
+		SessionIDSource:    sessionSource,
+	}
+	if previousResponseID != "" {
+		ctx.PreviousResponseIDHash = shortHash(previousResponseID, 64)
+	}
+	ctx.ApplyOwnerNamespace(intent.OwnerUserID)
+	return ctx
+}
+
+func finalizePromptCacheContext(ctx *PromptCacheContext, document *RequestDocument) error {
+	if ctx == nil {
+		return nil
+	}
+	upstream, err := document.Object()
+	if err != nil {
+		return err
+	}
+	ctx.RequestPayloadHash = document.CanonicalHash()
+	ctx.PromptCacheRetentionRequested = text(upstream["prompt_cache_retention"])
+	if _, ok := upstream["prompt_cache_retention"]; ok {
+		delete(upstream, "prompt_cache_retention")
+		document.MarkDirty()
+	}
+	if ctx.PromptCacheKey != "" && text(upstream["prompt_cache_key"]) != ctx.PromptCacheKey {
+		upstream["prompt_cache_key"] = ctx.PromptCacheKey
+	}
+	// Prompt-cache requests were always normalized before forwarding. Preserve
+	// that wire behavior while deferring the single encoding until all request
+	// mutations, including account fingerprinting, are complete.
+	document.MarkDirty()
+	ctx.PromptCacheRetentionSent = text(upstream["prompt_cache_retention"])
+	ctx.PromptTemplateHash, ctx.PromptDynamicHash = promptHashes(upstream)
+	return nil
+}
+
+func completePromptCacheContext(ctx *PromptCacheContext, upstreamBody []byte) {
+	if ctx == nil {
+		return
+	}
+	ctx.UpstreamPayloadHash = sha256Bytes(upstreamBody)
+	ctx.PromptCacheTrace = buildPromptCacheTrace(ctx)
+	if ctx.ownerUserID > 0 {
+		ctx.PromptCacheTrace["owner_user_id"] = ctx.ownerUserID
+		ctx.PromptCacheTrace["affinity_owner_scoped"] = true
+	}
 }
 
 func (ctx *PromptCacheContext) ApplyOwnerNamespace(ownerUserID int64) {
@@ -138,6 +222,7 @@ func (ctx *PromptCacheContext) ApplyOwnerNamespace(ownerUserID int64) {
 		return
 	}
 	namespace := fmt.Sprintf("owner:%d", ownerUserID)
+	ctx.ownerUserID = ownerUserID
 	if ctx.AffinityKey != "" {
 		ctx.AffinityKey = shortHash(namespace+":"+ctx.AffinityKey, 32)
 	}

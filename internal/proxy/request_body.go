@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,43 +16,62 @@ import (
 var errRequestBodyTooLarge = errors.New("request body too large")
 
 func readProxyRequestBody(r *http.Request, maxBytes int64) ([]byte, int, string, error) {
+	result, status, message, err := readProxyRequestBodyWithDigest(r, maxBytes)
+	return result.Bytes, status, message, err
+}
+
+type proxyRequestBody struct {
+	Bytes  []byte
+	SHA256 string
+}
+
+func readProxyRequestBodyWithDigest(r *http.Request, maxBytes int64) (proxyRequestBody, int, string, error) {
 	if r.Body == nil {
-		return nil, 0, "", nil
+		return proxyRequestBody{SHA256: sha256Bytes(nil)}, 0, "", nil
 	}
 	defer func() { _ = r.Body.Close() }()
 
 	encodings := contentEncodings(r.Header.Get("Content-Encoding"))
 	if len(encodings) == 0 || isIdentityEncoding(encodings) {
-		body, err := readBodyWithLimit(r.Body, maxBytes)
+		body, digest, err := readBodyWithLimitAndDigest(r.Body, maxBytes)
 		if err != nil {
 			status, message, readErr := requestBodyReadError(err, "failed to read request body")
-			return nil, status, message, readErr
+			return proxyRequestBody{}, status, message, readErr
 		}
-		return body, 0, "", nil
+		return proxyRequestBody{Bytes: body, SHA256: digest}, 0, "", nil
 	}
 	if len(encodings) != 1 || encodings[0] != "zstd" {
-		return nil, http.StatusUnsupportedMediaType, fmt.Sprintf("unsupported content encoding: %s", strings.Join(encodings, ", ")), errors.New("unsupported content encoding")
+		return proxyRequestBody{}, http.StatusUnsupportedMediaType, fmt.Sprintf("unsupported content encoding: %s", strings.Join(encodings, ", ")), errors.New("unsupported content encoding")
 	}
 
 	compressed, err := readBodyWithLimit(r.Body, maxBytes)
 	if err != nil {
 		status, message, readErr := requestBodyReadError(err, "failed to read request body")
-		return nil, status, message, readErr
+		return proxyRequestBody{}, status, message, readErr
 	}
 	decoder, err := zstd.NewReader(bytes.NewReader(compressed))
 	if err != nil {
-		return nil, http.StatusBadRequest, "invalid zstd body", err
+		return proxyRequestBody{}, http.StatusBadRequest, "invalid zstd body", err
 	}
 	defer decoder.Close()
 
-	body, err := readBodyWithLimit(decoder, maxBytes)
+	body, digest, err := readBodyWithLimitAndDigest(decoder, maxBytes)
 	if err != nil {
 		if errors.Is(err, errRequestBodyTooLarge) {
-			return nil, http.StatusRequestEntityTooLarge, "request body too large", err
+			return proxyRequestBody{}, http.StatusRequestEntityTooLarge, "request body too large", err
 		}
-		return nil, http.StatusBadRequest, "invalid zstd body", err
+		return proxyRequestBody{}, http.StatusBadRequest, "invalid zstd body", err
 	}
-	return body, 0, "", nil
+	return proxyRequestBody{Bytes: body, SHA256: digest}, 0, "", nil
+}
+
+func readBodyWithLimitAndDigest(reader io.Reader, maxBytes int64) ([]byte, string, error) {
+	hasher := sha256.New()
+	body, err := readBodyWithLimit(io.TeeReader(reader, hasher), maxBytes)
+	if err != nil {
+		return nil, "", err
+	}
+	return body, hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 func requestBodyReadError(err error, fallback string) (int, string, error) {

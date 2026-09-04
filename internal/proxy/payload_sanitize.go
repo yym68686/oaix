@@ -9,24 +9,26 @@ import (
 )
 
 func sanitizeReasoningContentBody(body []byte) ([]byte, bool) {
-	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 {
+	document := newRequestDocument(body, "")
+	if !sanitizeReasoningContentDocument(document) {
 		return body, false
 	}
-	var payload any
-	decoder := json.NewDecoder(bytes.NewReader(trimmed))
-	decoder.UseNumber()
-	if err := decoder.Decode(&payload); err != nil {
-		return body, false
-	}
-	if !removeReasoningContentFields(payload) {
-		return body, false
-	}
-	encoded, err := openai.EncodeJSON(payload)
+	encoded, err := document.Bytes()
 	if err != nil {
 		return body, false
 	}
 	return encoded, true
+}
+
+func sanitizeReasoningContentDocument(document *RequestDocument) bool {
+	if document == nil || document.parseErr != nil || document.value == nil {
+		return false
+	}
+	if !removeReasoningContentFields(document.value) {
+		return false
+	}
+	document.MarkDirty()
+	return true
 }
 
 func removeReasoningContentFields(value any) bool {

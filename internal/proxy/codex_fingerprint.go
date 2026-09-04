@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -12,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yym68686/oaix/internal/protocol/openai"
 	"github.com/yym68686/oaix/internal/tokens"
 )
 
@@ -142,11 +140,24 @@ func applyCodexFingerprintBody(body []byte, ids *codexFingerprintIDs) ([]byte, e
 	if ids == nil {
 		return body, nil
 	}
-	var payload map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(bytes.TrimSpace(body)))
-	decoder.UseNumber()
-	if err := decoder.Decode(&payload); err != nil || payload == nil {
-		return nil, fmt.Errorf("apply Codex fingerprint: request body must be a JSON object")
+	document := newRequestDocument(body, "")
+	if err := applyCodexFingerprintDocument(document, ids); err != nil {
+		return nil, err
+	}
+	encoded, err := document.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("apply Codex fingerprint: %w", err)
+	}
+	return encoded, nil
+}
+
+func applyCodexFingerprintDocument(document *RequestDocument, ids *codexFingerprintIDs) error {
+	if ids == nil {
+		return nil
+	}
+	payload, err := document.Object()
+	if err != nil {
+		return fmt.Errorf("apply Codex fingerprint: request body must be a JSON object")
 	}
 	metadata, _ := payload["client_metadata"].(map[string]any)
 	if metadata == nil {
@@ -166,11 +177,8 @@ func applyCodexFingerprintBody(body []byte, ids *codexFingerprintIDs) ([]byte, e
 		"turn_started_at_unix_ms": ids.TurnStartedAt,
 	})
 	payload["client_metadata"] = metadata
-	encoded, err := openai.EncodeJSON(payload)
-	if err != nil {
-		return nil, fmt.Errorf("apply Codex fingerprint: %w", err)
-	}
-	return encoded, nil
+	document.MarkDirty()
+	return nil
 }
 
 func rewriteEmbeddedCodexTurnMetadata(metadata map[string]any, fields map[string]any) {
