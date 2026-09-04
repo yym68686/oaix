@@ -111,6 +111,42 @@ func TestPromptCacheUpstreamHashUsesEncodedWireBytes(t *testing.T) {
 	}
 }
 
+func TestPromptCacheUpstreamHashExcludesFingerprintFields(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","prompt_cache_key":"cache","input":"hello"}`)
+	document := newRequestDocument(body, "")
+	intent := normalizeIntentDocument(RequestIntent{Endpoint: "/v1/responses"}, document)
+	ctx := buildExplicitPromptCacheRoutingContext(http.Header{}, intent, document, defaultPromptCacheConfig())
+	if ctx == nil {
+		t.Fatal("expected prompt cache context")
+	}
+	if err := finalizePromptCacheContext(ctx, document); err != nil {
+		t.Fatal(err)
+	}
+	want := ctx.UpstreamPayloadHash
+
+	if err := applyCodexFingerprintDocument(document, &codexFingerprintIDs{
+		InstallationID: "installation",
+		SessionID:      "session",
+		ThreadID:       "thread",
+		TurnID:         "turn",
+		WindowID:       "window",
+		TurnStartedAt:  123,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := document.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	completePromptCacheContext(ctx, upstream)
+	if ctx.UpstreamPayloadHash != want {
+		t.Fatalf("fingerprint changed observation hash: got %s, want %s", ctx.UpstreamPayloadHash, want)
+	}
+	if wireHash := sha256Bytes(upstream); wireHash == want {
+		t.Fatalf("test fixture did not distinguish fingerprinted wire hash from observation hash: %s", wireHash)
+	}
+}
+
 func TestRequestDocumentStrictAndStreamingConsumersPreserveTrailingJSONSemantics(t *testing.T) {
 	document := newRequestDocument([]byte(`{"model":"gpt-5.5"} {"extra":true}`), "")
 	if payload, err := document.Object(); err != nil || payload["model"] != "gpt-5.5" {

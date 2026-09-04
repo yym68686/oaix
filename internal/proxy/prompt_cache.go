@@ -202,6 +202,10 @@ func finalizePromptCacheContext(ctx *PromptCacheContext, document *RequestDocume
 	document.MarkDirty()
 	ctx.PromptCacheRetentionSent = text(upstream["prompt_cache_retention"])
 	ctx.PromptTemplateHash, ctx.PromptDynamicHash = promptHashes(upstream)
+	// Keep the observation hash scoped to the normalized prompt-cache payload,
+	// before per-account fingerprint fields are injected. CanonicalHash streams
+	// the same JSON bytes as the final encoder without allocating another body.
+	ctx.UpstreamPayloadHash = document.CanonicalHash()
 	return nil
 }
 
@@ -209,7 +213,13 @@ func completePromptCacheContext(ctx *PromptCacheContext, upstreamBody []byte) {
 	if ctx == nil {
 		return
 	}
-	ctx.UpstreamPayloadHash = sha256Bytes(upstreamBody)
+	// Legacy callers can still complete a context that was not finalized through
+	// RequestDocument. Shared-document callers already computed the pre-
+	// fingerprint observation hash and must not overwrite it with randomized
+	// fingerprint fields from the final wire body.
+	if ctx.UpstreamPayloadHash == "" {
+		ctx.UpstreamPayloadHash = sha256Bytes(upstreamBody)
+	}
 	ctx.PromptCacheTrace = buildPromptCacheTrace(ctx)
 	if ctx.ownerUserID > 0 {
 		ctx.PromptCacheTrace["owner_user_id"] = ctx.ownerUserID
