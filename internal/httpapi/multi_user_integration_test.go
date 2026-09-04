@@ -984,6 +984,39 @@ func TestUserPlanConcurrencyOverridesAdminDefaultWithDatabase(t *testing.T) {
 	}
 }
 
+func TestAdminOrdinary429CooldownUpdatesRuntimeWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	_, _ = h.db.Pool().Exec(context.Background(), `delete from gateway_settings where key = $1`, store.Ordinary429CooldownSettingKey)
+	t.Cleanup(func() {
+		_, _ = h.db.Pool().Exec(context.Background(), `delete from gateway_settings where key = $1`, store.Ordinary429CooldownSettingKey)
+	})
+
+	initial := expectStatus(t, h.request(t, http.MethodGet, "/admin/ordinary-429-cooldown", "service-test-key", ""), http.StatusOK)
+	if initial["cooldown_seconds"] != float64(1) || initial["overridden"] != false {
+		t.Fatalf("initial cooldown = %#v, want configured 1 second default", initial)
+	}
+
+	expectStatus(t, h.request(t, http.MethodPost, "/admin/ordinary-429-cooldown", "service-test-key", `{"cooldown_seconds":17}`), http.StatusOK)
+	if got := h.app.proxy.Ordinary429Cooldown(); got != 17*time.Second {
+		t.Fatalf("runtime cooldown = %s, want 17s", got)
+	}
+	stored, err := h.db.GetOrdinary429CooldownSettings(context.Background(), h.cfg.TokenPool.DefaultCooldown)
+	if err != nil || stored.CooldownSeconds != 17 || stored.UpdatedAt == nil {
+		t.Fatalf("stored cooldown = %#v err=%v", stored, err)
+	}
+
+	expectStatus(t, h.request(t, http.MethodPost, "/admin/ordinary-429-cooldown", "service-test-key", `{"cooldown_seconds":0}`), http.StatusBadRequest)
+	expectStatus(t, h.request(t, http.MethodPost, "/admin/settings/ordinary_429_cooldown", "service-test-key", `{"cooldown_seconds":30}`), http.StatusBadRequest)
+
+	reset := expectStatus(t, h.request(t, http.MethodDelete, "/admin/ordinary-429-cooldown", "service-test-key", ""), http.StatusOK)
+	if reset["cooldown_seconds"] != float64(1) || reset["overridden"] != false {
+		t.Fatalf("reset cooldown = %#v, want configured 1 second default", reset)
+	}
+	if got := h.app.proxy.Ordinary429Cooldown(); got != time.Second {
+		t.Fatalf("reset runtime cooldown = %s, want 1s", got)
+	}
+}
+
 func TestUserPlanModelAccessOverridesAdministratorDefaultWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	h.app.modelCatalog = nil

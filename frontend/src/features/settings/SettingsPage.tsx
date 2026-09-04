@@ -1,4 +1,4 @@
-import { DatabaseIcon, RefreshCwIcon, RotateCcwIcon, SaveIcon, Settings2Icon, ShieldCheckIcon } from "lucide-react";
+import { DatabaseIcon, RefreshCwIcon, RotateCcwIcon, SaveIcon, Settings2Icon, ShieldCheckIcon, TimerResetIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Button } from "@/registry/default/ui/button";
@@ -12,6 +12,7 @@ import {
   api,
   getServiceKey,
   setServiceKey,
+  type Ordinary429CooldownSettings,
   type SettingItem,
   type TokenConcurrencyPlan,
   type TokenModelAccessPlan,
@@ -30,6 +31,19 @@ import {
 import { EmptyState, ErrorAlert, LoadingState, SelectField } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
 import type { ToastMessage } from "@/shared/types";
+
+const DEFAULT_ORDINARY_429_COOLDOWN_SECONDS = 300;
+const MIN_ORDINARY_429_COOLDOWN_SECONDS = 1;
+const MAX_ORDINARY_429_COOLDOWN_SECONDS = 86_400;
+const ORDINARY_429_COOLDOWN_SETTING_KEY = "ordinary_429_cooldown";
+const numberFormatter = new Intl.NumberFormat("zh-CN");
+
+function formatCooldownDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "5 分钟";
+  if (seconds % 3600 === 0) return `${numberFormatter.format(seconds / 3600)} 小时`;
+  if (seconds % 60 === 0) return `${numberFormatter.format(seconds / 60)} 分钟`;
+  return `${numberFormatter.format(seconds)} 秒`;
+}
 
 export function UserSettingsPage({
   pushToast,
@@ -430,6 +444,13 @@ export function SettingsPage({
   const [adminModelOverrides, setAdminModelOverrides] = useState<Record<string, string[]>>({});
   const [adminModelsSaving, setAdminModelsSaving] = useState(false);
   const adminModelsDirtyRef = useRef(false);
+  const [ordinary429Settings, setOrdinary429Settings] = useState<Ordinary429CooldownSettings | null>(null);
+  const [ordinary429Draft, setOrdinary429Draft] = useState(String(DEFAULT_ORDINARY_429_COOLDOWN_SECONDS));
+  const [ordinary429Saving, setOrdinary429Saving] = useState(false);
+  const [ordinary429Error, setOrdinary429Error] = useState("");
+  const [ordinary429Dirty, setOrdinary429Dirty] = useState(false);
+  const ordinary429DirtyRef = useRef(false);
+  const ordinary429InputRef = useRef<HTMLInputElement>(null);
 
   const loadTokenSelection = useCallback(async () => {
     const payload = await api.tokenSelection();
@@ -442,13 +463,23 @@ export function SettingsPage({
     setLoading(true);
     setError("");
     try {
-      const [settingsPayload, , models] = await Promise.all([api.settings(), loadTokenSelection(), api.adminTokenModels()]);
+      const [settingsPayload, , models, cooldown] = await Promise.all([
+        api.settings(),
+        loadTokenSelection(),
+        api.adminTokenModels(),
+        api.ordinary429Cooldown(),
+      ]);
       const nextItems = settingsPayload.items || [];
       setItems(nextItems);
       setAdminProbeModel(testModelFromSettings(nextItems, ADMIN_TOKEN_PROBE_MODEL_SETTING_KEY));
       setAdminModelSettings(models);
       if (!adminModelsDirtyRef.current) {
         setAdminModelOverrides(Object.fromEntries((models.plans || []).filter((plan) => plan.overridden).map((plan) => [plan.plan, plan.models || []])));
+      }
+      setOrdinary429Settings(cooldown);
+      if (!ordinary429DirtyRef.current) {
+        setOrdinary429Draft(String(cooldown.cooldown_seconds || DEFAULT_ORDINARY_429_COOLDOWN_SECONDS));
+        setOrdinary429Error("");
       }
     } catch (caught) {
       setError(errorMessage(caught));
@@ -461,10 +492,77 @@ export function SettingsPage({
     void loadSettings();
   }, [loadSettings, refreshNonce]);
 
+  useEffect(() => {
+    if (!ordinary429Dirty) return;
+    const warnAboutUnsavedCooldown = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnAboutUnsavedCooldown);
+    return () => window.removeEventListener("beforeunload", warnAboutUnsavedCooldown);
+  }, [ordinary429Dirty]);
+
   async function saveStreamCap() {
     await api.updateTokenSelection({ active_stream_cap: streamCap });
     pushToast("调度设置已保存");
     await loadTokenSelection();
+  }
+
+  function parsedOrdinary429Cooldown(): number | null {
+    const value = Number(ordinary429Draft);
+    if (!Number.isInteger(value) || value < MIN_ORDINARY_429_COOLDOWN_SECONDS || value > MAX_ORDINARY_429_COOLDOWN_SECONDS) {
+      return null;
+    }
+    return value;
+  }
+
+  async function saveOrdinary429Cooldown() {
+    const cooldownSeconds = parsedOrdinary429Cooldown();
+    if (cooldownSeconds == null) {
+      setOrdinary429Error("请输入 1–86,400 之间的整数秒数。");
+      ordinary429InputRef.current?.focus();
+      return;
+    }
+    setOrdinary429Saving(true);
+    setOrdinary429Error("");
+    try {
+      const saved = await api.updateOrdinary429Cooldown(cooldownSeconds);
+      setOrdinary429Settings(saved);
+      setOrdinary429Draft(String(saved.cooldown_seconds));
+      ordinary429DirtyRef.current = false;
+      setOrdinary429Dirty(false);
+      setItems((current) => {
+        const item = { key: ORDINARY_429_COOLDOWN_SETTING_KEY, value: { cooldown_seconds: saved.cooldown_seconds }, updated_at: saved.updated_at };
+        return [...current.filter((candidate) => candidate.key !== ORDINARY_429_COOLDOWN_SETTING_KEY), item].sort((left, right) => left.key.localeCompare(right.key));
+      });
+      pushToast(`普通 429 冷却已设为 ${formatCooldownDuration(saved.cooldown_seconds)}`);
+    } catch (caught) {
+      const message = errorMessage(caught);
+      setOrdinary429Error(message);
+      pushToast(message, "error");
+    } finally {
+      setOrdinary429Saving(false);
+    }
+  }
+
+  async function resetOrdinary429Cooldown() {
+    setOrdinary429Saving(true);
+    setOrdinary429Error("");
+    try {
+      const reset = await api.resetOrdinary429Cooldown();
+      setOrdinary429Settings(reset);
+      setOrdinary429Draft(String(reset.cooldown_seconds));
+      ordinary429DirtyRef.current = false;
+      setOrdinary429Dirty(false);
+      setItems((current) => current.filter((item) => item.key !== ORDINARY_429_COOLDOWN_SETTING_KEY));
+      pushToast(`已恢复默认 ${formatCooldownDuration(reset.cooldown_seconds)}`, "info");
+    } catch (caught) {
+      const message = errorMessage(caught);
+      setOrdinary429Error(message);
+      pushToast(message, "error");
+    } finally {
+      setOrdinary429Saving(false);
+    }
   }
 
   async function saveSetting() {
@@ -602,6 +700,75 @@ export function SettingsPage({
               <SaveIcon />
               保存调度设置
             </Button>
+          </CardPanel>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <TimerResetIcon aria-hidden="true" className="size-5" />
+              普通 429 冷却
+            </CardTitle>
+            <CardDescription>上游返回普通 429 且没有明确额度重置时间时，暂时停止调度该 Key。</CardDescription>
+          </CardHeader>
+          <CardPanel className="grid gap-4">
+            {!ordinary429Settings ? (
+              loading ? <LoadingState compact label="正在载入 429 冷却设置" /> : <ErrorAlert title="429 冷却设置载入失败" message={error || "未返回冷却设置"} />
+            ) : (
+              <>
+                <Alert variant="info">
+                  <DatabaseIcon aria-hidden="true" />
+                  <AlertTitle>
+                    当前生效：{formatCooldownDuration(ordinary429Settings?.cooldown_seconds || DEFAULT_ORDINARY_429_COOLDOWN_SECONDS)}
+                  </AlertTitle>
+                  <AlertDescription>
+                    {ordinary429Settings?.overridden ? "当前使用管理员自定义值。" : "当前使用默认值。"} 保存后立即应用到新发生的普通 429。
+                  </AlertDescription>
+                </Alert>
+                <div className="grid gap-2">
+                  <Label htmlFor="ordinary-429-cooldown-seconds">冷却时间（秒）</Label>
+                  <Input
+                    aria-describedby={ordinary429Error ? "ordinary-429-cooldown-help ordinary-429-cooldown-error" : "ordinary-429-cooldown-help"}
+                    aria-invalid={Boolean(ordinary429Error)}
+                    autoComplete="off"
+                    id="ordinary-429-cooldown-seconds"
+                    inputMode="numeric"
+                    max={MAX_ORDINARY_429_COOLDOWN_SECONDS}
+                    min={MIN_ORDINARY_429_COOLDOWN_SECONDS}
+                    name="ordinary_429_cooldown_seconds"
+                    nativeInput
+                    onChange={(event) => {
+                      ordinary429DirtyRef.current = true;
+                      setOrdinary429Dirty(true);
+                      setOrdinary429Draft(event.currentTarget.value);
+                      setOrdinary429Error("");
+                    }}
+                    ref={ordinary429InputRef}
+                    step={1}
+                    type="number"
+                    value={ordinary429Draft}
+                  />
+                  <p className="text-muted-foreground text-xs" id="ordinary-429-cooldown-help">
+                    可设置 1 秒到 24 小时。默认 300 秒（5 分钟）；已在冷却中的 Key 不会被追溯修改。
+                  </p>
+                  {ordinary429Error ? (
+                    <p className="text-destructive text-sm" id="ordinary-429-cooldown-error" role="alert">
+                      {ordinary429Error}
+                    </p>
+                  ) : null}
+                </div>
+                <div className="grid gap-2 sm:flex sm:flex-wrap">
+                  <Button className="w-full sm:w-auto" disabled={ordinary429Saving} loading={ordinary429Saving} onClick={() => void saveOrdinary429Cooldown()}>
+                    <SaveIcon aria-hidden="true" />
+                    保存 429 冷却
+                  </Button>
+                  <Button className="w-full sm:w-auto" disabled={ordinary429Saving} onClick={() => void resetOrdinary429Cooldown()} variant="outline">
+                    <RotateCcwIcon aria-hidden="true" />
+                    恢复默认 {formatCooldownDuration(ordinary429Settings?.default_cooldown_seconds || DEFAULT_ORDINARY_429_COOLDOWN_SECONDS)}
+                  </Button>
+                </div>
+              </>
+            )}
           </CardPanel>
         </Card>
 

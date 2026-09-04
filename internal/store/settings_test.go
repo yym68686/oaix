@@ -3,7 +3,42 @@ package store
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
+
+func TestBuildOrdinary429CooldownSettingsDefaultsToFiveMinutes(t *testing.T) {
+	settings := buildOrdinary429CooldownSettings(nil, nil, 0)
+	if settings.CooldownSeconds != 300 {
+		t.Fatalf("CooldownSeconds = %d, want 300", settings.CooldownSeconds)
+	}
+	if settings.UpdatedAt != nil {
+		t.Fatalf("UpdatedAt = %v, want nil", settings.UpdatedAt)
+	}
+}
+
+func TestBuildOrdinary429CooldownSettingsUsesValidPersistedValue(t *testing.T) {
+	updatedAt := time.Now().UTC()
+	settings := buildOrdinary429CooldownSettings(json.RawMessage(`{"cooldown_seconds": 45}`), &updatedAt, 5*time.Minute)
+	if settings.CooldownSeconds != 45 {
+		t.Fatalf("CooldownSeconds = %d, want 45", settings.CooldownSeconds)
+	}
+	if settings.UpdatedAt == nil || !settings.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("UpdatedAt = %v, want %v", settings.UpdatedAt, updatedAt)
+	}
+}
+
+func TestParseOrdinary429CooldownSecondsRange(t *testing.T) {
+	for _, value := range []int64{0, -1, MaxOrdinary429CooldownSeconds + 1} {
+		if _, err := ParseOrdinary429CooldownSeconds(value); err == nil {
+			t.Fatalf("ParseOrdinary429CooldownSeconds(%d) returned nil error", value)
+		}
+	}
+	for _, value := range []int64{MinOrdinary429CooldownSeconds, 300, MaxOrdinary429CooldownSeconds} {
+		if got, err := ParseOrdinary429CooldownSeconds(value); err != nil || got != value {
+			t.Fatalf("ParseOrdinary429CooldownSeconds(%d) = %d, %v", value, got, err)
+		}
+	}
+}
 
 func TestBuildTokenSelectionSettingsPreservesPythonPayload(t *testing.T) {
 	raw := json.RawMessage(`{

@@ -391,6 +391,13 @@ export type TokenModelAccessSettings = {
   updated_at?: string | null;
 };
 
+export type Ordinary429CooldownSettings = {
+  cooldown_seconds: number;
+  default_cooldown_seconds: number;
+  overridden: boolean;
+  updated_at?: string | null;
+};
+
 export type Sub2APITarget = {
   id: number;
   name: string;
@@ -640,6 +647,10 @@ export const api = {
   tokenSelection: (authKey?: string) => requestJSON<Record<string, unknown>>("/admin/token-selection", {}, authKey),
   updateTokenSelection: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/token-selection", payload),
+  ordinary429Cooldown: () => requestJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown"),
+  updateOrdinary429Cooldown: (cooldownSeconds: number) =>
+    postJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown", { cooldown_seconds: cooldownSeconds }),
+  resetOrdinary429Cooldown: () => deleteJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown"),
   adminTokenModels: () => requestJSON<TokenModelAccessSettings>("/admin/token-models"),
   updateAdminTokenModels: (planModels: Record<string, string[]>) =>
     postJSON<TokenModelAccessSettings>("/admin/token-models", { plan_models: planModels }),

@@ -15,6 +15,7 @@ func TestAdminOpenAPISpecContainsAPIizedResources(t *testing.T) {
 		t.Fatalf("paths missing: %#v", spec["paths"])
 	}
 	required := []string{
+		"/admin/ordinary-429-cooldown",
 		"/admin/import/parse",
 		"/admin/tokens/batch",
 		"/admin/import/jobs",

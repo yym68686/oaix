@@ -281,6 +281,7 @@ func (a *App) openapiSpec(w http.ResponseWriter, r *http.Request) {
 func adminOpenAPISpec() map[string]any {
 	routes := []string{
 		"GET /admin/openapi.json", "GET /admin/options",
+		"GET /admin/ordinary-429-cooldown", "POST /admin/ordinary-429-cooldown", "DELETE /admin/ordinary-429-cooldown",
 		"GET /admin/token-models", "POST /admin/token-models", "DELETE /admin/token-models",
 		"GET /admin/tokens", "POST /admin/tokens/batch", "GET /admin/token-refresh-tokens/{token_id}", "PATCH /admin/tokens/{token_id}", "GET /admin/tokens/export",
 		"GET /admin/token-quota-reset-credits/{token_id}", "POST /admin/token-quota-reset/{token_id}",
@@ -1521,8 +1522,8 @@ func (a *App) getSetting(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) deleteSetting(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimSpace(r.PathValue("key"))
-	if key == store.TokenModelAccessSettingKey {
-		writeError(w, http.StatusBadRequest, errors.New("token_model_access must be reset through /admin/token-models"))
+	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey {
+		writeError(w, http.StatusBadRequest, errors.New("this setting must be reset through its dedicated API"))
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -1559,6 +1560,15 @@ func (a *App) settingsSchema(w http.ResponseWriter, r *http.Request) {
 		"token_selection": map[string]any{
 			"type":       "object",
 			"properties": map[string]any{"active_stream_cap": map[string]any{"type": "integer", "minimum": 1, "maximum": store.MaxTokenActiveStreamCap}},
+		},
+		"ordinary_429_cooldown": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"cooldown_seconds": map[string]any{
+					"type": "integer", "minimum": store.MinOrdinary429CooldownSeconds, "maximum": store.MaxOrdinary429CooldownSeconds,
+				},
+			},
+			"default": map[string]any{"cooldown_seconds": int64(store.DefaultOrdinary429Cooldown / time.Second)},
 		},
 		"admin_token_probe_model": map[string]any{
 			"type":       "object",

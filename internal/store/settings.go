@@ -17,10 +17,14 @@ import (
 const (
 	TokenSelectionSettingKey        = "token_selection"
 	TokenConcurrencySettingKey      = "token_concurrency"
+	Ordinary429CooldownSettingKey   = "ordinary_429_cooldown"
 	DefaultTokenSelectionStrategy   = "least_recently_used"
 	TokenSelectionStrategyFillFirst = "fill_first"
 	MinTokenActiveStreamCap         = int64(1)
 	MaxTokenActiveStreamCap         = int64(50)
+	MinOrdinary429CooldownSeconds   = int64(1)
+	MaxOrdinary429CooldownSeconds   = int64(24 * 60 * 60)
+	DefaultOrdinary429Cooldown      = 5 * time.Minute
 	defaultTokenActiveStreamCap     = int64(10)
 )
 
@@ -41,6 +45,11 @@ type TokenSelectionSettings struct {
 	PlanOrder        []string   `json:"plan_order"`
 	ActiveStreamCap  int64      `json:"active_stream_cap"`
 	UpdatedAt        *time.Time `json:"updated_at,omitempty"`
+}
+
+type Ordinary429CooldownSettings struct {
+	CooldownSeconds int64      `json:"cooldown_seconds"`
+	UpdatedAt       *time.Time `json:"updated_at,omitempty"`
 }
 
 // TokenConcurrencySettings contains only the user-owned per-plan overrides.
@@ -70,6 +79,82 @@ func CanonicalTokenPlan(value string) string {
 
 type tokenConcurrencyPayload struct {
 	PlanConcurrency map[string]int64 `json:"plan_concurrency"`
+}
+
+type ordinary429CooldownPayload struct {
+	CooldownSeconds int64 `json:"cooldown_seconds"`
+}
+
+func (s *Store) GetOrdinary429CooldownSettings(ctx context.Context, fallback time.Duration) (Ordinary429CooldownSettings, error) {
+	setting, err := s.GetSetting(ctx, Ordinary429CooldownSettingKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return buildOrdinary429CooldownSettings(nil, nil, fallback), nil
+	}
+	if err != nil {
+		return Ordinary429CooldownSettings{}, err
+	}
+	updatedAt := setting.UpdatedAt.UTC()
+	return buildOrdinary429CooldownSettings(setting.Value, &updatedAt, fallback), nil
+}
+
+func (s *Store) UpdateOrdinary429CooldownSettings(ctx context.Context, cooldownSeconds int64) (Ordinary429CooldownSettings, error) {
+	resolved, err := ParseOrdinary429CooldownSeconds(cooldownSeconds)
+	if err != nil {
+		return Ordinary429CooldownSettings{}, err
+	}
+	payload, err := json.Marshal(ordinary429CooldownPayload{CooldownSeconds: resolved})
+	if err != nil {
+		return Ordinary429CooldownSettings{}, err
+	}
+	setting, err := s.UpsertSetting(ctx, Ordinary429CooldownSettingKey, payload)
+	if err != nil {
+		return Ordinary429CooldownSettings{}, err
+	}
+	updatedAt := setting.UpdatedAt.UTC()
+	return Ordinary429CooldownSettings{CooldownSeconds: resolved, UpdatedAt: &updatedAt}, nil
+}
+
+func (s *Store) DeleteOrdinary429CooldownSettings(ctx context.Context) error {
+	return s.deleteGlobalSetting(ctx, Ordinary429CooldownSettingKey)
+}
+
+func ParseOrdinary429CooldownSeconds(value int64) (int64, error) {
+	if value < MinOrdinary429CooldownSeconds || value > MaxOrdinary429CooldownSeconds {
+		return 0, fmt.Errorf(
+			"unsupported ordinary 429 cooldown; expected an integer from %d to %d seconds",
+			MinOrdinary429CooldownSeconds,
+			MaxOrdinary429CooldownSeconds,
+		)
+	}
+	return value, nil
+}
+
+func buildOrdinary429CooldownSettings(raw json.RawMessage, updatedAt *time.Time, fallback time.Duration) Ordinary429CooldownSettings {
+	fallbackSeconds := normalizedOrdinary429CooldownFallback(fallback)
+	settings := Ordinary429CooldownSettings{CooldownSeconds: fallbackSeconds}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		var payload map[string]any
+		if err := json.Unmarshal(raw, &payload); err == nil && payload != nil {
+			if parsed, ok := parseInt64Value(payload["cooldown_seconds"]); ok {
+				if resolved, err := ParseOrdinary429CooldownSeconds(parsed); err == nil {
+					settings.CooldownSeconds = resolved
+				}
+			}
+		}
+	}
+	if updatedAt != nil {
+		value := updatedAt.UTC()
+		settings.UpdatedAt = &value
+	}
+	return settings
+}
+
+func normalizedOrdinary429CooldownFallback(fallback time.Duration) int64 {
+	seconds := int64(fallback / time.Second)
+	if resolved, err := ParseOrdinary429CooldownSeconds(seconds); err == nil {
+		return resolved
+	}
+	return int64(DefaultOrdinary429Cooldown / time.Second)
 }
 
 func (s *Store) ListSettings(ctx context.Context) ([]Setting, error) {

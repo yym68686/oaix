@@ -123,6 +123,32 @@ func TestFrontendSettingsExposePlanModelOverrides(t *testing.T) {
 	}
 }
 
+func TestFrontendSettingsExposeOrdinary429Cooldown(t *testing.T) {
+	page := readFrontendFile(t, "src", "features", "settings", "SettingsPage.tsx")
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+	for _, required := range []string{
+		"普通 429 冷却",
+		"默认 300 秒（5 分钟）",
+		"api.ordinary429Cooldown()",
+		"api.updateOrdinary429Cooldown(cooldownSeconds)",
+		"api.resetOrdinary429Cooldown()",
+		"请输入 1–86,400 之间的整数秒数",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("ordinary 429 cooldown settings contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		`requestJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown")`,
+		`postJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown"`,
+		`deleteJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown")`,
+	} {
+		if !strings.Contains(apiFile, required) {
+			t.Fatalf("ordinary 429 cooldown API contract missing %q", required)
+		}
+	}
+}
+
 func TestFrontendProfileSupportsSavedAccountSwitching(t *testing.T) {
 	appShell := readFrontendFile(t, "src", "app", "AppShell.tsx")
 	router := readFrontendFile(t, "src", "app", "router.ts")

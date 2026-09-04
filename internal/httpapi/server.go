@@ -149,6 +149,9 @@ func (a *App) Handler() http.Handler {
 	a.registerPlatformAdminAPIRoutes(mux)
 	mux.HandleFunc("GET /admin/token-selection", a.requireAuth(a.tokenSelection))
 	mux.HandleFunc("POST /admin/token-selection", a.requireAuth(a.updateTokenSelection))
+	mux.HandleFunc("GET /admin/ordinary-429-cooldown", a.requireAuth(a.getOrdinary429Cooldown))
+	mux.HandleFunc("POST /admin/ordinary-429-cooldown", a.requireAuth(a.updateOrdinary429Cooldown))
+	mux.HandleFunc("DELETE /admin/ordinary-429-cooldown", a.requireAuth(a.resetOrdinary429Cooldown))
 	mux.HandleFunc("GET /admin/token-models", a.requireAuth(a.getAdminTokenModelAccess))
 	mux.HandleFunc("POST /admin/token-models", a.requireAuth(a.updateAdminTokenModelAccess))
 	mux.HandleFunc("DELETE /admin/token-models", a.requireAuth(a.deleteAdminTokenModelAccess))
@@ -1411,6 +1414,9 @@ func (a *App) runtime(w http.ResponseWriter, r *http.Request) {
 	} else {
 		scheduler["token_selection_settings_error"] = err.Error()
 	}
+	if a.proxy != nil {
+		scheduler["ordinary_429_cooldown_seconds"] = int64(a.proxy.Ordinary429Cooldown() / time.Second)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token_pool":  a.tokens.Stats(),
 		"scheduler":   scheduler,
@@ -1441,8 +1447,8 @@ func (a *App) updateSetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
 		return
 	}
-	if key == store.TokenModelAccessSettingKey {
-		writeError(w, http.StatusBadRequest, errors.New("token_model_access must be updated through /admin/token-models"))
+	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey {
+		writeError(w, http.StatusBadRequest, errors.New("this setting must be updated through its dedicated API"))
 		return
 	}
 	defer r.Body.Close()

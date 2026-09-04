@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/yym68686/oaix/internal/affinity"
 	"github.com/yym68686/oaix/internal/config"
@@ -59,6 +60,12 @@ func RunGateway(ctx context.Context) error {
 	} else {
 		activeStreamCap = settings.ActiveStreamCap
 	}
+	ordinary429Cooldown := cfg.TokenPool.DefaultCooldown
+	if settings, err := db.GetOrdinary429CooldownSettings(ctx, cfg.TokenPool.DefaultCooldown); err != nil {
+		logger.Warn("ordinary 429 cooldown settings load failed; using configured default", "error", err, "cooldown", cfg.TokenPool.DefaultCooldown)
+	} else {
+		ordinary429Cooldown = time.Duration(settings.CooldownSeconds) * time.Second
+	}
 	tokenManager := tokens.NewManager(db, logger, cfg.TokenPool.SnapshotMaxAge, cfg.TokenPool.RefreshInterval, activeStreamCap)
 	tokenManager.Start(ctx)
 	logWriter := logs.NewWriter(db, logger, cfg.RequestLog)
@@ -68,6 +75,7 @@ func RunGateway(ctx context.Context) error {
 	defer upstream.CloseIdleConnections()
 	affinityStore := affinity.NewPostgresStore(db.Pool())
 	pipeline := proxy.New(cfg, logger, tokenManager, upstream, logWriter, db, affinityStore)
+	pipeline.SetOrdinary429Cooldown(ordinary429Cooldown)
 	oauthClient := oauth.NewHTTPClient(cfg.Upstream.OAuthTokenURL)
 	oauthClient.ClientID = cfg.Upstream.OAuthClientID
 	oauthClient.Scope = cfg.Upstream.OAuthScope

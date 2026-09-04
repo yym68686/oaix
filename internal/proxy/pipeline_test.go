@@ -1620,6 +1620,53 @@ func TestProxyUsageLimitUsesOfficialCooldown(t *testing.T) {
 	}
 }
 
+func TestOrdinary429CooldownCanBeUpdatedAtRuntime(t *testing.T) {
+	pipeline := New(config.Config{TokenPool: config.TokenPoolConfig{DefaultCooldown: 5 * time.Minute}}, nil, nil, nil, nil, nil, nil)
+	if got := pipeline.Ordinary429Cooldown(); got != 5*time.Minute {
+		t.Fatalf("initial cooldown = %s, want 5m", got)
+	}
+	pipeline.SetOrdinary429Cooldown(17 * time.Second)
+	startedAt := time.Now().UTC()
+	decision := pipeline.decideTokenFailure(
+		context.Background(),
+		nil,
+		http.StatusTooManyRequests,
+		AttemptResult{ErrorBody: []byte(`{"error":{"code":"rate_limit_exceeded","message":"retry later"}}`)},
+		nil,
+		OutcomeUpstream429Cooldown,
+		nil,
+		map[string]any{},
+	)
+	if !decision.commitRequired || decision.cooldownUntil == nil {
+		t.Fatalf("decision = %+v, want persisted cooldown", decision)
+	}
+	if got := decision.cooldownUntil.Sub(startedAt); got < 16*time.Second || got > 18*time.Second {
+		t.Fatalf("runtime cooldown = %s, want near 17s", got)
+	}
+}
+
+func TestOrdinary429CooldownDoesNotOverrideUsageLimitFallback(t *testing.T) {
+	pipeline := New(config.Config{TokenPool: config.TokenPoolConfig{DefaultCooldown: 11 * time.Second}}, nil, nil, nil, nil, nil, nil)
+	pipeline.SetOrdinary429Cooldown(17 * time.Second)
+	startedAt := time.Now().UTC()
+	decision := pipeline.decideTokenFailure(
+		context.Background(),
+		nil,
+		http.StatusTooManyRequests,
+		AttemptResult{ErrorBody: []byte(`{"error":{"type":"usage_limit_reached","message":"quota exhausted"}}`)},
+		nil,
+		OutcomeUpstream429Cooldown,
+		nil,
+		map[string]any{},
+	)
+	if decision.cooldownUntil == nil {
+		t.Fatal("usage-limit decision did not include a cooldown")
+	}
+	if got := decision.cooldownUntil.Sub(startedAt); got < 10*time.Second || got > 12*time.Second {
+		t.Fatalf("usage-limit fallback = %s, want near configured 11s", got)
+	}
+}
+
 func TestProxyDeactivatesAndRetriesAfterDeactivatedWorkspace402(t *testing.T) {
 	var mu sync.Mutex
 	var authHeaders []string

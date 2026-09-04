@@ -56,6 +56,7 @@ type Pipeline struct {
 	agentIdentityTasks         *agentidentitytask.Coordinator
 	agentIdentityCredentials   sync.Map
 	commitFailures             atomic.Int64
+	ordinary429CooldownNanos   atomic.Int64
 }
 
 type TokenModelCapabilityLoss struct {
@@ -174,7 +175,7 @@ const (
 )
 
 func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, client *transport.Client, writer *logs.Writer, stateStore tokenStateStore, affinityStore affinity.Store) *Pipeline {
-	return &Pipeline{
+	pipeline := &Pipeline{
 		cfg:       cfg,
 		logger:    logger,
 		tokens:    tokenManager,
@@ -183,6 +184,28 @@ func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, c
 		store:     stateStore,
 		affinity:  affinityStore,
 	}
+	pipeline.SetOrdinary429Cooldown(cfg.TokenPool.DefaultCooldown)
+	return pipeline
+}
+
+func (p *Pipeline) SetOrdinary429Cooldown(value time.Duration) time.Duration {
+	if value <= 0 {
+		value = 5 * time.Minute
+	}
+	if p != nil {
+		p.ordinary429CooldownNanos.Store(int64(value))
+	}
+	return value
+}
+
+func (p *Pipeline) Ordinary429Cooldown() time.Duration {
+	if p == nil {
+		return 5 * time.Minute
+	}
+	if value := time.Duration(p.ordinary429CooldownNanos.Load()); value > 0 {
+		return value
+	}
+	return 5 * time.Minute
 }
 
 func (p *Pipeline) AgentIdentityTaskCoordinator() *agentidentitytask.Coordinator {
@@ -1512,13 +1535,14 @@ func (p *Pipeline) decideTokenFailure(
 	}
 	if action == OutcomeUpstream429Cooldown {
 		now := time.Now().UTC()
-		decision.cooldownUntil = cooldown.UsageLimitUntil(status, result.ErrorBody, now, p.cfg.TokenPool.DefaultCooldown)
+		usageLimitFallback := p.cfg.TokenPool.DefaultCooldown
+		if usageLimitFallback <= 0 {
+			usageLimitFallback = 5 * time.Minute
+		}
+		decision.cooldownUntil = cooldown.UsageLimitUntil(status, result.ErrorBody, now, usageLimitFallback)
 		decision.commitMessage = "upstream 429 cooldown"
 		if decision.cooldownUntil == nil {
-			fallback := p.cfg.TokenPool.DefaultCooldown
-			if fallback <= 0 {
-				fallback = 300 * time.Second
-			}
+			fallback := p.Ordinary429Cooldown()
 			until := now.Add(fallback)
 			decision.cooldownUntil = &until
 		} else {
