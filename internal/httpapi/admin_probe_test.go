@@ -24,6 +24,12 @@ import (
 	"github.com/yym68686/oaix/internal/store"
 )
 
+func TestNormalizeConfiguredTokenProbeModelSupportsGPT6Astra(t *testing.T) {
+	if got := normalizeConfiguredTokenProbeModel("gpt-6-astra"); got != "gpt-6-astra" {
+		t.Fatalf("normalized probe model = %q, want gpt-6-astra", got)
+	}
+}
+
 func TestProbeTokenUsesCurrentAccessTokenAndStreamingPayload(t *testing.T) {
 	oauthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("oauth refresh should not be called by token probe")

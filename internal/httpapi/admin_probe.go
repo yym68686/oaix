@@ -27,7 +27,7 @@ const (
 	userProbeModelSettingKey   = "token_probe_model"
 )
 
-var supportedTokenProbeModels = modelaccess.TextModelIDs()
+var supportedTokenProbeModels = append(modelaccess.TextModelIDs(), "gpt-6-astra")
 
 func (a *App) listTokenQuota(w http.ResponseWriter, r *http.Request) {
 	ids, err := parseAdminTokenIDs(r.URL.Query().Get("ids"), 100)

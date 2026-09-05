@@ -129,6 +129,13 @@ func TestFrontendSettingsExposePlanModelOverrides(t *testing.T) {
 	}
 }
 
+func TestFrontendSettingsExposeGPT6AstraProbeModel(t *testing.T) {
+	testModels := readFrontendFile(t, "src", "lib", "test-models.ts")
+	if !strings.Contains(testModels, `"gpt-6-astra"`) {
+		t.Fatal("test model options must include gpt-6-astra")
+	}
+}
+
 func TestFrontendSettingsExposeGPT6AstraLongContextPricing(t *testing.T) {
 	page := readFrontendFile(t, "src", "features", "settings", "SettingsPage.tsx")
 	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
