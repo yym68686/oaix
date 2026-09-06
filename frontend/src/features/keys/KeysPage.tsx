@@ -510,37 +510,40 @@ export function KeyListPage({
             </PageSectionAction>
           )}
         </PageSectionHeader>
-        <PageSectionPanel className="flex min-h-0 flex-1 flex-col gap-4">
-          <FilterBar>
-            <div className="grid min-w-0 gap-2">
-              <Label htmlFor={searchId}>搜索 Key</Label>
-              <div className="relative min-w-0">
-                <SearchIcon className="-translate-y-1/2 pointer-events-none absolute left-3 top-1/2 size-4 text-muted-foreground" />
-                <Input
-                  className="min-w-0 pl-9"
-                  id={searchId}
-                  nativeInput
-                  onChange={(event) => updateQuery({ page: 1, q: event.currentTarget.value })}
-                  placeholder="邮箱、Token ID、来源或错误"
-                  type="search"
-                  value={search}
-                />
-              </div>
+        <PageSectionPanel className="flex min-h-0 flex-1 flex-col">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border bg-card shadow-xs">
+            <div className="p-4 sm:p-5">
+              <FilterBar>
+                <div className="grid min-w-0 gap-2">
+                  <Label htmlFor={searchId}>搜索 Key</Label>
+                  <div className="relative min-w-0">
+                    <SearchIcon className="-translate-y-1/2 pointer-events-none absolute left-3 top-1/2 size-4 text-muted-foreground" />
+                    <Input
+                      className="min-w-0 pl-9"
+                      id={searchId}
+                      nativeInput
+                      onChange={(event) => updateQuery({ page: 1, q: event.currentTarget.value })}
+                      placeholder="邮箱、Token ID、来源或错误"
+                      type="search"
+                      value={search}
+                    />
+                  </div>
+                </div>
+                {config.ownerFilterOptions && (
+                  <SelectField
+                    label="账号"
+                    onChange={(value) => updateQuery({ owner_user_id: value, page: 1 })}
+                    options={config.ownerFilterOptions}
+                    value={ownerUserID}
+                  />
+                )}
+                <SelectField label="状态" onChange={(value) => updateQuery({ page: 1, status: value })} options={statusOptions} value={status} />
+                <SelectField label="计划" onChange={(value) => updateQuery({ page: 1, plan: value })} options={planOptions} value={plan} />
+                <SelectField label="排序" onChange={(value) => updateQuery({ page: 1, sort: value })} options={SORT_OPTIONS} value={sort} />
+              </FilterBar>
             </div>
-            {config.ownerFilterOptions && (
-              <SelectField
-                label="账号"
-                onChange={(value) => updateQuery({ owner_user_id: value, page: 1 })}
-                options={config.ownerFilterOptions}
-                value={ownerUserID}
-              />
-            )}
-            <SelectField label="状态" onChange={(value) => updateQuery({ page: 1, status: value })} options={statusOptions} value={status} />
-            <SelectField label="计划" onChange={(value) => updateQuery({ page: 1, plan: value })} options={planOptions} value={plan} />
-            <SelectField label="排序" onChange={(value) => updateQuery({ page: 1, sort: value })} options={SORT_OPTIONS} value={sort} />
-          </FilterBar>
 
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-muted/40 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-y bg-muted/20 px-4 py-3 sm:px-5">
             <div className="flex flex-wrap items-center gap-2">
               <Label className="rounded-lg border bg-background px-3 py-2">
                 <Checkbox
@@ -585,7 +588,7 @@ export function KeyListPage({
             <Badge variant="secondary">{selectedCount ? `已选择 ${formatNumber(selectedCount)} 个` : "未选择"}</Badge>
           </div>
 
-          <div className="min-h-0 flex-1">
+          <div className="min-h-0 flex-1 bg-background/35">
             <TokenTable
               activeStreamCap={activeStreamCap}
               detailBasePath={detailBasePath}
@@ -603,8 +606,9 @@ export function KeyListPage({
               tokens={tokens}
             />
           </div>
-          <div className="mt-auto border-t pt-2">
+          <div className="mt-auto border-t bg-muted/10 px-4 pt-2 sm:px-5">
             <Pagination page={page} totalPages={totalPages} onPageChange={(next) => updateQuery({ page: clamp(next, 1, totalPages) }, false)} total={tokenTotal} />
+          </div>
           </div>
         </PageSectionPanel>
       </PageSection>
@@ -664,8 +668,8 @@ function TokenTable({
   }
   if (loading) {
     return (
-      <div className="grid min-h-[18rem] place-items-center rounded-lg border bg-muted/24">
-        <div className="flex items-center gap-2 rounded-lg border bg-background px-4 py-3 text-muted-foreground text-sm shadow-xs">
+      <div className="grid min-h-[18rem] place-items-center bg-muted/12">
+        <div className="flex items-center gap-2 rounded-full bg-muted px-4 py-2.5 text-muted-foreground text-sm">
           <LoaderCircleIcon className="size-4 animate-spin" />
           <span>正在加载 Key</span>
         </div>
@@ -676,7 +680,7 @@ function TokenTable({
     return <EmptyState title="没有匹配的 key" description={emptyDescription || "调整搜索、状态、计划或排序后再试。"} />;
   }
   return (
-    <div className="min-w-0 overflow-x-auto rounded-lg border oaix-scrollbar">
+      <div className="min-w-0 overflow-x-auto oaix-scrollbar">
       <Table className="table-fixed" style={{ width: "max(100%, 86rem)" }}>
         <colgroup>
           <col className="w-9" />
