@@ -848,7 +848,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			return fmt.Errorf("online migration statement %d failed: %w\n%s", index+1, err, strings.TrimSpace(statement))
 		}
 	}
-	return nil
+	return s.EnsureRequestCostRepairIndex(ctx)
 }
 
 // MigrateForStartup keeps ordinary gateway restarts off the DDL path and uses

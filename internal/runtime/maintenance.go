@@ -23,6 +23,7 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 	workerCtx, cancel := context.WithCancel(ctx)
 	maintenanceDone := make(chan struct{})
 	indexDone := make(chan struct{})
+	costIndexDone := make(chan struct{})
 	importWorker := newImportWorker(cfg)
 	sub2apiSyncer := sub2api.NewSyncer(db, nil, logger, cfg.Upstream.OAuthClientID)
 	go func() {
@@ -55,6 +56,10 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 		defer close(indexDone)
 		runRequestAttemptRetentionIndexWorker(workerCtx, logger, db)
 	}()
+	go func() {
+		defer close(costIndexDone)
+		RunRequestCostIndexWorker(workerCtx, logger, db)
+	}()
 	if logger != nil {
 		logger.Info("embedded worker started")
 	}
@@ -68,6 +73,33 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 		select {
 		case <-indexDone:
 		case <-shutdownCtx.Done():
+		}
+		select {
+		case <-costIndexDone:
+		case <-shutdownCtx.Done():
+		}
+	}
+}
+
+func RunRequestCostIndexWorker(ctx context.Context, logger *slog.Logger, db *store.Store) {
+	for {
+		stepCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		err := db.EnsureRequestCostRepairIndex(stepCtx)
+		cancel()
+		if err == nil {
+			logger.Info("request cost repair index ready")
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		logger.Warn("request cost repair index ensure failed", "error", err)
+		timer := time.NewTimer(time.Minute)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 	}
 }

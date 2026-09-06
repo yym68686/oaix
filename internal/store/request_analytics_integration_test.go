@@ -201,6 +201,35 @@ func TestCurrentObservedCostSnapshotRepairsLateFinalizedRequestIDReuse(t *testin
 		t.Fatalf("fixture did not reproduce stale aggregate: analytics_before_finish=%v aggregate_cost=%f", analyticsBeforeFinish, aggregateCost)
 	}
 
+	if _, err := db.pool.Exec(ctx, "drop index "+requestCostRepairIndexName); err != nil {
+		t.Fatal(err)
+	}
+	// With no partial index, repair must not touch the heap even when it is locked.
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "lock table gateway_request_logs in access exclusive mode"); err != nil {
+		t.Fatal(err)
+	}
+	shortCtx, shortCancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	unchanged := map[int64]*float64{tokenID: float64Ptr(7)}
+	err = db.overrideLateFinalizedRequestCosts(shortCtx, map[int64]int64{tokenID: tokenID}, unchanged)
+	shortCancel()
+	if err != nil || valueOrZero(unchanged[tokenID]) != 7 {
+		t.Fatalf("repair without index touched logs or changed the snapshot: %v, %v", unchanged, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureRequestCostRepairIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureRequestCostRepairIndex(ctx); err != nil {
+		t.Fatalf("ensure existing index: %v", err)
+	}
+
 	costs, err := db.TokenObservedCostsCurrentSnapshot(ctx, []Token{{ID: tokenID}})
 	if err != nil {
 		t.Fatalf("TokenObservedCostsCurrentSnapshot returned error: %v", err)

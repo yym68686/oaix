@@ -12,6 +12,7 @@ import (
 	"github.com/yym68686/oaix/internal/importer"
 	"github.com/yym68686/oaix/internal/oauth"
 	"github.com/yym68686/oaix/internal/observability"
+	"github.com/yym68686/oaix/internal/runtime"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -40,6 +41,7 @@ func main() {
 	defer cleanupTicker.Stop()
 	importWorker := newImportWorker(cfg)
 	go ensureRequestAttemptRetentionIndex(ctx, db, logger)
+	go runtime.RunRequestCostIndexWorker(ctx, logger, db)
 	logger.Info("oaix worker started")
 	for {
 		select {

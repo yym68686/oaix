@@ -7,27 +7,30 @@ import (
 
 const gatewayRequestAttemptsRetentionIndexName = "ix_gateway_request_attempts_retention"
 
-var errRequestAttemptRetentionIndexBuildInProgress = errors.New("request attempt retention index build is already in progress")
-
 // EnsureRequestAttemptRetentionIndex builds the age index asynchronously from
 // the worker path. It is concurrent and advisory-lock guarded, so a gateway
 // restart or a second worker cannot hold an application table lock or start a
 // duplicate build.
 func (s *Store) EnsureRequestAttemptRetentionIndex(ctx context.Context) error {
+	return s.ensureConcurrentIndex(ctx, gatewayRequestAttemptsRetentionIndexName,
+		"create index concurrently if not exists "+gatewayRequestAttemptsRetentionIndexName+" on gateway_request_attempts (started_at, id) where finished_at is not null")
+}
+
+func (s *Store) ensureConcurrentIndex(ctx context.Context, indexName, statement string) error {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
 	var locked bool
-	if err := conn.QueryRow(ctx, "select pg_try_advisory_lock(hashtext($1))", gatewayRequestAttemptsRetentionIndexName).Scan(&locked); err != nil {
+	if err := conn.QueryRow(ctx, "select pg_try_advisory_lock(hashtext($1))", indexName).Scan(&locked); err != nil {
 		return err
 	}
 	if !locked {
-		return errRequestAttemptRetentionIndexBuildInProgress
+		return errors.New("index build is already in progress: " + indexName)
 	}
 	defer func() {
-		_, _ = conn.Exec(context.Background(), "select pg_advisory_unlock(hashtext($1))", gatewayRequestAttemptsRetentionIndexName)
+		_, _ = conn.Exec(context.Background(), "select pg_advisory_unlock(hashtext($1))", indexName)
 	}()
 	var ready bool
 	if err := conn.QueryRow(ctx, `
@@ -38,7 +41,7 @@ func (s *Store) EnsureRequestAttemptRetentionIndex(ctx context.Context) error {
 			join pg_index i on i.indexrelid=c.oid
 			where n.nspname=current_schema() and c.relname=$1 and i.indisready and i.indisvalid
 		)
-	`, gatewayRequestAttemptsRetentionIndexName).Scan(&ready); err != nil {
+	`, indexName).Scan(&ready); err != nil {
 		return err
 	}
 	if ready {
@@ -59,18 +62,18 @@ func (s *Store) EnsureRequestAttemptRetentionIndex(ctx context.Context) error {
 			join pg_namespace n on n.oid=c.relnamespace
 			where n.nspname=current_schema() and c.relname=$1
 		)
-	`, gatewayRequestAttemptsRetentionIndexName).Scan(&invalid, &building); err != nil {
+	`, indexName).Scan(&invalid, &building); err != nil {
 		return err
 	}
 	if building {
-		return nil
+		return errors.New("index build is already in progress: " + indexName)
 	}
 	if invalid {
-		if _, err := conn.Exec(ctx, "drop index concurrently if exists "+gatewayRequestAttemptsRetentionIndexName); err != nil {
+		if _, err := conn.Exec(ctx, "drop index concurrently if exists "+indexName); err != nil {
 			return err
 		}
 	}
-	_, err = conn.Exec(ctx, "create index concurrently if not exists "+gatewayRequestAttemptsRetentionIndexName+" on gateway_request_attempts (started_at, id) where finished_at is not null")
+	_, err = conn.Exec(ctx, statement)
 	return err
 }
 

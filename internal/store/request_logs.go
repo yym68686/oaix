@@ -966,6 +966,10 @@ func (s *Store) addRequestCostsByTokenLogs(ctx context.Context, canonicalByLogTo
 }
 
 func (s *Store) overrideLateFinalizedRequestCosts(ctx context.Context, canonicalByLogTokenID map[int64]int64, result map[int64]*float64) error {
+	ready, err := s.requestCostRepairIndexReady(ctx)
+	if err != nil || !ready {
+		return err
+	}
 	logTokenIDs := make([]int64, 0, len(canonicalByLogTokenID))
 	for tokenID := range canonicalByLogTokenID {
 		logTokenIDs = append(logTokenIDs, tokenID)

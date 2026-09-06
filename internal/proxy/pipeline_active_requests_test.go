@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 func TestPipelineActiveRequestsAreIsolatedByCallerOwner(t *testing.T) {
 	pipeline := &Pipeline{}
@@ -16,6 +19,7 @@ func TestPipelineActiveRequestsAreIsolatedByCallerOwner(t *testing.T) {
 	}
 
 	releaseA1()
+	releaseA1()
 	if got := pipeline.ActiveRequestsForOwner(101); got != 1 {
 		t.Fatalf("owner 101 active requests after release = %d, want 1", got)
 	}
@@ -30,6 +34,28 @@ func TestPipelineActiveRequestsAreIsolatedByCallerOwner(t *testing.T) {
 	}
 	if got := pipeline.ActiveRequestsForOwner(202); got != 0 {
 		t.Fatalf("owner 202 active requests after release = %d, want 0", got)
+	}
+}
+
+func TestPipelineActiveRequestsReleaseConcurrently(t *testing.T) {
+	pipeline := &Pipeline{}
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			release := pipeline.trackActiveRequest(101)
+			_ = pipeline.ActiveRequestsForOwner(101)
+			release()
+			release()
+		}()
+	}
+	wg.Wait()
+	if got := pipeline.ActiveRequestsForOwner(101); got != 0 {
+		t.Fatalf("remaining active requests = %d", got)
+	}
+	if len(pipeline.activeRequestsByOwner) != 0 {
+		t.Fatal("idle owners must be removed")
 	}
 }
 
