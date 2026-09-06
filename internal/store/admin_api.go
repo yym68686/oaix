@@ -165,6 +165,7 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
+		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
 		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 	`, update.TokenID,
 		update.Remark != nil, stringPtrValue(update.Remark),
