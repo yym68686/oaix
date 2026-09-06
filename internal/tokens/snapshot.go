@@ -223,14 +223,7 @@ func (m *Manager) ActiveStreamCap() int64 {
 }
 
 func (m *Manager) ActiveStreamCapForToken(token store.Token) int64 {
-	fallback := m.ActiveStreamCap()
-	if token.ActiveStreamCapOverride != nil && *token.ActiveStreamCapOverride > 0 {
-		return *token.ActiveStreamCapOverride
-	}
-	if token.UserActiveStreamCap != nil && *token.UserActiveStreamCap > 0 {
-		return *token.UserActiveStreamCap
-	}
-	return fallback
+	return activeStreamCapFor(&RuntimeToken{Token: token}, m.ActiveStreamCap())
 }
 
 func (m *Manager) SetActiveStreamCap(value int64) int64 {

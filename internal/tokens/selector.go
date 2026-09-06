@@ -212,6 +212,9 @@ fallback:
 }
 
 func activeStreamCapFor(candidate *RuntimeToken, fallback int64) int64 {
+	if candidate != nil && candidate.Token.ActiveStreamCapOverride != nil && *candidate.Token.ActiveStreamCapOverride > 0 {
+		return *candidate.Token.ActiveStreamCapOverride
+	}
 	if candidate != nil && candidate.Token.UserActiveStreamCap != nil && *candidate.Token.UserActiveStreamCap > 0 {
 		return *candidate.Token.UserActiveStreamCap
 	}

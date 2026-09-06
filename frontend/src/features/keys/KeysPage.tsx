@@ -912,8 +912,6 @@ export function KeyDetailPage({
   const [quotaCreditBusy, setQuotaCreditBusy] = useState(false);
   const [quotaResetBusy, setQuotaResetBusy] = useState(false);
   const [fingerprintBusy, setFingerprintBusy] = useState(false);
-  const [concurrencyBusy, setConcurrencyBusy] = useState(false);
-  const [concurrencyOverride, setConcurrencyOverride] = useState("");
   const [quotaCreditCount, setQuotaCreditCount] = useState<number | null>(null);
   const [probeResult, setProbeResult] = useState<TokenProbeResponse | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
@@ -930,7 +928,6 @@ export function KeyDetailPage({
     try {
       const nextToken = await api.getToken(id, true, apiScope);
       setToken(nextToken);
-      setConcurrencyOverride(nextToken.active_stream_cap_override ? String(nextToken.active_stream_cap_override) : "");
       setQuotaCreditCount(quotaResetCreditCount(nextToken.quota));
     } catch (caught) {
       setError(errorMessage(caught));
@@ -1081,27 +1078,6 @@ export function KeyDetailPage({
     }
   }
 
-  async function saveConcurrencyOverride() {
-    if (!token) return;
-    const raw = concurrencyOverride.trim();
-    const value = raw === "" ? 0 : Number(raw);
-    if (!Number.isInteger(value) || value < 0 || value > 50) {
-      pushToast("账号并发请输入 0–50 的整数；0 表示跟随用户或管理员设置", "warning");
-      return;
-    }
-    setConcurrencyBusy(true);
-    try {
-      await api.updateTokenConcurrency(token.id, value, apiScope);
-      const nextOverride = value > 0 ? value : undefined;
-      setToken((current) => (current && current.id === token.id ? { ...current, active_stream_cap_override: nextOverride } : current));
-      setConcurrencyOverride(nextOverride ? String(nextOverride) : "");
-      pushToast(nextOverride ? `账号专属并发已设为 ${nextOverride}` : "账号专属并发已清除");
-    } catch (caught) {
-      pushToast(errorMessage(caught), "error");
-    } finally {
-      setConcurrencyBusy(false);
-    }
-  }
 
   if (error) {
     return (
@@ -1205,25 +1181,17 @@ export function KeyDetailPage({
               <div className="mt-2 text-[11px]">
                 <TokenConcurrency fallbackCap={activeStreamCap} item={token} />
               </div>
-              <div className="mt-3 grid gap-2 border-t border-border/60 pt-3">
-                <Label className="text-xs" htmlFor="token-concurrency-override">账号专属并发</Label>
-                <div className="flex items-center gap-2">
-                  <Input
-                    aria-describedby="token-concurrency-help"
-                    className="h-8"
-                    id="token-concurrency-override"
-                    max={50}
-                    min={0}
-                    nativeInput
-                    onChange={(event) => setConcurrencyOverride(event.currentTarget.value)}
-                    placeholder="跟随上级"
-                    type="number"
-                    value={concurrencyOverride}
-                  />
-                  <Button disabled={concurrencyBusy} loading={concurrencyBusy} onClick={() => void saveConcurrencyOverride()} size="xs">保存</Button>
-                </div>
-                <p className="text-muted-foreground text-[11px]" id="token-concurrency-help">留空或填 0 跟随用户订阅设置，再回退到管理员默认。</p>
-              </div>
+              <TokenConcurrencyEditor
+                key={`${apiScope}:${id}`}
+                token={token}
+                apiScope={apiScope}
+                onSaved={(override) => setToken((current) => current?.id === token.id ? {
+                  ...current,
+                  active_stream_cap_override: override,
+                  active_stream_cap: override ?? current.inherited_active_stream_cap ?? current.active_stream_cap,
+                } : current)}
+                pushToast={pushToast}
+              />
             </div>
             <div className="rounded-lg border bg-muted/32 p-3">
               <div className="text-muted-foreground text-xs">已用金额</div>
@@ -1291,6 +1259,53 @@ export function KeyDetailPage({
         onOpenChange={(open) => !open && setRemarkTarget(null)}
         onSave={() => void saveRemark()}
       />
+    </div>
+  );
+}
+
+function TokenConcurrencyEditor({ token, apiScope, onSaved, pushToast }: {
+  token: TokenItem;
+  apiScope: TokenAPIScope;
+  onSaved: (override: number | null) => void;
+  pushToast: (title: string, variant?: ToastMessage["variant"]) => void;
+}) {
+  // A draft survives the shell's periodic refresh; remount when the account changes.
+  const [draft, setDraft] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const value = draft ?? String(token.active_stream_cap_override ?? "");
+  const canEdit = String(getAuthContext()?.role || getAuthContext()?.user?.role || "").toLowerCase() !== "readonly_admin";
+  const source = token.active_stream_cap_override != null ? "账号专属设置" : token.user_active_stream_cap != null ? "用户订阅设置" : "管理员默认";
+  const invalid = value.trim() !== "" && (!Number.isInteger(Number(value)) || Number(value) < 0 || Number(value) > 50);
+
+  async function save(raw: string) {
+    const cap = raw.trim() === "" ? 0 : Number(raw);
+    if (!Number.isInteger(cap) || cap < 0 || cap > 50 || busy || !canEdit) return;
+    setBusy(true);
+    try {
+      await api.updateTokenConcurrency(token.id, cap, apiScope);
+      onSaved(cap === 0 ? null : cap);
+      setDraft(null);
+      pushToast(cap ? `账号专属并发已设为 ${cap}` : "已恢复继承并发设置");
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 grid gap-2 border-t border-border/60 pt-3">
+      <Label className="text-xs" htmlFor="token-concurrency-override">账号专属并发</Label>
+      <div className="flex flex-wrap items-center gap-2">
+        <Input aria-describedby="token-concurrency-help" aria-invalid={invalid} className="w-28" disabled={busy || !canEdit}
+          id="token-concurrency-override" min={0} max={50} step={1} nativeInput type="number" placeholder="跟随上级"
+          onChange={(event) => setDraft(event.currentTarget.value)} value={value} />
+        <Button disabled={invalid || !canEdit} loading={busy} onClick={() => void save(value)} size="sm">保存并发</Button>
+        {token.active_stream_cap_override != null && <Button disabled={busy || !canEdit} onClick={() => void save("")} size="sm" variant="ghost">恢复继承</Button>}
+      </div>
+      <p className="text-muted-foreground text-xs">当前生效：{token.active_stream_cap ?? "—"}，来源：{source}</p>
+      <p className="text-muted-foreground text-xs" id="token-concurrency-help">优先级：账号专属设置 ＞ 用户订阅设置 ＞ 管理员默认。范围 1–50，留空或填 0 恢复继承。</p>
+      {invalid && <p role="alert" className="text-destructive-foreground text-xs">请输入 0–50 的整数。</p>}
     </div>
   );
 }

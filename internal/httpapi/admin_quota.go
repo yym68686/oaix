@@ -49,19 +49,20 @@ const (
 
 type adminTokenItem struct {
 	store.Token
-	CredentialMode          string              `json:"credential_mode"`
-	Status                  string              `json:"status"`
-	ActiveStreams           int64               `json:"active_streams"`
-	ActiveStreamCap         int64               `json:"active_stream_cap"`
-	ObservedCostUSD         *float64            `json:"observed_cost_usd"`
-	LocalObservedCostUSD    *float64            `json:"local_observed_cost_usd"`
-	Sub2APIObservedCostUSD  *float64            `json:"sub2api_observed_cost_usd"`
-	CombinedObservedCostUSD *float64            `json:"combined_observed_cost_usd"`
-	Sub2APIUsageSyncedAt    *time.Time          `json:"sub2api_usage_synced_at,omitempty"`
-	Sub2APIUsageStale       bool                `json:"sub2api_usage_stale"`
-	ResetAt                 *time.Time          `json:"reset_at,omitempty"`
-	Quota                   *codexQuotaSnapshot `json:"quota,omitempty"`
-	QuotaFetchState         string              `json:"quota_fetch_state,omitempty"`
+	CredentialMode           string              `json:"credential_mode"`
+	Status                   string              `json:"status"`
+	ActiveStreams            int64               `json:"active_streams"`
+	ActiveStreamCap          int64               `json:"active_stream_cap"`
+	InheritedActiveStreamCap int64               `json:"inherited_active_stream_cap"`
+	ObservedCostUSD          *float64            `json:"observed_cost_usd"`
+	LocalObservedCostUSD     *float64            `json:"local_observed_cost_usd"`
+	Sub2APIObservedCostUSD   *float64            `json:"sub2api_observed_cost_usd"`
+	CombinedObservedCostUSD  *float64            `json:"combined_observed_cost_usd"`
+	Sub2APIUsageSyncedAt     *time.Time          `json:"sub2api_usage_synced_at,omitempty"`
+	Sub2APIUsageStale        bool                `json:"sub2api_usage_stale"`
+	ResetAt                  *time.Time          `json:"reset_at,omitempty"`
+	Quota                    *codexQuotaSnapshot `json:"quota,omitempty"`
+	QuotaFetchState          string              `json:"quota_fetch_state,omitempty"`
 }
 
 type codexQuotaWindow struct {
@@ -261,21 +262,24 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 			_, pending := pendingByID[token.ID]
 			quotaFetchState = quotaFetchStateForToken(token, quota, pending)
 		}
+		inherited := token
+		inherited.ActiveStreamCapOverride = nil
 		items = append(items, adminTokenItem{
-			Token:                   token,
-			CredentialMode:          tokenProbeCredentialMode(token),
-			Status:                  adminTokenStatus(token, now),
-			ActiveStreams:           activeByID[token.ID],
-			ActiveStreamCap:         a.tokens.ActiveStreamCapForToken(token),
-			ObservedCostUSD:         localCost,
-			LocalObservedCostUSD:    localCost,
-			Sub2APIObservedCostUSD:  remoteCostPointer,
-			CombinedObservedCostUSD: combinedCost,
-			Sub2APIUsageSyncedAt:    remoteUsage.SyncedAt,
-			Sub2APIUsageStale:       !sub2APIUsageLoaded || remoteUsage.Stale,
-			ResetAt:                 quotaNextResetAt(quota, now),
-			Quota:                   quota,
-			QuotaFetchState:         quotaFetchState,
+			Token:                    token,
+			CredentialMode:           tokenProbeCredentialMode(token),
+			Status:                   adminTokenStatus(token, now),
+			ActiveStreams:            activeByID[token.ID],
+			ActiveStreamCap:          a.tokens.ActiveStreamCapForToken(token),
+			InheritedActiveStreamCap: a.tokens.ActiveStreamCapForToken(inherited),
+			ObservedCostUSD:          localCost,
+			LocalObservedCostUSD:     localCost,
+			Sub2APIObservedCostUSD:   remoteCostPointer,
+			CombinedObservedCostUSD:  combinedCost,
+			Sub2APIUsageSyncedAt:     remoteUsage.SyncedAt,
+			Sub2APIUsageStale:        !sub2APIUsageLoaded || remoteUsage.Stale,
+			ResetAt:                  quotaNextResetAt(quota, now),
+			Quota:                    quota,
+			QuotaFetchState:          quotaFetchState,
 		})
 	}
 	if disabledFromQuota && a.tokens != nil {

@@ -86,6 +86,9 @@ export type TokenItem = {
   status?: string | null;
   active_streams?: number | null;
   active_stream_cap?: number | null;
+  active_stream_cap_override?: number | null;
+  inherited_active_stream_cap?: number;
+  user_active_stream_cap?: number | null;
   observed_cost_usd?: number | null;
   local_observed_cost_usd?: number | null;
   sub2api_observed_cost_usd?: number | null;

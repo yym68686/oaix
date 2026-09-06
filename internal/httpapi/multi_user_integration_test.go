@@ -1089,6 +1089,31 @@ func TestUserPlanConcurrencyOverridesAdminDefaultWithDatabase(t *testing.T) {
 	}
 }
 
+func TestAccountConcurrencyOverridePrecedesUserPlanAndAdminDefault(t *testing.T) {
+	h := newMultiUserHarness(t)
+	user, key := h.createUser(t, "account-concurrency")
+	token := h.createToken(t, user.ID, "account-concurrency-pro")
+	h.app.tokens.SetActiveStreamCap(9)
+
+	expectStatus(t, h.request(t, http.MethodPost, "/api/me/token-concurrency", key.PlaintextKey, `{"plan_concurrency":{"pro":4}}`), http.StatusOK)
+	accountPath := fmt.Sprintf("/api/tokens/%d", token.ID)
+	account := expectStatus(t, h.request(t, http.MethodPatch, accountPath, key.PlaintextKey, `{"active_stream_cap_override":2}`), http.StatusOK)
+	if accountToken, ok := account["token"].(map[string]any); !ok || accountToken["active_stream_cap_override"] != float64(2) {
+		t.Fatalf("account override response = %#v", account)
+	}
+	if got := h.app.tokens.ActiveStreamCapForToken(h.app.tokens.SnapshotForOwner(user.ID).ByID[token.ID].Token); got != 2 {
+		t.Fatalf("effective account cap = %d, want 2", got)
+	}
+
+	cleared := expectStatus(t, h.request(t, http.MethodPatch, accountPath, key.PlaintextKey, `{"active_stream_cap_override":0}`), http.StatusOK)
+	if accountToken, ok := cleared["token"].(map[string]any); !ok || accountToken["active_stream_cap_override"] != nil {
+		t.Fatalf("cleared account override response = %#v", cleared)
+	}
+	if got := h.app.tokens.ActiveStreamCapForToken(h.app.tokens.SnapshotForOwner(user.ID).ByID[token.ID].Token); got != 4 {
+		t.Fatalf("effective inherited cap = %d, want user plan cap 4", got)
+	}
+}
+
 func TestAdminOrdinary429CooldownUpdatesRuntimeWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	_, _ = h.db.Pool().Exec(context.Background(), `delete from gateway_settings where key = $1`, store.Ordinary429CooldownSettingKey)

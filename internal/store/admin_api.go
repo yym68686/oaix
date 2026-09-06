@@ -14,18 +14,17 @@ import (
 )
 
 type TokenMetadataUpdate struct {
-	TokenID                      int64
-	Remark                       *string
-	PlanType                     *string
-	Email                        *string
-	AccountID                    *string
-	Source                       *string
-	SourceFile                   *string
-	IsActive                     *bool
-	CodexFingerprintEnabled      *bool
-	ActiveStreamCapOverride      *int64
-	ClearActiveStreamCapOverride bool
-	OwnerUserID                  *int64
+	TokenID                 int64
+	Remark                  *string
+	PlanType                *string
+	Email                   *string
+	AccountID               *string
+	Source                  *string
+	SourceFile              *string
+	IsActive                *bool
+	CodexFingerprintEnabled *bool
+	ActiveStreamCapOverride *int64
+	OwnerUserID             *int64
 }
 
 type TokenRefreshHistoryItem struct {
@@ -145,6 +144,9 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 	if update.TokenID <= 0 {
 		return nil, fmt.Errorf("token id is required")
 	}
+	if update.ActiveStreamCapOverride != nil && (*update.ActiveStreamCapOverride < 0 || *update.ActiveStreamCapOverride > MaxTokenActiveStreamCap) {
+		return nil, fmt.Errorf("active_stream_cap_override must be between 1 and 50, or 0 to inherit")
+	}
 	sourcePayload := map[string]any{}
 	if update.Source != nil && strings.TrimSpace(*update.Source) != "" {
 		sourcePayload["source"] = strings.TrimSpace(*update.Source)
@@ -180,7 +182,7 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		update.SourceFile != nil, stringPtrValue(update.SourceFile),
 		update.IsActive != nil, boolPtrValue(update.IsActive),
 		update.CodexFingerprintEnabled != nil, boolPtrValue(update.CodexFingerprintEnabled),
-		update.ActiveStreamCapOverride != nil || update.ClearActiveStreamCapOverride, int64PtrValue(update.ActiveStreamCapOverride),
+		update.ActiveStreamCapOverride != nil, int64PtrValue(update.ActiveStreamCapOverride),
 		jsonBytes(sourcePayload),
 		update.OwnerUserID,
 	)

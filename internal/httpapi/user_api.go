@@ -810,7 +810,10 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 		CodexFingerprintEnabled *bool   `json:"codex_fingerprint_enabled"`
 		ActiveStreamCapOverride *int64  `json:"active_stream_cap_override"`
 	}
-	_ = decodeJSON(r, &payload)
+	if err := decodeJSON(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	var token *store.Token
@@ -832,12 +835,12 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 	} else if payload.CodexFingerprintEnabled != nil {
 		token, err = a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{TokenID: id, CodexFingerprintEnabled: payload.CodexFingerprintEnabled})
 	} else if payload.ActiveStreamCapOverride != nil {
-		if *payload.ActiveStreamCapOverride > store.MaxTokenActiveStreamCap {
+		if *payload.ActiveStreamCapOverride < 0 || *payload.ActiveStreamCapOverride > store.MaxTokenActiveStreamCap {
 			writeError(w, http.StatusBadRequest, errors.New("active_stream_cap_override must be between 1 and 50, or 0 to inherit"))
 			return
 		}
 		ownerID := *scope.OwnerUserID
-		token, err = a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{TokenID: id, ActiveStreamCapOverride: payload.ActiveStreamCapOverride, ClearActiveStreamCapOverride: *payload.ActiveStreamCapOverride <= 0, OwnerUserID: &ownerID})
+		token, err = a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{TokenID: id, ActiveStreamCapOverride: payload.ActiveStreamCapOverride, OwnerUserID: &ownerID})
 	} else {
 		token, err = a.store.GetTokenScoped(ctx, scope, id)
 	}
@@ -849,8 +852,12 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	_ = a.store.WriteAuditLog(ctx, "user_token_update", "self", "token", strconv.FormatInt(id, 10), map[string]any{"user_id": *scope.OwnerUserID, "remark": payload.Remark != nil, "is_active": payload.IsActive, "share_enabled": shareEnabled})
-	_ = a.tokens.Refresh(ctx)
+	_ = a.store.WriteAuditLog(ctx, "user_token_update", "self", "token", strconv.FormatInt(id, 10), map[string]any{"user_id": *scope.OwnerUserID, "remark": payload.Remark != nil, "is_active": payload.IsActive, "share_enabled": shareEnabled, "active_stream_cap_override": payload.ActiveStreamCapOverride})
+	if payload.ActiveStreamCapOverride != nil {
+		a.refreshTokenPoolSettings(ctx, token.OwnerUserID)
+	} else {
+		_ = a.tokens.Refresh(ctx)
+	}
 	if payload.IsActive != nil && *payload.IsActive {
 		a.syncSub2APIAvailabilityAsync(token, "user_token_active")
 	}

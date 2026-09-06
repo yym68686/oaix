@@ -435,7 +435,7 @@ func (a *App) patchToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if payload.ActiveStreamCapOverride != nil && *payload.ActiveStreamCapOverride > store.MaxTokenActiveStreamCap {
+	if payload.ActiveStreamCapOverride != nil && (*payload.ActiveStreamCapOverride < 0 || *payload.ActiveStreamCapOverride > store.MaxTokenActiveStreamCap) {
 		writeError(w, http.StatusBadRequest, errors.New("active_stream_cap_override must be between 1 and 50, or 0 to inherit"))
 		return
 	}
@@ -444,9 +444,8 @@ func (a *App) patchToken(w http.ResponseWriter, r *http.Request) {
 	token, err := a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{
 		TokenID: id, Remark: payload.Remark, PlanType: payload.PlanType, Email: payload.Email,
 		AccountID: payload.AccountID, Source: payload.Source, SourceFile: payload.SourceFile, IsActive: payload.IsActive,
-		CodexFingerprintEnabled:      payload.CodexFingerprintEnabled,
-		ActiveStreamCapOverride:      payload.ActiveStreamCapOverride,
-		ClearActiveStreamCapOverride: payload.ActiveStreamCapOverride != nil && *payload.ActiveStreamCapOverride <= 0,
+		CodexFingerprintEnabled: payload.CodexFingerprintEnabled,
+		ActiveStreamCapOverride: payload.ActiveStreamCapOverride,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("token not found"))
@@ -475,7 +474,11 @@ func (a *App) patchToken(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	_ = a.tokens.Refresh(ctx)
+	if payload.ActiveStreamCapOverride != nil {
+		a.refreshTokenPoolSettings(ctx, token.OwnerUserID)
+	} else {
+		_ = a.tokens.Refresh(ctx)
+	}
 	_ = a.store.WriteAuditLog(ctx, "token_metadata_update", "api", "token", strconv.FormatInt(id, 10), payload)
 	if payload.IsActive != nil && *payload.IsActive {
 		a.syncSub2APIAvailabilityAsync(token, "admin_metadata_active")
