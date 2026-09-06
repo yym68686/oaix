@@ -96,8 +96,8 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 }
 
 func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
-	if SchemaVersion != 24 {
-		t.Fatalf("unexpected schema version: got %d want 24", SchemaVersion)
+	if SchemaVersion != 25 {
+		t.Fatalf("unexpected schema version: got %d want 25", SchemaVersion)
 	}
 
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
@@ -132,6 +132,13 @@ func TestMigrationAddsCodexFingerprintToggle(t *testing.T) {
 	migration, ok := startupMigrations[24]
 	if !ok || len(migration.statements) != 1 || !strings.Contains(strings.ToLower(migration.statements[0]), "add column if not exists codex_fingerprint_enabled") {
 		t.Fatalf("startup migration 24 = %#v, want additive Codex fingerprint toggle migration", migration)
+	}
+}
+
+func TestMigrationAddsTokenConcurrencyOverride(t *testing.T) {
+	migration, ok := startupMigrations[25]
+	if !ok || len(migration.statements) != 1 || !strings.Contains(strings.ToLower(migration.statements[0]), "add column if not exists active_stream_cap_override") {
+		t.Fatalf("startup migration 25 = %#v, want additive token concurrency override migration", migration)
 	}
 }
 

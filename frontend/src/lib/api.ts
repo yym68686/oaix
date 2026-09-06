@@ -756,6 +756,10 @@ export const api = {
     patchJSON<Record<string, unknown>>(tokenScopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`, scope), {
       codex_fingerprint_enabled: enabled,
     }),
+  updateTokenConcurrency: (id: number, value: number, scope: TokenAPIScope = "auto") =>
+    patchJSON<Record<string, unknown>>(tokenScopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`, scope), {
+      active_stream_cap_override: value,
+    }),
   probeToken: (id: number, payload: Record<string, unknown> = {}, scope: TokenAPIScope = "auto") =>
     postJSON<TokenProbeResponse>(tokenScopedPath(`/api/tokens/${id}/probe`, `/admin/tokens/${id}/probe`, scope), payload),
   deleteToken: (id: number, scope: TokenAPIScope = "auto") =>

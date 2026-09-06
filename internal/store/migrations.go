@@ -103,6 +103,9 @@ var startupMigrations = map[int]startupMigration{
 	24: {statements: []string{
 		`alter table codex_tokens add column if not exists codex_fingerprint_enabled boolean not null default true`,
 	}},
+	25: {statements: []string{
+		`alter table codex_tokens add column if not exists active_stream_cap_override integer`,
+	}},
 }
 
 var migrationStatements = []string{
@@ -182,6 +185,7 @@ var migrationStatements = []string{
 		marketplace_price_updated_at timestamptz,
 		marketplace_price_source varchar(64) not null default 'owner_default',
 		codex_fingerprint_enabled boolean not null default true,
+		active_stream_cap_override integer,
 		last_used_at timestamptz,
 		last_error text,
 		created_at timestamptz not null default now(),

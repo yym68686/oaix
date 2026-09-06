@@ -51,6 +51,7 @@ type Token struct {
 	AgentIdentity             *agentidentity.Credentials `json:"-"`
 	PlanType                  *string                    `json:"plan_type,omitempty"`
 	UserActiveStreamCap       *int64                     `json:"user_active_stream_cap,omitempty"`
+	ActiveStreamCapOverride   *int64                     `json:"active_stream_cap_override,omitempty"`
 	AllowedModels             []string                   `json:"-"`
 	ModelAccessConfigured     bool                       `json:"-"`
 	Remark                    *string                    `json:"remark,omitempty"`
@@ -272,7 +273,7 @@ func (s *Store) ListAvailableTokensScoped(ctx context.Context, scope ResourceSco
 		         nullif(regexp_replace(lower(btrim(t.plan_type)), '^chatgpt_', ''), ''),
 		         'unknown'
 		       ),
-		       t.codex_fingerprint_enabled
+		       t.codex_fingerprint_enabled, t.active_stream_cap_override
 		from codex_tokens t
 		left join token_agent_identities ai on ai.token_id = t.id
 		left join user_settings concurrency
@@ -339,7 +340,7 @@ func (s *Store) ListTokensScoped(ctx context.Context, scope ResourceScope, opts 
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		       last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		       last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 		from codex_tokens
 		where %s
 		order by %s
@@ -516,7 +517,7 @@ func (s *Store) ListTokensByIDsScoped(ctx context.Context, scope ResourceScope, 
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		       last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		       last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 		from codex_tokens
 		where id = any($1::integer[])
 		  and merged_into_token_id is null
@@ -1060,7 +1061,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 					          is_active, cooldown_until, disabled_at,
 					          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 					          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-					          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+					          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(storedPayload), isActive, lastError, refreshToken, lastRefresh, shareExplicit, shareEnabled, shareStatus, isAgentIdentity)
 			token, scanErr := scanTokenWithSharing(row)
 			if scanErr != nil {
@@ -1123,7 +1124,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 				          is_active, cooldown_until, disabled_at,
 				          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 				          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-				          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+				          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 			`, ownerUserID, email, accountID, idToken, accessToken, refreshToken, jsonBytes(storedPayload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh, shareEnabled, shareStatus, shareExplicit)
 		token, scanErr := scanTokenWithSharing(row)
 		if scanErr != nil {
@@ -1706,7 +1707,7 @@ func (s *Store) SetTokenActiveScoped(ctx context.Context, scope ResourceScope, t
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 	`, args...)
 	token, err := scanTokenWithSharing(row)
 	if err != nil {
@@ -1768,7 +1769,7 @@ func (s *Store) GetTokenScoped(ctx context.Context, scope ResourceScope, tokenID
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		       last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		       last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 		from codex_tokens
 		where id = $1 and merged_into_token_id is null
 		  and `+ownerWhere, args...)
@@ -1817,7 +1818,7 @@ func (s *Store) UpdateTokenRemarkScoped(ctx context.Context, scope ResourceScope
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 	`, args...)
 	token, err := scanTokenWithSharing(row)
 	if err != nil {
@@ -1843,7 +1844,7 @@ func (s *Store) SetTokenSharingScoped(ctx context.Context, scope ResourceScope, 
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 	`, args...)
 	token, err := scanTokenWithSharing(row)
 	if err != nil {
@@ -2176,6 +2177,7 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 		var marketplacePriceBPS sql.NullInt64
 		var marketplacePriceSource sql.NullString
 		var fingerprintEnabled sql.NullBool
+		var activeStreamCapOverride sql.NullInt64
 		err := rows.Scan(
 			&token.ID,
 			&token.OwnerUserID,
@@ -2202,6 +2204,7 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 			&token.CreatedAt,
 			&token.UpdatedAt,
 			&fingerprintEnabled,
+			&activeStreamCapOverride,
 		)
 		if err != nil {
 			return nil, err
@@ -2225,6 +2228,12 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 		if fingerprintEnabled.Valid {
 			value := fingerprintEnabled.Bool
 			token.CodexFingerprintEnabled = &value
+		}
+		if activeStreamCapOverride.Valid {
+			value := activeStreamCapOverride.Int64
+			if cap, err := ParseTokenActiveStreamCap(value); err == nil {
+				token.ActiveStreamCapOverride = &cap
+			}
 		}
 		tokens = append(tokens, token)
 	}
@@ -2250,6 +2259,7 @@ func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
 		var userAllowedModels sql.NullString
 		var globalAllowedModels sql.NullString
 		var fingerprintEnabled sql.NullBool
+		var activeStreamCapOverride sql.NullInt64
 		err := rows.Scan(
 			&token.ID,
 			&token.OwnerUserID,
@@ -2285,6 +2295,7 @@ func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
 			&userAllowedModels,
 			&globalAllowedModels,
 			&fingerprintEnabled,
+			&activeStreamCapOverride,
 		)
 		if err != nil {
 			return nil, err
@@ -2308,6 +2319,12 @@ func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
 		if fingerprintEnabled.Valid {
 			value := fingerprintEnabled.Bool
 			token.CodexFingerprintEnabled = &value
+		}
+		if activeStreamCapOverride.Valid {
+			value := activeStreamCapOverride.Int64
+			if cap, err := ParseTokenActiveStreamCap(value); err == nil {
+				token.ActiveStreamCapOverride = &cap
+			}
 		}
 		if userActiveStreamCap.Valid {
 			if parsed, ok := parseInt64Value(userActiveStreamCap.String); ok {
@@ -2374,6 +2391,7 @@ func scanToken(row rowScanner) (Token, error) {
 	var accessToken sql.NullString
 	var refreshToken sql.NullString
 	var fingerprintEnabled sql.NullBool
+	var activeStreamCapOverride sql.NullInt64
 	err := row.Scan(
 		&token.ID,
 		&token.OwnerUserID,
@@ -2392,6 +2410,7 @@ func scanToken(row rowScanner) (Token, error) {
 		&token.CreatedAt,
 		&token.UpdatedAt,
 		&fingerprintEnabled,
+		&activeStreamCapOverride,
 	)
 	if accessToken.Valid {
 		token.AccessToken = accessToken.String
@@ -2402,6 +2421,12 @@ func scanToken(row rowScanner) (Token, error) {
 	if fingerprintEnabled.Valid {
 		value := fingerprintEnabled.Bool
 		token.CodexFingerprintEnabled = &value
+	}
+	if activeStreamCapOverride.Valid {
+		value := activeStreamCapOverride.Int64
+		if cap, err := ParseTokenActiveStreamCap(value); err == nil {
+			token.ActiveStreamCapOverride = &cap
+		}
 	}
 	return token, err
 }
@@ -2414,6 +2439,7 @@ func scanTokenWithSharing(row rowScanner) (Token, error) {
 	var marketplacePriceBPS sql.NullInt64
 	var marketplacePriceSource sql.NullString
 	var fingerprintEnabled sql.NullBool
+	var activeStreamCapOverride sql.NullInt64
 	err := row.Scan(
 		&token.ID,
 		&token.OwnerUserID,
@@ -2440,6 +2466,7 @@ func scanTokenWithSharing(row rowScanner) (Token, error) {
 		&token.CreatedAt,
 		&token.UpdatedAt,
 		&fingerprintEnabled,
+		&activeStreamCapOverride,
 	)
 	if accessToken.Valid {
 		token.AccessToken = accessToken.String
@@ -2460,6 +2487,12 @@ func scanTokenWithSharing(row rowScanner) (Token, error) {
 	if fingerprintEnabled.Valid {
 		value := fingerprintEnabled.Bool
 		token.CodexFingerprintEnabled = &value
+	}
+	if activeStreamCapOverride.Valid {
+		value := activeStreamCapOverride.Int64
+		if cap, err := ParseTokenActiveStreamCap(value); err == nil {
+			token.ActiveStreamCapOverride = &cap
+		}
 	}
 	return token, err
 }

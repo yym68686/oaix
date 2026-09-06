@@ -912,6 +912,8 @@ export function KeyDetailPage({
   const [quotaCreditBusy, setQuotaCreditBusy] = useState(false);
   const [quotaResetBusy, setQuotaResetBusy] = useState(false);
   const [fingerprintBusy, setFingerprintBusy] = useState(false);
+  const [concurrencyBusy, setConcurrencyBusy] = useState(false);
+  const [concurrencyOverride, setConcurrencyOverride] = useState("");
   const [quotaCreditCount, setQuotaCreditCount] = useState<number | null>(null);
   const [probeResult, setProbeResult] = useState<TokenProbeResponse | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
@@ -928,6 +930,7 @@ export function KeyDetailPage({
     try {
       const nextToken = await api.getToken(id, true, apiScope);
       setToken(nextToken);
+      setConcurrencyOverride(nextToken.active_stream_cap_override ? String(nextToken.active_stream_cap_override) : "");
       setQuotaCreditCount(quotaResetCreditCount(nextToken.quota));
     } catch (caught) {
       setError(errorMessage(caught));
@@ -1078,6 +1081,28 @@ export function KeyDetailPage({
     }
   }
 
+  async function saveConcurrencyOverride() {
+    if (!token) return;
+    const raw = concurrencyOverride.trim();
+    const value = raw === "" ? 0 : Number(raw);
+    if (!Number.isInteger(value) || value < 0 || value > 50) {
+      pushToast("账号并发请输入 0–50 的整数；0 表示跟随用户或管理员设置", "warning");
+      return;
+    }
+    setConcurrencyBusy(true);
+    try {
+      await api.updateTokenConcurrency(token.id, value, apiScope);
+      const nextOverride = value > 0 ? value : undefined;
+      setToken((current) => (current && current.id === token.id ? { ...current, active_stream_cap_override: nextOverride } : current));
+      setConcurrencyOverride(nextOverride ? String(nextOverride) : "");
+      pushToast(nextOverride ? `账号专属并发已设为 ${nextOverride}` : "账号专属并发已清除");
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setConcurrencyBusy(false);
+    }
+  }
+
   if (error) {
     return (
       <div className="grid gap-4">
@@ -1179,6 +1204,25 @@ export function KeyDetailPage({
               <div className="text-muted-foreground text-xs">并发</div>
               <div className="mt-2 text-[11px]">
                 <TokenConcurrency fallbackCap={activeStreamCap} item={token} />
+              </div>
+              <div className="mt-3 grid gap-2 border-t border-border/60 pt-3">
+                <Label className="text-xs" htmlFor="token-concurrency-override">账号专属并发</Label>
+                <div className="flex items-center gap-2">
+                  <Input
+                    aria-describedby="token-concurrency-help"
+                    className="h-8"
+                    id="token-concurrency-override"
+                    max={50}
+                    min={0}
+                    nativeInput
+                    onChange={(event) => setConcurrencyOverride(event.currentTarget.value)}
+                    placeholder="跟随上级"
+                    type="number"
+                    value={concurrencyOverride}
+                  />
+                  <Button disabled={concurrencyBusy} loading={concurrencyBusy} onClick={() => void saveConcurrencyOverride()} size="xs">保存</Button>
+                </div>
+                <p className="text-muted-foreground text-[11px]" id="token-concurrency-help">留空或填 0 跟随用户订阅设置，再回退到管理员默认。</p>
               </div>
             </div>
             <div className="rounded-lg border bg-muted/32 p-3">

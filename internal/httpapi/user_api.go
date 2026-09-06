@@ -808,6 +808,7 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 		ShareStatusCamel        *string `json:"shareStatus"`
 		ShareDisabledReason     *string `json:"share_disabled_reason"`
 		CodexFingerprintEnabled *bool   `json:"codex_fingerprint_enabled"`
+		ActiveStreamCapOverride *int64  `json:"active_stream_cap_override"`
 	}
 	_ = decodeJSON(r, &payload)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -830,6 +831,13 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 		token, err = a.store.SetTokenActiveScoped(ctx, scope, id, *payload.IsActive, *payload.IsActive)
 	} else if payload.CodexFingerprintEnabled != nil {
 		token, err = a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{TokenID: id, CodexFingerprintEnabled: payload.CodexFingerprintEnabled})
+	} else if payload.ActiveStreamCapOverride != nil {
+		if *payload.ActiveStreamCapOverride > store.MaxTokenActiveStreamCap {
+			writeError(w, http.StatusBadRequest, errors.New("active_stream_cap_override must be between 1 and 50, or 0 to inherit"))
+			return
+		}
+		ownerID := *scope.OwnerUserID
+		token, err = a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{TokenID: id, ActiveStreamCapOverride: payload.ActiveStreamCapOverride, ClearActiveStreamCapOverride: *payload.ActiveStreamCapOverride <= 0, OwnerUserID: &ownerID})
 	} else {
 		token, err = a.store.GetTokenScoped(ctx, scope, id)
 	}

@@ -91,6 +91,20 @@ func TestManagerClaimRelease(t *testing.T) {
 	}
 }
 
+func TestManagerActiveStreamCapForTokenPrefersAccountOverride(t *testing.T) {
+	manager := NewManager(&fakeSource{}, slog.Default(), time.Second, time.Second, 9)
+	userCap := int64(4)
+	accountCap := int64(2)
+	token := store.Token{UserActiveStreamCap: &userCap, ActiveStreamCapOverride: &accountCap}
+	if got := manager.ActiveStreamCapForToken(token); got != accountCap {
+		t.Fatalf("effective cap = %d, want account override %d", got, accountCap)
+	}
+	token.ActiveStreamCapOverride = nil
+	if got := manager.ActiveStreamCapForToken(token); got != userCap {
+		t.Fatalf("effective cap = %d, want user cap %d", got, userCap)
+	}
+}
+
 func TestManagerTokenModelCapabilityLossIsImmediateScopedAndReloadable(t *testing.T) {
 	now := time.Now().UTC()
 	rows := makeTokens(2)

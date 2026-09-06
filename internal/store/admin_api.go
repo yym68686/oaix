@@ -14,15 +14,18 @@ import (
 )
 
 type TokenMetadataUpdate struct {
-	TokenID                 int64
-	Remark                  *string
-	PlanType                *string
-	Email                   *string
-	AccountID               *string
-	Source                  *string
-	SourceFile              *string
-	IsActive                *bool
-	CodexFingerprintEnabled *bool
+	TokenID                      int64
+	Remark                       *string
+	PlanType                     *string
+	Email                        *string
+	AccountID                    *string
+	Source                       *string
+	SourceFile                   *string
+	IsActive                     *bool
+	CodexFingerprintEnabled      *bool
+	ActiveStreamCapOverride      *int64
+	ClearActiveStreamCapOverride bool
+	OwnerUserID                  *int64
 }
 
 type TokenRefreshHistoryItem struct {
@@ -155,18 +158,20 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		    source_file = case when $10::boolean then nullif($11, '') else source_file end,
 		    is_active = case when $12::boolean then $13 else is_active end,
 		    codex_fingerprint_enabled = case when $14::boolean then $15 else codex_fingerprint_enabled end,
+		    active_stream_cap_override = case when $16::boolean then nullif($17, 0) else active_stream_cap_override end,
 		    disabled_at = case when $12::boolean and $13 then null when $12::boolean and not $13 then coalesce(disabled_at, now()) else disabled_at end,
 		    raw_payload = case
-		      when $16::jsonb <> '{}'::jsonb then coalesce(raw_payload::jsonb, '{}'::jsonb) || $16::jsonb
+		      when $18::jsonb <> '{}'::jsonb then coalesce(raw_payload::jsonb, '{}'::jsonb) || $18::jsonb
 		      else raw_payload::jsonb
 		    end,
 		    updated_at = now()
 		where id = $1 and merged_into_token_id is null
+		  and ($19::bigint is null or owner_user_id = $19)
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 	`, update.TokenID,
 		update.Remark != nil, stringPtrValue(update.Remark),
 		update.PlanType != nil, stringPtrValue(update.PlanType),
@@ -175,7 +180,9 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		update.SourceFile != nil, stringPtrValue(update.SourceFile),
 		update.IsActive != nil, boolPtrValue(update.IsActive),
 		update.CodexFingerprintEnabled != nil, boolPtrValue(update.CodexFingerprintEnabled),
+		update.ActiveStreamCapOverride != nil || update.ClearActiveStreamCapOverride, int64PtrValue(update.ActiveStreamCapOverride),
 		jsonBytes(sourcePayload),
+		update.OwnerUserID,
 	)
 	token, err := scanTokenWithSharing(row)
 	if err != nil {
@@ -196,7 +203,7 @@ func (s *Store) SetTokenCooldown(ctx context.Context, tokenID int64, until time.
 			    updated_at = now()
 			where id = $1 and merged_into_token_id is null
 			returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-			          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+			          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 		`, tokenID, until, truncate(reason, 4000))
 		updated, err := scanToken(row)
 		if err != nil {
@@ -221,7 +228,7 @@ func (s *Store) ClearTokenCooldown(ctx context.Context, tokenID int64) (*Token, 
 		set cooldown_until = null, updated_at = now()
 		where id = $1 and merged_into_token_id is null
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 	`, tokenID)
 	token, err := scanToken(row)
 	if err != nil {
@@ -237,7 +244,7 @@ func (s *Store) ClearTokenLastError(ctx context.Context, tokenID int64) (*Token,
 		set last_error = null, updated_at = now()
 		where id = $1 and merged_into_token_id is null
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 	`, tokenID)
 	token, err := scanToken(row)
 	if err != nil {
@@ -302,7 +309,7 @@ func (s *Store) UnmergeToken(ctx context.Context, tokenID int64) (*Token, error)
 		    updated_at = now()
 		where id = $1
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
+		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled, active_stream_cap_override
 	`, tokenID)
 	token, err := scanToken(row)
 	if err != nil {
@@ -1128,6 +1135,13 @@ func stringPtrValue(value *string) string {
 
 func boolPtrValue(value *bool) bool {
 	return value != nil && *value
+}
+
+func int64PtrValue(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func firstString(value string, fallback string) string {
