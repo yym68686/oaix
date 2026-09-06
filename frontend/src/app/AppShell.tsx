@@ -274,10 +274,8 @@ export function AppShell({
             </div>
           </div>
           <div className={cn("min-h-0 flex-1 overflow-y-auto px-3 pb-5 oaix-scrollbar", collapsed && "px-4")}>{navigation()}</div>
-          <div className={cn("shrink-0 border-t bg-background/20 p-3", collapsed && "px-3")}>
-            <div className={cn("rounded-xl bg-sidebar-accent/45 p-1", collapsed && "bg-transparent p-0")}>
-              {accountMenu(collapsed)}
-            </div>
+          <div className={cn("shrink-0 border-t p-2", collapsed && "flex justify-center py-3")}>
+            {accountMenu(collapsed)}
           </div>
         </aside>
         <div className="min-w-0">
@@ -469,13 +467,13 @@ function AccountMenu({
     <Menu>
       <MenuTrigger
         aria-label={signedIn ? `账户菜单：${name}` : "账户菜单"}
-        render={<Button className={cn("shrink-0 transition-colors", compact ? "rounded-full" : "h-auto w-full justify-start gap-3 rounded-lg border border-transparent bg-background/45 px-2 py-2 hover:border-border hover:bg-background/80")} size={compact ? "icon" : "default"} variant="ghost" />}
+        render={<Button className={cn("shrink-0 transition-colors", compact ? "size-9 rounded-full sm:size-9" : "grid h-auto w-full grid-cols-[2rem_minmax(0,1fr)_1rem] gap-3 rounded-lg px-2 py-2.5 sm:h-auto")} size={compact ? "icon" : "default"} variant="ghost" />}
         title={signedIn ? name : "未登录"}
       >
         <span className="flex size-8 shrink-0 items-center justify-center rounded-full border bg-primary/10 text-sm font-semibold text-primary">
           {signedIn && initial ? initial : <UserRoundIcon className="size-4" />}
         </span>
-        {!compact && <><span className="grid min-w-0 flex-1 gap-0.5 text-left"><span className="truncate text-sm font-medium">{signedIn ? name : "登录账户"}</span><span className="text-muted-foreground text-xs">{signedIn ? principalRoleLabel(me, serviceOnly, activeAccount) : "主题与账户"}</span></span><ChevronsUpDownIcon className="size-4 shrink-0 text-muted-foreground" /></>}
+        {!compact && <><span className="grid min-w-0 gap-0.5 text-left"><span className="truncate text-sm font-medium leading-5">{signedIn ? name : "登录账户"}</span><span className="text-muted-foreground text-xs leading-4">{signedIn ? principalRoleLabel(me, serviceOnly, activeAccount) : "主题与账户"}</span></span><ChevronsUpDownIcon className="size-4 shrink-0 text-muted-foreground" /></>}
       </MenuTrigger>
       <MenuPopup>
         {signedIn && (
