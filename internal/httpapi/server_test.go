@@ -12,6 +12,26 @@ import (
 	"github.com/yym68686/oaix/internal/proxy"
 )
 
+func TestExperimentalResponsesRequiresTargetToken(t *testing.T) {
+	app := &App{}
+	req := httptest.NewRequest(http.MethodPost, "/admin/experiments/responses", nil)
+	recorder := httptest.NewRecorder()
+	app.experimentalResponses(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+}
+
+func TestExperimentalResponsesRejectsInvalidFingerprintOverride(t *testing.T) {
+	app := &App{}
+	req := httptest.NewRequest(http.MethodPost, "/admin/experiments/responses?token_id=1&fingerprint_enabled=maybe", nil)
+	recorder := httptest.NewRecorder()
+	app.experimentalResponses(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+}
+
 func TestHandlerRegistersRoutes(t *testing.T) {
 	app := NewApp(config.Config{Auth: config.AuthConfig{ServiceAPIKeys: []string{"service-key"}}}, nil, nil, nil, nil, nil)
 	_ = app.Handler()

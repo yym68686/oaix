@@ -115,6 +115,14 @@ type RequestIntent struct {
 	ImageResponseFormat string
 	ImageStreamPrefix   string
 	ToolSearchKeyFixes  int
+	// CodexFingerprintEnabled is an experiment-only, request-scoped override.
+	// nil preserves the account's persisted default.
+	CodexFingerprintEnabled *bool
+	Experiment              bool
+	UpstreamUserAgent       string
+	UpstreamOriginator      string
+	// MaxAttempts bounds retries for an experiment request only.
+	MaxAttempts int
 }
 
 type Attempt struct {
@@ -395,6 +403,9 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	if intent.TargetTokenID > 0 {
 		timing["target_token_id"] = intent.TargetTokenID
 	}
+	if intent.Experiment {
+		timing["experimental_request"] = true
+	}
 	if intent.RequireFast {
 		timing["fast_mode_requested"] = true
 		timing["service_tier"] = intent.ServiceTier
@@ -479,7 +490,14 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			timing["model_eligibility_error"] = eligibilityErr.Error()
 		}
 	}
-	for attempt := 1; attempt <= p.cfg.Upstream.MaxRetries; attempt++ {
+	maxAttempts := p.cfg.Upstream.MaxRetries
+	if intent.MaxAttempts > 0 && intent.MaxAttempts < maxAttempts {
+		maxAttempts = intent.MaxAttempts
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		selectStarted := time.Now()
 		tokenIntent := baseTokenIntent
 		tokenIntent.ExcludeTokenIDs = excluded
@@ -571,7 +589,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 		encryptedContentRetryStarted := time.Now()
 		encryptedContentRetryCount := 0
-		for encryptedContentRetryCount < maxRejectedEncryptedContentRetries && !result.Committed && !result.StreamState.DownstreamStarted {
+		for encryptedContentRetryCount < maxRejectedEncryptedContentRetries && !attemptSpec.Intent.Experiment && !result.Committed && !result.StreamState.DownstreamStarted {
 			marker, ok := rejectedEncryptedContentMarker(intent, result.Status, err, result.ErrorBody)
 			if !ok {
 				break
@@ -692,7 +710,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			timing["alpha_search_401_failover"] = true
 			timing["alpha_search_401_failover_count"] = alphaSearch401Failovers
 			p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, true, false, nil)
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
@@ -704,7 +722,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401UnauthorizedDetail, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
@@ -733,7 +751,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				RequestID:   requestID,
 				ValidUntil:  validUntil,
 			})
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
@@ -745,7 +763,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Invalidated, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
@@ -757,7 +775,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Expired, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
@@ -769,7 +787,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream402Deactivated, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
@@ -781,7 +799,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403TokenInactive, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
@@ -793,7 +811,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403InactiveMember, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
@@ -805,13 +823,13 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403AgentRuntimeDeleted, attemptID))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
 		}
 		decision := p.decideTokenFailure(r.Context(), claim, status, result, err, action, refreshedAuthTokens, timing)
-		terminalFailure := result.ResponsesFailure != nil && (!retry || attempt == p.cfg.Upstream.MaxRetries)
+		terminalFailure := result.ResponsesFailure != nil && (!retry || attempt == maxAttempts)
 		if terminalFailure {
 			deliveryErr := writeResponsesFailureResponse(w, streamState.DownstreamStarted, result.ResponsesFailure, result.StreamDeliveryTrace)
 			if deliveryErr != nil {
@@ -838,13 +856,13 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			return
 		}
 		if decision.retrySameToken {
-			if attempt < p.cfg.Upstream.MaxRetries {
+			if attempt < maxAttempts {
 				continue
 			}
 			break
 		}
 		excluded[claim.TokenID()] = struct{}{}
-		if !retry || attempt == p.cfg.Upstream.MaxRetries {
+		if !retry || attempt == maxAttempts {
 			break
 		}
 	}
@@ -1227,6 +1245,12 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		return AttemptResult{Status: http.StatusBadGateway}, err
 	}
 	copyProxyHeaders(req.Header, r.Header)
+	if strings.TrimSpace(attempt.Intent.UpstreamUserAgent) != "" {
+		req.Header.Set("User-Agent", strings.TrimSpace(attempt.Intent.UpstreamUserAgent))
+	}
+	if strings.TrimSpace(attempt.Intent.UpstreamOriginator) != "" {
+		req.Header.Set("Originator", strings.TrimSpace(attempt.Intent.UpstreamOriginator))
+	}
 	req.Header.Set("X-Request-ID", attempt.RequestID)
 	authorization, err := p.authorizationForClaim(r.Context(), attempt.Claim)
 	if err != nil {

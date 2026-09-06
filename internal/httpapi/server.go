@@ -1479,6 +1479,41 @@ func (a *App) responses(w http.ResponseWriter, r *http.Request) {
 	a.proxyRequest(w, r, proxy.RequestIntent{Endpoint: "/v1/responses", Stream: requestStream(r)})
 }
 
+// experimentalResponses is an admin-only, request-scoped experiment lane.
+// It never changes the normal /v1/responses defaults or token settings.
+// Query parameters are deliberately allowlisted so experiments cannot inject
+// arbitrary upstream headers or alter global scheduler configuration.
+func (a *App) experimentalResponses(w http.ResponseWriter, r *http.Request) {
+	if tokenID := queryInt64(r, "token_id", 0); tokenID > 0 {
+		w.Header().Set("X-OAIX-Experiment", "true")
+		intent := proxy.RequestIntent{
+			Endpoint:      "/v1/responses",
+			Stream:        requestStream(r),
+			TargetTokenID: tokenID,
+			Experiment:    true,
+			MaxAttempts:   1,
+		}
+		if raw := strings.TrimSpace(r.URL.Query().Get("fingerprint_enabled")); raw != "" {
+			enabled, ok := parseExperimentBool(raw)
+			if !ok {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "fingerprint_enabled must be true or false"})
+				return
+			}
+			intent.CodexFingerprintEnabled = &enabled
+		}
+		intent.UpstreamUserAgent = boundedExperimentValue(r.URL.Query().Get("user_agent"), 512)
+		intent.UpstreamOriginator = boundedExperimentValue(r.URL.Query().Get("originator"), 128)
+		if sessionID := boundedExperimentValue(r.URL.Query().Get("session_id"), 256); sessionID != "" {
+			r = r.Clone(r.Context())
+			r.Header = r.Header.Clone()
+			r.Header.Set("session-id", sessionID)
+		}
+		a.proxyRequest(w, r, intent)
+		return
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "token_id is required and must be positive"})
+}
+
 func (a *App) alphaSearch(w http.ResponseWriter, r *http.Request) {
 	a.proxyRequest(w, r, proxy.RequestIntent{
 		Endpoint:            "/v1/alpha/search",
@@ -1865,6 +1900,25 @@ func queryInt(r *http.Request, key string, fallback int) int {
 	value, err := strconv.Atoi(raw)
 	if err != nil {
 		return fallback
+	}
+	return value
+}
+
+func parseExperimentBool(raw string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func boundedExperimentValue(raw string, max int) string {
+	value := strings.TrimSpace(raw)
+	if len(value) > max {
+		return value[:max]
 	}
 	return value
 }

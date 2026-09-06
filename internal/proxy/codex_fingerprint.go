@@ -20,6 +20,7 @@ type CodexFingerprintContext struct {
 	ClientSessionID string
 	TurnID          string
 	TurnStartedAt   int64
+	EnabledOverride *bool
 }
 
 type codexFingerprintIDs struct {
@@ -41,6 +42,7 @@ func buildCodexFingerprintContext(headers http.Header, intent RequestIntent) *Co
 		ClientSessionID: extractClientSessionID(headers),
 		TurnID:          newUUIDv7(),
 		TurnStartedAt:   time.Now().UnixMilli(),
+		EnabledOverride: intent.CodexFingerprintEnabled,
 	}
 }
 
@@ -65,7 +67,11 @@ func resolveCodexFingerprintIDs(claim *tokens.Claim, context *CodexFingerprintCo
 	if claim == nil || context == nil || claim.TokenID() <= 0 {
 		return nil
 	}
-	if claim.Token != nil && !claim.Token.Token.CodexFingerprintIsEnabled() {
+	if context.EnabledOverride != nil {
+		if !*context.EnabledOverride {
+			return nil
+		}
+	} else if claim.Token != nil && !claim.Token.Token.CodexFingerprintIsEnabled() {
 		return nil
 	}
 	accountSeed := codexFingerprintAccountSeed(claim)

@@ -161,6 +161,7 @@ func (r *quotaRefreshRegistry) update(id string, fn func(job *quotaRefreshJob)) 
 func (a *App) registerAdminAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/openapi.json", a.requireAuth(a.openapiSpec))
 	mux.HandleFunc("GET /admin/options", a.requireAuth(a.adminOptions))
+	mux.HandleFunc("POST /admin/experiments/responses", a.requireAuth(a.experimentalResponses))
 
 	mux.HandleFunc("PATCH /admin/tokens/{token_id}", a.requireAuth(a.patchToken))
 	mux.HandleFunc("GET /admin/tokens/export", a.requireAuth(a.exportTokens))
@@ -281,6 +282,7 @@ func (a *App) openapiSpec(w http.ResponseWriter, r *http.Request) {
 func adminOpenAPISpec() map[string]any {
 	routes := []string{
 		"GET /admin/openapi.json", "GET /admin/options",
+		"POST /admin/experiments/responses",
 		"GET /admin/ordinary-429-cooldown", "POST /admin/ordinary-429-cooldown", "DELETE /admin/ordinary-429-cooldown",
 		"GET /admin/gpt6-astra-long-context-pricing", "POST /admin/gpt6-astra-long-context-pricing", "DELETE /admin/gpt6-astra-long-context-pricing",
 		"GET /admin/token-models", "POST /admin/token-models", "DELETE /admin/token-models",
