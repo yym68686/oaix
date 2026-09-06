@@ -443,6 +443,9 @@ func TestFrontendUserDashboardContract(t *testing.T) {
 		`type="date"`,
 		"缓存命中率曲线",
 		"模型消费",
+		"TrendSkeleton",
+		"ModelSkeleton",
+		"Skeleton",
 		"api.myConcurrency",
 		"getServiceKey().trim() !== requestCredential",
 	} {

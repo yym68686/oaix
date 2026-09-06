@@ -10,6 +10,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Input } from "@/registry/default/ui/input";
+import { Skeleton } from "@/registry/default/ui/skeleton";
 import {
   api,
   getServiceKey,
@@ -20,7 +21,7 @@ import {
   type DashboardTrendPoint,
 } from "@/lib/api";
 import { clamp, formatCurrency, formatDate, formatNumber } from "@/lib/format";
-import { EmptyState, ErrorAlert, LoadingState } from "@/shared/components";
+import { EmptyState, ErrorAlert } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
 
 const RANGE_OPTIONS: Array<{ label: string; value: DashboardRange }> = [
@@ -179,13 +180,13 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
             icon={<ActivityIcon className="size-4" />} detail="实时" tone="emerald" />
           <MetricCard label="消耗金额" value={selectedPeriod ? formatCompactCurrency(selectedPeriod.estimated_cost_usd) : "--"}
             icon={<CoinsIcon className="size-4" />} detail={PERIOD_LABELS[range]} tone="amber"
-            title={selectedPeriod ? formatCurrency(selectedPeriod.estimated_cost_usd || 0) : undefined} />
+            title={selectedPeriod ? formatCurrency(selectedPeriod.estimated_cost_usd || 0) : undefined} loading={pendingRange} />
           <MetricCard label="Token 用量" value={selectedPeriod ? formatCompactNumber(selectedPeriod.total_tokens) : "--"}
             icon={<LayersIcon className="size-4" />} detail={PERIOD_LABELS[range]} tone="blue"
-            title={selectedPeriod ? formatNumber(selectedPeriod.total_tokens || 0) : undefined} />
+            title={selectedPeriod ? formatNumber(selectedPeriod.total_tokens || 0) : undefined} loading={pendingRange} />
           <MetricCard label="请求数量" value={selectedPeriod ? formatCompactNumber(selectedPeriod.request_count) : "--"}
             icon={<HashIcon className="size-4" />} detail={PERIOD_LABELS[range]} tone="neutral"
-            title={selectedPeriod ? formatNumber(selectedPeriod.request_count || 0) : undefined} />
+            title={selectedPeriod ? formatNumber(selectedPeriod.request_count || 0) : undefined} loading={pendingRange} />
         </div>
       </section>
 
@@ -203,7 +204,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
           </div>
         </header>
         <div className="min-h-[284px]" aria-busy={pendingRange}>
-          {pendingRange ? <div className="grid h-[284px] place-items-center"><LoadingState label="正在载入" /></div> :
+          {pendingRange ? <TrendSkeleton /> :
             <CacheRateChart bucket={dashboard?.bucket || "day"} points={selectedRangeLoaded ? dashboard?.trend || [] : []} />}
         </div>
       </section>
@@ -216,7 +217,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
           <span className="text-muted-foreground text-xs">{rangeLabel}</span>
         </header>
         <div className="min-h-40" aria-busy={pendingRange}>
-          {pendingRange ? <div className="grid h-40 place-items-center"><LoadingState label="正在载入" /></div> :
+          {pendingRange ? <ModelSkeleton /> :
             <ModelSpendChart models={selectedRangeLoaded ? dashboard?.models || [] : []} />}
         </div>
       </section>
@@ -228,9 +229,9 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
   );
 }
 
-function MetricCard({ label, value, icon, detail, tone, title }: {
+function MetricCard({ label, value, icon, detail, tone, title, loading = false }: {
   label: string; value: string; icon: ReactNode; detail: string;
-  tone: "emerald" | "amber" | "blue" | "neutral"; title?: string;
+  tone: "emerald" | "amber" | "blue" | "neutral"; title?: string; loading?: boolean;
 }) {
   const accent = {
     emerald: "border-emerald-500/25 text-emerald-700 dark:text-emerald-400",
@@ -243,9 +244,46 @@ function MetricCard({ label, value, icon, detail, tone, title }: {
       <div className="flex items-center justify-between gap-2 text-xs sm:text-sm">
         <span>{label}</span><span aria-hidden="true">{icon}</span>
       </div>
-      <div data-metric-value className="break-all oaix-tabular font-semibold text-2xl leading-tight text-foreground sm:text-3xl" title={title}>{value}</div>
-      <span className="text-muted-foreground text-xs">{detail}</span>
+      <div aria-label={loading ? `${label}正在载入` : undefined} data-metric-value className="break-all oaix-tabular font-semibold text-2xl leading-tight text-foreground sm:text-3xl" title={title}>
+        {loading ? <Skeleton className="h-9 w-28 rounded-md sm:h-10" /> : value}
+      </div>
+      {loading ? <Skeleton className="h-3 w-12 rounded-full" /> : <span className="text-muted-foreground text-xs">{detail}</span>}
     </article>
+  );
+}
+
+function TrendSkeleton() {
+  return (
+    <div aria-label="缓存命中率正在载入" className="grid h-[284px] content-center gap-6 rounded-lg border bg-muted/10 p-5" role="status">
+      <div className="flex items-center justify-between gap-4">
+        <Skeleton className="h-3 w-28 rounded-full" />
+        <Skeleton className="h-3 w-16 rounded-full" />
+      </div>
+      <div className="grid gap-4">
+        {["w-full", "w-11/12", "w-4/5", "w-10/12"].map((width, index) => <Skeleton className={`h-px ${width}`} key={index} />)}
+      </div>
+      <div className="flex items-end gap-2 px-8">
+        {[38, 56, 44, 72, 61, 78, 52, 67, 48, 70].map((height, index) => (
+          <Skeleton className="min-w-0 flex-1 rounded-t-md" key={index} style={{ height: `${height}px` }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ModelSkeleton() {
+  return (
+    <div aria-label="模型消费正在载入" className="grid gap-5 rounded-lg border bg-muted/10 p-4" role="status">
+      {["w-4/5", "w-11/12", "w-3/5", "w-10/12"].map((width, index) => (
+        <div className="grid gap-2" key={index}>
+          <div className="flex items-center justify-between gap-4">
+            <Skeleton className={`h-4 ${width} rounded-full`} />
+            <Skeleton className="h-3 w-16 rounded-full" />
+          </div>
+          <Skeleton className="h-1.5 w-full rounded-full" />
+        </div>
+      ))}
+    </div>
   );
 }
 
