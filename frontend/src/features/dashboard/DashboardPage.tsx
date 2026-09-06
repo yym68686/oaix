@@ -200,7 +200,9 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-muted-foreground text-xs">平均缓存率</span>
-            <span className="oaix-tabular font-semibold text-xl">{cacheRate}</span>
+            <div className="flex h-7 items-center oaix-tabular font-semibold text-xl" aria-busy={pendingRange}>
+              {pendingRange ? <LoadingPlaceholder className="h-5 w-16" /> : cacheRate}
+            </div>
           </div>
         </header>
         <div className="min-h-[284px]" aria-busy={pendingRange}>
@@ -217,7 +219,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
           <span className="text-muted-foreground text-xs">{rangeLabel}</span>
         </header>
         <div className="min-h-40" aria-busy={pendingRange}>
-          {pendingRange ? <ModelSkeleton /> :
+          {pendingRange ? <ModelSkeleton rows={Math.min(20, Math.max(4, dashboard?.models?.length || 0))} /> :
             <ModelSpendChart models={selectedRangeLoaded ? dashboard?.models || [] : []} />}
         </div>
       </section>
@@ -240,49 +242,62 @@ function MetricCard({ label, value, icon, detail, tone, title, loading = false }
     neutral: "border-border text-muted-foreground",
   }[tone];
   return (
-    <article aria-label={label} className={`grid min-h-[152px] min-w-0 content-between gap-4 rounded-lg border bg-card p-4 sm:p-5 ${accent}`}>
+    <article aria-label={label} aria-busy={loading} className={`grid min-h-[152px] min-w-0 content-between gap-4 rounded-lg border bg-card p-4 sm:p-5 ${accent}`}>
       <div className="flex items-center justify-between gap-2 text-xs sm:text-sm">
         <span>{label}</span><span aria-hidden="true">{icon}</span>
       </div>
       <div aria-label={loading ? `${label}正在载入` : undefined} data-metric-value className="break-all oaix-tabular font-semibold text-2xl leading-tight text-foreground sm:text-3xl" title={title}>
-        {loading ? <Skeleton className="h-9 w-28 rounded-md sm:h-10" /> : value}
+        {loading ? <LoadingPlaceholder className="h-[1.25em] w-28 max-w-full" /> : value}
       </div>
-      {loading ? <Skeleton className="h-3 w-12 rounded-full" /> : <span className="text-muted-foreground text-xs">{detail}</span>}
+      <span className="text-muted-foreground text-xs">{detail}</span>
     </article>
   );
 }
 
+function LoadingPlaceholder({ className }: { className: string }) {
+  return <Skeleton aria-hidden="true" className={`rounded-md motion-reduce:animate-none ${className}`} />;
+}
+
 function TrendSkeleton() {
   return (
-    <div aria-label="缓存命中率正在载入" className="grid h-[284px] content-center gap-6 rounded-lg border bg-muted/10 p-5" role="status">
-      <div className="flex items-center justify-between gap-4">
-        <Skeleton className="h-3 w-28 rounded-full" />
-        <Skeleton className="h-3 w-16 rounded-full" />
-      </div>
-      <div className="grid gap-4">
-        {["w-full", "w-11/12", "w-4/5", "w-10/12"].map((width, index) => <Skeleton className={`h-px ${width}`} key={index} />)}
-      </div>
-      <div className="flex items-end gap-2 px-8">
-        {[38, 56, 44, 72, 61, 78, 52, 67, 48, 70].map((height, index) => (
-          <Skeleton className="min-w-0 flex-1 rounded-t-md" key={index} style={{ height: `${height}px` }} />
+    <div aria-label="缓存命中率正在载入" className="relative h-[284px] w-full" role="status">
+      <div aria-hidden="true" className="absolute inset-x-0 top-[30px] bottom-12 flex flex-col justify-between">
+        {[0, 1, 2, 3, 4].map((row) => (
+          <div className="flex items-center gap-3 pr-[18px]" key={row}>
+            <LoadingPlaceholder className="h-2.5 w-9 shrink-0" />
+            <div className="min-w-0 flex-1 border-t border-dashed border-border/60" />
+          </div>
         ))}
+      </div>
+      <div className="absolute inset-0 flex items-center justify-center pl-12 pr-[18px]">
+        <span className="rounded-full bg-background/90 px-4 py-2 text-muted-foreground text-xs">正在加载统计</span>
+      </div>
+      <div aria-hidden="true" className="absolute bottom-5 left-12 right-[18px] flex justify-between gap-3">
+        {[0, 1, 2].map((column) => <LoadingPlaceholder className="h-2.5 w-10" key={column} />)}
       </div>
     </div>
   );
 }
 
-function ModelSkeleton() {
+function ModelSkeleton({ rows }: { rows: number }) {
   return (
-    <div aria-label="模型消费正在载入" className="grid gap-5 rounded-lg border bg-muted/10 p-4" role="status">
-      {["w-4/5", "w-11/12", "w-3/5", "w-10/12"].map((width, index) => (
-        <div className="grid gap-2" key={index}>
-          <div className="flex items-center justify-between gap-4">
-            <Skeleton className={`h-4 ${width} rounded-full`} />
-            <Skeleton className="h-3 w-16 rounded-full" />
+    <div aria-label="模型消费正在载入" className="grid w-full gap-4" role="status">
+      {Array.from({ length: rows }, (_, index) => (
+        <div className="grid gap-1.5" key={index}>
+          <div className="flex min-w-0 items-center justify-between gap-4">
+            <div className="flex min-w-0 items-center gap-2">
+              <LoadingPlaceholder className="size-5 shrink-0" />
+              <LoadingPlaceholder className={`h-3 max-w-full ${["w-24", "w-32", "w-28", "w-20"][index % 4]}`} />
+            </div>
+            <LoadingPlaceholder className="h-3 w-14 shrink-0" />
           </div>
-          <Skeleton className="h-1.5 w-full rounded-full" />
+          <LoadingPlaceholder className="h-1.5 w-full" />
         </div>
       ))}
+      <div className="flex gap-4 border-t pt-3">
+        <LoadingPlaceholder className="h-4 w-28" />
+        <LoadingPlaceholder className="h-4 w-16" />
+      </div>
     </div>
   );
 }
