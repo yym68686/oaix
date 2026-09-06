@@ -320,7 +320,7 @@ export type UsageSummary = {
   average_duration_ms?: number;
 };
 
-export type DashboardRange = "today" | "week" | "month" | "year";
+export type DashboardRange = "today" | "week" | "month" | "year" | "custom";
 
 export type DashboardPeriod = {
   request_count?: number;
@@ -344,6 +344,8 @@ export type DashboardModel = {
 };
 
 export type DashboardData = {
+  custom_from?: string;
+  custom_to?: string;
   generated_at?: string;
   timezone?: string;
   range?: DashboardRange;
@@ -669,8 +671,12 @@ export type ImportAPIScope = "self" | "admin";
 export const api = {
   health: () => requestJSON<HealthResponse>("/healthz"),
   me: (authKey?: string) => requestJSON<MeResponse>("/api/me", {}, authKey),
-  dashboard: (range: DashboardRange, timezone: string, authKey?: string, signal?: AbortSignal) => {
+  dashboard: (range: DashboardRange, timezone: string, authKey?: string, signal?: AbortSignal, dates?: { from: string; to: string }) => {
     const params = new URLSearchParams({ range, timezone });
+    if (range === "custom" && dates) {
+      params.set("from", dates.from);
+      params.set("to", dates.to);
+    }
     return requestJSON<DashboardResponse>(`/api/me/dashboard?${params.toString()}`, { signal }, authKey);
   },
   myConcurrency: (authKey?: string) =>

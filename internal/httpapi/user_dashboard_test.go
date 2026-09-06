@@ -11,11 +11,12 @@ func TestParseUserDashboardRange(t *testing.T) {
 		input string
 		want  store.UserDashboardRange
 	}{
-		{input: "", want: store.UserDashboardMonth},
+		{input: "", want: store.UserDashboardToday},
 		{input: "TODAY", want: store.UserDashboardToday},
 		{input: " week ", want: store.UserDashboardWeek},
 		{input: "month", want: store.UserDashboardMonth},
 		{input: "year", want: store.UserDashboardYear},
+		{input: "custom", want: store.UserDashboardCustom},
 	} {
 		got, err := parseUserDashboardRange(test.input)
 		if err != nil || got != test.want {

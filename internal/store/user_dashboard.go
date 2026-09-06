@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -11,16 +12,19 @@ import (
 type UserDashboardRange string
 
 const (
-	UserDashboardToday UserDashboardRange = "today"
-	UserDashboardWeek  UserDashboardRange = "week"
-	UserDashboardMonth UserDashboardRange = "month"
-	UserDashboardYear  UserDashboardRange = "year"
+	UserDashboardToday  UserDashboardRange = "today"
+	UserDashboardWeek   UserDashboardRange = "week"
+	UserDashboardMonth  UserDashboardRange = "month"
+	UserDashboardYear   UserDashboardRange = "year"
+	UserDashboardCustom UserDashboardRange = "custom"
 )
 
 type UserDashboardOptions struct {
-	Now      time.Time
-	Location *time.Location
-	Range    UserDashboardRange
+	Now        time.Time
+	Location   *time.Location
+	Range      UserDashboardRange
+	CustomFrom time.Time
+	CustomTo   time.Time
 }
 
 type UserDashboardPeriod struct {
@@ -57,13 +61,18 @@ type UserDashboard struct {
 	Periods     map[string]UserDashboardPeriod `json:"periods"`
 	Trend       []UserDashboardTrendPoint      `json:"trend"`
 	Models      []UserDashboardModel           `json:"models"`
+	CustomFrom  string                         `json:"custom_from,omitempty"`
+	CustomTo    string                         `json:"custom_to,omitempty"`
 }
 
 type userDashboardWindow struct {
 	periodStarts map[string]time.Time
 	selectedFrom time.Time
+	selectedTo   time.Time
 	bucket       string
 }
+
+var ErrInvalidDashboardDates = errors.New("custom dates must be between 1970-01-01 and today, with from on or before to")
 
 func (s *Store) UserDashboardScoped(ctx context.Context, scope ResourceScope, opts UserDashboardOptions) (UserDashboard, error) {
 	now := opts.Now.UTC()
@@ -76,35 +85,55 @@ func (s *Store) UserDashboardScoped(ctx context.Context, scope ResourceScope, op
 	}
 	selectedRange := opts.Range
 	if !validUserDashboardRange(selectedRange) {
-		selectedRange = UserDashboardMonth
+		selectedRange = UserDashboardToday
 	}
 	window := buildUserDashboardWindow(now, location, selectedRange)
+	if selectedRange == UserDashboardCustom {
+		from, to := opts.CustomFrom.In(location), opts.CustomTo.In(location)
+		if from.IsZero() || to.IsZero() || from.Year() < 1970 || to.Before(from) || to.After(now) {
+			return UserDashboard{}, ErrInvalidDashboardDates
+		}
+		window.selectedFrom = time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, location)
+		window.selectedTo = time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, location).AddDate(0, 0, 1).Add(-time.Nanosecond)
+		if from.Format(time.DateOnly) == to.Format(time.DateOnly) {
+			window.bucket = "hour"
+		} else if window.selectedTo.Sub(window.selectedFrom) > 90*24*time.Hour {
+			window.bucket = "month"
+		}
+	}
 	periods, err := s.userDashboardPeriods(ctx, scope, window.periodStarts, now)
 	if err != nil {
 		return UserDashboard{}, err
 	}
-	trend, err := s.userDashboardTrend(ctx, scope, window.selectedFrom, now, location, window.bucket)
+	selectedTo := window.selectedTo
+	if selectedTo.IsZero() || selectedTo.After(now) {
+		selectedTo = now
+	}
+	trend, err := s.userDashboardTrend(ctx, scope, window.selectedFrom, selectedTo, location, window.bucket)
 	if err != nil {
 		return UserDashboard{}, err
 	}
-	models, err := s.userDashboardModels(ctx, scope, window.selectedFrom, now)
+	models, err := s.userDashboardModels(ctx, scope, window.selectedFrom, selectedTo)
 	if err != nil {
 		return UserDashboard{}, err
 	}
+	periods[string(selectedRange)] = summarizeDashboardTrend(trend)
 	return UserDashboard{
 		GeneratedAt: now,
 		Timezone:    location.String(),
 		Range:       selectedRange,
 		Bucket:      window.bucket,
 		Periods:     periods,
-		Trend:       fillUserDashboardTrend(trend, window.selectedFrom, now, location, window.bucket),
+		Trend:       fillUserDashboardTrend(trend, window.selectedFrom, selectedTo, location, window.bucket),
 		Models:      models,
+		CustomFrom:  dashboardDateJSON(window.selectedFrom, selectedRange == UserDashboardCustom),
+		CustomTo:    dashboardDateJSON(selectedTo.In(location), selectedRange == UserDashboardCustom),
 	}, nil
 }
 
 func validUserDashboardRange(value UserDashboardRange) bool {
 	switch value {
-	case UserDashboardToday, UserDashboardWeek, UserDashboardMonth, UserDashboardYear:
+	case UserDashboardToday, UserDashboardWeek, UserDashboardMonth, UserDashboardYear, UserDashboardCustom:
 		return true
 	default:
 		return false
@@ -116,8 +145,8 @@ func buildUserDashboardWindow(now time.Time, location *time.Location, selectedRa
 	today := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, location)
 	starts := map[string]time.Time{
 		string(UserDashboardToday): today,
-		string(UserDashboardWeek):  today.AddDate(0, 0, -6),
-		string(UserDashboardMonth): today.AddDate(0, 0, -29),
+		string(UserDashboardWeek):  today.AddDate(0, 0, -(int(today.Weekday())+6)%7),
+		string(UserDashboardMonth): time.Date(localNow.Year(), localNow.Month(), 1, 0, 0, 0, 0, location),
 		string(UserDashboardYear):  time.Date(localNow.Year(), time.January, 1, 0, 0, 0, 0, location),
 	}
 	bucket := "day"
@@ -127,6 +156,28 @@ func buildUserDashboardWindow(now time.Time, location *time.Location, selectedRa
 		bucket = "month"
 	}
 	return userDashboardWindow{periodStarts: starts, selectedFrom: starts[string(selectedRange)], bucket: bucket}
+}
+
+func dashboardDateJSON(value time.Time, enabled bool) string {
+	if !enabled || value.IsZero() {
+		return ""
+	}
+	return value.Format(time.DateOnly)
+}
+
+func summarizeDashboardTrend(points []UserDashboardTrendPoint) UserDashboardPeriod {
+	var summary UserDashboardPeriod
+	for _, point := range points {
+		summary.RequestCount += point.RequestCount
+		summary.TotalTokens += point.TotalTokens
+		summary.EstimatedCostUSD += point.EstimatedCostUSD
+		summary.InputTokens += point.InputTokens
+		summary.CachedInputTokens += point.CachedInputTokens
+	}
+	if summary.InputTokens > 0 {
+		summary.CacheHitRatio = float64(summary.CachedInputTokens) / float64(summary.InputTokens)
+	}
+	return summary
 }
 
 func (s *Store) userDashboardPeriods(ctx context.Context, scope ResourceScope, starts map[string]time.Time, now time.Time) (map[string]UserDashboardPeriod, error) {
@@ -141,9 +192,11 @@ func (s *Store) userDashboardPeriods(ctx context.Context, scope ResourceScope, s
 	monthArg := addArg(starts[string(UserDashboardMonth)])
 	yearArg := addArg(starts[string(UserDashboardYear)])
 	nowArg := addArg(now)
-	earliest := starts[string(UserDashboardMonth)]
-	if starts[string(UserDashboardYear)].Before(earliest) {
-		earliest = starts[string(UserDashboardYear)]
+	earliest := now
+	for _, start := range starts {
+		if start.Before(earliest) {
+			earliest = start
+		}
 	}
 	earliestArg := addArg(earliest)
 	rows, err := s.pool.Query(ctx, `

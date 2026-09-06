@@ -437,8 +437,10 @@ func TestFrontendUserDashboardContract(t *testing.T) {
 	}
 	for _, required := range []string{
 		"当前并发",
-		"近 7 天",
-		"近 30 天",
+		"本周",
+		"本月",
+		"自定义",
+		`type="date"`,
 		"缓存命中率曲线",
 		"模型消费",
 		"api.myConcurrency",
@@ -451,6 +453,7 @@ func TestFrontendUserDashboardContract(t *testing.T) {
 	for _, required := range []string{
 		`/api/me/dashboard?${params.toString()}`,
 		`/api/me/concurrency`,
+		`range === "custom"`,
 	} {
 		if !strings.Contains(apiFile, required) {
 			t.Fatalf("dashboard API client contract missing %q", required)

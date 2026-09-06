@@ -14,8 +14,8 @@ func TestBuildUserDashboardWindowUsesLocalCalendarBoundaries(t *testing.T) {
 	window := buildUserDashboardWindow(now, location, UserDashboardMonth)
 
 	assertDashboardTime(t, window.periodStarts["today"], "2026-08-14T00:00:00+08:00")
-	assertDashboardTime(t, window.periodStarts["week"], "2026-08-08T00:00:00+08:00")
-	assertDashboardTime(t, window.periodStarts["month"], "2026-07-16T00:00:00+08:00")
+	assertDashboardTime(t, window.periodStarts["week"], "2026-08-10T00:00:00+08:00")
+	assertDashboardTime(t, window.periodStarts["month"], "2026-08-01T00:00:00+08:00")
 	assertDashboardTime(t, window.periodStarts["year"], "2026-01-01T00:00:00+08:00")
 	if window.bucket != "day" || !window.selectedFrom.Equal(window.periodStarts["month"]) {
 		t.Fatalf("unexpected selected window: %+v", window)

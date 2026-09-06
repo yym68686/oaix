@@ -38,11 +38,28 @@ func (a *App) myDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	payload, err := a.store.UserDashboardScoped(ctx, scope, store.UserDashboardOptions{
+	opts := store.UserDashboardOptions{
 		Now:      time.Now().UTC(),
 		Location: location,
 		Range:    rangeValue,
-	})
+	}
+	if rangeValue == store.UserDashboardCustom {
+		opts.CustomFrom, err = time.ParseInLocation(time.DateOnly, r.URL.Query().Get("from"), location)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("from must be YYYY-MM-DD"))
+			return
+		}
+		opts.CustomTo, err = time.ParseInLocation(time.DateOnly, r.URL.Query().Get("to"), location)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("to must be YYYY-MM-DD"))
+			return
+		}
+	}
+	payload, err := a.store.UserDashboardScoped(ctx, scope, opts)
+	if errors.Is(err, store.ErrInvalidDashboardDates) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -69,12 +86,12 @@ func (a *App) myConcurrency(w http.ResponseWriter, r *http.Request) {
 func parseUserDashboardRange(value string) (store.UserDashboardRange, error) {
 	rangeValue := store.UserDashboardRange(strings.ToLower(strings.TrimSpace(value)))
 	if rangeValue == "" {
-		return store.UserDashboardMonth, nil
+		return store.UserDashboardToday, nil
 	}
 	switch rangeValue {
-	case store.UserDashboardToday, store.UserDashboardWeek, store.UserDashboardMonth, store.UserDashboardYear:
+	case store.UserDashboardToday, store.UserDashboardWeek, store.UserDashboardMonth, store.UserDashboardYear, store.UserDashboardCustom:
 		return rangeValue, nil
 	default:
-		return "", errors.New("range must be today, week, month, or year")
+		return "", errors.New("range must be today, week, month, year, or custom")
 	}
 }

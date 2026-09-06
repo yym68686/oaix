@@ -958,6 +958,17 @@ func TestUserDashboardIsScopedToAuthenticatedCallerWithDatabase(t *testing.T) {
 		t.Fatalf("idle dashboard concurrency = %d, want 0", got)
 	}
 	expectStatus(t, h.request(t, http.MethodGet, "/api/me/dashboard?range=today&timezone=Not%2FAZone", keyA.PlaintextKey, ""), http.StatusBadRequest)
+	custom := expectStatus(t, h.request(t, http.MethodGet, "/api/me/dashboard?range=custom&from="+now.Format("2006-01-02")+"&to="+now.Format("2006-01-02")+"&timezone=UTC", keyA.PlaintextKey, ""), http.StatusOK)
+	customDashboard, _ := custom["dashboard"].(map[string]any)
+	if customDashboard["range"] != "custom" {
+		t.Fatalf("custom dashboard range = %#v", customDashboard["range"])
+	}
+	customPeriods, _ := customDashboard["periods"].(map[string]any)
+	customPeriod, _ := customPeriods["custom"].(map[string]any)
+	if got := int64(customPeriod["request_count"].(float64)); got != 2 {
+		t.Fatalf("custom dashboard request_count = %d, want 2", got)
+	}
+	expectStatus(t, h.request(t, http.MethodGet, "/api/me/dashboard?range=custom&from=2030-01-01&to=2030-01-02&timezone=UTC", keyA.PlaintextKey, ""), http.StatusBadRequest)
 }
 
 func TestMultiUserAPIKeyRevocationAndDisabledUserWithDatabase(t *testing.T) {
