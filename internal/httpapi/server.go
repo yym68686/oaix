@@ -1489,8 +1489,18 @@ func (a *App) experimentalResponses(w http.ResponseWriter, r *http.Request) {
 		r = r.Clone(r.Context())
 		r.Header = r.Header.Clone()
 		r.Header.Set("X-OAIX-Experiment", "true")
+		endpoint := "/v1/responses"
+		if raw := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("endpoint"))); raw != "" {
+			if raw != "chat" && raw != "responses" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "endpoint must be responses or chat"})
+				return
+			}
+			if raw == "chat" {
+				endpoint = "/v1/chat/completions"
+			}
+		}
 		intent := proxy.RequestIntent{
-			Endpoint:      "/v1/responses",
+			Endpoint:      endpoint,
 			Stream:        requestStream(r),
 			TargetTokenID: tokenID,
 			Experiment:    true,
