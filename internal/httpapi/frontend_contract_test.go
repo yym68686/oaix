@@ -195,7 +195,7 @@ func TestFrontendProfileSupportsSavedAccountSwitching(t *testing.T) {
 	profile := readFrontendFile(t, "src", "features", "account", "ProfilePage.tsx")
 	accounts := readFrontendFile(t, "src", "lib", "accounts.ts")
 	for _, required := range []string{
-		`{ key: "account_profile", href: "/account/profile"`,
+        `navigateTo("/account/profile")`,
 		`accounts.length > 1`,
 		`<MenuGroupLabel>切换账号</MenuGroupLabel>`,
 		`onSwitchAccount={switchAccount}`,

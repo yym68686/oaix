@@ -113,20 +113,19 @@ export function ProfilePage({
   }
 
   return (
-    <div className="grid min-w-0 gap-8 xl:grid-cols-[minmax(0,.7fr)_minmax(0,1fr)]">
-      <div className="grid content-start gap-8">
-        <PageSection>
+    <div className="grid min-w-0 gap-6">
+      <PageSection className="rounded-xl border bg-card p-5 shadow-xs sm:p-6">
           <PageSectionHeader>
             <PageSectionTitle className="flex items-center gap-2">
               <UserRoundIcon className="size-5" />
               个人资料
             </PageSectionTitle>
-            <PageSectionDescription>当前浏览器正在使用的 OAIX 身份。</PageSectionDescription>
+          <PageSectionDescription>当前浏览器正在使用的 OAIX 身份。</PageSectionDescription>
           </PageSectionHeader>
           <PageSectionPanel>
             {activeAccount || profile ? (
-              <div className="flex items-center gap-4">
-                <div className="flex size-14 shrink-0 items-center justify-center rounded-full border bg-muted font-heading text-xl font-semibold">
+              <div className="flex flex-wrap items-center gap-4">
+                <div className="flex size-16 shrink-0 items-center justify-center rounded-2xl border bg-primary/10 font-heading text-2xl font-semibold text-primary">
                   {profileName.slice(0, 1).toUpperCase() || <UserRoundIcon />}
                 </div>
                 <div className="min-w-0">
@@ -145,7 +144,8 @@ export function ProfilePage({
           </PageSectionPanel>
         </PageSection>
 
-        <PageSection>
+      <div className="grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(0,.72fr)_minmax(0,1.28fr)]">
+        <PageSection className="rounded-xl border bg-card p-5 shadow-xs sm:p-6">
           <PageSectionHeader>
             <PageSectionTitle className="flex items-center gap-2">
               <UserPlusIcon className="size-5" />
@@ -188,9 +188,8 @@ export function ProfilePage({
             </Button>
           </PageSectionPanel>
         </PageSection>
-      </div>
 
-      <PageSection>
+        <PageSection className="rounded-xl border bg-card p-5 shadow-xs sm:p-6">
         <PageSectionHeader>
           <PageSectionTitle className="flex items-center gap-2">
             <ShieldCheckIcon className="size-5" />
@@ -207,7 +206,7 @@ export function ProfilePage({
               const accountEmail = account.user?.email?.trim() || "";
               const accountName = savedAccountLabel(account);
               return (
-                <div className="flex flex-col gap-3 rounded-lg border bg-muted/25 p-4 sm:flex-row sm:items-center" key={account.id}>
+                <div className="flex flex-col gap-3 rounded-xl border bg-muted/20 p-4 transition-colors hover:bg-muted/35 sm:flex-row sm:items-center" key={account.id}>
                   <div className="flex min-w-0 flex-1 items-center gap-3">
                     <div className="flex size-10 shrink-0 items-center justify-center rounded-full border bg-background font-medium">
                       {accountName.slice(0, 1).toUpperCase() || <UserRoundIcon />}
@@ -243,7 +242,8 @@ export function ProfilePage({
             })
           )}
         </PageSectionPanel>
-      </PageSection>
+        </PageSection>
+      </div>
 
       <Dialog open={Boolean(removeTarget)} onOpenChange={(open) => !open && !removing && setRemoveTarget(null)}>
         <DialogPopup className="sm:max-w-md">

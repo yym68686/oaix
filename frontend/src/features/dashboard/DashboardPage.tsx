@@ -124,7 +124,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
   const selectedRangeLoaded = !dateError && loadedSelection === selection && dashboard?.range === range;
   const selectedPeriod = selectedRangeLoaded ? dashboard?.periods?.[range] : undefined;
 
-  const rangeLabel = range === "custom" ? `${customFrom} ~ ${customTo}` : PERIOD_LABELS[range];
+  const rangeLabel = range === "custom" ? `${customFrom} ~ ${customTo}` : range === "today" ? "" : PERIOD_LABELS[range];
   const pendingRange = !selectedRangeLoaded && !error && !dateError;
   const cacheRate = selectedPeriod && Number(selectedPeriod.input_tokens) > 0
     ? formatPercent(Number(selectedPeriod.cache_hit_ratio || 0)) : "--";
@@ -137,9 +137,8 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
             <LayoutDashboardIcon className="size-5 text-muted-foreground" />
             使用仪表盘
           </h2>
-          <span className="text-muted-foreground text-xs">{timezone}</span>
         </header>
-        <div className="flex flex-wrap items-end justify-between gap-4 border-b pb-5">
+        <div className="flex flex-wrap items-end gap-4 border-b pb-5">
           <fieldset aria-label="仪表盘时间范围" className="grid w-full grid-cols-5 gap-1 rounded-lg bg-muted p-1 sm:w-auto">
             {RANGE_OPTIONS.map((option) => (
               <label key={option.value} className="relative min-w-0 cursor-pointer">
@@ -170,7 +169,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
                   aria-invalid={Boolean(dateError)} onChange={(event) => { setError(""); setCustomTo(event.target.value); }} />
               </label>
             </div>
-          ) : <span className="pb-2 text-muted-foreground text-xs">{PERIOD_LABELS[range]}</span>}
+          ) : null}
         </div>
         {dateError ? <p role="alert" className="mt-4 text-destructive text-sm">{dateError}</p> : null}
         {error ? <div className="mt-4"><ErrorAlert title="仪表盘载入失败" message={error} /></div> : null}
@@ -178,13 +177,13 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
           <MetricCard label="当前并发" value={concurrency == null ? "--" : formatNumber(concurrency)}
             icon={<ActivityIcon className="size-4" />} detail="实时" tone="emerald" />
           <MetricCard label="消耗金额" value={selectedPeriod ? formatCompactCurrency(selectedPeriod.estimated_cost_usd) : "--"}
-            icon={<CoinsIcon className="size-4" />} detail={PERIOD_LABELS[range]} tone="amber"
+            icon={<CoinsIcon className="size-4" />} detail={range === "today" ? "" : PERIOD_LABELS[range]} tone="amber"
             title={selectedPeriod ? formatCurrency(selectedPeriod.estimated_cost_usd || 0) : undefined} loading={pendingRange} />
           <MetricCard label="Token 用量" value={selectedPeriod ? formatCompactNumber(selectedPeriod.total_tokens) : "--"}
-            icon={<LayersIcon className="size-4" />} detail={PERIOD_LABELS[range]} tone="blue"
+            icon={<LayersIcon className="size-4" />} detail={range === "today" ? "" : PERIOD_LABELS[range]} tone="blue"
             title={selectedPeriod ? formatNumber(selectedPeriod.total_tokens || 0) : undefined} loading={pendingRange} />
           <MetricCard label="请求数量" value={selectedPeriod ? formatCompactNumber(selectedPeriod.request_count) : "--"}
-            icon={<HashIcon className="size-4" />} detail={PERIOD_LABELS[range]} tone="neutral"
+            icon={<HashIcon className="size-4" />} detail={range === "today" ? "" : PERIOD_LABELS[range]} tone="neutral"
             title={selectedPeriod ? formatNumber(selectedPeriod.request_count || 0) : undefined} loading={pendingRange} />
         </div>
       </section>
@@ -195,7 +194,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
             <h2 id="dashboard-trend-title" className="flex items-center gap-2 font-semibold text-base">
               <GaugeIcon className="size-4 text-blue-600 dark:text-blue-400" />缓存命中率
             </h2>
-            <span className="text-muted-foreground text-xs">{rangeLabel}</span>
+            {rangeLabel && <span className="text-muted-foreground text-xs">{rangeLabel}</span>}
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-muted-foreground text-xs">平均缓存率</span>
@@ -215,7 +214,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
           <h2 id="dashboard-models-title" className="flex items-center gap-2 font-semibold text-base">
             <ChartColumnBigIcon className="size-4 text-amber-600 dark:text-amber-400" />模型消费
           </h2>
-          <span className="text-muted-foreground text-xs">{rangeLabel}</span>
+          {rangeLabel && <span className="text-muted-foreground text-xs">{rangeLabel}</span>}
         </header>
         <div className="min-h-40" aria-busy={pendingRange}>
           {pendingRange ? <ModelSkeleton rows={Math.min(20, Math.max(4, dashboard?.models?.length || 0))} /> :
@@ -244,7 +243,7 @@ function MetricCard({ label, value, icon, detail, tone, title, loading = false }
       <div aria-label={loading ? `${label}正在载入` : undefined} data-metric-value className="break-all oaix-tabular font-semibold text-2xl leading-tight text-foreground sm:text-3xl" title={title}>
         {loading ? <LoadingPlaceholder className="h-[1.25em] w-28 max-w-full" /> : value}
       </div>
-      <span className="text-muted-foreground text-xs">{detail}</span>
+      {detail && <span className="text-muted-foreground text-xs">{detail}</span>}
     </article>
   );
 }

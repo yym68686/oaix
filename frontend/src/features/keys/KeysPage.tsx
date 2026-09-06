@@ -495,7 +495,7 @@ export function KeyListPage({
 
   return (
     <div className="grid min-w-0 gap-8">
-      <PageSection>
+      <PageSection className="min-h-[calc(100dvh-9rem)]">
         <PageSectionHeader>
           <PageSectionTitle className="flex items-center gap-2">
             <KeyRoundIcon className="size-5" />
@@ -510,7 +510,7 @@ export function KeyListPage({
             </PageSectionAction>
           )}
         </PageSectionHeader>
-        <PageSectionPanel className="grid gap-4">
+        <PageSectionPanel className="flex min-h-0 flex-1 flex-col gap-4">
           <FilterBar>
             <div className="grid min-w-0 gap-2">
               <Label htmlFor={searchId}>搜索 Key</Label>
@@ -585,23 +585,27 @@ export function KeyListPage({
             <Badge variant="secondary">{selectedCount ? `已选择 ${formatNumber(selectedCount)} 个` : "未选择"}</Badge>
           </div>
 
-          <TokenTable
-            activeStreamCap={activeStreamCap}
-            detailBasePath={detailBasePath}
-            detailSearch={route.search}
-            emptyDescription={config.emptyDescription}
-            error={error}
-            loading={tableLoading}
-            onDelete={setDeleteTarget}
-            onProbe={(id) => void runTokenProbe(id)}
-            onRemark={setRemarkTarget}
-            onSelectionChange={setSelection}
-            onToggleActivation={(id, active) => void updateActivation(id, active)}
-            probeBusyIds={probeBusyIds}
-            selection={selection}
-            tokens={tokens}
-          />
-          <Pagination page={page} totalPages={totalPages} onPageChange={(next) => updateQuery({ page: clamp(next, 1, totalPages) }, false)} total={tokenTotal} />
+          <div className="min-h-0 flex-1">
+            <TokenTable
+              activeStreamCap={activeStreamCap}
+              detailBasePath={detailBasePath}
+              detailSearch={route.search}
+              emptyDescription={config.emptyDescription}
+              error={error}
+              loading={tableLoading}
+              onDelete={setDeleteTarget}
+              onProbe={(id) => void runTokenProbe(id)}
+              onRemark={setRemarkTarget}
+              onSelectionChange={setSelection}
+              onToggleActivation={(id, active) => void updateActivation(id, active)}
+              probeBusyIds={probeBusyIds}
+              selection={selection}
+              tokens={tokens}
+            />
+          </div>
+          <div className="mt-auto border-t pt-2">
+            <Pagination page={page} totalPages={totalPages} onPageChange={(next) => updateQuery({ page: clamp(next, 1, totalPages) }, false)} total={tokenTotal} />
+          </div>
         </PageSectionPanel>
       </PageSection>
       <DeleteDialog target={deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)} onConfirm={() => void confirmDelete()} />

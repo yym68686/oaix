@@ -57,7 +57,6 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { key: "dashboard", href: "/dashboard", icon: <LayoutDashboardIcon />, label: "仪表盘" },
       { key: "keys", href: "/keys?status=available", icon: <KeyRoundIcon />, label: "Key" },
-      { key: "account_profile", href: "/account/profile", icon: <UserRoundIcon />, label: "个人资料" },
       { key: "account_api_keys", href: "/account/api-keys", icon: <ShieldCheckIcon />, label: "API Key" },
       { key: "imports", href: "/imports", icon: <UploadIcon />, label: "导入" },
       { key: "requests", href: "/requests", icon: <ListFilterIcon />, label: "请求" },
@@ -269,7 +268,7 @@ export function AppShell({
             </Button>
           </div>
           <div className={cn("min-h-0 flex-1 overflow-y-auto px-3 pb-5 oaix-scrollbar", collapsed && "px-4")}>{navigation()}</div>
-          <div className={cn("grid shrink-0 gap-2 border-t p-3", collapsed && "justify-items-center px-4")}>
+          <div className={cn("grid shrink-0 gap-2 border-t bg-background/30 p-3", collapsed && "justify-items-center px-4")}>
             <Button aria-label="刷新数据" className={cn("justify-start gap-3 text-muted-foreground", collapsed && "size-9 justify-center px-0")}
               onClick={onRefresh} size="sm" title="刷新数据" variant="ghost">
               <RefreshCwIcon className={cn(loading && "animate-spin motion-reduce:animate-none")} />
@@ -467,10 +466,10 @@ function AccountMenu({
     <Menu>
       <MenuTrigger
         aria-label={signedIn ? `账户菜单：${name}` : "账户菜单"}
-        render={<Button className={cn("shrink-0", compact ? "rounded-full" : "h-auto w-full justify-start gap-3 px-2 py-2")} size={compact ? "icon" : "default"} variant="ghost" />}
+        render={<Button className={cn("shrink-0 transition-colors", compact ? "rounded-full" : "h-auto w-full justify-start gap-3 rounded-lg border border-transparent bg-background/45 px-2 py-2 hover:border-border hover:bg-background/80")} size={compact ? "icon" : "default"} variant="ghost" />}
         title={signedIn ? name : "未登录"}
       >
-        <span className="flex size-8 shrink-0 items-center justify-center rounded-full border bg-background text-sm font-medium">
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-full border bg-primary/10 text-sm font-semibold text-primary">
           {signedIn && initial ? initial : <UserRoundIcon className="size-4" />}
         </span>
         {!compact && <><span className="grid min-w-0 flex-1 gap-0.5 text-left"><span className="truncate text-sm font-medium">{signedIn ? name : "登录账户"}</span><span className="text-muted-foreground text-xs">{signedIn ? principalRoleLabel(me, serviceOnly, activeAccount) : "主题与账户"}</span></span><ChevronsUpDownIcon className="size-4 shrink-0 text-muted-foreground" /></>}
