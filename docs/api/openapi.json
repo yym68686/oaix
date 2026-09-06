@@ -63,7 +63,15 @@
     "/api/me/api-keys": {"get": {"responses": {"200": {"description": "My API keys"}}}, "post": {"responses": {"201": {"description": "Create my API key"}}}},
     "/api/me/api-keys/{key_id}": {"delete": {"responses": {"200": {"description": "Revoke my API key"}}}},
     "/api/me/usage": {"get": {"responses": {"200": {"description": "My usage summary"}}}},
-    "/api/me/dashboard": {"get": {"responses": {"200": {"description": "My usage dashboard"}}}},
+    "/api/me/dashboard": {"get": {
+      "parameters": [
+        {"name": "range", "in": "query", "schema": {"type": "string", "enum": ["today", "week", "month", "year", "custom"], "default": "today"}},
+        {"name": "timezone", "in": "query", "schema": {"type": "string", "default": "UTC"}, "description": "IANA timezone. Weeks start Monday; months and years use calendar boundaries."},
+        {"name": "from", "in": "query", "schema": {"type": "string", "format": "date"}, "description": "Required for custom. First included local date, on or after 1970-01-01."},
+        {"name": "to", "in": "query", "schema": {"type": "string", "format": "date"}, "description": "Required for custom. Last included local date, no later than today."}
+      ],
+      "responses": {"200": {"description": "My usage dashboard. The selected periods entry, trend, and model costs use the same time window; concurrency is always live."}, "400": {"description": "Invalid range, timezone or dates"}}
+    }},
     "/api/me/concurrency": {"get": {"responses": {"200": {"description": "Current request concurrency for the caller"}}}},
     "/api/me/pool-summary": {"get": {"responses": {"200": {"description": "My pool summary"}}}},
     "/api/me/settings": {"get": {"responses": {"200": {"description": "My user settings"}}}},
