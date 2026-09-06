@@ -310,7 +310,7 @@ Go 版支持 access token、refresh token，以及 sub2api 导出的 OpenAI Agen
 - `POST /admin/tokens/{id}/cooldown` / `DELETE /admin/token-cooldown/{id}`: 设置/清除冷却
 - `POST /admin/tokens/{id}/secrets`: 安全写入/轮换 access token、refresh token、id token
 - `GET /admin/requests`: 查看请求次数汇总与请求日志，支持 request/model/endpoint/status/token/account/stream/time 筛选；默认不做大表精确总数统计，传 `include_total=true` 才返回精确总数
-- `POST /admin/experiments/responses?token_id=<id>`：管理员专用实验旁路；每次最多一次上游尝试，可用 `fingerprint_enabled=true|false`、`user_agent`、`originator`、`session_id`、`connection_close=true|false`、`disable_compression=true|false` 做本次请求覆盖，不改变普通 `/v1/responses` 或账号默认设置
+- `POST /admin/experiments/responses?token_id=<id>`：管理员专用实验旁路；每次最多一次上游尝试，可用 `fingerprint_enabled=true|false`、`user_agent`、`originator`、`session_id`、`connection_close=true|false`、`disable_compression=true|false`、`http1_only=true|false` 做本次请求覆盖，不改变普通 `/v1/responses` 或账号默认设置
 - `POST /admin/import/parse`: 服务端解析粘贴文本
 - `POST /admin/import/upload`: 服务端解析上传文件
 - `POST /admin/import/jobs`: 创建异步导入 job

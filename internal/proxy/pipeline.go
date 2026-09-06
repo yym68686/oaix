@@ -123,6 +123,7 @@ type RequestIntent struct {
 	UpstreamOriginator         string
 	CloseUpstreamConnection    bool
 	DisableUpstreamCompression bool
+	ForceUpstreamHTTP1         bool
 	// MaxAttempts bounds retries for an experiment request only.
 	MaxAttempts int
 }
@@ -1284,7 +1285,10 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		req.Header.Set("Session_id", attempt.PromptCache.SessionID)
 	}
 	applyCodexFingerprintHeaders(req.Header, fingerprintIDs)
-	resp, err := p.transport.Do(r.Context(), req)
+	resp, err := p.transport.DoWithOptions(r.Context(), req, transport.RequestOptions{
+		ForceHTTP1:      attempt.Intent.ForceUpstreamHTTP1,
+		CloseConnection: attempt.Intent.CloseUpstreamConnection,
+	})
 	if err != nil {
 		return AttemptResult{Status: http.StatusBadGateway, Retry: true}, err
 	}

@@ -1509,6 +1509,7 @@ func (a *App) experimentalResponses(w http.ResponseWriter, r *http.Request) {
 		for key, dst := range map[string]*bool{
 			"connection_close":    &intent.CloseUpstreamConnection,
 			"disable_compression": &intent.DisableUpstreamCompression,
+			"http1_only":          &intent.ForceUpstreamHTTP1,
 		} {
 			if raw := strings.TrimSpace(r.URL.Query().Get(key)); raw != "" {
 				value, ok := parseExperimentBool(raw)

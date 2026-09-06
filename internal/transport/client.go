@@ -28,6 +28,12 @@ type Stats struct {
 	Active        int64 `json:"active"`
 }
 
+// RequestOptions controls an isolated transport used only by experiment calls.
+type RequestOptions struct {
+	ForceHTTP1      bool
+	CloseConnection bool
+}
+
 func New(cfg config.UpstreamConfig) *Client {
 	shards := cfg.ShardCount
 	if shards <= 0 {
@@ -70,6 +76,27 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 	c.active.Add(1)
 	resp, err := c.clientFor(req).Do(req.WithContext(ctx))
 	c.active.Add(-1)
+	if err != nil {
+		c.errors.Add(1)
+	}
+	return resp, err
+}
+
+// DoWithOptions keeps experimental wire changes out of the shared client pool.
+func (c *Client) DoWithOptions(ctx context.Context, req *http.Request, options RequestOptions) (*http.Response, error) {
+	if c == nil || !options.ForceHTTP1 {
+		return c.Do(ctx, req)
+	}
+	c.requests.Add(1)
+	c.active.Add(1)
+	defer c.active.Add(-1)
+	oneShotConfig := c.cfg
+	oneShotConfig.ForceAttemptHTTP2 = false
+	client := newHTTPClient(oneShotConfig)
+	if options.CloseConnection {
+		req.Close = true
+	}
+	resp, err := client.Do(req.WithContext(ctx))
 	if err != nil {
 		c.errors.Add(1)
 	}
