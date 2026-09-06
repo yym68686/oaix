@@ -1506,6 +1506,19 @@ func (a *App) experimentalResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		intent.UpstreamUserAgent = boundedExperimentValue(r.URL.Query().Get("user_agent"), 512)
 		intent.UpstreamOriginator = boundedExperimentValue(r.URL.Query().Get("originator"), 128)
+		for key, dst := range map[string]*bool{
+			"connection_close":    &intent.CloseUpstreamConnection,
+			"disable_compression": &intent.DisableUpstreamCompression,
+		} {
+			if raw := strings.TrimSpace(r.URL.Query().Get(key)); raw != "" {
+				value, ok := parseExperimentBool(raw)
+				if !ok {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"detail": key + " must be true or false"})
+					return
+				}
+				*dst = value
+			}
+		}
 		if sessionID := boundedExperimentValue(r.URL.Query().Get("session_id"), 256); sessionID != "" {
 			// Prompt-cache experiments use the legacy underscore spelling that
 			// the routing layer recognizes; this remains request-scoped.

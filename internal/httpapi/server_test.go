@@ -32,6 +32,16 @@ func TestExperimentalResponsesRejectsInvalidFingerprintOverride(t *testing.T) {
 	}
 }
 
+func TestExperimentalResponsesRejectsInvalidWireOverride(t *testing.T) {
+	app := &App{}
+	req := httptest.NewRequest(http.MethodPost, "/admin/experiments/responses?token_id=1&connection_close=maybe", nil)
+	recorder := httptest.NewRecorder()
+	app.experimentalResponses(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+}
+
 func TestHandlerRegistersRoutes(t *testing.T) {
 	app := NewApp(config.Config{Auth: config.AuthConfig{ServiceAPIKeys: []string{"service-key"}}}, nil, nil, nil, nil, nil)
 	_ = app.Handler()

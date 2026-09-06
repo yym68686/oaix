@@ -117,10 +117,12 @@ type RequestIntent struct {
 	ToolSearchKeyFixes  int
 	// CodexFingerprintEnabled is an experiment-only, request-scoped override.
 	// nil preserves the account's persisted default.
-	CodexFingerprintEnabled *bool
-	Experiment              bool
-	UpstreamUserAgent       string
-	UpstreamOriginator      string
+	CodexFingerprintEnabled    *bool
+	Experiment                 bool
+	UpstreamUserAgent          string
+	UpstreamOriginator         string
+	CloseUpstreamConnection    bool
+	DisableUpstreamCompression bool
 	// MaxAttempts bounds retries for an experiment request only.
 	MaxAttempts int
 }
@@ -1250,6 +1252,13 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	}
 	if strings.TrimSpace(attempt.Intent.UpstreamOriginator) != "" {
 		req.Header.Set("Originator", strings.TrimSpace(attempt.Intent.UpstreamOriginator))
+	}
+	if attempt.Intent.CloseUpstreamConnection {
+		req.Close = true
+		req.Header.Set("Connection", "close")
+	}
+	if attempt.Intent.DisableUpstreamCompression {
+		req.Header.Set("Accept-Encoding", "identity")
 	}
 	req.Header.Set("X-Request-ID", attempt.RequestID)
 	authorization, err := p.authorizationForClaim(r.Context(), attempt.Claim)
