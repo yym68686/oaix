@@ -320,6 +320,44 @@ export type UsageSummary = {
   average_duration_ms?: number;
 };
 
+export type DashboardRange = "today" | "week" | "month" | "year";
+
+export type DashboardPeriod = {
+  request_count?: number;
+  total_tokens?: number;
+  estimated_cost_usd?: number;
+  input_tokens?: number;
+  cached_input_tokens?: number;
+  cache_hit_ratio?: number;
+};
+
+export type DashboardTrendPoint = Omit<DashboardPeriod, "cache_hit_ratio"> & {
+  bucket_start: string;
+  cache_hit_ratio?: number | null;
+};
+
+export type DashboardModel = {
+  model_name: string;
+  request_count?: number;
+  total_tokens?: number;
+  estimated_cost_usd?: number;
+};
+
+export type DashboardData = {
+  generated_at?: string;
+  timezone?: string;
+  range?: DashboardRange;
+  bucket?: "hour" | "day" | "month" | string;
+  periods?: Partial<Record<DashboardRange, DashboardPeriod>>;
+  trend?: DashboardTrendPoint[];
+  models?: DashboardModel[];
+};
+
+export type DashboardResponse = {
+  current_concurrency?: number;
+  dashboard?: DashboardData;
+};
+
 export type OwnerUsageSummary = {
   owner_user_id?: number;
   hours?: number;
@@ -631,6 +669,12 @@ export type ImportAPIScope = "self" | "admin";
 export const api = {
   health: () => requestJSON<HealthResponse>("/healthz"),
   me: (authKey?: string) => requestJSON<MeResponse>("/api/me", {}, authKey),
+  dashboard: (range: DashboardRange, timezone: string, authKey?: string, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ range, timezone });
+    return requestJSON<DashboardResponse>(`/api/me/dashboard?${params.toString()}`, { signal }, authKey);
+  },
+  myConcurrency: (authKey?: string) =>
+    requestJSON<{ current_concurrency?: number; generated_at?: string }>("/api/me/concurrency", {}, authKey),
   register: (payload: Record<string, unknown>) =>
     postJSON<{ user?: PlatformUser; api_key?: CreatedAPIKey }>("/api/auth/register", payload),
   login: (payload: Record<string, unknown>) =>

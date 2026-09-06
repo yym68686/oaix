@@ -21,7 +21,7 @@ oaix 管理面以 `/admin/*` 为稳定 API 前缀，前端只是这些 API 的�
 ## 用户 API
 
 - Auth：`POST /api/auth/register`、`POST /api/auth/login`。注册只需要邮箱和密码。
-- 我的账号：`GET /api/me`、`GET /api/me/usage`、`GET /api/me/pool-summary`。
+- 我的账号：`GET /api/me`、`GET /api/me/usage`、`GET /api/me/dashboard`、`GET /api/me/concurrency`、`GET /api/me/pool-summary`。仪表盘支持 `range=today|week|month|year` 和 IANA `timezone`，消费金额是 OAIX 按请求用量和模型费率计算的估算值。
 - 我的 API Key：`GET /api/me/api-keys`、`POST /api/me/api-keys`、`DELETE /api/me/api-keys/{key_id}`。
 - 我的设置：`GET /api/me/settings`、`GET /api/me/settings/{key}`、`POST /api/me/settings/{key}`、`DELETE /api/me/settings/{key}`。这些设置写入 `user_settings`，不会污染全局 `gateway_settings`。
 - 我的计划并发：`GET /api/me/token-concurrency` 查看管理员默认值、各计划有效值和用户覆盖；`POST /api/me/token-concurrency` 以 `{"plan_concurrency":{"free":1,"plus":4,"pro":8}}` 保存按计划覆盖；`DELETE /api/me/token-concurrency` 删除全部覆盖并恢复继承管理员默认值。用户覆盖优先于管理员全局值，并按 token 所有者应用到自用和 marketplace 流量。

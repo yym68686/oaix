@@ -866,6 +866,100 @@ func TestAdminUserUsageIncludesObservedCostByTokenOwnerWithDatabase(t *testing.T
 	assertObservedUsageCost(t, item["usage"], recentCost, oldCost+recentCost)
 }
 
+func TestUserDashboardIsScopedToAuthenticatedCallerWithDatabase(t *testing.T) {
+	h := newMultiUserHarness(t)
+	userA, keyA := h.createUser(t, "dashboard-a")
+	userB, _ := h.createUser(t, "dashboard-b")
+	now := time.Now().UTC().Add(-time.Minute)
+	finished := now.Add(time.Second)
+	success := true
+	status := http.StatusOK
+	requestSuffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	logs := []store.RequestLog{
+		{
+			RequestID:         "dashboard-a-sol-" + requestSuffix,
+			OwnerUserID:       &userA.ID,
+			Endpoint:          "/v1/responses",
+			Model:             testStringPtr("gpt-dashboard-a-sol"),
+			ModelName:         testStringPtr("gpt-dashboard-a-sol"),
+			StatusCode:        &status,
+			Success:           &success,
+			StartedAt:         now,
+			FinishedAt:        &finished,
+			InputTokens:       testIntPtr(100),
+			CachedInputTokens: testIntPtr(40),
+			TotalTokens:       testIntPtr(120),
+			EstimatedCostUSD:  testFloatPtr(1.25),
+		},
+		{
+			RequestID:         "dashboard-a-terra-" + requestSuffix,
+			OwnerUserID:       &userA.ID,
+			Endpoint:          "/v1/responses",
+			Model:             testStringPtr("gpt-dashboard-a-terra"),
+			ModelName:         testStringPtr("gpt-dashboard-a-terra"),
+			StatusCode:        &status,
+			Success:           &success,
+			StartedAt:         now,
+			FinishedAt:        &finished,
+			InputTokens:       testIntPtr(200),
+			CachedInputTokens: testIntPtr(60),
+			TotalTokens:       testIntPtr(240),
+			EstimatedCostUSD:  testFloatPtr(2.5),
+		},
+		{
+			RequestID:         "dashboard-b-private-" + requestSuffix,
+			OwnerUserID:       &userB.ID,
+			Endpoint:          "/v1/responses",
+			Model:             testStringPtr("gpt-dashboard-b-private"),
+			ModelName:         testStringPtr("gpt-dashboard-b-private"),
+			StatusCode:        &status,
+			Success:           &success,
+			StartedAt:         now,
+			FinishedAt:        &finished,
+			InputTokens:       testIntPtr(9000),
+			CachedInputTokens: testIntPtr(9000),
+			TotalTokens:       testIntPtr(9000),
+			EstimatedCostUSD:  testFloatPtr(99),
+		},
+	}
+	if err := h.db.UpsertRequestLogs(context.Background(), logs); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := h.db.AggregateRequestHourlyStats(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := expectStatus(t, h.request(t, http.MethodGet, "/api/me/dashboard?range=today&timezone=UTC", keyA.PlaintextKey, ""), http.StatusOK)
+	dashboard, _ := payload["dashboard"].(map[string]any)
+	periods, _ := dashboard["periods"].(map[string]any)
+	today, _ := periods["today"].(map[string]any)
+	if got := int64(today["request_count"].(float64)); got != 2 {
+		t.Fatalf("user A dashboard request_count = %d, want 2; payload=%v", got, payload)
+	}
+	if got := int64(today["total_tokens"].(float64)); got != 360 {
+		t.Fatalf("user A dashboard total_tokens = %d, want 360", got)
+	}
+	if got := today["estimated_cost_usd"].(float64); math.Abs(got-3.75) > 1e-9 {
+		t.Fatalf("user A dashboard cost = %f, want 3.75", got)
+	}
+	models, _ := dashboard["models"].([]any)
+	if len(models) != 2 {
+		t.Fatalf("user A dashboard models = %d, want 2; payload=%v", len(models), payload)
+	}
+	for _, raw := range models {
+		model, _ := raw.(map[string]any)
+		if model["model_name"] == "gpt-dashboard-b-private" {
+			t.Fatalf("user B model leaked into user A dashboard: %v", models)
+		}
+	}
+	if got := int64(payload["current_concurrency"].(float64)); got != 0 {
+		t.Fatalf("idle dashboard concurrency = %d, want 0", got)
+	}
+	expectStatus(t, h.request(t, http.MethodGet, "/api/me/dashboard?range=today&timezone=Not%2FAZone", keyA.PlaintextKey, ""), http.StatusBadRequest)
+}
+
 func TestMultiUserAPIKeyRevocationAndDisabledUserWithDatabase(t *testing.T) {
 	h := newMultiUserHarness(t)
 	userA, keyA := h.createUser(t, "revoke-a")
@@ -1120,6 +1214,10 @@ func testStringPtr(value string) *string {
 }
 
 func testIntPtr(value int) *int {
+	return &value
+}
+
+func testFloatPtr(value float64) *float64 {
 	return &value
 }
 

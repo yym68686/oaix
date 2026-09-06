@@ -3,6 +3,7 @@ import { AppShell } from "@/app/AppShell";
 import { useRouteState } from "@/app/router";
 import { AccountAPIKeysPage } from "@/features/account/APIKeysPage";
 import { ProfilePage } from "@/features/account/ProfilePage";
+import { DashboardPage } from "@/features/dashboard/DashboardPage";
 import { ImportsPage } from "@/features/imports/ImportsPage";
 import { KeyDetailPage, KeysPage } from "@/features/keys/KeysPage";
 import { RequestsPage } from "@/features/requests/RequestsPage";
@@ -202,6 +203,13 @@ export function App(): React.ReactElement {
     page = <AccountAPIKeysPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "account_profile") {
     page = <ProfilePage me={me} onRefresh={() => void refreshAll()} pushToast={pushToast} />;
+  } else if (route.key === "dashboard") {
+    page = me ? <DashboardPage key={getServiceKey()} refreshNonce={refreshNonce} /> : (
+      <EmptyState
+        description={loading ? "正在确认当前账号。" : "请先使用用户 API Key 登录。"}
+        title={loading ? "正在验证身份" : "请登录"}
+      />
+    );
   } else if (route.key === "imports" || route.key === "import_new") {
     page = <ImportsPage pushToast={pushToast} refreshNonce={refreshNonce} route={route} />;
   } else if (route.key === "requests") {

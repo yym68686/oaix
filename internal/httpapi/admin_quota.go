@@ -189,7 +189,7 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 		defer cancel()
 		var err error
-		observedCostByID, err = a.store.TokenObservedCostsSnapshot(ctx, tokens)
+		observedCostByID, err = a.store.TokenObservedCostsCurrentSnapshot(ctx, tokens)
 		if err != nil {
 			if observedCostByID == nil {
 				observedCostByID = map[int64]*float64{}

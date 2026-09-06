@@ -25,6 +25,8 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/me/api-keys/{key_id}/value", a.requireAuth(a.revealMyAPIKey))
 	mux.HandleFunc("DELETE /api/me/api-keys/{key_id}", a.requireAuth(a.revokeMyAPIKey))
 	mux.HandleFunc("GET /api/me/usage", a.requireAuth(a.myUsage))
+	mux.HandleFunc("GET /api/me/dashboard", a.requireAuth(a.myDashboard))
+	mux.HandleFunc("GET /api/me/concurrency", a.requireAuth(a.myConcurrency))
 	mux.HandleFunc("GET /api/me/pool-summary", a.requireAuth(a.myPoolSummary))
 	mux.HandleFunc("GET /api/me/settings", a.requireAuth(a.listMySettings))
 	mux.HandleFunc("GET /api/me/settings/{key}", a.requireAuth(a.getMySetting))

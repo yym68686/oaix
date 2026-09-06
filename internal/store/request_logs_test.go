@@ -52,9 +52,10 @@ func TestCurrentObservedCostSnapshotAddsOnlyPendingLogs(t *testing.T) {
 	}
 	body := compactSQL(text[start : start+endOffset])
 	for _, fragment := range []string{
-		"tokenobservedcostsaggregatesnapshot(ctx, tokens, true)",
+		"tokenobservedcostsaggregatesnapshot(ctx, tokens, true, true)",
 		"addrequestcostsbytokenaggregate",
 		"addrequestcostsbytokenlogs(ctx, canonicalbylogtokenid, result, true)",
+		"overridelatefinalizedrequestcosts",
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Fatalf("current observed cost snapshot missing %q: %s", fragment, body)
@@ -62,6 +63,35 @@ func TestCurrentObservedCostSnapshotAddsOnlyPendingLogs(t *testing.T) {
 	}
 	if strings.Contains(body, "addrequestcostsbyuniqueaccountfallback") {
 		t.Fatalf("current observed cost snapshot must not scan lifetime account logs: %s", body)
+	}
+}
+
+func TestLateFinalizedObservedCostRepairIsScopedByToken(t *testing.T) {
+	source, err := os.ReadFile("request_logs.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func (s *Store) overrideLateFinalizedRequestCosts")
+	if start < 0 {
+		t.Fatal("late finalized observed cost repair source not found")
+	}
+	endOffset := strings.Index(text[start:], "func addCanonicalCost")
+	if endOffset < 0 {
+		t.Fatal("late finalized observed cost repair boundary not found")
+	}
+	body := compactSQL(text[start : start+endOffset])
+	for _, fragment := range []string{
+		"token_id = any($1::integer[])",
+		"analytics_recorded_at < finished_at",
+		"estimated_cost_usd is not null",
+		"order by started_at asc",
+		"select id, created_at from codex_tokens",
+		"group by token_id",
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("late finalized observed cost repair missing %q: %s", fragment, body)
+		}
 	}
 }
 
@@ -185,7 +215,7 @@ func TestAggregateObservedCostSnapshotAvoidsRequestLogFallback(t *testing.T) {
 		t.Fatal("TokenObservedCostsCurrentSnapshot source not found")
 	}
 	body := text[start : start+endOffset]
-	if !strings.Contains(body, "tokenObservedCostsAggregateSnapshot(ctx, tokens, false)") {
+	if !strings.Contains(body, "tokenObservedCostsAggregateSnapshot(ctx, tokens, false, false)") {
 		t.Fatalf("aggregate snapshot does not select aggregate-only mode: %s", body)
 	}
 	for _, forbidden := range []string{"addRequestCostsByTokenLogs", "addRequestCostsByUniqueAccountFallback"} {

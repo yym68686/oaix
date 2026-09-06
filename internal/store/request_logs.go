@@ -722,18 +722,21 @@ func (s *Store) TokenObservedCostsSnapshot(ctx context.Context, tokens []Token) 
 // heap. Wide list views use this bounded snapshot so one response cannot start
 // a lifetime account-log scan.
 func (s *Store) TokenObservedCostsAggregateSnapshot(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
-	return s.tokenObservedCostsAggregateSnapshot(ctx, tokens, false)
+	return s.tokenObservedCostsAggregateSnapshot(ctx, tokens, false, false)
 }
 
 // TokenObservedCostsCurrentSnapshot returns the reconciled aggregate plus
 // completed request logs that are still waiting in the analytics queue. The
 // pending-only lookup uses the bounded partial index, so import summaries stay
-// current without falling back to a lifetime request-log scan.
+// current. If an upstream retry reused a request ID after its earlier state was
+// aggregated, the finalized row is newer than analytics_recorded_at; only those
+// affected tokens fall back to an exact indexed request-log sum when their
+// complete lifetime is still inside request-log retention.
 func (s *Store) TokenObservedCostsCurrentSnapshot(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
-	return s.tokenObservedCostsAggregateSnapshot(ctx, tokens, true)
+	return s.tokenObservedCostsAggregateSnapshot(ctx, tokens, true, true)
 }
 
-func (s *Store) tokenObservedCostsAggregateSnapshot(ctx context.Context, tokens []Token, includePendingLogs bool) (map[int64]*float64, error) {
+func (s *Store) tokenObservedCostsAggregateSnapshot(ctx context.Context, tokens []Token, includePendingLogs bool, repairLateFinalizedLogs bool) (map[int64]*float64, error) {
 	result := make(map[int64]*float64, len(tokens))
 	requestedIDs := make([]int64, 0, len(tokens))
 	requested := map[int64]struct{}{}
@@ -769,6 +772,12 @@ func (s *Store) tokenObservedCostsAggregateSnapshot(ctx context.Context, tokens 
 		if err := s.addRequestCostsByTokenLogs(ctx, canonicalByLogTokenID, result, true); err != nil {
 			fillMissingObservedCosts(tokens, result)
 			return result, &observedCostsPartialError{step: "pending_token_logs", err: err}
+		}
+	}
+	if repairLateFinalizedLogs {
+		if err := s.overrideLateFinalizedRequestCosts(ctx, canonicalByLogTokenID, result); err != nil {
+			fillMissingObservedCosts(tokens, result)
+			return result, &observedCostsPartialError{step: "late_finalized_token_logs", err: err}
 		}
 	}
 	fillMissingObservedCosts(tokens, result)
@@ -954,6 +963,138 @@ func (s *Store) addRequestCostsByTokenLogs(ctx context.Context, canonicalByLogTo
 		addCanonicalCost(canonicalByLogTokenID, result, logTokenID, cost)
 	}
 	return rows.Err()
+}
+
+func (s *Store) overrideLateFinalizedRequestCosts(ctx context.Context, canonicalByLogTokenID map[int64]int64, result map[int64]*float64) error {
+	logTokenIDs := make([]int64, 0, len(canonicalByLogTokenID))
+	for tokenID := range canonicalByLogTokenID {
+		logTokenIDs = append(logTokenIDs, tokenID)
+	}
+	ids := postgresIntIDs(logTokenIDs)
+	if len(ids) == 0 {
+		return nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		select distinct token_id
+		from gateway_request_logs
+		where token_id = any($1::integer[])
+		  and analytics_recorded_at < finished_at
+		  and estimated_cost_usd is not null
+	`, ids)
+	if err != nil {
+		return err
+	}
+	affectedCanonicalIDs := map[int64]struct{}{}
+	for rows.Next() {
+		var logTokenID int64
+		if err := rows.Scan(&logTokenID); err != nil {
+			rows.Close()
+			return err
+		}
+		if canonicalID, ok := canonicalByLogTokenID[logTokenID]; ok {
+			affectedCanonicalIDs[canonicalID] = struct{}{}
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(affectedCanonicalIDs) == 0 {
+		return nil
+	}
+
+	var oldestRetainedStartedAt time.Time
+	err = s.pool.QueryRow(ctx, `
+		select started_at
+		from gateway_request_logs
+		order by started_at asc
+		limit 1
+	`).Scan(&oldestRetainedStartedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	createdAtByLogTokenID := make(map[int64]time.Time, len(canonicalByLogTokenID))
+	rows, err = s.pool.Query(ctx, `
+		select id, created_at
+		from codex_tokens
+		where id = any($1::integer[])
+	`, ids)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var tokenID int64
+		var createdAt time.Time
+		if err := rows.Scan(&tokenID, &createdAt); err != nil {
+			rows.Close()
+			return err
+		}
+		createdAtByLogTokenID[tokenID] = createdAt
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	completeCanonicalIDs := make(map[int64]struct{}, len(affectedCanonicalIDs))
+	for canonicalID := range affectedCanonicalIDs {
+		completeCanonicalIDs[canonicalID] = struct{}{}
+	}
+	for logTokenID, canonicalID := range canonicalByLogTokenID {
+		if _, affected := completeCanonicalIDs[canonicalID]; !affected {
+			continue
+		}
+		createdAt, ok := createdAtByLogTokenID[logTokenID]
+		if !ok || createdAt.Before(oldestRetainedStartedAt) {
+			delete(completeCanonicalIDs, canonicalID)
+		}
+	}
+	if len(completeCanonicalIDs) == 0 {
+		return nil
+	}
+
+	affectedLogTokenIDs := make([]int64, 0, len(canonicalByLogTokenID))
+	for logTokenID, canonicalID := range canonicalByLogTokenID {
+		if _, ok := completeCanonicalIDs[canonicalID]; ok {
+			affectedLogTokenIDs = append(affectedLogTokenIDs, logTokenID)
+		}
+	}
+	rows, err = s.pool.Query(ctx, `
+		select token_id, coalesce(sum(estimated_cost_usd), 0)::float8
+		from gateway_request_logs
+		where token_id = any($1::integer[])
+		  and estimated_cost_usd is not null
+		group by token_id
+	`, postgresIntIDs(affectedLogTokenIDs))
+	if err != nil {
+		return err
+	}
+	exactByCanonicalID := make(map[int64]float64, len(completeCanonicalIDs))
+	for rows.Next() {
+		var logTokenID int64
+		var cost float64
+		if err := rows.Scan(&logTokenID, &cost); err != nil {
+			rows.Close()
+			return err
+		}
+		if canonicalID, ok := canonicalByLogTokenID[logTokenID]; ok {
+			exactByCanonicalID[canonicalID] += cost
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for canonicalID := range completeCanonicalIDs {
+		cost := roundCostUSD(exactByCanonicalID[canonicalID])
+		result[canonicalID] = &cost
+	}
+	return nil
 }
 
 func addCanonicalCost(canonicalByLogTokenID map[int64]int64, result map[int64]*float64, logTokenID int64, cost float64) {

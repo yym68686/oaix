@@ -414,6 +414,50 @@ func TestFrontendUserAreaUsesUserPrincipalScope(t *testing.T) {
 	}
 }
 
+func TestFrontendUserDashboardContract(t *testing.T) {
+	appShell := readFrontendFile(t, "src", "app", "AppShell.tsx")
+	router := readFrontendFile(t, "src", "app", "router.ts")
+	app := readFrontendFile(t, "src", "App.tsx")
+	page := readFrontendFile(t, "src", "features", "dashboard", "DashboardPage.tsx")
+	apiFile := readFrontendFile(t, "src", "lib", "api.ts")
+
+	for _, required := range []string{
+		`{ key: "dashboard", href: "/dashboard"`,
+		`label: "仪表盘"`,
+	} {
+		if !strings.Contains(appShell, required) {
+			t.Fatalf("dashboard navigation contract missing %q", required)
+		}
+	}
+	if !strings.Contains(router, `return { key: "dashboard"`) {
+		t.Fatal("router must expose /dashboard")
+	}
+	if !strings.Contains(app, `route.key === "dashboard"`) || !strings.Contains(app, `<DashboardPage`) {
+		t.Fatal("App must render the user dashboard page")
+	}
+	for _, required := range []string{
+		"当前并发",
+		"近 7 天",
+		"近 30 天",
+		"缓存命中率曲线",
+		"模型消费",
+		"api.myConcurrency",
+		"getServiceKey().trim() !== requestCredential",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("dashboard page contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		`/api/me/dashboard?${params.toString()}`,
+		`/api/me/concurrency`,
+	} {
+		if !strings.Contains(apiFile, required) {
+			t.Fatalf("dashboard API client contract missing %q", required)
+		}
+	}
+}
+
 func readFrontendFile(t *testing.T, parts ...string) string {
 	t.Helper()
 	pathParts := append([]string{"..", "..", "frontend"}, parts...)

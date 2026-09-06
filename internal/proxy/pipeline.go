@@ -55,6 +55,8 @@ type Pipeline struct {
 	agentIdentityTaskMu         sync.Mutex
 	agentIdentityTasks          *agentidentitytask.Coordinator
 	agentIdentityCredentials    sync.Map
+	activeRequestsMu            sync.RWMutex
+	activeRequestsByOwner       map[int64]int64
 	commitFailures              atomic.Int64
 	ordinary429CooldownNanos    atomic.Int64
 	gpt6AstraLongContextPricing atomic.Bool
@@ -277,6 +279,9 @@ func (p *Pipeline) CloseIdleConnections() {
 }
 
 func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestIntent) {
+	releaseActiveRequest := p.trackActiveRequest(intent.OwnerUserID)
+	defer releaseActiveRequest()
+
 	started := time.Now().UTC()
 	requestID := requestID(r)
 	downstreamConnectionID := observability.ConnectionIDFromContext(r.Context())
@@ -900,6 +905,37 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	writeFinalErrorResponse(w, intent.Stream, streamState.DownstreamStarted, finalStatus, message)
 	observeGatewayIdempotencyDelivery(timing, idempotencyExecution)
 	p.finalLog(r.Context(), requestID, intent, started, finalStatus, false, finalAttemptCount, selectedTokenID, selectedTokenOwnerID, accountID, &message, timing, promptCacheContext, upstreamSessionIDHash, upstreamSessionIDSource, lastAffinityResult, lastUsage, lastResponseID, lastFirstTokenAt, downstreamConnectionID, lastStreamDeliveryTrace)
+}
+
+// ActiveRequestsForOwner counts this process's requests by caller, not token owner.
+func (p *Pipeline) ActiveRequestsForOwner(ownerUserID int64) int64 {
+	if p == nil || ownerUserID <= 0 {
+		return 0
+	}
+	p.activeRequestsMu.RLock()
+	defer p.activeRequestsMu.RUnlock()
+	return p.activeRequestsByOwner[ownerUserID]
+}
+
+func (p *Pipeline) trackActiveRequest(ownerUserID int64) func() {
+	if p == nil || ownerUserID <= 0 {
+		return func() {}
+	}
+	p.activeRequestsMu.Lock()
+	if p.activeRequestsByOwner == nil {
+		p.activeRequestsByOwner = make(map[int64]int64)
+	}
+	p.activeRequestsByOwner[ownerUserID]++
+	p.activeRequestsMu.Unlock()
+	return sync.OnceFunc(func() {
+		p.activeRequestsMu.Lock()
+		defer p.activeRequestsMu.Unlock()
+		if p.activeRequestsByOwner[ownerUserID] <= 1 {
+			delete(p.activeRequestsByOwner, ownerUserID)
+		} else {
+			p.activeRequestsByOwner[ownerUserID]--
+		}
+	})
 }
 
 func (p *Pipeline) claimToken(ctx context.Context, intent tokens.Intent, promptCacheContext *PromptCacheContext) (*tokens.Claim, tokens.PromptAffinityResult, error) {

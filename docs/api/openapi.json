@@ -63,6 +63,8 @@
     "/api/me/api-keys": {"get": {"responses": {"200": {"description": "My API keys"}}}, "post": {"responses": {"201": {"description": "Create my API key"}}}},
     "/api/me/api-keys/{key_id}": {"delete": {"responses": {"200": {"description": "Revoke my API key"}}}},
     "/api/me/usage": {"get": {"responses": {"200": {"description": "My usage summary"}}}},
+    "/api/me/dashboard": {"get": {"responses": {"200": {"description": "My usage dashboard"}}}},
+    "/api/me/concurrency": {"get": {"responses": {"200": {"description": "Current request concurrency for the caller"}}}},
     "/api/me/pool-summary": {"get": {"responses": {"200": {"description": "My pool summary"}}}},
     "/api/me/settings": {"get": {"responses": {"200": {"description": "My user settings"}}}},
     "/api/me/settings/{key}": {"get": {"responses": {"200": {"description": "My setting"}}}, "post": {"responses": {"200": {"description": "Update my setting"}}}, "delete": {"responses": {"200": {"description": "Delete my setting"}}}},

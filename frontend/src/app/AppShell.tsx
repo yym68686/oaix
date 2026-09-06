@@ -2,6 +2,7 @@ import {
   ActivityIcon,
   DatabaseIcon,
   KeyRoundIcon,
+  LayoutDashboardIcon,
   ListFilterIcon,
   LogInIcon,
   LogOutIcon,
@@ -53,6 +54,7 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
   {
     label: "用户",
     items: [
+      { key: "dashboard", href: "/dashboard", icon: <LayoutDashboardIcon />, label: "仪表盘" },
       { key: "keys", href: "/keys?status=available", icon: <KeyRoundIcon />, label: "Key" },
       { key: "account_profile", href: "/account/profile", icon: <UserRoundIcon />, label: "个人资料" },
       { key: "account_api_keys", href: "/account/api-keys", icon: <ShieldCheckIcon />, label: "API Key" },
