@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
-import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { PageSection, PageSectionAction, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
 import {
   Dialog,
   DialogClose,
@@ -141,21 +141,21 @@ export function AccountAPIKeysPage({
         <AlertDescription>这里创建的 API Key 只能调用你自己添加的 ChatGPT / Codex 账号，不会使用其他用户的账号池。</AlertDescription>
       </Alert>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+      <PageSection>
+        <PageSectionHeader>
+          <PageSectionTitle className="flex items-center gap-2">
             <KeyRoundIcon className="size-5" />
             API Key
-          </CardTitle>
-          <CardDescription>创建、复制或删除自己的调用凭证。新创建的 Key 会加密保存，可以随时回来复制。</CardDescription>
-          <CardAction>
+          </PageSectionTitle>
+          <PageSectionDescription>创建、复制或删除自己的调用凭证。新创建的 Key 会加密保存，可以随时回来复制。</PageSectionDescription>
+          <PageSectionAction>
             <Button disabled={creating} loading={creating} onClick={() => void createKey()} size="sm">
               <PlusIcon />
               创建 API Key
             </Button>
-          </CardAction>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
+          </PageSectionAction>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-4">
           {error && <ErrorAlert title="API Key 操作失败" message={error} />}
           <div className="grid gap-2 sm:max-w-md">
             <Label htmlFor="api-key-name">名称</Label>
@@ -236,8 +236,8 @@ export function AccountAPIKeysPage({
             </div>
           )}
           <div className="text-muted-foreground text-xs">共 {formatNumber(activeItems.length)} 个有效 API Key</div>
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
 
       <Dialog open={Boolean(deleteTarget)} onOpenChange={(open) => !open && !deleting && setDeleteTarget(null)}>
         <DialogPopup className="sm:max-w-md">

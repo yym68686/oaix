@@ -34,14 +34,12 @@ export function App(): React.ReactElement {
   const [protectedMode, setProtectedMode] = useState(false);
   const [authBlocked, setAuthBlocked] = useState(false);
   const [me, setMe] = useState<MeResponse | null>(null);
-  const [syncText, setSyncText] = useState("等待同步");
   const [loading, setLoading] = useState(true);
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [streamCap, setStreamCap] = useState(10);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const refreshIDRef = useRef(0);
   const validatedCredentialRef = useRef("");
-  const webVersion = window.__OAIX_WEB_VERSION__;
 
   const pushToast = useCallback((title: string, variant: ToastMessage["variant"] = "success") => {
     const id = Date.now() + Math.floor(Math.random() * 1000);
@@ -63,7 +61,6 @@ export function App(): React.ReactElement {
       setMe(null);
       setCounts({});
       setAuthBlocked(false);
-      setSyncText(credential ? "正在验证身份" : "等待登录");
     }
     try {
       const healthPayload = await api.health();
@@ -78,7 +75,6 @@ export function App(): React.ReactElement {
         setMe(null);
         setCounts(healthPayload.counts || {});
         setAuthBlocked(true);
-        setSyncText(`需要凭证 · ${new Date().toLocaleTimeString("zh-CN")}`);
         return;
       }
       let mePayload: MeResponse | null = null;
@@ -131,7 +127,6 @@ export function App(): React.ReactElement {
       }
       setCounts(nextCounts);
       setRefreshNonce((value) => value + 1);
-      setSyncText(`已同步 ${new Date().toLocaleTimeString("zh-CN")}`);
     } catch (caught) {
       if (!isCurrentRefresh()) {
         return;
@@ -145,7 +140,6 @@ export function App(): React.ReactElement {
         setAuthBlocked(true);
       }
       pushToast(errorMessage(caught), "error");
-      setSyncText(`同步失败 ${new Date().toLocaleTimeString("zh-CN")}`);
     } finally {
       if (isCurrentRefresh()) {
         setLoading(false);
@@ -227,17 +221,13 @@ export function App(): React.ReactElement {
   return (
     <AppShell
       authBlocked={authBlocked}
-      counts={counts}
-      health={health}
       loading={loading}
       me={me}
       onRefresh={() => void refreshAll()}
       onThemeChange={setTheme}
       protectedMode={protectedMode}
       routeKey={route.key}
-      syncText={syncText}
       theme={theme}
-      webVersion={webVersion}
     >
       {page}
       <ToastStack items={toasts} />

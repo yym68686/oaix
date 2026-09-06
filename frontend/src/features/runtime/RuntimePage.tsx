@@ -1,7 +1,7 @@
 import { ActivityIcon, GaugeIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Badge } from "@/registry/default/ui/badge";
-import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { PageSection, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
 import { Skeleton } from "@/registry/default/ui/skeleton";
 import { api, type HealthResponse, type TokenCounts } from "@/lib/api";
 import { formatNumber } from "@/lib/format";
@@ -46,16 +46,16 @@ export function RuntimePage({
   }, [loadRuntime, refreshNonce]);
 
   return (
-    <div className="grid gap-4 xl:grid-cols-[minmax(0,.8fr)_minmax(0,1fr)]">
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+    <div className="grid min-w-0 gap-8 xl:grid-cols-[minmax(0,.8fr)_minmax(0,1fr)]">
+      <PageSection>
+        <PageSectionHeader>
+          <PageSectionTitle className="flex items-center gap-2">
             <GaugeIcon className="size-5" />
             池状态剖面
-          </CardTitle>
-          <CardDescription>Key 总量、可用状态和当前服务健康度。</CardDescription>
-        </CardHeader>
-        <CardPanel className="grid gap-3">
+          </PageSectionTitle>
+          <PageSectionDescription>Key 总量、可用状态和当前服务健康度。</PageSectionDescription>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-3">
           <div className="grid gap-3 sm:grid-cols-3">
             <Metric label="有效 Key" loading={loading && !counts.total} tone="success" value={counts.available} />
             <Metric label="冷却中" loading={loading && !counts.total} tone="warning" value={counts.cooling} />
@@ -75,18 +75,18 @@ export function RuntimePage({
               <span className="bg-destructive" style={{ width: `${statusCounts.disabled}%` }} />
             </div>
           </div>
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+      <PageSection>
+        <PageSectionHeader>
+          <PageSectionTitle className="flex items-center gap-2">
             <ActivityIcon className="size-5" />
             Runtime
-          </CardTitle>
-          <CardDescription>Go 网关运行元数据和 token pool 快照。</CardDescription>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
+          </PageSectionTitle>
+          <PageSectionDescription>Go 网关运行元数据和 token pool 快照。</PageSectionDescription>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-4">
           {error ? (
             <ErrorAlert title="Runtime 载入失败" message={error} />
           ) : loading && !runtime ? (
@@ -103,8 +103,8 @@ export function RuntimePage({
               </pre>
             </>
           )}
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
     </div>
   );
 }

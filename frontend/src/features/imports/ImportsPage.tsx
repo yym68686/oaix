@@ -13,7 +13,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } fro
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
-import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { PageSection, PageSectionAction, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
 import { Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
@@ -894,20 +894,20 @@ function ImportBatchesPage({
   const detailJob = batches.find((job) => job.id === detailDialogId) || null;
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+    <PageSection>
+      <PageSectionHeader>
+        <PageSectionTitle className="flex items-center gap-2">
           <UploadIcon className="size-5" />
           导入批次
-        </CardTitle>
-        <CardDescription>查看每次导入的处理结果、平均余额和关联 key。</CardDescription>
-        <CardAction>
+        </PageSectionTitle>
+        <PageSectionDescription>查看每次导入的处理结果、平均余额和关联 key。</PageSectionDescription>
+        <PageSectionAction>
           <Button onClick={() => setImportDialogOpen(true)} size="sm">
             新导入
           </Button>
-        </CardAction>
-      </CardHeader>
-      <CardPanel>
+        </PageSectionAction>
+      </PageSectionHeader>
+      <PageSectionPanel>
         {error ? (
           <ErrorAlert title="导入批次载入失败" message={error} />
         ) : (
@@ -952,8 +952,8 @@ function ImportBatchesPage({
             />
           </>
         )}
-      </CardPanel>
-    </Card>
+      </PageSectionPanel>
+    </PageSection>
   );
 }
 

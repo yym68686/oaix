@@ -20,7 +20,7 @@ import {
   type DashboardRange,
   type DashboardTrendPoint,
 } from "@/lib/api";
-import { clamp, formatCurrency, formatDate, formatNumber } from "@/lib/format";
+import { clamp, formatCurrency, formatNumber } from "@/lib/format";
 import { EmptyState, ErrorAlert } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
 
@@ -123,7 +123,6 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
 
   const selectedRangeLoaded = !dateError && loadedSelection === selection && dashboard?.range === range;
   const selectedPeriod = selectedRangeLoaded ? dashboard?.periods?.[range] : undefined;
-  const generatedAt = dashboard?.generated_at;
 
   const rangeLabel = range === "custom" ? `${customFrom} ~ ${customTo}` : PERIOD_LABELS[range];
   const pendingRange = !selectedRangeLoaded && !error && !dateError;
@@ -131,7 +130,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
     ? formatPercent(Number(selectedPeriod.cache_hit_ratio || 0)) : "--";
 
   return (
-    <div className="grid min-w-0 gap-8 p-1 sm:p-3">
+    <div className="grid min-w-0 gap-8">
       <section aria-labelledby="dashboard-title" className="min-w-0">
         <header className="flex flex-wrap items-center justify-between gap-3 pb-5">
           <h2 id="dashboard-title" className="flex items-center gap-2 font-semibold text-lg">
@@ -223,10 +222,6 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
             <ModelSpendChart models={selectedRangeLoaded ? dashboard?.models || [] : []} />}
         </div>
       </section>
-      <footer className="flex flex-wrap items-center justify-between gap-2 border-t pt-4 text-muted-foreground text-xs">
-        <span>预估消费 · USD</span>
-        <span>统计更新时间 {selectedRangeLoaded ? formatDate(generatedAt) : "--"}</span>
-      </footer>
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import { ListFilterIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/registry/default/ui/badge";
-import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { PageSection, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { api, isAuthContextPending, type RequestItem, type RequestSummary } from "@/lib/api";
 import { formatDate, formatNumber } from "@/lib/format";
@@ -41,15 +41,15 @@ export function RequestsPage({ refreshNonce }: { refreshNonce: number }) {
   }, [loadRequests, refreshNonce]);
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+    <PageSection>
+      <PageSectionHeader>
+        <PageSectionTitle className="flex items-center gap-2">
           <ListFilterIcon className="size-5" />
           请求观察
-        </CardTitle>
-        <CardDescription>最近请求、24 小时聚合和模型分布。</CardDescription>
-      </CardHeader>
-      <CardPanel className="grid gap-4">
+        </PageSectionTitle>
+        <PageSectionDescription>最近请求、24 小时聚合和模型分布。</PageSectionDescription>
+      </PageSectionHeader>
+      <PageSectionPanel className="grid gap-4">
         <div className="grid gap-3 sm:grid-cols-4">
           <MiniMetric label="总请求" value={summary.total} />
           <MiniMetric label="成功" value={summary.success} />
@@ -118,7 +118,7 @@ export function RequestsPage({ refreshNonce }: { refreshNonce: number }) {
         ) : (
           <EmptyState title="暂无请求日志" description="有新的代理请求后会在这里出现。" />
         )}
-      </CardPanel>
-    </Card>
+      </PageSectionPanel>
+    </PageSection>
   );
 }

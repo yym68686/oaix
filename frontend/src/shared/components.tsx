@@ -100,7 +100,7 @@ export function Pagination({
   totalPages: number;
 }) {
   return (
-    <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-muted/40 p-3">
+    <div className="flex flex-wrap items-center justify-between gap-3 py-2">
       <Badge variant="secondary">
         第 {page} / {totalPages} 页，合计 {formatNumber(total)} 条
       </Badge>

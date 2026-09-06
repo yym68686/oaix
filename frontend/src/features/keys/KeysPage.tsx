@@ -14,7 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
-import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { PageSection, PageSectionAction, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
 import { Checkbox } from "@/registry/default/ui/checkbox";
 import {
   Dialog,
@@ -494,23 +494,23 @@ export function KeyListPage({
   }
 
   return (
-    <div className="grid min-w-0 gap-4">
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+    <div className="grid min-w-0 gap-8">
+      <PageSection>
+        <PageSectionHeader>
+          <PageSectionTitle className="flex items-center gap-2">
             <KeyRoundIcon className="size-5" />
             {title}
-          </CardTitle>
-          <CardDescription>{description}</CardDescription>
+          </PageSectionTitle>
+          <PageSectionDescription>{description}</PageSectionDescription>
           {importMode !== "hidden" && (
-            <CardAction>
+            <PageSectionAction>
               <Button onClick={openImport} size="sm" variant="outline">
                 导入 Key
               </Button>
-            </CardAction>
+            </PageSectionAction>
           )}
-        </CardHeader>
-        <CardPanel className="grid gap-4">
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-4">
           <FilterBar>
             <div className="grid min-w-0 gap-2">
               <Label htmlFor={searchId}>搜索 Key</Label>
@@ -602,8 +602,8 @@ export function KeyListPage({
             tokens={tokens}
           />
           <Pagination page={page} totalPages={totalPages} onPageChange={(next) => updateQuery({ page: clamp(next, 1, totalPages) }, false)} total={tokenTotal} />
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
       <DeleteDialog target={deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)} onConfirm={() => void confirmDelete()} />
       <ProbeResultDialog target={probeResultTarget} onOpenChange={(open) => !open && setProbeResultTarget(null)} />
       <RemarkDialog
@@ -1080,18 +1080,18 @@ export function KeyDetailPage({
         <ChevronLeftIcon />
         {backLabel}
       </Button>
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex min-w-0 flex-wrap items-center gap-2">
+      <PageSection>
+        <PageSectionHeader>
+          <PageSectionTitle className="flex min-w-0 flex-wrap items-center gap-2">
             <span className="min-w-0 truncate" title={title}>
               {title}
             </span>
             <Badge variant="outline">ID {token.id}</Badge>
             <Badge variant={statusBadge(status)}>{tokenStatusLabel(status)}</Badge>
             <Badge variant="secondary">{plan}</Badge>
-          </CardTitle>
-          <CardDescription>{token.account_id || token.source_file || "-"}</CardDescription>
-          <CardAction>
+          </PageSectionTitle>
+          <PageSectionDescription>{token.account_id || token.source_file || "-"}</PageSectionDescription>
+          <PageSectionAction>
             <div className="flex flex-wrap gap-2">
               <Button loading={probeBusy} onClick={() => void runProbe()} size="sm" variant="outline">
                 <ActivityIcon />
@@ -1140,9 +1140,9 @@ export function KeyDetailPage({
                 备注
               </Button>
             </div>
-          </CardAction>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
+          </PageSectionAction>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-4">
           <div className="grid gap-3 md:grid-cols-3">
             <div className="rounded-lg border bg-muted/32 p-3">
               <div className="text-muted-foreground text-xs">额度</div>
@@ -1188,8 +1188,8 @@ export function KeyDetailPage({
               </AlertDescription>
             </Alert>
           )}
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
       <RemarkDialog
         target={remarkTarget}
         onChange={(remark) => setRemarkTarget((target) => (target ? { ...target, remark } : target))}

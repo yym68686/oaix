@@ -6,6 +6,8 @@ import {
   ListFilterIcon,
   LogInIcon,
   LogOutIcon,
+  MenuIcon,
+  ChevronsUpDownIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
   RefreshCwIcon,
@@ -36,8 +38,7 @@ import {
   useSavedAccounts,
   type SavedAccount,
 } from "@/lib/accounts";
-import { api, getServiceKey, isAdminPrincipal, isServicePrincipal, setServiceKey, type HealthResponse, type MeResponse, type TokenCounts } from "@/lib/api";
-import { formatNumber } from "@/lib/format";
+import { api, getServiceKey, isAdminPrincipal, isServicePrincipal, setServiceKey, type MeResponse } from "@/lib/api";
 import { readSidebarCollapsed, writeSidebarCollapsed } from "@/shared/domain";
 import type { RouteKey, ThemePreference } from "@/shared/types";
 import { navigateTo } from "./router";
@@ -81,33 +82,25 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
 export function AppShell({
   authBlocked,
   children,
-  counts,
-  health,
   loading,
   me,
   onRefresh,
   onThemeChange,
   protectedMode,
   routeKey,
-  syncText,
   theme,
-  webVersion,
 }: {
   authBlocked: boolean;
   children: React.ReactNode;
-  counts: TokenCounts;
-  health: HealthResponse | null;
   loading: boolean;
   me: MeResponse | null;
   onRefresh: () => void;
   onThemeChange: (theme: ThemePreference) => void;
   protectedMode: boolean;
   routeKey: RouteKey;
-  syncText: string;
   theme: ThemePreference;
-  webVersion?: { hash: string; time: string };
 }) {
-  const available = counts.available ?? counts.active ?? 0;
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(() => readSidebarCollapsed());
   const [credentialDialogOpen, setCredentialDialogOpen] = useState(false);
   const [serviceKeyDraft, setServiceKeyDraft] = useState(() => getServiceKey());
@@ -212,132 +205,105 @@ export function AppShell({
     }
   }
 
-  return (
-    <div className="min-h-screen text-foreground">
-      <div
-        className="mx-auto grid min-h-screen w-full max-w-[1600px] grid-cols-1 gap-0 px-3 py-3 transition-[grid-template-columns] duration-200 ease-out lg:grid-cols-[var(--oaix-sidebar-width)_minmax(0,1fr)] lg:px-4"
-        style={{ "--oaix-sidebar-width": collapsed ? "68px" : "220px" } as React.CSSProperties}
-      >
-        <aside className="sticky top-3 z-20 mb-3 h-fit rounded-lg border bg-card/90 p-3 shadow-xs/5 backdrop-blur lg:mb-0 lg:min-h-[calc(100vh-1.5rem)]">
-          <div className={cn("flex items-center gap-2 px-2 py-2", collapsed && "lg:flex-col lg:gap-3 lg:px-0")}>
-            <div className="flex size-9 shrink-0 items-center justify-center rounded-md border bg-muted">
-              <DatabaseIcon className="size-4" />
+  function navigation(mobile = false) {
+    return (
+      <nav aria-label={mobile ? "移动导航" : "主导航"} className="grid content-start gap-6">
+        {NAV_GROUPS.map((group) => {
+          const items = group.items.filter((item) => !item.adminOnly || admin);
+          if (!items.length) return null;
+          const compact = collapsed && !mobile;
+          return (
+            <div className="grid gap-1" key={group.label}>
+              <div className={cn("mb-1 px-3 text-muted-foreground text-xs", compact && "sr-only")}>{group.label}</div>
+              {compact && <div className="mx-auto mb-2 h-px w-5 bg-border" />}
+              {items.map((item) => {
+                const active = routeKey === item.key ||
+                  (routeKey === "key_detail" && item.key === "keys") ||
+                  (routeKey === "import_new" && item.key === "imports") ||
+                  (routeKey === "admin_pool_detail" && item.key === "admin_pools") ||
+                  (routeKey === "admin_user_detail" && item.key === "admin_users");
+                return (
+                  <Button
+                    aria-current={active ? "page" : undefined}
+                    aria-label={item.label}
+                    className={cn("h-9 justify-start gap-3 rounded-lg px-3 text-muted-foreground hover:text-foreground", active && "bg-sidebar-accent text-foreground", compact && "size-9 justify-center px-0")}
+                    key={item.href}
+                    onClick={() => { navigateTo(item.href); setMobileNavOpen(false); }}
+                    size="sm"
+                    title={compact ? item.label : undefined}
+                    variant="ghost"
+                  >
+                    {item.icon}
+                    {!compact && <span>{item.label}</span>}
+                  </Button>
+                );
+              })}
             </div>
-            <div className={cn("min-w-0 flex-1 font-heading text-lg font-semibold leading-none", collapsed && "lg:hidden")}>oaix</div>
-            <Button
-              aria-expanded={!collapsed}
-              aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
-              className="hidden lg:inline-flex"
-              onClick={toggleSidebar}
-              size="icon-sm"
-              title={collapsed ? "展开侧边栏" : "折叠侧边栏"}
-              variant="ghost"
-            >
+          );
+        })}
+      </nav>
+    );
+  }
+
+  function accountMenu(compact: boolean) {
+    return <AccountMenu accounts={savedAccounts} activeAccount={activeSavedAccount} compact={compact}
+      me={me} onLogin={openLogin} onLogout={logout} onSwitchAccount={switchAccount}
+      onThemeChange={onThemeChange} serviceOnly={serviceOnly} theme={theme} />;
+  }
+
+  return (
+    <div className="min-h-screen bg-background text-foreground">
+      <a className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-background focus:p-3 focus:ring-2" href="#main-content">跳转到内容</a>
+      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[var(--oaix-sidebar-width)_minmax(0,1fr)]"
+        style={{ "--oaix-sidebar-width": collapsed ? "68px" : "232px" } as React.CSSProperties}>
+        <aside aria-label="侧边栏" className="sticky top-0 hidden h-dvh min-h-0 flex-col border-r bg-sidebar lg:flex">
+          <div className={cn("flex h-20 shrink-0 items-center gap-3 px-5", collapsed && "h-auto flex-col gap-2 px-4 py-5")}>
+            <a aria-label="oaix 首页" className="flex min-w-0 flex-1 items-center gap-3 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring" href="/dashboard"
+              onClick={(event) => { event.preventDefault(); navigateTo("/dashboard"); }}>
+              <DatabaseIcon className="size-6 shrink-0" />
+              {!collapsed && <span className="font-heading text-xl font-semibold tracking-tight">oaix</span>}
+            </a>
+            <Button aria-expanded={!collapsed} aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
+              onClick={toggleSidebar} size="icon-sm" title={collapsed ? "展开侧边栏" : "折叠侧边栏"} variant="ghost">
               {collapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
             </Button>
           </div>
-          <nav className="mt-4 grid gap-4">
-            {NAV_GROUPS.map((group) => {
-              const items = group.items.filter((item) => !item.adminOnly || admin);
-              if (!items.length) {
-                return null;
-              }
-              return (
-                <div className="grid gap-1" key={group.label}>
-                  <div className={cn("px-2 text-muted-foreground text-xs", collapsed && "lg:hidden")}>{group.label}</div>
-                  {collapsed && <div className="mx-auto mb-1 hidden h-px w-6 bg-border lg:block" />}
-                  <div className={cn("flex gap-1 overflow-x-auto lg:grid lg:overflow-visible", collapsed && "lg:justify-items-center")}>
-                    {items.map((item) => {
-                      const active =
-                        routeKey === item.key ||
-                        (routeKey === "key_detail" && item.key === "keys") ||
-                        (routeKey === "import_new" && item.key === "imports") ||
-                        (routeKey === "admin_pool_detail" && item.key === "admin_pools") ||
-                        (routeKey === "admin_user_detail" && item.key === "admin_users");
-                      return (
-                        <Button
-                          className={cn("justify-start", active && "bg-secondary", collapsed && "lg:size-9 lg:justify-center lg:px-0")}
-                          key={item.href}
-                          onClick={() => navigateTo(item.href)}
-                          size="sm"
-                          title={collapsed ? item.label : undefined}
-                          variant={active ? "secondary" : "ghost"}
-                        >
-                          {item.icon}
-                          <span className={cn(collapsed && "lg:hidden")}>{item.label}</span>
-                        </Button>
-                      );
-                    })}
-                  </div>
-                </div>
-              );
-            })}
-          </nav>
-          <div className={cn("mt-4 hidden gap-2 border-t pt-4 text-xs text-muted-foreground lg:grid", collapsed && "lg:gap-2.5")}>
-            {[
-              { label: "有效", value: available },
-              { label: "冷却", value: counts.cooling },
-              { label: "禁用", value: counts.disabled },
-            ].map((row) => (
-              <div
-                className={cn("flex items-center justify-between", collapsed && "lg:flex-col lg:justify-center lg:gap-0.5 lg:text-[11px]")}
-                key={row.label}
-                title={collapsed ? `${row.label} ${formatNumber(row.value)}` : undefined}
-              >
-                <span>{row.label}</span>
-                <span className="oaix-tabular">{formatNumber(row.value)}</span>
-              </div>
-            ))}
+          <div className={cn("min-h-0 flex-1 overflow-y-auto px-3 pb-5 oaix-scrollbar", collapsed && "px-4")}>{navigation()}</div>
+          <div className={cn("grid shrink-0 gap-2 border-t p-3", collapsed && "justify-items-center px-4")}>
+            <Button aria-label="刷新数据" className={cn("justify-start gap-3 text-muted-foreground", collapsed && "size-9 justify-center px-0")}
+              onClick={onRefresh} size="sm" title="刷新数据" variant="ghost">
+              <RefreshCwIcon className={cn(loading && "animate-spin motion-reduce:animate-none")} />
+              {!collapsed && "刷新数据"}
+            </Button>
+            {accountMenu(collapsed)}
           </div>
         </aside>
-
-        <div className="min-w-0 lg:pl-4">
-          <header className="mb-4 rounded-lg border bg-card/90 p-4 shadow-xs/5 backdrop-blur">
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <div className="min-w-0">
-                <div className="mb-2 flex flex-wrap items-center gap-2">
-                  {!protectedMode && <Badge variant="warning">未启用服务侧凭证</Badge>}
-                  <Badge variant={health?.ok === false ? "warning" : "secondary"}>{syncText}</Badge>
-                  <Badge variant="outline">总量 {formatNumber(counts.total)}</Badge>
-                </div>
-                <h1 className="font-heading text-2xl font-semibold tracking-normal">Key 池控制台</h1>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 md:justify-end">
-                <Button onClick={onRefresh} variant="outline">
-                  <RefreshCwIcon className={cn(loading && "animate-spin")} />
-                  刷新
-                </Button>
-                <AccountMenu
-                  accounts={savedAccounts}
-                  activeAccount={activeSavedAccount}
-                  me={me}
-                  onLogin={openLogin}
-                  onLogout={logout}
-                  onSwitchAccount={switchAccount}
-                  onThemeChange={onThemeChange}
-                  serviceOnly={serviceOnly}
-                  theme={theme}
-                />
-              </div>
-            </div>
+        <div className="min-w-0">
+          <header className="sticky top-0 z-20 flex h-16 items-center gap-3 border-b bg-background/95 px-4 backdrop-blur lg:hidden">
+            <Button aria-label="打开导航" aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen(true)} size="icon-sm" variant="ghost"><MenuIcon /></Button>
+            <a className="mr-auto font-heading text-lg font-semibold" href="/dashboard" onClick={(event) => { event.preventDefault(); navigateTo("/dashboard"); }}>oaix</a>
+            <Button aria-label="刷新数据" onClick={onRefresh} size="icon-sm" variant="ghost"><RefreshCwIcon className={cn(loading && "animate-spin motion-reduce:animate-none")} /></Button>
+            {accountMenu(true)}
           </header>
-
-          {authBlocked && (
-            <Alert className="mb-4" variant="warning">
-              <ShieldCheckIcon />
-              <AlertTitle>需要登录</AlertTitle>
-              <AlertDescription>普通用户请登录或注册；管理员可在弹窗里切换到管理员入口。</AlertDescription>
-            </Alert>
-          )}
-
-          <main className="min-w-0">{children}</main>
-
-          <footer className="flex flex-wrap items-center justify-between gap-2 py-4 text-muted-foreground text-xs">
-            <span>oaix platform</span>
-            <span title={`资源版本 ${webVersion?.hash || "-"}`}>前端版本 {webVersion?.time || "-"}</span>
-          </footer>
+          <main id="main-content" tabIndex={-1} className="mx-auto min-w-0 max-w-[1600px] px-4 py-6 outline-none sm:px-6 lg:px-10 lg:py-9">
+            {!protectedMode && me && <Badge className="mb-5" variant="warning">未启用服务侧凭证</Badge>}
+            {authBlocked && (
+              <Alert className="mb-6" variant="warning">
+                <ShieldCheckIcon />
+                <AlertTitle>需要登录</AlertTitle>
+                <AlertDescription>普通用户请登录或注册；管理员可在弹窗里切换到管理员入口。</AlertDescription>
+              </Alert>
+            )}
+            {children}
+          </main>
         </div>
       </div>
+      <Dialog open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
+        <DialogPopup className="max-w-sm">
+          <DialogHeader><DialogTitle>oaix 导航</DialogTitle></DialogHeader>
+          <DialogPanel>{navigation(true)}</DialogPanel>
+        </DialogPopup>
+      </Dialog>
       <Dialog open={credentialOpen} onOpenChange={changeCredentialDialogOpen}>
         <DialogPopup className="sm:max-w-md" showCloseButton={!credentialRequired}>
           <DialogHeader>
@@ -463,12 +429,13 @@ function principalRoleLabel(me: MeResponse | null, serviceOnly: boolean, activeA
 }
 
 /**
- * 头像菜单：身份、主题、登录/退出登录都收在这里，避免头部平铺一排按钮。
+ * 头像菜单：身份、主题、登录/退出登录都收在这里，统一收在侧边栏底部和移动端工具栏。
  * 未登录时依然渲染（否则主题切换会没有入口），此时展示登录项。
  */
 function AccountMenu({
   accounts,
   activeAccount,
+  compact = true,
   me,
   onLogin,
   onLogout,
@@ -479,6 +446,7 @@ function AccountMenu({
 }: {
   accounts: SavedAccount[];
   activeAccount: SavedAccount | null;
+  compact?: boolean;
   me: MeResponse | null;
   onLogin: () => void;
   onLogout: () => void;
@@ -499,10 +467,13 @@ function AccountMenu({
     <Menu>
       <MenuTrigger
         aria-label={signedIn ? `账户菜单：${name}` : "账户菜单"}
-        render={<Button className="rounded-full before:rounded-full" size="icon" variant="outline" />}
+        render={<Button className={cn("shrink-0", compact ? "rounded-full" : "h-auto w-full justify-start gap-3 px-2 py-2")} size={compact ? "icon" : "default"} variant="ghost" />}
         title={signedIn ? name : "未登录"}
       >
-        {signedIn && initial ? <span className="font-medium text-sm">{initial}</span> : signedIn ? <ShieldCheckIcon /> : <UserRoundIcon />}
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-full border bg-background text-sm font-medium">
+          {signedIn && initial ? initial : <UserRoundIcon className="size-4" />}
+        </span>
+        {!compact && <><span className="grid min-w-0 flex-1 gap-0.5 text-left"><span className="truncate text-sm font-medium">{signedIn ? name : "登录账户"}</span><span className="text-muted-foreground text-xs">{signedIn ? principalRoleLabel(me, serviceOnly, activeAccount) : "主题与账户"}</span></span><ChevronsUpDownIcon className="size-4 shrink-0 text-muted-foreground" /></>}
       </MenuTrigger>
       <MenuPopup>
         {signedIn && (

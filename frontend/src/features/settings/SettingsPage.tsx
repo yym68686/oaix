@@ -2,7 +2,7 @@ import { DatabaseIcon, RefreshCwIcon, RotateCcwIcon, SaveIcon, Settings2Icon, Sh
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Button } from "@/registry/default/ui/button";
-import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { PageSection, PageSectionAction, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
 import { Checkbox } from "@/registry/default/ui/checkbox";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
@@ -206,16 +206,16 @@ export function UserSettingsPage({
   }
 
   return (
-    <div className="grid min-w-0 gap-4">
-      <Card className="min-w-0">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+    <div className="grid min-w-0 gap-8">
+      <PageSection className="min-w-0">
+        <PageSectionHeader>
+          <PageSectionTitle className="flex items-center gap-2">
             <Settings2Icon className="size-5" />
             计划并发
-          </CardTitle>
-          <CardDescription>按账号计划设置每个 Key 的并发上限。你的设置优先于管理员默认值。</CardDescription>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
+          </PageSectionTitle>
+          <PageSectionDescription>按账号计划设置每个 Key 的并发上限。你的设置优先于管理员默认值。</PageSectionDescription>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-4">
           {error && <ErrorAlert title="设置载入失败" message={error} />}
           {loading && !error ? (
             <LoadingState compact label="正在载入并发设置" />
@@ -278,8 +278,8 @@ export function UserSettingsPage({
               </div>
             </>
           )}
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
       <TokenModelAccessPanel
         modelOverrides={modelOverrides}
         onReset={() => void resetModels()}
@@ -292,15 +292,15 @@ export function UserSettingsPage({
         settings={modelSettings}
         userMode
       />
-      <Card className="min-w-0">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+      <PageSection className="min-w-0">
+        <PageSectionHeader>
+          <PageSectionTitle className="flex items-center gap-2">
             <Settings2Icon className="size-5" />
             测试设置
-          </CardTitle>
-          <CardDescription>设置用户页面 Key 测试按钮默认使用的模型。</CardDescription>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
+          </PageSectionTitle>
+          <PageSectionDescription>设置用户页面 Key 测试按钮默认使用的模型。</PageSectionDescription>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-4">
           {loading && !error ? (
             <LoadingState compact label="正在载入设置" />
           ) : (
@@ -317,8 +317,8 @@ export function UserSettingsPage({
               </Button>
             </>
           )}
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
     </div>
   );
 }
@@ -347,15 +347,15 @@ function TokenModelAccessPanel({
   userMode?: boolean;
 }) {
   return (
-    <Card className="min-w-0">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+    <PageSection className="min-w-0">
+      <PageSectionHeader>
+        <PageSectionTitle className="flex items-center gap-2">
           <Settings2Icon className="size-5" />
           计划模型
-        </CardTitle>
-        <CardDescription>{userMode ? "按计划选择用户可使用的模型。用户设置优先于管理员默认值。" : "按计划选择默认可用模型，用户可以在自己的设置中覆盖。"}</CardDescription>
-      </CardHeader>
-      <CardPanel className="grid min-w-0 gap-4">
+        </PageSectionTitle>
+        <PageSectionDescription>{userMode ? "按计划选择用户可使用的模型。用户设置优先于管理员默认值。" : "按计划选择默认可用模型，用户可以在自己的设置中覆盖。"}</PageSectionDescription>
+      </PageSectionHeader>
+      <PageSectionPanel className="grid min-w-0 gap-4">
         {!settings ? (
           loading ? <LoadingState compact label="正在载入模型设置" /> : <ErrorAlert title="模型设置载入失败" message={error || "未返回模型设置"} />
         ) : (
@@ -416,8 +416,8 @@ function TokenModelAccessPanel({
             </div>
           </>
         )}
-      </CardPanel>
-    </Card>
+      </PageSectionPanel>
+    </PageSection>
   );
 }
 
@@ -695,7 +695,7 @@ export function SettingsPage({
   }
 
   return (
-    <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(320px,.7fr)_minmax(0,1fr)]">
+    <div className="grid min-w-0 gap-8 xl:grid-cols-[minmax(0,.7fr)_minmax(0,1fr)]">
       <div className="min-w-0 xl:col-span-2">
         <TokenModelAccessPanel
           modelOverrides={adminModelOverrides}
@@ -709,16 +709,16 @@ export function SettingsPage({
           settings={adminModelSettings}
         />
       </div>
-      <div className="grid gap-4">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
+      <div className="grid min-w-0 gap-8">
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle className="flex items-center gap-2">
               <Settings2Icon className="size-5" />
               调度设置
-            </CardTitle>
-            <CardDescription>Key 分发、每 Key 并发和当前 selector 状态。</CardDescription>
-          </CardHeader>
-          <CardPanel className="grid gap-4">
+            </PageSectionTitle>
+            <PageSectionDescription>Key 分发、每 Key 并发和当前 selector 状态。</PageSectionDescription>
+          </PageSectionHeader>
+          <PageSectionPanel className="grid gap-4">
             <Alert variant="info">
               <DatabaseIcon />
               <AlertTitle>{selectionSummary}</AlertTitle>
@@ -740,18 +740,18 @@ export function SettingsPage({
               <SaveIcon />
               保存调度设置
             </Button>
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle className="flex items-center gap-2">
               <Settings2Icon aria-hidden="true" className="size-5" />
               GPT-6 Astra 计费
-            </CardTitle>
-            <CardDescription>基础费率按官方 API 每百万 token 价格；Codex 订阅默认不启用长上下文阶梯倍率。</CardDescription>
-          </CardHeader>
-          <CardPanel className="grid gap-4">
+            </PageSectionTitle>
+            <PageSectionDescription>基础费率按官方 API 每百万 token 价格；Codex 订阅默认不启用长上下文阶梯倍率。</PageSectionDescription>
+          </PageSectionHeader>
+          <PageSectionPanel className="grid gap-4">
             {!gpt6AstraPricing ? (
               loading ? <LoadingState compact label="正在载入 Astra 计费设置" /> : <ErrorAlert title="Astra 计费设置载入失败" message={error || "未返回计费设置"} />
             ) : (
@@ -787,18 +787,18 @@ export function SettingsPage({
                 </div>
               </>
             )}
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle className="flex items-center gap-2">
               <TimerResetIcon aria-hidden="true" className="size-5" />
               普通 429 冷却
-            </CardTitle>
-            <CardDescription>上游返回普通 429 且没有明确额度重置时间时，暂时停止调度该 Key。</CardDescription>
-          </CardHeader>
-          <CardPanel className="grid gap-4">
+            </PageSectionTitle>
+            <PageSectionDescription>上游返回普通 429 且没有明确额度重置时间时，暂时停止调度该 Key。</PageSectionDescription>
+          </PageSectionHeader>
+          <PageSectionPanel className="grid gap-4">
             {!ordinary429Settings ? (
               loading ? <LoadingState compact label="正在载入 429 冷却设置" /> : <ErrorAlert title="429 冷却设置载入失败" message={error || "未返回冷却设置"} />
             ) : (
@@ -856,18 +856,18 @@ export function SettingsPage({
                 </div>
               </>
             )}
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle className="flex items-center gap-2">
               <Settings2Icon className="size-5" />
               测试设置
-            </CardTitle>
-            <CardDescription>管理员号池总览和 Key 详情测试按钮默认使用的模型。</CardDescription>
-          </CardHeader>
-          <CardPanel className="grid gap-4">
+            </PageSectionTitle>
+            <PageSectionDescription>管理员号池总览和 Key 详情测试按钮默认使用的模型。</PageSectionDescription>
+          </PageSectionHeader>
+          <PageSectionPanel className="grid gap-4">
             <SelectField
               label="默认测试模型"
               onChange={(value) => setAdminProbeModel(value as TestModel)}
@@ -878,18 +878,18 @@ export function SettingsPage({
               <SaveIcon />
               保存测试设置
             </Button>
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle className="flex items-center gap-2">
               <ShieldCheckIcon className="size-5" />
               Service API Key
-            </CardTitle>
-            <CardDescription>保存本浏览器访问受保护接口使用的管理员凭证。</CardDescription>
-          </CardHeader>
-          <CardPanel className="grid gap-3">
+            </PageSectionTitle>
+            <PageSectionDescription>保存本浏览器访问受保护接口使用的管理员凭证。</PageSectionDescription>
+          </PageSectionHeader>
+          <PageSectionPanel className="grid gap-3">
             <div className="grid gap-2">
               <Label htmlFor="settings-service-key">Service API Key</Label>
               <Input
@@ -910,22 +910,22 @@ export function SettingsPage({
                 清空
               </Button>
             </div>
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>运行设置</CardTitle>
-          <CardDescription>查看和写入 JSON 设置项。</CardDescription>
-          <CardAction>
+      <PageSection>
+        <PageSectionHeader>
+          <PageSectionTitle>运行设置</PageSectionTitle>
+          <PageSectionDescription>查看和写入 JSON 设置项。</PageSectionDescription>
+          <PageSectionAction>
             <Button onClick={() => void loadSettings()} size="sm" variant="outline">
               <RefreshCwIcon className={cn(loading && "animate-spin")} />
               刷新
             </Button>
-          </CardAction>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
+          </PageSectionAction>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-4">
           <div className="grid gap-2 md:grid-cols-[minmax(180px,.35fr)_minmax(0,1fr)]">
             <div className="grid gap-2">
               <Label htmlFor="settings-key">Key</Label>
@@ -957,8 +957,8 @@ export function SettingsPage({
               {!items.length && !loading && <EmptyState title="暂无设置项" description="保存后会显示在这里。" compact />}
             </div>
           )}
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
     </div>
   );
 }

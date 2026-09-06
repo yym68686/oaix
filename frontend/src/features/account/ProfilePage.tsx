@@ -2,7 +2,7 @@ import { CheckIcon, LogInIcon, MailIcon, ShieldCheckIcon, Trash2Icon, UserPlusIc
 import { useMemo, useState } from "react";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
-import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { PageSection, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
 import {
   Dialog,
   DialogClose,
@@ -113,17 +113,17 @@ export function ProfilePage({
   }
 
   return (
-    <div className="grid gap-4 xl:grid-cols-[minmax(300px,.7fr)_minmax(0,1fr)]">
-      <div className="grid content-start gap-4">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
+    <div className="grid min-w-0 gap-8 xl:grid-cols-[minmax(0,.7fr)_minmax(0,1fr)]">
+      <div className="grid content-start gap-8">
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle className="flex items-center gap-2">
               <UserRoundIcon className="size-5" />
               个人资料
-            </CardTitle>
-            <CardDescription>当前浏览器正在使用的 OAIX 身份。</CardDescription>
-          </CardHeader>
-          <CardPanel>
+            </PageSectionTitle>
+            <PageSectionDescription>当前浏览器正在使用的 OAIX 身份。</PageSectionDescription>
+          </PageSectionHeader>
+          <PageSectionPanel>
             {activeAccount || profile ? (
               <div className="flex items-center gap-4">
                 <div className="flex size-14 shrink-0 items-center justify-center rounded-full border bg-muted font-heading text-xl font-semibold">
@@ -142,18 +142,18 @@ export function ProfilePage({
             ) : (
               <EmptyState compact title="尚未登录" description="添加一个 OAIX 账号后即可在此浏览器中保存并切换。" />
             )}
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle className="flex items-center gap-2">
               <UserPlusIcon className="size-5" />
               添加账号
-            </CardTitle>
-            <CardDescription>登录另一个已有 OAIX 账号。浏览器只保存登录返回的 API Key，不会保存密码。</CardDescription>
-          </CardHeader>
-          <CardPanel className="grid gap-4">
+            </PageSectionTitle>
+            <PageSectionDescription>登录另一个已有 OAIX 账号。浏览器只保存登录返回的 API Key，不会保存密码。</PageSectionDescription>
+          </PageSectionHeader>
+          <PageSectionPanel className="grid gap-4">
             <div className="grid gap-2">
               <Label htmlFor="add-account-email">邮箱</Label>
               <Input
@@ -186,19 +186,19 @@ export function ProfilePage({
               <LogInIcon />
               添加并切换
             </Button>
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+      <PageSection>
+        <PageSectionHeader>
+          <PageSectionTitle className="flex items-center gap-2">
             <ShieldCheckIcon className="size-5" />
             本浏览器账号
-          </CardTitle>
-          <CardDescription>已保存 {accounts.length} 个账号；存在两个或更多账号时，也可以从右上角头像菜单直接切换。</CardDescription>
-        </CardHeader>
-        <CardPanel className="grid gap-3">
+          </PageSectionTitle>
+          <PageSectionDescription>已保存 {accounts.length} 个账号；存在两个或更多账号时，也可以从账户菜单直接切换。</PageSectionDescription>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-3">
           {!orderedAccounts.length ? (
             <EmptyState compact title="暂无保存的账号" description="使用左侧表单登录后会显示在这里。" />
           ) : (
@@ -242,8 +242,8 @@ export function ProfilePage({
               );
             })
           )}
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
 
       <Dialog open={Boolean(removeTarget)} onOpenChange={(open) => !open && !removing && setRemoveTarget(null)}>
         <DialogPopup className="sm:max-w-md">

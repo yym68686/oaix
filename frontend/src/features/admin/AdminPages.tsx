@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { navigateTo, type RouteState } from "@/app/router";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
-import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { PageSection, PageSectionAction, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
 import { Input } from "@/registry/default/ui/input";
 import { Label } from "@/registry/default/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
@@ -80,15 +80,15 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+    <PageSection>
+      <PageSectionHeader>
+        <PageSectionTitle className="flex items-center gap-2">
           <UsersRoundIcon className="size-5" />
           用户状态
-        </CardTitle>
-        <CardDescription>查看平台用户、状态和角色。</CardDescription>
-      </CardHeader>
-      <CardPanel className="grid gap-4">
+        </PageSectionTitle>
+        <PageSectionDescription>查看平台用户、状态和角色。</PageSectionDescription>
+      </PageSectionHeader>
+      <PageSectionPanel className="grid gap-4">
         {error && <ErrorAlert title="用户数据载入失败" message={error} />}
         <FilterBar>
           <div className="grid min-w-0 gap-2">
@@ -171,8 +171,8 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
           </div>
         )}
         {!loading && !users.length && <EmptyState title="暂无用户" description="创建用户后会在这里显示。" />}
-      </CardPanel>
-    </Card>
+      </PageSectionPanel>
+    </PageSection>
   );
 }
 
@@ -278,21 +278,21 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
   }
 
   return (
-    <div className="grid gap-4">
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+    <div className="grid min-w-0 gap-8">
+      <PageSection>
+        <PageSectionHeader>
+          <PageSectionTitle className="flex items-center gap-2">
             <UserRoundIcon className="size-5" />
             用户详情
-          </CardTitle>
-          <CardDescription>{user?.email || `User #${userID}`}</CardDescription>
-          <CardAction>
+          </PageSectionTitle>
+          <PageSectionDescription>{user?.email || `User #${userID}`}</PageSectionDescription>
+          <PageSectionAction>
             <Button onClick={() => navigateTo("/admin/users")} size="sm" variant="outline">
               返回
             </Button>
-          </CardAction>
-        </CardHeader>
-        <CardPanel className="grid gap-4">
+          </PageSectionAction>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid gap-4">
           {error && <ErrorAlert title={error.startsWith("部分") ? "用户详情部分载入失败" : "用户详情载入失败"} message={error} />}
           {loading && !user ? (
             <LoadingState compact label="正在载入用户详情" />
@@ -304,8 +304,8 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
               <MiniMetric label="有效 Key" value={pool.counts?.available ?? pool.counts?.active ?? 0} />
             </div>
           )}
-        </CardPanel>
-      </Card>
+        </PageSectionPanel>
+      </PageSection>
       <div className="flex flex-wrap gap-2">
         {[
           ["overview", "概览"],
@@ -321,37 +321,37 @@ export function AdminUserDetailPage({ pushToast, refreshNonce, route }: { pushTo
         ))}
       </div>
       {tab === "overview" && (
-        <Card>
-          <CardHeader>
-            <CardTitle>概览</CardTitle>
-          </CardHeader>
-          <CardPanel className="grid gap-3 md:grid-cols-4">
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle>概览</PageSectionTitle>
+          </PageSectionHeader>
+          <PageSectionPanel className="grid gap-3 md:grid-cols-4">
             <MiniMetric label="请求量" value={usage.request_count || 0} />
             <MiniMetric label="成功率" value={formatPercent(usage.success_rate)} />
             <MiniMetric label="缓存率" value={formatPercent(usage.cache_hit_ratio)} />
             <MiniMetric label="24h 成本" value={formatCurrency(usage.estimated_cost_usd || 0)} />
             <MiniMetric label="累计成本" value={formatCurrency(readObservedCostUSD(usage))} />
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
       )}
       {tab === "tokens" && <TokenTable items={tokens} loading={loading && !tokens.length} scope={{ kind: "user", userId: userID }} />}
       {tab === "imports" && <ImportJobsTable items={imports} loading={loading && !imports.length} scope={{ kind: "user", userId: userID }} />}
       {tab === "requests" && <RequestLogsTable items={requests} loading={loading && !requests.length} scope={{ kind: "user", userId: userID }} />}
       {tab === "api_keys" && (
-        <Card>
-          <CardHeader>
-            <CardTitle>API Key</CardTitle>
-            <CardAction>
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle>API Key</PageSectionTitle>
+            <PageSectionAction>
               <Button onClick={() => void createAPIKey()} size="sm">
                 新建
               </Button>
-            </CardAction>
-          </CardHeader>
-          <CardPanel className="grid gap-3">
+            </PageSectionAction>
+          </PageSectionHeader>
+          <PageSectionPanel className="grid gap-3">
             {createdKey?.plaintext_key && <Input nativeInput readOnly value={createdKey.plaintext_key} />}
             <ApiKeyTable items={apiKeys} loading={loading && !apiKeys.length} onRevoke={(id) => void revokeAPIKey(id)} scope={{ kind: "user", userId: userID }} />
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
       )}
       {tab === "audit" && <AuditMiniTable items={auditItems} loading={loading && !auditItems.length} />}
     </div>
@@ -494,20 +494,20 @@ export function AdminImportsPage({ refreshNonce }: { refreshNonce: number }) {
   );
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+    <PageSection>
+      <PageSectionHeader>
+        <PageSectionTitle className="flex items-center gap-2">
           <UploadIcon className="size-5" />
           全局导入
-        </CardTitle>
-        <CardDescription>查看所有账号的导入批次，可按账号筛选。</CardDescription>
-      </CardHeader>
-      <CardPanel className="grid gap-3">
+        </PageSectionTitle>
+        <PageSectionDescription>查看所有账号的导入批次，可按账号筛选。</PageSectionDescription>
+      </PageSectionHeader>
+      <PageSectionPanel className="grid gap-3">
         {error && <ErrorAlert title="全局导入载入失败" message={error} />}
         <SelectField label="账号" onChange={setUserID} options={ownerOptions} value={userID} />
         <ImportJobsTable items={items} loading={loading && !items.length} ownerLabel={ownerLabel} scope={{ kind: "all" }} />
-      </CardPanel>
-    </Card>
+      </PageSectionPanel>
+    </PageSection>
   );
 }
 
@@ -545,15 +545,15 @@ export function AdminRequestsPage({ refreshNonce }: { refreshNonce: number }) {
   }, [load, refreshNonce]);
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+    <PageSection>
+      <PageSectionHeader>
+        <PageSectionTitle className="flex items-center gap-2">
           <ListFilterIcon className="size-5" />
           全局请求
-        </CardTitle>
-        <CardDescription>全局最近请求，包含 owner/api_key 字段。</CardDescription>
-      </CardHeader>
-      <CardPanel className="grid gap-3">
+        </PageSectionTitle>
+        <PageSectionDescription>全局最近请求，包含 owner/api_key 字段。</PageSectionDescription>
+      </PageSectionHeader>
+      <PageSectionPanel className="grid gap-3">
         {error && <ErrorAlert title="全局请求载入失败" message={error} />}
         <UserSelector
           apiKeyID={apiKeyID}
@@ -567,8 +567,8 @@ export function AdminRequestsPage({ refreshNonce }: { refreshNonce: number }) {
           userID={userID}
         />
         <RequestLogsTable items={items} loading={loading && !items.length} scope={{ kind: "all" }} />
-      </CardPanel>
-    </Card>
+      </PageSectionPanel>
+    </PageSection>
   );
 }
 
@@ -595,15 +595,15 @@ export function AdminAuditPage({ refreshNonce }: { refreshNonce: number }) {
   }, [load, refreshNonce]);
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+    <PageSection>
+      <PageSectionHeader>
+        <PageSectionTitle className="flex items-center gap-2">
           <FileClockIcon className="size-5" />
           审计日志
-        </CardTitle>
-        <CardDescription>用户、API Key、导入和管理操作记录。</CardDescription>
-      </CardHeader>
-      <CardPanel className="grid gap-3">
+        </PageSectionTitle>
+        <PageSectionDescription>用户、API Key、导入和管理操作记录。</PageSectionDescription>
+      </PageSectionHeader>
+      <PageSectionPanel className="grid gap-3">
         {error && <ErrorAlert title="审计日志载入失败" message={error} />}
         {loading && !items.length ? (
           <LoadingState label="正在载入审计日志" />
@@ -633,8 +633,8 @@ export function AdminAuditPage({ refreshNonce }: { refreshNonce: number }) {
         ) : (
           <EmptyState title="暂无审计记录" description="用户、API Key、导入和管理操作会在这里显示。" />
         )}
-      </CardPanel>
-    </Card>
+      </PageSectionPanel>
+    </PageSection>
   );
 }
 

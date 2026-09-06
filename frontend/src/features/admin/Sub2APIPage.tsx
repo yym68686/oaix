@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
 import { Badge } from "@/registry/default/ui/badge";
 import { Button } from "@/registry/default/ui/button";
-import { Card, CardAction, CardDescription, CardHeader, CardPanel, CardTitle } from "@/registry/default/ui/card";
+import { PageSection, PageSectionAction, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
 import { Checkbox } from "@/registry/default/ui/checkbox";
 import { Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
 import { Input } from "@/registry/default/ui/input";
@@ -573,22 +573,22 @@ export function AdminSub2APIPage({
 
   return (
     <>
-      <div className="grid gap-4">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
+      <div className="grid min-w-0 gap-8">
+        <PageSection>
+          <PageSectionHeader>
+            <PageSectionTitle className="flex items-center gap-2">
               <SendIcon className="size-5" />
               Sub2API 推送
-            </CardTitle>
-            <CardDescription>管理多个 Sub2API 目标和自动补充策略。</CardDescription>
-            <CardAction>
+            </PageSectionTitle>
+            <PageSectionDescription>管理多个 Sub2API 目标和自动补充策略。</PageSectionDescription>
+            <PageSectionAction>
               <Button onClick={openCreateDialog} variant="outline">
                 <PlusIcon />
                 新增目标
               </Button>
-            </CardAction>
-          </CardHeader>
-          <CardPanel className="grid gap-4">
+            </PageSectionAction>
+          </PageSectionHeader>
+          <PageSectionPanel className="grid gap-4">
             {error && <ErrorAlert title="Sub2API 载入失败" message={error} />}
             {latestCompatibilityNotice && (
               <Alert aria-live="polite" variant="warning">
@@ -613,8 +613,8 @@ export function AdminSub2APIPage({
               onSync={(target) => void runTarget(target, "sync")}
             />
             <RunTable items={runs.slice(0, 12)} loading={loading && !runs.length} />
-          </CardPanel>
-        </Card>
+          </PageSectionPanel>
+        </PageSection>
       </div>
 
       <Dialog open={targetDialogOpen} onOpenChange={changeTargetDialogOpen}>
