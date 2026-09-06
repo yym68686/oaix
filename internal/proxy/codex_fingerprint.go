@@ -65,6 +65,9 @@ func resolveCodexFingerprintIDs(claim *tokens.Claim, context *CodexFingerprintCo
 	if claim == nil || context == nil || claim.TokenID() <= 0 {
 		return nil
 	}
+	if claim.Token != nil && !claim.Token.Token.CodexFingerprintIsEnabled() {
+		return nil
+	}
 	accountSeed := codexFingerprintAccountSeed(claim)
 	installationID := deterministicUUID("oaix:codex-install-id:v1:" + accountSeed)
 	sessionID := deterministicUUID("oaix:codex-session-id:v1:" + accountSeed)

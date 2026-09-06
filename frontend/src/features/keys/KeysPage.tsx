@@ -903,6 +903,7 @@ export function KeyDetailPage({
   const [copyRefreshBusy, setCopyRefreshBusy] = useState(false);
   const [quotaCreditBusy, setQuotaCreditBusy] = useState(false);
   const [quotaResetBusy, setQuotaResetBusy] = useState(false);
+  const [fingerprintBusy, setFingerprintBusy] = useState(false);
   const [quotaCreditCount, setQuotaCreditCount] = useState<number | null>(null);
   const [probeResult, setProbeResult] = useState<TokenProbeResponse | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
@@ -1053,6 +1054,22 @@ export function KeyDetailPage({
     await loadToken();
   }
 
+  async function updateFingerprint(enabled: boolean) {
+    if (!token) {
+      return;
+    }
+    setFingerprintBusy(true);
+    try {
+      await api.updateCodexFingerprint(token.id, enabled, apiScope);
+      setToken((current) => (current && current.id === token.id ? { ...current, codex_fingerprint_enabled: enabled } : current));
+      pushToast(enabled ? "已开启指纹收敛" : "已关闭指纹收敛");
+    } catch (caught) {
+      pushToast(errorMessage(caught), "error");
+    } finally {
+      setFingerprintBusy(false);
+    }
+  }
+
   if (error) {
     return (
       <div className="grid gap-4">
@@ -1178,6 +1195,32 @@ export function KeyDetailPage({
             </div>
             <DetailItem label="备注" value={token.remark || "-"} />
             <DetailItem label="最后错误" value={token.last_error || "-"} code />
+          </div>
+          <div className="flex items-start gap-3 rounded-lg border bg-muted/24 p-3">
+            <button
+              aria-checked={token.codex_fingerprint_enabled !== false}
+              aria-label="开启 Codex 指纹收敛"
+              className={cn(
+                "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                token.codex_fingerprint_enabled !== false ? "border-primary bg-primary" : "border-input bg-muted",
+                fingerprintBusy && "cursor-not-allowed opacity-60",
+              )}
+              disabled={fingerprintBusy}
+              onClick={() => void updateFingerprint(token.codex_fingerprint_enabled === false)}
+              role="switch"
+              type="button"
+            >
+              <span
+                className={cn(
+                  "pointer-events-none block size-4 rounded-full bg-background shadow-sm transition-transform",
+                  token.codex_fingerprint_enabled !== false ? "translate-x-4" : "translate-x-0.5",
+                )}
+              />
+            </button>
+            <div className="grid gap-1">
+              <div className="font-medium text-sm">开启 Codex 指纹收敛</div>
+              <p className="text-muted-foreground text-xs">默认开启；关闭后此账号的请求保留客户端原始指纹字段。</p>
+            </div>
           </div>
           {probeResult && (
             <Alert variant="info">

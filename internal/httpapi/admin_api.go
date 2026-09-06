@@ -414,18 +414,19 @@ func (a *App) patchToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		Remark              *string `json:"remark"`
-		PlanType            *string `json:"plan_type"`
-		Email               *string `json:"email"`
-		AccountID           *string `json:"account_id"`
-		Source              *string `json:"source"`
-		SourceFile          *string `json:"source_file"`
-		IsActive            *bool   `json:"is_active"`
-		ShareEnabled        *bool   `json:"share_enabled"`
-		ShareEnabledCamel   *bool   `json:"shareEnabled"`
-		ShareStatus         *string `json:"share_status"`
-		ShareStatusCamel    *string `json:"shareStatus"`
-		ShareDisabledReason *string `json:"share_disabled_reason"`
+		Remark                  *string `json:"remark"`
+		PlanType                *string `json:"plan_type"`
+		Email                   *string `json:"email"`
+		AccountID               *string `json:"account_id"`
+		Source                  *string `json:"source"`
+		SourceFile              *string `json:"source_file"`
+		IsActive                *bool   `json:"is_active"`
+		ShareEnabled            *bool   `json:"share_enabled"`
+		ShareEnabledCamel       *bool   `json:"shareEnabled"`
+		ShareStatus             *string `json:"share_status"`
+		ShareStatusCamel        *string `json:"shareStatus"`
+		ShareDisabledReason     *string `json:"share_disabled_reason"`
+		CodexFingerprintEnabled *bool   `json:"codex_fingerprint_enabled"`
 	}
 	if err := decodeJSON(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -436,6 +437,7 @@ func (a *App) patchToken(w http.ResponseWriter, r *http.Request) {
 	token, err := a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{
 		TokenID: id, Remark: payload.Remark, PlanType: payload.PlanType, Email: payload.Email,
 		AccountID: payload.AccountID, Source: payload.Source, SourceFile: payload.SourceFile, IsActive: payload.IsActive,
+		CodexFingerprintEnabled: payload.CodexFingerprintEnabled,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, errors.New("token not found"))

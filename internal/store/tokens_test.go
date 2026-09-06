@@ -28,6 +28,12 @@ func (r fakeTokenRow) Scan(dest ...any) error {
 			}
 		case *bool:
 			*target = value.(bool)
+		case *sql.NullBool:
+			if value == nil {
+				*target = sql.NullBool{}
+			} else {
+				*target = sql.NullBool{Bool: value.(bool), Valid: true}
+			}
 		case **time.Time:
 			*target, _ = value.(*time.Time)
 		case *time.Time:
@@ -393,6 +399,7 @@ func TestScanTokenAllowsMissingSecretColumns(t *testing.T) {
 		nil,
 		now,
 		now,
+		true,
 	}})
 	if err != nil {
 		t.Fatalf("scanToken returned error: %v", err)

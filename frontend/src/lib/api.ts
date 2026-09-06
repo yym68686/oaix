@@ -94,6 +94,7 @@ export type TokenItem = {
   sub2api_usage_stale?: boolean;
   quota?: TokenQuotaSnapshot | null;
   quota_fetch_state?: TokenQuotaFetchState | null;
+  codex_fingerprint_enabled?: boolean;
 };
 
 export type TokenObservedCostItem = {
@@ -751,6 +752,10 @@ export const api = {
     }
     return postJSON<Record<string, unknown>>(`/admin/tokens/${id}/remark`, { remark });
   },
+  updateCodexFingerprint: (id: number, enabled: boolean, scope: TokenAPIScope = "auto") =>
+    patchJSON<Record<string, unknown>>(tokenScopedPath(`/api/tokens/${id}`, `/admin/tokens/${id}`, scope), {
+      codex_fingerprint_enabled: enabled,
+    }),
   probeToken: (id: number, payload: Record<string, unknown> = {}, scope: TokenAPIScope = "auto") =>
     postJSON<TokenProbeResponse>(tokenScopedPath(`/api/tokens/${id}/probe`, `/admin/tokens/${id}/probe`, scope), payload),
   deleteToken: (id: number, scope: TokenAPIScope = "auto") =>

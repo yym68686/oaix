@@ -96,8 +96,8 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 }
 
 func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
-	if SchemaVersion != 23 {
-		t.Fatalf("unexpected schema version: got %d want 23", SchemaVersion)
+	if SchemaVersion != 24 {
+		t.Fatalf("unexpected schema version: got %d want 24", SchemaVersion)
 	}
 
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
@@ -121,6 +121,17 @@ func TestMigrationAddsRecoverableAPIKeyCiphertext(t *testing.T) {
 	migration, ok := startupMigrations[23]
 	if !ok || len(migration.statements) != 1 || migration.statements[0] != addAPIKeyCiphertext {
 		t.Fatalf("startup migration 23 = %#v, want additive API key ciphertext migration", migration)
+	}
+}
+
+func TestMigrationAddsCodexFingerprintToggle(t *testing.T) {
+	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))
+	if !strings.Contains(joined, "codex_fingerprint_enabled boolean not null default true") {
+		t.Fatal("full migration must default Codex fingerprint convergence to enabled")
+	}
+	migration, ok := startupMigrations[24]
+	if !ok || len(migration.statements) != 1 || !strings.Contains(strings.ToLower(migration.statements[0]), "add column if not exists codex_fingerprint_enabled") {
+		t.Fatalf("startup migration 24 = %#v, want additive Codex fingerprint toggle migration", migration)
 	}
 }
 

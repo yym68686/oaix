@@ -47,6 +47,16 @@ func TestCodexFingerprintSessionModeDerivations(t *testing.T) {
 	}
 }
 
+func TestCodexFingerprintCanBeDisabledPerToken(t *testing.T) {
+	accountID := "acct-disabled"
+	enabled := false
+	claim := fingerprintTestClaim(8, &accountID)
+	claim.Token.Token.CodexFingerprintEnabled = &enabled
+	if got := resolveCodexFingerprintIDs(claim, &CodexFingerprintContext{TurnID: "turn", TurnStartedAt: 1}); got != nil {
+		t.Fatalf("disabled token unexpectedly received fingerprint IDs: %+v", got)
+	}
+}
+
 func TestCodexFingerprintFallsBackToSessionThreadWithoutClientSession(t *testing.T) {
 	claim := fingerprintTestClaim(9, nil)
 	ids := resolveCodexFingerprintIDs(claim, &CodexFingerprintContext{TurnID: "turn", TurnStartedAt: 1})

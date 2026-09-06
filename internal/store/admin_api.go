@@ -14,14 +14,15 @@ import (
 )
 
 type TokenMetadataUpdate struct {
-	TokenID    int64
-	Remark     *string
-	PlanType   *string
-	Email      *string
-	AccountID  *string
-	Source     *string
-	SourceFile *string
-	IsActive   *bool
+	TokenID                 int64
+	Remark                  *string
+	PlanType                *string
+	Email                   *string
+	AccountID               *string
+	Source                  *string
+	SourceFile              *string
+	IsActive                *bool
+	CodexFingerprintEnabled *bool
 }
 
 type TokenRefreshHistoryItem struct {
@@ -153,9 +154,10 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		    account_id = case when $8::boolean then nullif($9, '') else account_id end,
 		    source_file = case when $10::boolean then nullif($11, '') else source_file end,
 		    is_active = case when $12::boolean then $13 else is_active end,
+		    codex_fingerprint_enabled = case when $14::boolean then $15 else codex_fingerprint_enabled end,
 		    disabled_at = case when $12::boolean and $13 then null when $12::boolean and not $13 then coalesce(disabled_at, now()) else disabled_at end,
 		    raw_payload = case
-		      when $14::jsonb <> '{}'::jsonb then coalesce(raw_payload::jsonb, '{}'::jsonb) || $14::jsonb
+		      when $16::jsonb <> '{}'::jsonb then coalesce(raw_payload::jsonb, '{}'::jsonb) || $16::jsonb
 		      else raw_payload::jsonb
 		    end,
 		    updated_at = now()
@@ -163,7 +165,7 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
-		          last_used_at, last_error, created_at, updated_at
+		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 	`, update.TokenID,
 		update.Remark != nil, stringPtrValue(update.Remark),
 		update.PlanType != nil, stringPtrValue(update.PlanType),
@@ -171,6 +173,7 @@ func (s *Store) UpdateTokenMetadata(ctx context.Context, update TokenMetadataUpd
 		update.AccountID != nil, stringPtrValue(update.AccountID),
 		update.SourceFile != nil, stringPtrValue(update.SourceFile),
 		update.IsActive != nil, boolPtrValue(update.IsActive),
+		update.CodexFingerprintEnabled != nil, boolPtrValue(update.CodexFingerprintEnabled),
 		jsonBytes(sourcePayload),
 	)
 	token, err := scanTokenWithSharing(row)
@@ -192,7 +195,7 @@ func (s *Store) SetTokenCooldown(ctx context.Context, tokenID int64, until time.
 			    updated_at = now()
 			where id = $1 and merged_into_token_id is null
 			returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-			          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+			          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 		`, tokenID, until, truncate(reason, 4000))
 		updated, err := scanToken(row)
 		if err != nil {
@@ -217,7 +220,7 @@ func (s *Store) ClearTokenCooldown(ctx context.Context, tokenID int64) (*Token, 
 		set cooldown_until = null, updated_at = now()
 		where id = $1 and merged_into_token_id is null
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 	`, tokenID)
 	token, err := scanToken(row)
 	if err != nil {
@@ -233,7 +236,7 @@ func (s *Store) ClearTokenLastError(ctx context.Context, tokenID int64) (*Token,
 		set last_error = null, updated_at = now()
 		where id = $1 and merged_into_token_id is null
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 	`, tokenID)
 	token, err := scanToken(row)
 	if err != nil {
@@ -298,7 +301,7 @@ func (s *Store) UnmergeToken(ctx context.Context, tokenID int64) (*Token, error)
 		    updated_at = now()
 		where id = $1
 		returning id, coalesce(owner_user_id, 0), email, account_id, access_token, refresh_token, plan_type, remark, source_file,
-		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at
+		          is_active, cooldown_until, disabled_at, last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 	`, tokenID)
 	token, err := scanToken(row)
 	if err != nil {

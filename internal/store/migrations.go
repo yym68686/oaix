@@ -100,6 +100,9 @@ var startupMigrations = map[int]startupMigration{
 	23: {statements: []string{
 		addAPIKeyCiphertext,
 	}},
+	24: {statements: []string{
+		`alter table codex_tokens add column if not exists codex_fingerprint_enabled boolean not null default true`,
+	}},
 }
 
 var migrationStatements = []string{
@@ -178,6 +181,7 @@ var migrationStatements = []string{
 		marketplace_price_bps integer,
 		marketplace_price_updated_at timestamptz,
 		marketplace_price_source varchar(64) not null default 'owner_default',
+		codex_fingerprint_enabled boolean not null default true,
 		last_used_at timestamptz,
 		last_error text,
 		created_at timestamptz not null default now(),

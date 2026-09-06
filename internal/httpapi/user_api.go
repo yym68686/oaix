@@ -800,13 +800,14 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		Remark              *string `json:"remark"`
-		IsActive            *bool   `json:"is_active"`
-		ShareEnabled        *bool   `json:"share_enabled"`
-		ShareEnabledCamel   *bool   `json:"shareEnabled"`
-		ShareStatus         *string `json:"share_status"`
-		ShareStatusCamel    *string `json:"shareStatus"`
-		ShareDisabledReason *string `json:"share_disabled_reason"`
+		Remark                  *string `json:"remark"`
+		IsActive                *bool   `json:"is_active"`
+		ShareEnabled            *bool   `json:"share_enabled"`
+		ShareEnabledCamel       *bool   `json:"shareEnabled"`
+		ShareStatus             *string `json:"share_status"`
+		ShareStatusCamel        *string `json:"shareStatus"`
+		ShareDisabledReason     *string `json:"share_disabled_reason"`
+		CodexFingerprintEnabled *bool   `json:"codex_fingerprint_enabled"`
 	}
 	_ = decodeJSON(r, &payload)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -827,6 +828,8 @@ func (a *App) patchMyToken(w http.ResponseWriter, r *http.Request) {
 		token, err = a.store.UpdateTokenRemarkScoped(ctx, scope, id, *payload.Remark)
 	} else if payload.IsActive != nil {
 		token, err = a.store.SetTokenActiveScoped(ctx, scope, id, *payload.IsActive, *payload.IsActive)
+	} else if payload.CodexFingerprintEnabled != nil {
+		token, err = a.store.UpdateTokenMetadata(ctx, store.TokenMetadataUpdate{TokenID: id, CodexFingerprintEnabled: payload.CodexFingerprintEnabled})
 	} else {
 		token, err = a.store.GetTokenScoped(ctx, scope, id)
 	}

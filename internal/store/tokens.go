@@ -63,6 +63,7 @@ type Token struct {
 	ShareReason               *string                    `json:"share_disabled_reason,omitempty"`
 	ShareEnabledAt            *time.Time                 `json:"share_enabled_at,omitempty"`
 	ShareDisabledAt           *time.Time                 `json:"share_disabled_at,omitempty"`
+	CodexFingerprintEnabled   *bool                      `json:"codex_fingerprint_enabled,omitempty"`
 	MarketplacePriceBPS       *int                       `json:"marketplace_price_bps,omitempty"`
 	MarketplacePriceUpdatedAt *time.Time                 `json:"marketplace_price_updated_at,omitempty"`
 	MarketplacePriceSource    string                     `json:"marketplace_price_source,omitempty"`
@@ -70,6 +71,13 @@ type Token struct {
 	LastError                 *string                    `json:"last_error,omitempty"`
 	CreatedAt                 time.Time                  `json:"created_at"`
 	UpdatedAt                 time.Time                  `json:"updated_at"`
+}
+
+// CodexFingerprintIsEnabled preserves the historical default for in-memory
+// tokens while allowing the persisted per-account switch to explicitly turn
+// convergence off.
+func (t Token) CodexFingerprintIsEnabled() bool {
+	return t.CodexFingerprintEnabled == nil || *t.CodexFingerprintEnabled
 }
 
 func (t Token) IsAgentIdentity() bool {
@@ -263,7 +271,8 @@ func (s *Store) ListAvailableTokensScoped(ctx context.Context, scope ResourceSco
 		       global_models.value->'plan_models'->coalesce(
 		         nullif(regexp_replace(lower(btrim(t.plan_type)), '^chatgpt_', ''), ''),
 		         'unknown'
-		       )
+		       ),
+		       t.codex_fingerprint_enabled
 		from codex_tokens t
 		left join token_agent_identities ai on ai.token_id = t.id
 		left join user_settings concurrency
@@ -330,7 +339,7 @@ func (s *Store) ListTokensScoped(ctx context.Context, scope ResourceScope, opts 
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		       last_used_at, last_error, created_at, updated_at
+		       last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 		from codex_tokens
 		where %s
 		order by %s
@@ -507,7 +516,7 @@ func (s *Store) ListTokensByIDsScoped(ctx context.Context, scope ResourceScope, 
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		       last_used_at, last_error, created_at, updated_at
+		       last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 		from codex_tokens
 		where id = any($1::integer[])
 		  and merged_into_token_id is null
@@ -1051,7 +1060,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 					          is_active, cooldown_until, disabled_at,
 					          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 					          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-					          last_used_at, last_error, created_at, updated_at
+					          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 				`, existingID, accessToken, accountID, email, planType, nullableString(source), idToken, tokenType, jsonBytes(storedPayload), isActive, lastError, refreshToken, lastRefresh, shareExplicit, shareEnabled, shareStatus, isAgentIdentity)
 			token, scanErr := scanTokenWithSharing(row)
 			if scanErr != nil {
@@ -1114,7 +1123,7 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 				          is_active, cooldown_until, disabled_at,
 				          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 				          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-				          last_used_at, last_error, created_at, updated_at
+				          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 			`, ownerUserID, email, accountID, idToken, accessToken, refreshToken, jsonBytes(storedPayload), planType, nullableString(source), tokenType, isActive, lastError, lastRefresh, shareEnabled, shareStatus, shareExplicit)
 		token, scanErr := scanTokenWithSharing(row)
 		if scanErr != nil {
@@ -1697,7 +1706,7 @@ func (s *Store) SetTokenActiveScoped(ctx context.Context, scope ResourceScope, t
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		          last_used_at, last_error, created_at, updated_at
+		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 	`, args...)
 	token, err := scanTokenWithSharing(row)
 	if err != nil {
@@ -1759,7 +1768,7 @@ func (s *Store) GetTokenScoped(ctx context.Context, scope ResourceScope, tokenID
 		       is_active, cooldown_until, disabled_at,
 		       share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		       marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		       last_used_at, last_error, created_at, updated_at
+		       last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 		from codex_tokens
 		where id = $1 and merged_into_token_id is null
 		  and `+ownerWhere, args...)
@@ -1808,7 +1817,7 @@ func (s *Store) UpdateTokenRemarkScoped(ctx context.Context, scope ResourceScope
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		          last_used_at, last_error, created_at, updated_at
+		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 	`, args...)
 	token, err := scanTokenWithSharing(row)
 	if err != nil {
@@ -1834,7 +1843,7 @@ func (s *Store) SetTokenSharingScoped(ctx context.Context, scope ResourceScope, 
 		          is_active, cooldown_until, disabled_at,
 		          share_enabled, share_status, share_disabled_reason, share_enabled_at, share_disabled_at,
 		          marketplace_price_bps, marketplace_price_updated_at, marketplace_price_source,
-		          last_used_at, last_error, created_at, updated_at
+		          last_used_at, last_error, created_at, updated_at, codex_fingerprint_enabled
 	`, args...)
 	token, err := scanTokenWithSharing(row)
 	if err != nil {
@@ -2166,6 +2175,7 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 		var shareStatus sql.NullString
 		var marketplacePriceBPS sql.NullInt64
 		var marketplacePriceSource sql.NullString
+		var fingerprintEnabled sql.NullBool
 		err := rows.Scan(
 			&token.ID,
 			&token.OwnerUserID,
@@ -2191,6 +2201,7 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 			&token.LastError,
 			&token.CreatedAt,
 			&token.UpdatedAt,
+			&fingerprintEnabled,
 		)
 		if err != nil {
 			return nil, err
@@ -2210,6 +2221,10 @@ func scanAvailableTokens(rows pgx.Rows) ([]Token, error) {
 		}
 		if marketplacePriceSource.Valid {
 			token.MarketplacePriceSource = marketplacePriceSource.String
+		}
+		if fingerprintEnabled.Valid {
+			value := fingerprintEnabled.Bool
+			token.CodexFingerprintEnabled = &value
 		}
 		tokens = append(tokens, token)
 	}
@@ -2234,6 +2249,7 @@ func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
 		var userActiveStreamCap sql.NullString
 		var userAllowedModels sql.NullString
 		var globalAllowedModels sql.NullString
+		var fingerprintEnabled sql.NullBool
 		err := rows.Scan(
 			&token.ID,
 			&token.OwnerUserID,
@@ -2268,6 +2284,7 @@ func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
 			&userActiveStreamCap,
 			&userAllowedModels,
 			&globalAllowedModels,
+			&fingerprintEnabled,
 		)
 		if err != nil {
 			return nil, err
@@ -2287,6 +2304,10 @@ func scanRuntimeTokens(rows pgx.Rows) ([]Token, error) {
 		}
 		if marketplacePriceSource.Valid {
 			token.MarketplacePriceSource = marketplacePriceSource.String
+		}
+		if fingerprintEnabled.Valid {
+			value := fingerprintEnabled.Bool
+			token.CodexFingerprintEnabled = &value
 		}
 		if userActiveStreamCap.Valid {
 			if parsed, ok := parseInt64Value(userActiveStreamCap.String); ok {
@@ -2352,6 +2373,7 @@ func scanToken(row rowScanner) (Token, error) {
 	var token Token
 	var accessToken sql.NullString
 	var refreshToken sql.NullString
+	var fingerprintEnabled sql.NullBool
 	err := row.Scan(
 		&token.ID,
 		&token.OwnerUserID,
@@ -2369,12 +2391,17 @@ func scanToken(row rowScanner) (Token, error) {
 		&token.LastError,
 		&token.CreatedAt,
 		&token.UpdatedAt,
+		&fingerprintEnabled,
 	)
 	if accessToken.Valid {
 		token.AccessToken = accessToken.String
 	}
 	if refreshToken.Valid {
 		token.RefreshToken = refreshToken.String
+	}
+	if fingerprintEnabled.Valid {
+		value := fingerprintEnabled.Bool
+		token.CodexFingerprintEnabled = &value
 	}
 	return token, err
 }
@@ -2386,6 +2413,7 @@ func scanTokenWithSharing(row rowScanner) (Token, error) {
 	var shareStatus sql.NullString
 	var marketplacePriceBPS sql.NullInt64
 	var marketplacePriceSource sql.NullString
+	var fingerprintEnabled sql.NullBool
 	err := row.Scan(
 		&token.ID,
 		&token.OwnerUserID,
@@ -2411,6 +2439,7 @@ func scanTokenWithSharing(row rowScanner) (Token, error) {
 		&token.LastError,
 		&token.CreatedAt,
 		&token.UpdatedAt,
+		&fingerprintEnabled,
 	)
 	if accessToken.Valid {
 		token.AccessToken = accessToken.String
@@ -2427,6 +2456,10 @@ func scanTokenWithSharing(row rowScanner) (Token, error) {
 	}
 	if marketplacePriceSource.Valid {
 		token.MarketplacePriceSource = marketplacePriceSource.String
+	}
+	if fingerprintEnabled.Valid {
+		value := fingerprintEnabled.Bool
+		token.CodexFingerprintEnabled = &value
 	}
 	return token, err
 }
