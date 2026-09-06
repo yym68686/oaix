@@ -1506,7 +1506,9 @@ func (a *App) experimentalResponses(w http.ResponseWriter, r *http.Request) {
 		if sessionID := boundedExperimentValue(r.URL.Query().Get("session_id"), 256); sessionID != "" {
 			r = r.Clone(r.Context())
 			r.Header = r.Header.Clone()
-			r.Header.Set("session-id", sessionID)
+			// Prompt-cache experiments use the legacy underscore spelling that
+			// the routing layer recognizes; this remains request-scoped.
+			r.Header.Set("Session_id", sessionID)
 		}
 		a.proxyRequest(w, r, intent)
 		return
