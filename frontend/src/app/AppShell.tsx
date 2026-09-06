@@ -262,19 +262,22 @@ export function AppShell({
               <DatabaseIcon className="size-6 shrink-0" />
               {!collapsed && <span className="font-heading text-xl font-semibold tracking-tight">oaix</span>}
             </a>
-            <Button aria-expanded={!collapsed} aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
-              onClick={toggleSidebar} size="icon-sm" title={collapsed ? "展开侧边栏" : "折叠侧边栏"} variant="ghost">
-              {collapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
-            </Button>
+            <div className={cn("flex shrink-0 items-center gap-1", collapsed && "flex-col")}>
+              <Button aria-label="刷新数据" className="text-muted-foreground hover:text-foreground" onClick={onRefresh}
+                size="icon-sm" title="刷新数据" variant="ghost">
+                <RefreshCwIcon className={cn(loading && "animate-spin motion-reduce:animate-none")} />
+              </Button>
+              <Button aria-expanded={!collapsed} aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
+                onClick={toggleSidebar} size="icon-sm" title={collapsed ? "展开侧边栏" : "折叠侧边栏"} variant="ghost">
+                {collapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
+              </Button>
+            </div>
           </div>
           <div className={cn("min-h-0 flex-1 overflow-y-auto px-3 pb-5 oaix-scrollbar", collapsed && "px-4")}>{navigation()}</div>
-          <div className={cn("grid shrink-0 gap-2 border-t bg-background/30 p-3", collapsed && "justify-items-center px-4")}>
-            <Button aria-label="刷新数据" className={cn("justify-start gap-3 text-muted-foreground", collapsed && "size-9 justify-center px-0")}
-              onClick={onRefresh} size="sm" title="刷新数据" variant="ghost">
-              <RefreshCwIcon className={cn(loading && "animate-spin motion-reduce:animate-none")} />
-              {!collapsed && "刷新数据"}
-            </Button>
-            {accountMenu(collapsed)}
+          <div className={cn("shrink-0 border-t bg-background/20 p-3", collapsed && "px-3")}>
+            <div className={cn("rounded-xl bg-sidebar-accent/45 p-1", collapsed && "bg-transparent p-0")}>
+              {accountMenu(collapsed)}
+            </div>
           </div>
         </aside>
         <div className="min-w-0">
