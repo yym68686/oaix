@@ -926,12 +926,12 @@ export function SettingsPage({
           </PageSectionAction>
         </PageSectionHeader>
         <PageSectionPanel className="grid gap-4">
-          <div className="grid gap-2 md:grid-cols-[minmax(180px,.35fr)_minmax(0,1fr)]">
-            <div className="grid gap-2">
+          <div className="grid min-w-0 grid-cols-1 gap-2 md:grid-cols-[minmax(180px,.35fr)_minmax(0,1fr)]">
+            <div className="grid min-w-0 gap-2">
               <Label htmlFor="settings-key">Key</Label>
               <Input id="settings-key" nativeInput onChange={(event) => setSettingKey(event.currentTarget.value)} placeholder="例如 token_selection" value={settingKey} />
             </div>
-            <div className="grid gap-2">
+            <div className="grid min-w-0 gap-2">
               <Label htmlFor="settings-value">Value JSON</Label>
               <Textarea id="settings-value" onChange={(event) => setSettingValue(event.currentTarget.value)} rows={4} spellCheck={false} value={settingValue} />
             </div>
@@ -943,11 +943,11 @@ export function SettingsPage({
           {error ? (
             <ErrorAlert title="设置载入失败" message={error} />
           ) : (
-            <div className="grid gap-2">
+            <div className="grid min-w-0 gap-2">
               {loading && !items.length && <LoadingState compact label="正在载入设置项" />}
               {items.map((item) => (
-                <div className="rounded-lg border bg-muted/40 p-3" key={item.key}>
-                  <div className="font-medium text-sm">{item.key}</div>
+                <div className="min-w-0 rounded-lg border bg-muted/40 p-3" key={item.key}>
+                  <div className="break-all font-medium text-sm">{item.key}</div>
                   <pre className="mt-2 max-h-56 overflow-auto rounded-lg bg-background p-3 text-xs oaix-scrollbar">
                     {JSON.stringify(item.value ?? null, null, 2)}
                   </pre>
