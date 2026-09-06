@@ -118,6 +118,7 @@ type RequestIntent struct {
 	// CodexFingerprintEnabled is an experiment-only, request-scoped override.
 	// nil preserves the account's persisted default.
 	CodexFingerprintEnabled    *bool
+	CodexFingerprintMode       string
 	Experiment                 bool
 	UpstreamUserAgent          string
 	UpstreamOriginator         string
@@ -371,7 +372,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 	initialSessionIDHash := promptString(promptCacheContext, func(c *PromptCacheContext) string { return shortHash(c.SessionID, 64) })
 	initialSessionIDSource := promptString(promptCacheContext, func(c *PromptCacheContext) string { return c.SessionIDSource })
 	if codexFingerprintContext != nil || deferNonRoutingPreparation && codexFingerprintEligible(intent) {
-		timing["codex_fingerprint_mode"] = "session"
+		timing["codex_fingerprint_mode"] = codexFingerprintModeLabel(intent)
 		timing["codex_client_session_present"] = extractClientSessionID(r.Header) != ""
 		initialSessionIDHash = nil
 		initialSessionIDSource = nil
@@ -534,7 +535,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 				return
 			}
 			if codexFingerprintContext != nil {
-				timing["codex_fingerprint_mode"] = "session"
+				timing["codex_fingerprint_mode"] = codexFingerprintModeLabel(intent)
 				timing["codex_client_session_present"] = codexFingerprintContext.ClientSessionID != ""
 			}
 			if intent.ToolSearchKeyFixes > 0 {

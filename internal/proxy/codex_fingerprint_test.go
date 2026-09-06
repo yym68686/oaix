@@ -57,6 +57,22 @@ func TestCodexFingerprintCanBeDisabledPerToken(t *testing.T) {
 	}
 }
 
+func TestCodexFingerprintExperimentModes(t *testing.T) {
+	claim := fingerprintTestClaim(12, nil)
+	device := resolveCodexFingerprintIDs(claim, &CodexFingerprintContext{ModeOverride: "device", TurnID: "turn", TurnStartedAt: 1})
+	if device == nil || device.InstallationID == "" || device.SessionID != "" || device.ThreadID != "" {
+		t.Fatalf("device mode IDs = %+v", device)
+	}
+	full := resolveCodexFingerprintIDs(claim, &CodexFingerprintContext{ModeOverride: "full", ClientSessionID: "client", TurnID: "turn", TurnStartedAt: 1})
+	if full == nil || full.ThreadID != full.SessionID || full.WindowID != full.SessionID+":0" {
+		t.Fatalf("full mode IDs = %+v", full)
+	}
+	off := resolveCodexFingerprintIDs(claim, &CodexFingerprintContext{ModeOverride: "off", TurnID: "turn", TurnStartedAt: 1})
+	if off != nil {
+		t.Fatalf("off mode unexpectedly produced IDs: %+v", off)
+	}
+}
+
 func TestCodexFingerprintFallsBackToSessionThreadWithoutClientSession(t *testing.T) {
 	claim := fingerprintTestClaim(9, nil)
 	ids := resolveCodexFingerprintIDs(claim, &CodexFingerprintContext{TurnID: "turn", TurnStartedAt: 1})

@@ -1504,6 +1504,19 @@ func (a *App) experimentalResponses(w http.ResponseWriter, r *http.Request) {
 			}
 			intent.CodexFingerprintEnabled = &enabled
 		}
+		if raw := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("fingerprint_mode"))); raw != "" {
+			switch raw {
+			case "off", "device", "session", "full":
+				if intent.CodexFingerprintEnabled != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "fingerprint_mode cannot be combined with fingerprint_enabled"})
+					return
+				}
+				intent.CodexFingerprintMode = raw
+			default:
+				writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "fingerprint_mode must be off, device, session, or full"})
+				return
+			}
+		}
 		intent.UpstreamUserAgent = boundedExperimentValue(r.URL.Query().Get("user_agent"), 512)
 		intent.UpstreamOriginator = boundedExperimentValue(r.URL.Query().Get("originator"), 128)
 		for key, dst := range map[string]*bool{

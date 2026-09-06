@@ -21,6 +21,7 @@ type CodexFingerprintContext struct {
 	TurnID          string
 	TurnStartedAt   int64
 	EnabledOverride *bool
+	ModeOverride    string
 }
 
 type codexFingerprintIDs struct {
@@ -43,6 +44,7 @@ func buildCodexFingerprintContext(headers http.Header, intent RequestIntent) *Co
 		TurnID:          newUUIDv7(),
 		TurnStartedAt:   time.Now().UnixMilli(),
 		EnabledOverride: intent.CodexFingerprintEnabled,
+		ModeOverride:    intent.CodexFingerprintMode,
 	}
 }
 
@@ -51,6 +53,13 @@ func codexFingerprintEligible(intent RequestIntent) bool {
 		return false
 	}
 	return intent.Endpoint == "/v1/responses" || intent.UpstreamEndpoint == "/v1/responses"
+}
+
+func codexFingerprintModeLabel(intent RequestIntent) string {
+	if mode := strings.ToLower(strings.TrimSpace(intent.CodexFingerprintMode)); mode != "" {
+		return mode
+	}
+	return "session"
 }
 
 func extractClientSessionID(headers http.Header) string {
@@ -67,6 +76,10 @@ func resolveCodexFingerprintIDs(claim *tokens.Claim, context *CodexFingerprintCo
 	if claim == nil || context == nil || claim.TokenID() <= 0 {
 		return nil
 	}
+	mode := strings.ToLower(strings.TrimSpace(context.ModeOverride))
+	if mode == "off" {
+		return nil
+	}
 	if context.EnabledOverride != nil {
 		if !*context.EnabledOverride {
 			return nil
@@ -74,11 +87,17 @@ func resolveCodexFingerprintIDs(claim *tokens.Claim, context *CodexFingerprintCo
 	} else if claim.Token != nil && !claim.Token.Token.CodexFingerprintIsEnabled() {
 		return nil
 	}
+	if mode == "" {
+		mode = "session"
+	}
 	accountSeed := codexFingerprintAccountSeed(claim)
 	installationID := deterministicUUID("oaix:codex-install-id:v1:" + accountSeed)
+	if mode == "device" {
+		return &codexFingerprintIDs{InstallationID: installationID}
+	}
 	sessionID := deterministicUUID("oaix:codex-session-id:v1:" + accountSeed)
 	threadID := sessionID
-	if context.ClientSessionID != "" {
+	if mode != "full" && context.ClientSessionID != "" {
 		threadID = deterministicUUID("oaix:codex-thread-id:v1:" + accountSeed + ":" + context.ClientSessionID)
 	}
 	return &codexFingerprintIDs{
@@ -112,20 +131,40 @@ func applyCodexFingerprintHeaders(headers http.Header, ids *codexFingerprintIDs)
 	if headers == nil || ids == nil {
 		return
 	}
-	headers.Set("x-codex-installation-id", ids.InstallationID)
-	headers.Set("x-codex-window-id", ids.WindowID)
-	headers.Set("x-client-request-id", ids.ThreadID)
-	headers.Set("session-id", ids.SessionID)
-	headers.Set("session_id", ids.SessionID)
-	headers.Set("thread-id", ids.ThreadID)
-	rewriteCodexTurnMetadata(headers, map[string]any{
-		"installation_id":         ids.InstallationID,
-		"session_id":              ids.SessionID,
-		"thread_id":               ids.ThreadID,
-		"turn_id":                 ids.TurnID,
-		"window_id":               ids.WindowID,
-		"turn_started_at_unix_ms": ids.TurnStartedAt,
-	})
+	if ids.InstallationID != "" {
+		headers.Set("x-codex-installation-id", ids.InstallationID)
+	}
+	if ids.WindowID != "" {
+		headers.Set("x-codex-window-id", ids.WindowID)
+	}
+	if ids.ThreadID != "" {
+		headers.Set("x-client-request-id", ids.ThreadID)
+		headers.Set("thread-id", ids.ThreadID)
+	}
+	if ids.SessionID != "" {
+		headers.Set("session-id", ids.SessionID)
+		headers.Set("session_id", ids.SessionID)
+	}
+	fields := map[string]any{}
+	if ids.InstallationID != "" {
+		fields["installation_id"] = ids.InstallationID
+	}
+	if ids.SessionID != "" {
+		fields["session_id"] = ids.SessionID
+	}
+	if ids.ThreadID != "" {
+		fields["thread_id"] = ids.ThreadID
+	}
+	if ids.TurnID != "" {
+		fields["turn_id"] = ids.TurnID
+	}
+	if ids.WindowID != "" {
+		fields["window_id"] = ids.WindowID
+	}
+	if ids.TurnStartedAt != 0 {
+		fields["turn_started_at_unix_ms"] = ids.TurnStartedAt
+	}
+	rewriteCodexTurnMetadata(headers, fields)
 }
 
 func rewriteCodexTurnMetadata(headers http.Header, fields map[string]any) {
@@ -172,19 +211,41 @@ func applyCodexFingerprintDocument(document *RequestDocument, ids *codexFingerpr
 	if metadata == nil {
 		metadata = make(map[string]any)
 	}
-	metadata["x-codex-installation-id"] = ids.InstallationID
-	metadata["session_id"] = ids.SessionID
-	metadata["thread_id"] = ids.ThreadID
-	metadata["turn_id"] = ids.TurnID
-	metadata["x-codex-window-id"] = ids.WindowID
-	rewriteEmbeddedCodexTurnMetadata(metadata, map[string]any{
-		"installation_id":         ids.InstallationID,
-		"session_id":              ids.SessionID,
-		"thread_id":               ids.ThreadID,
-		"turn_id":                 ids.TurnID,
-		"window_id":               ids.WindowID,
-		"turn_started_at_unix_ms": ids.TurnStartedAt,
-	})
+	if ids.InstallationID != "" {
+		metadata["x-codex-installation-id"] = ids.InstallationID
+	}
+	if ids.SessionID != "" {
+		metadata["session_id"] = ids.SessionID
+	}
+	if ids.ThreadID != "" {
+		metadata["thread_id"] = ids.ThreadID
+	}
+	if ids.TurnID != "" {
+		metadata["turn_id"] = ids.TurnID
+	}
+	if ids.WindowID != "" {
+		metadata["x-codex-window-id"] = ids.WindowID
+	}
+	fields := map[string]any{}
+	if ids.InstallationID != "" {
+		fields["installation_id"] = ids.InstallationID
+	}
+	if ids.SessionID != "" {
+		fields["session_id"] = ids.SessionID
+	}
+	if ids.ThreadID != "" {
+		fields["thread_id"] = ids.ThreadID
+	}
+	if ids.TurnID != "" {
+		fields["turn_id"] = ids.TurnID
+	}
+	if ids.WindowID != "" {
+		fields["window_id"] = ids.WindowID
+	}
+	if ids.TurnStartedAt != 0 {
+		fields["turn_started_at_unix_ms"] = ids.TurnStartedAt
+	}
+	rewriteEmbeddedCodexTurnMetadata(metadata, fields)
 	payload["client_metadata"] = metadata
 	document.MarkDirty()
 	return nil
