@@ -287,6 +287,9 @@ func deriveChatPromptCacheKey(payload map[string]any) string {
 
 func promptCacheSession(headers http.Header, clientScope, promptCacheKey, affinityKey string, preferHeader bool) (string, string) {
 	explicit := strings.TrimSpace(headers.Get("Session_id"))
+	// The experiment lane may opt into a request-scoped session without
+	// changing the normal prompt-cache policy.
+	preferHeader = preferHeader || strings.EqualFold(strings.TrimSpace(headers.Get("X-OAIX-Experiment")), "true")
 	seed := promptCacheKey
 	if seed == "" {
 		seed = affinityKey

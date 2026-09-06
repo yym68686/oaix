@@ -1486,6 +1486,9 @@ func (a *App) responses(w http.ResponseWriter, r *http.Request) {
 func (a *App) experimentalResponses(w http.ResponseWriter, r *http.Request) {
 	if tokenID := queryInt64(r, "token_id", 0); tokenID > 0 {
 		w.Header().Set("X-OAIX-Experiment", "true")
+		r = r.Clone(r.Context())
+		r.Header = r.Header.Clone()
+		r.Header.Set("X-OAIX-Experiment", "true")
 		intent := proxy.RequestIntent{
 			Endpoint:      "/v1/responses",
 			Stream:        requestStream(r),
@@ -1504,8 +1507,6 @@ func (a *App) experimentalResponses(w http.ResponseWriter, r *http.Request) {
 		intent.UpstreamUserAgent = boundedExperimentValue(r.URL.Query().Get("user_agent"), 512)
 		intent.UpstreamOriginator = boundedExperimentValue(r.URL.Query().Get("originator"), 128)
 		if sessionID := boundedExperimentValue(r.URL.Query().Get("session_id"), 256); sessionID != "" {
-			r = r.Clone(r.Context())
-			r.Header = r.Header.Clone()
 			// Prompt-cache experiments use the legacy underscore spelling that
 			// the routing layer recognizes; this remains request-scoped.
 			r.Header.Set("Session_id", sessionID)
