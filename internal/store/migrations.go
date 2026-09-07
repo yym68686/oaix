@@ -123,6 +123,7 @@ var startupMigrations = map[int]startupMigration{
 		usageRollupsSQL,
 		currentCostsSQL,
 	}},
+	27: {statements: []string{usageRollupsSQL}},
 }
 
 var migrationStatements = []string{
@@ -822,6 +823,8 @@ var onlineMigrationStatements = []string{
 
 var downMigrationStatements = []string{
 	`drop view if exists sub2api_usage_account_current`,
+	`drop function if exists oaix_usage_exact_fallback(bigint,bigint,date,boolean)`,
+	`drop function if exists oaix_usage_unsettled_dates(date,date,datemultirange)`,
 	`drop view if exists sub2api_usage_daily_current`,
 	`drop trigger if exists oaix_current_token_cost_insert on gateway_request_logs`,
 	`drop trigger if exists oaix_current_token_cost_update on gateway_request_logs`,

@@ -41,13 +41,29 @@ func TestPerformanceSettledHistoryBenchmark(t *testing.T) {
 		 left join sub2api_usage_daily_snapshots u on u.target_id=b.target_id and u.remote_account_id=b.remote_account_id and u.usage_date=d.day::date
 		 where b.target_id=$1 and u.finalized_at is null`},
 		{"new_finalization", `select count(*) from sub2api_usage_account_current b
-		 cross join lateral unnest(datemultirange(daterange(b.through_date+1,date '2026-08-17','[)'))-b.finalized_dates) gaps(days)
-		 cross join lateral generate_series(lower(gaps.days),upper(gaps.days)-1,interval '1 day') d(day)
+		 cross join lateral oaix_usage_unsettled_dates(b.through_date,date '2026-08-17',b.finalized_dates) d(day)
 		 where b.target_id=$1`},
 		{"old_costs", `select sum(account_cost_usd)::float8 from sub2api_usage_daily_snapshots where target_id=$1`},
 		{"new_costs", `select sum(account_cost_usd)::float8 from sub2api_usage_account_current where target_id=$1`},
 	}
 	for _, query := range queries {
+		if os.Getenv("OAIX_EXPLAIN_PERFORMANCE") == "1" {
+			rows, err := db.pool.Query(ctx, "explain (analyze, buffers) "+query.sql, target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for rows.Next() {
+				var line string
+				if err := rows.Scan(&line); err != nil {
+					t.Fatal(err)
+				}
+				t.Log(query.name + ": " + line)
+			}
+			rows.Close()
+			if rows.Err() != nil {
+				t.Fatal(rows.Err())
+			}
+		}
 		var value float64
 		start := time.Now()
 		for i := 0; i < 3; i++ {

@@ -403,6 +403,12 @@ func tokenCredentialReadyWhere() string {
 	return "(coalesce(access_token, '') <> '' or exists (select 1 from token_agent_identities where token_id = codex_tokens.id))"
 }
 
+// Aggregate scans use one join instead of a correlated EXISTS costed once per
+// token. This avoids needless JIT compilation for mostly disabled pools.
+const tokenIdentityJoin = `left join (select token_id as identity_token_id from token_agent_identities) identity
+ on identity.identity_token_id=codex_tokens.id`
+const tokenJoinedCredentialReady = `(coalesce(access_token,'')<>'' or identity.identity_token_id is not null)`
+
 func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope ResourceScope) (string, []any) {
 	var filters []string
 	var args []any
@@ -550,12 +556,12 @@ func (s *Store) TokenCountsScopedAt(ctx context.Context, scope ResourceScope, as
 			count(*) filter (
 				where is_active = true
 				  and disabled_at is null
-				  and `+tokenCredentialReadyWhere()+`
+				  and `+tokenJoinedCredentialReady+`
 				  and `+tokenDisplayAvailableWhere("$1")+`
 			)::int as available,
 			count(*) filter (where is_active = true and disabled_at is null and `+tokenDisplayCoolingWhere("$1")+`)::int as cooling,
 			count(*) filter (where is_active = false or disabled_at is not null)::int as disabled
-		from codex_tokens
+		from codex_tokens `+tokenIdentityJoin+`
 		where merged_into_token_id is null
 		  and `+ownerWhere, args...).Scan(&counts.Total, &counts.Available, &counts.Cooling, &counts.Disabled)
 	return counts, err
@@ -607,14 +613,14 @@ func (s *Store) TokenPoolSummariesByOwner(ctx context.Context, ownerIDs []int64,
 			count(*) filter (
 				where is_active = true
 				  and disabled_at is null
-				  and `+tokenCredentialReadyWhere()+`
+				  and `+tokenJoinedCredentialReady+`
 				  and `+tokenDisplayAvailableWhere("$1")+`
 			)::int as available,
 			count(*) filter (where is_active = true and disabled_at is null and `+tokenDisplayCoolingWhere("$1")+`)::int as cooling,
 			count(*) filter (where is_active = false or disabled_at is not null)::int as disabled,
 			count(*) filter (where share_enabled = true and lower(coalesce(share_status, '')) = 'active')::int as shared,
 			count(*) filter (where share_enabled = false or lower(coalesce(share_status, '')) <> 'active')::int as private
-		from codex_tokens
+		from codex_tokens `+tokenIdentityJoin+`
 		where merged_into_token_id is null
 		  and owner_user_id = any($2::bigint[])
 		group by owner_user_id, 2
@@ -776,10 +782,10 @@ func (s *Store) TokenListMetadataScoped(ctx context.Context, scope ResourceScope
 		select coalesce(nullif(lower(btrim(plan_type)),''),'unknown') as plan,
 		       (`+filter+`) as matches_plan,
 		       count(*)::int,
-		       count(*) filter(where is_active and disabled_at is null and `+tokenCredentialReadyWhere()+` and `+tokenDisplayAvailableWhere(at)+`)::int,
+		       count(*) filter(where is_active and disabled_at is null and `+tokenJoinedCredentialReady+` and `+tokenDisplayAvailableWhere(at)+`)::int,
 		       count(*) filter(where is_active and disabled_at is null and `+tokenDisplayCoolingWhere(at)+`)::int,
 		       count(*) filter(where not is_active or disabled_at is not null)::int
-		from codex_tokens where merged_into_token_id is null and `+ownerWhere+`
+		from codex_tokens `+tokenIdentityJoin+` where merged_into_token_id is null and `+ownerWhere+`
 		group by plan,matches_plan`, args...)
 	if err != nil {
 		return TokenCounts{}, nil, err

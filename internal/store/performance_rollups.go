@@ -123,7 +123,7 @@ func (s *Store) BackfillCurrentTokenCosts(ctx context.Context, beforeID int64) (
 		return beforeID, 0, err
 	}
 	rows, err := s.pool.Query(ctx, `select t.id from codex_tokens t
-		where t.id < $1 and not exists(select 1 from gateway_current_token_costs c where c.token_id=t.id)
+		where t.id < $1::bigint and not exists(select 1 from gateway_current_token_costs c where c.token_id=t.id)
 		order by t.id desc limit 32`, beforeID)
 	if err != nil {
 		return beforeID, 0, err

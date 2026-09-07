@@ -107,6 +107,45 @@ for each row execute function oaix_usage_rollup_changed();
 create or replace trigger oaix_usage_check_changed after insert or update on sub2api_usage_daily_sync_state
 for each row execute function oaix_usage_checked();
 
+-- Keep the rare exact fallback behind a bounded function estimate. Inlining
+-- its historical scan for every already-ready account made PostgreSQL 18 JIT
+-- compile a large unused plan on each poll (verified with EXPLAIN ANALYZE).
+create or replace function oaix_usage_exact_fallback(p_target bigint,p_account bigint,p_through date,p_ready boolean)
+returns table(account_cost_usd numeric,standard_cost_usd numeric,user_cost_usd numeric,
+              total_requests numeric,total_tokens numeric,synced_at timestamptz,
+              failed boolean,missing_days boolean,finalized_dates datemultirange)
+language plpgsql stable rows 1 cost 100 as $$
+begin
+    if p_ready then return; end if;
+    return query
+    select coalesce(sum(d.account_cost_usd) filter(where d.status='synced'),0),
+           coalesce(sum(d.standard_cost_usd) filter(where d.status='synced'),0),
+           coalesce(sum(d.user_cost_usd) filter(where d.status='synced'),0),
+           coalesce(sum(d.total_requests) filter(where d.status='synced'),0),
+           coalesce(sum(d.total_tokens) filter(where d.status='synced'),0),
+           max(d.synced_at) filter(where d.status='synced'),
+           coalesce(bool_or(d.status<>'synced'),false),
+           coalesce(max(d.usage_date)-p_through > count(*) filter(where d.status='synced'),true),
+           range_agg(daterange(d.usage_date,d.usage_date+1,'[)')) filter(where d.finalized_at is not null)
+    from sub2api_usage_daily_current d
+    where d.target_id=p_target and d.remote_account_id=p_account and d.usage_date>p_through;
+end $$;
+
+-- The usual result is empty, not the 100 ranges x 1000 days assumed by two
+-- nested SRFs. Encapsulate expansion so the outer join has a realistic bound.
+create or replace function oaix_usage_unsettled_dates(p_through date,p_before date,p_finalized datemultirange)
+returns setof date language plpgsql immutable rows 8 cost 5 as $$
+declare remaining datemultirange;
+begin
+    if p_through is null or p_through>=p_before-1 then return; end if;
+    remaining:=datemultirange(daterange(p_through+1,p_before,'[)'))-coalesce(p_finalized,'{}'::datemultirange);
+    if remaining='{}'::datemultirange then return; end if;
+    return query
+    select lower(gaps.days)+d.day_offset
+    from unnest(remaining) gaps(days)
+    cross join lateral generate_series(0,upper(gaps.days)-lower(gaps.days)-1) d(day_offset);
+end $$;
+
 create or replace view sub2api_usage_account_current as
 select b.target_id,b.remote_account_id,b.token_id,b.through_date,b.status,
        b.account_cost_usd+case when b.through_date is null then 0 else coalesce(r.account_cost_usd,x.account_cost_usd,0) end as account_cost_usd,
@@ -121,16 +160,4 @@ select b.target_id,b.remote_account_id,b.token_id,b.through_date,b.status,
        coalesce(r.finalized_dates,x.finalized_dates,'{}'::datemultirange) as finalized_dates
 from sub2api_usage_snapshots b
 left join sub2api_usage_rollups r on r.target_id=b.target_id and r.remote_account_id=b.remote_account_id and r.ready
-left join lateral (
-    select coalesce(sum(d.account_cost_usd) filter(where d.status='synced'),0) as account_cost_usd,
-           coalesce(sum(d.standard_cost_usd) filter(where d.status='synced'),0) as standard_cost_usd,
-           coalesce(sum(d.user_cost_usd) filter(where d.status='synced'),0) as user_cost_usd,
-           coalesce(sum(d.total_requests) filter(where d.status='synced'),0) as total_requests,
-           coalesce(sum(d.total_tokens) filter(where d.status='synced'),0) as total_tokens,
-           max(d.synced_at) filter(where d.status='synced') as synced_at,
-           coalesce(bool_or(d.status<>'synced'),false) as failed,
-           coalesce(max(d.usage_date)-b.through_date > count(*) filter(where d.status='synced'),true) as missing_days,
-           range_agg(daterange(d.usage_date,d.usage_date+1,'[)')) filter(where d.finalized_at is not null) as finalized_dates
-    from sub2api_usage_daily_current d
-    where r.target_id is null and d.target_id=b.target_id and d.remote_account_id=b.remote_account_id and d.usage_date>b.through_date
-) x on r.target_id is null;
+left join lateral oaix_usage_exact_fallback(b.target_id,b.remote_account_id,b.through_date,r.target_id is not null) x on r.target_id is null;

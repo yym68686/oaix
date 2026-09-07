@@ -238,12 +238,7 @@ func (s *Store) ListPendingSub2APIDailyUsageFinalizations(ctx context.Context, t
 		join codex_tokens token on token.id = m.token_id
 		join sub2api_usage_account_current baseline
 		  on baseline.target_id = m.target_id and baseline.remote_account_id = m.remote_account_id
-		cross join lateral unnest(
-			case when baseline.through_date < $3::date - 1
-			then datemultirange(daterange(baseline.through_date + 1, $3::date, '[)')) - baseline.finalized_dates
-			else '{}'::datemultirange end
-		) gaps(dates)
-		cross join lateral generate_series(lower(gaps.dates), upper(gaps.dates)-1, interval '1 day') due(usage_date)
+		cross join lateral oaix_usage_unsettled_dates(baseline.through_date,$3::date,baseline.finalized_dates) due(usage_date)
 		left join sub2api_usage_daily_current daily
 		  on daily.target_id=m.target_id and daily.remote_account_id=m.remote_account_id
 		 and daily.usage_date=due.usage_date::date

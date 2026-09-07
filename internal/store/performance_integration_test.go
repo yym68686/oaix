@@ -124,6 +124,21 @@ func TestCurrentTokenCostsExactDeltasAndRetention(t *testing.T) {
 	check(3.25) // Retention must not erase lifetime spend.
 }
 
+func TestCurrentTokenCostBackfillStartsAndCompletes(t *testing.T) {
+	db, ctx, _, token := performanceFixture(t)
+	if _, err := db.ReconcileRecordedTokenCosts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cursor, count, err := db.BackfillCurrentTokenCosts(ctx, 0)
+	if err != nil || count != 1 || cursor != token {
+		t.Fatalf("first batch cursor=%d count=%d err=%v", cursor, count, err)
+	}
+	cursor, count, err = db.BackfillCurrentTokenCosts(ctx, cursor)
+	if err != nil || count != 0 || cursor != 0 {
+		t.Fatalf("completed cursor=%d count=%d err=%v", cursor, count, err)
+	}
+}
+
 func TestCurrentTokenCostsConcurrentInitialization(t *testing.T) {
 	db, ctx, _, token := performanceFixture(t)
 	if _, err := db.pool.Exec(ctx, `insert into gateway_request_logs(request_id,endpoint,started_at) values($1,'fixture',now()-interval '2 days')`, fmt.Sprintf("concurrent-sentinel-%d", token)); err != nil {

@@ -51,3 +51,21 @@ remove any request data and must run outside a transaction.
 Run the workload with `OAIX_RUN_PERFORMANCE_BENCHMARK=1` and a disposable
 `OAIX_TEST_DATABASE_URL`, then `go test ./internal/store -run
 TestPerformanceSettledHistoryBenchmark -count=1 -v`.
+
+## PostgreSQL 18 rollout follow-up
+
+Production verification found that the initial cost-backfill cursor exceeded
+int4; pgx rejected it before execution and all accounts correctly remained on
+the exact fallback. The query now explicitly binds the cursor as bigint, with
+an integration test that starts at zero and completes the cursor pass.
+
+EXPLAIN ANALYZE on PostgreSQL 18 found 220 ms of JIT work for a zero-result
+settled-history query: two SRFs inflated the estimate to 500 million rows. Schema
+27 encapsulates the exact fallback and missing-date expansion with bounded row
+estimates. Same-size PostgreSQL 18 benchmark: 433.08 ms -> 11.63 ms, both zero;
+complete costs 35.04 ms -> 6.39 ms, both 230,000. No global JIT setting is changed.
+
+Production token metadata had the same cost-estimation problem through its
+correlated identity EXISTS. A single left join gives the same readiness result
+and avoids JIT: measured 894.57 ms -> 109.07 ms on the live pool. These individual
+measurements do not establish a 90% reduction in total CPU.
