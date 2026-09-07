@@ -126,10 +126,12 @@ var startupMigrations = map[int]startupMigration{
 	27: {statements: []string{usageRollupsSQL}},
 	29: {statements: []string{createProxyChannels, createProxyChannelsOwnerIndex, createTokenProxyBindings, createTokenProxyChannelIndex}},
 	30: {statements: []string{currentCostsSQL}},
+	31: {statements: []string{createEgressObservations}},
 	28: {statements: []string{usageRollupsSQL}},
 }
 
 var migrationStatements = []string{
+	createEgressObservations,
 	`create table if not exists schema_migrations (
 		name text primary key,
 		version integer not null,
@@ -826,6 +828,7 @@ var onlineMigrationStatements = []string{
 }
 
 var downMigrationStatements = []string{
+	`drop table if exists gateway_egress_observations`,
 	`drop table if exists token_proxy_bindings`,
 	`drop table if exists proxy_channels`,
 	`drop view if exists sub2api_usage_account_current`,

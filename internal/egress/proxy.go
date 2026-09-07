@@ -117,6 +117,9 @@ func publicIP(ip netip.Addr) bool {
 type Resolver interface {
 	ResolveTokenProxy(context.Context, int64) (*url.URL, error)
 }
+type SnapshotResolver interface {
+	ResolveTokenProxySnapshot(context.Context, int64) (*url.URL, RouteSnapshot, error)
+}
 type contextKey struct{}
 type route struct {
 	proxy *url.URL
@@ -136,7 +139,18 @@ func ForToken(ctx context.Context, source any, tokenID int64) context.Context {
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	proxy, err := resolver.ResolveTokenProxy(lookupCtx, tokenID)
+	var proxy *url.URL
+	var err error
+	trace := TraceFrom(ctx)
+	trace.Event("route_config", "start", "", nil, 0)
+	if source, ok := source.(SnapshotResolver); ok && trace != nil {
+		var snapshot RouteSnapshot
+		proxy, snapshot, err = source.ResolveTokenProxySnapshot(lookupCtx, tokenID)
+		trace.update(func(d *TraceRecord) { d.Route = snapshot })
+	} else {
+		proxy, err = resolver.ResolveTokenProxy(lookupCtx, tokenID)
+	}
+	trace.Event("route_config", "done", "", err, 0)
 	if err != nil {
 		err = errors.New("无法读取账号代理配置")
 	}
@@ -153,12 +167,28 @@ func NewTransport(base *http.Transport) http.RoundTripper {
 	tr.Proxy = func(req *http.Request) (*url.URL, error) {
 		r, ok := req.Context().Value(contextKey{}).(route)
 		if ok && (r.proxy != nil || r.err != nil) {
+			TraceFrom(req.Context()).setRoute("account_proxy", r.proxy)
 			return r.proxy, r.err
 		}
 		if originalProxy != nil {
-			return originalProxy(req)
+			proxy, err := originalProxy(req)
+			kind := "default_direct"
+			if proxy != nil {
+				kind = "environment_proxy"
+			}
+			TraceFrom(req.Context()).setRoute(kind, proxy)
+			return proxy, err
 		}
+		TraceFrom(req.Context()).setRoute("default_direct", nil)
 		return nil, nil
+	}
+	originalConnectResponse := tr.OnProxyConnectResponse
+	tr.OnProxyConnectResponse = func(ctx context.Context, proxyURL *url.URL, req *http.Request, resp *http.Response) error {
+		TraceFrom(ctx).Event("proxy_connect", "done", "", nil, resp.StatusCode)
+		if originalConnectResponse != nil {
+			return originalConnectResponse(ctx, proxyURL, req, resp)
+		}
+		return nil
 	}
 	dial := tr.DialContext
 	if dial == nil {
@@ -167,13 +197,20 @@ func NewTransport(base *http.Transport) http.RoundTripper {
 	tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		r, _ := ctx.Value(contextKey{}).(route)
 		if r.proxy == nil {
-			return dial(ctx, network, address)
+			conn, err := dial(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			return wrapConn(conn), nil
 		}
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
 			return nil, errors.New("代理地址无效")
 		}
+		trace := TraceFrom(ctx)
+		trace.Event("proxy_dns", "start", address, nil, 0)
 		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		trace.Event("proxy_dns", "done", address, err, 0)
 		if err != nil || len(ips) == 0 {
 			return nil, errors.New("代理域名解析失败")
 		}
@@ -186,7 +223,7 @@ func NewTransport(base *http.Transport) http.RoundTripper {
 		for _, ip := range ips {
 			conn, dialErr := dial(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
 			if dialErr == nil {
-				return conn, nil
+				return wrapConn(conn), nil
 			}
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -199,10 +236,19 @@ func NewTransport(base *http.Transport) http.RoundTripper {
 
 func (t *proxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	r, _ := req.Context().Value(contextKey{}).(route)
+	trace := TraceFrom(req.Context())
 	if r.err != nil {
 		return nil, r.err
 	}
+	trace.Event("round_trip", "start", "", nil, 0)
 	resp, err := t.inner.RoundTrip(req)
+	trace.Event("round_trip", "done", "", err, 0)
+	if resp != nil && trace != nil {
+		trace.Response(resp)
+		if resp.Body != nil {
+			resp.Body = &tracedBody{ReadCloser: resp.Body, trace: trace}
+		}
+	}
 	if err != nil && r.proxy != nil {
 		if req.Context().Err() != nil {
 			return nil, req.Context().Err()
@@ -210,6 +256,21 @@ func (t *proxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, errors.New("代理连接失败，请检查地址、认证信息和网络可用性")
 	}
 	return resp, err
+}
+
+func (t *Trace) setRoute(kind string, proxy *url.URL) {
+	t.update(func(d *TraceRecord) {
+		d.Route.Kind = kind
+		d.ProxySelectionObserved = true
+		if proxy != nil {
+			d.Route.Protocol = knownValue(proxy.Scheme, "http", "https", "socks5", "socks5h")
+			d.ProxyHandshakeCoverage = "connect_response_only"
+			if proxy.Scheme == "socks5" || proxy.Scheme == "socks5h" {
+				d.ProxyHandshakeCoverage = "socks_handshake_not_instrumented"
+			}
+			d.Route.Endpoint = safeEndpoint(proxy.Host)
+		}
+	})
 }
 
 func (t *proxyTransport) CloseIdleConnections() { t.inner.CloseIdleConnections() }

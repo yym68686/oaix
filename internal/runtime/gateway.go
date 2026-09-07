@@ -88,6 +88,8 @@ func RunGateway(ctx context.Context) error {
 	oauthClient.Scope = cfg.Upstream.OAuthScope
 	pipeline.SetOAuthClient(oauthClient)
 	app := httpapi.NewApp(cfg, logger, db, tokenManager, logWriter, pipeline)
+	stopEgress := app.StartEgressObservability(context.Background())
+	defer stopEgress(context.Background())
 	app.SetProbeRequestDoer(upstream)
 	pipeline.SetTokenModelCapabilityLossHandler(app.HandleTokenModelCapabilityLoss)
 	app.StartQuotaRecovery(ctx)

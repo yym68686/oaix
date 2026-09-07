@@ -23,6 +23,7 @@ import (
 	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/agentidentitytask"
 	"github.com/yym68686/oaix/internal/config"
+	"github.com/yym68686/oaix/internal/egress"
 	"github.com/yym68686/oaix/internal/importpayload"
 	"github.com/yym68686/oaix/internal/logs"
 	"github.com/yym68686/oaix/internal/oauth"
@@ -32,6 +33,8 @@ import (
 )
 
 type App struct {
+	egressRecorder         *egress.Recorder
+	egressExporter         *egress.OTLPExporter
 	cfg                    config.Config
 	logger                 *slog.Logger
 	store                  *store.Store
@@ -114,6 +117,8 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		httpRoutes:         newHTTPRouteMetrics(),
 	}
 	if pipeline != nil {
+		app.egressRecorder = app.newEgressRecorder()
+		pipeline.SetEgressRecorder(app.egressRecorder)
 		app.agentIdentityTasks = pipeline.AgentIdentityTaskCoordinator()
 	}
 	if app.quota != nil {
@@ -146,6 +151,9 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /livez", a.livez)
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /metrics", a.metrics)
+	mux.HandleFunc("GET /admin/egress-observability", a.requireAuth(a.getEgressObservability))
+	mux.HandleFunc("POST /admin/egress-observability", a.requireAuth(a.updateEgressObservability))
+	mux.HandleFunc("GET /admin/egress-observations", a.requireAuth(a.getEgressObservations))
 	a.registerUserAPIRoutes(mux)
 	a.registerPlatformAdminAPIRoutes(mux)
 	mux.HandleFunc("GET /admin/token-selection", a.requireAuth(a.tokenSelection))
@@ -292,11 +300,12 @@ func (a *App) livez(w http.ResponseWriter, r *http.Request) {
 		recoveryStats = a.recovery.Stats()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":             true,
-		"uptime_seconds": int(time.Since(a.started).Seconds()),
-		"token_pool":     a.tokens.Stats(),
-		"request_log":    a.logs.Stats(),
-		"quota_recovery": recoveryStats,
+		"ok":                   true,
+		"uptime_seconds":       int(time.Since(a.started).Seconds()),
+		"token_pool":           a.tokens.Stats(),
+		"request_log":          a.logs.Stats(),
+		"quota_recovery":       recoveryStats,
+		"egress_observability": a.egressRecorder.Stats(),
 	})
 }
 
@@ -331,6 +340,7 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	tokenStats := a.tokens.Stats()
 	logStats := a.logs.Stats()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	a.writeEgressMetrics(w)
 	_, _ = fmt.Fprintf(w, "# HELP oaix_token_ready_tokens Ready tokens in the current snapshot.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_ready_tokens gauge\n")
 	_, _ = fmt.Fprintf(w, "oaix_token_ready_tokens %d\n", tokenStats.ReadyTokens)
@@ -1458,7 +1468,7 @@ func (a *App) updateSetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
 		return
 	}
-	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey {
+	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey || key == egress.PolicyKey {
 		writeError(w, http.StatusBadRequest, errors.New("this setting must be updated through its dedicated API"))
 		return
 	}

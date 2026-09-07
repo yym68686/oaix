@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/yym68686/oaix/internal/egress"
 	"github.com/yym68686/oaix/internal/protocol/openai"
 	"github.com/yym68686/oaix/internal/protocol/sse"
 	"github.com/yym68686/oaix/internal/store"
@@ -1402,10 +1403,12 @@ func (p *Pipeline) collectResponsesJSONFromSSE(resp *http.Response, attempt Atte
 	parser := sse.NewParser(int(p.cfg.Upstream.NonStreamMaxResponseBytes))
 	err := parser.Parse(responseContext(resp), resp.Body, func(event sse.Event) error {
 		if strings.TrimSpace(string(event.Data)) == "[DONE]" {
+			egress.ObserveSSE(responseContext(resp), "[DONE]", nil)
 			return errStopSSE
 		}
 		payload := parseEventPayload(event)
 		typ := eventType(event, payload)
+		egress.ObserveSSE(responseContext(resp), typ, payloadSequenceNumber(payload))
 		if status, message, failed := responseFailureStatus(payload); failed {
 			return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
 		}
@@ -1610,6 +1613,7 @@ func (p *Pipeline) collectImageAPIResponseFromSSE(resp *http.Response, attempt A
 	parser := sse.NewParser(int(p.cfg.Upstream.NonStreamMaxResponseBytes))
 	err := parser.Parse(responseContext(resp), resp.Body, func(event sse.Event) error {
 		if strings.TrimSpace(string(event.Data)) == "[DONE]" {
+			egress.ObserveSSE(responseContext(resp), "[DONE]", nil)
 			if synthetic := syntheticCompletedEvent(responseID, modelName, createdAt, outputItemsByIndex, outputItemsFallback); synthetic != nil {
 				results, completedAt, usage, err := extractImagesFromCompletedResponse(synthetic)
 				if err != nil {
@@ -1621,6 +1625,7 @@ func (p *Pipeline) collectImageAPIResponseFromSSE(resp *http.Response, attempt A
 		}
 		payload := parseEventPayload(event)
 		typ := eventType(event, payload)
+		egress.ObserveSSE(responseContext(resp), typ, payloadSequenceNumber(payload))
 		if status, message, failed := responseFailureStatus(payload); failed {
 			return streamPreflightError{status: status, message: message, raw: cloneBytes(event.Data)}
 		}
@@ -1819,6 +1824,7 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 	parser := sse.NewParser(int(p.cfg.Upstream.NonStreamMaxResponseBytes))
 	err := parser.Parse(responseContext(resp), resp.Body, func(event sse.Event) error {
 		if strings.TrimSpace(string(event.Data)) == "[DONE]" {
+			egress.ObserveSSE(responseContext(resp), "[DONE]", nil)
 			trace.LastEventType = redactedImageStreamEventType("[DONE]")
 			if synthetic := syntheticCompletedEvent(responseID, modelName, createdAt, outputItemsByIndex, outputItemsFallback); synthetic != nil {
 				events, completed, err := transformImageStreamEvent("response.completed", synthetic, attempt.Intent.ImageResponseFormat, attempt.Intent.ImageStreamPrefix)
@@ -1838,6 +1844,7 @@ func (p *Pipeline) streamImageResponse(w http.ResponseWriter, resp *http.Respons
 		}
 		payload := parseEventPayload(event)
 		typ := eventType(event, payload)
+		egress.ObserveSSE(responseContext(resp), typ, payloadSequenceNumber(payload))
 		trace.LastEventType = redactedImageStreamEventType(typ)
 		if status, message, failed := responseFailureStatus(payload); failed {
 			if !committed {
@@ -1976,6 +1983,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 		eventOrdinal++
 		payload := parseEventPayload(event)
 		typ := eventType(event, payload)
+		egress.ObserveSSE(responseContext(resp), typ, payloadSequenceNumber(payload))
 		sequenceNumber := payloadSequenceNumber(payload)
 		observeUpstreamStreamEvent(trace, typ, eventOrdinal, sequenceNumber, event.Data)
 		if typ == "response.created" {

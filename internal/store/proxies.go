@@ -213,3 +213,39 @@ func (s *Store) ResolveTokenProxy(ctx context.Context, tokenID int64) (*url.URL,
 	}
 	return s.decryptProxy(*ciphertext)
 }
+
+// Resolve the observation and encrypted serving intent in one MVCC query.
+// The diagnostic record never includes ciphertext, usernames or passwords.
+func (s *Store) ResolveTokenProxySnapshot(ctx context.Context, tokenID int64) (*url.URL, egress.RouteSnapshot, error) {
+	snapshot := egress.RouteSnapshot{Kind: "unresolved"}
+	if s == nil {
+		return nil, snapshot, nil
+	}
+	var ciphertext *string
+	var channelID *int64
+	var channelUpdated *time.Time
+	var bindingUpdated time.Time
+	err := s.pool.QueryRow(ctx, `select p.url_ciphertext, p.id, p.updated_at, b.updated_at from token_proxy_bindings b
+		left join codex_tokens t on t.id=b.token_id and t.owner_user_id=b.owner_user_id
+		left join proxy_channels p on p.id=b.proxy_channel_id and p.owner_user_id=t.owner_user_id
+		where b.token_id=$1`, tokenID).Scan(&ciphertext, &channelID, &channelUpdated, &bindingUpdated)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, egress.RouteSnapshot{Kind: "default"}, nil
+	}
+	if err != nil {
+		return nil, snapshot, err
+	}
+	if ciphertext == nil {
+		return nil, snapshot, errors.New("账号代理归属已变更，请重新设置代理")
+	}
+	snapshot.Kind = "account_proxy"
+	if channelID != nil {
+		snapshot.ChannelID = *channelID
+	}
+	if channelUpdated != nil {
+		snapshot.ChannelRevision = channelUpdated.UTC().Format(time.RFC3339Nano)
+	}
+	snapshot.BindingRevision = bindingUpdated.UTC().Format(time.RFC3339Nano)
+	u, err := s.decryptProxy(*ciphertext)
+	return u, snapshot, err
+}

@@ -61,6 +61,7 @@ type Pipeline struct {
 	commitFailures              atomic.Int64
 	ordinary429CooldownNanos    atomic.Int64
 	gpt6AstraLongContextPricing atomic.Bool
+	egressRecorder              atomic.Pointer[egress.Recorder]
 }
 
 type TokenModelCapabilityLoss struct {
@@ -202,6 +203,14 @@ func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, c
 	}
 	pipeline.SetOrdinary429Cooldown(cfg.TokenPool.DefaultCooldown)
 	return pipeline
+}
+
+func (p *Pipeline) SetEgressRecorder(recorder *egress.Recorder) { p.egressRecorder.Store(recorder) }
+func (p *Pipeline) EgressRecorder() *egress.Recorder {
+	if p == nil {
+		return nil
+	}
+	return p.egressRecorder.Load()
 }
 
 func (p *Pipeline) SetOrdinary429Cooldown(value time.Duration) time.Duration {
@@ -1217,6 +1226,15 @@ func (p *Pipeline) recordClaimReleaseTiming(timing map[string]any, claim *tokens
 }
 
 func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Attempt) (attemptResult AttemptResult, attemptErr error) {
+	recorder := p.EgressRecorder()
+	ctx, trace := recorder.Begin(r.Context(), r.Header, attempt.RequestID, attempt.Index, attempt.Claim.TokenID())
+	r = r.WithContext(ctx)
+	if trace != nil {
+		defer func() {
+			trace.ObserveDownstreamHeaders(w.Header())
+			recorder.Finish(trace, ctx, attemptResult.Status, attemptResult.Committed, attemptResult.StreamState.DownstreamStarted || attempt.StreamState.DownstreamStarted, attemptResult.Retry, attemptErr)
+		}()
+	}
 	r = r.WithContext(egress.ForToken(r.Context(), p.store, attempt.Claim.TokenID()))
 	upstreamURL, err := p.upstreamURL(attempt.Intent)
 	if err != nil {
