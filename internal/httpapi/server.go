@@ -139,6 +139,7 @@ func (a *App) SetProbeRequestDoer(doer agentidentity.RequestDoer) {
 
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
+	a.registerProxyRoutes(mux)
 	mux.HandleFunc("GET /", a.index)
 	mux.HandleFunc("GET /auth/callback", a.openAIOAuthCallback)
 	mux.Handle("GET /assets/", a.assets())

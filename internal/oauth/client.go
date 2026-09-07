@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yym68686/oaix/internal/egress"
 	"io"
 	"net/http"
 	"net/url"
@@ -78,7 +79,8 @@ func NewHTTPClient(tokenURL string) *HTTPClient {
 		TokenURL: tokenURL,
 		Scope:    "openid profile email",
 		HTTPClient: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout:   15 * time.Second,
+			Transport: egress.DefaultTransport,
 		},
 		MaxRetries: 3,
 	}
@@ -97,7 +99,7 @@ func (c *HTTPClient) refresh(ctx context.Context, refreshToken string, clientID 
 		return RefreshResult{}, errors.New("oauth token url is not configured")
 	}
 	if c.HTTPClient == nil {
-		c.HTTPClient = &http.Client{Timeout: 15 * time.Second}
+		c.HTTPClient = &http.Client{Timeout: 15 * time.Second, Transport: egress.DefaultTransport}
 	}
 	maxRetries := c.MaxRetries
 	if maxRetries <= 0 {
@@ -155,7 +157,7 @@ func (c *HTTPClient) ExchangeAuthorizationCode(ctx context.Context, request Auth
 		return RefreshResult{}, errors.New("oauth code verifier is required")
 	}
 	if c.HTTPClient == nil {
-		c.HTTPClient = &http.Client{Timeout: 15 * time.Second}
+		c.HTTPClient = &http.Client{Timeout: 15 * time.Second, Transport: egress.DefaultTransport}
 	}
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")

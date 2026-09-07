@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yym68686/oaix/internal/egress"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1075,6 +1076,7 @@ func (p *Pipeline) refreshAccessTokenAfterAuthFailure(parent context.Context, cl
 }
 
 func (p *Pipeline) refreshOAuthToken(ctx context.Context, tokenID int64, refreshToken string) (oauth.RefreshResult, error) {
+	ctx = egress.ForToken(ctx, p.store, tokenID)
 	clientID := ""
 	if source, ok := p.store.(tokenOAuthClientIDStore); ok && source != nil {
 		if value, err := source.TokenOAuthClientID(ctx, tokenID); err == nil {
@@ -1215,6 +1217,7 @@ func (p *Pipeline) recordClaimReleaseTiming(timing map[string]any, claim *tokens
 }
 
 func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Attempt) (AttemptResult, error) {
+	r = r.WithContext(egress.ForToken(r.Context(), p.store, attempt.Claim.TokenID()))
 	upstreamURL, err := p.upstreamURL(attempt.Intent)
 	if err != nil {
 		return AttemptResult{Status: http.StatusBadGateway}, err

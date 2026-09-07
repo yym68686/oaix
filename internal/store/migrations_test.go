@@ -96,8 +96,8 @@ func TestMigrationAddsGPT56CacheWriteObservability(t *testing.T) {
 }
 
 func TestMigrationAddsStreamDeliveryObservability(t *testing.T) {
-	if SchemaVersion != 28 {
-		t.Fatalf("unexpected schema version: got %d want 28", SchemaVersion)
+	if SchemaVersion != 29 {
+		t.Fatalf("unexpected schema version: got %d want 29", SchemaVersion)
 	}
 
 	joined := strings.ToLower(strings.Join(migrationStatements, "\n"))

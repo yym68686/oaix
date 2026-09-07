@@ -124,6 +124,7 @@ var startupMigrations = map[int]startupMigration{
 		currentCostsSQL,
 	}},
 	27: {statements: []string{usageRollupsSQL}},
+	29: {statements: []string{createProxyChannels, createProxyChannelsOwnerIndex, createTokenProxyBindings, createTokenProxyChannelIndex}},
 	28: {statements: []string{usageRollupsSQL}},
 }
 
@@ -799,6 +800,7 @@ var migrationStatements = []string{
 	createSub2APIUsageDailySyncState,
 	usageRollupsSQL,
 	currentCostsSQL,
+	createProxyChannels, createProxyChannelsOwnerIndex, createTokenProxyBindings, createTokenProxyChannelIndex,
 }
 
 var onlineMigrationStatements = []string{
@@ -823,6 +825,8 @@ var onlineMigrationStatements = []string{
 }
 
 var downMigrationStatements = []string{
+	`drop table if exists token_proxy_bindings`,
+	`drop table if exists proxy_channels`,
 	`drop view if exists sub2api_usage_account_current`,
 	`drop function if exists oaix_usage_exact_fallback(bigint,bigint,date,boolean)`,
 	`drop function if exists oaix_usage_unsettled_dates(date,date,datemultirange)`,

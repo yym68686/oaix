@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yym68686/oaix/internal/egress"
 	"io"
 	"net/http"
 	"strings"
@@ -55,6 +56,7 @@ func localTokenProbeFailure(status int, stage string, errorCode string, detail s
 }
 
 func (a *App) executeTokenProbe(parent context.Context, token store.Token, model string) tokenProbeAttempt {
+	parent = egress.ForToken(parent, a.store, token.ID)
 	baseURL := strings.TrimSpace(a.cfg.Upstream.ResponsesURL)
 	if baseURL == "" {
 		return localTokenProbeFailure(http.StatusInternalServerError, probeStageLocalPreflight, "upstream_url_missing", "CODEX_BASE_URL is empty")

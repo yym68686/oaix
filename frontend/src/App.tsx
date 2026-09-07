@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AppShell } from "@/app/AppShell";
 import { useRouteState } from "@/app/router";
 import { AccountAPIKeysPage } from "@/features/account/APIKeysPage";
+import { ProxiesPage } from "@/features/account/ProxiesPage";
 import { ProfilePage } from "@/features/account/ProfilePage";
 import { DashboardPage } from "@/features/dashboard/DashboardPage";
 import { ImportsPage } from "@/features/imports/ImportsPage";
@@ -193,6 +194,8 @@ export function App(): React.ReactElement {
     page = <AdminAuditPage refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_sub2api") {
     page = <AdminSub2APIPage pushToast={pushToast} refreshNonce={refreshNonce} />;
+  } else if (route.key === "account_proxies") {
+    page = <ProxiesPage key={getServiceKey()} pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "account_api_keys") {
     page = <AccountAPIKeysPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "account_profile") {

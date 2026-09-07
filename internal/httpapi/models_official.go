@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yym68686/oaix/internal/egress"
 	"io"
 	"log/slog"
 	"net/http"
@@ -69,7 +70,7 @@ type officialModelsCatalog struct {
 func newOfficialModelsCatalog() *officialModelsCatalog {
 	return &officialModelsCatalog{
 		upstreamURL: officialModelsURL,
-		client:      &http.Client{Timeout: officialModelsFetchTimeout},
+		client:      &http.Client{Timeout: officialModelsFetchTimeout, Transport: egress.DefaultTransport},
 		cacheTTL:    officialModelsCacheTTL,
 		staleTTL:    officialModelsStaleTTL,
 		waitTimeout: officialModelsWaitTimeout,
@@ -279,6 +280,7 @@ func (a *App) fetchOfficialModelsPlanCatalog(ctx context.Context, ownerUserID in
 }
 
 func (a *App) fetchOfficialModelsWithClaim(ctx context.Context, claim *tokens.Claim, clientVersion string) (officialModelsCacheEntry, error) {
+	ctx = egress.ForToken(ctx, a.store, claim.TokenID())
 	if claim == nil || claim.Token == nil {
 		return officialModelsCacheEntry{}, errors.New("official models token claim is unavailable")
 	}

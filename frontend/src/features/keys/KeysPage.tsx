@@ -1,3 +1,4 @@
+import { TokenProxyEditor } from "@/features/account/ProxiesPage";
 import {
   ActivityIcon,
   ChevronLeftIcon,
@@ -1225,6 +1226,7 @@ export function KeyDetailPage({
           </PageSectionTitle>
         </PageSectionHeader>
         <PageSectionPanel className="grid content-start divide-y">
+          <TokenProxyEditor key={`proxy:${apiScope}:${id}`} tokenID={id} apiScope={apiScope} pushToast={pushToast} />
           <TokenConcurrencyEditor
             key={`${apiScope}:${id}`}
             token={token}

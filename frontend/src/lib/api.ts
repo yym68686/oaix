@@ -654,6 +654,11 @@ function scopedPath(userPath: string, adminPath: string): string {
   return hasUserPrincipal() ? userPath : adminPath;
 }
 
+export type ProxyPreview = { protocol: string; host: string; port: number | string; has_auth: boolean };
+export type ProxyChannel = ProxyPreview & { id: number; name: string; account_count: number; created_at: string; updated_at: string };
+export type ProxyTestResult = { ok: boolean; message: string; duration_ms: number; checked_at: string; exit_ip?: string; status_code?: number };
+export type TokenProxySettings = { proxy_channel_id: number; items: ProxyChannel[] };
+
 export type TokenAPIScope = "auto" | "self" | "admin";
 
 function tokenScopedPath(userPath: string, adminPath: string, scope: TokenAPIScope = "auto"): string {
@@ -673,6 +678,13 @@ function oauthBase(): string {
 export type ImportAPIScope = "self" | "admin";
 
 export const api = {
+  myProxies: () => requestJSON<{ items: ProxyChannel[] }>("/api/proxies"),
+  parseProxy: (proxy: string) => postJSON<ProxyPreview>("/api/proxies/parse", { proxy }),
+  saveProxy: (id: number | undefined, payload: { name: string; proxy: string }) => postJSON<{ id: number }>(id ? `/api/proxies/${id}` : "/api/proxies", payload),
+  deleteProxy: (id: number) => deleteJSON<{ ok: boolean }>(`/api/proxies/${id}`),
+  testProxy: (id: number) => postJSON<ProxyTestResult>(`/api/proxies/${id}/test`, {}),
+  tokenProxy: (id: number, scope: TokenAPIScope) => requestJSON<TokenProxySettings>(tokenScopedPath(`/api/tokens/${id}/proxy`, `/api/admin/tokens/${id}/proxy`, scope)),
+  updateTokenProxy: (id: number, proxy_channel_id: number, scope: TokenAPIScope) => postJSON<TokenProxySettings>(tokenScopedPath(`/api/tokens/${id}/proxy`, `/api/admin/tokens/${id}/proxy`, scope), { proxy_channel_id }),
   health: () => requestJSON<HealthResponse>("/healthz"),
   me: (authKey?: string) => requestJSON<MeResponse>("/api/me", {}, authKey),
   dashboard: (range: DashboardRange, timezone: string, authKey?: string, signal?: AbortSignal, dates?: { from: string; to: string }) => {

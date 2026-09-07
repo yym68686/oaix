@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/yym68686/oaix/internal/egress"
 	"net/http"
 	"strings"
 	"time"
@@ -49,7 +50,7 @@ func (d fallbackTokenProbeDoer) Do(ctx context.Context, request *http.Request) (
 }
 
 var defaultTokenProbeDoer agentidentity.RequestDoer = fallbackTokenProbeDoer{
-	client: &http.Client{Timeout: probeRequestTimeout},
+	client: &http.Client{Timeout: probeRequestTimeout, Transport: egress.DefaultTransport},
 }
 
 func tokenProbeCredentialMode(token store.Token) string {

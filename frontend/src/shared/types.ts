@@ -6,6 +6,7 @@ export type RouteKey =
   | "dashboard"
   | "keys"
   | "key_detail"
+  | "account_proxies"
   | "account_profile"
   | "account_api_keys"
   | "imports"

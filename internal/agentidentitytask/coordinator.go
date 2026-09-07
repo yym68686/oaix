@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/yym68686/oaix/internal/egress"
 	"log/slog"
 	"strings"
 	"sync"
@@ -87,6 +88,7 @@ func (c *Coordinator) Recover(parent context.Context, tokenID, ownerUserID int64
 		return Result{Credentials: credentials}, nil
 	}
 
+	ctx = egress.ForToken(ctx, c.store, tokenID)
 	newTaskID, err := agentidentity.RegisterTask(ctx, c.doer, c.authURL, credentials)
 	if err != nil {
 		return Result{}, err

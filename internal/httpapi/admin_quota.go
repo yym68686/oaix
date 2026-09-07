@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yym68686/oaix/internal/egress"
 	"io"
 	"log/slog"
 	"math"
@@ -150,7 +151,8 @@ func newAdminQuotaService(cfg config.Config, tokenStore *store.Store, logger *sl
 	oauthClient.Scope = cfg.Upstream.OAuthScope
 	return &adminQuotaService{
 		client: &http.Client{
-			Timeout: time.Duration(timeoutSeconds) * time.Second,
+			Timeout:   time.Duration(timeoutSeconds) * time.Second,
+			Transport: egress.DefaultTransport,
 		},
 		oauthClient:       oauthClient,
 		store:             tokenStore,
@@ -731,6 +733,7 @@ func (s *adminQuotaService) resetCredit(ctx context.Context, token store.Token) 
 }
 
 func (s *adminQuotaService) requestUsage(ctx context.Context, token store.Token) (int, []byte, error) {
+	ctx = egress.ForToken(ctx, s.store, token.ID)
 	if token.IsAgentIdentity() {
 		return s.requestAgentIdentityUsage(ctx, token)
 	}
@@ -801,6 +804,7 @@ func (s *adminQuotaService) requestAgentIdentityUsage(ctx context.Context, token
 }
 
 func (s *adminQuotaService) requestUsageWithAuthorization(ctx context.Context, token store.Token, authorization tokenProbeAuthorization) (int, []byte, error) {
+	ctx = egress.ForToken(ctx, s.store, token.ID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.usageURL, nil)
 	if err != nil {
 		return 0, nil, err
@@ -887,6 +891,7 @@ func (s *adminQuotaService) requestAgentIdentityResetCredit(ctx context.Context,
 }
 
 func (s *adminQuotaService) requestResetCreditWithAuthorization(ctx context.Context, token store.Token, redeemRequestID string, authorization tokenProbeAuthorization) (int, []byte, *codexQuotaResetResult, error) {
+	ctx = egress.ForToken(ctx, s.store, token.ID)
 	bodyBytes, err := json.Marshal(map[string]string{"redeem_request_id": redeemRequestID})
 	if err != nil {
 		return 0, nil, nil, err
@@ -1051,6 +1056,7 @@ func (s *adminQuotaService) refreshQuotaToken(ctx context.Context, token store.T
 }
 
 func (s *adminQuotaService) refreshOAuthToken(ctx context.Context, token store.Token, refreshToken string) (oauth.RefreshResult, error) {
+	ctx = egress.ForToken(ctx, s.store, token.ID)
 	clientID := ""
 	if s.store != nil {
 		value, err := s.store.TokenOAuthClientID(ctx, token.ID)

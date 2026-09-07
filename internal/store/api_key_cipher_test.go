@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -24,7 +25,14 @@ func TestAPIKeyCipherRoundTripAndTamperDetection(t *testing.T) {
 		t.Fatalf("Decrypt = %q, want %q", decoded, plaintext)
 	}
 
-	tampered := encoded[:len(encoded)-1] + "A"
+	parts := strings.Split(encoded, ":")
+	ciphertext, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext[0] ^= 1
+	parts[2] = base64.RawURLEncoding.EncodeToString(ciphertext)
+	tampered := strings.Join(parts, ":")
 	if _, err := cipher.Decrypt(tampered); !errors.Is(err, ErrAPIKeyNotRecoverable) {
 		t.Fatalf("tampered ciphertext error = %v, want ErrAPIKeyNotRecoverable", err)
 	}

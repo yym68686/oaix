@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"github.com/yym68686/oaix/internal/egress"
 	"hash/fnv"
 	"io"
 	"net"
@@ -68,7 +69,7 @@ func newHTTPClient(cfg config.UpstreamConfig) *http.Client {
 		DisableCompression:    cfg.DisableCompression,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 	}
-	return &http.Client{Transport: tr}
+	return &http.Client{Transport: egress.NewTransport(tr)}
 }
 
 func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, error) {

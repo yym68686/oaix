@@ -45,6 +45,9 @@ export function parseRoute(pathname: string, search = ""): RouteState {
   if (segments[0] === "dashboard") {
     return { key: "dashboard", params: {}, path, search };
   }
+  if (segments[0] === "account" && segments[1] === "proxies") {
+    return { key: "account_proxies", params: {}, path, search };
+  }
   if (segments[0] === "account" && segments[1] === "api-keys") {
     return { key: "account_api_keys", params: {}, path, search };
   }
