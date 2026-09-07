@@ -1,15 +1,17 @@
-import { CableIcon, CheckCircle2Icon, PencilIcon, PlayIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { ArrowUpRightIcon, CableIcon, CheckCircle2Icon, PencilIcon, PlayIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api, getAuthContext, type ProxyChannel, type ProxyPreview, type ProxyTestResult, type TokenAPIScope } from "@/lib/api";
 import { navigateTo } from "@/app/router";
 import { Button } from "@/registry/default/ui/button";
 import { Input } from "@/registry/default/ui/input";
+import { SettingsRow } from "@/shared/settings-row";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "@/registry/default/ui/select";
 import { Label } from "@/registry/default/ui/label";
 import { Badge } from "@/registry/default/ui/badge";
 import { Dialog, DialogDescription, DialogFooter, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "@/registry/default/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/registry/default/ui/table";
 import { PageSection, PageSectionAction, PageSectionDescription, PageSectionHeader, PageSectionPanel, PageSectionTitle } from "@/shared/page-section";
-import { EmptyState, ErrorAlert, LoadingState, SelectField } from "@/shared/components";
+import { EmptyState, ErrorAlert, LoadingState } from "@/shared/components";
 import { errorMessage } from "@/shared/domain";
 import type { ToastMessage } from "@/shared/types";
 
@@ -179,18 +181,35 @@ export function TokenProxyEditor({ tokenID, apiScope, pushToast }: { tokenID: nu
     finally { setBusy(false); }
   }
   const missing = saved !== "0" && !items.some((item) => String(item.id) === saved);
-  return <div className="grid min-w-0 gap-3 py-5">
-    <div><Label>账号代理</Label><p className="text-muted-foreground mt-2 text-xs leading-relaxed">推理请求、模型列表、额度查询和凭证刷新使用同一代理。代理不可用时请求会失败；保存后从下一次出站请求生效。</p></div>
-    {loading ? <p className="text-muted-foreground text-xs">正在加载代理渠道…</p> : error ? <div><ErrorAlert title="代理配置加载失败" message={error} /><Button size="sm" variant="outline" onClick={() => setReload((n) => n + 1)}>重试</Button></div> : <>
-      <div className="flex flex-wrap items-end gap-3">
-        <fieldset disabled={busy || !canWrite()} className="min-w-0 flex-1 disabled:pointer-events-none disabled:opacity-60">
-          <SelectField className="max-w-md" label="使用渠道" value={selected} onChange={setSelected} options={[{ value: "0", label: "不使用账号代理（默认出站）" }, ...items.map((item) => ({ value: String(item.id), label: `${item.name} · ${item.host}:${item.port}` })), ...(missing ? [{ value: saved, label: "原代理不可用，请重新选择" }] : [])]} />
-        </fieldset>
-        <Button size="sm" loading={busy} disabled={selected === saved || !canWrite()} onClick={() => void save()}>保存代理</Button>
-        <Button size="sm" variant="ghost" onClick={() => navigateTo("/account/proxies")}>管理我的代理</Button>
-      </div>
-      {items.length === 0 && <p className="text-muted-foreground text-xs">此账号所属用户尚未添加代理渠道。</p>}
-      {missing && <p className="text-destructive-foreground text-xs" role="alert">当前代理归属已变更，请重新选择渠道或取消代理。</p>}
-    </>}
-  </div>;
+  const options = [
+    { value: "0", label: "不使用代理" },
+    ...items.map((item) => ({ value: String(item.id), label: `${item.name} · ${item.host}:${item.port}` })),
+    ...(missing ? [{ value: saved, label: "原代理不可用，请重新选择" }] : []),
+  ];
+  return (
+    <SettingsRow controlId="token-proxy-channel" title="账号代理" description="为这个账号选择网络出口，保存后对新请求生效。">
+      {loading ? <p className="text-muted-foreground flex min-h-9 items-center text-xs">正在加载代理渠道…</p> : error ? (
+        <div className="grid gap-2">
+          <ErrorAlert title="代理配置加载失败" message={error} />
+          <Button className="w-fit" size="sm" variant="outline" onClick={() => setReload((n) => n + 1)}>重试</Button>
+        </div>
+      ) : <>
+        <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+          <Select disabled={busy || !canWrite()} items={options} value={selected} onValueChange={(value) => setSelected(String(value))}>
+            <SelectTrigger id="token-proxy-channel" aria-label="账号代理" size="lg" className="h-10 min-w-0 sm:h-9"><SelectValue /></SelectTrigger>
+            <SelectPopup>{options.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectPopup>
+          </Select>
+          <Button size="lg" className="min-w-20" aria-label="保存账号代理" loading={busy} disabled={selected === saved || !canWrite()} onClick={() => void save()}>保存</Button>
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1 text-xs leading-5">
+          <p className="text-muted-foreground">连接失败时不会自动直连。</p>
+          <a className="inline-flex items-center gap-0.5 underline-offset-4 hover:underline focus-visible:rounded-sm focus-visible:outline-2 focus-visible:outline-ring" href="/account/proxies" onClick={(event) => {
+            if (!event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) { event.preventDefault(); navigateTo("/account/proxies"); }
+          }}>管理代理渠道<ArrowUpRightIcon className="size-3.5" /></a>
+        </div>
+        {items.length === 0 && <p className="text-muted-foreground text-xs leading-5">此账号所属用户尚未添加代理渠道。</p>}
+        {missing && <p className="text-destructive-foreground text-xs leading-5" role="alert">当前代理归属已变更，请重新选择渠道或取消代理。</p>}
+      </>}
+    </SettingsRow>
+  );
 }

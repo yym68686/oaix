@@ -1,3 +1,4 @@
+import { SettingsRow } from "@/shared/settings-row";
 import { TokenProxyEditor } from "@/features/account/ProxiesPage";
 import {
   ActivityIcon,
@@ -914,6 +915,7 @@ export function KeyDetailPage({
   const [quotaCreditBusy, setQuotaCreditBusy] = useState(false);
   const [quotaResetBusy, setQuotaResetBusy] = useState(false);
   const [fingerprintBusy, setFingerprintBusy] = useState(false);
+  const canEditSettings = String(getAuthContext()?.role || getAuthContext()?.user?.role || "").toLowerCase() !== "readonly_admin";
   const [quotaCreditCount, setQuotaCreditCount] = useState<number | null>(null);
   const [probeResult, setProbeResult] = useState<TokenProbeResponse | null>(null);
   const [remarkTarget, setRemarkTarget] = useState<RemarkTarget | null>(null);
@@ -1065,7 +1067,7 @@ export function KeyDetailPage({
   }
 
   async function updateFingerprint(enabled: boolean) {
-    if (!token) {
+    if (!token || fingerprintBusy || !canEditSettings) {
       return;
     }
     setFingerprintBusy(true);
@@ -1218,8 +1220,8 @@ export function KeyDetailPage({
           )}
         </PageSectionPanel>
       </PageSection>
-      <PageSection aria-labelledby="account-settings-title" className="pt-2">
-        <PageSectionHeader>
+      <PageSection aria-labelledby="account-settings-title" className="max-w-4xl gap-0 pt-2">
+        <PageSectionHeader className="border-b pb-4">
           <PageSectionTitle id="account-settings-title" className="flex items-center gap-2">
             <Settings2Icon className="size-5" />
             账号设置
@@ -1238,33 +1240,32 @@ export function KeyDetailPage({
             } : current)}
             pushToast={pushToast}
           />
-          <div className="flex min-w-0 items-start justify-between gap-5 py-5">
-            <div className="grid min-w-0 gap-2">
-              <Label htmlFor="token-fingerprint-enabled">开启 Codex 指纹收敛</Label>
-              <p className="text-muted-foreground text-xs leading-relaxed">默认开启；关闭后此账号的请求保留客户端原始指纹字段。</p>
-            </div>
-            <button
-              id="token-fingerprint-enabled"
-              aria-checked={token.codex_fingerprint_enabled !== false}
-              aria-label="开启 Codex 指纹收敛"
-              className={cn(
-                "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
-                token.codex_fingerprint_enabled !== false ? "border-primary bg-primary" : "border-input bg-muted",
-                fingerprintBusy && "cursor-not-allowed opacity-60",
-              )}
-              disabled={fingerprintBusy}
-              onClick={() => void updateFingerprint(token.codex_fingerprint_enabled === false)}
-              role="switch"
-              type="button"
-            >
-              <span
+          <SettingsRow controlId="token-fingerprint-enabled" title="Codex 指纹收敛" description="默认开启，关闭后保留客户端的原始指纹。">
+            <div className="flex h-9 items-center gap-3">
+              <button
+                id="token-fingerprint-enabled"
+                aria-checked={token.codex_fingerprint_enabled !== false}
+                aria-label="开启 Codex 指纹收敛"
                 className={cn(
-                  "pointer-events-none block size-4 rounded-full bg-background shadow-sm transition-transform",
-                  token.codex_fingerprint_enabled !== false ? "translate-x-4" : "translate-x-0.5",
+                  "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                  token.codex_fingerprint_enabled !== false ? "border-primary bg-primary" : "border-input bg-muted",
+                  (fingerprintBusy || !canEditSettings) && "cursor-not-allowed opacity-60",
                 )}
-              />
-            </button>
-          </div>
+                disabled={fingerprintBusy || !canEditSettings}
+                onClick={() => void updateFingerprint(token.codex_fingerprint_enabled === false)}
+                role="switch"
+                type="button"
+              >
+                <span
+                  className={cn(
+                    "pointer-events-none block size-4 rounded-full bg-background shadow-sm transition-transform",
+                    token.codex_fingerprint_enabled !== false ? "translate-x-4" : "translate-x-0.5",
+                  )}
+                />
+              </button>
+              <span className="text-muted-foreground text-sm">{token.codex_fingerprint_enabled !== false ? "已开启" : "已关闭"}</span>
+            </div>
+          </SettingsRow>
         </PageSectionPanel>
       </PageSection>
       <RemarkDialog
@@ -1307,22 +1308,21 @@ function TokenConcurrencyEditor({ token, apiScope, onSaved, pushToast }: {
     }
   }
 
+  const unchanged = !invalid && Number(value.trim() || 0) === (token.active_stream_cap_override ?? 0);
   return (
-    <div className="grid min-w-0 gap-x-8 gap-y-3 pb-5 sm:grid-cols-[minmax(0,1fr)_auto]">
-      <div className="grid min-w-0 gap-2">
-        <Label htmlFor="token-concurrency-override">账号专属并发</Label>
-        <p className="text-muted-foreground text-xs leading-relaxed">当前生效：{token.active_stream_cap ?? "—"}，来源：{source}</p>
-        <p className="text-muted-foreground text-xs leading-relaxed" id="token-concurrency-help">优先级：账号专属设置 ＞ 用户订阅设置 ＞ 管理员默认。范围 1–50，留空或填 0 恢复继承。</p>
-      </div>
-      <div className="flex flex-wrap items-center gap-2 self-start sm:justify-end">
-        <Input aria-describedby="token-concurrency-help" aria-invalid={invalid} className="w-28" disabled={busy || !canEdit}
-          id="token-concurrency-override" min={0} max={50} step={1} nativeInput type="number" placeholder="跟随上级"
+    <SettingsRow controlId="token-concurrency-override" title="账号专属并发" description="限制同时处理的请求数。范围 1–50，留空或填 0 继承上级设置。">
+      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+        <Input aria-describedby="token-concurrency-help" aria-invalid={invalid} size="lg" className="w-full" disabled={busy || !canEdit}
+          id="token-concurrency-override" min={0} max={50} step={1} nativeInput type="number" placeholder={`继承上级（${token.inherited_active_stream_cap ?? token.active_stream_cap ?? "—"}）`}
           onChange={(event) => setDraft(event.currentTarget.value)} value={value} />
-        <Button disabled={invalid || !canEdit} loading={busy} onClick={() => void save(value)} size="sm">保存并发</Button>
-        {token.active_stream_cap_override != null && <Button disabled={busy || !canEdit} onClick={() => void save("")} size="sm" variant="ghost">恢复继承</Button>}
+        <Button size="lg" className="min-w-20" aria-label="保存账号并发" disabled={invalid || unchanged || !canEdit} loading={busy} onClick={() => void save(value)}>保存</Button>
       </div>
-      {invalid && <p role="alert" className="text-destructive-foreground text-xs sm:col-span-2">请输入 0–50 的整数。</p>}
-    </div>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs leading-5">
+        <p id="token-concurrency-help" className="text-muted-foreground">当前生效 <span className="text-foreground font-medium tabular-nums">{token.active_stream_cap ?? "—"}</span> · {source}</p>
+        {token.active_stream_cap_override != null && <button className="underline-offset-4 hover:underline focus-visible:rounded-sm focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50" disabled={busy || !canEdit} onClick={() => void save("")} type="button">恢复继承</button>}
+      </div>
+      {invalid && <p role="alert" className="text-destructive-foreground text-xs leading-5">请输入 0–50 的整数。</p>}
+    </SettingsRow>
   );
 }
 
