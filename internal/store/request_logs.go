@@ -1078,7 +1078,7 @@ func (s *Store) overrideLateFinalizedRequestCosts(ctx context.Context, canonical
 	if err != nil {
 		return err
 	}
-	exactByCanonicalID := make(map[int64]float64, len(completeCanonicalIDs))
+	exactCostByCanonicalID := make(map[int64]float64, len(completeCanonicalIDs))
 	for rows.Next() {
 		var logTokenID int64
 		var cost float64
@@ -1087,15 +1087,16 @@ func (s *Store) overrideLateFinalizedRequestCosts(ctx context.Context, canonical
 			return err
 		}
 		if canonicalID, ok := canonicalByLogTokenID[logTokenID]; ok {
-			exactByCanonicalID[canonicalID] += cost
+			exactCostByCanonicalID[canonicalID] += cost
 		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
+
 	for canonicalID := range completeCanonicalIDs {
-		cost := roundCostUSD(exactByCanonicalID[canonicalID])
+		cost := roundCostUSD(exactCostByCanonicalID[canonicalID])
 		result[canonicalID] = &cost
 	}
 	return nil

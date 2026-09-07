@@ -254,10 +254,13 @@ func (s *Store) ListPendingSub2APIDailyUsageFinalizations(ctx context.Context, t
 			$3::date - 1,
 			interval '1 day'
 		) due(usage_date)
-		left join sub2api_usage_daily_snapshots daily
-		  on daily.target_id = m.target_id
-		 and daily.remote_account_id = m.remote_account_id
-		 and daily.usage_date = due.usage_date::date
+		left join lateral (
+			select remote_account_id, status, error_message, updated_at, finalized_at
+			from sub2api_usage_daily_snapshots
+			where target_id = m.target_id
+			  and remote_account_id = m.remote_account_id
+			  and usage_date = due.usage_date::date
+		) daily on true
 		where m.target_id = $1
 		  and baseline.through_date is not null
 		  and daily.finalized_at is null
@@ -314,6 +317,20 @@ func (s *Store) SaveSub2APIUsageSnapshots(ctx context.Context, targetID int64, i
 			    status = 'synced',
 			    error_message = null,
 			    updated_at = now()
+			where (sub2api_usage_snapshots.token_id,
+			       sub2api_usage_snapshots.account_cost_usd,
+			       sub2api_usage_snapshots.standard_cost_usd,
+			       sub2api_usage_snapshots.user_cost_usd,
+			       sub2api_usage_snapshots.total_requests,
+			       sub2api_usage_snapshots.total_tokens,
+			       sub2api_usage_snapshots.source_computed_at,
+			       sub2api_usage_snapshots.through_date,
+			       sub2api_usage_snapshots.status,
+			       sub2api_usage_snapshots.error_message)
+			  is distinct from
+			      (excluded.token_id, excluded.account_cost_usd, excluded.standard_cost_usd,
+			       excluded.user_cost_usd, excluded.total_requests, excluded.total_tokens,
+			       excluded.source_computed_at, excluded.through_date, 'synced', null)
 		`, targetID, item.RemoteAccountID, item.TokenID, item.AccountCostUSD, item.StandardCostUSD, item.UserCostUSD, item.TotalRequests, item.TotalTokens, item.SourceComputedAt, item.ThroughDate)
 	}
 	if batch.Len() == 0 {
@@ -363,6 +380,22 @@ func (s *Store) SaveSub2APIDailyUsageSnapshots(ctx context.Context, targetID int
 			    status = 'synced',
 			    error_message = null,
 			    updated_at = now()
+			where (sub2api_usage_daily_snapshots.token_id,
+			       sub2api_usage_daily_snapshots.account_cost_usd,
+			       sub2api_usage_daily_snapshots.standard_cost_usd,
+			       sub2api_usage_daily_snapshots.user_cost_usd,
+			       sub2api_usage_daily_snapshots.total_requests,
+			       sub2api_usage_daily_snapshots.total_tokens,
+			       sub2api_usage_daily_snapshots.source_computed_at,
+			       sub2api_usage_daily_snapshots.finalized_at,
+			       sub2api_usage_daily_snapshots.status,
+			       sub2api_usage_daily_snapshots.error_message)
+			  is distinct from
+			      (excluded.token_id, excluded.account_cost_usd, excluded.standard_cost_usd,
+			       excluded.user_cost_usd, excluded.total_requests, excluded.total_tokens,
+			       excluded.source_computed_at,
+			       coalesce(excluded.finalized_at, sub2api_usage_daily_snapshots.finalized_at),
+			       'synced', null)
 		`, targetID, item.RemoteAccountID, item.TokenID, item.UsageDate, item.AccountCostUSD, item.StandardCostUSD, item.UserCostUSD, item.TotalRequests, item.TotalTokens, item.SourceComputedAt, item.Finalized)
 	}
 	if batch.Len() == 0 {
