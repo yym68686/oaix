@@ -1,4 +1,4 @@
-import { SettingsRow } from "@/shared/settings-row";
+import { AccountDetailPanel, SettingsRow } from "@/shared/settings-row";
 import { TokenProxyEditor } from "@/features/account/ProxiesPage";
 import {
   ActivityIcon,
@@ -9,7 +9,6 @@ import {
   RefreshCwIcon,
   RotateCcwIcon,
   SearchIcon,
-  Settings2Icon,
   Trash2Icon,
 } from "lucide-react";
 import type * as React from "react";
@@ -1105,88 +1104,88 @@ export function KeyDetailPage({
   const title = tokenTitle(token);
   const plan = tokenPlanType(token);
   return (
-    <div className="grid gap-4">
+    <div data-slot="account-detail" className="grid min-w-0 gap-6">
       <Button className="w-fit" onClick={() => navigateTo(backHref)} variant="outline">
         <ChevronLeftIcon />
         {backLabel}
       </Button>
-      <PageSection>
-        <PageSectionHeader>
-          <PageSectionTitle className="flex min-w-0 flex-wrap items-center gap-2">
-            <span className="min-w-0 truncate" title={title}>
-              {title}
-            </span>
-            <Badge variant="outline">ID {token.id}</Badge>
-            <Badge variant={statusBadge(status)}>{tokenStatusLabel(status)}</Badge>
-            <Badge variant="secondary">{plan}</Badge>
-          </PageSectionTitle>
-          <PageSectionDescription>{token.account_id || token.source_file || "-"}</PageSectionDescription>
-          <PageSectionAction>
-            <div className="flex flex-wrap gap-2">
-              <Button loading={probeBusy} onClick={() => void runProbe()} size="sm" variant="outline">
-                <ActivityIcon />
-                测试
+      <PageSection className="border-b-0 pb-0">
+        <header className="flex min-w-0 flex-wrap items-start gap-x-6 gap-y-4">
+          <div className="min-w-0 flex-[1_1_28rem]">
+            <PageSectionTitle className="flex min-w-0 flex-wrap items-center gap-2">
+              <span className="min-w-0 truncate" title={title}>
+                {title}
+              </span>
+              <Badge variant="outline">ID {token.id}</Badge>
+              <Badge variant={statusBadge(status)}>{tokenStatusLabel(status)}</Badge>
+              <Badge variant="secondary">{plan}</Badge>
+            </PageSectionTitle>
+            <PageSectionDescription className="mt-1.5 break-all">{token.account_id || token.source_file || "-"}</PageSectionDescription>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <Button loading={probeBusy} onClick={() => void runProbe()} size="sm" variant="outline">
+              <ActivityIcon />
+              测试
+            </Button>
+            {token.credential_mode !== "agent_identity" ? (
+              <Button loading={copyRefreshBusy} onClick={() => void copyRefreshToken()} size="sm" variant="outline">
+                <CopyIcon />
+                复制 refresh_token
               </Button>
-              {token.credential_mode !== "agent_identity" ? (
-                <Button loading={copyRefreshBusy} onClick={() => void copyRefreshToken()} size="sm" variant="outline">
-                  <CopyIcon />
-                  复制 refresh_token
-                </Button>
-              ) : null}
-              <Button
-                disabled={quotaResetBusy}
-                loading={quotaCreditBusy}
-                onClick={() => void queryQuotaResetCredits()}
-                size="sm"
-                title={quotaCreditCount === null ? "查询重置次数" : "刷新重置次数"}
-                variant="outline"
-              >
-                <RefreshCwIcon />
-                {quotaCreditCount === null ? "次数" : `次数 ${formatNumber(quotaCreditCount)}`}
-              </Button>
-              <Button
-                disabled={quotaCreditBusy || quotaCreditCount === null || quotaCreditCount <= 0}
-                loading={quotaResetBusy}
-                onClick={() => void resetQuotaCredit()}
-                size="sm"
-                title={quotaCreditCount === null ? "先查询次数" : quotaCreditCount <= 0 ? "没有可用的重置次数" : "消耗 1 次重置额度"}
-                variant="outline"
-              >
-                <RotateCcwIcon />
-                重置
-              </Button>
-              <Button
-                onClick={() =>
-                  setRemarkTarget({
-                    id: token.id,
-                    meta: token.source_file || "-",
-                    remark: token.remark || "",
-                    title,
-                  })
-                }
-                size="sm"
-                variant="outline"
-              >
-                备注
-              </Button>
-            </div>
-          </PageSectionAction>
-        </PageSectionHeader>
-        <PageSectionPanel className="grid gap-4">
-          <div className="grid gap-3 md:grid-cols-3">
-            <div className="rounded-lg border bg-muted/32 p-3">
+            ) : null}
+            <Button
+              disabled={quotaResetBusy}
+              loading={quotaCreditBusy}
+              onClick={() => void queryQuotaResetCredits()}
+              size="sm"
+              title={quotaCreditCount === null ? "查询重置次数" : "刷新重置次数"}
+              variant="outline"
+            >
+              <RefreshCwIcon />
+              {quotaCreditCount === null ? "次数" : `次数 ${formatNumber(quotaCreditCount)}`}
+            </Button>
+            <Button
+              disabled={quotaCreditBusy || quotaCreditCount === null || quotaCreditCount <= 0}
+              loading={quotaResetBusy}
+              onClick={() => void resetQuotaCredit()}
+              size="sm"
+              title={quotaCreditCount === null ? "先查询次数" : quotaCreditCount <= 0 ? "没有可用的重置次数" : "消耗 1 次重置额度"}
+              variant="outline"
+            >
+              <RotateCcwIcon />
+              重置
+            </Button>
+            <Button
+              onClick={() =>
+                setRemarkTarget({
+                  id: token.id,
+                  meta: token.source_file || "-",
+                  remark: token.remark || "",
+                  title,
+                })
+              }
+              size="sm"
+              variant="outline"
+            >
+              备注
+            </Button>
+          </div>
+        </header>
+        <PageSectionPanel className="grid gap-6">
+          <div data-slot="account-metrics" className="grid grid-cols-2 gap-3 md:grid-cols-3">
+            <div className="col-span-2 min-w-0 rounded-xl border bg-muted/24 p-4 sm:p-5 md:col-span-1">
               <div className="text-muted-foreground text-xs">额度</div>
               <div className="mt-2 flex flex-wrap gap-1 text-[11px]">
                 <TokenQuotaStrip quota={token.quota} state={token.quota_fetch_state} />
               </div>
             </div>
-            <div className="rounded-lg border bg-muted/32 p-3">
+            <div className="min-w-0 rounded-xl border bg-muted/24 p-4 sm:p-5">
               <div className="text-muted-foreground text-xs">并发</div>
               <div className="mt-2 text-[11px]">
                 <TokenConcurrency fallbackCap={activeStreamCap} item={token} />
               </div>
             </div>
-            <div className="rounded-lg border bg-muted/32 p-3">
+            <div className="min-w-0 rounded-xl border bg-muted/24 p-4 sm:p-5">
               <div className="text-muted-foreground text-xs">已用金额</div>
               <div className="mt-2 text-[11px]">
                 <TokenObservedCost
@@ -1199,16 +1198,18 @@ export function KeyDetailPage({
               </div>
             </div>
           </div>
-          <div className="grid gap-2 rounded-lg border bg-muted/24 p-3 text-sm">
-            <div className="grid gap-2 md:grid-cols-2">
+          <AccountDetailPanel id="account-information-title" title="账号信息">
+            <div data-slot="account-information-grid" className="grid grid-cols-2 gap-x-8 gap-y-4 p-4 sm:p-5">
               <DetailItem label="最近使用" value={formatDate(token.last_used_at)} />
               <DetailItem label="重置时间" value={tokenResetAtLabel(token)} />
-              <DetailItem label="创建" value={formatDate(token.created_at)} />
-              <DetailItem label="更新" value={formatDate(token.updated_at)} />
+              <DetailItem label="创建时间" value={formatDate(token.created_at)} />
+              <DetailItem label="更新时间" value={formatDate(token.updated_at)} />
             </div>
-            <DetailItem label="备注" value={token.remark || "-"} />
-            <DetailItem label="最后错误" value={token.last_error || "-"} code />
-          </div>
+            <div className="grid gap-x-8 gap-y-4 border-t p-4 sm:grid-cols-2 sm:p-5">
+              <DetailItem label="备注" value={token.remark || "未添加备注"} />
+              <DetailItem label="最后错误" value={token.last_error || "暂无错误"} code={Boolean(token.last_error)} />
+            </div>
+          </AccountDetailPanel>
           {probeResult && (
             <Alert variant="info">
               <ActivityIcon />
@@ -1220,14 +1221,8 @@ export function KeyDetailPage({
           )}
         </PageSectionPanel>
       </PageSection>
-      <PageSection aria-labelledby="account-settings-title" className="max-w-4xl gap-0 pt-2">
-        <PageSectionHeader className="border-b pb-4">
-          <PageSectionTitle id="account-settings-title" className="flex items-center gap-2">
-            <Settings2Icon className="size-5" />
-            账号设置
-          </PageSectionTitle>
-        </PageSectionHeader>
-        <PageSectionPanel className="grid content-start divide-y">
+      <AccountDetailPanel id="account-settings-title" title="账号设置">
+        <div className="grid min-w-0 divide-y">
           <TokenProxyEditor key={`proxy:${apiScope}:${id}`} tokenID={id} apiScope={apiScope} pushToast={pushToast} />
           <TokenConcurrencyEditor
             key={`${apiScope}:${id}`}
@@ -1266,8 +1261,8 @@ export function KeyDetailPage({
               <span className="text-muted-foreground text-sm">{token.codex_fingerprint_enabled !== false ? "已开启" : "已关闭"}</span>
             </div>
           </SettingsRow>
-        </PageSectionPanel>
-      </PageSection>
+        </div>
+      </AccountDetailPanel>
       <RemarkDialog
         target={remarkTarget}
         onChange={(remark) => setRemarkTarget((target) => (target ? { ...target, remark } : target))}
@@ -1330,7 +1325,7 @@ function DetailItem({ code = false, label, value }: { code?: boolean; label: str
   return (
     <div className="min-w-0">
       <div className="text-muted-foreground text-xs">{label}</div>
-      <div className={cn("mt-1 min-w-0 break-words", code && "rounded-md bg-background p-2 font-mono text-xs")}>{value}</div>
+      <div className={cn("mt-1 min-w-0 break-words text-sm leading-6", code && "rounded-md bg-background p-2 font-mono text-xs")}>{value}</div>
     </div>
   );
 }
