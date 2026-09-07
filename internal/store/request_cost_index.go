@@ -3,19 +3,13 @@ package store
 import "context"
 
 const requestCostRepairIndexName = "ix_gateway_request_logs_late_cost"
-const requestCostRepairCoveringIndexName = "ix_gateway_request_logs_late_cost_covering"
 
 // EnsureRequestCostRepairIndex runs outside startup readiness: the concurrent
 // build still reads the full log heap even though the resulting index is small.
 func (s *Store) EnsureRequestCostRepairIndex(ctx context.Context) error {
-	if err := s.ensureConcurrentIndex(ctx, requestCostRepairIndexName,
+	return s.ensureConcurrentIndex(ctx, requestCostRepairIndexName,
 		"create index concurrently if not exists "+requestCostRepairIndexName+
-			" on gateway_request_logs (token_id) where analytics_recorded_at < finished_at and estimated_cost_usd is not null"); err != nil {
-		return err
-	}
-	return s.ensureConcurrentIndex(ctx, requestCostRepairCoveringIndexName,
-		"create index concurrently if not exists "+requestCostRepairCoveringIndexName+
-			" on gateway_request_logs (token_id) include (estimated_cost_usd) where analytics_recorded_at < finished_at and estimated_cost_usd is not null")
+			" on gateway_request_logs (token_id) where analytics_recorded_at < finished_at and estimated_cost_usd is not null")
 }
 
 func (s *Store) requestCostRepairIndexReady(ctx context.Context) (bool, error) {
