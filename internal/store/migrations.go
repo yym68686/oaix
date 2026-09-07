@@ -124,6 +124,7 @@ var startupMigrations = map[int]startupMigration{
 		currentCostsSQL,
 	}},
 	27: {statements: []string{usageRollupsSQL}},
+	28: {statements: []string{usageRollupsSQL}},
 }
 
 var migrationStatements = []string{

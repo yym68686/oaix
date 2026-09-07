@@ -20,7 +20,7 @@ import (
 	"github.com/yym68686/oaix/internal/config"
 )
 
-const SchemaVersion = 27
+const SchemaVersion = 28
 
 type Workload string
 

@@ -134,7 +134,7 @@ end $$;
 -- The usual result is empty, not the 100 ranges x 1000 days assumed by two
 -- nested SRFs. Encapsulate expansion so the outer join has a realistic bound.
 create or replace function oaix_usage_unsettled_dates(p_through date,p_before date,p_finalized datemultirange)
-returns setof date language plpgsql immutable rows 8 cost 5 as $$
+returns setof date language plpgsql immutable rows 1 cost 5 as $$
 declare remaining datemultirange;
 begin
     if p_through is null or p_through>=p_before-1 then return; end if;

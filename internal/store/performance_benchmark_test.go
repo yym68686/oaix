@@ -22,8 +22,15 @@ func TestPerformanceSettledHistoryBenchmark(t *testing.T) {
 	if _, err := db.pool.Exec(ctx, `alter table sub2api_usage_snapshots disable trigger user; alter table sub2api_usage_daily_snapshots disable trigger user`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.pool.Exec(ctx, `insert into codex_tokens(refresh_token,owner_user_id) select 'bench-token-'||i,$1 from generate_series(1,5000) i`, owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.pool.Exec(ctx, `insert into sub2api_sync_mappings(target_id,token_id,remote_account_id,status)
+		select $1,id,replace(refresh_token,'bench-token-','')::bigint,'synced' from codex_tokens where refresh_token like 'bench-token-%'`, target); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.pool.Exec(ctx, `insert into sub2api_usage_snapshots(target_id,remote_account_id,token_id,through_date,status,synced_at)
-		select $1,i,$2,'2026-07-01','synced',now() from generate_series(1,5000) i`, target, token); err != nil {
+		select target_id,remote_account_id,token_id,'2026-07-01','synced',now() from sub2api_sync_mappings where target_id=$1`, target); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.pool.Exec(ctx, `insert into sub2api_usage_daily_snapshots(target_id,remote_account_id,token_id,usage_date,account_cost_usd,status,finalized_at,synced_at)
@@ -32,7 +39,7 @@ func TestPerformanceSettledHistoryBenchmark(t *testing.T) {
 	}
 	if _, err := db.pool.Exec(ctx, `alter table sub2api_usage_snapshots enable trigger user; alter table sub2api_usage_daily_snapshots enable trigger user;
 		select oaix_refresh_usage_rollup(target_id,remote_account_id) from sub2api_usage_snapshots;
-		analyze sub2api_usage_daily_snapshots; analyze sub2api_usage_rollups; analyze sub2api_usage_snapshots; set work_mem='4MB'`); err != nil {
+		analyze sub2api_usage_daily_snapshots; analyze sub2api_usage_rollups; analyze sub2api_usage_snapshots; analyze codex_tokens; analyze sub2api_sync_mappings; set work_mem='4MB'`); err != nil {
 		t.Fatal(err)
 	}
 	queries := []struct{ name, sql string }{
@@ -78,6 +85,30 @@ func TestPerformanceSettledHistoryBenchmark(t *testing.T) {
 		}
 		if value != want {
 			t.Fatalf("%s result=%v want=%v", query.name, value, want)
+		}
+	}
+	start := time.Now()
+	before := time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC)
+	items, err := db.ListPendingSub2APIDailyUsageFinalizations(ctx, Sub2APISyncTarget{ID: target, OwnerUserID: owner, Enabled: true, CheckIntervalSeconds: 300}, before, 32)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("full finalization: items=%v err=%v", items, err)
+	}
+	t.Logf("full_finalization: elapsed=%v results=%d", time.Since(start), len(items))
+	if os.Getenv("OAIX_EXPLAIN_PERFORMANCE") == "1" {
+		rows, err := db.pool.Query(ctx, "explain (analyze,buffers) "+pendingSub2APIDailyFinalizationsSQL, target, owner, before, 300, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				t.Fatal(err)
+			}
+			t.Log("full_finalization: " + line)
+		}
+		rows.Close()
+		if rows.Err() != nil {
+			t.Fatal(rows.Err())
 		}
 	}
 }

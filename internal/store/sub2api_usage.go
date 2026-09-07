@@ -220,6 +220,33 @@ func (s *Store) ListDueSub2APITodayUsageSyncMappings(ctx context.Context, target
 	return items, rows.Err()
 }
 
+const pendingSub2APIDailyFinalizationsSQL = `
+		with candidates as materialized (
+			select m.target_id,m.token_id,m.remote_account_id,m.created_at,baseline.through_date,baseline.finalized_dates
+			from sub2api_sync_mappings m
+			join codex_tokens token on token.id=m.token_id
+			join sub2api_usage_account_current baseline
+			  on baseline.target_id=m.target_id and baseline.remote_account_id=m.remote_account_id
+			where m.target_id=$1 and m.status='synced' and baseline.through_date is not null
+			  and token.merged_into_token_id is null and token.owner_user_id=$2
+		)
+		select m.target_id,m.token_id,m.remote_account_id,m.created_at,m.through_date,due.usage_date
+		from candidates m
+		cross join lateral oaix_usage_unsettled_dates(m.through_date,$3::date,m.finalized_dates) due(usage_date)
+		left join lateral (
+			select remote_account_id,error_message,updated_at,finalized_at
+			from sub2api_usage_daily_current
+			where target_id=m.target_id and remote_account_id=m.remote_account_id
+			  and usage_date=due.usage_date::date
+			offset 0
+		) daily on true
+		where daily.finalized_at is null
+		  and (daily.error_message is null or daily.updated_at < now() - make_interval(secs => $4))
+		order by (daily.remote_account_id is null) desc, (daily.error_message is not null) asc,
+		         due.usage_date asc, daily.updated_at asc, m.token_id asc
+		limit $5
+	`
+
 func (s *Store) ListPendingSub2APIDailyUsageFinalizations(ctx context.Context, target Sub2APISyncTarget, beforeDate time.Time, limit int) ([]Sub2APIDailyUsageFinalization, error) {
 	if target.ID <= 0 || !target.Enabled || beforeDate.IsZero() {
 		return nil, nil
@@ -232,27 +259,7 @@ func (s *Store) ListPendingSub2APIDailyUsageFinalizations(ctx context.Context, t
 		interval = sub2APIUsageSyncMinInterval
 	}
 	intervalSeconds := int(interval / time.Second)
-	rows, err := s.pool.Query(ctx, `
-		select m.target_id, m.token_id, m.remote_account_id, m.created_at, baseline.through_date, due.usage_date::date
-		from sub2api_sync_mappings m
-		join codex_tokens token on token.id = m.token_id
-		join sub2api_usage_account_current baseline
-		  on baseline.target_id = m.target_id and baseline.remote_account_id = m.remote_account_id
-		cross join lateral oaix_usage_unsettled_dates(baseline.through_date,$3::date,baseline.finalized_dates) due(usage_date)
-		left join sub2api_usage_daily_current daily
-		  on daily.target_id=m.target_id and daily.remote_account_id=m.remote_account_id
-		 and daily.usage_date=due.usage_date::date
-		where m.target_id = $1
-		  and baseline.through_date is not null
-		  and daily.finalized_at is null
-		  and m.status = 'synced'
-		  and token.merged_into_token_id is null
-		  and token.owner_user_id = $2
-		  and (daily.error_message is null or daily.updated_at < now() - make_interval(secs => $4))
-		order by (daily.remote_account_id is null) desc, (daily.error_message is not null) asc,
-		         due.usage_date asc, daily.updated_at asc, m.token_id asc
-		limit $5
-	`, target.ID, target.OwnerUserID, beforeDate, intervalSeconds, limit)
+	rows, err := s.pool.Query(ctx, pendingSub2APIDailyFinalizationsSQL, target.ID, target.OwnerUserID, beforeDate, intervalSeconds, limit)
 	if err != nil {
 		return nil, err
 	}
