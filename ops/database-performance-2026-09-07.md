@@ -69,3 +69,20 @@ Production token metadata had the same cost-estimation problem through its
 correlated identity EXISTS. A single left join gives the same readiness result
 and avoids JIT: measured 894.57 ms -> 109.07 ms on the live pool. These individual
 measurements do not establish a 90% reduction in total CPU.
+
+## Initialization of larger accounts
+
+After the initial pass, seven accounts repeatedly exceeded the seed query's
+500 ms budget. Repeated scans kept consuming CPU without completing those
+accounts. Schema 30 adds a private delta capture table for initialization only.
+Preparation briefly takes the existing writer lock and commits capture state.
+The exact historical total and capture counter are read in one MVCC snapshot
+without the writer lock. Publication briefly takes the writer lock and adds
+only deltas committed since that snapshot. The read has a 3-second SQL budget;
+ordinary cost writes remain unblocked by that read. User-visible totals continue
+to use the exact fallback until publication. No partial total is exposed.
+
+The existing writer lock and INSERT ON CONFLICT preserve compatibility with
+older initializers during rollout. Tests explicitly interleave writes, late
+changes and rollback with an open initializer transaction, verify the resulting
+sum, and verify an older initializer's published total is never overwritten.

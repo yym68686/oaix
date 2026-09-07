@@ -96,7 +96,7 @@ func RunPerformanceRollupWorker(ctx context.Context, logger *slog.Logger, db *st
 		stepCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		usage, usageErr := db.BackfillSub2APIUsageRollups(stepCtx)
 		cancel()
-		stepCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
+		stepCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
 		next, costs, costErr := db.BackfillCurrentTokenCosts(stepCtx, cursor)
 		cursor = next
 		cancel()

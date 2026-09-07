@@ -125,6 +125,7 @@ var startupMigrations = map[int]startupMigration{
 	}},
 	27: {statements: []string{usageRollupsSQL}},
 	29: {statements: []string{createProxyChannels, createProxyChannelsOwnerIndex, createTokenProxyBindings, createTokenProxyChannelIndex}},
+	30: {statements: []string{currentCostsSQL}},
 	28: {statements: []string{usageRollupsSQL}},
 }
 
@@ -835,6 +836,7 @@ var downMigrationStatements = []string{
 	`drop trigger if exists oaix_current_token_cost_update on gateway_request_logs`,
 	`drop function if exists oaix_current_token_cost_changed()`,
 	`drop table if exists gateway_current_token_costs`,
+	`drop table if exists gateway_token_cost_seed_deltas`,
 	`drop table if exists sub2api_usage_daily_sync_state`,
 	`drop table if exists sub2api_usage_rollups`,
 	`drop table if exists gateway_idempotency_records`,

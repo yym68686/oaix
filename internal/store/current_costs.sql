@@ -4,6 +4,13 @@ create table if not exists gateway_current_token_costs (
     initialized_at timestamptz not null default now()
 ) with (fillfactor=80);
 
+-- Private initialization state: never used as a user-visible cost. Capturing
+-- deltas here lets the historical read run without holding the writer lock.
+create table if not exists gateway_token_cost_seed_deltas (
+    token_id integer primary key references codex_tokens(id) on delete cascade,
+    delta_usd numeric not null default 0
+) with (fillfactor=80);
+
 -- The log itself is the request-ID ledger. OLD/NEW deltas cover retries,
 -- reassignment and repricing without creating a second copy of all logs.
 -- Retention deletes do not subtract lifetime costs.
@@ -28,11 +35,16 @@ begin
         where token_id is not null
         group by token_id having sum(cost)<>0 order by token_id
     loop
-        -- Initialization takes the same lock before its single-snapshot seed.
+        -- Keep the existing lock for compatibility with older initializers.
+        -- New initializers only take it to prepare and publish, never to scan.
         perform pg_advisory_xact_lock(17984321,item.token_id);
         update gateway_current_token_costs
         set estimated_cost_usd=estimated_cost_usd+item.delta
         where token_id=item.token_id;
+        if not found then
+            update gateway_token_cost_seed_deltas
+            set delta_usd=delta_usd+item.delta where token_id=item.token_id;
+        end if;
     end loop;
     return new;
 end $$;

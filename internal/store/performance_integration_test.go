@@ -139,6 +139,95 @@ func TestCurrentTokenCostBackfillStartsAndCompletes(t *testing.T) {
 	}
 }
 
+func TestCurrentTokenCostSeedDoesNotBlockWritersAndIncludesConcurrentDeltas(t *testing.T) {
+	db, ctx, _, token := performanceFixture(t)
+	requestID := fmt.Sprintf("seed-write-%d", token)
+	if _, err := db.pool.Exec(ctx, `insert into gateway_request_logs(request_id,endpoint,started_at,token_id,estimated_cost_usd) values($1,'fixture',now(),$2,2)`, requestID, token); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.prepareCurrentTokenCostSeed(ctx, token); err != nil || !ok {
+		t.Fatalf("prepare %v %v", ok, err)
+	}
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock(17984322,$1::integer)`, token); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := readCurrentTokenCostSeed(ctx, tx, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hold the initializer transaction open while another connection writes.
+	// Taking the old writer lock for the scan would make these time out.
+	writeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	_, err = db.pool.Exec(writeCtx, `update gateway_request_logs set estimated_cost_usd=7 where request_id=$1`, requestID)
+	cancel()
+	if err != nil {
+		t.Fatalf("initializer blocked writer: %v", err)
+	}
+	if _, err := db.pool.Exec(ctx, `insert into gateway_request_logs(request_id,endpoint,started_at,token_id,estimated_cost_usd) values($1,'fixture',now(),$2,3)`, requestID+"-next", token); err != nil {
+		t.Fatal(err)
+	}
+	rollback, err := db.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rollback.Exec(ctx, `update gateway_request_logs set estimated_cost_usd=99 where request_id=$1`, requestID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollback.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := publishCurrentTokenCostSeed(ctx, tx, token, seed); err != nil || !ok {
+		t.Fatalf("publish %v %v", ok, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.TokenObservedCostsCurrentSnapshot(ctx, []Token{{ID: token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertApprox(t, valueOrZero(got[token]), 10)
+	var remaining int
+	if err := db.pool.QueryRow(ctx, `select count(*) from gateway_token_cost_seed_deltas where token_id=$1`, token).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("capture cleanup %d %v", remaining, err)
+	}
+}
+
+func TestCurrentTokenCostSeedPreservesOlderInitializerWinner(t *testing.T) {
+	db, ctx, _, token := performanceFixture(t)
+	if ok, err := db.prepareCurrentTokenCostSeed(ctx, token); err != nil || !ok {
+		t.Fatalf("prepare %v %v", ok, err)
+	}
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	seed, err := readCurrentTokenCostSeed(ctx, tx, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.pool.Exec(ctx, `insert into gateway_current_token_costs(token_id,estimated_cost_usd) values($1,23)`, token); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := publishCurrentTokenCostSeed(ctx, tx, token, seed); err != nil || ok {
+		t.Fatalf("overwrote winner: %v %v", ok, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.TokenObservedCostsCurrentSnapshot(ctx, []Token{{ID: token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertApprox(t, valueOrZero(got[token]), 23)
+}
+
 func TestCurrentTokenCostsConcurrentInitialization(t *testing.T) {
 	db, ctx, _, token := performanceFixture(t)
 	if _, err := db.pool.Exec(ctx, `insert into gateway_request_logs(request_id,endpoint,started_at) values($1,'fixture',now()-interval '2 days')`, fmt.Sprintf("concurrent-sentinel-%d", token)); err != nil {

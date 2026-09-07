@@ -79,11 +79,9 @@ func (s *Store) currentTokenCosts(ctx context.Context, tokens []Token) (map[int6
 	return result, nil
 }
 
-// initializeCurrentTokenCost shares a lock with the write trigger. The INSERT
-// sees one MVCC snapshot, so an analytics drain cannot double-count a pending
-// log. Retained accounts use their exact ledger; older accounts preserve the
-// existing lifetime aggregate and add pending costs, never discarding history.
-func (s *Store) initializeCurrentTokenCost(ctx context.Context, tokenID int64) (bool, error) {
+// prepareCurrentTokenCostSeed briefly serializes with cost writers. Once this
+// transaction commits, every subsequent cost delta is captured privately.
+func (s *Store) prepareCurrentTokenCostSeed(ctx context.Context, tokenID int64) (bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -93,23 +91,95 @@ func (s *Store) initializeCurrentTokenCost(ctx context.Context, tokenID int64) (
 	if err := tx.QueryRow(ctx, `select pg_try_advisory_xact_lock(17984321,$1::integer)`, tokenID).Scan(&locked); err != nil || !locked {
 		return false, err
 	}
-	if _, err := tx.Exec(ctx, `set local statement_timeout='500ms'; set local lock_timeout='100ms'`); err != nil {
+	var ready bool
+	if err := tx.QueryRow(ctx, `select exists(select 1 from gateway_current_token_costs where token_id=$1)`, tokenID).Scan(&ready); err != nil {
 		return false, err
 	}
-	tag, err := tx.Exec(ctx, `
-		insert into gateway_current_token_costs(token_id,estimated_cost_usd)
-		select t.id, case when t.created_at >= (select started_at from gateway_request_logs order by started_at limit 1)
-		then (select coalesce(sum(l.estimated_cost_usd::numeric),0) from gateway_request_logs l where l.token_id=t.id and l.estimated_cost_usd is not null)
-		else coalesce(a.estimated_cost_usd::numeric,0) +
-		     (select coalesce(sum(l.estimated_cost_usd::numeric),0) from gateway_request_logs l where l.token_id=t.id and l.analytics_recorded_at is null and l.estimated_cost_usd is not null)
-		end
-		from codex_tokens t left join gateway_request_token_costs a on a.token_id=t.id
-		where t.id=$1 and not exists(select 1 from gateway_current_token_costs c where c.token_id=t.id)
-		on conflict do nothing`, tokenID)
+	if ready {
+		if _, err := tx.Exec(ctx, `delete from gateway_token_cost_seed_deltas where token_id=$1`, tokenID); err != nil {
+			return false, err
+		}
+		return false, tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx, `insert into gateway_token_cost_seed_deltas(token_id) values($1) on conflict do nothing`, tokenID); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}
+
+type currentTokenCostSeed struct{ amount, delta string }
+
+// Both source total and captured delta use one MVCC snapshot. Aggregation can
+// move a log from pending to recorded without double counting it.
+func readCurrentTokenCostSeed(ctx context.Context, tx pgx.Tx, tokenID int64) (currentTokenCostSeed, error) {
+	var seed currentTokenCostSeed
+	err := tx.QueryRow(ctx, `
+  select (case when t.created_at >= (select started_at from gateway_request_logs order by started_at limit 1)
+  then (select coalesce(sum(l.estimated_cost_usd::numeric),0) from gateway_request_logs l where l.token_id=t.id and l.estimated_cost_usd is not null)
+  else coalesce(a.estimated_cost_usd::numeric,0) +
+       (select coalesce(sum(l.estimated_cost_usd::numeric),0) from gateway_request_logs l where l.token_id=t.id and l.analytics_recorded_at is null and l.estimated_cost_usd is not null)
+  end)::text,p.delta_usd::text
+  from codex_tokens t left join gateway_request_token_costs a on a.token_id=t.id
+  join gateway_token_cost_seed_deltas p on p.token_id=t.id
+  where t.id=$1 and not exists(select 1 from gateway_current_token_costs c where c.token_id=t.id)
+ `, tokenID).Scan(&seed.amount, &seed.delta)
+	return seed, err
+}
+
+// Publication takes the writer lock only for two small-row writes. A writer
+// committed after the snapshot contributes exactly delta_now - delta_snapshot.
+func publishCurrentTokenCostSeed(ctx context.Context, tx pgx.Tx, tokenID int64, seed currentTokenCostSeed) (bool, error) {
+	var locked bool
+	if err := tx.QueryRow(ctx, `select pg_try_advisory_xact_lock(17984321,$1::integer)`, tokenID).Scan(&locked); err != nil || !locked {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx, `insert into gateway_current_token_costs(token_id,estimated_cost_usd)
+ select token_id,$2::numeric+delta_usd-$3::numeric from gateway_token_cost_seed_deltas where token_id=$1
+ on conflict do nothing`, tokenID, seed.amount, seed.delta)
 	if err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() > 0, tx.Commit(ctx)
+	if _, err := tx.Exec(ctx, `delete from gateway_token_cost_seed_deltas where token_id=$1`, tokenID); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *Store) initializeCurrentTokenCost(ctx context.Context, tokenID int64) (bool, error) {
+	prepared, err := s.prepareCurrentTokenCostSeed(ctx, tokenID)
+	if err != nil || !prepared {
+		return false, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	// A separate lock serializes new initializers without blocking log writers
+	// or older release initializers. ON CONFLICT preserves an older seed winner.
+	var locked bool
+	if err := tx.QueryRow(ctx, `select pg_try_advisory_xact_lock(17984322,$1::integer)`, tokenID).Scan(&locked); err != nil || !locked {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `set local statement_timeout='3s'; set local lock_timeout='100ms'`); err != nil {
+		return false, err
+	}
+	seed, err := readCurrentTokenCostSeed(ctx, tx, tokenID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err = tx.Exec(ctx, `delete from gateway_token_cost_seed_deltas where token_id=$1 and exists(select 1 from gateway_current_token_costs where token_id=$1)`, tokenID)
+		if err != nil {
+			return false, err
+		}
+		return false, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, err
+	}
+	changed, err := publishCurrentTokenCostSeed(ctx, tx, tokenID, seed)
+	if err != nil {
+		return false, err
+	}
+	return changed, tx.Commit(ctx)
 }
 
 // BackfillCurrentTokenCosts visits missing rows in descending ID order. The
@@ -147,7 +217,7 @@ func (s *Store) BackfillCurrentTokenCosts(ctx context.Context, beforeID int64) (
 			return nextID, initialized, ctx.Err()
 		}
 		nextID = id
-		stepCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+		stepCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 		changed, seedErr := s.initializeCurrentTokenCost(stepCtx, id)
 		cancel()
 		if seedErr != nil {
