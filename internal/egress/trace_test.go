@@ -86,7 +86,7 @@ func TestEgressTraceDistinguishesResolverUDPFromTCP(t *testing.T) {
 	hooks.ConnectDone("tcp4", "1.1.1.1:9999", nil)
 	r.Finish(tr, ctx, 502, false, false, true, io.EOF)
 	d := <-r.queue
-	if d.SchemaVersion != 2 || d.Events[0].Phase != "udp" || d.Events[1].Phase != "udp" || d.Events[2].Phase != "tcp" || d.Events[3].Phase != "tcp" {
+	if d.SchemaVersion != 3 || d.Events[0].Phase != "udp" || d.Events[1].Phase != "udp" || d.Events[2].Phase != "tcp" || d.Events[3].Phase != "tcp" {
 		t.Fatalf("wrong network metadata: %+v", d)
 	}
 }
@@ -247,6 +247,14 @@ func TestEgressTraceReuseAndObserverOff(t *testing.T) {
 		resp.Body.Close()
 		r.Finish(tr, ctx, 200, true, false, false, nil)
 		d := <-r.queue
+		if d.BodyReadError != "" || !d.BodyEOF {
+			t.Fatalf("normal EOF reported as failure: %+v", d)
+		}
+		for _, event := range d.Events {
+			if event.Phase == "body_read" && event.Error != "" {
+				t.Fatal("normal EOF makes an error span")
+			}
+		}
 		if i == 0 {
 			first = d.ConnectionID
 			if first == "" {

@@ -103,7 +103,7 @@ func (e *OTLPExporter) Export(ctx context.Context, d TraceRecord) error {
 		hash := sha256.Sum256([]byte(d.SpanID + ":" + strconv.Itoa(i)))
 		spans = append(spans, span(hex.EncodeToString(hash[:8]), d.SpanID, event.Phase, start, event.AtUS, map[string]string{"error_type": event.Error, "status_code": strconv.Itoa(event.Status), "paired_start": strconv.FormatBool(ok)}))
 	}
-	data, err := json.Marshal(map[string]any{"resourceSpans": []any{map[string]any{"resource": map[string]any{"attributes": otlpAttrs(e.resource)}, "scopeSpans": []any{map[string]any{"scope": map[string]string{"name": "oaix.egress", "version": "2"}, "spans": spans}}}}})
+	data, err := json.Marshal(map[string]any{"resourceSpans": []any{map[string]any{"resource": map[string]any{"attributes": otlpAttrs(e.resource)}, "scopeSpans": []any{map[string]any{"scope": map[string]string{"name": "oaix.egress", "version": "3"}, "spans": spans}}}}})
 	if err != nil {
 		return err
 	}

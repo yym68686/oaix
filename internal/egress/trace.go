@@ -302,12 +302,18 @@ func (b *tracedBody) Read(p []byte) (int, error) {
 			d.LastBodyUS = &us
 		}
 		if err != nil {
-			d.BodyReadError = ErrorClass(err)
 			d.BodyEOF = errors.Is(err, io.EOF)
+			if !d.BodyEOF {
+				d.BodyReadError = ErrorClass(err)
+			}
 		}
 	})
 	if err != nil {
-		b.trace.Event("body_read", "done", "", err, 0)
+		readErr := err
+		if errors.Is(err, io.EOF) {
+			readErr = nil
+		}
+		b.trace.Event("body_read", "done", "", readErr, 0)
 	}
 	return n, err
 }
