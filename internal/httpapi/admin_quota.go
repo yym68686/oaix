@@ -23,6 +23,7 @@ import (
 	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/oauth"
+	"github.com/yym68686/oaix/internal/observability"
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/upstreamerror"
 )
@@ -172,43 +173,67 @@ func (a *App) adminTokenItems(parent context.Context, tokens []store.Token, incl
 }
 
 func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, includeQuota bool, now time.Time) ([]adminTokenItem, []int64) {
+	started := time.Now()
+	var quotaDuration, costDuration, usageDuration time.Duration
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
 	quotaByID := map[int64]*codexQuotaSnapshot{}
 	var pendingIDs []int64
+	// Join all enrichments before rendering. Upstream quota I/O and the exact
+	// cost queries are independent and must not add their latencies together.
+	var enrichments sync.WaitGroup
 	if includeQuota && a.quota != nil && len(tokens) > 0 {
-		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-		defer cancel()
-		quotaByID, pendingIDs = a.quota.collect(ctx, tokens)
+		enrichments.Add(1)
+		go func() {
+			defer enrichments.Done()
+			stageStarted := time.Now()
+			defer func() { quotaDuration = time.Since(stageStarted) }()
+			ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+			defer cancel()
+			quotaByID, pendingIDs = a.quota.collect(ctx, tokens)
+		}()
 	}
 
 	observedCostByID := map[int64]*float64{}
 	sub2APIUsageByID := map[int64]store.Sub2APIUsageCost{}
 	sub2APIUsageLoaded := true
 	if len(tokens) > 0 {
-		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
-		defer cancel()
-		var err error
-		observedCostByID, err = a.store.TokenObservedCostsCurrentSnapshot(ctx, tokens)
-		if err != nil {
-			if observedCostByID == nil {
-				observedCostByID = map[int64]*float64{}
+		enrichments.Add(1)
+		go func() {
+			defer enrichments.Done()
+			stageStarted := time.Now()
+			defer func() { costDuration = time.Since(stageStarted) }()
+			ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+			defer cancel()
+			var err error
+			observedCostByID, err = a.store.TokenObservedCostsCurrentSnapshot(ctx, tokens)
+			if err != nil {
+				if observedCostByID == nil {
+					observedCostByID = map[int64]*float64{}
+				}
+				if a.logger != nil {
+					a.logger.Warn("admin token observed costs load failed", "error", err)
+				}
 			}
-			if a.logger != nil {
-				a.logger.Warn("admin token observed costs load failed", "error", err)
+		}()
+		enrichments.Add(1)
+		go func() {
+			defer enrichments.Done()
+			stageStarted := time.Now()
+			defer func() { usageDuration = time.Since(stageStarted) }()
+			usageCtx, usageCancel := context.WithTimeout(parent, 5*time.Second)
+			var err error
+			sub2APIUsageByID, err = a.store.Sub2APIUsageByTokens(usageCtx, tokens)
+			usageCancel()
+			if err != nil {
+				sub2APIUsageByID = map[int64]store.Sub2APIUsageCost{}
+				sub2APIUsageLoaded = false
+				if a.logger != nil {
+					a.logger.Warn("admin token sub2api usage load failed", "error", err)
+				}
 			}
-		}
-		usageCtx, usageCancel := context.WithTimeout(parent, 5*time.Second)
-		sub2APIUsageByID, err = a.store.Sub2APIUsageByTokens(usageCtx, tokens)
-		usageCancel()
-		if err != nil {
-			sub2APIUsageByID = map[int64]store.Sub2APIUsageCost{}
-			sub2APIUsageLoaded = false
-			if a.logger != nil {
-				a.logger.Warn("admin token sub2api usage load failed", "error", err)
-			}
-		}
+		}()
 	}
 
 	activeByID := a.activeStreamsByTokenID(tokens)
@@ -216,13 +241,16 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 	for _, token := range tokens {
 		ownerIDs = append(ownerIDs, token.OwnerUserID)
 	}
+	concurrencyStarted := time.Now()
 	concurrencyByOwner, concurrencyErr := a.store.UserTokenConcurrencyByOwner(parent, ownerIDs)
+	concurrencyDuration := time.Since(concurrencyStarted)
 	if concurrencyErr != nil {
 		concurrencyByOwner = map[int64]store.TokenConcurrencySettings{}
 		if a.logger != nil {
 			a.logger.Warn("token concurrency settings load failed", "error", concurrencyErr)
 		}
 	}
+	enrichments.Wait()
 	pendingByID := make(map[int64]struct{}, len(pendingIDs))
 	for _, id := range pendingIDs {
 		pendingByID[id] = struct{}{}
@@ -288,6 +316,14 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		if err := a.tokens.Refresh(ctx); err != nil && a.logger != nil {
 			a.logger.Warn("token pool refresh after quota disable failed", "error", err)
 		}
+	}
+	if a.logger != nil {
+		a.logger.Info("token details loaded",
+			"request_id", observability.RequestIDFromContext(parent), "token_count", len(tokens),
+			"include_quota", includeQuota, "duration_ms", time.Since(started).Milliseconds(),
+			"quota_ms", quotaDuration.Milliseconds(), "cost_ms", costDuration.Milliseconds(),
+			"sub2api_usage_ms", usageDuration.Milliseconds(), "concurrency_ms", concurrencyDuration.Milliseconds(),
+			"quota_pending_count", len(pendingIDs))
 	}
 	return items, pendingIDs
 }
