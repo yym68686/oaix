@@ -82,6 +82,24 @@ func TestSub2APIUsageDailySnapshotComposition(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save daily usage: %v", err)
 	}
+	var dailyUpdatedAt time.Time
+	if err := db.pool.QueryRow(ctx, `select updated_at from sub2api_usage_daily_snapshots where target_id = $1 and remote_account_id = $2 and usage_date = $3::date`, targetID, remoteAccountID, days[1]).Scan(&dailyUpdatedAt); err != nil {
+		t.Fatalf("read daily update timestamp: %v", err)
+	}
+	if err := db.SaveSub2APIDailyUsageSnapshots(ctx, targetID, []Sub2APIDailyUsageSnapshotInput{{
+		TokenID: tokenID, RemoteAccountID: remoteAccountID, UsageDate: days[1], AccountCostUSD: 3,
+		StandardCostUSD: 2.5, UserCostUSD: 3.5, TotalRequests: 3, TotalTokens: 30,
+		SourceComputedAt: &computedAt,
+	}}); err != nil {
+		t.Fatalf("repeat unchanged daily usage: %v", err)
+	}
+	var dailyUpdatedAtAfter time.Time
+	if err := db.pool.QueryRow(ctx, `select updated_at from sub2api_usage_daily_snapshots where target_id = $1 and remote_account_id = $2 and usage_date = $3::date`, targetID, remoteAccountID, days[1]).Scan(&dailyUpdatedAtAfter); err != nil {
+		t.Fatalf("read repeated daily update timestamp: %v", err)
+	}
+	if !dailyUpdatedAtAfter.Equal(dailyUpdatedAt) {
+		t.Fatalf("unchanged daily usage rewrote row: before=%s after=%s", dailyUpdatedAt, dailyUpdatedAtAfter)
+	}
 
 	legacy, err := db.Sub2APIUsageByTokens(ctx, []Token{{ID: tokenID}})
 	if err != nil {
