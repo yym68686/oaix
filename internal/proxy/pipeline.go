@@ -1216,7 +1216,7 @@ func (p *Pipeline) recordClaimReleaseTiming(timing map[string]any, claim *tokens
 	}
 }
 
-func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Attempt) (AttemptResult, error) {
+func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Attempt) (attemptResult AttemptResult, attemptErr error) {
 	r = r.WithContext(egress.ForToken(r.Context(), p.store, attempt.Claim.TokenID()))
 	upstreamURL, err := p.upstreamURL(attempt.Intent)
 	if err != nil {
@@ -1314,6 +1314,24 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	if isAlphaSearchEndpoint(attempt.Intent) {
 		return p.writeAlphaSearchJSONResponse(w, resp, attempt)
 	}
+	// A successful HTTP status can still fail during body collection or SSE
+	// preflight. Roll back this attempt's headers only while nothing has been
+	// sent, preserving the gateway's original headers and their multiple values.
+	before := w.Header().Clone()
+	defer func() {
+		if attemptResult.Committed || attemptResult.StreamState.DownstreamStarted || attempt.StreamState.DownstreamStarted {
+			return
+		}
+		headers := w.Header()
+		for key := range headers {
+			if _, existed := before[key]; !existed {
+				delete(headers, key)
+			}
+		}
+		for key, values := range before {
+			headers[key] = values
+		}
+	}()
 	p.copySuccessResponseHeaders(w, resp, attempt)
 	if attempt.Intent.ImageResponseFormat != "" {
 		if attempt.Intent.Stream {
@@ -1349,6 +1367,11 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 }
 
 func (p *Pipeline) copySuccessResponseHeaders(w http.ResponseWriter, resp *http.Response, attempt Attempt) {
+	// A keepalive may already have committed headers on an earlier attempt.
+	// Later attempts must not append headers that cannot be sent on the wire.
+	if attempt.StreamState.DownstreamStarted {
+		return
+	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("X-OAIX-Request-ID", attempt.RequestID)
 	w.Header().Set("X-OAIX-Token-ID", fmt.Sprint(attempt.Claim.TokenID()))
