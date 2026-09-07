@@ -589,12 +589,11 @@ func (a *App) listTokens(w http.ResponseWriter, r *http.Request) {
 	if tokenOpts.OwnerUserID > 0 {
 		countsScope = store.OwnerResources(tokenOpts.OwnerUserID)
 	}
-	counts, planCounts, err := a.loadTokenListMetadata(r.Context(), countsScope, tokenOpts, asOf)
+	counts, planCounts, adminItems, pendingIDs, err := a.loadTokenListPresentation(r.Context(), countsScope, tokenOpts, asOf, items, queryBool(r, "include_quota", false))
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), items, queryBool(r, "include_quota", false), asOf)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts":          counts,
 		"filtered_counts": counts,
@@ -616,25 +615,60 @@ func (a *App) loadTokenListMetadata(parent context.Context, scope store.Resource
 	if asOf.IsZero() {
 		asOf = time.Now().UTC()
 	}
-	countCtx, countCancel := context.WithTimeout(parent, 5*time.Second)
-	counts, err := a.store.TokenCountsScopedAt(countCtx, scope, asOf)
-	countCancel()
-	if err != nil {
+	var wg sync.WaitGroup
+	var counts store.TokenCounts
+	var planCounts []store.TokenPlanCount
+	var countErr, planErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		countCtx, countCancel := context.WithTimeout(parent, 5*time.Second)
+		defer countCancel()
+		counts, countErr = a.store.TokenCountsScopedAt(countCtx, scope, asOf)
+	}()
+	go func() {
+		defer wg.Done()
+		planCtx, planCancel := context.WithTimeout(parent, 5*time.Second)
+		defer planCancel()
+		planCounts, planErr = a.store.TokenPlanCountsScoped(planCtx, scope, opts)
+	}()
+	wg.Wait()
+	if countErr != nil {
 		if a.logger != nil {
-			a.logger.Warn("token list counts load failed", append(tokenListScopeAttrs(scope), "error", err)...)
+			a.logger.Warn("token list counts load failed", append(tokenListScopeAttrs(scope), "error", countErr)...)
 		}
-		return store.TokenCounts{}, nil, err
+		return store.TokenCounts{}, nil, countErr
 	}
-	planCtx, planCancel := context.WithTimeout(parent, 5*time.Second)
-	planCounts, err := a.store.TokenPlanCountsScoped(planCtx, scope, opts)
-	planCancel()
-	if err != nil {
+	if planErr != nil {
 		if a.logger != nil {
-			a.logger.Warn("token list plan counts load failed", append(tokenListScopeAttrs(scope), "error", err)...)
+			a.logger.Warn("token list plan counts load failed", append(tokenListScopeAttrs(scope), "error", planErr)...)
 		}
-		return store.TokenCounts{}, nil, err
+		return store.TokenCounts{}, nil, planErr
 	}
 	return counts, planCounts, nil
+}
+
+func (a *App) loadTokenListPresentation(parent context.Context, scope store.ResourceScope, opts store.TokenListOptions, asOf time.Time, tokens []store.Token, includeQuota bool) (store.TokenCounts, []store.TokenPlanCount, []adminTokenItem, []int64, error) {
+	var wg sync.WaitGroup
+	var counts store.TokenCounts
+	var planCounts []store.TokenPlanCount
+	var adminItems []adminTokenItem
+	var pendingIDs []int64
+	var metadataErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		counts, planCounts, metadataErr = a.loadTokenListMetadata(parent, scope, opts, asOf)
+	}()
+	go func() {
+		defer wg.Done()
+		adminItems, pendingIDs = a.adminTokenItemsAt(parent, tokens, includeQuota, asOf)
+	}()
+	wg.Wait()
+	if metadataErr != nil {
+		return store.TokenCounts{}, nil, nil, nil, metadataErr
+	}
+	return counts, planCounts, adminItems, pendingIDs, nil
 }
 
 func tokenListScopeAttrs(scope store.ResourceScope) []any {

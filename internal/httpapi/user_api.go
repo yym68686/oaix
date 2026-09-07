@@ -634,12 +634,11 @@ func (a *App) listMyTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	asOf := store.TokenListStatusAsOf(opts)
-	counts, planCounts, err := a.loadTokenListMetadata(r.Context(), scope, opts, asOf)
+	counts, planCounts, adminItems, pendingIDs, err := a.loadTokenListPresentation(r.Context(), scope, opts, asOf, items, queryBool(r, "include_quota", false))
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	adminItems, pendingIDs := a.adminTokenItemsAt(r.Context(), items, queryBool(r, "include_quota", false), asOf)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"counts":                    counts,
 		"filtered_counts":           counts,
