@@ -7,6 +7,7 @@ import {
   RefreshCwIcon,
   RotateCcwIcon,
   SearchIcon,
+  Settings2Icon,
   Trash2Icon,
 } from "lucide-react";
 import type * as React from "react";
@@ -1181,17 +1182,6 @@ export function KeyDetailPage({
               <div className="mt-2 text-[11px]">
                 <TokenConcurrency fallbackCap={activeStreamCap} item={token} />
               </div>
-              <TokenConcurrencyEditor
-                key={`${apiScope}:${id}`}
-                token={token}
-                apiScope={apiScope}
-                onSaved={(override) => setToken((current) => current?.id === token.id ? {
-                  ...current,
-                  active_stream_cap_override: override,
-                  active_stream_cap: override ?? current.inherited_active_stream_cap ?? current.active_stream_cap,
-                } : current)}
-                pushToast={pushToast}
-              />
             </div>
             <div className="rounded-lg border bg-muted/32 p-3">
               <div className="text-muted-foreground text-xs">已用金额</div>
@@ -1216,8 +1206,43 @@ export function KeyDetailPage({
             <DetailItem label="备注" value={token.remark || "-"} />
             <DetailItem label="最后错误" value={token.last_error || "-"} code />
           </div>
-          <div className="flex items-start gap-3 rounded-lg border bg-muted/24 p-3">
+          {probeResult && (
+            <Alert variant="info">
+              <ActivityIcon />
+              <AlertTitle>测试结果</AlertTitle>
+              <AlertDescription>
+                <TokenProbeResult result={probeResult} />
+              </AlertDescription>
+            </Alert>
+          )}
+        </PageSectionPanel>
+      </PageSection>
+      <PageSection aria-labelledby="account-settings-title" className="pt-2">
+        <PageSectionHeader>
+          <PageSectionTitle id="account-settings-title" className="flex items-center gap-2">
+            <Settings2Icon className="size-5" />
+            账号设置
+          </PageSectionTitle>
+        </PageSectionHeader>
+        <PageSectionPanel className="grid content-start divide-y">
+          <TokenConcurrencyEditor
+            key={`${apiScope}:${id}`}
+            token={token}
+            apiScope={apiScope}
+            onSaved={(override) => setToken((current) => current?.id === token.id ? {
+              ...current,
+              active_stream_cap_override: override,
+              active_stream_cap: override ?? current.inherited_active_stream_cap ?? current.active_stream_cap,
+            } : current)}
+            pushToast={pushToast}
+          />
+          <div className="flex min-w-0 items-start justify-between gap-5 py-5">
+            <div className="grid min-w-0 gap-2">
+              <Label htmlFor="token-fingerprint-enabled">开启 Codex 指纹收敛</Label>
+              <p className="text-muted-foreground text-xs leading-relaxed">默认开启；关闭后此账号的请求保留客户端原始指纹字段。</p>
+            </div>
             <button
+              id="token-fingerprint-enabled"
               aria-checked={token.codex_fingerprint_enabled !== false}
               aria-label="开启 Codex 指纹收敛"
               className={cn(
@@ -1237,20 +1262,7 @@ export function KeyDetailPage({
                 )}
               />
             </button>
-            <div className="grid gap-1">
-              <div className="font-medium text-sm">开启 Codex 指纹收敛</div>
-              <p className="text-muted-foreground text-xs">默认开启；关闭后此账号的请求保留客户端原始指纹字段。</p>
-            </div>
           </div>
-          {probeResult && (
-            <Alert variant="info">
-              <ActivityIcon />
-              <AlertTitle>测试结果</AlertTitle>
-              <AlertDescription>
-                <TokenProbeResult result={probeResult} />
-              </AlertDescription>
-            </Alert>
-          )}
         </PageSectionPanel>
       </PageSection>
       <RemarkDialog
@@ -1294,18 +1306,20 @@ function TokenConcurrencyEditor({ token, apiScope, onSaved, pushToast }: {
   }
 
   return (
-    <div className="mt-3 grid gap-2 border-t border-border/60 pt-3">
-      <Label className="text-xs" htmlFor="token-concurrency-override">账号专属并发</Label>
-      <div className="flex flex-wrap items-center gap-2">
+    <div className="grid min-w-0 gap-x-8 gap-y-3 pb-5 sm:grid-cols-[minmax(0,1fr)_auto]">
+      <div className="grid min-w-0 gap-2">
+        <Label htmlFor="token-concurrency-override">账号专属并发</Label>
+        <p className="text-muted-foreground text-xs leading-relaxed">当前生效：{token.active_stream_cap ?? "—"}，来源：{source}</p>
+        <p className="text-muted-foreground text-xs leading-relaxed" id="token-concurrency-help">优先级：账号专属设置 ＞ 用户订阅设置 ＞ 管理员默认。范围 1–50，留空或填 0 恢复继承。</p>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 self-start sm:justify-end">
         <Input aria-describedby="token-concurrency-help" aria-invalid={invalid} className="w-28" disabled={busy || !canEdit}
           id="token-concurrency-override" min={0} max={50} step={1} nativeInput type="number" placeholder="跟随上级"
           onChange={(event) => setDraft(event.currentTarget.value)} value={value} />
         <Button disabled={invalid || !canEdit} loading={busy} onClick={() => void save(value)} size="sm">保存并发</Button>
         {token.active_stream_cap_override != null && <Button disabled={busy || !canEdit} onClick={() => void save("")} size="sm" variant="ghost">恢复继承</Button>}
       </div>
-      <p className="text-muted-foreground text-xs">当前生效：{token.active_stream_cap ?? "—"}，来源：{source}</p>
-      <p className="text-muted-foreground text-xs" id="token-concurrency-help">优先级：账号专属设置 ＞ 用户订阅设置 ＞ 管理员默认。范围 1–50，留空或填 0 恢复继承。</p>
-      {invalid && <p role="alert" className="text-destructive-foreground text-xs">请输入 0–50 的整数。</p>}
+      {invalid && <p role="alert" className="text-destructive-foreground text-xs sm:col-span-2">请输入 0–50 的整数。</p>}
     </div>
   );
 }
