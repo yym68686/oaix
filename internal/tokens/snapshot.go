@@ -249,13 +249,13 @@ func (m *Manager) Start(ctx context.Context) {
 			case <-m.stopCh:
 				return
 			case <-ticker.C:
-				if err := m.Refresh(ctx); err != nil && m.logger != nil {
-					m.logger.Warn("token snapshot refresh failed", "error", err)
-				}
-				if refreshed, err := m.RefreshActiveOwners(ctx); err != nil && m.logger != nil {
-					m.logger.Warn("active owner token snapshot refresh failed", "error", err)
-				} else if refreshed > 0 && m.logger != nil {
-					m.logger.Debug("active owner token snapshots refreshed", "owners", refreshed)
+				if err := m.Refresh(ctx); err != nil {
+					if m.logger != nil {
+						m.logger.Warn("token snapshot refresh failed", "error", err)
+					}
+					if _, ownerErr := m.RefreshActiveOwners(ctx); ownerErr != nil && m.logger != nil {
+						m.logger.Warn("active owner token snapshot refresh failed", "error", ownerErr)
+					}
 				}
 			}
 		}
@@ -292,12 +292,47 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	next := m.buildSnapshot(rows, version)
 	readyTransitions := newlyReadyTokens(current, next)
 	m.snapshot.Store(next)
+	m.refreshOwnersFromGlobal(rows, version, next.LoadedAt)
 	m.refreshMu.Unlock()
 	if m.logger != nil {
 		m.logger.Info("token snapshot refreshed", "version", version, "ready_tokens", len(next.Ready))
 	}
 	m.notifyReadyTransitions(ctx, readyTransitions)
 	return nil
+}
+
+func (m *Manager) refreshOwnersFromGlobal(rows []store.Token, version int64, loadedAt time.Time) {
+	refreshWindow := max(m.refreshInterval*10, 5*time.Minute)
+	active := map[int64]*ownerSnapshotState{}
+	m.ownerSnapshots.Range(func(key, value any) bool {
+		state, ok := value.(*ownerSnapshotState)
+		if !ok || state == nil {
+			m.ownerSnapshots.Delete(key)
+			return true
+		}
+		last := state.lastUsedUnix.Load()
+		if last <= 0 {
+			return true
+		}
+		age := loadedAt.Sub(time.Unix(last, 0))
+		if age > refreshWindow*6 {
+			m.ownerSnapshots.Delete(key)
+		} else if age <= refreshWindow {
+			active[state.ownerID] = state
+		}
+		return true
+	})
+	byOwner := make(map[int64][]store.Token, len(active))
+	for _, row := range rows {
+		if active[row.OwnerUserID] != nil {
+			byOwner[row.OwnerUserID] = append(byOwner[row.OwnerUserID], row)
+		}
+	}
+	for owner, state := range active {
+		next := m.buildSnapshot(byOwner[owner], version)
+		next.LoadedAt = loadedAt
+		state.snapshot.Store(next)
+	}
 }
 
 func (m *Manager) RefreshOwner(ctx context.Context, ownerUserID int64) error {

@@ -80,13 +80,9 @@ func (s *Store) BeginGatewayIdempotency(ctx context.Context, input GatewayIdempo
 	if err := validateGatewayIdempotencyBegin(input); err != nil {
 		return GatewayIdempotencyBeginResult{}, err
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return GatewayIdempotencyBeginResult{}, err
-	}
-	defer tx.Rollback(ctx)
-
-	record, err := scanGatewayIdempotencyRecord(tx.QueryRow(ctx, `
+	// A new key needs only one durable statement. Conflicting keys still take
+	// the row lock below before inspecting or changing the lease.
+	record, err := scanGatewayIdempotencyRecord(s.pool.QueryRow(ctx, `
 		insert into gateway_idempotency_records(
 			owner_user_id, key_hash, request_hash, request_id, generation, state,
 			lease_token, lease_expires_at, replayable, created_at, started_at, updated_at, expires_at
@@ -105,14 +101,16 @@ func (s *Store) BeginGatewayIdempotency(ctx context.Context, input GatewayIdempo
 		input.RecordTTL.Seconds(),
 	))
 	if err == nil {
-		if err := tx.Commit(ctx); err != nil {
-			return GatewayIdempotencyBeginResult{}, err
-		}
 		return GatewayIdempotencyBeginResult{Action: GatewayIdempotencyExecute, Record: record}, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return GatewayIdempotencyBeginResult{}, err
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return GatewayIdempotencyBeginResult{}, err
+	}
+	defer tx.Rollback(ctx)
 
 	record, err = scanGatewayIdempotencyRecord(tx.QueryRow(ctx, `
 		select `+gatewayIdempotencyColumns+`
@@ -120,6 +118,13 @@ func (s *Store) BeginGatewayIdempotency(ctx context.Context, input GatewayIdempo
 		where owner_user_id = $1 and key_hash = $2
 		for update
 	`, input.OwnerUserID, input.KeyHash))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Retention can remove the expired conflict between the two statements.
+		if err := tx.Rollback(ctx); err != nil {
+			return GatewayIdempotencyBeginResult{}, err
+		}
+		return s.BeginGatewayIdempotency(ctx, input)
+	}
 	if err != nil {
 		return GatewayIdempotencyBeginResult{}, err
 	}
@@ -272,6 +277,7 @@ func (s *Store) DeleteExpiredGatewayIdempotencyRecords(ctx context.Context, limi
 			  and (state <> 'in_progress' or lease_expires_at is null or lease_expires_at <= now())
 			order by expires_at
 			limit $1
+			for update skip locked
 		)
 		delete from gateway_idempotency_records records
 		using expired

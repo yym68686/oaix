@@ -59,6 +59,18 @@ const createSub2APIUsageDailySnapshots = `create table if not exists sub2api_usa
 const createSub2APIUsageDailyTokenIndex = `create index if not exists ix_sub2api_usage_daily_token on sub2api_usage_daily_snapshots(token_id, usage_date)`
 const createSub2APIUsageDailySyncIndex = `create index if not exists ix_sub2api_usage_daily_sync on sub2api_usage_daily_snapshots(target_id, usage_date, synced_at)`
 
+// Keep freshness separate from the wide daily usage row. A successful poll
+// can update this narrow primary-key table without rewriting every indexed
+// usage and status column in the daily snapshot table.
+const createSub2APIUsageDailySyncState = `create table if not exists sub2api_usage_daily_sync_state (
+	target_id bigint not null,
+	remote_account_id bigint not null,
+	usage_date date not null,
+	synced_at timestamptz not null,
+	source_computed_at timestamptz,
+	primary key(target_id, remote_account_id, usage_date)
+) with (fillfactor=80)`
+
 const createTokenAgentIdentitiesTable = `create table if not exists token_agent_identities (
 	token_id integer primary key references codex_tokens(id) on delete cascade,
 	owner_user_id bigint references platform_users(id) on delete cascade,
@@ -105,6 +117,11 @@ var startupMigrations = map[int]startupMigration{
 	}},
 	25: {statements: []string{
 		`alter table codex_tokens add column if not exists active_stream_cap_override integer`,
+	}},
+	26: {statements: []string{
+		createSub2APIUsageDailySyncState,
+		usageRollupsSQL,
+		currentCostsSQL,
 	}},
 }
 
@@ -777,6 +794,9 @@ var migrationStatements = []string{
 	createSub2APIUsageDailySnapshots,
 	createSub2APIUsageDailyTokenIndex,
 	createSub2APIUsageDailySyncIndex,
+	createSub2APIUsageDailySyncState,
+	usageRollupsSQL,
+	currentCostsSQL,
 }
 
 var onlineMigrationStatements = []string{
@@ -801,10 +821,22 @@ var onlineMigrationStatements = []string{
 }
 
 var downMigrationStatements = []string{
+	`drop view if exists sub2api_usage_account_current`,
+	`drop view if exists sub2api_usage_daily_current`,
+	`drop trigger if exists oaix_current_token_cost_insert on gateway_request_logs`,
+	`drop trigger if exists oaix_current_token_cost_update on gateway_request_logs`,
+	`drop function if exists oaix_current_token_cost_changed()`,
+	`drop table if exists gateway_current_token_costs`,
+	`drop table if exists sub2api_usage_daily_sync_state`,
+	`drop table if exists sub2api_usage_rollups`,
 	`drop table if exists gateway_idempotency_records`,
 	`drop table if exists token_agent_identities`,
 	`drop table if exists sub2api_usage_daily_snapshots`,
 	`drop table if exists sub2api_usage_snapshots`,
+	`drop function if exists oaix_usage_checked()`,
+	`drop function if exists oaix_usage_rollup_changed()`,
+	`drop function if exists oaix_usage_rollup_lock()`,
+	`drop function if exists oaix_refresh_usage_rollup(bigint,bigint)`,
 	`drop table if exists sub2api_sync_mappings`,
 	`drop table if exists sub2api_sync_runs`,
 	`drop table if exists sub2api_sync_targets`,
@@ -897,6 +929,10 @@ func (s *Store) applyStartupMigration(ctx context.Context, targetVersion int, mi
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// A pending trigger DDL lock must not queue behind long business writes.
+	if _, err := tx.Exec(ctx, `set local lock_timeout = '500ms'`); err != nil {
+		return err
+	}
 
 	var currentVersion int
 	if err := tx.QueryRow(ctx, `

@@ -31,6 +31,10 @@ type GPT56CostRepriceResult struct {
 // process are also corrected before the repair is marked complete.
 func (s *Store) RepriceGPT56RequestCosts(ctx context.Context) (GPT56CostRepriceResult, error) {
 	result := GPT56CostRepriceResult{}
+	if completed, err := s.maintenanceSettingCompleted(ctx, gpt56CostRepriceSettingKey); err != nil || completed {
+		result.Completed, result.Phase = completed, "completed"
+		return result, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return result, err

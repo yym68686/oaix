@@ -24,6 +24,7 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 	maintenanceDone := make(chan struct{})
 	indexDone := make(chan struct{})
 	costIndexDone := make(chan struct{})
+	rollupDone := make(chan struct{})
 	importWorker := newImportWorker(cfg)
 	sub2apiSyncer := sub2api.NewSyncer(db, nil, logger, cfg.Upstream.OAuthClientID)
 	go func() {
@@ -60,6 +61,10 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 		defer close(costIndexDone)
 		RunRequestCostIndexWorker(workerCtx, logger, db)
 	}()
+	go func() {
+		defer close(rollupDone)
+		RunPerformanceRollupWorker(workerCtx, logger, db)
+	}()
 	if logger != nil {
 		logger.Info("embedded worker started")
 	}
@@ -77,6 +82,41 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 		select {
 		case <-costIndexDone:
 		case <-shutdownCtx.Done():
+		}
+		select {
+		case <-rollupDone:
+		case <-shutdownCtx.Done():
+		}
+	}
+}
+
+func RunPerformanceRollupWorker(ctx context.Context, logger *slog.Logger, db *store.Store) {
+	var cursor int64
+	for ctx.Err() == nil {
+		stepCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		usage, usageErr := db.BackfillSub2APIUsageRollups(stepCtx)
+		cancel()
+		stepCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
+		next, costs, costErr := db.BackfillCurrentTokenCosts(stepCtx, cursor)
+		cursor = next
+		cancel()
+		if logger != nil && ctx.Err() == nil {
+			if usageErr != nil || costErr != nil {
+				logger.Warn("performance rollup backfill deferred", "usage_error", usageErr, "cost_error", costErr, "cost_cursor", cursor)
+			} else if usage > 0 || costs > 0 {
+				logger.Info("performance rollup backfill", "usage_accounts", usage, "cost_accounts", costs, "cost_cursor", cursor)
+			}
+		}
+		delay := 5 * time.Second
+		if usage == 0 && costs == 0 && cursor == 0 {
+			delay = time.Minute
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 	}
 }

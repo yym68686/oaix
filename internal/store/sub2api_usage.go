@@ -94,23 +94,9 @@ func (s *Store) Sub2APIAccountCostsByTokens(ctx context.Context, tokens []Token)
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		with per_account as (
-			select baseline.token_id,
-			       case when baseline.through_date is null
-				then baseline.account_cost_usd
-				else baseline.account_cost_usd + coalesce(sum(daily.account_cost_usd) filter (where daily.status = 'synced' and daily.usage_date > baseline.through_date), 0)
-			       end as account_cost_usd
-			from sub2api_usage_snapshots baseline
-			left join sub2api_usage_daily_snapshots daily
-			  on daily.target_id = baseline.target_id
-			 and daily.remote_account_id = baseline.remote_account_id
-			where baseline.token_id = any($1::integer[])
-			group by baseline.target_id, baseline.remote_account_id, baseline.token_id, baseline.through_date, baseline.account_cost_usd
-		)
-		select token_id,
-		       coalesce(sum(account_cost_usd), 0)::float8
-		from per_account
-		group by token_id
+		select token_id, coalesce(sum(account_cost_usd),0)::float8
+		from sub2api_usage_account_current
+		where token_id=any($1::integer[]) group by token_id
 	`, postgresIntIDs(snapshotTokenIDs))
 	if err != nil {
 		return nil, err
@@ -200,6 +186,10 @@ func (s *Store) ListDueSub2APITodayUsageSyncMappings(ctx context.Context, target
 		  on daily.target_id = m.target_id
 		 and daily.remote_account_id = m.remote_account_id
 		 and daily.usage_date = $3::date
+		left join sub2api_usage_daily_sync_state freshness
+		  on freshness.target_id = m.target_id
+		 and freshness.remote_account_id = m.remote_account_id
+		 and freshness.usage_date = $3::date
 		where m.target_id = $1
 		  and m.status = 'synced'
 		  and coalesce(m.remote_account_id, 0) > 0
@@ -207,10 +197,10 @@ func (s *Store) ListDueSub2APITodayUsageSyncMappings(ctx context.Context, target
 		  and token.owner_user_id = $2
 		  and (
 			daily.remote_account_id is null
-			or (daily.status = 'synced' and daily.synced_at < now() - make_interval(secs => $4))
+			or (daily.status = 'synced' and greatest(freshness.synced_at, daily.synced_at) < now() - make_interval(secs => $4))
 			or (daily.status <> 'synced' and daily.updated_at < now() - make_interval(secs => $4))
 		  )
-		order by daily.synced_at asc nulls first, m.created_at desc, m.token_id desc
+		order by greatest(freshness.synced_at, daily.synced_at) asc nulls first, m.created_at desc, m.token_id desc
 		limit $5
 	`, target.ID, target.OwnerUserID, usageDate, intervalSeconds, limit)
 	if err != nil {
@@ -246,21 +236,17 @@ func (s *Store) ListPendingSub2APIDailyUsageFinalizations(ctx context.Context, t
 		select m.target_id, m.token_id, m.remote_account_id, m.created_at, baseline.through_date, due.usage_date::date
 		from sub2api_sync_mappings m
 		join codex_tokens token on token.id = m.token_id
-		join sub2api_usage_snapshots baseline
-		  on baseline.target_id = m.target_id
-		 and baseline.remote_account_id = m.remote_account_id
-		cross join lateral generate_series(
-			baseline.through_date + 1,
-			$3::date - 1,
-			interval '1 day'
-		) due(usage_date)
-		left join lateral (
-			select remote_account_id, status, error_message, updated_at, finalized_at
-			from sub2api_usage_daily_snapshots
-			where target_id = m.target_id
-			  and remote_account_id = m.remote_account_id
-			  and usage_date = due.usage_date::date
-		) daily on true
+		join sub2api_usage_account_current baseline
+		  on baseline.target_id = m.target_id and baseline.remote_account_id = m.remote_account_id
+		cross join lateral unnest(
+			case when baseline.through_date < $3::date - 1
+			then datemultirange(daterange(baseline.through_date + 1, $3::date, '[)')) - baseline.finalized_dates
+			else '{}'::datemultirange end
+		) gaps(dates)
+		cross join lateral generate_series(lower(gaps.dates), upper(gaps.dates)-1, interval '1 day') due(usage_date)
+		left join sub2api_usage_daily_current daily
+		  on daily.target_id=m.target_id and daily.remote_account_id=m.remote_account_id
+		 and daily.usage_date=due.usage_date::date
 		where m.target_id = $1
 		  and baseline.through_date is not null
 		  and daily.finalized_at is null
@@ -317,20 +303,6 @@ func (s *Store) SaveSub2APIUsageSnapshots(ctx context.Context, targetID int64, i
 			    status = 'synced',
 			    error_message = null,
 			    updated_at = now()
-			where (sub2api_usage_snapshots.token_id,
-			       sub2api_usage_snapshots.account_cost_usd,
-			       sub2api_usage_snapshots.standard_cost_usd,
-			       sub2api_usage_snapshots.user_cost_usd,
-			       sub2api_usage_snapshots.total_requests,
-			       sub2api_usage_snapshots.total_tokens,
-			       sub2api_usage_snapshots.source_computed_at,
-			       sub2api_usage_snapshots.through_date,
-			       sub2api_usage_snapshots.status,
-			       sub2api_usage_snapshots.error_message)
-			  is distinct from
-			      (excluded.token_id, excluded.account_cost_usd, excluded.standard_cost_usd,
-			       excluded.user_cost_usd, excluded.total_requests, excluded.total_tokens,
-			       excluded.source_computed_at, excluded.through_date, 'synced', null)
 		`, targetID, item.RemoteAccountID, item.TokenID, item.AccountCostUSD, item.StandardCostUSD, item.UserCostUSD, item.TotalRequests, item.TotalTokens, item.SourceComputedAt, item.ThroughDate)
 	}
 	if batch.Len() == 0 {
@@ -386,17 +358,23 @@ func (s *Store) SaveSub2APIDailyUsageSnapshots(ctx context.Context, targetID int
 			       sub2api_usage_daily_snapshots.user_cost_usd,
 			       sub2api_usage_daily_snapshots.total_requests,
 			       sub2api_usage_daily_snapshots.total_tokens,
-			       sub2api_usage_daily_snapshots.source_computed_at,
-			       sub2api_usage_daily_snapshots.finalized_at,
+			       (sub2api_usage_daily_snapshots.finalized_at is not null),
 			       sub2api_usage_daily_snapshots.status,
 			       sub2api_usage_daily_snapshots.error_message)
 			  is distinct from
 			      (excluded.token_id, excluded.account_cost_usd, excluded.standard_cost_usd,
 			       excluded.user_cost_usd, excluded.total_requests, excluded.total_tokens,
-			       excluded.source_computed_at,
-			       coalesce(excluded.finalized_at, sub2api_usage_daily_snapshots.finalized_at),
+			       (excluded.finalized_at is not null or sub2api_usage_daily_snapshots.finalized_at is not null),
 			       'synced', null)
 		`, targetID, item.RemoteAccountID, item.TokenID, item.UsageDate, item.AccountCostUSD, item.StandardCostUSD, item.UserCostUSD, item.TotalRequests, item.TotalTokens, item.SourceComputedAt, item.Finalized)
+		// SendBatch commits both statements together; freshness follows the value
+		// triggers so they always observe the final source row.
+		batch.Queue(`
+			insert into sub2api_usage_daily_sync_state(target_id, remote_account_id, usage_date, synced_at, source_computed_at)
+			values($1, $2, $3::date, now(), $4)
+			on conflict(target_id, remote_account_id, usage_date) do update
+			set synced_at = excluded.synced_at, source_computed_at = excluded.source_computed_at
+		`, targetID, item.RemoteAccountID, item.UsageDate, item.SourceComputedAt)
 	}
 	if batch.Len() == 0 {
 		return nil
@@ -512,47 +490,12 @@ func (s *Store) Sub2APIUsageByTokens(ctx context.Context, tokens []Token) (map[i
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		with per_account as (
-			select baseline.token_id,
-			       case when baseline.through_date is null
-				then baseline.account_cost_usd
-				else baseline.account_cost_usd + coalesce(sum(daily.account_cost_usd) filter (where daily.status = 'synced' and daily.usage_date > baseline.through_date), 0)
-			       end as account_cost_usd,
-			       case when baseline.through_date is null
-				then baseline.standard_cost_usd
-				else baseline.standard_cost_usd + coalesce(sum(daily.standard_cost_usd) filter (where daily.status = 'synced' and daily.usage_date > baseline.through_date), 0)
-			       end as standard_cost_usd,
-			       case when baseline.through_date is null
-				then baseline.user_cost_usd
-				else baseline.user_cost_usd + coalesce(sum(daily.user_cost_usd) filter (where daily.status = 'synced' and daily.usage_date > baseline.through_date), 0)
-			       end as user_cost_usd,
-			       case when baseline.through_date is null
-				then baseline.total_requests
-				else baseline.total_requests + coalesce(sum(daily.total_requests) filter (where daily.status = 'synced' and daily.usage_date > baseline.through_date), 0)
-			       end as total_requests,
-			       case when baseline.through_date is null
-				then baseline.total_tokens
-				else baseline.total_tokens + coalesce(sum(daily.total_tokens) filter (where daily.status = 'synced' and daily.usage_date > baseline.through_date), 0)
-			       end as total_tokens,
-			       greatest(baseline.synced_at, max(daily.synced_at) filter (where daily.status = 'synced' and daily.usage_date > baseline.through_date)) as synced_at
-			from sub2api_usage_snapshots baseline
-			left join sub2api_usage_daily_snapshots daily
-			  on daily.target_id = baseline.target_id
-			 and daily.remote_account_id = baseline.remote_account_id
-			where baseline.token_id = any($1::integer[])
-			group by baseline.target_id, baseline.remote_account_id, baseline.token_id, baseline.through_date,
-			         baseline.account_cost_usd, baseline.standard_cost_usd, baseline.user_cost_usd,
-			         baseline.total_requests, baseline.total_tokens, baseline.synced_at
-		)
-		select token_id,
-		       coalesce(sum(account_cost_usd), 0)::float8,
-		       coalesce(sum(standard_cost_usd), 0)::float8,
-		       coalesce(sum(user_cost_usd), 0)::float8,
-		       coalesce(sum(total_requests), 0)::bigint,
-		       coalesce(sum(total_tokens), 0)::bigint,
+		select token_id, coalesce(sum(account_cost_usd),0)::float8,
+		       coalesce(sum(standard_cost_usd),0)::float8, coalesce(sum(user_cost_usd),0)::float8,
+		       coalesce(sum(total_requests),0)::bigint, coalesce(sum(total_tokens),0)::bigint,
 		       max(synced_at)
-		from per_account
-		group by token_id
+		from sub2api_usage_account_current
+		where token_id=any($1::integer[]) group by token_id
 	`, postgresIntIDs(snapshotTokenIDs))
 	if err != nil {
 		return nil, err
@@ -593,29 +536,16 @@ func (s *Store) Sub2APIUsageByTokens(ctx context.Context, tokens []Token) (map[i
 				or usage.synced_at < now() - make_interval(secs => greatest(t.check_interval_seconds * 3, 900))
 			else
 				usage.status <> 'synced'
-				or daily.last_synced_at is null
-				or daily.failed
-				or daily.missing_days
-				or daily.last_synced_at < now() - make_interval(secs => greatest(t.check_interval_seconds * 3, 900))
+				or usage.daily_synced_at is null
+				or usage.daily_failed
+				or usage.missing_days
+				or usage.daily_synced_at < now() - make_interval(secs => greatest(t.check_interval_seconds * 3, 900))
 			end
 		       )
 		from sub2api_sync_mappings m
 		join sub2api_sync_targets t on t.id = m.target_id and t.enabled = true
-		left join sub2api_usage_snapshots usage
-		  on usage.target_id = m.target_id
-		 and usage.remote_account_id = m.remote_account_id
-		left join lateral (
-			select max(synced_at) filter (where status = 'synced') as last_synced_at,
-			       coalesce(bool_or(status <> 'synced'), false) as failed,
-			       coalesce(
-				(max(usage_date) - usage.through_date) > count(*) filter (where status = 'synced'),
-				true
-			       ) as missing_days
-			from sub2api_usage_daily_snapshots
-			where target_id = m.target_id
-			  and remote_account_id = m.remote_account_id
-			  and usage_date > usage.through_date
-		) daily on usage.through_date is not null
+		left join sub2api_usage_account_current usage
+		  on usage.target_id=m.target_id and usage.remote_account_id=m.remote_account_id
 		where m.token_id = any($1::integer[])
 		  and m.status = 'synced'
 		  and coalesce(m.remote_account_id, 0) > 0
@@ -652,22 +582,9 @@ func (s *Store) Sub2APIUsageCostsByOwner(ctx context.Context, ownerIDs []int64) 
 		return result, nil
 	}
 	rows, err := s.pool.Query(ctx, `
-		with per_account as (
-			select baseline.token_id,
-			       case when baseline.through_date is null
-				then baseline.account_cost_usd
-				else baseline.account_cost_usd + coalesce(sum(daily.account_cost_usd) filter (where daily.status = 'synced' and daily.usage_date > baseline.through_date), 0)
-			       end as account_cost_usd
-			from sub2api_usage_snapshots baseline
-			left join sub2api_usage_daily_snapshots daily
-			  on daily.target_id = baseline.target_id
-			 and daily.remote_account_id = baseline.remote_account_id
-			group by baseline.target_id, baseline.remote_account_id, baseline.token_id,
-			         baseline.through_date, baseline.account_cost_usd
-		)
 		select coalesce(parent.owner_user_id, token.owner_user_id) as owner_user_id,
 		       coalesce(sum(usage.account_cost_usd), 0)::float8
-		from per_account usage
+		from sub2api_usage_account_current usage
 		join codex_tokens token on token.id = usage.token_id
 		left join codex_tokens parent on parent.id = token.merged_into_token_id
 		where coalesce(parent.owner_user_id, token.owner_user_id) = any($1::bigint[])

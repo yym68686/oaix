@@ -605,6 +605,36 @@ func TestManagerRefreshActiveOwnersOnlyRecentOwners(t *testing.T) {
 	}
 }
 
+func TestGlobalRefreshAlsoRefreshesActiveOwnerWithoutAnotherQuery(t *testing.T) {
+	rows := makeTokens(3)
+	rows[0].OwnerUserID = 10
+	rows[1].OwnerUserID = 20
+	rows[2].OwnerUserID = 10
+	source := &fakeSource{tokens: rows}
+	manager := NewManager(source, nil, time.Second, time.Second, 1)
+	claim, err := manager.Claim(context.Background(), Intent{OwnerUserID: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer claim.Release()
+	source.scopedCalls = 0
+	// The next authoritative snapshot excludes one previously ready token.
+	source.tokens = []store.Token{claim.Token.Token, rows[1]}
+	if err := manager.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	owner := manager.SnapshotForOwner(10)
+	if source.scopedCalls != 0 || len(owner.Ready) != 1 || owner.Ready[0].Token.OwnerUserID != 10 {
+		t.Fatalf("duplicate read or owner leak: calls=%d snapshot=%+v", source.scopedCalls, owner)
+	}
+	if !owner.LoadedAt.Equal(manager.Snapshot().LoadedAt) {
+		t.Fatal("owner freshness differs from the authoritative global read")
+	}
+	if owner.Ready[0].Active != claim.Token.Active {
+		t.Fatal("refresh lost shared in-flight concurrency state")
+	}
+}
+
 func TestManagerStartRefreshesGlobalSnapshotPeriodically(t *testing.T) {
 	source := &fakeSource{tokens: makeTokens(2)}
 	manager := NewManager(source, nil, time.Second, 10*time.Millisecond, 1)

@@ -181,7 +181,7 @@ func TestPostgresStartupMigrationFromVersion20AddsSub2APIUsageDailySnapshots(t *
 	if err := db.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate returned error: %v", err)
 	}
-	if _, err := db.pool.Exec(ctx, `drop table if exists sub2api_usage_daily_snapshots`); err != nil {
+	if _, err := db.pool.Exec(ctx, `drop view if exists sub2api_usage_account_current; drop view if exists sub2api_usage_daily_current; drop table if exists sub2api_usage_daily_snapshots`); err != nil {
 		t.Fatalf("drop daily snapshot table: %v", err)
 	}
 	if _, err := db.pool.Exec(ctx, `alter table sub2api_usage_snapshots drop column if exists through_date`); err != nil {

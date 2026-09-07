@@ -762,6 +762,49 @@ func (s *Store) TokenPlanCounts(ctx context.Context, opts TokenListOptions) ([]T
 	return s.TokenPlanCountsScoped(ctx, AllResources(), opts)
 }
 
+// TokenListMetadataScoped computes the unfiltered status totals and filtered
+// plan facets in the same scan and snapshot. Facets intentionally ignore Plan.
+func (s *Store) TokenListMetadataScoped(ctx context.Context, scope ResourceScope, opts TokenListOptions, asOf time.Time) (TokenCounts, []TokenPlanCount, error) {
+	if asOf.IsZero() {
+		asOf = time.Now().UTC()
+	}
+	filter, args := tokenListWhereScoped(opts, false, scope)
+	args = append(args, asOf.UTC())
+	at := fmt.Sprintf("$%d", len(args))
+	ownerWhere := scope.ownerFilter("owner_user_id", &args)
+	rows, err := s.pool.Query(ctx, `
+		select coalesce(nullif(lower(btrim(plan_type)),''),'unknown') as plan,
+		       (`+filter+`) as matches_plan,
+		       count(*)::int,
+		       count(*) filter(where is_active and disabled_at is null and `+tokenCredentialReadyWhere()+` and `+tokenDisplayAvailableWhere(at)+`)::int,
+		       count(*) filter(where is_active and disabled_at is null and `+tokenDisplayCoolingWhere(at)+`)::int,
+		       count(*) filter(where not is_active or disabled_at is not null)::int
+		from codex_tokens where merged_into_token_id is null and `+ownerWhere+`
+		group by plan,matches_plan`, args...)
+	if err != nil {
+		return TokenCounts{}, nil, err
+	}
+	defer rows.Close()
+	var counts TokenCounts
+	plans := map[string]int{}
+	for rows.Next() {
+		var plan string
+		var matches *bool
+		var group TokenCounts
+		if err := rows.Scan(&plan, &matches, &group.Total, &group.Available, &group.Cooling, &group.Disabled); err != nil {
+			return TokenCounts{}, nil, err
+		}
+		counts.Total += group.Total
+		counts.Available += group.Available
+		counts.Cooling += group.Cooling
+		counts.Disabled += group.Disabled
+		if matches != nil && *matches {
+			plans[plan] += group.Total
+		}
+	}
+	return counts, buildPlanCounts(plans), rows.Err()
+}
+
 func (s *Store) TokenPlanCountsScoped(ctx context.Context, scope ResourceScope, opts TokenListOptions) ([]TokenPlanCount, error) {
 	where, args := tokenListWhereScoped(opts, false, scope)
 	rows, err := s.pool.Query(ctx, `

@@ -52,7 +52,7 @@ func TestCurrentObservedCostSnapshotAddsOnlyPendingLogs(t *testing.T) {
 	}
 	body := compactSQL(text[start : start+endOffset])
 	for _, fragment := range []string{
-		"tokenobservedcostsaggregatesnapshot(ctx, tokens, true, true)",
+		"currenttokencosts(ctx, tokens)",
 		"addrequestcostsbytokenaggregate",
 		"addrequestcostsbytokenlogs(ctx, canonicalbylogtokenid, result, true)",
 		"overridelatefinalizedrequestcosts",

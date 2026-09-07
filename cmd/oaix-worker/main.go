@@ -42,6 +42,7 @@ func main() {
 	importWorker := newImportWorker(cfg)
 	go ensureRequestAttemptRetentionIndex(ctx, db, logger)
 	go runtime.RunRequestCostIndexWorker(ctx, logger, db)
+	go runtime.RunPerformanceRollupWorker(ctx, logger, db)
 	logger.Info("oaix worker started")
 	for {
 		select {

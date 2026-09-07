@@ -37,6 +37,10 @@ type FastCostRepriceResult struct {
 // writes from old processes during a rolling deployment.
 func (s *Store) RepriceFastRequestCosts(ctx context.Context) (FastCostRepriceResult, error) {
 	result := FastCostRepriceResult{}
+	if completed, err := s.maintenanceSettingCompleted(ctx, fastCostRepriceSettingKey); err != nil || completed {
+		result.Completed, result.Phase = completed, "completed"
+		return result, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return result, err

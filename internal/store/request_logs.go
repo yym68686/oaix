@@ -341,6 +341,7 @@ func (s *Store) DrainRequestLogOutbox(ctx context.Context, limit int) (int, erro
 }
 
 func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) error {
+	batch := &pgx.Batch{}
 	for _, item := range logs {
 		modelName := item.ModelName
 		if modelName == nil {
@@ -348,7 +349,7 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 		}
 		promptTrace := jsonBytes(item.PromptCacheTrace)
 		streamDeliveryTrace := streamDeliveryTraceBytes(item.StreamDeliveryTrace)
-		_, err := tx.Exec(ctx, `
+		batch.Queue(`
 			with upserted as (
 			insert into gateway_request_logs (
 				request_id, owner_user_id, api_key_id, token_owner_user_id, endpoint, model, model_name, is_stream, status_code, success,
@@ -435,11 +436,15 @@ func upsertRequestLogsTx(ctx context.Context, tx pgx.Tx, logs []RequestLog) erro
 			promptTrace, item.ErrorMessage, item.SelectionMode, item.CallerOwnerUserID,
 			item.StreamDeliveryState, item.DownstreamConnectionID, streamDeliveryTrace,
 		)
-		if err != nil {
+	}
+	results := tx.SendBatch(ctx, batch)
+	defer results.Close()
+	for range batch.Len() {
+		if _, err := results.Exec(); err != nil {
 			return err
 		}
 	}
-	return nil
+	return results.Close()
 }
 
 func (s *Store) RequestLogSummary(ctx context.Context, hours int) (RequestLogSummary, error) {
@@ -615,6 +620,9 @@ func (s *Store) aggregateRequestHourlyStatsBatch(ctx context.Context) (int64, in
 }
 
 func (s *Store) backfillRequestAnalyticsQueue(ctx context.Context) error {
+	if completed, err := s.maintenanceSettingCompleted(ctx, requestAnalyticsBackfillSettingKey); err != nil || completed {
+		return err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -725,15 +733,10 @@ func (s *Store) TokenObservedCostsAggregateSnapshot(ctx context.Context, tokens 
 	return s.tokenObservedCostsAggregateSnapshot(ctx, tokens, false, false)
 }
 
-// TokenObservedCostsCurrentSnapshot returns the reconciled aggregate plus
-// completed request logs that are still waiting in the analytics queue. The
-// pending-only lookup uses the bounded partial index, so import summaries stay
-// current. If an upstream retry reused a request ID after its earlier state was
-// aggregated, the finalized row is newer than analytics_recorded_at; only those
-// affected tokens fall back to an exact indexed request-log sum when their
-// complete lifetime is still inside request-log retention.
+// TokenObservedCostsCurrentSnapshot reads transactionally maintained totals.
+// Accounts awaiting initialization use the existing exact pending/late repair.
 func (s *Store) TokenObservedCostsCurrentSnapshot(ctx context.Context, tokens []Token) (map[int64]*float64, error) {
-	return s.tokenObservedCostsAggregateSnapshot(ctx, tokens, true, true)
+	return s.currentTokenCosts(ctx, tokens)
 }
 
 func (s *Store) tokenObservedCostsAggregateSnapshot(ctx context.Context, tokens []Token, includePendingLogs bool, repairLateFinalizedLogs bool) (map[int64]*float64, error) {
@@ -1218,6 +1221,9 @@ func (s *Store) RequestTokenCostsReconciled(ctx context.Context) (bool, error) {
 }
 
 func (s *Store) ReconcileRecordedTokenCosts(ctx context.Context) (bool, error) {
+	if completed, err := s.maintenanceSettingCompleted(ctx, requestTokenCostReconcileSettingKey); err != nil || completed {
+		return false, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
