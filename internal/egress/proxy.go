@@ -201,7 +201,7 @@ func NewTransport(base *http.Transport) http.RoundTripper {
 			if err != nil {
 				return nil, err
 			}
-			return wrapConn(conn), nil
+			return observeDialConn(ctx, conn), nil
 		}
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
@@ -223,7 +223,7 @@ func NewTransport(base *http.Transport) http.RoundTripper {
 		for _, ip := range ips {
 			conn, dialErr := dial(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
 			if dialErr == nil {
-				return wrapConn(conn), nil
+				return observeDialConn(ctx, conn), nil
 			}
 			if ctx.Err() != nil {
 				return nil, ctx.Err()

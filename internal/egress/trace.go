@@ -43,6 +43,7 @@ type Event struct {
 }
 
 type TraceRecord struct {
+	TransportError         string        `json:"transport_error,omitempty"`
 	ProxySelectionObserved bool          `json:"proxy_selection_observed"`
 	ProxyHandshakeCoverage string        `json:"proxy_handshake_coverage,omitempty"`
 	DownstreamHeaderCount  int           `json:"downstream_request_id_header_count"`
@@ -137,6 +138,9 @@ func (t *Trace) Event(phase, step, endpoint string, err error, status int) {
 		return
 	}
 	t.update(func(d *TraceRecord) {
+		if phase == "round_trip" && err != nil {
+			d.TransportError = ErrorClass(err)
+		}
 		if len(d.Events) >= MaxTraceEvents {
 			d.DroppedEvents++
 			d.Truncated = true
@@ -385,8 +389,8 @@ func (t *Trace) withHooks(ctx context.Context) context.Context {
 		},
 		DNSStart:          func(info httptrace.DNSStartInfo) { t.Event("dns", "start", "", nil, 0) },
 		DNSDone:           func(info httptrace.DNSDoneInfo) { t.Event("dns", "done", "", info.Err, 0) },
-		ConnectStart:      func(network, address string) { t.Event("tcp", "start", address, nil, 0) },
-		ConnectDone:       func(network, address string, err error) { t.Event("tcp", "done", address, err, 0) },
+		ConnectStart:      func(network, address string) { t.Event(networkPhase(network), "start", address, nil, 0) },
+		ConnectDone:       func(network, address string, err error) { t.Event(networkPhase(network), "done", address, err, 0) },
 		TLSHandshakeStart: func() { t.Event("tls", "start", "", nil, 0) },
 		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
 			t.update(func(d *TraceRecord) { d.TLSProtocol = knownValue(state.NegotiatedProtocol, "h2", "http/1.1") })
@@ -399,4 +403,27 @@ func (t *Trace) withHooks(ctx context.Context) context.Context {
 
 func (t *Trace) ObserveDownstreamHeaders(headers http.Header) {
 	t.update(func(d *TraceRecord) { d.DownstreamHeaderCount = len(headers.Values("X-Oai-Request-ID")) })
+}
+
+// GotConn occurs after TLS. Preserve the socket identity for earlier failures.
+func observeDialConn(ctx context.Context, conn net.Conn) net.Conn {
+	wrapped := wrapConn(conn)
+	trace := TraceFrom(ctx)
+	trace.update(func(d *TraceRecord) {
+		d.ConnectionID = connectionID(wrapped)
+		d.LocalEndpoint = safeEndpoint(conn.LocalAddr().String())
+		d.RemoteEndpoint = safeEndpoint(conn.RemoteAddr().String())
+	})
+	trace.Event("socket_open", "done", "", nil, 0)
+	return wrapped
+}
+
+func networkPhase(network string) string {
+	if strings.HasPrefix(network, "tcp") {
+		return "tcp"
+	}
+	if strings.HasPrefix(network, "udp") {
+		return "udp"
+	}
+	return "network_connect"
 }

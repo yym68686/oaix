@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync"
@@ -67,11 +68,26 @@ func TestEgressTraceHTTP2CompressionAndTLSFailure(t *testing.T) {
 					t.Fatalf("decoded body facts: %+v", d)
 				}
 			case "tls_failure":
-				if d.ErrorClass != "tls_certificate" || d.UpstreamStatus != 0 {
+				if d.ErrorClass != "tls_certificate" || d.UpstreamStatus != 0 || d.ConnectionID == "" || d.TransportError != "tls_certificate" {
 					t.Fatalf("TLS facts: %+v", d)
 				}
 			}
 		})
+	}
+}
+
+func TestEgressTraceDistinguishesResolverUDPFromTCP(t *testing.T) {
+	r := testRecorder(t)
+	ctx, tr := r.Begin(context.Background(), nil, "resolver", 1, 1)
+	hooks := httptrace.ContextClientTrace(ctx)
+	hooks.ConnectStart("udp", "1.1.1.1:53")
+	hooks.ConnectDone("udp", "1.1.1.1:53", nil)
+	hooks.ConnectStart("tcp4", "1.1.1.1:9999")
+	hooks.ConnectDone("tcp4", "1.1.1.1:9999", nil)
+	r.Finish(tr, ctx, 502, false, false, true, io.EOF)
+	d := <-r.queue
+	if d.SchemaVersion != 2 || d.Events[0].Phase != "udp" || d.Events[1].Phase != "udp" || d.Events[2].Phase != "tcp" || d.Events[3].Phase != "tcp" {
+		t.Fatalf("wrong network metadata: %+v", d)
 	}
 }
 
@@ -324,10 +340,35 @@ func TestEgressExporterPayloadAndFailureIsolation(t *testing.T) {
 	ctx, tr := r.Begin(context.Background(), http.Header{"Traceparent": []string{"00-" + strings.Repeat("a", 32) + "-" + strings.Repeat("b", 16) + "-01"}}, "export", 1, 1)
 	tr.Event("tls", "start", "", nil, 0)
 	tr.Event("tls", "done", "", nil, 0)
+	tr.Event("udp", "start", "1.1.1.1:53", nil, 0)
+	tr.Event("udp", "start", "1.1.1.1:53", nil, 0)
+	tr.Event("udp", "done", "1.1.1.1:53", nil, 0)
+	tr.Event("udp", "done", "1.1.1.1:53", nil, 0)
 	r.Finish(tr, ctx, 200, true, false, false, nil)
 	d := <-r.queue
 	if err := e.Export(context.Background(), d); err != nil {
 		t.Fatal(err)
+	}
+	spans := received["resourceSpans"].([]any)[0].(map[string]any)["scopeSpans"].([]any)[0].(map[string]any)["spans"].([]any)
+	ambiguous := 0
+	for _, raw := range spans {
+		span := raw.(map[string]any)
+		if span["name"] != "udp" {
+			continue
+		}
+		ambiguous++
+		if span["startTimeUnixNano"] != span["endTimeUnixNano"] {
+			t.Fatal("invented a duration for overlapping DNS dials")
+		}
+		for _, rawAttr := range span["attributes"].([]any) {
+			attr := rawAttr.(map[string]any)
+			if attr["key"] == "paired_start" && attr["value"].(map[string]any)["stringValue"] != "false" {
+				t.Fatal("ambiguous dial pairing claimed exact")
+			}
+		}
+	}
+	if ambiguous != 2 {
+		t.Fatal("missing parallel dial observations")
 	}
 	if received["resourceSpans"] == nil || d.ParentSpanID != strings.Repeat("b", 16) {
 		t.Fatal("OTLP identity missing")

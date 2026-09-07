@@ -143,7 +143,7 @@ func (r *Recorder) Begin(ctx context.Context, headers http.Header, requestID str
 	}
 	start := time.Now()
 	t := &Trace{start: start, late: &r.lateEvents, successSamplePercent: p.SuccessSamplePercent, data: TraceRecord{
-		SchemaVersion: 1, AttemptID: randomHex(16), RequestID: safeID(requestID), AttemptIndex: index,
+		SchemaVersion: 2, AttemptID: randomHex(16), RequestID: safeID(requestID), AttemptIndex: index,
 		TraceID: traceID, SpanID: randomHex(8), ParentSpanID: parent, TokenID: tokenID,
 		StartedAt: start.UTC(), ContentLength: -1, Route: RouteSnapshot{Kind: "unresolved"},
 		Events: make([]Event, 0, 24),

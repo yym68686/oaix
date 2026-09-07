@@ -63,3 +63,6 @@ Schema 31只新增 `gateway_egress_observations` 和该空表的索引；不ALTE
 新增隔离测试覆盖：真实CONNECT407、HTTPS隧道成功及正文短读、连接复用、HTTP/2、TLS验证失败、gzip截断、EOF重试结果和最终响应头一致、SSE完成事件、错误/凭证脱敏、队列/速率/事件上限、异步导出阻塞、迟到回调、管理员权限、策略持久化、诊断幂等与保留。
 
 PG14/18验证Schema30→31和重复启动；迁移时锁住业务日志、账号和代理配置表仍能完成，证明增量不访问这些热表。基线代理解析、失败不直连、凭证隔离及SOCKS测试继续运行。全量Go测试、vet、相关race及Linux构建为发布门槛。隔离benchmark只反映观测代码开销，不代表生产P99或整机CPU收益。
+
+
+记录schema_version=2修正了初次线上验收发现的观测细节：DNS拨号的UDP/TCP按实际network区分；CONNECT/TLS失败在GotConn之前也保留已建立socket的ID和端点；原始transport错误与安全包装后的结果分别保存。同端点并行拨号无法从标准钩子唯一配对时，span标记paired_start=false，不伪造耗时。schema_version=1的历史记录不回写，其DNS阶段的tcp标记不能单独作为实际TCP证据。

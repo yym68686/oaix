@@ -62,37 +62,48 @@ func (e *OTLPExporter) Export(ctx context.Context, d TraceRecord) error {
 		fields["stage"] = name
 		return map[string]any{"traceId": d.TraceID, "spanId": id, "parentSpanId": parent, "name": name, "kind": 3, "startTimeUnixNano": strconv.FormatInt(d.StartedAt.Add(time.Duration(start)*time.Microsecond).UnixNano(), 10), "endTimeUnixNano": strconv.FormatInt(d.StartedAt.Add(time.Duration(end)*time.Microsecond).UnixNano(), 10), "attributes": otlpAttrs(fields)}
 	}
-	root := span(d.SpanID, d.ParentSpanID, "egress_attempt", 0, d.DurationUS, map[string]string{"status_code": strconv.Itoa(d.LocalStatus), "upstream_status_code": strconv.Itoa(d.UpstreamStatus), "error_type": d.ErrorClass, "body_read_error": d.BodyReadError, "proxy_channel_id": strconv.FormatInt(d.Route.ChannelID, 10), "connection_id": d.ConnectionID})
+	root := span(d.SpanID, d.ParentSpanID, "egress_attempt", 0, d.DurationUS, map[string]string{"status_code": strconv.Itoa(d.LocalStatus), "upstream_status_code": strconv.Itoa(d.UpstreamStatus), "error_type": d.ErrorClass, "body_read_error": d.BodyReadError, "transport_error": d.TransportError, "proxy_channel_id": strconv.FormatInt(d.Route.ChannelID, 10), "connection_id": d.ConnectionID})
 	if d.ErrorClass != "" {
 		root["status"] = map[string]any{"code": 2, "message": d.ErrorClass}
 	}
 	spans := []map[string]any{root}
-	starts := map[string]int64{}
+	starts := map[string][]int64{}
+	ambiguous := map[string]bool{}
 	for i, event := range d.Events {
 		key := event.Phase + "|" + event.Endpoint
 		if event.Step == "start" {
-			starts[key] = event.AtUS
+			if len(starts[key]) > 0 {
+				ambiguous[key] = true
+			}
+			starts[key] = append(starts[key], event.AtUS)
 			continue
 		}
-		start, ok := starts[key]
-		if !ok && event.Phase == "connection" {
-			for k, v := range starts {
+		if len(starts[key]) == 0 && event.Phase == "connection" {
+			for k := range starts {
 				if strings.HasPrefix(k, "connection|") {
-					start = v
-					ok = true
-					delete(starts, k)
+					key = k
 					break
 				}
 			}
 		}
-		if !ok {
-			start = event.AtUS
+		start, ok := event.AtUS, false
+		if pending := starts[key]; len(pending) > 0 {
+			// Hooks do not identify parallel DNS dials to the same endpoint.
+			// Preserve their events without inventing which start matches a done.
+			if !ambiguous[key] {
+				start = pending[0]
+				ok = true
+			}
+			starts[key] = pending[1:]
+			if len(starts[key]) == 0 {
+				delete(starts, key)
+				delete(ambiguous, key)
+			}
 		}
-		delete(starts, key)
 		hash := sha256.Sum256([]byte(d.SpanID + ":" + strconv.Itoa(i)))
 		spans = append(spans, span(hex.EncodeToString(hash[:8]), d.SpanID, event.Phase, start, event.AtUS, map[string]string{"error_type": event.Error, "status_code": strconv.Itoa(event.Status), "paired_start": strconv.FormatBool(ok)}))
 	}
-	data, err := json.Marshal(map[string]any{"resourceSpans": []any{map[string]any{"resource": map[string]any{"attributes": otlpAttrs(e.resource)}, "scopeSpans": []any{map[string]any{"scope": map[string]string{"name": "oaix.egress", "version": "1"}, "spans": spans}}}}})
+	data, err := json.Marshal(map[string]any{"resourceSpans": []any{map[string]any{"resource": map[string]any{"attributes": otlpAttrs(e.resource)}, "scopeSpans": []any{map[string]any{"scope": map[string]string{"name": "oaix.egress", "version": "2"}, "spans": spans}}}}})
 	if err != nil {
 		return err
 	}
