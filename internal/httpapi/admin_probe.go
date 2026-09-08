@@ -189,10 +189,18 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		}
 		return tokenProbeResultForAttempt(token, "inconclusive", statusCode, message, attempt.Detail, model, attempt)
 	case tokenProbeTransient:
+		if attempt.ErrorCode == "proxy_unavailable" && attempt.Stage == probeStageUpstreamTransport {
+			return tokenProbeResultForAttempt(token, "inconclusive", statusCode, "代理不可用，当前状态未改变。", attempt.Detail, model, attempt)
+		}
+		if attempt.ErrorCode == "upstream_transport_error" && attempt.Stage == probeStageUpstreamTransport {
+			return tokenProbeResultForAttempt(token, "inconclusive", statusCode, "连接上游失败，当前状态未改变。", attempt.Detail, model, attempt)
+		}
 		return tokenProbeResultForAttempt(token, "inconclusive", statusCode, "上游暂时不可用或限流，当前状态未改变。", attempt.Detail, model, attempt)
 	default:
 		message := "测试未收到可信的完整成功事件，当前状态未改变。"
-		if !attempt.UpstreamAttempted {
+		if attempt.ErrorCode == "proxy_configuration_unavailable" && !attempt.UpstreamAttempted {
+			message = "测试未执行：无法读取代理配置，当前状态未改变。"
+		} else if !attempt.UpstreamAttempted {
 			message = "测试未执行：本地预检失败，未向上游发送请求。"
 		} else if attempt.Stage == probeStageCredentialPreparation {
 			message = "测试未完成：Agent Identity 凭据恢复失败，账号状态未改变。"

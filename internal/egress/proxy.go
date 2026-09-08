@@ -14,6 +14,13 @@ import (
 	"unicode"
 )
 
+// These safe errors distinguish proxy configuration/transport failures from
+// upstream HTTP responses without exposing credentials or changing error text.
+var (
+	ErrProxyConfigurationUnavailable = errors.New("无法读取账号代理配置")
+	ErrProxyUnavailable              = errors.New("代理连接失败，请检查地址、认证信息和网络可用性")
+)
+
 // Parse accepts a proxy URL or host:port[:username:password]. Errors never
 // contain the supplied credentials. Passwords in the shorthand may contain ':'.
 func Parse(raw string) (*url.URL, error) {
@@ -152,7 +159,7 @@ func ForToken(ctx context.Context, source any, tokenID int64) context.Context {
 	}
 	trace.Event("route_config", "done", "", err, 0)
 	if err != nil {
-		err = errors.New("无法读取账号代理配置")
+		err = ErrProxyConfigurationUnavailable
 	}
 	return context.WithValue(ctx, contextKey{}, route{proxy: proxy, err: err})
 }
@@ -253,7 +260,7 @@ func (t *proxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if req.Context().Err() != nil {
 			return nil, req.Context().Err()
 		}
-		return nil, errors.New("代理连接失败，请检查地址、认证信息和网络可用性")
+		return nil, ErrProxyUnavailable
 	}
 	return resp, err
 }

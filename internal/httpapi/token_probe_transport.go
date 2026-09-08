@@ -109,8 +109,19 @@ func (a *App) executeTokenProbe(parent context.Context, token store.Token, model
 				ErrorCode: "request_canceled", Stage: probeStageUpstreamTransport, UpstreamAttempted: true,
 			}
 		}
+		if errors.Is(err, egress.ErrProxyConfigurationUnavailable) {
+			return localTokenProbeFailure(http.StatusServiceUnavailable, probeStageLocalPreflight,
+				"proxy_configuration_unavailable", "无法读取账号代理配置，未向上游发送请求；请稍后重试。")
+		}
+		if errors.Is(err, egress.ErrProxyUnavailable) {
+			return tokenProbeAttempt{
+				Outcome: tokenProbeTransient, StatusCode: http.StatusBadGateway,
+				Detail:    "未能通过账号代理完成请求，请检查代理配置及连通性；本次测试无法判断账号是否可用。",
+				ErrorCode: "proxy_unavailable", Stage: probeStageUpstreamTransport, UpstreamAttempted: true,
+			}
+		}
 		return tokenProbeAttempt{
-			Outcome: tokenProbeTransient, StatusCode: http.StatusBadGateway, Detail: "upstream probe request failed",
+			Outcome: tokenProbeTransient, StatusCode: http.StatusBadGateway, Detail: "未收到上游响应，本次测试无法判断账号是否可用，请稍后重试。",
 			ErrorCode: "upstream_transport_error", Stage: probeStageUpstreamTransport, UpstreamAttempted: true,
 		}
 	}
