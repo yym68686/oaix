@@ -1128,6 +1128,9 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 					return result, err
 				}
 			}
+			if err := applyTokenImportMetadata(ctx, tx, ownerUserID, &token, payload); err != nil {
+				return result, err
+			}
 			action := "updated"
 			result.Updated++
 			result.Tokens = append(result.Tokens, token)
@@ -1187,6 +1190,9 @@ func (s *Store) UpsertTokenPayloadsForOwner(ctx context.Context, ownerUserID int
 			if err := recordTokenSecretAndRefreshHistory(ctx, tx, ownerUserID, token.ID, accessToken, refreshToken, idToken); err != nil {
 				return result, err
 			}
+		}
+		if err := applyTokenImportMetadata(ctx, tx, ownerUserID, &token, payload); err != nil {
+			return result, err
 		}
 		result.Created++
 		result.Tokens = append(result.Tokens, token)
