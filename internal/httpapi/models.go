@@ -270,6 +270,17 @@ func codexModelProfileForID(id string, priority int) codexModelProfile {
 		MaxContextWindow:        codexFallbackContextWindow,
 	}
 	switch {
+	case codexModelMatchesFamily(id, "gpt-6-astra"):
+		profile.DisplayName = "GPT-6-Astra"
+		profile.Description = "Our most capable model for complex, demanding work."
+		profile.Priority = 1
+		profile.DefaultVerbosity = "low"
+		profile.MaxContextWindow = 872000
+		profile.CompHash = "3000"
+		profile.UseResponsesLite = true
+		profile.ToolMode = "code_mode_only"
+		profile.MultiAgentVersion = "v2"
+		profile.ServiceTiers = []codexServiceTier{{ID: "priority", Name: "Fast", Description: "2x speed, increased usage"}}
 	case codexModelMatchesFamily(id, "gpt-5.6-sol"):
 		profile.DisplayName = "GPT-5.6-Sol"
 		profile.Description = "Latest frontier agentic coding model."
@@ -343,7 +354,8 @@ func codexReasoningLevels(id string) []codexReasoningPreset {
 		{Effort: "high", Description: "Greater reasoning depth for complex problems"},
 		{Effort: "xhigh", Description: "Extra high reasoning depth for complex problems"},
 	}
-	if codexModelMatchesFamily(id, "gpt-5.6-sol") ||
+	if codexModelMatchesFamily(id, "gpt-6-astra") ||
+		codexModelMatchesFamily(id, "gpt-5.6-sol") ||
 		codexModelMatchesFamily(id, "gpt-5.6-terra") ||
 		codexModelMatchesFamily(id, "gpt-5.6-luna") {
 		levels = append(levels, codexReasoningPreset{
@@ -351,7 +363,8 @@ func codexReasoningLevels(id string) []codexReasoningPreset {
 			Description: "Maximum reasoning depth for the hardest problems",
 		})
 	}
-	if codexModelMatchesFamily(id, "gpt-5.6-sol") ||
+	if codexModelMatchesFamily(id, "gpt-6-astra") ||
+		codexModelMatchesFamily(id, "gpt-5.6-sol") ||
 		codexModelMatchesFamily(id, "gpt-5.6-terra") {
 		levels = append(levels, codexReasoningPreset{
 			Effort:      "ultra",
@@ -402,6 +415,7 @@ func isCodexCatalogModelID(id string) bool {
 func codexModelSupportsReasoning(id string) bool {
 	lower := strings.ToLower(id)
 	return strings.Contains(lower, "codex") ||
+		codexModelMatchesFamily(lower, "gpt-6-astra") ||
 		strings.HasPrefix(lower, "gpt-5") ||
 		strings.HasPrefix(lower, "o1") ||
 		strings.HasPrefix(lower, "o3") ||

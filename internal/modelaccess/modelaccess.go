@@ -19,12 +19,13 @@ var catalog = []Model{
 	{ID: "gpt-5.6-sol", Label: "GPT-5.6 Sol"},
 	{ID: "gpt-5.6-terra", Label: "GPT-5.6 Terra"},
 	{ID: "gpt-5.6-luna", Label: "GPT-5.6 Luna"},
+	{ID: "gpt-6-astra", Label: "GPT-6 Astra"},
 	{ID: "gpt-image-2", Label: "GPT Image 2"},
 }
 
 var (
 	modelIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:-]{0,127}$`)
-	nonFreeOnly    = []string{"gpt-image-2", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2"}
+	nonFreeOnly    = []string{"gpt-image-2", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-6-astra"}
 )
 
 func Models() []Model {

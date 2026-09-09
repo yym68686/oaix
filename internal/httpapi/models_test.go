@@ -38,6 +38,7 @@ func TestModelsReturnsOpenAIList(t *testing.T) {
 		"gpt-5.6-sol",
 		"gpt-5.6-terra",
 		"gpt-5.6-luna",
+		"gpt-6-astra",
 		"gpt-image-2",
 	}
 	if len(payload.Data) != len(wantIDs) {
@@ -79,6 +80,7 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		"gpt-5.6-sol",
 		"gpt-5.6-terra",
 		"gpt-5.6-luna",
+		"gpt-6-astra",
 	}
 	if len(payload.Models) != len(wantIDs) {
 		t.Fatalf("models = %d, want %d: %#v", len(payload.Models), len(wantIDs), payload.Models)
@@ -110,6 +112,7 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		"gpt-5.6-sol":   {"low", "medium", "high", "xhigh", "max", "ultra"},
 		"gpt-5.6-terra": {"low", "medium", "high", "xhigh", "max", "ultra"},
 		"gpt-5.6-luna":  {"low", "medium", "high", "xhigh", "max"},
+		"gpt-6-astra":   {"low", "medium", "high", "xhigh", "max", "ultra"},
 	}
 	type modelCapabilities struct {
 		displayName       string
@@ -127,6 +130,11 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		multiAgentVersion string
 	}
 	wantCapabilities := map[string]modelCapabilities{
+		"gpt-6-astra": {
+			displayName: "GPT-6-Astra", defaultReasoning: "medium", defaultVerbosity: "low",
+			contextWindow: 272000, maxContextWindow: 872000, priority: 1, compHash: "3000",
+			useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
+		},
 		"gpt-5.4-mini": {
 			displayName: "GPT-5.4-Mini", defaultReasoning: "medium", defaultVerbosity: "medium",
 			contextWindow: 272000, maxContextWindow: 272000, priority: 23, compHash: "2911",

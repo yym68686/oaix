@@ -147,6 +147,8 @@ oaix 现在区分三类 API Key：
 
 计划模型白名单通过 `GET` / `POST` / `DELETE /api/me/token-models` 管理。`POST` 请求格式为 `{"plan_models":{"free":["gpt-5.4-mini"],"pro":["gpt-5.5","gpt-5.6-sol"]}}`；出现的计划键是用户显式覆盖，空数组表示该计划禁用全部模型，省略计划则继续继承管理员设置或内置默认值。用户覆盖优先于 `/admin/token-models` 的管理员默认，但不能绕过 OAIX 从官方每计划模型目录探测到的能力边界。白名单按 token 所有者应用，自用与 marketplace 流量行为一致。
 
+内置默认模型权限为所有非 Free 计划开启 `gpt-6-astra`（包括未知计划），Free 默认关闭。已有管理员或用户显式覆盖继续优先生效；恢复默认后应用上述规则，实际可用性仍受官方账号能力限制。默认策略发布不迁移或重写已有白名单，管理员可通过上述 API 独立调整配置。
+
 ## 路由尝试级幂等
 
 受信任的路由层可在 `/v1/*` 请求上发送 `X-OAIX-Routing-Attempt-ID`。同一 owner、同一尝试 ID、同一请求指纹的并发请求只执行一次；已完成的 `<500` 响应会原样重放，并通过 `X-OAIX-Idempotency-Status` 返回 `executed` 或 `replayed`。同一尝试 ID 搭配不同请求会返回 `409`，协调存储不可用时会在调用上游前返回 `503`。
