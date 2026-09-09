@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -343,5 +344,30 @@ func TestSub2APIImportIntegrationRefreshFailureIndices(t *testing.T) {
 	encoded, _ := json.Marshal(result)
 	if strings.Contains(string(encoded), "secret-refresh-token") {
 		t.Fatal("OAuth error leaked a credential")
+	}
+}
+
+func TestSub2APIImportJWTSubjectIsNotAccountID(t *testing.T) {
+	jwt := func(claims string) string {
+		return "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".fixture"
+	}
+	idToken := jwt(`{"sub":"user-subject","email":"id@example.test"}`)
+	accessToken := jwt(`{"sub":"user-subject","https://api.openai.com/auth":{"chatgpt_account_id":"real-workspace"},"email":"access@example.test"}`)
+	payload := sub2APINativeCredentials(map[string]any{"access_token": accessToken, "id_token": idToken})
+	if payload["account_id"] != "real-workspace" || payload["email"] != "access@example.test" {
+		t.Fatalf("wrong access identity: %#v", payload)
+	}
+	payload = sub2APINativeCredentials(map[string]any{"access_token": "opaque-access", "id_token": idToken})
+	if payload["account_id"] != nil {
+		t.Fatal("JWT subject was promoted to workspace account ID")
+	}
+	explicitIDToken := jwt(`{"sub":"user-subject","https://api.openai.com/auth":{"chatgpt_account_id":"id-workspace"}}`)
+	payload = sub2APINativeCredentials(map[string]any{"access_token": "opaque-access", "id_token": explicitIDToken})
+	if payload["account_id"] != "id-workspace" {
+		t.Fatal("explicit ID token workspace was not mapped")
+	}
+	payload = sub2APINativeCredentials(map[string]any{"access_token": accessToken, "account_id": "explicit-workspace"})
+	if payload["account_id"] != "explicit-workspace" {
+		t.Fatal("explicit metadata was overwritten")
 	}
 }

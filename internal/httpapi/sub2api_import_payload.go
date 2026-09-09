@@ -3,6 +3,7 @@ package httpapi
 // This file is a wire-format adapter. Only the allowlisted native credential
 // fields leave this boundary; foreign scheduling/billing/group settings do not.
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -119,7 +120,10 @@ func sub2APINativeCredentials(raw map[string]any) map[string]any {
 	if flag, ok := source["chatgpt_account_is_fedramp"].(bool); ok {
 		payload["chatgpt_account_is_fedramp"] = flag
 	}
-	if identity, err := oauth.ParseIDTokenIdentity(importpayload.String(payload, "id_token")); err == nil {
+	// Explicit imported metadata wins; access-token identity precedes ID-token
+	// fallback. A JWT subject identifies a user, not a ChatGPT workspace.
+	for _, tokenKey := range []string{"access_token", "id_token"} {
+		identity := sub2APIJWTIdentity(importpayload.String(payload, tokenKey))
 		for key, value := range map[string]string{"account_id": identity.AccountID, "email": identity.Email, "plan_type": identity.PlanType, "chatgpt_user_id": identity.UserID, "organization_id": identity.OrganizationID} {
 			if payload[key] == nil && value != "" {
 				payload[key] = value
@@ -130,6 +134,29 @@ func sub2APINativeCredentials(raw map[string]any) map[string]any {
 		payload["is_active"] = !disabled
 	}
 	return payload
+}
+
+func sub2APIJWTIdentity(token string) oauth.IDTokenIdentity {
+	identity, err := oauth.ParseIDTokenIdentity(token)
+	if err != nil {
+		return oauth.IDTokenIdentity{}
+	}
+	parts := strings.Split(token, ".")
+	data, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return oauth.IDTokenIdentity{}
+	}
+	var claims map[string]any
+	if json.Unmarshal(data, &claims) != nil {
+		return oauth.IDTokenIdentity{}
+	}
+	identity.AccountID = stringFromImportPayload(claims, "account_id")
+	if auth, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+		if accountID := stringFromImportPayload(auth, "chatgpt_account_id", "account_id"); accountID != "" {
+			identity.AccountID = accountID
+		}
+	}
+	return identity
 }
 
 func (item sub2APIAccountInput) nativePayload() (map[string]any, error) {
