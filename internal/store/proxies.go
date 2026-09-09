@@ -249,3 +249,29 @@ func (s *Store) ResolveTokenProxySnapshot(ctx context.Context, tokenID int64) (*
 	u, err := s.decryptProxy(*ciphertext)
 	return u, snapshot, err
 }
+
+// TokenProxyChannelIDs returns non-secret bindings only within the requested owner scope.
+func (s *Store) TokenProxyChannelIDs(ctx context.Context, scope ResourceScope, tokenIDs []int64) (map[int64]int64, error) {
+	out := map[int64]int64{}
+	if len(tokenIDs) == 0 {
+		return out, nil
+	}
+	args := []any{postgresIntIDs(tokenIDs)}
+	ownerWhere := scope.ownerFilter("t.owner_user_id", &args)
+	rows, err := s.pool.Query(ctx, `select b.token_id, b.proxy_channel_id from token_proxy_bindings b
+ join codex_tokens t on t.id=b.token_id and t.owner_user_id=b.owner_user_id
+ join proxy_channels p on p.id=b.proxy_channel_id and p.owner_user_id=t.owner_user_id
+ where t.merged_into_token_id is null and t.id=any($1::integer[]) and `+ownerWhere, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tokenID, proxyID int64
+		if err := rows.Scan(&tokenID, &proxyID); err != nil {
+			return nil, err
+		}
+		out[tokenID] = proxyID
+	}
+	return out, rows.Err()
+}

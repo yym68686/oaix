@@ -165,6 +165,7 @@ func (a *App) Handler() http.Handler {
 	a.registerUserAPIRoutes(mux)
 	a.registerPlatformAdminAPIRoutes(mux)
 	a.registerSub2APIImportRoutes(mux)
+	a.registerSub2APIQueryRoutes(mux)
 	mux.HandleFunc("GET /admin/token-selection", a.requireAuth(a.tokenSelection))
 	mux.HandleFunc("POST /admin/token-selection", a.requireAuth(a.updateTokenSelection))
 	mux.HandleFunc("GET /admin/ordinary-429-cooldown", a.requireAuth(a.getOrdinary429Cooldown))

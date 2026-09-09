@@ -45,6 +45,10 @@ func sub2APIReply(w http.ResponseWriter, status int, data any, message string) {
 }
 
 func (a *App) sub2APIImportAuth(next http.HandlerFunc) http.HandlerFunc {
+	return a.sub2APIAuth(next, true)
+}
+
+func (a *App) sub2APIAuth(next http.HandlerFunc, writable bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// The foreign admin-key header carries an existing OAIX key. Match the
 		// source API's x-api-key precedence without changing native authentication.
@@ -57,8 +61,8 @@ func (a *App) sub2APIImportAuth(next http.HandlerFunc) http.HandlerFunc {
 			sub2APIReply(w, 401, nil, "Invalid or missing admin API key")
 			return
 		}
-		if !sub2APIImportAllowed(auth) {
-			sub2APIReply(w, 403, nil, "Writable, active OAIX API key required")
+		if !sub2APIQueryAllowed(auth) || (writable && auth.ReadOnly) {
+			sub2APIReply(w, 403, nil, "Active OAIX API key with the required permission is required")
 			return
 		}
 		if err := a.applyActAsUser(r.Context(), r, auth); err != nil {
@@ -67,12 +71,17 @@ func (a *App) sub2APIImportAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
+		w.Header().Set("Cache-Control", "private, no-store")
 		next(w, withAuthContext(r.WithContext(ctx), auth))
 	}
 }
 
 func sub2APIImportAllowed(auth *AuthContext) bool {
-	return auth != nil && (auth.IsAdmin || auth.IsService || (auth.UserID != nil && *auth.UserID > 0)) && !auth.ReadOnly && !blockedStatus(auth)
+	return sub2APIQueryAllowed(auth) && !auth.ReadOnly
+}
+
+func sub2APIQueryAllowed(auth *AuthContext) bool {
+	return auth != nil && (auth.IsAdmin || auth.IsService || (auth.UserID != nil && *auth.UserID > 0)) && !blockedStatus(auth)
 }
 
 func sub2APIDecode(w http.ResponseWriter, r *http.Request, dst any) bool {

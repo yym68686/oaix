@@ -165,26 +165,29 @@ type ImportResultItem struct {
 }
 
 type TokenListOptions struct {
-	Limit          int
-	Offset         int
-	Cursor         string
-	OwnerUserID    int64
-	Query          string
-	Status         string
-	Plan           string
-	Sort           string
-	ImportJobID    int64
-	Source         string
-	SourceFile     string
-	CreatedFrom    *time.Time
-	CreatedTo      *time.Time
-	LastUsedFrom   *time.Time
-	LastUsedTo     *time.Time
-	HasError       *bool
-	ErrorCode      string
-	CooldownReason string
-	QuotaState     string
-	StatusAsOf     *time.Time
+	CredentialReady *bool
+	IDs             []int64
+	ProxyChannelID  int64
+	Limit           int
+	Offset          int
+	Cursor          string
+	OwnerUserID     int64
+	Query           string
+	Status          string
+	Plan            string
+	Sort            string
+	ImportJobID     int64
+	Source          string
+	SourceFile      string
+	CreatedFrom     *time.Time
+	CreatedTo       *time.Time
+	LastUsedFrom    *time.Time
+	LastUsedTo      *time.Time
+	HasError        *bool
+	ErrorCode       string
+	CooldownReason  string
+	QuotaState      string
+	StatusAsOf      *time.Time
 }
 
 type TokenSharingCounts struct {
@@ -319,6 +322,14 @@ func (s *Store) ListTokensScoped(ctx context.Context, scope ResourceScope, opts 
 	}
 	orderBy := "id desc"
 	switch strings.ToLower(strings.TrimSpace(opts.Sort)) {
+	case "name", "-name":
+		direction := "asc"
+		if opts.Sort == "-name" {
+			direction = "desc"
+		}
+		orderBy = "coalesce(nullif(btrim(remark), ''), nullif(email, ''), nullif(account_id, ''), 'Codex ' || id::text) " + direction + ", id " + direction
+	case "last_used_at":
+		orderBy = "last_used_at asc nulls last, id asc"
 	case "oldest":
 		orderBy = "id asc"
 	case "created_at":
@@ -331,6 +342,8 @@ func (s *Store) ListTokensScoped(ctx context.Context, scope ResourceScope, opts 
 		orderBy = "last_used_at desc nulls last, id desc"
 	case "available":
 		orderBy = "is_active desc, cooldown_until asc nulls first, last_used_at asc nulls first"
+	case "-status":
+		orderBy = "is_active asc, disabled_at desc nulls last, cooldown_until desc nulls last, id asc"
 	case "status":
 		orderBy = "is_active desc, disabled_at asc nulls first, cooldown_until asc nulls first, id desc"
 	}
@@ -418,6 +431,19 @@ func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope Resourc
 	}
 	filters = append(filters, "merged_into_token_id is null")
 	filters = append(filters, scope.ownerFilter("owner_user_id", &args))
+	if opts.CredentialReady != nil {
+		predicate := tokenCredentialReadyWhere()
+		if !*opts.CredentialReady {
+			predicate = "not " + predicate
+		}
+		filters = append(filters, predicate)
+	}
+	if opts.IDs != nil {
+		filters = append(filters, "id = any("+arg(postgresIntIDs(opts.IDs))+"::integer[])")
+	}
+	if opts.ProxyChannelID > 0 {
+		filters = append(filters, "exists (select 1 from token_proxy_bindings b where b.token_id = codex_tokens.id and b.owner_user_id = codex_tokens.owner_user_id and b.proxy_channel_id = "+arg(opts.ProxyChannelID)+")")
+	}
 	if opts.OwnerUserID > 0 {
 		placeholder := arg(opts.OwnerUserID)
 		filters = append(filters, fmt.Sprintf("owner_user_id = %s", placeholder))
@@ -427,6 +453,16 @@ func tokenListWhereScoped(opts TokenListOptions, includePlan bool, scope Resourc
 		filters = append(filters, fmt.Sprintf("(email ilike %s or account_id ilike %s or remark ilike %s)", placeholder, placeholder, placeholder))
 	}
 	switch strings.ToLower(strings.TrimSpace(opts.Status)) {
+	case "ready":
+		asOf := arg(TokenListStatusAsOf(opts))
+		filters = append(filters, "is_active = true and disabled_at is null and "+tokenCredentialReadyWhere()+" and (cooldown_until is null or cooldown_until <= "+asOf+")")
+	case "backoff":
+		asOf := arg(TokenListStatusAsOf(opts))
+		filters = append(filters, "is_active = true and disabled_at is null and "+tokenCredentialReadyWhere()+" and cooldown_until > "+asOf+" and "+tokenTransientRetryBackoffWhere(asOf))
+	case "paused":
+		filters = append(filters, "(is_active = false or disabled_at is not null) and coalesce(btrim(last_error), '') = ''")
+	case "credential_error":
+		filters = append(filters, "(((is_active = false or disabled_at is not null) and coalesce(btrim(last_error), '') <> '') or (is_active = true and disabled_at is null and not "+tokenCredentialReadyWhere()+"))")
 	case "available", "active":
 		asOf := arg(TokenListStatusAsOf(opts))
 		filters = append(filters, fmt.Sprintf("is_active = true and disabled_at is null and %s", tokenDisplayAvailableWhere(asOf)))
