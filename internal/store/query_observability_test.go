@@ -50,3 +50,23 @@ func TestDBQueryStatsAreRequestScopedAndRanked(t *testing.T) {
 		t.Fatalf("unexpected top query stats: %+v", snapshot.Top)
 	}
 }
+
+func TestFullSQLFingerprintDistinguishesPredicateAndRedactsDollarComments(t *testing.T) {
+	prefix := "select " + strings.Repeat("long_column, ", 40) + " id from logs where "
+	a := safeSQLShape(prefix+"pending is null", 10000)
+	b := safeSQLShape(prefix+"pending is not null", 10000)
+	if sqlFingerprint(a) == sqlFingerprint(b) {
+		t.Fatal("tail predicates collide")
+	}
+	sql := `select $1, 'secret', $$dollar-secret$$, $tag$tag-secret$tag$ /* comment-secret /* nested-secret */ */ -- line-secret
+ from example where id=1234`
+	normalized := safeSQLShape(sql, 10000)
+	for _, secret := range []string{"secret", "1234"} {
+		if strings.Contains(normalized, secret) {
+			t.Fatal(normalized)
+		}
+	}
+	if !strings.Contains(normalized, "$1") {
+		t.Fatal("parameter replaced", normalized)
+	}
+}

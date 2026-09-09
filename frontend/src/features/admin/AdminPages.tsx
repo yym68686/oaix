@@ -42,7 +42,8 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
       if (activity === "24h") params.set("active_within_hours", "24");
       if (activity === "7d") params.set("active_within_hours", "168");
       if (activity === "inactive7d") params.set("inactive_for_hours", "168");
-      const [payload, poolPayload] = await Promise.all([api.adminUsers(params), api.adminPoolSummaryByUser(params)]);
+      const pageLoadID = globalThis.crypto?.randomUUID?.();
+      const [payload, poolPayload] = await Promise.all([api.adminUsers(params, pageLoadID), api.adminPoolSummaryByUser(params, pageLoadID)]);
       setUsers(payload.items || []);
       const nextPools: Record<number, TokenCounts> = {};
       const nextUsage: Record<number, OwnerUsageSummary> = {};
@@ -55,7 +56,8 @@ export function AdminUsersPage({ pushToast, refreshNonce }: { pushToast: (title:
       setPoolByUser(nextPools);
       setUsageByUser(nextUsage);
     } catch (caught) {
-      setError(errorMessage(caught));
+      const requestId = (caught as { requestId?: string })?.requestId;
+      setError(`${errorMessage(caught)}${requestId ? ` · 请求编号：${requestId}` : ""}`);
     } finally {
       setLoading(false);
     }

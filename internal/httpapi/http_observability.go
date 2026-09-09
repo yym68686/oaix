@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yym68686/oaix/internal/admindiag"
+	"github.com/yym68686/oaix/internal/egress"
 	"github.com/yym68686/oaix/internal/observability"
 	"github.com/yym68686/oaix/internal/store"
 )
@@ -174,13 +176,28 @@ func (a *App) observeHTTP(next http.Handler) http.Handler {
 		}
 		ctx := observability.ContextWithRequestID(r.Context(), requestID)
 		ctx, dbQueryStats := store.ContextWithDBQueryStats(ctx)
+		var diagnostic *admindiag.Trace
+		if observeAdminRoute(r.Method, r.URL.Path) {
+			traceID, parent := egress.TraceIdentity(r.Header)
+			ctx, diagnostic = a.adminRecorder.Begin(ctx, r.URL.Path, r.Header.Get("X-OAIX-Page-Load-ID"), traceID, parent)
+		}
 		r = r.WithContext(ctx)
 		w.Header().Set("X-Request-ID", requestID)
 		before := a.poolStats()
 		observed := &observedResponseWriter{ResponseWriter: w, started: started}
+		returned := false
+		if diagnostic != nil {
+			defer func() {
+				if !returned {
+					a.adminRecorder.Finish(diagnostic, 500)
+				}
+			}()
+		}
 		next.ServeHTTP(observed, r)
+		returned = true
 		duration := time.Since(started)
 		status := observed.statusCode()
+		a.adminRecorder.Finish(diagnostic, status)
 		route := normalizeRoutePattern(r.Method, r.Pattern)
 		if route == "" {
 			route = "unmatched"

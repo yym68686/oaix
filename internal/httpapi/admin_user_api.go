@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/yym68686/oaix/internal/admindiag"
 	"github.com/yym68686/oaix/internal/store"
 )
 
@@ -62,7 +63,9 @@ func (a *App) listPlatformUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	users, total, err := a.store.ListPlatformUsers(ctx, opts)
+	userCtx, userDone := admindiag.Stage(ctx, "user_list")
+	users, total, err := a.store.ListPlatformUsers(userCtx, opts)
+	userDone(err)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -359,7 +362,9 @@ func (a *App) platformPoolSummaryByUser(w http.ResponseWriter, r *http.Request) 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
-	users, total, err := a.store.ListPlatformUsers(ctx, opts)
+	userCtx, userDone := admindiag.Stage(ctx, "user_list")
+	users, total, err := a.store.ListPlatformUsers(userCtx, opts)
+	userDone(err)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
@@ -421,6 +426,8 @@ func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStor
 
 	group.Go(func() error {
 		var err error
+		groupCtx, done := admindiag.Stage(groupCtx, "pool")
+		defer func() { done(err) }()
 		poolByOwner, err = db.TokenPoolSummariesByOwner(groupCtx, ownerIDs, time.Now().UTC())
 		if err != nil {
 			return fmt.Errorf("load token pool summaries: %w", err)
@@ -429,6 +436,8 @@ func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStor
 	})
 	group.Go(func() error {
 		var err error
+		groupCtx, done := admindiag.Stage(groupCtx, "usage")
+		defer func() { done(err) }()
 		usageByOwner, err = db.RequestUsageByTokenOwner(groupCtx, ownerIDs, hours)
 		if err != nil {
 			return fmt.Errorf("load token owner usage: %w", err)
@@ -437,6 +446,8 @@ func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStor
 	})
 	group.Go(func() error {
 		var err error
+		groupCtx, done := admindiag.Stage(groupCtx, "cost")
+		defer func() { done(err) }()
 		observedCostsByOwner, err = db.TokenObservedCostsByOwner(groupCtx, ownerIDs)
 		if err != nil {
 			return fmt.Errorf("load token owner costs: %w", err)
@@ -445,6 +456,8 @@ func loadPlatformPoolSummaryData(ctx context.Context, db platformPoolSummaryStor
 	})
 	group.Go(func() error {
 		var err error
+		groupCtx, done := admindiag.Stage(groupCtx, "sub2api_cost")
+		defer func() { done(err) }()
 		sub2APICostsByOwner, err = db.Sub2APIUsageCostsByOwner(groupCtx, ownerIDs)
 		if err != nil {
 			return fmt.Errorf("load sub2api usage costs by owner: %w", err)

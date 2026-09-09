@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/yym68686/oaix/internal/admindiag"
 )
 
 type RequestLogListOptions struct {
@@ -435,7 +436,9 @@ func (s *Store) TokenObservedCostsByOwner(ctx context.Context, ownerIDs []int64)
 	return out, nil
 }
 
-func (s *Store) addObservedCostsByOwnerAggregate(ctx context.Context, ownerIDs []int64, out map[int64]float64) error {
+func (s *Store) addObservedCostsByOwnerAggregate(ctx context.Context, ownerIDs []int64, out map[int64]float64) (err error) {
+	ctx, done := admindiag.Stage(ctx, "cost_aggregate")
+	defer func() { done(err) }()
 	rows, err := s.pool.Query(ctx, `
 		select cost_owner_user_id, coalesce(sum(estimated_cost_usd), 0)::float8
 		from (
@@ -463,7 +466,13 @@ func (s *Store) addObservedCostsByOwnerAggregate(ctx context.Context, ownerIDs [
 	return rows.Err()
 }
 
-func (s *Store) addObservedCostsByOwnerLogs(ctx context.Context, ownerIDs []int64, out map[int64]float64, pendingOnly bool) error {
+func (s *Store) addObservedCostsByOwnerLogs(ctx context.Context, ownerIDs []int64, out map[int64]float64, pendingOnly bool) (err error) {
+	stage := "cost_logs_full"
+	if pendingOnly {
+		stage = "cost_logs_pending"
+	}
+	ctx, done := admindiag.Stage(ctx, stage)
+	defer func() { done(err) }()
 	pendingClause := ""
 	if pendingOnly {
 		pendingClause = "and logs.analytics_recorded_at is null"

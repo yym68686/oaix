@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/yym68686/oaix/internal/admindiag"
 )
 
 type RequestLog struct {
@@ -1207,9 +1208,10 @@ func roundCostUSD(value float64) float64 {
 	return math.Round(value*1_000_000) / 1_000_000
 }
 
-func (s *Store) RequestTokenCostsReconciled(ctx context.Context) (bool, error) {
-	var completed bool
-	err := s.pool.QueryRow(ctx, `
+func (s *Store) RequestTokenCostsReconciled(ctx context.Context) (completed bool, err error) {
+	ctx, done := admindiag.Stage(ctx, "cost_reconcile_marker")
+	defer func() { done(err) }()
+	err = s.pool.QueryRow(ctx, `
 		select coalesce((value->>'completed')::boolean, false)
 		from gateway_settings
 		where key = $1

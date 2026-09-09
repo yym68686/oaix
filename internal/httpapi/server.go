@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/yym68686/oaix/internal/admindiag"
 	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/agentidentitytask"
 	"github.com/yym68686/oaix/internal/config"
@@ -33,6 +34,7 @@ import (
 )
 
 type App struct {
+	adminRecorder          *admindiag.Recorder
 	egressRecorder         *egress.Recorder
 	egressExporter         *egress.OTLPExporter
 	cfg                    config.Config
@@ -116,6 +118,9 @@ func NewApp(cfg config.Config, logger *slog.Logger, store *store.Store, tokenMan
 		authKeys:           cfg.Auth.ServiceAPIKeys,
 		httpRoutes:         newHTTPRouteMetrics(),
 	}
+	if store != nil {
+		app.adminRecorder = store.AdminRecorder()
+	}
 	if pipeline != nil {
 		app.egressRecorder = app.newEgressRecorder()
 		pipeline.SetEgressRecorder(app.egressRecorder)
@@ -151,6 +156,9 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /livez", a.livez)
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /metrics", a.metrics)
+	mux.HandleFunc("GET /admin/query-observability", a.requireAuth(a.getAdminObservability))
+	mux.HandleFunc("POST /admin/query-observability", a.requireAuth(a.updateAdminObservability))
+	mux.HandleFunc("GET /admin/query-observations", a.requireAuth(a.getAdminObservations))
 	mux.HandleFunc("GET /admin/egress-observability", a.requireAuth(a.getEgressObservability))
 	mux.HandleFunc("POST /admin/egress-observability", a.requireAuth(a.updateEgressObservability))
 	mux.HandleFunc("GET /admin/egress-observations", a.requireAuth(a.getEgressObservations))
@@ -341,6 +349,7 @@ func (a *App) metrics(w http.ResponseWriter, r *http.Request) {
 	logStats := a.logs.Stats()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	a.writeEgressMetrics(w)
+	a.writeAdminMetrics(w)
 	_, _ = fmt.Fprintf(w, "# HELP oaix_token_ready_tokens Ready tokens in the current snapshot.\n")
 	_, _ = fmt.Fprintf(w, "# TYPE oaix_token_ready_tokens gauge\n")
 	_, _ = fmt.Fprintf(w, "oaix_token_ready_tokens %d\n", tokenStats.ReadyTokens)
@@ -1468,7 +1477,7 @@ func (a *App) updateSetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
 		return
 	}
-	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey || key == egress.PolicyKey {
+	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey || key == egress.PolicyKey || key == admindiag.PolicyKey {
 		writeError(w, http.StatusBadRequest, errors.New("this setting must be updated through its dedicated API"))
 		return
 	}

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"github.com/yym68686/oaix/internal/admindiag"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -60,5 +61,22 @@ func TestWriteHTTPRouteMetricsUsesBoundedRouteLabels(t *testing.T) {
 	}
 	if !strings.Contains(text, "oaix_http_request_first_byte_observations_total") {
 		t.Fatalf("metrics missing first-byte observation counter: %s", text)
+	}
+}
+
+func TestAdminObservationPanicDoesNotLeakActiveSlot(t *testing.T) {
+	app := &App{httpRoutes: newHTTPRouteMetrics(), adminRecorder: admindiag.New("test")}
+	app.adminRecorder.SetPolicy(admindiag.Policy{Enabled: true, MaxRecordsPerMinute: 60, SuccessSamplePercent: 100})
+	handler := app.observeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("fixture") }))
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("panic was swallowed")
+			}
+		}()
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/api/admin/users", nil))
+	}()
+	if app.adminRecorder.Stats().Active != 0 {
+		t.Fatal("panic leaked observation slot")
 	}
 }

@@ -1536,7 +1536,7 @@ func (a *App) getSetting(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) deleteSetting(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimSpace(r.PathValue("key"))
-	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey || key == "egress_observability" {
+	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey || key == "egress_observability" || key == "admin_query_observability" {
 		writeError(w, http.StatusBadRequest, errors.New("this setting must be reset through its dedicated API"))
 		return
 	}

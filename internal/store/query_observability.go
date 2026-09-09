@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/yym68686/oaix/internal/admindiag"
 	"github.com/yym68686/oaix/internal/observability"
 )
 
@@ -124,6 +126,7 @@ func (s *DBQueryStats) Snapshot(limit int) DBQueryStatsSnapshot {
 }
 
 type slowQueryTrace struct {
+	observation *admindiag.Handle
 	started     time.Time
 	fingerprint string
 	shape       string
@@ -131,8 +134,10 @@ type slowQueryTrace struct {
 }
 
 type slowQueryTracer struct {
-	logger    *slog.Logger
-	threshold time.Duration
+	admin       *admindiag.Recorder
+	connections sync.Map
+	logger      *slog.Logger
+	threshold   time.Duration
 }
 
 func newSlowQueryTracer(logger *slog.Logger, threshold time.Duration) *slowQueryTracer {
@@ -142,11 +147,27 @@ func newSlowQueryTracer(logger *slog.Logger, threshold time.Duration) *slowQuery
 	return &slowQueryTracer{logger: logger, threshold: threshold}
 }
 
-func (t *slowQueryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	shape := safeSQLShape(data.SQL, 240)
+func (t *slowQueryTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	fullShape := safeSQLShape(data.SQL, len(data.SQL)+1)
+	shape := fullShape
+	if len(shape) > 240 {
+		shape = strings.TrimSpace(shape[:240]) + "…"
+	}
+	var pid uint32
+	connection := ""
+	if conn != nil {
+		pid = conn.PgConn().PID()
+		if id, ok := t.connections.Load(conn); ok {
+			connection = id.(string)
+		}
+	}
+	fingerprint := sqlFingerprint(fullShape)
+	h := admindiag.BeginEvent(ctx, "query", fingerprint, pid, connection, data.SQL)
+	t.admin.Track(ctx, h)
 	return context.WithValue(ctx, slowQueryTraceKey{}, slowQueryTrace{
 		started:     time.Now(),
-		fingerprint: sqlFingerprint(shape),
+		fingerprint: fingerprint,
+		observation: h,
 		shape:       shape,
 		operation:   sqlOperation(shape),
 	})
@@ -161,6 +182,8 @@ func (t *slowQueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data p
 		return
 	}
 	duration := time.Since(trace.started)
+	trace.observation.End(ctx, data.Err, data.CommandTag.RowsAffected())
+	t.admin.Untrack(trace.observation)
 	if stats, _ := ctx.Value(dbQueryStatsKey{}).(*DBQueryStats); stats != nil {
 		stats.record(trace, duration, data.Err)
 	}
@@ -185,36 +208,97 @@ func (t *slowQueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data p
 	)
 }
 
+// The fingerprint uses the whole normalized template. Display truncation is
+// separate. SQL arguments are never supplied to this function.
 func safeSQLShape(sql string, limit int) string {
 	if limit <= 0 {
 		limit = 240
 	}
-	var builder strings.Builder
-	inLiteral := false
-	for index := 0; index < len(sql); index++ {
-		char := sql[index]
-		if inLiteral {
-			if char != '\'' {
-				continue
+	var b strings.Builder
+	for i := 0; i < len(sql); {
+		c := sql[i]
+		if i+1 < len(sql) && sql[i:i+2] == "--" {
+			for i < len(sql) && sql[i] != '\n' {
+				i++
 			}
-			if index+1 < len(sql) && sql[index+1] == '\'' {
-				index++
-				continue
-			}
-			inLiteral = false
-			builder.WriteString("'?'")
+			b.WriteByte(' ')
 			continue
 		}
-		if char == '\'' {
-			inLiteral = true
+		if i+1 < len(sql) && sql[i:i+2] == "/*" {
+			depth := 1
+			i += 2
+			for i < len(sql) && depth > 0 {
+				if i+1 < len(sql) && sql[i:i+2] == "/*" {
+					depth++
+					i += 2
+				} else if i+1 < len(sql) && sql[i:i+2] == "*/" {
+					depth--
+					i += 2
+				} else {
+					i++
+				}
+			}
+			b.WriteByte(' ')
 			continue
 		}
-		builder.WriteByte(char)
+		if c == '\'' {
+			i++
+			for i < len(sql) {
+				if sql[i] == '\\' && i+1 < len(sql) {
+					i += 2
+					continue
+				}
+				if sql[i] == '\'' {
+					i++
+					if i < len(sql) && sql[i] == '\'' {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+			b.WriteString("'?'")
+			continue
+		}
+		if c == '$' {
+			j := i + 1
+			for j < len(sql) && ((sql[j] >= 'a' && sql[j] <= 'z') || (sql[j] >= 'A' && sql[j] <= 'Z') || sql[j] == '_' || (j > i+1 && sql[j] >= '0' && sql[j] <= '9')) {
+				j++
+			}
+			if j < len(sql) && sql[j] == '$' {
+				tag := sql[i : j+1]
+				end := strings.Index(sql[j+1:], tag)
+				if end < 0 {
+					i = len(sql)
+				} else {
+					i = j + 1 + end + len(tag)
+				}
+				b.WriteString("'?'")
+				continue
+			}
+			if j == i+1 {
+				b.WriteByte(c)
+				i++
+				for i < len(sql) && sql[i] >= '0' && sql[i] <= '9' {
+					b.WriteByte(sql[i])
+					i++
+				}
+				continue
+			}
+		}
+		if c >= '0' && c <= '9' && (i == 0 || !((sql[i-1] >= 'a' && sql[i-1] <= 'z') || (sql[i-1] >= 'A' && sql[i-1] <= 'Z') || sql[i-1] == '_')) {
+			i++
+			for i < len(sql) && ((sql[i] >= '0' && sql[i] <= '9') || sql[i] == '.') {
+				i++
+			}
+			b.WriteByte('?')
+			continue
+		}
+		b.WriteByte(c)
+		i++
 	}
-	if inLiteral {
-		builder.WriteString("'?'")
-	}
-	shape := strings.Join(strings.Fields(builder.String()), " ")
+	shape := strings.Join(strings.Fields(b.String()), " ")
 	if len(shape) > limit {
 		shape = strings.TrimSpace(shape[:limit]) + "…"
 	}
@@ -232,4 +316,19 @@ func sqlOperation(shape string) string {
 		return "unknown"
 	}
 	return strings.ToLower(fields[0])
+}
+
+// These hooks measure this acquire call; global pool deltas include siblings.
+type adminAcquireKey struct{}
+
+func (t *slowQueryTracer) TraceAcquireStart(ctx context.Context, _ *pgxpool.Pool, _ pgxpool.TraceAcquireStartData) context.Context {
+	h := admindiag.BeginEvent(ctx, "acquire", "", 0, "", "")
+	if h == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, adminAcquireKey{}, h)
+}
+func (t *slowQueryTracer) TraceAcquireEnd(ctx context.Context, _ *pgxpool.Pool, d pgxpool.TraceAcquireEndData) {
+	h, _ := ctx.Value(adminAcquireKey{}).(*admindiag.Handle)
+	h.End(ctx, d.Err, 0)
 }

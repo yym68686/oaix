@@ -17,10 +17,11 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/yym68686/oaix/internal/admindiag"
 	"github.com/yym68686/oaix/internal/config"
 )
 
-const SchemaVersion = 31
+const SchemaVersion = 32
 
 type Workload string
 
@@ -32,9 +33,12 @@ const (
 )
 
 type Store struct {
-	pool          *pgxpool.Pool
-	workloadPools map[Workload]*pgxpool.Pool
-	apiKeyCipher  *apiKeyCipher
+	adminRecorder    *admindiag.Recorder
+	diagnosticReader *pgxpool.Pool
+	diagnosticWriter *pgxpool.Pool
+	pool             *pgxpool.Pool
+	workloadPools    map[Workload]*pgxpool.Pool
+	apiKeyCipher     *apiKeyCipher
 }
 
 type ResourceScope struct {
@@ -93,9 +97,15 @@ func ConnectObserved(ctx context.Context, cfg config.DatabaseConfig, logger *slo
 	poolCfg.MinConns = cfg.MinConns
 	poolCfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
 	poolCfg.ConnConfig.RuntimeParams["application_name"] = "oaix-go"
-	if logger != nil {
-		poolCfg.ConnConfig.Tracer = newSlowQueryTracer(logger, 250*time.Millisecond)
+	recorder := admindiag.New(admindiag.BuildRevision)
+	tracer := newSlowQueryTracer(logger, 250*time.Millisecond)
+	tracer.admin = recorder
+	poolCfg.ConnConfig.Tracer = tracer
+	poolCfg.AfterConnect = func(_ context.Context, c *pgx.Conn) error {
+		tracer.connections.Store(c, admindiag.NewConnectionID())
+		return nil
 	}
+	poolCfg.BeforeClose = func(c *pgx.Conn) { tracer.connections.Delete(c) }
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, err
@@ -106,7 +116,19 @@ func ConnectObserved(ctx context.Context, cfg config.DatabaseConfig, logger *slo
 		pool.Close()
 		return nil, err
 	}
+	reader, err := diagnosticPool(ctx, poolCfg, true)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	writer, err := diagnosticPool(ctx, poolCfg, false)
+	if err != nil {
+		reader.Close()
+		pool.Close()
+		return nil, err
+	}
 	return &Store{
+		adminRecorder: recorder, diagnosticReader: reader, diagnosticWriter: writer,
 		pool:         pool,
 		apiKeyCipher: newAPIKeyCipher(cfg.APIKeyEncryptionSecret, cfg.URL),
 		workloadPools: map[Workload]*pgxpool.Pool{
@@ -121,6 +143,12 @@ func ConnectObserved(ctx context.Context, cfg config.DatabaseConfig, logger *slo
 func (s *Store) Close() {
 	if s == nil {
 		return
+	}
+	if s.diagnosticReader != nil {
+		s.diagnosticReader.Close()
+	}
+	if s.diagnosticWriter != nil {
+		s.diagnosticWriter.Close()
 	}
 	seen := map[*pgxpool.Pool]struct{}{}
 	for _, pool := range s.workloadPools {

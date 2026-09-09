@@ -610,6 +610,7 @@ async function requestJSON<T>(path: string, init: RequestInit = {}, authKey?: st
     throw Object.assign(new Error(String(message)), {
       payload,
       status: response.status,
+      requestId: /^[A-Za-z0-9_.:-]{1,128}$/.test(response.headers.get("X-Request-ID") || "") ? response.headers.get("X-Request-ID") : undefined,
     });
   }
   return payload as T;
@@ -854,8 +855,8 @@ export const api = {
   settings: () => requestJSON<{ items?: SettingItem[] }>("/admin/settings"),
   updateSetting: (key: string, value: unknown) =>
     postJSON<Record<string, unknown>>(`/admin/settings/${encodeURIComponent(key)}`, value),
-  adminUsers: (params = new URLSearchParams()) =>
-    requestJSON<AdminUserListResponse>(`/api/admin/users${params.toString() ? `?${params.toString()}` : ""}`),
+  adminUsers: (params = new URLSearchParams(), pageLoadID?: string) =>
+    requestJSON<AdminUserListResponse>(`/api/admin/users${params.toString() ? `?${params.toString()}` : ""}`, { headers: pageLoadID ? { "X-OAIX-Page-Load-ID": pageLoadID } : {} }),
   adminCreateUser: (payload: Record<string, unknown>) =>
     postJSON<{ user?: PlatformUser; api_key?: CreatedAPIKey }>("/api/admin/users", payload),
   adminUser: (id: number) => requestJSON<{ user?: PlatformUser }>(`/api/admin/users/${id}`),
@@ -876,13 +877,14 @@ export const api = {
   adminRevokeUserAPIKey: (userID: number, keyID: number) =>
     deleteJSON<Record<string, unknown>>(`/api/admin/users/${userID}/api-keys/${keyID}`),
   adminPoolSummary: () => requestJSON<PoolSummaryResponse>("/api/admin/pool-summary"),
-  adminPoolSummaryByUser: (paramsOrLimit: URLSearchParams | number = 100) => {
+  adminPoolSummaryByUser: (paramsOrLimit: URLSearchParams | number = 100, pageLoadID?: string) => {
     const params = paramsOrLimit instanceof URLSearchParams ? new URLSearchParams(paramsOrLimit) : new URLSearchParams({ limit: String(paramsOrLimit) });
     if (!params.has("limit")) {
       params.set("limit", "100");
     }
     return requestJSON<{ items?: Array<{ user?: PlatformUser; counts?: TokenCounts; plan_counts?: TokenPlanCount[]; usage?: OwnerUsageSummary }>; pagination?: Pagination }>(
       `/api/admin/pool-summary/by-user?${params.toString()}`,
+      { headers: pageLoadID ? { "X-OAIX-Page-Load-ID": pageLoadID } : {} },
     );
   },
   adminRequests: (paramsOrLimit: URLSearchParams | number = 120) => {

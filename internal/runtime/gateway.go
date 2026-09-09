@@ -88,6 +88,8 @@ func RunGateway(ctx context.Context) error {
 	oauthClient.Scope = cfg.Upstream.OAuthScope
 	pipeline.SetOAuthClient(oauthClient)
 	app := httpapi.NewApp(cfg, logger, db, tokenManager, logWriter, pipeline)
+	stopAdmin := app.StartAdminObservability(context.Background())
+	defer stopAdmin(context.Background())
 	stopEgress := app.StartEgressObservability(context.Background())
 	defer stopEgress(context.Background())
 	app.SetProbeRequestDoer(upstream)
