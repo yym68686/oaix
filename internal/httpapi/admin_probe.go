@@ -21,7 +21,7 @@ import (
 
 const (
 	adminTokenProbeInput       = "say test"
-	defaultAdminProbeModel     = "gpt-5.4-mini"
+	defaultAdminProbeModel     = "gpt-5.6-luna"
 	defaultAdminProbeBodyLimit = 2 * 1024 * 1024
 	adminProbeModelSettingKey  = "admin_token_probe_model"
 	userProbeModelSettingKey   = "token_probe_model"

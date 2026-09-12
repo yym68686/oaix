@@ -481,7 +481,7 @@ func TestProbeTokenIgnoresInvalidRefreshTokenWhenCurrentAccessTokenWorks(t *test
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if payload["model"] != "gpt-5.4-mini" {
+		if payload["model"] != "gpt-5.6-luna" {
 			t.Fatalf("default probe model = %#v", payload["model"])
 		}
 		upstreamSeen = true

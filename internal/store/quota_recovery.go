@@ -21,7 +21,7 @@ const (
 	QuotaRecoveryDisabledEvent     = "quota_recovery_disabled"
 	QuotaRecoveryInconclusiveEvent = "quota_recovery_inconclusive"
 	TokenUsageLimitConfirmedEvent  = "usage_limit_confirmed"
-	QuotaRecoveryModel             = "gpt-5.4-mini"
+	QuotaRecoveryModel             = "gpt-5.6-luna"
 )
 
 type QuotaRecoveryCandidate struct {

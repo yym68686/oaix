@@ -1,8 +1,6 @@
-export const DEFAULT_TEST_MODEL = "gpt-5.4-mini";
+export const DEFAULT_TEST_MODEL = "gpt-5.6-luna";
 
 export const TEST_MODEL_OPTIONS = [
-  "gpt-5.4-mini",
-  "gpt-5.4",
   "gpt-5.5",
   "gpt-5.6-sol",
   "gpt-5.6-terra",

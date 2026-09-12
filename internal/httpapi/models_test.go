@@ -32,8 +32,6 @@ func TestModelsReturnsOpenAIList(t *testing.T) {
 		t.Fatalf("object = %q", payload.Object)
 	}
 	wantIDs := []string{
-		"gpt-5.4-mini",
-		"gpt-5.4",
 		"gpt-5.5",
 		"gpt-5.6-sol",
 		"gpt-5.6-terra",
@@ -74,8 +72,6 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantIDs := []string{
-		"gpt-5.4-mini",
-		"gpt-5.4",
 		"gpt-5.5",
 		"gpt-5.6-sol",
 		"gpt-5.6-terra",
@@ -106,8 +102,6 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		}
 	}
 	wantReasoning := map[string][]string{
-		"gpt-5.4-mini":  {"low", "medium", "high", "xhigh"},
-		"gpt-5.4":       {"low", "medium", "high", "xhigh"},
 		"gpt-5.5":       {"low", "medium", "high", "xhigh"},
 		"gpt-5.6-sol":   {"low", "medium", "high", "xhigh", "max", "ultra"},
 		"gpt-5.6-terra": {"low", "medium", "high", "xhigh", "max", "ultra"},
@@ -134,14 +128,6 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 			displayName: "GPT-6-Astra", defaultReasoning: "medium", defaultVerbosity: "low",
 			contextWindow: 272000, maxContextWindow: 872000, priority: 1, compHash: "3000",
 			useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
-		},
-		"gpt-5.4-mini": {
-			displayName: "GPT-5.4-Mini", defaultReasoning: "medium", defaultVerbosity: "medium",
-			contextWindow: 272000, maxContextWindow: 272000, priority: 23, compHash: "2911",
-		},
-		"gpt-5.4": {
-			displayName: "GPT-5.4", defaultReasoning: "medium", defaultVerbosity: "low",
-			contextWindow: 272000, maxContextWindow: 1000000, priority: 16, compHash: "2911",
 		},
 		"gpt-5.5": {
 			displayName: "GPT-5.5", defaultReasoning: "medium", defaultVerbosity: "low",
@@ -206,7 +192,7 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 			t.Fatalf("%s multi-agent version = %q, want %q", model.Slug, got, want.multiAgentVersion)
 		}
 	}
-	sol := payload.Models[3]
+	sol := payload.Models[1]
 	if got := reasoningDescription(sol.SupportedReasoningLevels, "max"); got != "Maximum reasoning depth for the hardest problems" {
 		t.Fatalf("max description = %q", got)
 	}

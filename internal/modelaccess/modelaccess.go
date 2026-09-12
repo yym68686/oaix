@@ -13,8 +13,6 @@ type Model struct {
 }
 
 var catalog = []Model{
-	{ID: "gpt-5.4-mini", Label: "GPT-5.4 Mini"},
-	{ID: "gpt-5.4", Label: "GPT-5.4"},
 	{ID: "gpt-5.5", Label: "GPT-5.5"},
 	{ID: "gpt-5.6-sol", Label: "GPT-5.6 Sol"},
 	{ID: "gpt-5.6-terra", Label: "GPT-5.6 Terra"},

@@ -4844,7 +4844,7 @@ def _is_invalid_encrypted_content_error(status_code: int, error_text: str) -> bo
 
 
 def _admin_token_probe_model() -> str:
-    return _normalize_optional_text(os.getenv("ADMIN_TOKEN_PROBE_MODEL")) or "gpt-5.5"
+    return _normalize_optional_text(os.getenv("ADMIN_TOKEN_PROBE_MODEL")) or "gpt-5.6-luna"
 
 
 def _decode_error_body(raw: bytes) -> str:
