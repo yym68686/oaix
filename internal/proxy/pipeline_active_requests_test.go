@@ -17,6 +17,9 @@ func TestPipelineActiveRequestsAreIsolatedByCallerOwner(t *testing.T) {
 	if got := pipeline.ActiveRequestsForOwner(202); got != 1 {
 		t.Fatalf("owner 202 active requests = %d, want 1", got)
 	}
+	if got := pipeline.ActiveRequests(); got != 3 {
+		t.Fatalf("all active requests = %d, want 3", got)
+	}
 
 	releaseA1()
 	releaseA1()
@@ -34,6 +37,9 @@ func TestPipelineActiveRequestsAreIsolatedByCallerOwner(t *testing.T) {
 	}
 	if got := pipeline.ActiveRequestsForOwner(202); got != 0 {
 		t.Fatalf("owner 202 active requests after release = %d, want 0", got)
+	}
+	if got := pipeline.ActiveRequests(); got != 0 {
+		t.Fatalf("all active requests after release = %d, want 0", got)
 	}
 }
 
@@ -69,5 +75,8 @@ func TestPipelineActiveRequestsIgnoreMissingOwner(t *testing.T) {
 	var nilPipeline *Pipeline
 	if got := nilPipeline.ActiveRequestsForOwner(12); got != 0 {
 		t.Fatalf("nil pipeline active requests = %d, want 0", got)
+	}
+	if got := nilPipeline.ActiveRequests(); got != 0 {
+		t.Fatalf("nil pipeline all active requests = %d, want 0", got)
 	}
 }

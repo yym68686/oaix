@@ -696,8 +696,17 @@ export const api = {
     }
     return requestJSON<DashboardResponse>(`/api/me/dashboard?${params.toString()}`, { signal }, authKey);
   },
+  adminDashboard: (range: DashboardRange, timezone: string, signal?: AbortSignal, dates?: { from: string; to: string }) => {
+    const params = new URLSearchParams({ range, timezone });
+    if (range === "custom" && dates) {
+      params.set("from", dates.from);
+      params.set("to", dates.to);
+    }
+    return requestJSON<DashboardResponse>(`/api/admin/dashboard?${params.toString()}`, { signal });
+  },
   myConcurrency: (authKey?: string) =>
     requestJSON<{ current_concurrency?: number; generated_at?: string }>("/api/me/concurrency", {}, authKey),
+  adminConcurrency: () => requestJSON<{ current_concurrency?: number; generated_at?: string }>("/api/admin/concurrency"),
   register: (payload: Record<string, unknown>) =>
     postJSON<{ user?: PlatformUser; api_key?: CreatedAPIKey }>("/api/auth/register", payload),
   login: (payload: Record<string, unknown>) =>

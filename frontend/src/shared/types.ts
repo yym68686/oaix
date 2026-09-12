@@ -4,6 +4,7 @@ export type ThemePreference = "auto" | "light" | "dark";
 export type TokenStatus = "all" | "available" | "cooling" | "disabled";
 export type RouteKey =
   | "dashboard"
+  | "admin_dashboard"
   | "keys"
   | "key_detail"
   | "account_proxies"

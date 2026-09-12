@@ -957,6 +957,21 @@ func TestUserDashboardIsScopedToAuthenticatedCallerWithDatabase(t *testing.T) {
 	if got := int64(payload["current_concurrency"].(float64)); got != 0 {
 		t.Fatalf("idle dashboard concurrency = %d, want 0", got)
 	}
+	adminPayload := expectStatus(t, h.request(t, http.MethodGet, "/api/admin/dashboard?range=today&timezone=UTC", "service-test-key", ""), http.StatusOK)
+	adminDashboard, _ := adminPayload["dashboard"].(map[string]any)
+	adminPeriods, _ := adminDashboard["periods"].(map[string]any)
+	adminToday, _ := adminPeriods["today"].(map[string]any)
+	if got := int64(adminToday["request_count"].(float64)); got != 3 {
+		t.Fatalf("admin dashboard request_count = %d, want 3", got)
+	}
+	if got := int64(adminToday["total_tokens"].(float64)); got != 9360 {
+		t.Fatalf("admin dashboard total_tokens = %d, want 9360", got)
+	}
+	adminModels, _ := adminDashboard["models"].([]any)
+	if len(adminModels) != 3 {
+		t.Fatalf("admin dashboard models = %d, want 3", len(adminModels))
+	}
+	expectStatus(t, h.request(t, http.MethodGet, "/api/admin/dashboard?range=today&timezone=UTC", keyA.PlaintextKey, ""), http.StatusForbidden)
 	expectStatus(t, h.request(t, http.MethodGet, "/api/me/dashboard?range=today&timezone=Not%2FAZone", keyA.PlaintextKey, ""), http.StatusBadRequest)
 	custom := expectStatus(t, h.request(t, http.MethodGet, "/api/me/dashboard?range=custom&from="+now.Format("2006-01-02")+"&to="+now.Format("2006-01-02")+"&timezone=UTC", keyA.PlaintextKey, ""), http.StatusOK)
 	customDashboard, _ := custom["dashboard"].(map[string]any)

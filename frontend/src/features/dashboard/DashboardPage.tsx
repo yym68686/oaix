@@ -40,7 +40,7 @@ const PERIOD_LABELS: Record<DashboardRange, string> = {
   custom: "自定义",
 };
 
-export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
+export function DashboardPage({ refreshNonce, admin = false }: { refreshNonce: number; admin?: boolean }) {
   const [range, setRange] = useState<DashboardRange>("today");
   const today = localDate(new Date());
   const [customFrom, setCustomFrom] = useState(today);
@@ -68,7 +68,9 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
       setError("");
       const requestCredential = credential;
       try {
-        const payload = await api.dashboard(range, timezone, requestCredential, controller.signal, { from: customFrom, to: customTo });
+        const payload = admin
+          ? await api.adminDashboard(range, timezone, controller.signal, { from: customFrom, to: customTo })
+          : await api.dashboard(range, timezone, requestCredential, controller.signal, { from: customFrom, to: customTo });
         if (cancelled || getServiceKey().trim() !== requestCredential) {
           return;
         }
@@ -90,7 +92,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
       cancelled = true;
       controller.abort();
     };
-  }, [credential, range, timezone, refreshNonce, customFrom, customTo, dateError, selection]);
+  }, [admin, credential, range, timezone, refreshNonce, customFrom, customTo, dateError, selection]);
 
   useEffect(() => {
     if (!credential || isAuthContextPending()) {
@@ -103,7 +105,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
       pending = true;
       const requestCredential = credential;
       try {
-        const payload = await api.myConcurrency(requestCredential);
+        const payload = admin ? await api.adminConcurrency() : await api.myConcurrency(requestCredential);
         if (!cancelled && getServiceKey().trim() === requestCredential) {
           setConcurrency(Math.max(0, Number(payload.current_concurrency || 0)));
         }
@@ -119,7 +121,7 @@ export function DashboardPage({ refreshNonce }: { refreshNonce: number }) {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [credential]);
+  }, [admin, credential]);
 
   const selectedRangeLoaded = !dateError && loadedSelection === selection && dashboard?.range === range;
   const selectedPeriod = selectedRangeLoaded ? dashboard?.periods?.[range] : undefined;

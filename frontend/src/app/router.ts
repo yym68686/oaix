@@ -18,6 +18,9 @@ export function parseRoute(pathname: string, search = ""): RouteState {
   if (segments[0] === "admin" && segments[1] === "users" && segments[2]) {
     return { key: "admin_user_detail", params: { id: segments[2] }, path, search };
   }
+  if (segments[0] === "admin" && segments[1] === "dashboard") {
+    return { key: "admin_dashboard", params: {}, path, search };
+  }
   if (segments[0] === "admin" && segments[1] === "users") {
     return { key: "admin_users", params: {}, path, search };
   }

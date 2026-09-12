@@ -18,43 +18,13 @@ func (a *App) myDashboard(w http.ResponseWriter, r *http.Request) {
 	if !ok || scope.OwnerUserID == nil {
 		return
 	}
-	rangeValue, err := parseUserDashboardRange(r.URL.Query().Get("range"))
+	opts, err := dashboardOptionsFromRequest(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	timezoneName := strings.TrimSpace(r.URL.Query().Get("timezone"))
-	if timezoneName == "" {
-		timezoneName = "UTC"
-	}
-	if len(timezoneName) > 64 {
-		writeError(w, http.StatusBadRequest, errors.New("invalid timezone"))
-		return
-	}
-	location, err := time.LoadLocation(timezoneName)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, errors.New("invalid timezone"))
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	opts := store.UserDashboardOptions{
-		Now:      time.Now().UTC(),
-		Location: location,
-		Range:    rangeValue,
-	}
-	if rangeValue == store.UserDashboardCustom {
-		opts.CustomFrom, err = time.ParseInLocation(time.DateOnly, r.URL.Query().Get("from"), location)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, errors.New("from must be YYYY-MM-DD"))
-			return
-		}
-		opts.CustomTo, err = time.ParseInLocation(time.DateOnly, r.URL.Query().Get("to"), location)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, errors.New("to must be YYYY-MM-DD"))
-			return
-		}
-	}
 	payload, err := a.store.UserDashboardScoped(ctx, scope, opts)
 	if errors.Is(err, store.ErrInvalidDashboardDates) {
 		writeError(w, http.StatusBadRequest, err)

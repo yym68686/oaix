@@ -28,6 +28,8 @@ func (a *App) registerPlatformAdminAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/users/{user_id}/requests", a.requireAuth(a.listPlatformUserRequests))
 	mux.HandleFunc("GET /api/admin/users/{user_id}/usage", a.requireAuth(a.platformUserUsage))
 	mux.HandleFunc("GET /api/admin/pool-summary", a.requireAuth(a.platformPoolSummary))
+	mux.HandleFunc("GET /api/admin/dashboard", a.requireAuth(a.adminDashboard))
+	mux.HandleFunc("GET /api/admin/concurrency", a.requireAuth(a.adminConcurrency))
 	mux.HandleFunc("GET /api/admin/pool-summary/by-user", a.requireAuth(a.platformPoolSummaryByUser))
 	mux.HandleFunc("GET /api/admin/analytics/users", a.requireAuth(a.platformPoolSummaryByUser))
 	mux.HandleFunc("GET /api/admin/requests", a.requireAuth(a.listPlatformRequests))

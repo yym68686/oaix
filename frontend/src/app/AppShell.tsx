@@ -68,6 +68,7 @@ const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
   {
     label: "管理员",
     items: [
+      { adminOnly: true, key: "admin_dashboard", href: "/admin/dashboard", icon: <LayoutDashboardIcon />, label: "仪表盘" },
       { adminOnly: true, key: "admin_users", href: "/admin/users", icon: <UsersRoundIcon />, label: "用户状态" },
       { adminOnly: true, key: "admin_pools", href: "/admin/pools", icon: <DatabaseIcon />, label: "号池总览" },
       { adminOnly: true, key: "admin_imports", href: "/admin/imports", icon: <UploadIcon />, label: "全局导入" },
@@ -259,8 +260,8 @@ export function AppShell({
         style={{ "--oaix-sidebar-width": collapsed ? "68px" : "232px" } as React.CSSProperties}>
         <aside aria-label="侧边栏" className="sticky top-0 hidden h-dvh min-h-0 flex-col border-r bg-sidebar lg:flex">
           <div className={cn("flex h-20 shrink-0 items-center gap-3 px-5", collapsed && "h-auto flex-col gap-2 px-4 py-5")}>
-            <a aria-label="oaix 首页" className="flex min-w-0 flex-1 items-center gap-3 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring" href="/dashboard"
-              onClick={(event) => { event.preventDefault(); navigateTo("/dashboard"); }}>
+            <a aria-label="oaix 首页" className="flex min-w-0 flex-1 items-center gap-3 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring" href={admin ? "/admin/dashboard" : "/dashboard"}
+              onClick={(event) => { event.preventDefault(); navigateTo(admin ? "/admin/dashboard" : "/dashboard"); }}>
               <DatabaseIcon className="size-6 shrink-0" />
               {!collapsed && <span className="font-heading text-xl font-semibold tracking-tight">oaix</span>}
             </a>
@@ -283,7 +284,7 @@ export function AppShell({
         <div className="min-w-0">
           <header className="sticky top-0 z-20 flex h-16 items-center gap-3 border-b bg-background/95 px-4 backdrop-blur lg:hidden">
             <Button aria-label="打开导航" aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen(true)} size="icon-sm" variant="ghost"><MenuIcon /></Button>
-            <a className="mr-auto font-heading text-lg font-semibold" href="/dashboard" onClick={(event) => { event.preventDefault(); navigateTo("/dashboard"); }}>oaix</a>
+            <a className="mr-auto font-heading text-lg font-semibold" href={admin ? "/admin/dashboard" : "/dashboard"} onClick={(event) => { event.preventDefault(); navigateTo(admin ? "/admin/dashboard" : "/dashboard"); }}>oaix</a>
             <Button aria-label="刷新数据" onClick={onRefresh} size="icon-sm" variant="ghost"><RefreshCwIcon className={cn(loading && "animate-spin motion-reduce:animate-none")} /></Button>
             {accountMenu(true)}
           </header>

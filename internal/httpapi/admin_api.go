@@ -334,7 +334,7 @@ func adminOpenAPISpec() map[string]any {
 		"POST /api/admin/users/{user_id}/api-keys", "DELETE /api/admin/users/{user_id}/api-keys/{key_id}",
 		"GET /api/admin/users/{user_id}/tokens", "GET /api/admin/users/{user_id}/import/jobs",
 		"GET /api/admin/users/{user_id}/requests", "GET /api/admin/users/{user_id}/usage",
-		"GET /api/admin/pool-summary", "GET /api/admin/pool-summary/by-user",
+		"GET /api/admin/pool-summary", "GET /api/admin/pool-summary/by-user", "GET /api/admin/dashboard", "GET /api/admin/concurrency",
 		"GET /api/admin/analytics/users", "GET /api/admin/requests", "GET /api/admin/requests/export",
 		"GET /api/admin/audit-logs", "GET /api/admin/audit-logs/{audit_id}",
 		"GET /api/admin/sub2api/targets", "POST /api/admin/sub2api/targets",

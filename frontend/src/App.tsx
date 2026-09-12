@@ -168,6 +168,8 @@ export function App(): React.ReactElement {
     ) : (
       <EmptyState title="无权限" description="当前 API Key 没有管理员权限。" />
     );
+  } else if (route.key === "admin_dashboard") {
+    page = <DashboardPage admin key={getServiceKey()} refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_users") {
     page = <AdminUsersPage pushToast={pushToast} refreshNonce={refreshNonce} />;
   } else if (route.key === "admin_user_detail") {
@@ -201,7 +203,7 @@ export function App(): React.ReactElement {
   } else if (route.key === "account_profile") {
     page = <ProfilePage me={me} onRefresh={() => void refreshAll()} pushToast={pushToast} />;
   } else if (route.key === "dashboard") {
-    page = me ? <DashboardPage key={getServiceKey()} refreshNonce={refreshNonce} /> : (
+    page = me ? <DashboardPage admin={admin} key={getServiceKey()} refreshNonce={refreshNonce} /> : (
       <EmptyState
         description={loading ? "正在确认当前账号。" : "请先使用用户 API Key 登录。"}
         title={loading ? "正在验证身份" : "请登录"}

@@ -35,6 +35,7 @@ func TestAdminOpenAPISpecContainsAPIizedResources(t *testing.T) {
 		"/api/import/jobs/{job_id}/tokens",
 		"/api/admin/users/{user_id}/tokens",
 		"/api/admin/pool-summary/by-user",
+		"/api/admin/dashboard",
 		"/api/admin/requests/export",
 	}
 	for _, path := range required {

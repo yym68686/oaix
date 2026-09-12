@@ -195,7 +195,7 @@ func TestFrontendProfileSupportsSavedAccountSwitching(t *testing.T) {
 	profile := readFrontendFile(t, "src", "features", "account", "ProfilePage.tsx")
 	accounts := readFrontendFile(t, "src", "lib", "accounts.ts")
 	for _, required := range []string{
-        `navigateTo("/account/profile")`,
+		`navigateTo("/account/profile")`,
 		`accounts.length > 1`,
 		`<MenuGroupLabel>切换账号</MenuGroupLabel>`,
 		`onSwitchAccount={switchAccount}`,
@@ -423,6 +423,7 @@ func TestFrontendUserDashboardContract(t *testing.T) {
 
 	for _, required := range []string{
 		`{ key: "dashboard", href: "/dashboard"`,
+		`{ adminOnly: true, key: "admin_dashboard", href: "/admin/dashboard"`,
 		`label: "仪表盘"`,
 	} {
 		if !strings.Contains(appShell, required) {
@@ -431,6 +432,9 @@ func TestFrontendUserDashboardContract(t *testing.T) {
 	}
 	if !strings.Contains(router, `return { key: "dashboard"`) {
 		t.Fatal("router must expose /dashboard")
+	}
+	if !strings.Contains(router, `return { key: "admin_dashboard"`) {
+		t.Fatal("router must expose /admin/dashboard")
 	}
 	if !strings.Contains(app, `route.key === "dashboard"`) || !strings.Contains(app, `<DashboardPage`) {
 		t.Fatal("App must render the user dashboard page")
@@ -453,6 +457,8 @@ func TestFrontendUserDashboardContract(t *testing.T) {
 	for _, required := range []string{
 		`/api/me/dashboard?${params.toString()}`,
 		`/api/me/concurrency`,
+		`/api/admin/dashboard?${params.toString()}`,
+		`/api/admin/concurrency`,
 		`range === "custom"`,
 	} {
 		if !strings.Contains(apiFile, required) {

@@ -949,6 +949,20 @@ func (p *Pipeline) ActiveRequestsForOwner(ownerUserID int64) int64 {
 	return p.activeRequestsByOwner[ownerUserID]
 }
 
+// ActiveRequests counts all requests currently tracked by this process.
+func (p *Pipeline) ActiveRequests() int64 {
+	if p == nil {
+		return 0
+	}
+	p.activeRequestsMu.RLock()
+	defer p.activeRequestsMu.RUnlock()
+	var total int64
+	for _, count := range p.activeRequestsByOwner {
+		total += count
+	}
+	return total
+}
+
 func (p *Pipeline) trackActiveRequest(ownerUserID int64) func() {
 	if p == nil || ownerUserID <= 0 {
 		return func() {}
