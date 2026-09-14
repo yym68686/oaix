@@ -56,7 +56,7 @@ export function UserSettingsPage({
 }) {
   const [probeModel, setProbeModel] = useState<TestModel>(DEFAULT_TEST_MODEL);
   const [concurrencyPlans, setConcurrencyPlans] = useState<TokenConcurrencyPlan[]>([]);
-  const [concurrencyOverrides, setConcurrencyOverrides] = useState<Record<string, number>>({});
+  const [concurrencyOverrides, setConcurrencyOverrides] = useState<Record<string, number | "">>({});
   const [globalConcurrency, setGlobalConcurrency] = useState(10);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -67,6 +67,7 @@ export function UserSettingsPage({
   const [modelOverrides, setModelOverrides] = useState<Record<string, string[]>>({});
   const [savingModels, setSavingModels] = useState(false);
   const modelDirtyRef = useRef(false);
+  const concurrencyInvalid = Object.values(concurrencyOverrides).some((cap) => cap === "" || !Number.isInteger(cap) || cap < 1 || cap > 50);
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
@@ -114,9 +115,13 @@ export function UserSettingsPage({
   }
 
   async function saveConcurrency() {
+    if (concurrencyInvalid) {
+      pushToast("请输入 1–50 之间的整数并发上限", "error");
+      return;
+    }
     setSavingConcurrency(true);
     try {
-      await api.updateMyTokenConcurrency(concurrencyOverrides);
+      await api.updateMyTokenConcurrency(Object.fromEntries(Object.entries(concurrencyOverrides).map(([plan, cap]) => [plan, Number(cap)])));
       pushToast("计划并发设置已保存");
       concurrencyDirtyRef.current = false;
       await loadSettings();
@@ -251,10 +256,13 @@ export function UserSettingsPage({
                           min={1}
                           nativeInput
                           onChange={(event) => {
+                            // React clears currentTarget after dispatch, before a queued updater may run.
+                            const value = event.currentTarget.value;
+                            const nextCap = value === "" ? "" : clamp(Math.trunc(Number(value)), 1, 50);
                             concurrencyDirtyRef.current = true;
                             setConcurrencyOverrides((current) => ({
                               ...current,
-                              [plan.plan]: clamp(Number(event.currentTarget.value || 1), 1, 50),
+                              [plan.plan]: nextCap,
                             }));
                           }}
                           type="number"
@@ -266,8 +274,9 @@ export function UserSettingsPage({
                 })}
                 {!concurrencyPlans.length && <EmptyState compact title="暂无计划" description="当前账号还没有可配置并发的 Key 计划。" />}
               </div>
+              {concurrencyInvalid && <p className="text-destructive-foreground text-sm" role="status">请输入 1–50 之间的整数并发上限后再保存。</p>}
               <div className="grid gap-2 sm:flex sm:flex-wrap">
-                <Button className="w-full sm:w-auto" disabled={savingConcurrency} loading={savingConcurrency} onClick={() => void saveConcurrency()}>
+                <Button className="w-full sm:w-auto" disabled={savingConcurrency || concurrencyInvalid} loading={savingConcurrency} onClick={() => void saveConcurrency()}>
                   <SaveIcon />
                   保存并发设置
                 </Button>
