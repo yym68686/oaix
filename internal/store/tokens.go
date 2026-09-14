@@ -1706,13 +1706,17 @@ func (s *Store) MarkTokenErrorWithContext(ctx context.Context, tokenID int64, me
 	defer tx.Rollback(ctx)
 	var ownerUserID sql.NullInt64
 	var previousActive bool
+	var access, refresh, account string
 	if err := tx.QueryRow(ctx, `
-		select owner_user_id, is_active
+		select owner_user_id, is_active, coalesce(access_token,''), coalesce(refresh_token,''), coalesce(account_id,'')
 		from codex_tokens
 		where id = $1
 		for update
-	`, tokenID).Scan(&ownerUserID, &previousActive); err != nil {
+	`, tokenID).Scan(&ownerUserID, &previousActive, &access, &refresh, &account); err != nil {
 		return err
+	}
+	if f := eventCtx.CredentialFence; f != nil && (!previousActive || access != f.AccessToken || refresh != f.RefreshToken || account != f.AccountID) {
+		return tx.Commit(ctx)
 	}
 	// A non-terminal failure may finish after another in-flight request has
 	// permanently disabled this token. Preserve the terminal state and reason;

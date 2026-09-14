@@ -18,6 +18,7 @@ type Config struct {
 	Idempotency   IdempotencyConfig
 	TokenPool     TokenPoolConfig
 	QuotaRecovery QuotaRecoveryConfig
+	Recovery401   Recovery401Config
 	PromptCache   PromptCacheConfig
 	RequestLog    RequestLogConfig
 	Import        ImportConfig
@@ -97,6 +98,11 @@ type QuotaRecoveryConfig struct {
 	ProbeRetryInterval time.Duration
 	BatchSize          int
 	Concurrency        int
+}
+
+type Recovery401Config struct {
+	Enabled bool
+	BaseURL string
 }
 
 type PromptCacheConfig struct {
@@ -213,6 +219,10 @@ func Load() (Config, error) {
 			ProbeRetryInterval: envDurationSeconds("OAIX_AUTO_QUOTA_RECOVERY_PROBE_RETRY_SECONDS", 15*time.Minute),
 			BatchSize:          envInt("OAIX_AUTO_QUOTA_RECOVERY_BATCH_SIZE", 24),
 			Concurrency:        envInt("OAIX_AUTO_QUOTA_RECOVERY_CONCURRENCY", 4),
+		},
+		Recovery401: Recovery401Config{
+			Enabled: envBool("OAIX_401_RECOVERY_ENABLED", true),
+			BaseURL: envString("OAIX_401_RECOVERY_URL", "https://5xteam.shop"),
 		},
 		PromptCache: PromptCacheConfig{
 			AffinityEnabled:       envBool("PROMPT_CACHE_AFFINITY_ENABLED", true),

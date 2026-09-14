@@ -29,6 +29,7 @@ import (
 	"github.com/yym68686/oaix/internal/observability"
 	"github.com/yym68686/oaix/internal/protocol/openai"
 	"github.com/yym68686/oaix/internal/protocol/sse"
+	"github.com/yym68686/oaix/internal/recovery"
 	"github.com/yym68686/oaix/internal/store"
 	"github.com/yym68686/oaix/internal/tokens"
 	"github.com/yym68686/oaix/internal/transport"
@@ -677,7 +678,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			}
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, retry, decision.deactivate, decision.cooldownUntil)
 			if decision.commitRequired {
-				p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, decision.commitMessage, decision.deactivate, decision.cooldownUntil, p.tokenStateEventContext(requestID, intent, status, action, attemptID))
+				p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, decision.commitMessage, decision.deactivate, decision.cooldownUntil, p.tokenStateEventContext(requestID, intent, status, action, attemptID, claim))
 				if decision.deactivate {
 					p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 				}
@@ -733,7 +734,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			message := `terminal upstream status 401: detail "Unauthorized"`
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream401UnauthorizedDetail, retry, true, nil)
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401UnauthorizedDetail, attemptID))
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401UnauthorizedDetail, attemptID, claim))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < maxAttempts {
@@ -774,7 +775,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			message := "terminal upstream status 401: token_invalidated"
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream401Invalidated, retry, true, nil)
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Invalidated, attemptID))
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Invalidated, attemptID, claim))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < maxAttempts {
@@ -786,7 +787,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			message := "terminal upstream status 401: token_expired"
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream401Expired, retry, true, nil)
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Expired, attemptID))
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream401Expired, attemptID, claim))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < maxAttempts {
@@ -798,7 +799,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			message := "terminal upstream status 402: deactivated_workspace"
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream402Deactivated, retry, true, nil)
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream402Deactivated, attemptID))
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream402Deactivated, attemptID, claim))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < maxAttempts {
@@ -810,7 +811,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			message := "terminal upstream status 403: biscuit_baker_service_auth_credential_error_status (personal access token inactive)"
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream403TokenInactive, retry, true, nil)
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403TokenInactive, attemptID))
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403TokenInactive, attemptID, claim))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < maxAttempts {
@@ -822,7 +823,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			message := "terminal upstream status 403: biscuit_baker_service_auth_credential_error_status (inactive selected workspace member)"
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream403InactiveMember, retry, true, nil)
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403InactiveMember, attemptID))
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403InactiveMember, attemptID, claim))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < maxAttempts {
@@ -834,7 +835,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 			message := "terminal upstream status 403: biscuit_baker_service_agent_error_status (agent runtime deleted)"
 			lastErr = errors.New(message)
 			attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, lastErr, OutcomeUpstream403AgentRuntimeDeleted, retry, true, nil)
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403AgentRuntimeDeleted, attemptID))
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, message, true, nil, p.tokenStateEventContext(requestID, intent, status, OutcomeUpstream403AgentRuntimeDeleted, attemptID, claim))
 			p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			excluded[claim.TokenID()] = struct{}{}
 			if attempt < maxAttempts {
@@ -855,7 +856,7 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		}
 		attemptID := p.recordGatewayAttempt(context.Background(), attemptSpec, result, err, action, retry, decision.deactivate, decision.cooldownUntil)
 		if decision.commitRequired {
-			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, decision.commitMessage, decision.deactivate, decision.cooldownUntil, p.tokenStateEventContext(requestID, intent, status, action, attemptID))
+			p.commitTokenError(claim.TokenID(), selectedTokenOwnerID, decision.commitMessage, decision.deactivate, decision.cooldownUntil, p.tokenStateEventContext(requestID, intent, status, action, attemptID, claim))
 			if decision.deactivate {
 				p.tokens.RemovePromptAffinityToken(p.affinity, claim.TokenID())
 			}
@@ -1653,6 +1654,15 @@ func (p *Pipeline) decideTokenFailure(
 			decision.commitMessage = fmt.Sprintf("terminal agent identity upstream status %d", status)
 			return decision
 		}
+		if status == http.StatusUnauthorized && p.cfg.Recovery401.Enabled && claim.Token != nil && claim.Token.Token.PlanType != nil && *claim.Token.Token.PlanType == recovery.EligiblePlan {
+			decision.deactivate = true
+			decision.commitRequired = true
+			decision.commitMessage = "upstream 401: awaiting website OAuth recovery"
+			if bytes.Contains(bytes.ToLower(result.ErrorBody), []byte("account_deactivated")) {
+				decision.commitMessage = "upstream 401: account_deactivated"
+			}
+			return decision
+		}
 		refreshResult := p.refreshAccessTokenAfterAuthFailure(ctx, claim, alreadyRefreshed)
 		switch {
 		case refreshResult.Refreshed:
@@ -1864,8 +1874,18 @@ func (p *Pipeline) insertGatewayAttempt(item store.GatewayRequestAttempt) *int64
 	return &id
 }
 
-func (p *Pipeline) tokenStateEventContext(requestID string, intent RequestIntent, status int, outcome Outcome, attemptID *int64) store.TokenStateEventContext {
+func (p *Pipeline) tokenStateEventContext(requestID string, intent RequestIntent, status int, outcome Outcome, attemptID *int64, claims ...*tokens.Claim) store.TokenStateEventContext {
+	var fence *store.QuotaRecoveryCredentialFence
+	if len(claims) > 0 && claims[0] != nil && claims[0].Token != nil {
+		t := claims[0].Token.Token
+		id := ""
+		if t.AccountID != nil {
+			id = *t.AccountID
+		}
+		fence = &store.QuotaRecoveryCredentialFence{AccessToken: t.AccessToken, RefreshToken: t.RefreshToken, AccountID: id}
+	}
 	return store.TokenStateEventContext{
+		CredentialFence:         fence,
 		RequestID:               requestID,
 		GatewayRequestAttemptID: attemptID,
 		Endpoint:                intent.Endpoint,

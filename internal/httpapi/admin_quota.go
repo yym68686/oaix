@@ -622,6 +622,9 @@ func (s *adminQuotaService) fetchSnapshotWithDiagnostic(ctx context.Context, tok
 		}
 		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshotForRecovery(now, err.Error(), quotaRecoveryCheckErrorTransport), persist), quotaRecoveryCheckErrorTransport
 	}
+	if persist && s.recordQuota401(token, statusCode, body) {
+		return s.storeSnapshotWithPersistence(token.ID, quotaErrorSnapshot(now, responseErrorDetail(statusCode, body)), persist), quotaRecoveryCheckErrorHTTPUnauthorized
+	}
 	var refreshFailureReason quotaRecoveryCheckErrorReason
 	if quotaStatusShouldRefresh(statusCode) && !quotaResponseShouldDisable(statusCode, body) && token.HasRefreshableOAuthToken() {
 		if refreshed, refreshErr := s.refreshQuotaToken(ctx, token); refreshErr == nil {

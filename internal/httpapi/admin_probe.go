@@ -108,6 +108,16 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		a.logManualTokenProbe(token, model, result, time.Since(startedAt))
 	}()
 	attempt, probedToken := a.executeTokenProbeWithAuth(parent, token, model)
+	if attempt.StatusCode == http.StatusUnauthorized && a.cfg.Recovery401.Enabled && stringPtr(token.PlanType) == "self_serve_business_prolite" && !token.IsAgentIdentity() {
+		reason := "upstream 401: awaiting website OAuth recovery"
+		if strings.Contains(attempt.RawResponse, "account_deactivated") {
+			reason = "upstream 401: account_deactivated"
+		}
+		if err := a.markProbeDisabled(token, probedToken, reason, false, 401, model); err != nil {
+			return tokenProbeResultForAttempt(token, "inconclusive", 503, "无法保存 401 恢复状态。", "state persistence failed", model, attempt)
+		}
+		return tokenProbeResultForAttempt(token, "recovery_pending", 401, "账号已进入后台 OAuth 恢复；通过完整模型测试后才会恢复可用。", "", model, attempt)
+	}
 	statusCode := attempt.StatusCode
 	if statusCode == 0 {
 		statusCode = http.StatusRequestTimeout

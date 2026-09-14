@@ -95,6 +95,7 @@ func RunGateway(ctx context.Context) error {
 	app.SetProbeRequestDoer(upstream)
 	pipeline.SetTokenModelCapabilityLossHandler(app.HandleTokenModelCapabilityLoss)
 	app.StartQuotaRecovery(ctx)
+	app.Start401Recovery(ctx)
 	connectionIDs := observability.NewConnectionIDGenerator()
 	server := &http.Server{
 		Addr:         cfg.Address(),

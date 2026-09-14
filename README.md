@@ -67,6 +67,8 @@
 - `IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS`: `gpt-image-2` 撞到上游 `input-images` 短速率限制且未返回明确重试时间时的 scoped 冷却秒数，默认 `5`
 - `IMAGE_RATE_LIMIT_MIN_COOLDOWN_SECONDS`: 解析到 `Please try again in ...` 时的最小 scoped 冷却秒数，默认 `1`
 - `DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS`: 429 且没有明确重置时间时的部署默认冷却秒数，默认 `300`；普通 429 可在设置页或 `/admin/ordinary-429-cooldown` API 中即时覆盖
+- `OAIX_401_RECOVERY_ENABLED`: 是否启用 5xteam 网站 OAuth 恢复，默认 `true`。仅原始 `plan_type` 精确为 `self_serve_business_prolite` 且有当前 401 失效事件的 OAuth 账号可进入；其它计划、手动禁用、Agent Identity、已明确封禁的账号不触发。
+- `OAIX_401_RECOVERY_URL`: 恢复服务根 URL，默认 `https://5xteam.shop`。请求只发送账号名称，不发送旧 access/refresh token。
 - `OAIX_AUTO_QUOTA_RECOVERY_ENABLED`: 是否后台检查仍处于 usage-limit 冷却、但原始额度窗口均已大于 `0` 或额度查询报错的账号，并用固定 `gpt-5.4-mini` 完整请求验证；成功时提前恢复，明确永久凭据错误时自动禁用，默认 `true`
 - `OAIX_AUTO_QUOTA_RECOVERY_STARTUP_DELAY_SECONDS`: 自动额度恢复首次扫描前等待秒数，默认 `30`
 - `OAIX_AUTO_QUOTA_RECOVERY_SCAN_INTERVAL_SECONDS`: 自动额度恢复候选扫描间隔秒数，默认 `30`
@@ -348,3 +350,13 @@ Go 版支持 access token、refresh token，以及 sub2api 导出的 OpenAI Agen
 - 如果 refresh token 明确已经失效，例如 `refresh_token_reused` / `invalid_grant` / “Please try signing in again”，网关会清空 access token 并永久停用该 key
 - 如果 key 是 access-token-only，网关不会刷新；JWT 过期或上游返回 `401/403` 时会清空 access token 并永久停用该 key
 - 如果上游返回普通 `401/403`，会清空当前 access token，并尝试刷新/切换下一个 key
+
+## 401 网站自动恢复
+
+后台每 15 秒扫描当前 401 失效账号，串行调用网站 `POST /api/cdk/replenish-email-gpt`，并轮询 `/api/cdk/replenish-email-gpt/status/{jobKey}`。业务请求继续通过现有账号池切换其它账号，无需等待网站 OAuth 完成。
+
+账号名优先采用导入原始 `name` 或备注中与邮箱匹配的 `邮箱----空间名称`；缺失时使用网站标准的 `邮箱----myWorkspace-` 加 workspace UUID 最后六位。自定义空间可在 OAIX 备注中保存完整网站账号名。网站没有对应 RT 记录、用户已被移出空间或账号被停用时，不能自动生成有效凭据。
+
+只有新 JWT 的邮箱、workspace 和原始订阅类型全部匹配，且通过该账号代理收到完整 `gpt-5.6-luna` 的 `response.completed` 后，才在原 token ID 上原子替换凭据并恢复可用。保留 owner、共享、价格、代理和并发设置；恢复期间发生的手动修改或凭据更新会阻止写入。失败不会导入新账号，也不会提前将旧账号标记可用。
+
+任务结果记录在 `token_state_events` 的 `oauth_401_recovery_started`、`oauth_401_recovery_result`、`oauth_401_recovered` 事件，并输出不含凭据的 `401 recovery completed` 日志。每个账号两次提交至少间隔 15 分钟，24 小时最多 3 次；明确缺失空间/RT、封禁或身份不匹配时等待 24 小时。重启保留这些间隔，HTTP 200 本身不代表恢复成功。

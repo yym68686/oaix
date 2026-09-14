@@ -5649,3 +5649,26 @@ func (w failingWriter) Write(p []byte) (int, error) {
 
 var _ http.ResponseWriter = failingWriter{}
 var _ io.Writer = failingWriter{}
+
+func TestWebsiteRecoveryOnlyInterceptsProlite401(t *testing.T) {
+	for _, test := range []struct {
+		plan    string
+		status  int
+		enabled bool
+		want    bool
+	}{
+		{"self_serve_business_prolite", 401, true, true},
+		{"business", 401, true, false}, {"team", 401, true, false}, {"free", 401, true, false},
+		{"self_serve_business_prolite", 403, true, false}, {"self_serve_business_prolite", 401, false, false},
+	} {
+		t.Run(fmt.Sprintf("%s-%d-%t", test.plan, test.status, test.enabled), func(t *testing.T) {
+			p := &Pipeline{cfg: config.Config{Recovery401: config.Recovery401Config{Enabled: test.enabled}}}
+			claim := &tokens.Claim{Token: &tokens.RuntimeToken{Token: store.Token{ID: 42, PlanType: &test.plan, RefreshToken: "refresh"}}}
+			d := p.decideTokenFailure(context.Background(), claim, test.status, AttemptResult{}, nil, classify(test.status, nil), map[int64]struct{}{}, map[string]any{})
+			got := d.deactivate && d.commitMessage == "upstream 401: awaiting website OAuth recovery"
+			if got != test.want {
+				t.Fatalf("intercept=%t want %t", got, test.want)
+			}
+		})
+	}
+}

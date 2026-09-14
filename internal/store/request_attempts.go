@@ -43,17 +43,18 @@ type GatewayRequestAttempt struct {
 }
 
 type TokenStateEventContext struct {
-	RequestID               string         `json:"request_id,omitempty"`
-	GatewayRequestLogID     *int64         `json:"gateway_request_log_id,omitempty"`
-	GatewayRequestAttemptID *int64         `json:"gateway_request_attempt_id,omitempty"`
-	Endpoint                string         `json:"endpoint,omitempty"`
-	Model                   string         `json:"model,omitempty"`
-	StatusCode              *int           `json:"status_code,omitempty"`
-	SelectionMode           string         `json:"selection_mode,omitempty"`
-	CallerOwnerUserID       *int64         `json:"caller_owner_user_id,omitempty"`
-	PreviousIsActive        *bool          `json:"previous_is_active,omitempty"`
-	NextIsActive            *bool          `json:"next_is_active,omitempty"`
-	Metadata                map[string]any `json:"metadata,omitempty"`
+	CredentialFence         *QuotaRecoveryCredentialFence `json:"-"`
+	RequestID               string                        `json:"request_id,omitempty"`
+	GatewayRequestLogID     *int64                        `json:"gateway_request_log_id,omitempty"`
+	GatewayRequestAttemptID *int64                        `json:"gateway_request_attempt_id,omitempty"`
+	Endpoint                string                        `json:"endpoint,omitempty"`
+	Model                   string                        `json:"model,omitempty"`
+	StatusCode              *int                          `json:"status_code,omitempty"`
+	SelectionMode           string                        `json:"selection_mode,omitempty"`
+	CallerOwnerUserID       *int64                        `json:"caller_owner_user_id,omitempty"`
+	PreviousIsActive        *bool                         `json:"previous_is_active,omitempty"`
+	NextIsActive            *bool                         `json:"next_is_active,omitempty"`
+	Metadata                map[string]any                `json:"metadata,omitempty"`
 }
 
 type TokenStateEvent struct {
