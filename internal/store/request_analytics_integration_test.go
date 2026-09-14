@@ -247,3 +247,47 @@ func valueOrZero(value *float64) float64 {
 	}
 	return *value
 }
+
+func TestHourlyAggregationGroupsByEffectiveTokenOwner(t *testing.T) {
+	dsn := os.Getenv("OAIX_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("requires isolated Postgres")
+	}
+	ctx := context.Background()
+	db, err := Connect(ctx, config.DatabaseConfig{URL: configURL(dsn), MaxConns: 4, ConnectTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var caller, owner int64
+	for i, dest := range []*int64{&caller, &owner} {
+		if err := db.pool.QueryRow(ctx, `insert into platform_users(email,role,status) values($1,'user','active') returning id`, fmt.Sprintf("hourly-owner-%d-%d@example.test", time.Now().UnixNano(), i)).Scan(dest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finished := time.Now().UTC()
+	success := true
+	model := fmt.Sprintf("hourly-owner-%d", time.Now().UnixNano())
+	items := []RequestLog{
+		{RequestID: model + "-marketplace", OwnerUserID: &caller, TokenOwnerUserID: &owner, ModelName: &model, StartedAt: finished.Add(-time.Second), FinishedAt: &finished, Success: &success},
+		{RequestID: model + "-fallback", OwnerUserID: &caller, ModelName: &model, StartedAt: finished.Add(-time.Second), FinishedAt: &finished, Success: &success},
+	}
+	if err := db.UpsertRequestLogs(ctx, items); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AggregateRequestHourlyStats(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{caller, owner} {
+		var count int64
+		if err := db.pool.QueryRow(ctx, `select request_count from gateway_request_hourly_stats where owner_user_id=$1 and model_name=$2`, id, model).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("owner %d count=%d; distinct account owners were grouped together", id, count)
+		}
+	}
+}

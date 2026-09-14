@@ -567,8 +567,8 @@ func (s *Store) aggregateRequestHourlyStatsBatch(ctx context.Context) (int64, in
 			where id = any($1::integer[])
 			  and analytics_recorded_at is null
 			  and finished_at is not null
-			  and owner_user_id is not null
-			group by owner_user_id, date_trunc('hour', started_at), coalesce(model_name, model, '')
+			  and coalesce(token_owner_user_id, owner_user_id) is not null
+			group by coalesce(token_owner_user_id, owner_user_id), date_trunc('hour', started_at), coalesce(model_name, model, '')
 		)
 		insert into gateway_request_hourly_stats (
 			owner_user_id, bucket_start, model_name, request_count, success_count, failure_count, streaming_count,

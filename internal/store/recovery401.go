@@ -43,7 +43,7 @@ func (s *Store) ListRecovery401Candidates(ctx context.Context) ([]int64, error) 
  and not exists (select 1 from token_agent_identities a where a.token_id=t.id)
  and lower(e.reason) not like '%account_deactivated%'
  `+recovery401RetryPredicate+`
- order by e.id asc limit 16`)
+ order by e.id desc limit 16`)
 	if err != nil {
 		return nil, err
 	}

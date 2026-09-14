@@ -65,7 +65,8 @@ func recoveryAccountName(candidate store.Recovery401Candidate) (string, error) {
 			return email + "----" + strings.TrimSpace(parts[1]), nil
 		}
 	}
-	// 5xteam's exported names use the final six workspace UUID characters.
+	// Recover the conventional name used in 5xteam exports. The returned
+	// complete workspace identity is still checked before any credential write.
 	return email + "----myWorkspace-" + strings.ToLower(accountID[len(accountID)-6:]), nil
 }
 

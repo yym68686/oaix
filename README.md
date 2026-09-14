@@ -355,7 +355,7 @@ Go 版支持 access token、refresh token，以及 sub2api 导出的 OpenAI Agen
 
 后台每 15 秒扫描当前 401 失效账号，串行调用网站 `POST /api/cdk/replenish-email-gpt`，并轮询 `/api/cdk/replenish-email-gpt/status/{jobKey}`。业务请求继续通过现有账号池切换其它账号，无需等待网站 OAuth 完成。
 
-账号名优先采用导入原始 `name` 或备注中与邮箱匹配的 `邮箱----空间名称`；缺失时使用网站标准的 `邮箱----myWorkspace-` 加 workspace UUID 最后六位。自定义空间可在 OAIX 备注中保存完整网站账号名。网站没有对应 RT 记录、用户已被移出空间或账号被停用时，不能自动生成有效凭据。
+账号名优先采用导入原始 `name` 或备注中与邮箱匹配的 `邮箱----空间名称`；缺失时采用该网站导出的常规格式 `邮箱----myWorkspace-` 加 workspace UUID 最后六位，并始终校验返回的完整 workspace ID。自定义空间可在 OAIX 备注中保存完整网站账号名。网站没有对应 RT 记录、用户已被移出空间或账号被停用时，不能自动生成有效凭据。
 
 只有新 JWT 的邮箱、workspace 和原始订阅类型全部匹配，且通过该账号代理收到完整 `gpt-5.6-luna` 的 `response.completed` 后，才在原 token ID 上原子替换凭据并恢复可用。保留 owner、共享、价格、代理和并发设置；恢复期间发生的手动修改或凭据更新会阻止写入。失败不会导入新账号，也不会提前将旧账号标记可用。
 
