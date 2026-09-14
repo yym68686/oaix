@@ -258,7 +258,8 @@ export function UserSettingsPage({
                           onChange={(event) => {
                             // React clears currentTarget after dispatch, before a queued updater may run.
                             const value = event.currentTarget.value;
-                            const nextCap = value === "" ? "" : clamp(Math.trunc(Number(value)), 1, 50);
+                            const parsed = Number(value);
+                            const nextCap = value === "" || !Number.isFinite(parsed) ? "" : clamp(Math.trunc(parsed), 1, 50);
                             concurrencyDirtyRef.current = true;
                             setConcurrencyOverrides((current) => ({
                               ...current,
