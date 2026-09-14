@@ -167,6 +167,17 @@ func (c Credentials) BuildAssertion(now time.Time) (string, error) {
 	return "AgentAssertion " + base64.RawURLEncoding.EncodeToString(envelope), nil
 }
 
+// TaskRegistrationError preserves a bounded, redacted HTTP response for callers
+// to classify. Error deliberately omits the body to keep routine logs private.
+type TaskRegistrationError struct {
+	StatusCode int
+	Body       []byte
+}
+
+func (e *TaskRegistrationError) Error() string {
+	return fmt.Sprintf("agent task registration returned status %d", e.StatusCode)
+}
+
 func RegisterTask(ctx context.Context, doer RequestDoer, baseURL string, credentials Credentials) (string, error) {
 	if doer == nil {
 		return "", errors.New("agent task registration transport is unavailable")
@@ -209,8 +220,15 @@ func RegisterTask(ctx context.Context, doer RequestDoer, baseURL string, credent
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64*1024))
-		return "", fmt.Errorf("agent task registration returned status %d", response.StatusCode)
+		errorBody, readErr := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
+		// Only complete, bounded responses can establish a permanent failure.
+		if readErr != nil || len(errorBody) > 64*1024 {
+			errorBody = nil
+		}
+		return "", &TaskRegistrationError{
+			StatusCode: response.StatusCode,
+			Body:       RedactSensitiveBody(errorBody, credentials),
+		}
 	}
 	var result taskRegistrationResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&result); err != nil {

@@ -39,6 +39,16 @@ func IsUnauthorizedDetail(status int, body []byte) bool {
 // are intentionally ignored so localized or unrelated 401 errors cannot
 // deactivate a token.
 func IsTokenInvalidated(status int, body []byte) bool {
+	return hasUnauthorizedErrorCode(status, body, "token_invalidated")
+}
+
+// IsTokenRevoked accepts only the explicit 401 token_revoked protocol signal.
+// Messages mentioning revocation and other HTTP statuses are not sufficient.
+func IsTokenRevoked(status int, body []byte) bool {
+	return hasUnauthorizedErrorCode(status, body, "token_revoked")
+}
+
+func hasUnauthorizedErrorCode(status int, body []byte, code string) bool {
 	if status != http.StatusUnauthorized || len(body) == 0 {
 		return false
 	}
@@ -50,7 +60,7 @@ func IsTokenInvalidated(status int, body []byte) bool {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(payload.Error.Code), "token_invalidated")
+	return strings.EqualFold(strings.TrimSpace(payload.Error.Code), code)
 }
 
 // IsTokenExpired reports whether an upstream HTTP response contains the

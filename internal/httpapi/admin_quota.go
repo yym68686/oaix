@@ -1401,7 +1401,7 @@ func (s *adminQuotaService) disableTokenFromQuota(ctx context.Context, tokenID i
 }
 
 func quotaResponseShouldDisable(status int, body []byte) bool {
-	if upstreamerror.IsTokenInvalidated(status, body) {
+	if upstreamerror.IsTokenInvalidated(status, body) || upstreamerror.IsTokenRevoked(status, body) {
 		return true
 	}
 	if upstreamerror.IsTokenExpired(status, body) {

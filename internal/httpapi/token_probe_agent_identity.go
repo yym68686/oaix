@@ -12,6 +12,7 @@ import (
 	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/agentidentitytask"
 	"github.com/yym68686/oaix/internal/store"
+	"github.com/yym68686/oaix/internal/upstreamerror"
 )
 
 const (
@@ -137,12 +138,13 @@ func (a *App) prepareTokenProbeAuthorization(parent context.Context, token store
 			if a != nil && a.logger != nil {
 				a.logger.Warn("manual token probe agent identity task registration failed", "token_id", token.ID, "error", err)
 			}
-			return tokenProbeAuthorization{}, localTokenProbeFailure(
+			failure := localTokenProbeFailure(
 				http.StatusBadGateway,
 				probeStageCredentialPreparation,
 				"agent_identity_task_registration_failed",
 				"agent identity task registration failed",
-			), false
+			)
+			return tokenProbeAuthorization{}, agentIdentityRegistrationProbeFailure(err, failure), false
 		}
 	}
 	assertion, err := credentials.BuildAssertion(time.Now())
@@ -200,6 +202,22 @@ func (a *App) recoverAgentIdentityProbeTask(parent context.Context, token store.
 		return agentidentity.Credentials{}, err
 	}
 	return result.Credentials, nil
+}
+
+func agentIdentityRegistrationProbeFailure(err error, fallback tokenProbeAttempt) tokenProbeAttempt {
+	var registrationErr *agentidentity.TaskRegistrationError
+	if !errors.As(err, &registrationErr) {
+		return fallback
+	}
+	fallback.StatusCode = registrationErr.StatusCode
+	fallback.RawResponse = string(registrationErr.Body)
+	fallback.Detail = responseErrorDetail(registrationErr.StatusCode, registrationErr.Body)
+	fallback.UpstreamAttempted = true
+	if upstreamerror.IsTokenRevoked(registrationErr.StatusCode, registrationErr.Body) {
+		fallback.Outcome = tokenProbeDisabled
+		fallback.ErrorCode = "token_revoked"
+	}
+	return fallback
 }
 
 func redactAgentIdentityProbeAttempt(attempt tokenProbeAttempt, credentials *agentidentity.Credentials) tokenProbeAttempt {

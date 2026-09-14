@@ -143,12 +143,17 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 	case tokenProbeDisabled:
 		rawResponse := []byte(attempt.RawResponse)
 		tokenInvalidated := upstreamerror.IsTokenInvalidated(statusCode, rawResponse)
+		tokenRevoked := upstreamerror.IsTokenRevoked(statusCode, rawResponse)
 		tokenExpired := upstreamerror.IsTokenExpired(statusCode, rawResponse)
 		inactivePersonalAccessToken := upstreamerror.IsInactivePersonalAccessToken(statusCode, rawResponse)
 		agentRuntimeDeleted := upstreamerror.IsAgentRuntimeDeleted(statusCode, rawResponse)
-		clearAccess := tokenInvalidated || tokenExpired
+		clearAccess := tokenInvalidated || tokenExpired || tokenRevoked
 		failureMessage := "测试确认工作区已停用，但保存禁用状态失败。"
 		resultMessage := "测试失败：上游明确返回工作区已停用，当前已标记为禁用。"
+		if tokenRevoked {
+			failureMessage = "测试确认上游凭据已撤销，但保存禁用状态失败。"
+			resultMessage = "测试失败：上游明确返回 token_revoked，凭据已撤销，当前已标记为禁用。"
+		}
 		if tokenExpired {
 			failureMessage = "测试确认 authentication token 已过期，但保存禁用状态失败。"
 			resultMessage = "测试失败：上游明确返回 token_expired，当前已标记为禁用。"
@@ -203,7 +208,10 @@ func (a *App) probeTokenWithAccess(parent context.Context, token store.Token, re
 		} else if !attempt.UpstreamAttempted {
 			message = "测试未执行：本地预检失败，未向上游发送请求。"
 		} else if attempt.Stage == probeStageCredentialPreparation {
-			message = "测试未完成：Agent Identity 凭据恢复失败，账号状态未改变。"
+			message = "测试未完成：OAuth 凭据刷新失败，账号状态未改变。"
+			if token.IsAgentIdentity() {
+				message = "测试未完成：Agent Identity 凭据恢复失败，账号状态未改变。"
+			}
 		} else if attempt.ErrorCode == "agent_identity_task_rejected_after_recovery" {
 			message = "测试未完成：上游在 task 恢复后仍拒绝 Agent Identity，账号状态未改变。"
 		}

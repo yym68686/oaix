@@ -348,7 +348,7 @@ func (a *App) executeTokenProbeWithAuth(parent context.Context, token store.Toke
 			attempt.Detail = "agent identity task recovery failed"
 			attempt.ErrorCode = "agent_identity_task_recovery_failed"
 			attempt.Stage = probeStageCredentialPreparation
-			return attempt, token
+			return agentIdentityRegistrationProbeFailure(err, attempt), token
 		}
 		token.AgentIdentity = &recovered
 		retry := a.executeTokenProbe(parent, token, model)

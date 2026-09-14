@@ -443,6 +443,7 @@ func (w *quotaRecoveryWorker) processCandidate(ctx context.Context, candidate st
 		}
 	case tokenProbeDisabled:
 		clearAccess := upstreamerror.IsTokenInvalidated(attempt.StatusCode, []byte(attempt.RawResponse)) ||
+			upstreamerror.IsTokenRevoked(attempt.StatusCode, []byte(attempt.RawResponse)) ||
 			upstreamerror.IsTokenExpired(attempt.StatusCode, []byte(attempt.RawResponse))
 		applied, err := w.store.DisableQuotaRecovery(ctx, *claim, fence, attempt.Detail, clearAccess, attempt.StatusCode, metadata)
 		if err != nil {

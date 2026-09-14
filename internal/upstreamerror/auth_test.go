@@ -237,3 +237,27 @@ func TestIsAgentRuntimeDeleted(t *testing.T) {
 		})
 	}
 }
+
+func TestIsTokenRevoked(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"explicit revoked", 401, `{"error":{"message":"Encountered invalidated oauth token for user, failing request","type":null,"code":"token_revoked","param":null},"status":401}`, true},
+		{"trimmed code", 401, `{"error":{"code":" TOKEN_REVOKED "}}`, true},
+		{"message only", 401, `{"error":{"message":"token_revoked"}}`, false},
+		{"wrong code", 401, `{"error":{"code":"not_token_revoked"}}`, false},
+		{"top level code", 401, `{"code":"token_revoked"}`, false},
+		{"wrong status", 403, `{"error":{"code":"token_revoked"},"status":401}`, false},
+		{"server failure", 502, `{"error":{"code":"token_revoked"},"status":401}`, false},
+		{"truncated JSON", 401, `{"error":{"code":"token_revoked"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsTokenRevoked(tc.status, []byte(tc.body)); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

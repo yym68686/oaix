@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -210,4 +211,44 @@ func mustJSON(t *testing.T, value any) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func TestRegisterTaskFailurePreservesRedactedBoundedResponse(t *testing.T) {
+	credentials, _ := testCredentials(t)
+	for _, oversized := range []bool{false, true} {
+		t.Run(fmt.Sprintf("oversized=%v", oversized), func(t *testing.T) {
+			body := fmt.Sprintf(`{"error":{"code":"token_revoked","message":"%s %s %s AgentAssertion secret"}}`, credentials.RuntimeID, credentials.TaskID, credentials.PrivateKey)
+			if oversized {
+				body += strings.Repeat(" ", 64*1024)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401); _, _ = w.Write([]byte(body)) }))
+			defer server.Close()
+			_, err := RegisterTask(t.Context(), httpDoer{client: server.Client()}, server.URL, credentials)
+			var failure *TaskRegistrationError
+			if !errors.As(err, &failure) || failure.StatusCode != 401 {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if strings.Contains(err.Error(), "token_revoked") {
+				t.Fatal("routine error logs include body")
+			}
+			if oversized {
+				if len(failure.Body) != 0 {
+					t.Fatal("oversized response retained as classification evidence")
+				}
+				return
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(failure.Body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(failure.Body), "token_revoked") {
+				t.Fatal("structured error code lost")
+			}
+			for _, secret := range []string{credentials.RuntimeID, credentials.TaskID, credentials.PrivateKey, "secret"} {
+				if strings.Contains(string(failure.Body), secret) {
+					t.Fatal("credential leaked in error body")
+				}
+			}
+		})
+	}
 }

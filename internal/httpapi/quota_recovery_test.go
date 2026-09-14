@@ -376,6 +376,57 @@ func TestQuotaRecoveryFreshPersistedErrorStartsProbeAndDisablesToken(t *testing.
 	}
 }
 
+func TestQuotaRecoveryTokenRevokedDisablesAndClearsAccess(t *testing.T) {
+	now := time.Now().UTC()
+	errorText := "HTTP 401: token_revoked"
+	snapshot := codexQuotaSnapshot{FetchedAt: now, Error: &errorText, Windows: []codexQuotaWindow{}}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetchedAt := now
+	candidate := store.QuotaRecoveryCandidate{
+		TokenID: 8, OwnerUserID: 9, CooldownUntil: now.Add(time.Hour), SourceEventID: 10,
+		QuotaSnapshot: raw, QuotaFetchedAt: &fetchedAt,
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(revokedProbeBody))
+	}))
+	defer upstream.Close()
+	fake := &fakeQuotaRecoveryStore{
+		candidates: []store.QuotaRecoveryCandidate{candidate},
+		token: store.Token{
+			ID: candidate.TokenID, OwnerUserID: candidate.OwnerUserID, AccessToken: "expired-access",
+			IsActive: true, CooldownUntil: &candidate.CooldownUntil,
+		},
+	}
+	app := &App{cfg: config.Config{Upstream: config.UpstreamConfig{ResponsesURL: upstream.URL}}}
+	worker := &quotaRecoveryWorker{
+		app: app,
+		cfg: config.QuotaRecoveryConfig{
+			BatchSize: 1, Concurrency: 1, QuotaMaxAge: time.Minute,
+			RecheckInterval: time.Minute, ProbeRetryInterval: time.Minute,
+		},
+		store: fake, quota: &adminQuotaService{}, nextCheck: map[int64]time.Time{}, nextProbe: map[int64]time.Time{},
+	}
+	app.recovery = worker
+	worker.scan(t.Context())
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.claimCalls != 1 || fake.disableCalls != 1 || fake.completeCalls != 0 || fake.recordCalls != 0 {
+		t.Fatalf("fresh quota error did not run the strict disable probe: claims=%d disables=%d completes=%d records=%d", fake.claimCalls, fake.disableCalls, fake.completeCalls, fake.recordCalls)
+	}
+	if !fake.disabledClearAccess || fake.disabledStatus != http.StatusUnauthorized || fake.disabledFence.AccessToken != "expired-access" {
+		t.Fatalf("unexpected disable persistence: clear_access=%v status=%d fence=%+v", fake.disabledClearAccess, fake.disabledStatus, fake.disabledFence)
+	}
+	stats := worker.Stats()
+	if stats.FreshQuotaErrorSkips != 0 || stats.QuotaErrorProbes != 1 || stats.ProbesStarted != 1 || stats.Disabled != 1 {
+		t.Fatalf("fresh error probe stats = %+v", stats)
+	}
+}
+
 func TestQuotaRecoveryFreshDeletedAgentRuntimeErrorDisablesToken(t *testing.T) {
 	now := time.Now().UTC()
 	errorText := "HTTP 403: Agent runtime has been deleted."
