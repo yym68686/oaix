@@ -20,6 +20,17 @@ func TestAggregateRequestHourlyStatsTokenCostsGroupByTokenOnly(t *testing.T) {
 	}
 }
 
+func TestAggregateRequestHourlyStatsUsesTokenOwnerScope(t *testing.T) {
+	source, err := os.ReadFile("request_logs.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := compactSQL(string(source))
+	if !strings.Contains(text, "coalesce(token_owner_user_id, owner_user_id) as owner_user_id") {
+		t.Fatal("hourly dashboard aggregation must scope traffic to the token owner")
+	}
+}
+
 func TestRequestAnalyticsQueueOnlyAggregatesClaimedIDs(t *testing.T) {
 	sql := compactSQL(aggregateRequestTokenCostsSQL)
 	for _, fragment := range []string{

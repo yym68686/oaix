@@ -121,7 +121,7 @@ export function UserSettingsPage({
     }
     setSavingConcurrency(true);
     try {
-      await api.updateMyTokenConcurrency(Object.fromEntries(Object.entries(concurrencyOverrides).map(([plan, cap]) => [plan, Number(cap)])));
+      await api.updateMyTokenConcurrency(concurrencyOverrides);
       pushToast("计划并发设置已保存");
       concurrencyDirtyRef.current = false;
       await loadSettings();

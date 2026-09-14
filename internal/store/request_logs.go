@@ -547,7 +547,7 @@ func (s *Store) aggregateRequestHourlyStatsBatch(ctx context.Context) (int64, in
 		with agg as (
 			select
 				date_trunc('hour', started_at) as bucket_start,
-				owner_user_id,
+				coalesce(token_owner_user_id, owner_user_id) as owner_user_id,
 				coalesce(model_name, model, '') as model_name,
 				count(*)::bigint as request_count,
 				count(*) filter (where success = true)::bigint as success_count,

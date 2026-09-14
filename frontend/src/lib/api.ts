@@ -722,8 +722,10 @@ export const api = {
   updateMySetting: (key: string, value: unknown) =>
     postJSON<SettingItem>(`/api/me/settings/${encodeURIComponent(key)}`, value),
   myTokenConcurrency: () => requestJSON<TokenConcurrencySettings>("/api/me/token-concurrency"),
-  updateMyTokenConcurrency: (planConcurrency: Record<string, number>) =>
-    postJSON<TokenConcurrencySettings>("/api/me/token-concurrency", { plan_concurrency: planConcurrency }),
+  updateMyTokenConcurrency: (planConcurrency: Record<string, number | "">) =>
+    postJSON<TokenConcurrencySettings>("/api/me/token-concurrency", {
+      plan_concurrency: Object.fromEntries(Object.entries(planConcurrency).map(([plan, cap]) => [plan, Number(cap)])),
+    }),
   resetMyTokenConcurrency: () => deleteJSON<TokenConcurrencySettings>("/api/me/token-concurrency"),
   myTokenModels: () => requestJSON<TokenModelAccessSettings>("/api/me/token-models"),
   updateMyTokenModels: (planModels: Record<string, string[]>) =>

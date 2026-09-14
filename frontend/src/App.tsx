@@ -203,7 +203,10 @@ export function App(): React.ReactElement {
   } else if (route.key === "account_profile") {
     page = <ProfilePage me={me} onRefresh={() => void refreshAll()} pushToast={pushToast} />;
   } else if (route.key === "dashboard") {
-    page = me ? <DashboardPage admin={admin} key={getServiceKey()} refreshNonce={refreshNonce} /> : (
+    // The user dashboard is scoped to the authenticated platform user even
+    // when that user is also an administrator. The explicit admin dashboard
+    // route above is the only route that requests the global view.
+    page = me ? <DashboardPage key={getServiceKey()} refreshNonce={refreshNonce} /> : (
       <EmptyState
         description={loading ? "正在确认当前账号。" : "请先使用用户 API Key 登录。"}
         title={loading ? "正在验证身份" : "请登录"}
