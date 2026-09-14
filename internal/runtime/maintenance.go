@@ -25,11 +25,15 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 	indexDone := make(chan struct{})
 	costIndexDone := make(chan struct{})
 	rollupDone := make(chan struct{})
-	importWorker := newImportWorker(cfg)
+	importDone := make(chan struct{})
+	go func() {
+		defer close(importDone)
+		RunImportWorker(workerCtx, cfg, logger, db, tokenManager)
+	}()
 	sub2apiSyncer := sub2api.NewSyncer(db, nil, logger, cfg.Upstream.OAuthClientID)
 	go func() {
 		defer close(maintenanceDone)
-		runMaintenanceOnce(workerCtx, cfg, logger, db, tokenManager, importWorker, sub2apiSyncer, true)
+		runMaintenanceOnce(workerCtx, cfg, logger, db, sub2apiSyncer, true)
 		aggregationInterval := cfg.RequestLog.AggregationWindow
 		if aggregationInterval <= 0 {
 			aggregationInterval = time.Minute
@@ -47,7 +51,7 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 			case <-workerCtx.Done():
 				return
 			case <-ticker.C:
-				runMaintenanceOnce(workerCtx, cfg, logger, db, tokenManager, importWorker, sub2apiSyncer, false)
+				runMaintenanceOnce(workerCtx, cfg, logger, db, sub2apiSyncer, false)
 			case <-cleanupTicker.C:
 				runRequestLogCleanup(workerCtx, cfg, logger, db)
 			}
@@ -70,6 +74,11 @@ func startEmbeddedWorker(ctx context.Context, cfg config.Config, logger *slog.Lo
 	}
 	return func(shutdownCtx context.Context) {
 		cancel()
+		select {
+		case <-importDone:
+		case <-shutdownCtx.Done():
+			return
+		}
 		select {
 		case <-maintenanceDone:
 		case <-shutdownCtx.Done():
@@ -180,41 +189,13 @@ func newImportWorker(cfg config.Config) *importer.Worker {
 	}
 }
 
-func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Logger, db *store.Store, tokenManager *tokens.Manager, importWorker *importer.Worker, sub2apiSyncer *sub2api.Syncer, includeCleanup bool) {
+func runMaintenanceOnce(ctx context.Context, cfg config.Config, logger *slog.Logger, db *store.Store, sub2apiSyncer *sub2api.Syncer, includeCleanup bool) {
 	runStep(ctx, logger, "request log outbox drain", 30*time.Second, func(stepCtx context.Context) error {
 		drained, err := db.DrainRequestLogOutbox(stepCtx, cfg.RequestLog.OutboxDrainBatch)
 		if err == nil && drained > 0 && logger != nil {
 			logger.Info("request log outbox drained", "count", drained)
 		}
 		return err
-	})
-	runStep(ctx, logger, "stale import job resume", 30*time.Second, func(stepCtx context.Context) error {
-		resumed, err := db.ResumeStaleImportJobs(stepCtx, 5*time.Minute)
-		if err == nil && resumed > 0 && logger != nil {
-			logger.Info("stale import jobs resumed", "count", resumed)
-		}
-		return err
-	})
-	runStep(ctx, logger, "import item processing", maxDuration(30*time.Second, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
-		claimed, err := db.ClaimImportItems(stepCtx, cfg.Import.StagingBatchSize)
-		if err != nil || len(claimed) == 0 {
-			return err
-		}
-		updates := importWorker.ValidateBatch(stepCtx, claimed)
-		if err := db.UpdateImportItems(stepCtx, updates); err != nil {
-			return err
-		}
-		published := publishValidatedAccessTokens(stepCtx, db, claimed, updates, logger)
-		importWorker.RecordPublished(published)
-		if published > 0 && tokenManager != nil {
-			if err := tokenManager.Refresh(stepCtx); err != nil && logger != nil {
-				logger.Warn("token snapshot refresh after import failed", "error", err)
-			}
-		}
-		if logger != nil {
-			logger.Info("import batch processed", "claimed", len(claimed), "published", published, "metrics", importWorker.Stats())
-		}
-		return nil
 	})
 	runStep(ctx, logger, "request token cost reconciliation", maxDuration(30*time.Second, cfg.RequestLog.AggregationWindow), func(stepCtx context.Context) error {
 		reconciled, err := db.ReconcileRecordedTokenCosts(stepCtx)

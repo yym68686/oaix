@@ -221,6 +221,10 @@ func (s *Store) CreateQueuedImportJobForOwner(ctx context.Context, ownerUserID i
 			return ImportJob{}, err
 		}
 	}
+	// Delivered only after commit; the database rows remain the queue of record.
+	if _, err := tx.Exec(ctx, "select pg_notify('oaix_import_jobs', '')"); err != nil {
+		return ImportJob{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ImportJob{}, err
 	}
@@ -950,6 +954,7 @@ func (s *Store) UpdateImportItems(ctx context.Context, updates []ImportItemUpdat
 			    refresh_error_message_excerpt = coalesce(nullif($19, ''), refresh_error_message_excerpt),
 			    updated_at = now()
 			where id = $1
+			returning job_id
 		`, update.ID, status, payload, update.TokenID, update.Action, update.ErrorMessage, update.ValidationMS, update.PublishMS,
 			update.Published, update.MatchedExistingTokenID, update.PublishAttempted, update.PublishSkippedReason, update.Reactivated,
 			update.PreviousIsActive, update.NextIsActive, update.PreviousDisabledAt, update.NextDisabledAt,
@@ -957,12 +962,30 @@ func (s *Store) UpdateImportItems(ctx context.Context, updates []ImportItemUpdat
 	}
 	br := s.pool.SendBatch(ctx, batch)
 	defer br.Close()
+	jobIDs := make([]int64, 0, len(updates))
+	seen := make(map[int64]bool)
 	for i := 0; i < batch.Len(); i++ {
-		if _, err := br.Exec(); err != nil {
+		var jobID int64
+		err := br.QueryRow().Scan(&jobID)
+		if err == pgx.ErrNoRows {
+			continue
+		}
+		if err != nil {
 			return err
 		}
+		if !seen[jobID] {
+			seen[jobID] = true
+			jobIDs = append(jobIDs, jobID)
+		}
 	}
-	return s.refreshImportJobProgress(ctx)
+	// Commit the batch and release its connection before querying progress.
+	if err := br.Close(); err != nil {
+		return err
+	}
+	if len(jobIDs) == 0 {
+		return nil
+	}
+	return s.refreshImportJobProgress(ctx, jobIDs)
 }
 
 func (s *Store) PublishImportTokens(ctx context.Context, jobID int64, accessTokens []string, source string) (ImportResult, error) {
@@ -1043,7 +1066,7 @@ func (s *Store) ResumeStaleImportJobs(ctx context.Context, staleAfter time.Durat
 	return resumed, nil
 }
 
-func (s *Store) refreshImportJobProgress(ctx context.Context) error {
+func (s *Store) refreshImportJobProgress(ctx context.Context, jobIDs []int64) error {
 	_, err := s.pool.Exec(ctx, `
 		with item_counts as (
 			select
@@ -1052,6 +1075,7 @@ func (s *Store) refreshImportJobProgress(ctx context.Context) error {
 				count(*) filter (where status = 'failed')::int as failed,
 				count(*) filter (where status = 'skipped')::int as skipped
 			from token_import_items
+			where job_id = any($1)
 			group by job_id
 		)
 		update token_import_jobs j
@@ -1069,7 +1093,7 @@ func (s *Store) refreshImportJobProgress(ctx context.Context) error {
 		    end
 		from item_counts
 		where j.id = item_counts.job_id
-	`)
+	`, jobIDs)
 	return err
 }
 
