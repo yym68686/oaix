@@ -204,17 +204,16 @@ func (a *App) recoverSignedAccount(ctx context.Context, candidate store.Recovery
 		return recovery.Result{}, &recovery.APIError{Code: "document_changed"}
 	}
 	email, account := stringPtr(candidate.Token.Email), stringPtr(candidate.Token.AccountID)
-	// A downloaded bundle can contain fresh credentials for several accounts.
-	// Reuse it without issuing another recovery for its next eligible account.
+	// Each completed cycle advances to the latest signed export. Reusing the
+	// original export forever can return the provider's old completed task.
+	input := doc.Raw
 	if len(doc.Latest) > 0 {
-		parsed, parseErr := recovery.ParseSignedDocument(doc.Latest)
-		if parseErr == nil {
-			credential, credErr := parsed.Credential(email, account)
-			if credErr == nil && credential.AccessToken != candidate.Token.AccessToken {
-				return credential, nil
-			}
+		latest, parseErr := recovery.ParseSignedDocument(doc.Latest)
+		if parseErr == nil && latest.Contains(email, account) {
+			input = doc.Latest
 		}
 	}
+
 	if doc.Session.Stage == "downloaded" && len(doc.Latest) > 0 {
 		doc.Session = recovery.SignedSession{}
 		if err := a.store.SaveRecoverySession(ctx, doc, doc.Session); err != nil {
@@ -222,7 +221,7 @@ func (a *App) recoverSignedAccount(ctx context.Context, candidate store.Recovery
 		}
 	}
 	client := recovery.NewSigned(a.cfg.Recovery401.SignedURL)
-	raw, err := client.Recover(ctx, doc.Raw, &doc.Session, func(s recovery.SignedSession) error { return a.store.SaveRecoverySession(ctx, doc, s) })
+	raw, err := client.Recover(ctx, input, &doc.Session, func(s recovery.SignedSession) error { return a.store.SaveRecoverySession(ctx, doc, s) })
 	if err != nil {
 		return recovery.Result{}, err
 	}

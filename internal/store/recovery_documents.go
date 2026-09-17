@@ -246,8 +246,9 @@ func (s *Store) RecoveryStatuses(ctx context.Context, tokens []Token) (map[int64
 	}
 	rows, err := s.PoolFor(WorkloadAdmin).Query(ctx, `select t.id,b.document_id is not null,
  coalesce(e.event_type,''),coalesce(e.reason,''),e.created_at,t.is_active,
- coalesce(t.last_error,''),coalesce(e.metadata->>'outcome',''),retry.next_at
+ coalesce(t.last_error,''),coalesce(e.metadata->>'outcome',''),retry.next_at,trigger.created_at
  from codex_tokens t left join token_recovery_documents b on b.token_id=t.id and b.owner_user_id=t.owner_user_id
+ left join lateral(select created_at from token_state_events where token_id=t.id and event_type in ('disabled','error') and status_code=401 order by created_at desc,id desc limit 1) trigger on true
  left join lateral (select event_type,reason,created_at,metadata from token_state_events e where e.token_id=t.id
  and e.event_type in ('oauth_401_recovery_started','oauth_401_recovery_result','oauth_401_recovered')
  and coalesce(e.metadata->>'provider','5xteam')=case when b.document_id is null then '5xteam' else 'signed' end
@@ -271,7 +272,8 @@ func (s *Store) RecoveryStatuses(ctx context.Context, tokens []Token) (map[int64
 		var r RecoveryStatus
 		var event, lastError, outcome string
 		var active bool
-		if err := rows.Scan(&id, &r.HasSignedFile, &event, &r.Reason, &r.UpdatedAt, &active, &lastError, &outcome, &r.NextRetryAt); err != nil {
+		var triggerAt *time.Time
+		if err := rows.Scan(&id, &r.HasSignedFile, &event, &r.Reason, &r.UpdatedAt, &active, &lastError, &outcome, &r.NextRetryAt, &triggerAt); err != nil {
 			return nil, err
 		}
 		r.Provider = "5xteam"
@@ -293,6 +295,10 @@ func (s *Store) RecoveryStatuses(ctx context.Context, tokens []Token) (map[int64
 			if !active && strings.Contains(lastError, "401") {
 				r.Status = "pending"
 			}
+		}
+		if !active && strings.Contains(lastError, "401") && triggerAt != nil && (r.UpdatedAt == nil || triggerAt.After(*r.UpdatedAt)) {
+			r.Status = "pending"
+			r.Reason = ""
 		}
 		if active || r.Status == "recovered" {
 			r.NextRetryAt = nil

@@ -157,13 +157,20 @@ func TestSignedRecoveryImportAndWorkerIntegration(t *testing.T) {
 	if !found {
 		t.Fatal("old provider backoff blocked signed recovery")
 	}
+	nextDoc := signedFixture(t, email, account)
+	var nextRoot map[string]any
+	json.Unmarshal(nextDoc, &nextRoot)
+	nextRoot["exported_at"] = "fixture-cycle-2"
+	nextDoc, _ = json.Marshal(nextRoot)
+	expectedUpload := raw
+	downloaded := nextDoc
 	calls := 0
 	website := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/revive/v1/verify/start":
 			calls++
 			got, _ := io.ReadAll(r.Body)
-			if !bytes.Equal(got, raw) {
+			if !bytes.Equal(got, expectedUpload) {
 				t.Error("uploaded bytes differ from signed source")
 			}
 			fmt.Fprint(w, `{"ok":true,"job":{"job_id":"job","task_token":"secret-session","status":"running"}}`)
@@ -175,7 +182,7 @@ func TestSignedRecoveryImportAndWorkerIntegration(t *testing.T) {
 		case "/api/revive/v1/tasks/task":
 			fmt.Fprint(w, `{"ok":true,"task":{"status":"normal","all_download_ready":true}}`)
 		default:
-			w.Write(raw)
+			w.Write(downloaded)
 		}
 	}))
 	defer website.Close()
@@ -194,11 +201,24 @@ func TestSignedRecoveryImportAndWorkerIntegration(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("unexpected submission count %d", calls)
 	}
+	// A later 401 must submit the newer signed document, not replay the old
+	// completed provider task forever. The fixture verifies exact source bytes.
+	if err := db.MarkTokenErrorWithContext(ctx, token.ID, "upstream 401 again", true, nil, store.TokenStateEventContext{StatusCode: &status}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := store.Recovery401Candidate{Token: *current, Provider: "signed", DocumentID: id}
+	expectedUpload = nextDoc
+	if _, err := a.recoverSignedAccount(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 4 {
+		t.Fatalf("second recovery cycle did not create a verification/task pair: %d", calls)
+	}
 	statuses, err := db.RecoveryStatuses(ctx, []store.Token{*current})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if statuses[token.ID].Status != "recovered" || !statuses[token.ID].HasSignedFile {
-		t.Fatal("status missing signed recovery outcome")
+	if statuses[token.ID].Status != "pending" || !statuses[token.ID].HasSignedFile {
+		t.Fatal("status failed to reflect a newer 401 trigger")
 	}
 }

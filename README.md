@@ -368,7 +368,7 @@ Go 版支持 access token、refresh token，以及 sub2api 导出的 OpenAI Agen
 
 有绑定文件的账号调用新站 `/api/revive/v1/verify/start` → 检测完成 → `/tasks?preflight_id=...&auto_start=1` → 任务完成 → `/tasks/{id}/download?scope=all&format=json`。任务 token 加密保存且只放授权头；状态查询支持重启续查。文件级租约避免同一签名批次并发重登；不确定是否被接收的 POST 不自动重发，返回 `submission_uncertain` 供人工核对。普通任务只恢复网站确认的失效账号，不使用 force_reauth。整个签名文件中的账号必须都是 `self_serve_business_prolite`；混合其它订阅的文件不能自动重登（不能擅自裁剪破坏签名）。
 
-下载结果先保存为该文件的加密最新结果，只有目标邮箱、完整 workspace ID、原始订阅、有效期匹配且模型返回完整 `response.completed`，才在原账号 ID 上原子更新凭据并恢复可用。原文件始终保留。其它账号可复用批次已下载的匹配结果，但不会不经探测就激活。
+下载结果先保存为该文件的加密最新结果，只有目标邮箱、完整 workspace ID、原始订阅、有效期匹配且模型返回完整 `response.completed`，才在原账号 ID 上原子更新凭据并恢复可用。原文件始终保留；下一轮优先提交包含目标账号的最新签名导出，避免复用原文件命中旧的已完成任务。无论文件中包含几个账号，每个账号都必须经模型探测才激活。
 
 旧账号可调用 `POST /admin/tokens/{id}/recovery-document`（用户入口 `/api/tokens/{id}/recovery-document`），请求体直接为完整原签名 JSON，沿用账号管理鉴权。该接口只绑定文件，不导入账号、不覆盖凭据、不手动激活；原来已记录 401 的账号由后台自动接手。只读 key 不可写，普通用户只能绑定自己的账号，文件必须包含同一邮箱与 workspace。
 
