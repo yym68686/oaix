@@ -75,29 +75,42 @@ func (a *App) preserveRecoveryImportForOwner(parent context.Context, owner int64
 	if err != nil {
 		return err
 	}
+	// Resolve each account once. Large signed bundles must not repeatedly
+	// decode every JWT for every import item; shared RTs are not unique identity.
+	byIdentity := make(map[string]int, len(doc.Accounts))
+	byRefresh := make(map[string]int, len(doc.Accounts))
+	for i, account := range doc.Accounts {
+		email, workspace, _ := account.Identity()
+		byIdentity[strings.ToLower(email)+"\x00"+workspace] = i
+		if rt := account.Credentials.RefreshToken; rt != "" {
+			if _, exists := byRefresh[rt]; exists {
+				byRefresh[rt] = -1
+			} else {
+				byRefresh[rt] = i
+			}
+		}
+	}
 	for _, p := range payloads {
-		matched := false
-		for _, account := range doc.Accounts {
-			email, workspace, _ := account.Identity()
-			if rt := stringFromImportPayload(p, "refresh_token"); rt != "" && rt == account.Credentials.RefreshToken {
-				p[recovery.DocumentIDField] = id
-				p["name"] = account.Name
-				matched = true
-				break
+		email := stringFromImportPayload(p, "email")
+		workspace := stringFromImportPayload(p, "account_id", "chatgpt_account_id")
+		index, matched := byIdentity[strings.ToLower(email)+"\x00"+workspace]
+		if !matched {
+			claims, err := recovery.TokenIdentity(stringFromImportPayload(p, "access_token"))
+			if err == nil {
+				index, matched = byIdentity[strings.ToLower(claims.Email)+"\x00"+claims.AccountID]
 			}
-			pemail := stringFromImportPayload(p, "email")
-			pid := stringFromImportPayload(p, "account_id", "chatgpt_account_id")
-			if strings.EqualFold(email, pemail) && workspace == pid {
-				p[recovery.DocumentIDField] = id
-				p["name"] = account.Name
-				matched = true
-				break
-			}
+		}
+		if !matched {
+			index, matched = byRefresh[stringFromImportPayload(p, "refresh_token")]
+			matched = matched && index >= 0
 		}
 		if !matched {
 			return errors.New("import identity does not match signed recovery document")
 		}
+		p[recovery.DocumentIDField] = id
+		p["name"] = doc.Accounts[index].Name
 	}
+
 	return nil
 }
 

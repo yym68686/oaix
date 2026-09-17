@@ -179,12 +179,18 @@ func (s *Store) SaveRecoveryDownload(ctx context.Context, d *RecoveryDocument, r
 	if err != nil {
 		return err
 	}
-	for _, a := range doc.Accounts {
-		e, id, _ := a.Identity()
-		if !original.Contains(e, id) {
+	identities := make(map[string]bool, len(original.Accounts))
+	for _, account := range original.Accounts {
+		email, id, _ := account.Identity()
+		identities[strings.ToLower(email)+"\x00"+id] = true
+	}
+	for _, account := range doc.Accounts {
+		email, id, _ := account.Identity()
+		if !identities[strings.ToLower(email)+"\x00"+id] {
 			return errors.New("download contains an unexpected recovery identity")
 		}
 	}
+
 	cipher, err := s.encryptRecoveryBytes(raw)
 	if err != nil {
 		return err
