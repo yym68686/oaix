@@ -101,8 +101,9 @@ type QuotaRecoveryConfig struct {
 }
 
 type Recovery401Config struct {
-	Enabled bool
-	BaseURL string
+	SignedURL string
+	Enabled   bool
+	BaseURL   string
 }
 
 type PromptCacheConfig struct {
@@ -221,8 +222,9 @@ func Load() (Config, error) {
 			Concurrency:        envInt("OAIX_AUTO_QUOTA_RECOVERY_CONCURRENCY", 4),
 		},
 		Recovery401: Recovery401Config{
-			Enabled: envBool("OAIX_401_RECOVERY_ENABLED", true),
-			BaseURL: envString("OAIX_401_RECOVERY_URL", "https://5xteam.shop"),
+			Enabled:   envBool("OAIX_401_RECOVERY_ENABLED", true),
+			SignedURL: envString("OAIX_SIGNED_RECOVERY_URL", "https://zzledu.kdns.fr"),
+			BaseURL:   envString("OAIX_401_RECOVERY_URL", "https://5xteam.shop"),
 		},
 		PromptCache: PromptCacheConfig{
 			AffinityEnabled:       envBool("PROMPT_CACHE_AFFINITY_ENABLED", true),

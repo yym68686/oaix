@@ -80,6 +80,7 @@ export type TokenItem = {
   reset_at?: string | null;
   disabled_at?: string | null;
   last_used_at?: string | null;
+  recovery_401?: { provider: string; status: string; reason?: string; has_signed_file: boolean; updated_at?: string; next_retry_at?: string };
   last_error?: string | null;
   created_at?: string | null;
   updated_at?: string | null;

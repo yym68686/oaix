@@ -4,15 +4,27 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/yym68686/oaix/internal/recovery"
 )
 
 // Native import metadata is applied in the same transaction as credentials.
 // Absent fields preserve existing configuration. A failed binding rolls back
 // credential changes too, so an account can never be published without its proxy.
 func applyTokenImportMetadata(ctx context.Context, tx pgx.Tx, ownerID int64, token *Token, payload map[string]any) error {
+	if raw, ok := payload[recovery.DocumentIDField]; ok {
+		id, err := strconv.ParseInt(fmt.Sprint(raw), 10, 64)
+		if err != nil || id <= 0 {
+			return errors.New("invalid recovery document id")
+		}
+		if err := bindRecoveryDocument(ctx, tx, ownerID, *token, id); err != nil {
+			return err
+		}
+	}
+
 	if remark, ok := payload["remark"].(string); ok {
 		if _, err := tx.Exec(ctx, `update codex_tokens set remark=nullif($2,'') where id=$1`, token.ID, remark); err != nil {
 			return err

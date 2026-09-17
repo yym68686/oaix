@@ -1208,6 +1208,9 @@ export function KeyDetailPage({
             <div className="grid gap-x-8 gap-y-4 border-t p-4 sm:grid-cols-2 sm:p-5">
               <DetailItem label="备注" value={token.remark || "未添加备注"} />
               <DetailItem label="最后错误" value={token.last_error || "暂无错误"} code={Boolean(token.last_error)} />
+              {token.recovery_401 && <DetailItem label="自动恢复" value={`${token.recovery_401.provider} · ${{ idle: "未触发", pending: "等待处理", running: "处理中", interrupted: "处理中断", failed: "恢复失败", recovered: "恢复成功" }[token.recovery_401.status] || token.recovery_401.status}${token.recovery_401.reason ? ` · ${token.recovery_401.reason}` : ""}${token.recovery_401.next_retry_at ? ` · 最早重试 ${formatDate(token.recovery_401.next_retry_at)}` : ""}`} />}
+              {token.recovery_401 && <DetailItem label="恢复签名文件" value={token.recovery_401.has_signed_file ? "已加密保存" : "未保存（需原始签名文件）"} />}
+
             </div>
           </AccountDetailPanel>
           {probeResult && (

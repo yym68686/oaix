@@ -398,7 +398,9 @@ func (a *App) sub2APIImportData(w http.ResponseWriter, r *http.Request) {
 			Accounts []sub2APIAccountInput `json:"accounts"`
 		} `json:"data"`
 	}
-	if !sub2APIDecode(w, r, &req) {
+	raw, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, sub2APIImportMaxBytes))
+	if readErr != nil || json.Unmarshal(raw, &req) != nil {
+		sub2APIReply(w, 400, nil, "invalid data JSON")
 		return
 	}
 	if (req.Data.Type != "" && req.Data.Type != "sub2api-data" && req.Data.Type != "sub2api-bundle") || (req.Data.Version != 0 && req.Data.Version != 1) {
@@ -419,6 +421,14 @@ func (a *App) sub2APIImportData(w http.ResponseWriter, r *http.Request) {
 		sub2APIReply(w, 503, nil, "account store unavailable")
 		return
 	}
+	var documentID int64
+	if signed := signedImportBytes(raw); signed != nil {
+		documentID, err = a.store.SaveRecoveryDocument(r.Context(), owner, signed)
+		if err != nil {
+			sub2APIReply(w, 400, nil, "could not preserve signed recovery document")
+			return
+		}
+	}
 	result := sub2APIDataResult{}
 	proxyIDs, err := a.sub2APIImportProxies(r.Context(), owner, req.Data.Proxies, &result)
 	if err != nil {
@@ -427,6 +437,7 @@ func (a *App) sub2APIImportData(w http.ResponseWriter, r *http.Request) {
 	}
 	accounts := make([]sub2APIAccountInput, 0, len(req.Data.Accounts))
 	for _, account := range req.Data.Accounts {
+		account.recoveryDocumentID = documentID
 		// Data-format IDs are foreign identifiers, resolved only through proxy_key.
 		account.ProxyID = nil
 		if account.ProxyKey != nil && *account.ProxyKey != "" {

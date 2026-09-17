@@ -21,7 +21,7 @@ import (
 	"github.com/yym68686/oaix/internal/config"
 )
 
-const SchemaVersion = 32
+const SchemaVersion = 33
 
 type Workload string
 

@@ -97,20 +97,25 @@ func (a *App) run401Recovery(parent context.Context, id int64) {
 			a.logger.Warn("401 recovery result persistence failed", "token_id", id, "error", err)
 		}
 		if a.logger != nil {
-			a.logger.Info("401 recovery completed", "token_id", id, "owner_user_id", candidate.Token.OwnerUserID, "outcome", outcome, "reason", reason)
+			a.logger.Info("401 recovery completed", "token_id", id, "owner_user_id", candidate.Token.OwnerUserID, "outcome", outcome, "reason", reason, "provider", candidate.Provider, "document_id", candidate.DocumentID)
 		}
 	}()
-	name, err := recoveryAccountName(*candidate)
-	if err != nil {
-		reason = err.Error()
-		return
+
+	var result recovery.Result
+	if candidate.DocumentID > 0 {
+		result, err = a.recoverSignedAccount(ctx, *candidate)
+	} else {
+		var name string
+		name, err = recoveryAccountName(*candidate)
+		if err == nil {
+			result, err = recovery.New(a.cfg.Recovery401.BaseURL).Recover(ctx, name)
+		}
 	}
-	client := recovery.New(a.cfg.Recovery401.BaseURL)
-	result, err := client.Recover(ctx, name)
 	if err != nil {
 		reason = recoveryErrorCode(err)
 		return
 	}
+
 	token := candidate.Token
 	if err := recovery.Validate(result, stringPtr(token.Email), stringPtr(token.AccountID)); err != nil {
 		reason = recoveryErrorCode(err)
@@ -180,4 +185,53 @@ func (s *adminQuotaService) recordQuota401(token store.Token, status int, body [
 		}
 	}
 	return true
+}
+
+func (a *App) recoverSignedAccount(ctx context.Context, candidate store.Recovery401Candidate) (recovery.Result, error) {
+	release, ok, err := a.store.TryRecoveryDocumentLease(ctx, candidate.DocumentID)
+	if err != nil {
+		return recovery.Result{}, err
+	}
+	if !ok {
+		return recovery.Result{}, &recovery.APIError{Code: "document_in_progress"}
+	}
+	defer release()
+	doc, err := a.store.RecoveryDocumentForToken(ctx, candidate.Token.OwnerUserID, candidate.Token.ID)
+	if err != nil {
+		return recovery.Result{}, err
+	}
+	if doc == nil || doc.ID != candidate.DocumentID {
+		return recovery.Result{}, &recovery.APIError{Code: "document_changed"}
+	}
+	email, account := stringPtr(candidate.Token.Email), stringPtr(candidate.Token.AccountID)
+	// A downloaded bundle can contain fresh credentials for several accounts.
+	// Reuse it without issuing another recovery for its next eligible account.
+	if len(doc.Latest) > 0 {
+		parsed, parseErr := recovery.ParseSignedDocument(doc.Latest)
+		if parseErr == nil {
+			credential, credErr := parsed.Credential(email, account)
+			if credErr == nil && credential.AccessToken != candidate.Token.AccessToken {
+				return credential, nil
+			}
+		}
+	}
+	if doc.Session.Stage == "downloaded" && len(doc.Latest) > 0 {
+		doc.Session = recovery.SignedSession{}
+		if err := a.store.SaveRecoverySession(ctx, doc, doc.Session); err != nil {
+			return recovery.Result{}, err
+		}
+	}
+	client := recovery.NewSigned(a.cfg.Recovery401.SignedURL)
+	raw, err := client.Recover(ctx, doc.Raw, &doc.Session, func(s recovery.SignedSession) error { return a.store.SaveRecoverySession(ctx, doc, s) })
+	if err != nil {
+		return recovery.Result{}, err
+	}
+	if err := a.store.SaveRecoveryDownload(ctx, doc, raw); err != nil {
+		return recovery.Result{}, err
+	}
+	parsed, err := recovery.ParseSignedDocument(raw)
+	if err != nil {
+		return recovery.Result{}, err
+	}
+	return parsed.Credential(email, account)
 }

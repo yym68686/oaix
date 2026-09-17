@@ -52,6 +52,7 @@ func (a *App) registerUserAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/tokens/disabled", a.requireAuth(a.deleteMyDisabledTokens))
 	mux.HandleFunc("DELETE /api/tokens/{token_id}", a.requireAuth(a.deleteMyToken))
 	mux.HandleFunc("POST /api/tokens/{token_id}/probe", a.requireAuth(a.probeMyToken))
+	mux.HandleFunc("POST /api/tokens/{token_id}/recovery-document", a.requireAuth(a.attachRecoveryDocument))
 	mux.HandleFunc("POST /api/import/parse", a.requireAuth(a.parseImport))
 	mux.HandleFunc("POST /api/import/upload", a.requireAuth(a.uploadImport))
 	mux.HandleFunc("POST /api/import/jobs", a.requireAuth(a.createMyImportJob))
@@ -1128,14 +1129,23 @@ func (a *App) createMyImportJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
+	raw, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 16*1024*1024))
+	if readErr != nil {
+		writeError(w, 400, readErr)
+		return
+	}
 	var body any
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024*1024)).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	payloads, queuePosition, err := parseImportPayloadExtended(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := a.preserveRecoveryImport(r, raw, payloads); err != nil {
+		writeError(w, 400, err)
 		return
 	}
 	payloads = dedupeImportPayloads(payloads)

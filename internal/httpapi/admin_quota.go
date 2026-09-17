@@ -50,6 +50,7 @@ const (
 )
 
 type adminTokenItem struct {
+	Recovery401 *store.RecoveryStatus `json:"recovery_401,omitempty"`
 	store.Token
 	CredentialMode           string              `json:"credential_mode"`
 	Status                   string              `json:"status"`
@@ -238,6 +239,20 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		}()
 	}
 
+	recoveryByID := map[int64]store.RecoveryStatus{}
+	if a.store != nil && a.cfg.Recovery401.Enabled && len(tokens) > 0 {
+		enrichments.Add(1)
+		go func() {
+			defer enrichments.Done()
+			ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+			defer cancel()
+			if statuses, err := a.store.RecoveryStatuses(ctx, tokens); err == nil {
+				recoveryByID = statuses
+			} else if a.logger != nil {
+				a.logger.Warn("recovery status load failed", "error", err)
+			}
+		}()
+	}
 	activeByID := a.activeStreamsByTokenID(tokens)
 	ownerIDs := make([]int64, 0, len(tokens))
 	for _, token := range tokens {
@@ -294,7 +309,13 @@ func (a *App) adminTokenItemsAt(parent context.Context, tokens []store.Token, in
 		}
 		inherited := token
 		inherited.ActiveStreamCapOverride = nil
+		var recoveryStatus *store.RecoveryStatus
+		if value, ok := recoveryByID[token.ID]; ok {
+			copy := value
+			recoveryStatus = &copy
+		}
 		items = append(items, adminTokenItem{
+			Recovery401:              recoveryStatus,
 			Token:                    token,
 			CredentialMode:           tokenProbeCredentialMode(token),
 			Status:                   adminTokenStatus(token, now),

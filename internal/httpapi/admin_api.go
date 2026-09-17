@@ -184,6 +184,7 @@ func (a *App) registerAdminAPIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/request-costs/reconcile", a.requireAuth(a.reconcileRequestCosts))
 	mux.HandleFunc("GET /admin/request-costs/reconcile", a.requireAuth(a.reconcileStatus))
 
+	mux.HandleFunc("POST /admin/tokens/{token_id}/recovery-document", a.requireAuth(a.attachRecoveryDocument))
 	mux.HandleFunc("POST /admin/import/parse", a.requireAuth(a.parseImport))
 	mux.HandleFunc("POST /admin/import/upload", a.requireAuth(a.uploadImport))
 	mux.HandleFunc("POST /admin/import/jobs", a.requireAuth(a.createImportJob))
@@ -873,6 +874,11 @@ func (a *App) parseImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	raw, _ := json.Marshal(payload)
+	if err := a.preserveRecoveryImport(r, raw, payloads); err != nil {
+		writeError(w, 400, err)
+		return
+	}
 	payloads, summary := finalizeImportParse(payloads, inputCount)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items":   payloads,
@@ -885,6 +891,7 @@ func (a *App) uploadImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 	var all []map[string]any
 	inputCount := 0
 	for _, headers := range r.MultipartForm.File {
@@ -905,6 +912,10 @@ func (a *App) uploadImport(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
+			if err := a.preserveRecoveryImport(r, data, payloads); err != nil {
+				writeError(w, 400, err)
+				return
+			}
 			inputCount += importTextInputCount(string(data), payloads)
 			for _, payload := range payloads {
 				payload["source_file"] = header.Filename
@@ -918,8 +929,13 @@ func (a *App) uploadImport(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) createImportJob(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
+	raw, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 16*1024*1024))
+	if readErr != nil {
+		writeError(w, 400, readErr)
+		return
+	}
 	var body any
-	if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024*1024)).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -946,6 +962,10 @@ func (a *App) createImportJob(w http.ResponseWriter, r *http.Request) {
 	payloads, queuePosition, err := parseImportPayloadExtended(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := a.preserveRecoveryImport(r, raw, payloads); err != nil {
+		writeError(w, 400, err)
 		return
 	}
 	payloads = dedupeImportPayloads(payloads)

@@ -723,14 +723,23 @@ func (a *App) listTokenCosts(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) importTokens(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
+	raw, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 16*1024*1024))
+	if readErr != nil {
+		writeError(w, 400, readErr)
+		return
+	}
 	var body any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	payloads, queuePosition, err := parseImportPayload(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := a.preserveRecoveryImport(r, raw, payloads); err != nil {
+		writeError(w, 400, err)
 		return
 	}
 	payloads = dedupeImportPayloads(payloads)
@@ -1941,7 +1950,7 @@ func preserveImportPayloadControlFields(dst map[string]any, src map[string]any) 
 	}
 	for _, key := range []string{
 		"_share_enabled", "_share_status", "share_enabled", "shareEnabled", "share_status", "shareStatus",
-		"source_file", "_import_index", "_previous_refresh_token", importRedactedCredentialCountKey,
+		"recovery_document_id", "name", "source_file", "_import_index", "_previous_refresh_token", importRedactedCredentialCountKey,
 	} {
 		if value, ok := src[key]; ok {
 			dst[key] = value

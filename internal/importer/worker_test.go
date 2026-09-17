@@ -236,3 +236,14 @@ func TestWorkerValidateBatchNestedCredentialsRefreshTokens(t *testing.T) {
 		t.Fatalf("nested credentials were not refreshed: %+v", updates[0].ValidatedPayload)
 	}
 }
+
+func TestOAuthValidationPreservesRecoveryReference(t *testing.T) {
+	worker := &Worker{Validator: TokenPayloadValidator{Refresh: OAuthRefreshValidator{Client: fakeRefreshClient{}}}}
+	updates := worker.ValidateBatch(context.Background(), []store.ImportItem{{ID: 1, Payload: map[string]any{"refresh_token": "old", "recovery_document_id": int64(42), "name": "owner@example.test"}}})
+	if len(updates) != 1 || updates[0].Status != string(ItemValidated) {
+		t.Fatal("validation failed")
+	}
+	if updates[0].ValidatedPayload["recovery_document_id"] != int64(42) || updates[0].ValidatedPayload["name"] != "owner@example.test" {
+		t.Fatal("OAuth validator lost recovery metadata")
+	}
+}

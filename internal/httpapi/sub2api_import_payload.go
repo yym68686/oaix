@@ -15,13 +15,14 @@ import (
 )
 
 type sub2APIAccountInput struct {
-	Name        string         `json:"name"`
-	Notes       *string        `json:"notes"`
-	Platform    string         `json:"platform"`
-	Type        string         `json:"type"`
-	Credentials map[string]any `json:"credentials"`
-	ProxyID     *int64         `json:"proxy_id"`
-	ProxyKey    *string        `json:"proxy_key"`
+	recoveryDocumentID int64
+	Name               string         `json:"name"`
+	Notes              *string        `json:"notes"`
+	Platform           string         `json:"platform"`
+	Type               string         `json:"type"`
+	Credentials        map[string]any `json:"credentials"`
+	ProxyID            *int64         `json:"proxy_id"`
+	ProxyKey           *string        `json:"proxy_key"`
 	// These fields describe foreign policies. Accept them without applying them.
 	Extra              json.RawMessage `json:"extra"`
 	Concurrency        json.RawMessage `json:"concurrency"`
@@ -167,6 +168,9 @@ func (item sub2APIAccountInput) nativePayload() (map[string]any, error) {
 		return nil, errors.New("only Codex accounts (platform=openai, type=oauth) are supported")
 	}
 	payload := sub2APINativeCredentials(item.Credentials)
+	if item.recoveryDocumentID > 0 {
+		payload["recovery_document_id"] = item.recoveryDocumentID
+	}
 	if _, agent, err := agentidentity.Parse(payload); agent {
 		if err != nil {
 			return nil, errors.New("invalid Codex agent identity credentials")

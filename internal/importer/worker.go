@@ -327,7 +327,7 @@ func copyImportControlFields(src map[string]any, dst map[string]any) {
 	if len(src) == 0 || dst == nil {
 		return
 	}
-	for _, key := range []string{"_share_enabled", "_share_status", "share_enabled", "shareEnabled", "share_status", "shareStatus", "client_id", "clientId", "oauth_client_id"} {
+	for _, key := range []string{"recovery_document_id", "name", "_share_enabled", "_share_status", "share_enabled", "shareEnabled", "share_status", "shareStatus", "client_id", "clientId", "oauth_client_id"} {
 		if value, ok := src[key]; ok {
 			dst[key] = value
 		}
