@@ -23,7 +23,8 @@ const createCodexTickets = `create table if not exists codex_turn_tickets (
 
 type codexTicketPolicyRecord struct {
 	codexticket.Policy
-	ProxyCiphertext string `json:"proxy_ciphertext,omitempty"`
+	ProxyCiphertext     string `json:"proxy_ciphertext,omitempty"`
+	ProxyChannelOwnerID int64  `json:"proxy_channel_owner_id,omitempty"`
 }
 
 func (s *Store) LoadCodexTicketPolicy(ctx context.Context) (codexticket.Policy, error) {
@@ -45,12 +46,29 @@ func (s *Store) LoadCodexTicketPolicy(ctx context.Context) (codexticket.Policy, 
 			return p, errors.New("cannot decrypt Codex ticket proxy")
 		}
 	}
+	record.HarvestProxyOwnerID = record.ProxyChannelOwnerID
 	return record.Policy, record.Policy.Validate()
+}
+
+type CodexTicketPolicyUpdate struct {
+	Enabled        *bool
+	FailClosed     *bool
+	Models         *[]string
+	ProxyURL       *string
+	ClearProxy     bool
+	ProxyChannelID *int64
+	// Set by the authenticated handler, never accepted from JSON.
+	ProxyChannelOwnerID int64
 }
 
 // A row lock prevents a concurrent partial settings update from losing a proxy.
 // Empty/omitted/masked URLs preserve it; clearProxy is the explicit reset action.
-func (s *Store) UpdateCodexTicketPolicy(ctx context.Context, enabled, failClosed *bool, models *[]string, proxyURL *string, clearProxy bool) error {
+func (s *Store) UpdateCodexTicketPolicy(ctx context.Context, update CodexTicketPolicyUpdate) error {
+	enabled, failClosed, models := update.Enabled, update.FailClosed, update.Models
+	proxyURL, clearProxy := update.ProxyURL, update.ClearProxy
+	if update.ProxyChannelID != nil && (*update.ProxyChannelID < 0 || *update.ProxyChannelID > 0 && (clearProxy || proxyURL != nil && strings.TrimSpace(*proxyURL) != "")) {
+		return errors.New("select a proxy channel or a URL, not both")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -68,6 +86,7 @@ func (s *Store) UpdateCodexTicketPolicy(ctx context.Context, enabled, failClosed
 	if err = json.Unmarshal(raw, &record); err != nil {
 		return errors.New("invalid stored Codex ticket policy")
 	}
+	record.HarvestProxyOwnerID = record.ProxyChannelOwnerID
 	if enabled != nil {
 		record.Enabled = *enabled
 	}
@@ -77,11 +96,26 @@ func (s *Store) UpdateCodexTicketPolicy(ctx context.Context, enabled, failClosed
 	if models != nil {
 		record.Models = append([]string(nil), (*models)...)
 	}
-	if err = record.Policy.Validate(); err != nil {
-		return err
-	}
 	if clearProxy {
 		record.ProxyCiphertext = ""
+		record.HarvestProxyChannelID, record.HarvestProxyOwnerID = 0, 0
+	}
+	if update.ProxyChannelID != nil && !clearProxy {
+		id := *update.ProxyChannelID
+		if id == 0 {
+			record.HarvestProxyChannelID, record.HarvestProxyOwnerID = 0, 0
+		} else {
+			ownerID := update.ProxyChannelOwnerID
+			if id == record.HarvestProxyChannelID {
+				ownerID = record.HarvestProxyOwnerID
+			}
+			var found int64
+			if err = tx.QueryRow(ctx, `select id from proxy_channels where id=$1 and owner_user_id=$2 for key share`, id, ownerID).Scan(&found); err != nil {
+				return errors.New("harvest proxy channel not found in your proxy configuration")
+			}
+			record.HarvestProxyChannelID, record.HarvestProxyOwnerID = id, ownerID
+			record.ProxyCiphertext = ""
+		}
 	}
 	if proxyURL != nil && strings.TrimSpace(*proxyURL) != "" && !clearProxy {
 		u, parseErr := egress.Parse(*proxyURL)
@@ -102,8 +136,13 @@ func (s *Store) UpdateCodexTicketPolicy(ctx context.Context, enabled, failClosed
 			if err != nil {
 				return err
 			}
+			record.HarvestProxyChannelID, record.HarvestProxyOwnerID = 0, 0
 		}
 	}
+	if err = record.Policy.Validate(); err != nil {
+		return err
+	}
+	record.ProxyChannelOwnerID = record.HarvestProxyOwnerID
 	raw, err = json.Marshal(record)
 	if err != nil {
 		return err
@@ -163,5 +202,5 @@ func redactCodexTicketSetting(item *Setting) {
 	item.Value, _ = json.Marshal(struct {
 		codexticket.Policy
 		ProxyConfigured bool `json:"harvest_proxy_configured"`
-	}{record.Policy, record.ProxyCiphertext != ""})
+	}{record.Policy, record.ProxyCiphertext != "" || record.HarvestProxyChannelID > 0})
 }

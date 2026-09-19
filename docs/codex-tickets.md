@@ -7,6 +7,11 @@ from [sub2api #7315](https://github.com/Wei-Shaw/sub2api/pull/7315).
 The default is enabled. Each active, available OAuth/access-token account uses
 its existing proxy for both harvesting and business requests. Administrators
 can select a separate harvest proxy without changing the business proxy.
+The harvest route can reference an existing **Proxy configuration** channel.
+OAIX stores its ID and authenticated owner scope, and resolves its current URL
+on every probe. Credentials stay in the channel; edits apply to the next probe.
+A missing or unreadable channel fails that probe without falling back to direct
+access. A channel selected for harvesting cannot be deleted until unselected.
 Agent Identity and personal access tokens retain their existing behavior.
 
 Only HTTP 200 responses with a 292-character `gAAAAA` ticket are accepted. Tickets
@@ -52,6 +57,7 @@ passwords are masked. `POST /admin/codex-tickets` accepts partial updates:
   "enabled": true,
   "fail_closed": false,
   "models": ["gpt-6-astra", "gpt-5.6-sol"],
+  "harvest_proxy_channel_id": 0,
   "harvest_proxy_url": "",
   "clear_harvest_proxy": false
 }
@@ -62,6 +68,14 @@ An omitted/empty or unchanged masked proxy preserves the saved proxy.
 SOCKS5 and SOCKS5h proxies use OAIX's existing public-address validation. These
 endpoints require admin/service access; readonly admins cannot mutate settings.
 The generic settings APIs cannot update or delete this protected setting.
+
+To select an existing channel, POST only `{"harvest_proxy_channel_id": 1}` with
+an admin/service identity that owns channel 1 (or an authorized act-as scope).
+This replaces an independent URL. Supplying a new URL replaces a channel
+reference; selecting both in the same update is rejected. GET includes the
+caller's scoped `proxy_channels` inventory and per-pair
+`last_proxy_channel_id`. Changing the harvest route retries missing/expiring
+tickets on the next scheduler tick; fresh tickets retain their expiry.
 
 ## Persistence and rollout
 

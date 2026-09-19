@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,7 +131,7 @@ func TestCodexTicketProbeHeadersOnlyAndBusinessIsolation(t *testing.T) {
 	a, _ := codexTicketAccount(fakes.tokens[0])
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	result, err := p.probeCodexTicket(ctx, a, "gpt-6-astra", "")
+	result, err := p.probeCodexTicket(ctx, a, "gpt-6-astra", codexticket.DefaultPolicy())
 	if err != nil || result.State != ticketState("A") {
 		t.Fatalf("probe failed: %v", err)
 	}
@@ -147,5 +150,45 @@ func TestCodexTicketExcludesAgentAndPAT(t *testing.T) {
 		if _, ok := codexTicketAccount(token); ok {
 			t.Fatal("unsupported credentials entered ticket gate")
 		}
+	}
+}
+
+type unavailableHarvestChannelStore struct {
+	*fakeProxyStore
+	owner, channel    int64
+	accountProxyCalls int
+}
+
+func (s *unavailableHarvestChannelStore) ProxyChannelURL(_ context.Context, owner, channel int64) (*url.URL, error) {
+	s.owner, s.channel = owner, channel
+	return nil, errors.New("channel deleted")
+}
+func (s *unavailableHarvestChannelStore) ResolveTokenProxy(context.Context, int64) (*url.URL, error) {
+	s.accountProxyCalls++
+	return nil, nil
+}
+
+func TestCodexTicketMissingChannelNeverUsesAccountOrDirectRoute(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(200) }))
+	defer upstream.Close()
+	fakes := &fakeProxyStore{tokens: []store.Token{{ID: 1, AccessToken: "access", IsActive: true}}}
+	p := newProxyPipelineTestHarness(t, upstream.URL, 1, fakes)
+	attachTickets(t, p, codexticket.DefaultPolicy())
+	source := &unavailableHarvestChannelStore{fakeProxyStore: fakes}
+	p.store = source
+	a, _ := codexTicketAccount(fakes.tokens[0])
+	policy := codexticket.DefaultPolicy()
+	policy.HarvestProxyChannelID = 7
+	policy.HarvestProxyOwnerID = 42
+	_, err := p.probeCodexTicket(context.Background(), a, "gpt-6-astra", policy)
+	if err == nil || calls.Load() != 0 || source.accountProxyCalls != 0 {
+		t.Fatal("missing channel fell back to account/direct route")
+	}
+	if source.owner != 42 || source.channel != 7 {
+		t.Fatal("wrong channel owner scope")
+	}
+	if p.tokens.Stats().ActiveStreams != 0 {
+		t.Fatal("failed lookup leaked account claim")
 	}
 }

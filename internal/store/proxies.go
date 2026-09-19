@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -37,7 +38,7 @@ const createTokenProxyChannelIndex = `create index if not exists ix_token_proxy_
 
 var ErrProxyLimit = errors.New("每个用户最多可添加 100 个代理渠道")
 
-var ErrProxyInUse = errors.New("该代理仍被账号使用，请先在账号设置中更换代理或取消绑定")
+var ErrProxyInUse = errors.New("该代理仍被账号或票据采集使用，请先更换代理或取消绑定")
 
 type ProxyChannel struct {
 	ID           int64     `json:"id"`
@@ -120,7 +121,25 @@ func (s *Store) SaveProxyChannel(ctx context.Context, ownerID, id int64, name, r
 }
 
 func (s *Store) DeleteProxyChannel(ctx context.Context, ownerID, id int64) error {
-	result, err := s.pool.Exec(ctx, `delete from proxy_channels where id=$1 and owner_user_id=$2`, id, ownerID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var found int64
+	if err = tx.QueryRow(ctx, `select id from proxy_channels where id=$1 and owner_user_id=$2 for update`, id, ownerID).Scan(&found); err != nil {
+		return err
+	}
+	// Serialize against the key-share lock in ticket policy updates. The
+	// channel URL remains the single source of truth for a live reference.
+	var usedByTickets bool
+	if err = tx.QueryRow(ctx, `select exists(select 1 from gateway_settings where key='codex_tickets' and value::jsonb->>'harvest_proxy_channel_id'=$1)`, fmt.Sprint(id)).Scan(&usedByTickets); err != nil {
+		return err
+	}
+	if usedByTickets {
+		return ErrProxyInUse
+	}
+	result, err := tx.Exec(ctx, `delete from proxy_channels where id=$1 and owner_user_id=$2`, id, ownerID)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23503" {
 		return ErrProxyInUse
@@ -128,7 +147,10 @@ func (s *Store) DeleteProxyChannel(ctx context.Context, ownerID, id int64) error
 	if err == nil && result.RowsAffected() == 0 {
 		return pgx.ErrNoRows
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) ProxyChannelURL(ctx context.Context, ownerID, id int64) (*url.URL, error) {

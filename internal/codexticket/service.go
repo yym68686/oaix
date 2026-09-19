@@ -21,18 +21,19 @@ type ProbeResult struct {
 	Status     int
 	RetryAfter time.Duration
 }
-type Probe func(context.Context, Account, string, string) (ProbeResult, error)
+type Probe func(context.Context, Account, string, Policy) (ProbeResult, error)
 type key struct {
 	tokenID int64
 	model   string
 }
 type entry struct {
-	ticket     Ticket
-	next       time.Time
-	failures   int
-	probing    bool
-	lastLength int
-	lastStatus int
+	ticket             Ticket
+	next               time.Time
+	failures           int
+	probing            bool
+	lastLength         int
+	lastStatus         int
+	lastProxyChannelID int64
 }
 
 type Service struct {
@@ -41,6 +42,7 @@ type Service struct {
 	accounts                                                         func() []Account
 	probe                                                            Probe
 	policy                                                           atomic.Pointer[Policy]
+	reloadMu                                                         sync.Mutex
 	mu                                                               sync.Mutex
 	entries                                                          map[key]*entry
 	started                                                          atomic.Bool
@@ -63,6 +65,8 @@ func (s *Service) Policy() Policy {
 }
 
 func (s *Service) ReloadPolicy(ctx context.Context) error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
 	p, err := s.repo.LoadCodexTicketPolicy(ctx)
 	if err == nil {
 		err = p.Validate()
@@ -72,7 +76,19 @@ func (s *Service) ReloadPolicy(ctx context.Context) error {
 		return err
 	}
 	p.Models = append([]string(nil), p.Models...)
-	s.policy.Store(&p)
+	previous := s.policy.Swap(&p)
+	if !sameHarvestRoute(*previous, p) {
+		// A changed route should be tried on the next tick, not inherit backoff
+		// from a different egress. Existing fresh tickets keep their schedule.
+		s.mu.Lock()
+		for _, e := range s.entries {
+			if !e.probing && !time.Now().Add(RefreshBefore).Before(e.ticket.ExpiresAt) {
+				e.failures = 0
+				e.next = time.Time{}
+			}
+		}
+		s.mu.Unlock()
+	}
 	return nil
 }
 
@@ -279,7 +295,7 @@ func (s *Service) refresh(parent context.Context, a Account, model string) {
 	var probeErr error
 	if !valid || !time.Now().Add(RefreshBefore).Before(t.ExpiresAt) {
 		s.probes.Add(1)
-		result, probeErr = s.probe(ctx, a, model, p.HarvestProxyURL)
+		result, probeErr = s.probe(ctx, a, model, p)
 		if probeErr == nil && result.Status == http.StatusOK && ValidState(result.State) && result.State != t.State {
 			s.Observe(a, model, result.State, result.Status)
 			s.harvested.Add(1)
@@ -304,6 +320,7 @@ func (s *Service) refresh(parent context.Context, a Account, model string) {
 	e := s.entries[k]
 	e.lastStatus = result.Status
 	e.lastLength = len(result.State)
+	e.lastProxyChannelID = p.HarvestProxyChannelID
 	if valid && time.Now().Add(RefreshBefore).Before(t.ExpiresAt) {
 		e.failures = 0
 		e.next = t.ExpiresAt.Add(-RefreshBefore)
@@ -326,9 +343,17 @@ func (s *Service) refresh(parent context.Context, a Account, model string) {
 	if e.ticket.CapturedAt.After(t.CapturedAt) {
 		e.next = time.Time{}
 	}
-	if s.logger != nil && (result.Status != 0 || probeErr != nil) {
-		s.logger.Info("codex_ticket_probe", "token_id", a.TokenID, "model", model, "status", result.Status, "header_length", len(result.State), "ticket_ready", valid, "probe_failed", probeErr != nil)
+	if !sameHarvestRoute(p, *s.policy.Load()) && !time.Now().Add(RefreshBefore).Before(e.ticket.ExpiresAt) {
+		e.failures = 0
+		e.next = time.Time{}
 	}
+	if s.logger != nil && (result.Status != 0 || probeErr != nil) {
+		s.logger.Info("codex_ticket_probe", "token_id", a.TokenID, "model", model, "status", result.Status, "header_length", len(result.State), "ticket_ready", valid, "probe_failed", probeErr != nil, "harvest_proxy_channel_id", p.HarvestProxyChannelID)
+	}
+}
+
+func sameHarvestRoute(a, b Policy) bool {
+	return a.HarvestProxyChannelID == b.HarvestProxyChannelID && a.HarvestProxyOwnerID == b.HarvestProxyOwnerID && a.HarvestProxyURL == b.HarvestProxyURL
 }
 
 func (s *Service) Stats() map[string]any {
@@ -371,6 +396,7 @@ func (s *Service) Statuses() []map[string]any {
 			if e != nil {
 				status["last_probe_status"] = e.lastStatus
 				status["last_header_length"] = e.lastLength
+				status["last_proxy_channel_id"] = e.lastProxyChannelID
 				status["next_refresh_at"] = e.next
 				if ready {
 					status["expires_at"] = e.ticket.ExpiresAt

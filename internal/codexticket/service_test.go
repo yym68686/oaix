@@ -65,7 +65,7 @@ func testService(t *testing.T) (*Service, *memoryRepository, Account) {
 	t.Helper()
 	a := Account{TokenID: 1, Identity: "account-1", Models: []string{"gpt-6-astra"}}
 	r := &memoryRepository{policy: DefaultPolicy()}
-	s := New(r, nil, func() []Account { return []Account{a} }, func(context.Context, Account, string, string) (ProbeResult, error) {
+	s := New(r, nil, func() []Account { return []Account{a} }, func(context.Context, Account, string, Policy) (ProbeResult, error) {
 		return ProbeResult{State: state("A"), Status: 200}, nil
 	})
 	if err := s.ReloadPolicy(context.Background()); err != nil {
@@ -166,7 +166,7 @@ func TestRefreshPersistsAndRestoresWithoutReprobe(t *testing.T) {
 	if len(r.tickets) != 1 {
 		t.Fatal("not persisted")
 	}
-	s2 := New(r, nil, s.accounts, func(context.Context, Account, string, string) (ProbeResult, error) {
+	s2 := New(r, nil, s.accounts, func(context.Context, Account, string, Policy) (ProbeResult, error) {
 		t.Error("reprobed fresh ticket")
 		return ProbeResult{}, nil
 	})
@@ -193,7 +193,7 @@ func TestRefreshFailureRetainsTicketAndBacksOff(t *testing.T) {
 	e.ticket.ExpiresAt = e.ticket.CapturedAt.Add(TTL)
 	old := e.ticket
 	s.mu.Unlock()
-	s.probe = func(context.Context, Account, string, string) (ProbeResult, error) {
+	s.probe = func(context.Context, Account, string, Policy) (ProbeResult, error) {
 		return ProbeResult{Status: 429, RetryAfter: 20 * time.Minute}, nil
 	}
 	s.refresh(context.Background(), a, model)
@@ -221,7 +221,7 @@ func TestBoundedConcurrentProbesAndShutdown(t *testing.T) {
 		return out
 	}
 	entered := make(chan struct{}, 20)
-	s.probe = func(ctx context.Context, _ Account, _, _ string) (ProbeResult, error) {
+	s.probe = func(ctx context.Context, _ Account, _ string, _ Policy) (ProbeResult, error) {
 		n := active.Add(1)
 		for old := peak.Load(); n > old; old = peak.Load() {
 			if peak.CompareAndSwap(old, n) {
@@ -321,5 +321,50 @@ func TestInitializeRestoresStrictPolicyBeforeServing(t *testing.T) {
 	}
 	if !s.Policy().FailClosed {
 		t.Fatal("read failure dropped strict policy")
+	}
+}
+
+func TestProxyChannelChangeRetriesMissingPairsAndKeepsTickets(t *testing.T) {
+	s, r, a := testService(t)
+	s.Observe(a, a.Models[0], state("A"), 200)
+	fresh, _ := s.Lookup(a, a.Models[0])
+	s.entries[key{a.TokenID, a.Models[0]}].next = fresh.ExpiresAt.Add(-RefreshBefore)
+	s.entries[key{2, a.Models[0]}] = &entry{next: time.Now().Add(time.Hour), failures: 6}
+	r.policy.HarvestProxyChannelID = 7
+	r.policy.HarvestProxyOwnerID = 3
+	if err := s.ReloadPolicy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !s.entries[key{2, a.Models[0]}].next.IsZero() {
+		t.Fatal("new channel inherited old route backoff")
+	}
+	if s.entries[key{a.TokenID, a.Models[0]}].next != fresh.ExpiresAt.Add(-RefreshBefore) {
+		t.Fatal("channel change discarded fresh ticket schedule")
+	}
+	var got Policy
+	s.probe = func(_ context.Context, _ Account, _ string, p Policy) (ProbeResult, error) {
+		got = p
+		return ProbeResult{}, nil
+	}
+	s.refresh(context.Background(), Account{TokenID: 2}, a.Models[0])
+	if got.HarvestProxyChannelID != 7 || got.HarvestProxyOwnerID != 3 {
+		t.Fatal("probe received wrong channel reference")
+	}
+}
+
+func TestChannelChangeWhileProbingDoesNotRetainOldRouteBackoff(t *testing.T) {
+	s, r, a := testService(t)
+	s.entries[key{a.TokenID, a.Models[0]}] = &entry{probing: true}
+	s.probe = func(ctx context.Context, _ Account, _ string, _ Policy) (ProbeResult, error) {
+		r.policy.HarvestProxyChannelID = 7
+		r.policy.HarvestProxyOwnerID = 3
+		if err := s.ReloadPolicy(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return ProbeResult{Status: 429, RetryAfter: time.Hour}, nil
+	}
+	s.refresh(context.Background(), a, a.Models[0])
+	if e := s.entries[key{a.TokenID, a.Models[0]}]; !e.next.IsZero() || e.probing {
+		t.Fatal("old route probe delayed the new route")
 	}
 }

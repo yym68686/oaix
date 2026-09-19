@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -65,7 +66,7 @@ func (p *Pipeline) ticketAccounts() []codexticket.Account {
 	return out
 }
 
-func (p *Pipeline) probeCodexTicket(ctx context.Context, account codexticket.Account, model, proxyURL string) (codexticket.ProbeResult, error) {
+func (p *Pipeline) probeCodexTicket(ctx context.Context, account codexticket.Account, model string, policy codexticket.Policy) (codexticket.ProbeResult, error) {
 	// Use a normal bounded claim so synthetic probes also respect per-account
 	// concurrency, model access and current token availability. This does not
 	// enter the business request/billing log pipeline or change token health.
@@ -78,8 +79,22 @@ func (p *Pipeline) probeCodexTicket(ctx context.Context, account codexticket.Acc
 	if !ok || actual.Identity != account.Identity {
 		return codexticket.ProbeResult{}, errors.New("ticket account changed")
 	}
-	if proxyURL != "" {
-		u, err := egress.Parse(proxyURL)
+	if policy.HarvestProxyChannelID > 0 {
+		source, ok := p.store.(interface {
+			ProxyChannelURL(context.Context, int64, int64) (*url.URL, error)
+		})
+		if !ok {
+			return codexticket.ProbeResult{}, errors.New("harvest proxy channel unavailable")
+		}
+		// Resolve the selected channel for every attempt so edits take effect
+		// without copying secrets. Missing/deleted channels never fall direct.
+		u, err := source.ProxyChannelURL(ctx, policy.HarvestProxyOwnerID, policy.HarvestProxyChannelID)
+		if err != nil || u == nil {
+			return codexticket.ProbeResult{}, errors.New("harvest proxy channel unavailable")
+		}
+		ctx = egress.WithProxy(ctx, u)
+	} else if policy.HarvestProxyURL != "" {
+		u, err := egress.Parse(policy.HarvestProxyURL)
 		if err != nil {
 			return codexticket.ProbeResult{}, err
 		}

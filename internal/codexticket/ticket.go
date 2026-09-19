@@ -25,10 +25,12 @@ const (
 var ErrUnavailable = errors.New("Codex turn-state ticket unavailable")
 
 type Policy struct {
-	Enabled         bool     `json:"enabled"`
-	FailClosed      bool     `json:"fail_closed"`
-	Models          []string `json:"models"`
-	HarvestProxyURL string   `json:"-"`
+	Enabled               bool     `json:"enabled"`
+	FailClosed            bool     `json:"fail_closed"`
+	Models                []string `json:"models"`
+	HarvestProxyURL       string   `json:"-"`
+	HarvestProxyChannelID int64    `json:"harvest_proxy_channel_id"`
+	HarvestProxyOwnerID   int64    `json:"-"`
 }
 
 func DefaultPolicy() Policy {
@@ -48,6 +50,9 @@ func (p Policy) Includes(model string) bool {
 }
 
 func (p Policy) Validate() error {
+	if p.HarvestProxyChannelID < 0 || p.HarvestProxyChannelID > 0 && (p.HarvestProxyOwnerID <= 0 || p.HarvestProxyURL != "") {
+		return errors.New("invalid harvest proxy channel")
+	}
 	if len(p.Models) == 0 || len(p.Models) > 16 {
 		return errors.New("models must contain 1 to 16 model names")
 	}
