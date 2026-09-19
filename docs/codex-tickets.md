@@ -39,8 +39,9 @@ Unconfigured models and a disabled policy preserve existing forwarding.
 The administrator Settings page includes a Codex tickets panel. Changes are
 stored independently in `gateway_settings.codex_tickets`, applied immediately
 on the receiving process, and reloaded by other processes every five seconds.
-Failed reads retain the last successfully loaded policy. On initial startup,
-background work waits for a successful policy read.
+Failed reads retain the last successfully loaded policy. Before accepting
+traffic on startup, the gateway must load the saved policy and persisted tickets;
+a failed load leaves the previous healthy release serving during rollout.
 
 `GET /admin/codex-tickets` returns the saved/runtime policy, counters and up to
 200 account/model status summaries. It never returns ticket blobs. Proxy

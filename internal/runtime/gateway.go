@@ -95,6 +95,12 @@ func RunGateway(ctx context.Context) error {
 	app.SetProbeRequestDoer(upstream)
 	pipeline.SetTokenModelCapabilityLossHandler(app.HandleTokenModelCapabilityLoss)
 	if tickets := pipeline.CodexTickets(); tickets != nil {
+		initCtx, stopInit := context.WithTimeout(ctx, 5*time.Second)
+		err := tickets.Initialize(initCtx)
+		stopInit()
+		if err != nil {
+			return errors.New("cannot initialize Codex ticket policy and persisted tickets")
+		}
 		ticketCtx, cancelTickets := context.WithCancel(ctx)
 		ticketDone := make(chan struct{})
 		go func() { defer close(ticketDone); tickets.Run(ticketCtx) }()

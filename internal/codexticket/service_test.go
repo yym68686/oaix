@@ -303,3 +303,23 @@ func TestInitialEmptySnapshotDoesNotDiscardRestoredTickets(t *testing.T) {
 		t.Fatal("initial empty token snapshot discarded restored ticket")
 	}
 }
+
+func TestInitializeRestoresStrictPolicyBeforeServing(t *testing.T) {
+	s, r, a := testService(t)
+	r.policy.FailClosed = true
+	now := time.Now().UTC()
+	r.tickets = []Ticket{{TokenID: a.TokenID, Model: a.Models[0], Identity: a.Identity, State: state("A"), CapturedAt: now, ExpiresAt: now.Add(TTL)}}
+	if err := s.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Allowed(a, a.Models[0]) || s.Allowed(Account{TokenID: 99}, a.Models[0]) {
+		t.Fatal("startup policy/tickets not restored")
+	}
+	r.loadErr = errors.New("database unavailable")
+	if err := s.Initialize(context.Background()); err == nil {
+		t.Fatal("must not start without reading persisted policy")
+	}
+	if !s.Policy().FailClosed {
+		t.Fatal("read failure dropped strict policy")
+	}
+}

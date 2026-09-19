@@ -136,11 +136,20 @@ func (s *Service) Observe(account Account, model, state string, status int) {
 	e.next = time.Time{}
 }
 
-func (s *Service) load(ctx context.Context) {
+// Initialize restores policy and tickets before the listener accepts traffic,
+// so a persisted strict policy cannot briefly fall open during a restart.
+func (s *Service) Initialize(ctx context.Context) error {
+	if err := s.ReloadPolicy(ctx); err != nil {
+		return err
+	}
+	return s.load(ctx)
+}
+
+func (s *Service) load(ctx context.Context) error {
 	rows, err := s.repo.LoadCodexTickets(ctx)
 	if err != nil {
 		s.reloadErrors.Add(1)
-		return
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -158,6 +167,7 @@ func (s *Service) load(ctx context.Context) {
 			e.ticket = t
 		}
 	}
+	return nil
 }
 
 // Run owns all workers and waits for them on cancellation. No probes survive
