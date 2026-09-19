@@ -22,6 +22,7 @@ import (
 	"github.com/yym68686/oaix/internal/affinity"
 	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/agentidentitytask"
+	"github.com/yym68686/oaix/internal/codexticket"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/cooldown"
 	"github.com/yym68686/oaix/internal/logs"
@@ -45,6 +46,8 @@ const (
 )
 
 type Pipeline struct {
+	codexTickets                *codexticket.Service
+	ticketTransport             *transport.Client
 	cfg                         config.Config
 	logger                      *slog.Logger
 	tokens                      *tokens.Manager
@@ -201,6 +204,10 @@ func New(cfg config.Config, logger *slog.Logger, tokenManager *tokens.Manager, c
 		logs:      writer,
 		store:     stateStore,
 		affinity:  affinityStore,
+	}
+	if repo, ok := stateStore.(codexticket.Repository); ok {
+		pipeline.ticketTransport = transport.New(cfg.Upstream)
+		pipeline.codexTickets = codexticket.New(repo, logger, pipeline.ticketAccounts, pipeline.probeCodexTicket)
 	}
 	pipeline.SetOrdinary429Cooldown(cfg.TokenPool.DefaultCooldown)
 	return pipeline
@@ -484,6 +491,13 @@ func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestI
 		TargetTokenID:      intent.TargetTokenID,
 		RequireFast:        intent.RequireFast,
 		RequireAlphaSearch: isAlphaSearchEndpoint(intent),
+	}
+	if p.codexTickets != nil && ticketIntentEligible(intent) {
+		model := codexTicketModel(intent, document, bodyBytes)
+		baseTokenIntent.AllowToken = func(t store.Token) bool {
+			account, ok := codexTicketAccount(t)
+			return !ok || p.codexTickets.Allowed(account, model)
+		}
 	}
 	if baseTokenIntent.RequireAlphaSearch {
 		timing["alpha_search_requires_direct_support"] = true
@@ -1322,6 +1336,9 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		req.Header.Set("Session_id", attempt.PromptCache.SessionID)
 	}
 	applyCodexFingerprintHeaders(req.Header, fingerprintIDs)
+	if err := p.applyCodexTicket(attempt, req.Header); err != nil {
+		return AttemptResult{Status: http.StatusServiceUnavailable, Retry: true}, err
+	}
 	resp, err := p.transport.DoWithOptions(r.Context(), req, transport.RequestOptions{
 		ForceHTTP1:      attempt.Intent.ForceUpstreamHTTP1,
 		CloseConnection: attempt.Intent.CloseUpstreamConnection,
@@ -1330,6 +1347,7 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 		return AttemptResult{Status: http.StatusBadGateway, Retry: true}, err
 	}
 	defer resp.Body.Close()
+	p.observeCodexTicket(attempt, resp)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		detail, raw := readUpstreamError(resp.Body)
 		if credentials, ok := p.agentIdentityForClaim(attempt.Claim); ok {

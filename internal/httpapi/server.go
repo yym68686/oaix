@@ -23,6 +23,7 @@ import (
 	"github.com/yym68686/oaix/internal/admindiag"
 	"github.com/yym68686/oaix/internal/agentidentity"
 	"github.com/yym68686/oaix/internal/agentidentitytask"
+	"github.com/yym68686/oaix/internal/codexticket"
 	"github.com/yym68686/oaix/internal/config"
 	"github.com/yym68686/oaix/internal/egress"
 	"github.com/yym68686/oaix/internal/importpayload"
@@ -166,6 +167,8 @@ func (a *App) Handler() http.Handler {
 	a.registerPlatformAdminAPIRoutes(mux)
 	a.registerSub2APIImportRoutes(mux)
 	a.registerSub2APIQueryRoutes(mux)
+	mux.HandleFunc("GET /admin/codex-tickets", a.requireAuth(a.getCodexTickets))
+	mux.HandleFunc("POST /admin/codex-tickets", a.requireAuth(a.updateCodexTickets))
 	mux.HandleFunc("GET /admin/token-selection", a.requireAuth(a.tokenSelection))
 	mux.HandleFunc("POST /admin/token-selection", a.requireAuth(a.updateTokenSelection))
 	mux.HandleFunc("GET /admin/ordinary-429-cooldown", a.requireAuth(a.getOrdinary429Cooldown))
@@ -1488,7 +1491,7 @@ func (a *App) updateSetting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("setting key is required"))
 		return
 	}
-	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey || key == egress.PolicyKey || key == admindiag.PolicyKey {
+	if key == codexticket.SettingKey || key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey || key == egress.PolicyKey || key == admindiag.PolicyKey {
 		writeError(w, http.StatusBadRequest, errors.New("this setting must be updated through its dedicated API"))
 		return
 	}

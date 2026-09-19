@@ -53,6 +53,7 @@
     "/admin/analytics/cache": {"get": {"responses": {"200": {"description": "Cache analytics"}}}},
     "/admin/analytics/errors": {"get": {"responses": {"200": {"description": "Error analytics"}}}},
     "/admin/analytics/latency": {"get": {"responses": {"200": {"description": "Latency analytics"}}}},
+    "/admin/codex-tickets": {"get": {"responses": {"200": {"description": "Codex ticket policy and redacted runtime status"}}}, "post": {"responses": {"200": {"description": "Update live Codex ticket policy and optional harvest proxy"}}}},
     "/admin/ordinary-429-cooldown": {"get": {"responses": {"200": {"description": "Current ordinary 429 cooldown"}}}, "post": {"responses": {"200": {"description": "Update ordinary 429 cooldown"}}}, "delete": {"responses": {"200": {"description": "Reset ordinary 429 cooldown"}}}},
     "/admin/settings/{key}": {"get": {"responses": {"200": {"description": "Setting"}}}, "post": {"responses": {"200": {"description": "Update setting"}}}, "delete": {"responses": {"200": {"description": "Delete setting"}}}},
     "/admin/audit-logs": {"get": {"responses": {"200": {"description": "Audit logs"}}}},

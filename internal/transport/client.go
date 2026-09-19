@@ -29,10 +29,11 @@ type Stats struct {
 	Active        int64 `json:"active"`
 }
 
-// RequestOptions controls an isolated transport used only by experiment calls.
+// RequestOptions controls an isolated transport for experiments and ticket harvesting.
 type RequestOptions struct {
 	ForceHTTP1      bool
 	CloseConnection bool
+	RejectRedirects bool
 }
 
 func New(cfg config.UpstreamConfig) *Client {
@@ -83,7 +84,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 	return resp, err
 }
 
-// DoWithOptions keeps experimental wire changes out of the shared client pool.
+// DoWithOptions keeps one-shot wire changes out of the shared client pool.
 func (c *Client) DoWithOptions(ctx context.Context, req *http.Request, options RequestOptions) (*http.Response, error) {
 	if c == nil || !options.ForceHTTP1 {
 		return c.Do(ctx, req)
@@ -94,6 +95,10 @@ func (c *Client) DoWithOptions(ctx context.Context, req *http.Request, options R
 	oneShotConfig := c.cfg
 	oneShotConfig.ForceAttemptHTTP2 = false
 	client := newHTTPClient(oneShotConfig)
+	defer client.CloseIdleConnections()
+	if options.RejectRedirects {
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
 	if options.CloseConnection {
 		req.Close = true
 	}

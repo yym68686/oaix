@@ -94,6 +94,12 @@ func RunGateway(ctx context.Context) error {
 	defer stopEgress(context.Background())
 	app.SetProbeRequestDoer(upstream)
 	pipeline.SetTokenModelCapabilityLossHandler(app.HandleTokenModelCapabilityLoss)
+	if tickets := pipeline.CodexTickets(); tickets != nil {
+		ticketCtx, cancelTickets := context.WithCancel(ctx)
+		ticketDone := make(chan struct{})
+		go func() { defer close(ticketDone); tickets.Run(ticketCtx) }()
+		defer func() { cancelTickets(); <-ticketDone }()
+	}
 	app.StartQuotaRecovery(ctx)
 	app.Start401Recovery(ctx)
 	connectionIDs := observability.NewConnectionIDGenerator()

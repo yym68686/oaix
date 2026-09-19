@@ -223,6 +223,7 @@ func (s *Store) ListSettings(ctx context.Context) ([]Setting, error) {
 		if err := rows.Scan(&item.Key, &item.Value, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
+		redactCodexTicketSetting(&item)
 		items = append(items, item)
 	}
 	return items, rows.Err()

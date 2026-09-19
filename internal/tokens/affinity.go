@@ -273,6 +273,9 @@ func tokenMatchesIntent(candidate *RuntimeToken, intent Intent) bool {
 	if candidate == nil {
 		return false
 	}
+	if intent.AllowToken != nil && !intent.AllowToken(candidate.Token) {
+		return false
+	}
 	if intent.TargetTokenID > 0 && candidate.Token.ID != intent.TargetTokenID {
 		return false
 	}

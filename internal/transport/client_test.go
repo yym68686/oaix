@@ -94,3 +94,31 @@ func TestClientResponseHeaderTimeout(t *testing.T) {
 		t.Fatal("expected transport error metric")
 	}
 }
+
+func TestHarvestTransportNeverReusesConnectionsOrFollowsRedirects(t *testing.T) {
+	var addresses []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		addresses = append(addresses, r.RemoteAddr)
+		if r.ProtoMajor != 1 || !r.Close {
+			t.Error("harvest must close HTTP/1 connection")
+		}
+		w.Header().Set("Location", "/should-not-follow")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+	client := New(config.UpstreamConfig{ForceAttemptHTTP2: true})
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest(http.MethodPost, server.URL, nil)
+		resp, err := client.DoWithOptions(context.Background(), req, RequestOptions{ForceHTTP1: true, CloseConnection: true, RejectRedirects: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusTemporaryRedirect {
+			t.Fatal("followed redirect")
+		}
+	}
+	if len(addresses) != 2 || addresses[0] == addresses[1] {
+		t.Fatal("reused harvest connection")
+	}
+}

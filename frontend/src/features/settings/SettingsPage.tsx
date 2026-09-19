@@ -1,3 +1,4 @@
+import { CodexTicketsPanel } from "./CodexTicketsPanel";
 import { DatabaseIcon, RefreshCwIcon, RotateCcwIcon, SaveIcon, Settings2Icon, ShieldCheckIcon, TimerResetIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/registry/default/ui/alert";
@@ -706,6 +707,7 @@ export function SettingsPage({
 
   return (
     <div className="grid min-w-0 gap-8 xl:grid-cols-[minmax(0,.7fr)_minmax(0,1fr)]">
+      <div className="min-w-0 xl:col-span-2"><CodexTicketsPanel /></div>
       <div className="min-w-0 xl:col-span-2">
         <TokenModelAccessPanel
           modelOverrides={adminModelOverrides}

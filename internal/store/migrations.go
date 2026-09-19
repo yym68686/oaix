@@ -95,6 +95,7 @@ type startupMigration struct {
 const startupMigrationBaseVersion = 19
 
 var startupMigrations = map[int]startupMigration{
+	34: {statements: []string{createCodexTickets}},
 	33: {statements: []string{createRecoveryDocuments, createRecoveryDocumentAccounts, createRecoveryDocumentBindings}},
 	20: {statements: []string{
 		createGatewayIdempotencyRecordsTable,
@@ -222,6 +223,7 @@ var migrationStatements = []string{
 	`create index if not exists ix_codex_tokens_plan_type on codex_tokens (plan_type)`,
 	`create index if not exists ix_codex_tokens_refresh_token on codex_tokens (refresh_token)`,
 	createRecoveryDocuments, createRecoveryDocumentAccounts, createRecoveryDocumentBindings,
+	createCodexTickets,
 	`alter table codex_tokens alter column type set default 'codex'`,
 	`update codex_tokens set type = 'codex' where type is null`,
 	`alter table codex_tokens alter column type set not null`,
@@ -832,6 +834,7 @@ var onlineMigrationStatements = []string{
 }
 
 var downMigrationStatements = []string{
+	`drop table if exists codex_turn_tickets`,
 	`drop table if exists gateway_admin_observations`,
 	`drop table if exists gateway_egress_observations`,
 	`drop table if exists token_proxy_bindings`,

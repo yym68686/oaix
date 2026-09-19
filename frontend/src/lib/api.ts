@@ -1,3 +1,5 @@
+export type CodexTicketSettings = { policy: { enabled: boolean; fail_closed: boolean; models: string[] }; harvest_proxy_configured: boolean; harvest_proxy_url: string; stats?: Record<string, number> };
+
 const KEY_STORAGE = "oaix.serviceApiKey";
 const LEGACY_KEY_STORAGE = "oaix.serviceKey";
 
@@ -736,6 +738,8 @@ export const api = {
   tokenSelection: (authKey?: string) => requestJSON<Record<string, unknown>>("/admin/token-selection", {}, authKey),
   updateTokenSelection: (payload: Record<string, unknown>) =>
     postJSON<Record<string, unknown>>("/admin/token-selection", payload),
+  codexTickets: () => requestJSON<CodexTicketSettings>("/admin/codex-tickets"),
+  updateCodexTickets: (payload: { enabled: boolean; fail_closed: boolean; models: string[]; harvest_proxy_url: string; clear_harvest_proxy: boolean }) => postJSON<CodexTicketSettings>("/admin/codex-tickets", payload),
   ordinary429Cooldown: () => requestJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown"),
   updateOrdinary429Cooldown: (cooldownSeconds: number) =>
     postJSON<Ordinary429CooldownSettings>("/admin/ordinary-429-cooldown", { cooldown_seconds: cooldownSeconds }),

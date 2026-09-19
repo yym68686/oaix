@@ -283,6 +283,7 @@ func (a *App) openapiSpec(w http.ResponseWriter, r *http.Request) {
 func adminOpenAPISpec() map[string]any {
 	routes := []string{
 		"GET /admin/openapi.json", "GET /admin/options",
+		"GET /admin/codex-tickets", "POST /admin/codex-tickets",
 		"POST /admin/experiments/responses",
 		"GET /admin/ordinary-429-cooldown", "POST /admin/ordinary-429-cooldown", "DELETE /admin/ordinary-429-cooldown",
 		"GET /admin/gpt6-astra-long-context-pricing", "POST /admin/gpt6-astra-long-context-pricing", "DELETE /admin/gpt6-astra-long-context-pricing",
@@ -1556,7 +1557,7 @@ func (a *App) getSetting(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) deleteSetting(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimSpace(r.PathValue("key"))
-	if key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey || key == "egress_observability" || key == "admin_query_observability" {
+	if key == "codex_tickets" || key == store.TokenModelAccessSettingKey || key == store.Ordinary429CooldownSettingKey || key == store.GPT6AstraLongContextSettingKey || key == "egress_observability" || key == "admin_query_observability" {
 		writeError(w, http.StatusBadRequest, errors.New("this setting must be reset through its dedicated API"))
 		return
 	}

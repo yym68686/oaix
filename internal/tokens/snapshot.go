@@ -158,6 +158,7 @@ type TokenActivity struct {
 }
 
 type Intent struct {
+	AllowToken             func(store.Token) bool
 	Endpoint               string
 	Model                  string
 	OwnerUserID            int64
