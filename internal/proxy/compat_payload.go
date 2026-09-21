@@ -1438,7 +1438,7 @@ func (p *Pipeline) collectResponsesJSONFromSSE(resp *http.Response, attempt Atte
 			}
 			mergeMapping(responseSnapshot, responseObj)
 		}
-		if typ == "response.completed" {
+		if typ == "response.completed" && p.settlementReceiptEnabled(attempt) {
 			return errStopSSE
 		}
 		return nil
@@ -1482,6 +1482,7 @@ func (p *Pipeline) writeResponsesJSONFromSSE(w http.ResponseWriter, resp *http.R
 			data = patched
 		}
 	}
+	p.addSettlementReceipt(data, attempt)
 	body, err := openai.EncodeJSON(data)
 	if err != nil {
 		result.Status = http.StatusBadGateway
@@ -2020,6 +2021,16 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 			eventType:             typ,
 			eventOrdinal:          eventOrdinal,
 			payloadSequenceNumber: sequenceNumber,
+		}
+		if typ == "response.completed" {
+			if response, ok := payload["response"].(map[string]any); ok {
+				p.addSettlementReceipt(response, attempt)
+				if data, encodeErr := json.Marshal(payload); encodeErr == nil {
+					event.Data = data
+					event.Raw = sse.Encode(event.Event, data)
+					downstreamEvent.raw = rawEventForDownstream(event, attempt.Intent.ResponseModelAlias)
+				}
+			}
 		}
 		if !committed && isPreflightResponseEvent(typ) {
 			if typ == "response.created" {

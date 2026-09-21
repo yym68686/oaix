@@ -419,6 +419,7 @@ func gatewayIdempotencyRequestHashWithBodyDigest(intent RequestIntent, bodySHA25
 		promptAffinityKey = promptCache.AffinityKey
 	}
 	metadata, err := json.Marshal(struct {
+		SettlementNonce     string `json:"settlement_nonce,omitempty"`
 		Method              string `json:"method"`
 		Endpoint            string `json:"endpoint"`
 		Model               string `json:"model"`
@@ -445,6 +446,7 @@ func gatewayIdempotencyRequestHashWithBodyDigest(intent RequestIntent, bodySHA25
 		SessionID           string `json:"session_id"`
 		PromptAffinityKey   string `json:"prompt_affinity_key"`
 	}{
+		SettlementNonce:     intent.SettlementNonce,
 		Method:              method,
 		Endpoint:            intent.Endpoint,
 		Model:               intent.Model,

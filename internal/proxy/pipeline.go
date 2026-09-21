@@ -100,6 +100,7 @@ type agentIdentityCredentialCacheEntry struct {
 }
 
 type RequestIntent struct {
+	SettlementNonce     string
 	Endpoint            string
 	Model               string
 	OwnerUserID         int64
@@ -309,6 +310,8 @@ func (p *Pipeline) CloseIdleConnections() {
 }
 
 func (p *Pipeline) Proxy(w http.ResponseWriter, r *http.Request, intent RequestIntent) {
+	// This opaque per-caller binding is not an upstream credential.
+	intent.SettlementNonce = strings.TrimSpace(r.Header.Get("X-OAIX-Settlement-Nonce"))
 	releaseActiveRequest := p.trackActiveRequest(intent.OwnerUserID)
 	defer releaseActiveRequest()
 
@@ -1396,6 +1399,9 @@ func (p *Pipeline) doAttempt(w http.ResponseWriter, r *http.Request, attempt Att
 	if isSSE(resp.Header.Get("Content-Type")) || attempt.Intent.Stream {
 		return p.streamResponsesWithPreflight(w, resp, attempt)
 	}
+	if p.settlementReceiptEnabled(attempt) {
+		return p.writeSettlementJSON(w, resp, attempt)
+	}
 	w.WriteHeader(resp.StatusCode)
 	if supportsUsageMetrics(attempt.Intent.Endpoint) {
 		capture := newUsageBodyCapture(p.cfg.Upstream.NonStreamMaxResponseBytes)
@@ -1425,6 +1431,9 @@ func (p *Pipeline) copySuccessResponseHeaders(w http.ResponseWriter, resp *http.
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("X-OAIX-Request-ID", attempt.RequestID)
+	if p.settlementReceiptEnabled(attempt) {
+		w.Header().Set("X-OAIX-Attribution-Contract", "receipt-v1")
+	}
 	w.Header().Set("X-OAIX-Token-ID", fmt.Sprint(attempt.Claim.TokenID()))
 	if attempt.Claim == nil || attempt.Claim.Token == nil {
 		return
