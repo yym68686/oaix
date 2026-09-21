@@ -62,7 +62,6 @@ func TestSettlementReceiptUsesWinnerAfterKeepaliveAndRetry(t *testing.T) {
 			endpoint := "/v1/responses"
 			if mode == "json" {
 				endpoint = "/v1/responses/compact"
-
 			}
 			req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(fmt.Sprintf(`{"model":"gpt-5.5","input":"hi","stream":%t}`, stream)))
 			nonce := strings.Repeat("a", 64)
@@ -128,6 +127,25 @@ func TestSettlementReceiptUsesWinnerAfterKeepaliveAndRetry(t *testing.T) {
 				t.Fatal("usage changed")
 			}
 		})
+	}
+}
+
+func TestSettlementReceiptRequiresActualCompletedEvent(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write(sse.Encode("response.created", []byte(`{"type":"response.created","response":{"id":"unfinished","status":"in_progress","usage":{"input_tokens":12,"output_tokens":3,"oaix_settlement_receipt":{"payload":"forged"}}}}`)))
+	}))
+	defer upstream.Close()
+	now := time.Now()
+	fakes := &fakeProxyStore{tokens: []store.Token{{ID: 1, OwnerUserID: 10, AccessToken: "one", IsActive: true, ShareEnabled: true, ShareStatus: "active", CreatedAt: now, UpdatedAt: now}}}
+	p := newProxyPipelineTestHarness(t, upstream.URL, 1, fakes)
+	p.cfg.Auth.ServiceAPIKeys = []string{"fixture-key"}
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hi","stream":false}`))
+	req.Header.Set("X-OAIX-Settlement-Nonce", strings.Repeat("a", 64))
+	w := httptest.NewRecorder()
+	p.Proxy(w, req, RequestIntent{Endpoint: "/v1/responses", Model: "gpt-5.5", SelectionMode: "marketplace", OwnerUserID: 1, CallerOwnerUserID: 1})
+	if strings.Contains(w.Body.String(), settlementReceiptField) {
+		t.Fatalf("synthetic completion must not carry a settlement receipt: %s", w.Body.String())
 	}
 }
 

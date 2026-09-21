@@ -1433,6 +1433,14 @@ func (p *Pipeline) collectResponsesJSONFromSSE(resp *http.Response, attempt Atte
 					responseObj, _ = payload["response"].(map[string]any)
 				}
 			}
+			if p.settlementReceiptEnabled(attempt) {
+				if usage, ok := responseObj["usage"].(map[string]any); ok {
+					delete(usage, settlementReceiptField)
+				}
+				if typ == "response.completed" {
+					p.addSettlementReceipt(responseObj, attempt)
+				}
+			}
 			if responseSnapshot == nil {
 				responseSnapshot = map[string]any{}
 			}
@@ -1482,7 +1490,6 @@ func (p *Pipeline) writeResponsesJSONFromSSE(w http.ResponseWriter, resp *http.R
 			data = patched
 		}
 	}
-	p.addSettlementReceipt(data, attempt)
 	body, err := openai.EncodeJSON(data)
 	if err != nil {
 		result.Status = http.StatusBadGateway
