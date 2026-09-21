@@ -1438,7 +1438,7 @@ func (p *Pipeline) collectResponsesJSONFromSSE(resp *http.Response, attempt Atte
 			}
 			mergeMapping(responseSnapshot, responseObj)
 		}
-		if typ == "response.completed" && p.settlementReceiptEnabled(attempt) {
+		if typ == "response.completed" {
 			return errStopSSE
 		}
 		return nil
@@ -2022,7 +2022,7 @@ func (p *Pipeline) streamResponsesWithPreflight(w http.ResponseWriter, resp *htt
 			eventOrdinal:          eventOrdinal,
 			payloadSequenceNumber: sequenceNumber,
 		}
-		if typ == "response.completed" {
+		if typ == "response.completed" && p.settlementReceiptEnabled(attempt) {
 			if response, ok := payload["response"].(map[string]any); ok {
 				p.addSettlementReceipt(response, attempt)
 				if data, encodeErr := json.Marshal(payload); encodeErr == nil {
