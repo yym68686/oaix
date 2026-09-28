@@ -37,6 +37,8 @@ func TestModelsReturnsOpenAIList(t *testing.T) {
 		"gpt-5.6-terra",
 		"gpt-5.6-luna",
 		"gpt-6-astra",
+		"gpt-6-sol",
+		"gpt-6-luna",
 		"gpt-image-2",
 	}
 	if len(payload.Data) != len(wantIDs) {
@@ -51,7 +53,7 @@ func TestModelsReturnsOpenAIList(t *testing.T) {
 
 func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 	handler := modelsTestHandler()
-	request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.2", nil)
+	request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version="+defaultCodexClientVersion, nil)
 	request.Header.Set("Authorization", "Bearer service-key")
 	response := httptest.NewRecorder()
 
@@ -77,6 +79,8 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		"gpt-5.6-terra",
 		"gpt-5.6-luna",
 		"gpt-6-astra",
+		"gpt-6-sol",
+		"gpt-6-luna",
 	}
 	if len(payload.Models) != len(wantIDs) {
 		t.Fatalf("models = %d, want %d: %#v", len(payload.Models), len(wantIDs), payload.Models)
@@ -107,6 +111,8 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		"gpt-5.6-terra": {"low", "medium", "high", "xhigh", "max", "ultra"},
 		"gpt-5.6-luna":  {"low", "medium", "high", "xhigh", "max"},
 		"gpt-6-astra":   {"low", "medium", "high", "xhigh", "max", "ultra"},
+		"gpt-6-sol":     {"low", "medium", "high", "xhigh", "max", "ultra"},
+		"gpt-6-luna":    {"low", "medium", "high", "xhigh", "max"},
 	}
 	type modelCapabilities struct {
 		displayName       string
@@ -127,6 +133,16 @@ func TestModelsReturnsCodexCatalogForClientVersion(t *testing.T) {
 		"gpt-6-astra": {
 			displayName: "GPT-6-Astra", defaultReasoning: "medium", defaultVerbosity: "low",
 			contextWindow: 272000, maxContextWindow: 872000, priority: 1, compHash: "3000",
+			useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
+		},
+		"gpt-6-sol": {
+			displayName: "GPT-6-Sol", defaultReasoning: "medium", defaultVerbosity: "low",
+			contextWindow: 272000, maxContextWindow: 872000, priority: 2, compHash: "3000",
+			useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
+		},
+		"gpt-6-luna": {
+			displayName: "GPT-6-Luna", defaultReasoning: "medium", defaultVerbosity: "low",
+			contextWindow: 272000, maxContextWindow: 872000, priority: 3, compHash: "3000",
 			useResponsesLite: true, toolMode: "code_mode_only", multiAgentVersion: "v2",
 		},
 		"gpt-5.5": {

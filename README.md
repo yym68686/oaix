@@ -150,7 +150,11 @@ oaix 现在区分三类 API Key：
 
 计划模型白名单通过 `GET` / `POST` / `DELETE /api/me/token-models` 管理。`POST` 请求格式为 `{"plan_models":{"free":["gpt-5.4-mini"],"pro":["gpt-5.5","gpt-5.6-sol"]}}`；出现的计划键是用户显式覆盖，空数组表示该计划禁用全部模型，省略计划则继续继承管理员设置或内置默认值。用户覆盖优先于 `/admin/token-models` 的管理员默认，但不能绕过 OAIX 从官方每计划模型目录探测到的能力边界。白名单按 token 所有者应用，自用与 marketplace 流量行为一致。
 
-内置默认模型权限为所有非 Free 计划开启 `gpt-6-astra`（包括未知计划），Free 默认关闭。已有管理员或用户显式覆盖继续优先生效；恢复默认后应用上述规则，实际可用性仍受官方账号能力限制。默认策略发布不迁移或重写已有白名单，管理员可通过上述 API 独立调整配置。
+内置默认模型权限为所有计划开启 `gpt-6-sol` 和 `gpt-6-luna`（包括 Free 和未知计划）；`gpt-6-astra` 继续仅对非 Free 计划默认开启。已有管理员或用户显式覆盖继续优先生效；恢复默认后应用上述规则，实际可用性仍受官方账号能力限制。默认策略发布不迁移或重写已有白名单，管理员可通过上述 API 独立调整配置。
+
+官方模型能力扫描使用 Codex `0.156.0`，避免旧客户端目录隐藏 GPT-6 Sol/Luna。静态 Codex 回退目录与 2026-09-28 实测官方目录一致：Sol 支持 `low` 至 `ultra`，Luna 支持 `low` 至 `max`，默认 `medium`，默认上下文 272K、可扩展至 872K。
+
+GPT-6 Sol/Luna 用量估算采用 [OpenAI 官方价格](https://developers.openai.com/api/docs/pricing)：每百万 token 的输入／缓存写入／缓存读取／输出单价分别为 Sol `$2 / $2.5 / $0.2 / $10`、Luna `$0.1 / $0.125 / $0.01 / $0.5`；输入超过 272K 时整次请求输入和缓存费率翻倍，输出费率乘 1.5。这两个模型的长上下文计费不受已有 Astra 专属开关影响。OAIX 使用订阅账号，Fast 按 [Codex 的 2.5 倍积分费率](https://learn.chatgpt.com/docs/agent-configuration/speed)估算。已有模型计费策略保持不变。
 
 ## 路由尝试级幂等
 

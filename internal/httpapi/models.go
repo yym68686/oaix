@@ -281,6 +281,26 @@ func codexModelProfileForID(id string, priority int) codexModelProfile {
 		profile.ToolMode = "code_mode_only"
 		profile.MultiAgentVersion = "v2"
 		profile.ServiceTiers = []codexServiceTier{{ID: "priority", Name: "Fast", Description: "2x speed, increased usage"}}
+	case codexModelMatchesFamily(id, "gpt-6-sol"):
+		profile.DisplayName = "GPT-6-Sol"
+		profile.Description = "Workhorse model for coding and everyday work."
+		profile.Priority = 2
+		profile.DefaultVerbosity = "low"
+		profile.MaxContextWindow = 872000
+		profile.CompHash = "3000"
+		profile.UseResponsesLite = true
+		profile.ToolMode = "code_mode_only"
+		profile.MultiAgentVersion = "v2"
+	case codexModelMatchesFamily(id, "gpt-6-luna"):
+		profile.DisplayName = "GPT-6-Luna"
+		profile.Description = "Fast and affordable model for easier tasks."
+		profile.Priority = 3
+		profile.DefaultVerbosity = "low"
+		profile.MaxContextWindow = 872000
+		profile.CompHash = "3000"
+		profile.UseResponsesLite = true
+		profile.ToolMode = "code_mode_only"
+		profile.MultiAgentVersion = "v2"
 	case codexModelMatchesFamily(id, "gpt-5.6-sol"):
 		profile.DisplayName = "GPT-5.6-Sol"
 		profile.Description = "Latest frontier agentic coding model."
@@ -355,6 +375,8 @@ func codexReasoningLevels(id string) []codexReasoningPreset {
 		{Effort: "xhigh", Description: "Extra high reasoning depth for complex problems"},
 	}
 	if codexModelMatchesFamily(id, "gpt-6-astra") ||
+		codexModelMatchesFamily(id, "gpt-6-sol") ||
+		codexModelMatchesFamily(id, "gpt-6-luna") ||
 		codexModelMatchesFamily(id, "gpt-5.6-sol") ||
 		codexModelMatchesFamily(id, "gpt-5.6-terra") ||
 		codexModelMatchesFamily(id, "gpt-5.6-luna") {
@@ -364,6 +386,7 @@ func codexReasoningLevels(id string) []codexReasoningPreset {
 		})
 	}
 	if codexModelMatchesFamily(id, "gpt-6-astra") ||
+		codexModelMatchesFamily(id, "gpt-6-sol") ||
 		codexModelMatchesFamily(id, "gpt-5.6-sol") ||
 		codexModelMatchesFamily(id, "gpt-5.6-terra") {
 		levels = append(levels, codexReasoningPreset{
@@ -416,6 +439,8 @@ func codexModelSupportsReasoning(id string) bool {
 	lower := strings.ToLower(id)
 	return strings.Contains(lower, "codex") ||
 		codexModelMatchesFamily(lower, "gpt-6-astra") ||
+		codexModelMatchesFamily(lower, "gpt-6-sol") ||
+		codexModelMatchesFamily(lower, "gpt-6-luna") ||
 		strings.HasPrefix(lower, "gpt-5") ||
 		strings.HasPrefix(lower, "o1") ||
 		strings.HasPrefix(lower, "o3") ||

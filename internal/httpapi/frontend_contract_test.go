@@ -129,10 +129,12 @@ func TestFrontendSettingsExposePlanModelOverrides(t *testing.T) {
 	}
 }
 
-func TestFrontendSettingsExposeGPT6AstraProbeModel(t *testing.T) {
+func TestFrontendSettingsExposeGPT6ProbeModels(t *testing.T) {
 	testModels := readFrontendFile(t, "src", "lib", "test-models.ts")
-	if !strings.Contains(testModels, `"gpt-6-astra"`) {
-		t.Fatal("test model options must include gpt-6-astra")
+	for _, model := range []string{"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"} {
+		if !strings.Contains(testModels, `"`+model+`"`) {
+			t.Fatalf("test model options must include %s", model)
+		}
 	}
 }
 

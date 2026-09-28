@@ -400,7 +400,7 @@ func applyUsagePricingWithPolicy(metrics *UsageMetrics, pricing modelPricing, mu
 		multiplier = 1
 	}
 	longContext := false
-	if longContextPricing {
+	if !pricing.longContextOptIn || longContextPricing {
 		pricing, longContext = effectiveModelPricing(pricing, metrics.InputTokens)
 	}
 	nonCached := metrics.InputTokens - metrics.CachedInputTokens
@@ -465,6 +465,9 @@ func fastCostMultiplierForPricingModel(pricingModel string) float64 {
 	switch {
 	case pricingModel == "gpt-6-astra":
 		return 2
+	case pricingModel == "gpt-6-sol" || pricingModel == "gpt-6-luna":
+		// Codex subscription Fast credits differ from public API Fast prices.
+		return 2.5
 	case strings.HasPrefix(pricingModel, "gpt-5.6-"):
 		// OAIX serves Codex subscription accounts, where GPT-5.6 Fast consumes
 		// 2.5x credits. The public API's 2x token price is a separate contract.
@@ -486,6 +489,7 @@ type modelPricing struct {
 	cached                      *float64
 	cacheWrite                  *float64
 	longContextThreshold        int
+	longContextOptIn            bool
 	longContextInputMultiplier  float64
 	longContextOutputMultiplier float64
 }
@@ -497,6 +501,16 @@ func pricingForModel(modelName string) (modelPricing, bool) {
 		"gpt-6-astra": {
 			name: "gpt-6-astra", billingMode: usageBillingModeOpenAIPromptCache,
 			input: 10.0, cacheWrite: price(12.5), cached: price(1.0), output: 50.0,
+			longContextThreshold: 272_000, longContextOptIn: true, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5,
+		},
+		"gpt-6-sol": {
+			name: "gpt-6-sol", billingMode: usageBillingModeOpenAIPromptCache,
+			input: 2.0, cacheWrite: price(2.5), cached: price(0.2), output: 10.0,
+			longContextThreshold: 272_000, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5,
+		},
+		"gpt-6-luna": {
+			name: "gpt-6-luna", billingMode: usageBillingModeOpenAIPromptCache,
+			input: 0.1, cacheWrite: price(0.125), cached: price(0.01), output: 0.5,
 			longContextThreshold: 272_000, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5,
 		},
 		"gpt-5.6-sol": {
@@ -543,8 +557,10 @@ func pricingForModel(modelName string) (modelPricing, bool) {
 	if pricing, ok := table[normalized]; ok {
 		return pricing, true
 	}
-	if strings.HasPrefix(normalized, "gpt-6-astra-") {
-		return table["gpt-6-astra"], true
+	for _, family := range []string{"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"} {
+		if strings.HasPrefix(normalized, family+"-") {
+			return table[family], true
+		}
 	}
 	if strings.HasPrefix(normalized, "gpt-6") {
 		return modelPricing{}, false

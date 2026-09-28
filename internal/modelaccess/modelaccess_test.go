@@ -2,8 +2,27 @@ package modelaccess
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
+
+func TestGPT6SolAndLunaDefaultAccessForEveryPlan(t *testing.T) {
+	for _, plan := range []string{"free", " CHATGPT_FREE ", "go", "plus", "team", "business", "pro", "chatgpt_pro", "prolite", "promax", "enterprise", "edu", "k12", "unknown", "future-plan", ""} {
+		t.Run(plan, func(t *testing.T) {
+			for _, model := range []string{"gpt-6-sol", "gpt-6-luna"} {
+				if !DefaultAllows(plan, model) || !DefaultAllows(plan, strings.ToUpper(model)+"-2026-09-22") {
+					t.Fatalf("%s must default to enabled for %q", model, plan)
+				}
+				if !slices.Contains(DefaultModels(plan, ModelIDs()), model) || !slices.Contains(TextModelIDs(), model) {
+					t.Fatalf("%s missing from default text catalog for %q", model, plan)
+				}
+				if slices.Contains(DefaultModels(plan, []string{"gpt-5.5"}), model) {
+					t.Fatal("default policy must not invent upstream capabilities")
+				}
+			}
+		})
+	}
+}
 
 func TestAstraDefaultAccessByPlan(t *testing.T) {
 	for _, plan := range []string{"free", " CHATGPT_FREE ", "plus", "team", "pro", "chatgpt_pro", "enterprise", "k12", "unknown", ""} {

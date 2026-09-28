@@ -18,6 +18,8 @@ var catalog = []Model{
 	{ID: "gpt-5.6-terra", Label: "GPT-5.6 Terra"},
 	{ID: "gpt-5.6-luna", Label: "GPT-5.6 Luna"},
 	{ID: "gpt-6-astra", Label: "GPT-6 Astra"},
+	{ID: "gpt-6-sol", Label: "GPT-6 Sol"},
+	{ID: "gpt-6-luna", Label: "GPT-6 Luna"},
 	{ID: "gpt-image-2", Label: "GPT Image 2"},
 }
 

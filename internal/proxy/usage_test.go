@@ -107,6 +107,66 @@ func TestGPT6AstraUsesOfficialAPIPricing(t *testing.T) {
 	}
 }
 
+func TestGPT6SolAndLunaUseOfficialPricing(t *testing.T) {
+	tests := []struct {
+		model      string
+		pricing    string
+		input      float64
+		cacheWrite float64
+		cached     float64
+		output     float64
+		baseCost   float64
+		fastCost   float64
+		longCost   float64
+	}{
+		{model: "gpt-6-sol-2026-09-22", pricing: "gpt-6-sol", input: 2, cacheWrite: 2.5, cached: 0.2, output: 10, baseCost: 0.000256, fastCost: 0.00064, longCost: 1.262},
+		{model: "gpt-6-luna", pricing: "gpt-6-luna", input: 0.1, cacheWrite: 0.125, cached: 0.01, output: 0.5, baseCost: 0.0000128, fastCost: 0.000032, longCost: 0.0631},
+	}
+	payload := map[string]any{
+		"usage": map[string]any{
+			"input_tokens": 100,
+			"input_tokens_details": map[string]any{
+				"cache_write_tokens": 20,
+				"cached_tokens":      30,
+			},
+			"output_tokens": 10,
+		},
+	}
+	longContextPayload := map[string]any{
+		"usage": map[string]any{
+			"input_tokens": 300_000,
+			"input_tokens_details": map[string]any{
+				"cache_write_tokens": 20_000,
+				"cached_tokens":      30_000,
+			},
+			"output_tokens": 10_000,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.model, func(t *testing.T) {
+			pricing, ok := pricingForModel(test.model)
+			if !ok || pricing.name != test.pricing {
+				t.Fatalf("unexpected pricing: %+v, %v", pricing, ok)
+			}
+			if pricing.input != test.input || pricing.cacheWrite == nil || *pricing.cacheWrite != test.cacheWrite || pricing.cached == nil || *pricing.cached != test.cached || pricing.output != test.output {
+				t.Fatalf("unexpected rates: %+v", pricing)
+			}
+			standard := extractUsageMetricsForPricingPolicy(payload, test.model, false, false)
+			fast := extractUsageMetricsForPricingPolicy(payload, test.model, true, false)
+			longContext := extractUsageMetricsForPricingPolicy(longContextPayload, test.model, false, false)
+			if standard == nil || fast == nil || longContext == nil {
+				t.Fatalf("missing usage metrics: standard=%v fast=%v long=%v", standard, fast, longContext)
+			}
+			assertCost(t, standard.EstimatedCostUSD, test.baseCost)
+			assertCost(t, fast.EstimatedCostUSD, test.fastCost)
+			assertCost(t, longContext.EstimatedCostUSD, test.longCost)
+			if standard.LongContextPricing || fast.BillingMultiplier != 2.5 || !fast.FastMode || !longContext.LongContextPricing || longContext.LongContextThresholdTokens != 272_000 {
+				t.Fatalf("unexpected pricing policy: standard=%+v fast=%+v long=%+v", standard, fast, longContext)
+			}
+		})
+	}
+}
+
 func TestGPT6AstraLongContextPricingIsOptIn(t *testing.T) {
 	payload := map[string]any{
 		"usage": map[string]any{

@@ -21,7 +21,7 @@ func TestModelsReturnsAndCachesOfficialCatalog(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		if got := r.URL.Query().Get("client_version"); got != "0.153.2" {
+		if got := r.URL.Query().Get("client_version"); got != defaultCodexClientVersion {
 			t.Errorf("client_version = %q", got)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer access-pro" {
@@ -80,7 +80,7 @@ func TestOfficialModelsAgentIdentityUsesAssertionAndWorkspaceHeaders(t *testing.
 		if got := r.Header.Get("X-OpenAI-FedRAMP"); got != "true" {
 			t.Errorf("X-OpenAI-FedRAMP = %q", got)
 		}
-		if got := r.Header.Get("Version"); got != "0.153.2" {
+		if got := r.Header.Get("Version"); got != defaultCodexClientVersion {
 			t.Errorf("Version = %q", got)
 		}
 		_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-5.6-sol"}]}`)
@@ -179,7 +179,7 @@ func TestOfficialModelsRetriesAnotherAvailableAccount(t *testing.T) {
 	app.modelCatalog.upstreamURL = server.URL
 	app.modelCatalog.maxAttempts = 2
 
-	entry, err := app.fetchOfficialModelsPlanCatalog(context.Background(), ownerUserID, "pro", "0.153.2")
+	entry, err := app.fetchOfficialModelsPlanCatalog(context.Background(), ownerUserID, "pro", defaultCodexClientVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +463,7 @@ func modelsCatalogTestApp(t *testing.T, ownerUserID int64, rows []store.Token) *
 }
 
 func serveModelsForOwner(app *App, ownerUserID int64) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.2", nil)
+	request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version="+defaultCodexClientVersion, nil)
 	request = withAuthContext(request, &AuthContext{UserID: &ownerUserID})
 	response := httptest.NewRecorder()
 	app.models(response, request)
